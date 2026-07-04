@@ -1,7 +1,5 @@
 //! AppContainer launcher backend for `lpm-sandbox-helper.exe`.
 //!
-//! Design overview: see
-//! [`private/46.3-pr2-network-denial.md`](../../../../private/46.3-pr2-network-denial.md).
 //! The high-level flow:
 //!
 //! 1. **SID create-or-reuse.** Call

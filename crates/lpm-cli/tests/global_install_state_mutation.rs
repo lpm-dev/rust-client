@@ -1,8 +1,7 @@
 //! CLI-level end-to-end coverage for the global install state surface.
 //!
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
-//! Discipline`). Justification class: **global-install state
-//! mutation**. These tests touch `~/.lpm/global/` (manifest WAL,
+//! **Tier placement: cli-binary.** Justification class:
+//! **global-install state mutation**. These tests touch `~/.lpm/global/` (manifest WAL,
 //! install-root commits, persistent shim state, startup recovery
 //! roll-forward) — surfaces the workflow tier's per-project
 //! `TempProject` model can't isolate cleanly. The `LpmRoot` env in

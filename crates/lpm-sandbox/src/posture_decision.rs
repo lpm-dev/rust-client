@@ -20,10 +20,7 @@
 //! The decision is a pure function of (kernel version string,
 //! `allow_degraded` bool) so the unit tests in this module can
 //! exercise the full table on the macOS developer host without
-//! spinning up a Linux VM, per the Q3 locked methodology in
-//! [the design note].
-//!
-//! [the design note]: ../../../../../../../a-package-manager/DOCS/new-features/37-rust-client-RUNNER-VISION-phase46.1-sandbox-network-denial.md
+//! spinning up a Linux VM.
 
 /// Effective posture the Linux backend should construct, per the
 /// kernel-version probe + user opt-in. See module doc for the table.

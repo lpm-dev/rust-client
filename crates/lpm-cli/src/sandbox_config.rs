@@ -30,11 +30,9 @@
 //! allow-degraded = false   # bool; true falls back to V1 on kernels < 6.7
 //! ```
 //!
-//! Per CLAUDE.md and the design-note locked decisions, the
-//! `[sandbox] allow-degraded` opt-in is persistent (not a flag-only
+//! The `[sandbox] allow-degraded` opt-in is persistent (not a flag-only
 //! escape) — it lives in lpm.toml / ~/.lpm/config.toml so a machine's
-//! degraded posture is a property of that machine, not a one-off
-//! invocation.
+//! degraded posture is a property of that machine, not a one-off invocation.
 //!
 //! ## Why not under `package.json > lpm`?
 //!

@@ -81,8 +81,7 @@
 //! deny-by-default seccomp profile (allowlist of "known-good"
 //! syscalls), but the deny-everything default would need a per-
 //! Node-major-version syscall inventory to avoid breaking legitimate
-//! lifecycle scripts. Tracked as accepted-posture in
-//! `private/security-findings.md` under M63.
+//! lifecycle scripts.
 //!
 //! # Async-signal safety
 //!

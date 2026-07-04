@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// Supported AI code editors.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AiEditor {
-    ClaudeCode,    // CLAUDE.md
+    ClaudeCode,
     Cursor,        // .cursor/rules/ directory
     CursorRules,   // .cursorrules file
     Windsurf,      // .windsurfrules

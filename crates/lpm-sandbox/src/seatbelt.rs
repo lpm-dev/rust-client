@@ -199,9 +199,6 @@ pub(crate) fn render_profile(
     // `--no-sandbox`, `trustedDependencies`, or by dropping back to
     // `mode = "default"`.
     //
-    // See
-    // `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46-DX.md`
-    // for the full mode contract.
     if !deny_outbound_network {
         out.push_str("(allow network*)\n");
     }

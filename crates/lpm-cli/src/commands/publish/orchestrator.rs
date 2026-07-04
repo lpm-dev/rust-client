@@ -298,10 +298,9 @@ pub async fn run(
     // This runs before the skill-staleness check so the first LPM network
     // call uses the exchanged client too.
     //
-    // The origin requires `package` for `scope=publish` (see a-package-manager
-    // `app/api/registry/-/token/oidc/route.js`), and the package name only
-    // becomes known after `package.json` is parsed — that's why this can't
-    // live in main.rs.
+    // The origin requires `package` for `scope=publish`, and the package name
+    // only becomes known after `package.json` is parsed — that's why this
+    // can't live in main.rs.
     //
     // Failure is non-fatal: the original `client` is reused so a missing
     // OIDC policy or a misconfigured token can still publish via the stored

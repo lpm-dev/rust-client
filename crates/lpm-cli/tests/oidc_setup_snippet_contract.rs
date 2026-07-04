@@ -1,6 +1,5 @@
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
-//! Discipline`). Justification class: **intentionally minimal
-//! binary-surface repros**. Cross-command contract pin: ensures the
+//! **Tier placement: cli-binary.** Justification class: **intentionally
+//! minimal binary-surface repros**. Cross-command contract pin: ensures the
 //! `lpm setup ci gitlab` snippet's `LPM_OIDC_TOKEN` env var name +
 //! `aud=https://lpm.dev` audience match what `lpm setup ci npmrc --oidc`
 //! actually exchanges. Single focused assertion against a raw

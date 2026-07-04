@@ -22,10 +22,6 @@
 //! `wrappedKey`, `vaultId`, `status`, and metadata. A TLS-terminating
 //! intermediary or a compromised CDN cache cannot forge a successful
 //! response without the auth token.
-//!
-//! ## Server side
-//!
-//! See `a-package-manager/lib/vault/response-signature.js`.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, Mac};

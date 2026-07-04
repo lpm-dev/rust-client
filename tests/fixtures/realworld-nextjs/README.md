@@ -1,6 +1,6 @@
 # realworld-nextjs fixture
 
-**Purpose:** real-world-shaped dependency tree for exercising the install pipeline at production scale — Item 5 of `private/test-coverage-followup-plan.md`.
+**Purpose:** real-world-shaped dependency tree for exercising the install pipeline at production scale.
 
 ## What this fixture represents
 
@@ -74,7 +74,7 @@ Re-calibrate the budgets in [`install_realworld.rs`](../../workflows/tests/insta
 
 - **2026-05-14, M-series macOS dev box** — initial calibration. N=6 cold + N=3 warm + N=3 RSS. Budgets: cold 25 s, warm 25 ms, RSS 1500 MiB.
 
-These numbers are recorded to stderr by the test for future budget-calibration work (Item 5 §2-§4). They are **not** asserted against fixed thresholds because real wall-clock budgets need a calibrated reference machine + 5+ measured runs + headroom per the plan's acceptance criteria.
+These numbers are recorded to stderr by the test for future budget-calibration work. They are **not** asserted against fixed thresholds because real wall-clock budgets need a calibrated reference machine + 5+ measured runs + headroom.
 
 ## Why exact versions
 
@@ -88,7 +88,7 @@ When this fixture's pins fall behind real-world current versions:
 
 ## What this fixture is NOT
 
-- **Not a perf budget.** Wall-clock numbers are deliberately not asserted by the bundled tests — they're CI-flake-prone without a calibrated reference machine. Item 5 §1 (this fixture) and Item 5 §2-§4 (cold/warm/memory budgets) are deliberately split so the fixture can ship without waiting on a reference-machine setup.
+- **Not a perf budget.** Wall-clock numbers are deliberately not asserted by the bundled tests — they're CI-flake-prone without a calibrated reference machine. Fixture coverage and cold/warm/memory budget enforcement are deliberately split so this fixture can run without depending on a reference-machine setup.
 - **Not a published-app shape.** No build scripts, no `eslint`, no `typescript`, no app code. The smallest manifest that produces a real-world-scale transitive tree is enough; adding more deps would just inflate test runtime without exercising new install-pipeline surface.
 - **Not committed `node_modules/` or `lpm.lock`.** Tests resolve and install fresh against Verdaccio so the contract is "install succeeds AT REAL SCALE", not "the install matches a snapshot".
 

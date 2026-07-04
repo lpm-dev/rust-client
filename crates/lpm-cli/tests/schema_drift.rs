@@ -1,38 +1,28 @@
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
-//! Discipline`). Justification class: **parser/schema corpus**. This
-//! file walks up the workspace tree from `CARGO_MANIFEST_DIR` to find
-//! public schema directories and diffs them against the binary's
-//! current schema output. Cross-repo path
-//! resolution + direct schema-source comparison both anchor on
-//! `lpm-cli`'s manifest dir; the workflow tier's project-isolated
-//! `TempProject` would obscure the cross-repo location instead of
-//! using it.
+//! **Tier placement: cli-binary.** Justification class:
+//! **parser/schema corpus**. This file walks up the workspace tree from
+//! `CARGO_MANIFEST_DIR` to find public schema directories and diffs them
+//! against the binary's current schema output. Direct schema-source
+//! comparison anchors on `lpm-cli`'s manifest dir; the workflow tier's
+//! project-isolated `TempProject` would obscure the schema location instead
+//! of using it.
 //!
 //! Drift guard between the rust-client schema source-of-truth and the
-//! static copies served by `rust-client-docs` at
-//! `https://cli.lpm.dev/schemas/<name>.json`, plus the compatibility
-//! copies served by `a-package-manager` at
-//! `https://lpm.dev/schemas/<name>.json`.
+//! static copies served from public schema URLs.
 //!
 //! When this test fails, regenerate the public copies via:
 //!
 //! ```bash
-//! cd rust-client-docs
-//! lpm schema lpm.json        -o public/schemas/lpm.json
-//! lpm schema lpm.config.json -o public/schemas/lpm.config.json
-//! cd /path/to/a-package-manager
 //! lpm schema lpm.json        -o public/schemas/lpm.json
 //! lpm schema lpm.config.json -o public/schemas/lpm.config.json
 //! ```
 //!
-//! and commit the diff alongside the rust-client change. Done in
-//! lockstep so the CDN copy never lags the binary.
+//! and commit the diff alongside the rust-client change. Done in lockstep so
+//! the public copy never lags the binary.
 //!
 //! ## How the test finds the public schemas dir
 //!
-//! Cross-repo concern: the gate is best-effort by design. Standalone
-//! `rust-client` CI doesn't check out `a-package-manager`, so the gate
-//! must not block that workflow.
+//! The gate is best-effort by design. Standalone CI might not check out the
+//! public schema host, so the gate must not block that workflow.
 //!
 //! Resolution order:
 //!
@@ -41,11 +31,9 @@
 //!    drift check enforced against one specific public schema directory.
 //! 2. `LPM_SCHEMAS_PUBLIC_DIR=skip` — explicit opt-out, with a stderr
 //!    note.
-//! 3. Otherwise: walk up from `CARGO_MANIFEST_DIR` looking for
-//!    `rust-client-docs/public/schemas/` and
-//!    `a-package-manager/public/schemas/` descendants under any
-//!    intermediate ancestor. Handles both the sibling-under-one-parent
-//!    and cross-subtree local layouts.
+//! 3. Otherwise: walk up from `CARGO_MANIFEST_DIR` looking for known public
+//!    schema directories under any intermediate ancestor. Handles both the
+//!    sibling-under-one-parent and cross-subtree local layouts.
 //! 4. When none of the above resolves: **silent skip with stderr
 //!    note**. Standalone CI without the docs repo just sees the test
 //!    pass. Local dev with the docs repo present sees the gate enforce.
