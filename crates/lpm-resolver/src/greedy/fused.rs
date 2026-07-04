@@ -710,23 +710,27 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     //     let the main loop refetch it.
     let worker_root_package_specs = if range_aware_worker_batch {
         worker_package_specs_from_root_deps(&state.root_deps, &route_table)
+            .into_iter()
+            .filter(|(name, _)| !shared_cache.contains_key(&CanonicalKey::from_dep_name(name)))
+            .collect()
     } else {
         Vec::new()
     };
-    let worker_root_names: Vec<String> = if worker_root_package_specs.is_empty() {
+    let worker_root_names: Vec<String> = if range_aware_worker_batch {
+        worker_package_names_from_specs(&worker_root_package_specs)
+    } else {
         state
             .root_deps
             .keys()
             .filter(|name| {
-                matches!(
-                    route_table.route_for_package(name),
-                    UpstreamRoute::LpmWorker
-                )
+                !shared_cache.contains_key(&CanonicalKey::from_dep_name(name))
+                    && matches!(
+                        route_table.route_for_package(name),
+                        UpstreamRoute::LpmWorker
+                    )
             })
             .cloned()
             .collect()
-    } else {
-        worker_package_names_from_specs(&worker_root_package_specs)
     };
     let streaming_worker_batch = range_aware_worker_batch
         && worker_streaming_batch_enabled()

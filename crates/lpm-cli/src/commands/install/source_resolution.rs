@@ -411,16 +411,17 @@ pub(super) async fn pre_resolve_non_registry_deps(
     let mut file_kinds: HashMap<String, FileKindClassification> = HashMap::new();
     for (local_name, raw) in deps.iter() {
         match lpm_resolver::Specifier::parse(raw) {
-            // Defaults-fixes #2: surface UnknownProtocol /
-            // WindowsDriveLetterPath at the manifest preflight rather
-            // than swallowing the error and letting the resolver fail
-            // downstream with a confusing "no version found for tag
-            // 'magic:bar'" message. Other parse errors stay on the
-            // previously swallow path to preserve behavior for malformed
-            // shapes that were previously tolerated upstream.
+            // Surface manifest-boundary parser errors before the
+            // resolver turns them into confusing range or fetch failures.
+            // Other parse errors stay on the previously swallow path to
+            // preserve behavior for malformed shapes that were previously
+            // tolerated upstream.
             Err(
                 err @ (lpm_resolver::SpecifierParseError::UnknownProtocol { .. }
-                | lpm_resolver::SpecifierParseError::WindowsDriveLetterPath(_)),
+                | lpm_resolver::SpecifierParseError::WindowsDriveLetterPath(_)
+                | lpm_resolver::SpecifierParseError::JsrMissingScope
+                | lpm_resolver::SpecifierParseError::InvalidJsrPackageName { .. }
+                | lpm_resolver::SpecifierParseError::JsrMissingPackageName { .. }),
             ) => {
                 return Err(LpmError::Registry(format!(
                     "dep '{local_name}' in package.json has invalid spec '{raw}': {err}"
@@ -1220,6 +1221,14 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
             let Some(raw_str) = raw.as_str() else {
                 continue;
             };
+            let normalized_spec = lpm_resolver::normalize_jsr_dependency(local_name, raw_str)
+                .map_err(|e| {
+                    LpmError::Registry(format!(
+                        "invalid transitive dep spec for `{local_name}` (\"{raw_str}\") declared in {}: {e}",
+                        source_dir.display(),
+                    ))
+                })?;
+            let effective_raw = normalized_spec.as_deref().unwrap_or(raw_str);
             // Invariant invariant: classify_source_dep now
             // returns a typed error for tarball-URL / file:tarball /
             // git transitives. Propagate at the manifest-read
@@ -1227,10 +1236,10 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
             // pointing at the offending source dir + dep key,
             // instead of a deep "invalid semver range" error from
             // inside the resolver.
-            let kind = classify_source_dep(source_dir, raw_str, local_name)?;
+            let kind = classify_source_dep(source_dir, effective_raw, local_name)?;
             out.push(SourceDep {
                 local_name: local_name.clone(),
-                raw_spec: raw_str.to_string(),
+                raw_spec: normalized_spec.unwrap_or_else(|| raw_str.to_string()),
                 kind,
                 target_source: None,
             });
@@ -1873,14 +1882,19 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
             continue;
         };
         let mut deps_out: Vec<(String, String)> = Vec::with_capacity(specs.len());
+        let mut aliases_out: HashMap<String, String> = HashMap::new();
         for spec in specs {
             match spec.kind {
                 DepKind::Registry => {
-                    // Look up by the LOCAL name. For registry deps
-                    // local_name == package_name (no aliasing in v1
-                    // for transitive deps from local sources).
-                    if let Some(version) = name_to_version.get(&spec.local_name) {
+                    let alias = lpm_resolver::ranges::parse_npm_alias(&spec.raw_spec);
+                    let lookup_name = alias
+                        .as_ref()
+                        .map_or(spec.local_name.as_str(), |a| a.target.as_str());
+                    if let Some(version) = name_to_version.get(lookup_name) {
                         deps_out.push((spec.local_name.clone(), version.clone()));
+                        if let Some(alias) = alias {
+                            aliases_out.insert(spec.local_name.clone(), alias.target);
+                        }
                     }
                     // Missing → resolver didn't fulfill this spec
                     // (e.g., optionalDependencies platform-skip).
@@ -1898,5 +1912,6 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
             }
         }
         p.dependencies = deps_out;
+        p.aliases.extend(aliases_out);
     }
 }

@@ -2268,6 +2268,71 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
 }
 
 #[test]
+fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
+    let mut packages = vec![
+        InstallPackage {
+            name: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            source: "directory+./packages/consumer".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec!["consumer".to_string()]),
+            is_direct: true,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+        },
+        InstallPackage {
+            name: "@jsr/std__path".to_string(),
+            version: "1.1.6".to_string(),
+            source: "registry+https://npm.jsr.io".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: true,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+        },
+    ];
+
+    let mut source_deps = HashMap::new();
+    source_deps.insert(
+        "directory+./packages/consumer".to_string(),
+        vec![SourceDep {
+            local_name: "@std/path".to_string(),
+            raw_spec: "npm:@jsr/std__path@^1.1.0".to_string(),
+            kind: DepKind::Registry,
+            target_source: None,
+        }],
+    );
+
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+
+    let consumer = packages.iter().find(|p| p.name == "consumer").unwrap();
+    assert_eq!(
+        consumer.dependencies,
+        vec![("@std/path".to_string(), "1.1.6".to_string())]
+    );
+    assert_eq!(
+        consumer.aliases.get("@std/path").map(String::as_str),
+        Some("@jsr/std__path")
+    );
+}
+
+#[test]
 fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
     let fork_source = "directory+./packages/react-fork".to_string();
     let fork_source_id = lpm_lockfile::Source::Directory {

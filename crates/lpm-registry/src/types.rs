@@ -1286,8 +1286,10 @@ where
             A: de::SeqAccess<'de>,
         {
             let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(s) = seq.next_element::<String>()? {
-                out.push(s);
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                if let Some(s) = value.as_str() {
+                    out.push(s.to_string());
+                }
             }
             Ok(out)
         }
@@ -1463,6 +1465,45 @@ mod tests {
         assert_eq!(
             version.libc.iter().map(String::as_str).collect::<Vec<_>>(),
             ["glibc"]
+        );
+    }
+
+    #[test]
+    fn package_metadata_ignores_null_platform_entries_from_historical_npm_packument() {
+        let json = r#"{
+            "name": "@todoctor/win32-x64",
+            "dist-tags": {
+                "latest": "1.4.2"
+            },
+            "versions": {
+                "1.3.2": {
+                    "name": "@todoctor/win32-x64",
+                    "version": "1.3.2",
+                    "os": [null],
+                    "cpu": ["x64"]
+                },
+                "1.4.2": {
+                    "name": "@todoctor/win32-x64",
+                    "version": "1.4.2",
+                    "os": ["win32"],
+                    "cpu": ["x64"]
+                }
+            }
+        }"#;
+
+        let metadata: PackageMetadata =
+            serde_json::from_str(json).expect("historical null platform entries should parse");
+        let dirty = metadata
+            .version("1.3.2")
+            .expect("metadata should include dirty historical version");
+        let current = metadata
+            .version("1.4.2")
+            .expect("metadata should include current version");
+
+        assert!(dirty.os.is_empty());
+        assert_eq!(
+            current.os.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["win32"]
         );
     }
 

@@ -11,6 +11,7 @@
 //! |-------------------------------------|-----------------------------------------------|
 //! | `""`, `"*"`, `"latest"`, `"^1.2.3"` | [`Specifier::SemverRange`]                    |
 //! | `npm:<target>@<range>`              | [`Specifier::NpmAlias`]                       |
+//! | `jsr:@scope/name[@range]`           | [`Specifier::NpmAlias`] to `@jsr/scope__name` |
 //! | `workspace:<rest>`                  | [`Specifier::Workspace`]                      |
 //! | `git+<url>[#refspec]`               | [`Specifier::Git`]                            |
 //! | `git://<url>[#refspec]`             | [`Specifier::Git`] (URL gets `git+` prefix)   |
@@ -87,6 +88,12 @@ pub enum SpecifierParseError {
     HostShorthandEmptyBody(String),
     #[error("host shorthand is not user/repo shape: {0:?}")]
     HostShorthandInvalidShape(String),
+    #[error("JSR package names must include a scope")]
+    JsrMissingScope,
+    #[error("invalid JSR package name '{pkg_name}'")]
+    InvalidJsrPackageName { pkg_name: String },
+    #[error("JSR specifier '{specifier}' is missing a package name")]
+    JsrMissingPackageName { specifier: String },
     /// Defaults-fixes #2: input has a colon-shaped prefix that doesn't
     /// match any known protocol. Pre-fix these fell through to
     /// SemverRange and produced a confusing downstream node_semver
@@ -95,7 +102,7 @@ pub enum SpecifierParseError {
     /// exists (Levenshtein ≤ 2).
     #[error(
         "unknown package specifier protocol '{prefix}'. \
-         Supported: npm:, workspace:, file:, link:, catalog:, \
+         Supported: npm:, jsr:, workspace:, file:, link:, catalog:, \
          git+http(s)://, git+ssh://, git+file://, git://, github:, \
          gitlab:, bitbucket:, gist:, http(s)://, or bare semver/dist-tag.\
          {}",
@@ -135,6 +142,14 @@ impl Specifier {
         // npm:<target>@<range>
         if let Some(rest) = s.strip_prefix("npm:") {
             return parse_npm_alias_inline(rest);
+        }
+
+        // jsr:@scope/name[@range] -> npm:@jsr/scope__name@range
+        if let Some(spec) = parse_jsr_specifier(s, None)? {
+            return Ok(Specifier::NpmAlias {
+                target: spec.npm_pkg_name,
+                range: jsr_range_or_wildcard(spec.version_selector),
+            });
         }
 
         // workspace:<rest>
@@ -266,10 +281,31 @@ const KNOWN_PROTOCOL_PREFIXES: &[&str] = &[
     "gitlab",
     "http",
     "https",
+    "jsr",
     "link",
     "npm",
     "workspace",
 ];
+
+/// Normalize a manifest dependency's `jsr:` specifier into the npm alias
+/// shape consumed by the resolver.
+///
+/// Version-only JSR specs such as `"@std/path": "jsr:^1.1.0"` need the
+/// dependency key to provide the package name. Non-JSR specs return
+/// `Ok(None)` so callers can cheaply apply this to an entire dependency map.
+pub fn normalize_jsr_dependency(
+    dep_name: &str,
+    raw_spec: &str,
+) -> Result<Option<String>, SpecifierParseError> {
+    let Some(spec) = parse_jsr_specifier(raw_spec.trim(), Some(dep_name))? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "npm:{}@{}",
+        spec.npm_pkg_name,
+        jsr_range_or_wildcard(spec.version_selector)
+    )))
+}
 
 fn detect_unknown_protocol(s: &str) -> Option<SpecifierParseError> {
     let colon = s.find(':')?;
@@ -389,6 +425,129 @@ fn parse_npm_alias_inline(rest: &str) -> Result<Specifier, SpecifierParseError> 
         target: target.to_string(),
         range: range.to_string(),
     })
+}
+
+struct JsrSpec {
+    npm_pkg_name: String,
+    version_selector: Option<String>,
+}
+
+fn parse_jsr_specifier(
+    raw_specifier: &str,
+    alias: Option<&str>,
+) -> Result<Option<JsrSpec>, SpecifierParseError> {
+    let Some(rest) = raw_specifier.strip_prefix("jsr:") else {
+        return Ok(None);
+    };
+
+    if rest.starts_with('@') {
+        let Some(last_at) = rest.rfind('@') else {
+            return Err(SpecifierParseError::JsrMissingPackageName {
+                specifier: rest.to_string(),
+            });
+        };
+        if last_at == 0 {
+            return Ok(Some(JsrSpec {
+                npm_pkg_name: jsr_to_npm_package_name(rest)?,
+                version_selector: None,
+            }));
+        }
+        let jsr_pkg_name = &rest[..last_at];
+        return Ok(Some(JsrSpec {
+            npm_pkg_name: jsr_to_npm_package_name(jsr_pkg_name)?,
+            version_selector: Some(rest[last_at + 1..].to_string()),
+        }));
+    }
+
+    if rest.contains('@') {
+        return Err(SpecifierParseError::JsrMissingScope);
+    }
+
+    let Some(alias) = alias.filter(|alias| !alias.is_empty()) else {
+        return Err(SpecifierParseError::JsrMissingPackageName {
+            specifier: rest.to_string(),
+        });
+    };
+
+    Ok(Some(JsrSpec {
+        npm_pkg_name: jsr_to_npm_package_name(alias)?,
+        version_selector: Some(rest.to_string()),
+    }))
+}
+
+fn jsr_to_npm_package_name(jsr_pkg_name: &str) -> Result<String, SpecifierParseError> {
+    let Some(after_at) = jsr_pkg_name.strip_prefix('@') else {
+        return Err(SpecifierParseError::JsrMissingScope);
+    };
+    if !is_valid_old_npm_package_name(jsr_pkg_name) {
+        return Err(SpecifierParseError::InvalidJsrPackageName {
+            pkg_name: jsr_pkg_name.to_string(),
+        });
+    }
+    let Some((scope, name)) = after_at.split_once('/') else {
+        return Err(SpecifierParseError::InvalidJsrPackageName {
+            pkg_name: jsr_pkg_name.to_string(),
+        });
+    };
+    Ok(format!("@jsr/{scope}__{name}"))
+}
+
+fn jsr_range_or_wildcard(version_selector: Option<String>) -> String {
+    match version_selector {
+        Some(selector) if !selector.is_empty() => selector,
+        _ => "*".to_string(),
+    }
+}
+
+fn is_valid_old_npm_package_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.starts_with('.') || name.starts_with('-') || name.starts_with('_') {
+        return false;
+    }
+    if name.trim() != name {
+        return false;
+    }
+    if matches_ignore_ascii_case(name, "node_modules")
+        || matches_ignore_ascii_case(name, "favicon.ico")
+    {
+        return false;
+    }
+    if is_url_friendly(name) {
+        return true;
+    }
+    if let Some((scope, pkg)) = match_scoped_npm_name(name) {
+        if pkg.starts_with('.') {
+            return false;
+        }
+        return is_url_friendly(scope) && is_url_friendly(pkg);
+    }
+    false
+}
+
+fn matches_ignore_ascii_case(input: &str, target: &str) -> bool {
+    input.len() == target.len()
+        && input
+            .bytes()
+            .zip(target.bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+}
+
+fn is_url_friendly(s: &str) -> bool {
+    s.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')')
+    })
+}
+
+fn match_scoped_npm_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix('@')?;
+    let (scope, pkg) = rest.split_once('/')?;
+    if scope.is_empty() || pkg.is_empty() || pkg.contains('/') {
+        return None;
+    }
+    Some((scope, pkg))
 }
 
 fn parse_host_shorthand(s: &str) -> Result<Option<Specifier>, SpecifierParseError> {
@@ -701,6 +860,96 @@ mod tests {
             parse("workspace:>=1.0.0"),
             Specifier::Workspace(">=1.0.0".into())
         );
+    }
+
+    // ── JSR protocol ────────────────────────────────────────────────────────
+
+    #[test]
+    fn jsr_scope_name_normalizes_to_npm_alias() {
+        assert_eq!(
+            parse("jsr:@std/path"),
+            Specifier::NpmAlias {
+                target: "@jsr/std__path".into(),
+                range: "*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn jsr_scope_name_and_selector_normalizes_to_npm_alias() {
+        assert_eq!(
+            parse("jsr:@std/path@^1.1.0"),
+            Specifier::NpmAlias {
+                target: "@jsr/std__path".into(),
+                range: "^1.1.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn jsr_version_only_specifier_borrows_dependency_name() {
+        assert_eq!(
+            normalize_jsr_dependency("@std/path", "jsr:^1.1.0").unwrap(),
+            Some("npm:@jsr/std__path@^1.1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn jsr_package_without_scope_errors() {
+        assert!(matches!(
+            Specifier::parse("jsr:std/path@^1.0.0"),
+            Err(SpecifierParseError::JsrMissingScope)
+        ));
+    }
+
+    #[test]
+    fn jsr_scope_without_name_errors() {
+        assert!(matches!(
+            Specifier::parse("jsr:@std"),
+            Err(SpecifierParseError::InvalidJsrPackageName { .. })
+        ));
+        assert!(matches!(
+            Specifier::parse("jsr:@std/"),
+            Err(SpecifierParseError::InvalidJsrPackageName { .. })
+        ));
+        assert!(matches!(
+            Specifier::parse("jsr:@std/@^1.0.0"),
+            Err(SpecifierParseError::InvalidJsrPackageName { .. })
+        ));
+    }
+
+    #[test]
+    fn jsr_empty_scope_errors() {
+        assert!(matches!(
+            Specifier::parse("jsr:@/path"),
+            Err(SpecifierParseError::InvalidJsrPackageName { .. })
+        ));
+    }
+
+    #[test]
+    fn jsr_path_separators_in_name_error_before_translation() {
+        for input in [
+            "jsr:@std/../path",
+            "jsr:@std/path/extra",
+            r"jsr:@std/path\extra",
+            r"jsr:@s\td/path",
+        ] {
+            assert!(
+                matches!(
+                    Specifier::parse(input),
+                    Err(SpecifierParseError::InvalidJsrPackageName { .. })
+                ),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn jsr_version_only_specifier_without_alias_errors() {
+        assert!(matches!(
+            Specifier::parse("jsr:^1.1.0"),
+            Err(SpecifierParseError::JsrMissingPackageName { .. })
+        ));
     }
 
     // ── Git (git+ form) ──────────────────────────────────────────────────────
