@@ -48,14 +48,25 @@ fn spawn_publish(cwd: &std::path::Path, registry: &str, args: &[&str]) -> Output
     let mut argv: Vec<&str> = vec!["publish"];
     argv.extend_from_slice(args);
     argv.extend(["--registry", registry]);
+    let home = cwd.join(".home");
+    let lpm_home = home.join(".lpm");
 
     Command::new(exe)
         .args(&argv)
         .current_dir(cwd)
-        .env("HOME", cwd.join(".home"))
+        .env("HOME", &home)
+        .env("LPM_HOME", &lpm_home)
         .env("NO_COLOR", "1")
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env("LPM_DISABLE_TELEMETRY", "1")
+        .env("LPM_FORCE_FILE_AUTH", "1")
+        .env("LPM_TEST_FAST_SCRYPT", "1")
+        .env("LPM_FORCE_FILE_VAULT", "1")
+        .env("LPM_DISABLE_HOST_CLI_AUTH", "1")
+        .env(
+            "LPM_SECURITY_POLICY_PATH",
+            lpm_home.join("security-policy.toml"),
+        )
         .env("LPM_OIDC_TOKEN", SUPPLIED_JWT)
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")

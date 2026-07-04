@@ -1463,6 +1463,7 @@ async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
 
 #[tokio::test]
 async fn e2e_yes_refuses_when_any_entry_is_amber_and_manifest_stays_unchanged() {
+    let _security_backend = ensure_security_test_backend();
     // End-to-end confirmation that the refusal gate wires through
     // to the `run()` entry point the CLI dispatches to. Amber
     // package (playwright install — a D18 downloader) MUST NOT

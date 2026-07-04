@@ -1653,6 +1653,10 @@ fn deploy_detail_colored(label: &str, value: String) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsString;
+
+    const TEST_SECURITY_SECRET: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn resolve_deploy_target(
         cwd: &Path,
@@ -1673,6 +1677,29 @@ mod tests {
         dry_run: bool,
         json_output: bool,
     ) -> Result<(), LpmError> {
+        let security_root = tempfile::tempdir().unwrap();
+        let lpm_home = security_root.path().join("lpm-home");
+        let security_dir = security_root.path().join("security");
+        let policy_path = security_root.path().join("security-policy.toml");
+        let _security_env = crate::test_env::ScopedEnv::update([
+            ("LPM_HOME", Some(lpm_home.as_os_str().to_owned())),
+            (
+                "LPM_SECURITY_DIR",
+                Some(security_dir.as_os_str().to_owned()),
+            ),
+            (
+                "LPM_SECURITY_POLICY_PATH",
+                Some(policy_path.as_os_str().to_owned()),
+            ),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                Some(OsString::from(TEST_SECURITY_SECRET)),
+            ),
+            (
+                "LPM_TEST_SECURITY_AUTH_RESULT",
+                Some(OsString::from("deny")),
+            ),
+        ]);
         super::run(
             client,
             cwd,
@@ -2086,10 +2113,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_full_pipeline_with_empty_deps_member_succeeds_human_mode() {
-        let _approval_env = crate::test_env::ScopedEnv::update([(
-            "LPM_TEST_SECURITY_AUTH_RESULT",
-            Option::<std::ffi::OsString>::None,
-        )]);
         // Member has no dependencies → install pipeline short-circuits.
         // Deploy should produce a successful end-to-end run.
         let tmp = tempfile::tempdir().unwrap();
