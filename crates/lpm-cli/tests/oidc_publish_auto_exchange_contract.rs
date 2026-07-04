@@ -1,6 +1,5 @@
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
-//! Discipline`). Justification class: **intentionally minimal
-//! binary-surface repros**. These are contract pins for the exact
+//! **Tier placement: cli-binary.** Justification class: **intentionally
+//! minimal binary-surface repros**. These are contract pins for the exact
 //! request shape the binary emits to lpm.dev's OIDC exchange route.
 //! The assertions inspect specific JSON fields on the wiremock-recorded
 //! request body (`scope`, `package`, `targets_lpm` gating). The
@@ -12,7 +11,7 @@
 //! Regression tests for the `lpm publish` OIDC auto-exchange contract:
 //!
 //! 1. **`package` field**: the origin's OIDC exchange route requires `package`
-//!    for `scope=publish` (a-package-manager `app/api/registry/-/token/oidc/route.js`).
+//!    for `scope=publish`.
 //!    An earlier revision called `exchange_oidc_token(..., None, "publish")`,
 //!    so every CI publish silently 400'd and fell back to stored auth —
 //!    defeating OIDC for publish-only CI runners.

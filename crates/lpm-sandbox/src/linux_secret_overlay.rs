@@ -235,8 +235,8 @@ fn walk_for_extensions(root: &Path, out: &mut Vec<PathBuf>, allow_set: &HashSet<
 ///
 /// Linux-only: the only consumer is `linux::LandlockSandbox::spawn`
 /// which is itself `#[cfg(target_os = "linux")]`. Gating the struct
-/// matches CLAUDE.md's cross-platform hygiene rule (no dead-code
-/// surfaces on macOS / Windows CI).
+/// keeps non-Linux production builds from compiling dead platform
+/// surfaces.
 #[cfg(target_os = "linux")]
 pub(crate) struct SecretOverlaySpec {
     /// CString-wrapped absolute paths the child will `mount(2)`

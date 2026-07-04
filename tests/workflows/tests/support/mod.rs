@@ -37,9 +37,6 @@
 //! envelope test (with redactions for temp paths, mock URLs, timestamps).
 //! Where the contract is more than shape (stable doctor codes, error
 //! code strings), keep semantic field assertions alongside the snapshot.
-//!
-//! Full rules: see `# Testing Tier Discipline` in the rust-client
-//! `CLAUDE.md` at the workspace root.
 
 pub mod assertions;
 pub mod auth_state;

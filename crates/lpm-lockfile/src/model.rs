@@ -515,8 +515,7 @@ impl Lockfile {
     /// on-disk field reflects which engine ran.
     ///
     /// `resolver` is purely informational. Reading it has never been
-    /// part of the lockfile contract — see CLAUDE.md "DON'T add code
-    /// that branches on `resolved_with`".
+    /// part of the lockfile contract; consumers must not branch on it.
     pub fn new_with_resolver(resolver: &str) -> Self {
         Lockfile {
             metadata: LockfileMetadata {

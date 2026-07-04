@@ -33,10 +33,7 @@
 //! `NetIsolationSetAppContainerConfig` + `privateNetworkClientServer`,
 //! both admin-only, and a non-loopback target is not hermetic on
 //! CI. The cross-platform workflow test handles that contract on
-//! macOS + Linux, and the manual smoke test at
-//! The manual smoke test at
-//! [`private/46.3-pr2-network-denial.md`](../../../../private/46.3-pr2-network-denial.md)
-//! verifies it on Windows hosts with outbound connectivity.
+//! macOS + Linux.
 
 #![cfg(target_os = "windows")]
 

@@ -130,8 +130,7 @@ mod windows_appcontainer;
 // on `target_os = "linux"` for production builds (where `linux.rs`
 // consumes it) and on `test` for any test build (so the rules unit
 // tests run on the macOS developer host). Non-Linux production
-// builds don't compile this module at all, which matches CLAUDE.md's
-// cross-platform hygiene rule.
+// builds don't compile this module at all.
 //
 // excluded from Windows test builds. The
 // rule fixtures use hard-coded POSIX paths (`/home/u/...`, `/tmp`,
@@ -663,10 +662,10 @@ pub trait Sandbox: Send + Sync {
 /// Returns a sandbox for the current platform + mode with the
 /// default [`SandboxOptions`] (`allow_degraded = false`).
 ///
-/// Dispatch is `cfg`-gated per CLAUDE.md hygiene rule: each platform
-/// arm pulls only its own backend module, and non-supported platforms
-/// return [`SandboxError::UnsupportedPlatform`] directly without
-/// compiling platform-specific code they don't have.
+/// Dispatch is `cfg`-gated: each platform arm pulls only its own backend
+/// module, and non-supported platforms return
+/// [`SandboxError::UnsupportedPlatform`] directly without compiling
+/// platform-specific code they don't have.
 ///
 /// [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]
 /// regardless of platform — the `--no-sandbox` escape hatch must

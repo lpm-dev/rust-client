@@ -132,17 +132,15 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
     //   side-effect is that an approved script can rewrite its own
     //   `package.json` between installs to launder the next
     //   `script_hash` — but the trusted-bindings layer detects that
-    //   as `BindingDrift` and re-prompts. Documented at L30 in
-    //   `private/security-findings.md`.
+    //   as `BindingDrift` and re-prompts.
     //
     // - **`~/.cache`, `~/.node-gyp`, `~/.npm`** are RW because
     //   npm-driven tooling chains (node-gyp prebuilt-headers,
     //   puppeteer/playwright Chromium downloads, npm-shaped install
     //   caches) depend on them. The side-effect is that an
     //   approved script can poison user-wide cache state for
-    //   future installs of the same package via other tools. Per
-    //   M64 this is documented and accepted; tightening would
-    //   require either a per-tool allowlist or migrating those
+    //   future installs of the same package via other tools. Tightening
+    //   would require either a per-tool allowlist or migrating those
     //   tools to LPM-controlled cache directories.
     rules.push((spec.package_dir.clone(), RuleAccess::ReadWrite));
     rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));

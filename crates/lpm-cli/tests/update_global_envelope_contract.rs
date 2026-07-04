@@ -1,10 +1,9 @@
 //! Cli-binary survivor — `lpm --json global update` rich-envelope
 //! contract.
 //!
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
-//! Discipline`). This test touches `~/.lpm/global/manifest.toml` and
-//! pins binary-level stdout shape, so the workflow tier's
-//! per-project `TempProject` model can't isolate cleanly.
+//! **Tier placement: cli-binary.** This test touches
+//! `~/.lpm/global/manifest.toml` and pins binary-level stdout shape, so the
+//! workflow tier's per-project `TempProject` model can't isolate cleanly.
 //!
 //! ## Contract under test
 //!

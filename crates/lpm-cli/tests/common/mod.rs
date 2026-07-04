@@ -12,12 +12,11 @@
 //!   [`MockPackage`] / [`MockPackageVersion`] and the lower-level
 //!   [`make_mock_tarball`], [`sri_for`], [`tarball_route`] builders).
 //!
-//! Per `rust-client/CLAUDE.md` `# Testing Tier Discipline`, every
-//! cli-binary file must use these helpers — never reinvent
-//! `CommandOutput`, `run_lpm`, or a mock-registry mounter from
-//! scratch. Drift between hand-rolled subprocess helpers is what
-//! produced the phase-named regression-dump files cleaned
-//! up; the canonical-helper rule is what stops it from coming back.
+//! Every cli-binary file must use these helpers — never reinvent
+//! `CommandOutput`, `run_lpm`, or a mock-registry mounter from scratch. Drift
+//! between hand-rolled subprocess helpers is what produced the phase-named
+//! regression-dump files cleaned up; the canonical-helper rule is what stops
+//! it from coming back.
 //!
 //! New cli-binary files should:
 //!

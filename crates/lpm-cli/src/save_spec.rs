@@ -30,9 +30,6 @@
 //!    under a forgotten `save-prefix` config setting.
 //! 4. **Config.** `save-exact = true`, then `save-prefix = "^|~|"`.
 //! 5. **Default.** `^resolvedVersion`.
-//!
-//! See `DOCS/new-features/37-rust-client-RUNNER-VISION-phase33.md` for the
-//! full policy table and rationale.
 
 use lpm_common::LpmError;
 use lpm_resolver::{Specifier, SpecifierParseError};

@@ -96,10 +96,8 @@
 //! The current backend prefers persistent Low IL labels because the
 //! AppContainer flow has its own footguns (LowBox token attribute
 //! quirks, package-family-name collisions across concurrent installs)
-//! and is not yet the default. The cross-IL poisoning class is
-//! tracked as accepted posture under M55 in
-//! `private/security-findings.md`; the long-term mitigation handle is
-//! the AppContainer backend migration.
+//! and is not yet the default. The AppContainer backend migration is
+//! the long-term mitigation for the cross-IL poisoning class.
 
 #![cfg(target_os = "windows")]
 
