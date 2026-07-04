@@ -155,8 +155,8 @@ fn read_save_keys_from_file(path: &Path) -> Result<RawSaveKeys, LpmError> {
 /// Coerce a TOML value into a `bool` using the same string-alias rules
 /// that [`crate::commands::config::GlobalConfig::get_bool`] uses.
 ///
-/// **Audit Finding A:** the generic `lpm config set <key> <value>`
-/// command (in `commands/config.rs`) writes every value as
+/// The generic `lpm config set <key> <value>` command (in
+/// `commands/config.rs`) writes every value as
 /// `toml::Value::String`, regardless of the key's intended type. So
 /// `lpm config set save-exact true` literally produces
 /// `save-exact = "true"` on disk. The loader MUST accept that
@@ -298,8 +298,8 @@ mod tests {
         assert_eq!(result.save_exact, Some(false));
     }
 
-    /// **Audit Finding A regression.** `lpm config set save-exact true`
-    /// writes `save-exact = "true"` (a TOML string, not a boolean) because
+    /// `lpm config set save-exact true` writes `save-exact = "true"`
+    /// (a TOML string, not a boolean) because
     /// the generic `lpm config set` command serializes every value as a
     /// string. The loader MUST accept this form so the documented
     /// persistent-config path actually works.

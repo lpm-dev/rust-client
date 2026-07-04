@@ -341,10 +341,8 @@ async fn assert_network_denied(
 
     // ── Assertion 0.5: strict-mode banner fires under env-set strict. ──
     //
-    // GPT-5 audit (2026-05-11) caught that the strict banner only
-    // fired for `--strict-sandbox` / `--paranoid` on the CLI —
-    // config-set and env-set strict users got the kernel-level
-    // network denial silently. This test runs with
+    // The strict banner must fire for config-set and env-set strict mode, not
+    // only for `--strict-sandbox` / `--paranoid` on the CLI. This test runs with
     // `LPM_STRICT_SANDBOX=1` (env tier), so the banner MUST appear
     // in stderr. Pre-fix it didn't; post-fix it must.
     //
@@ -356,8 +354,7 @@ async fn assert_network_denied(
     assert!(
         stderr.contains("strict-sandbox: outbound network"),
         "[{case_label}] strict-mode banner must appear in stderr under env-set \
-         `LPM_STRICT_SANDBOX=1`. GPT-5 audit follow-up: the banner used to gate \
-         only on the CLI flag; if this assertion fires, that regression is back. \
+         `LPM_STRICT_SANDBOX=1`; if this assertion fires, that regression is back. \
          stderr:\n{stderr}",
     );
 

@@ -1,6 +1,6 @@
 //! Shared fixture helpers for `.lpm/build-state.json` seeding.
 //!
-//! ## Why this exists (finding D from the #72/#73/#76 review)
+//! ## Why this exists
 //!
 //! Three historical fixture writers in this tree hand-wrote a
 //! synthetic `"script_hash": "sha256-fixture-script-hash"` into
@@ -13,8 +13,8 @@
 //! Those tests are currently safe because none of them invoke
 //! `lpm rebuild` afterward — `compute_script_hash` is only consulted
 //! by the rebuild trust gate, and approve-scripts itself propagates
-//! whatever string the fixture wrote. But the finding #75 retraction
-//! exposed the latent footgun: the moment any test combines
+//! whatever string the fixture wrote. But there is a latent footgun:
+//! the moment any test combines
 //! "synthetic build-state.json" with "live rebuild step," rebuild
 //! recomputes the real hash from disk, observes the mismatch, and
 //! filters the package out as `TrustMatch::BindingDrift`. The
@@ -25,7 +25,7 @@
 //! computes the **real** `script_hash` via
 //! `lpm_security::script_hash::compute_script_hash`. New tests that
 //! add a rebuild step now inherit correct hash semantics for free,
-//! and finding #75's misdiagnosis pattern cannot repeat.
+//! so the misdiagnosis pattern cannot repeat.
 //!
 //! ## What the helpers do
 //!

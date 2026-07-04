@@ -591,8 +591,7 @@ mod tests {
 
     #[test]
     fn from_package_json_invalid_script_policy_surfaces_parse_error() {
-        // v2.3 post-audit behavior change: a team-shared
-        // `package.json` with a typo in `scriptPolicy` must NOT
+        // A team-shared `package.json` with a typo in `scriptPolicy` must NOT
         // silently fall through to per-developer global config.
         // `policy` stays `None` (precedence falls through), but
         // `policy_parse_error` carries the offending input so

@@ -858,9 +858,8 @@ fn all_scripted_packages_trusted_ignores_already_built_untrusted_packages() {
 
 // ───: drifted-rich-binding regressions ─────────────
 //
-// These two tests pin the audit-prescribed behavior: a rich entry
-// whose stored `scriptHash` no longer matches what's on disk must
-// NOT be treated as trusted by either the install hint (of
+// A rich entry whose stored `scriptHash` no longer matches what's on
+// disk must NOT be treated as trusted by either the install hint (of
 // the plan) or the auto-build predicate. Pre-migration,
 // both used the lenient `policy.can_run_scripts(name)` gate and
 // returned true for drifted entries, while `rebuild::run` itself
@@ -891,8 +890,8 @@ fn write_drifted_rich_project(dir: &Path, name: &str, version: &str) {
 
 #[test]
 fn show_install_hint_drifted_rich_binding_is_not_trusted() {
-    // Audit prescription (test A): drifted rich binding must NOT
-    // show as `trusted ✓` in the install hint. We assert on the
+    // Drifted rich binding must NOT show as `trusted ✓` in the install hint.
+    // We assert on the
     // pure `scriptable_package_rows` helper that
     // `show_install_build_hint` wraps — `is_trusted` is the
     // observable under test.
@@ -936,8 +935,8 @@ fn show_install_hint_drifted_rich_binding_is_not_trusted() {
 
 #[test]
 fn all_scripted_packages_trusted_false_on_drifted_rich_binding() {
-    // Audit prescription (test B): drifted rich binding must NOT
-    // satisfy the auto-build "all trusted" predicate. Otherwise
+    // Drifted rich binding must NOT satisfy the auto-build "all trusted"
+    // predicate. Otherwise
     // install would auto-trigger `rebuild::run` for a package
     // `rebuild::run` then immediately skips.
     let dir = tempfile::tempdir().unwrap();
@@ -1024,8 +1023,8 @@ fn scriptable_rows_strict_match_is_trusted() {
     );
 }
 
-/// **Reviewer finding:** when the script-hash trust layer would grant
-/// trust but the capability gate rejects, the install hint
+/// When the script-hash trust layer would grant trust but the
+/// capability gate rejects, the install hint
 /// must report `is_trusted = false`. Otherwise the hint lies
 /// to the user about what `lpm rebuild` will actually do and
 /// contradicts the adjacent approve-scripts guidance.

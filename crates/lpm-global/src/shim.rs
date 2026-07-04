@@ -135,10 +135,8 @@ pub fn validate_command_name(name: &str) -> Result<(), ShimError> {
             reason: "command name contains NUL byte",
         });
     }
-    // Note on leading `-`: pre-fix this rejected `--help`-style names.
-    // The audit (Answer #3) flagged it as UX policy rather than a real
-    // safety boundary — accepting them now to match what npm/pnpm/bun
-    // accept. Real bin entries with leading dashes are rare but exist.
+    // Note on leading `-`: this is UX policy rather than a real safety
+    // boundary. Real bin entries with leading dashes are rare but exist.
     Ok(())
 }
 
@@ -221,7 +219,7 @@ pub fn emit_shim(bin_dir: &Path, shim: &Shim) -> Result<EmittedShim, ShimError> 
 /// scanners, Explorer preview), mirroring [`emit_shim`]'s atomic
 /// swap. Without retry, uninstall would commit even when a shim
 /// briefly couldn't be unlinked, leaving a stale command on PATH
-/// (audit Medium from the audit).
+/// after the manifest row is gone.
 pub fn remove_shim(bin_dir: &Path, command_name: &str) -> Result<Vec<PathBuf>, ShimError> {
     validate_command_name(command_name)?;
     let mut removed = Vec::new();
@@ -497,9 +495,7 @@ mod tests {
 
     #[test]
     fn validate_command_name_accepts_leading_dash() {
-        // Before the audit this was rejected as UX policy. Now matches
-        // npm/pnpm/bun behavior: leading dashes are uncommon but valid
-        // bin names. Audit Answer #3.
+        // Leading dashes are uncommon but valid bin names.
         assert!(validate_command_name("-rf").is_ok());
         assert!(validate_command_name("--help").is_ok());
     }

@@ -1568,7 +1568,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios: 2,
         failure_modes_tested: &[
             "non-TTY without --yes / --list / <pkg> fails with helpful alternatives",
-            "--json in non-TTY emits failure envelope on stdout (finding #73)",
+            "--json in non-TTY emits failure envelope on stdout",
         ],
         failure_modes_known: &[
             "PTY-driven interactive walk (q to quit, v to view, a to approve)",
@@ -1673,7 +1673,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         failure_modes_known: &[
             "dry-run with missing approval file",
-            "dry-run exit-code semantics vs live (finding #73)",
+            "dry-run exit-code semantics vs live",
             "dry-run that would have promoted nothing (output shape)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
@@ -1802,7 +1802,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "unknown action fails with helpful message",
         ],
         failure_modes_known: &[
-            "skills validate never exits non-zero (finding #72)",
+            "skills validate never exits non-zero",
             "malformed skill manifest (parse error path)",
             "concurrent skills clean + install",
         ],
@@ -2884,7 +2884,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // into `~/.zshrc`. Error paths (invalid shell value) are clap-level
     // and rejected before main() runs; clap's `value_enum` rejection
     // can't be intercepted by the LpmError → envelope handler without
-    // a much larger refactor. Not a gap. See finding #76 for the broader
+    // a much larger refactor. Not a gap; this is part of the broader
     // clap-vs-envelope routing story.
     SurfaceV2 {
         id: 133,

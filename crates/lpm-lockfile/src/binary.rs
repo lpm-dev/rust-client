@@ -41,7 +41,7 @@
 //! On rejection, install writeback rewrites `lpm.lockb` as the
 //! current version. `Lockfile::read_fast` reads the TOML lockfile
 //! directly so an opaque committed binary cache cannot override the
-//! reviewer-visible source.
+//! human-readable source.
 //!
 //! ## Null vs empty strings for optional fields
 //!
@@ -101,7 +101,7 @@ fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
 /// has no section for TOML-only metadata such as patch, alias, peer,
 /// platform, catalog, or registry-signature state. Writing those
 /// lockfiles as binary would silently drop data and make the generated
-/// companion disagree with the reviewer-visible TOML lockfile. The
+/// companion disagree with the human-readable TOML lockfile. The
 /// install writer MUST check this before calling `to_binary` and skip
 /// the binary write when unsupported metadata is present.
 ///

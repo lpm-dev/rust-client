@@ -585,9 +585,9 @@ fn lint_all_happy_path_e2e_network_gated() {
     assert_eq!(json["succeeded"], serde_json::json!(3));
     assert_eq!(json["failed"], serde_json::json!(0));
 
-    // Reviewer add: prove all three members actually ran by asserting the
-    // member array contains entries for each. The fixture is utils → core
-    // → app; topology order is preserved by the orchestrator.
+    // Prove all three members actually ran by asserting the member array
+    // contains entries for each. The fixture is utils → core → app; topology
+    // order is preserved by the orchestrator.
     let members = json["members"]
         .as_array()
         .expect("members must be an array");
@@ -1208,8 +1208,8 @@ fn bench_no_runner_under_json_emits_error_envelope_on_stdout() {
 
 // ─── one-member watch IS allowed (hands off to single-package) ──
 //
-// The reviewer caught that the previous blanket reject contradicted the
-// documented `lpm test --filter <name> --watch` workaround. The dispatcher
+// The previous blanket reject contradicted the documented
+// `lpm test --filter <name> --watch` workaround. The dispatcher
 // now resolves selection upfront: when --watch is requested AND the filter
 // resolves to exactly one member, hand off to the single-package path
 // against that member's directory.
@@ -1429,9 +1429,9 @@ fn bench_workspace_json_emits_valid_envelope_per_member() {
 
 // ─── compat-seam end-to-end ────────────────────────────
 //
-// The reviewer's load-bearing test: prove that `lpm test -- --all` still
-// forwards `--all` to the underlying runner after it claims `--all`
-// as an LPM workspace flag. We use a `scripts.test` fallback that simply
+// Prove that `lpm test -- --all` still forwards `--all` to the underlying
+// runner after it claims `--all` as an LPM workspace flag. We use a
+// `scripts.test` fallback that simply
 // echoes a literal sentinel (no shell-positional `$@` — the runner path
 // builds a single command string with args appended, not passed as `$@`).
 

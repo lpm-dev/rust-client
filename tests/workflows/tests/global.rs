@@ -567,11 +567,10 @@ fn global_path_for_unknown_package_under_json_emits_error_envelope_on_stdout() {
         .output()
         .expect("failed to run lpm global path <unknown> --json");
 
-    // Whether the process exits zero or non-zero is a separate
-    // contract (finding #73 in private/findings.md flags that
-    // `--json` paths uniformly exit 0). The load-bearing claim here
-    // is that the failure surfaces on stdout as a parsable envelope
-    // with `success: false`, not as a free-form stderr message.
+    // Whether the process exits zero or non-zero is a separate contract.
+    // The load-bearing claim here is that the failure surfaces on stdout as a
+    // parsable envelope with `success: false`, not as a free-form stderr
+    // message.
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("--json error path must emit JSON: {e}\n---\n{stdout}"));
@@ -859,7 +858,7 @@ fn global_remove_unknown_package_fails_with_helpful_message() {
 #[test]
 fn uninstall_g_unknown_package_matches_global_remove_error_path() {
     // `lpm uninstall -g <pkg>` and `lpm global remove <pkg>` route
-    // through the same M3.3 implementation. Pin parity so a future
+    // through the same implementation. Pin parity so a future
     // divergence between the two aliases fails this test.
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
 

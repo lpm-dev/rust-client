@@ -1846,8 +1846,7 @@ async fn halve_on_429_ratchets_even_under_full_saturation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn halve_on_429_multi_concurrent_races_respect_floor() {
-    // Reviewer regression for the multi-429 ratchet race: when N
-    // concurrent tasks all observe 429 before any of them decrements
+    // Multi-429 ratchet race: when N concurrent tasks all observe 429 before any of them decrements
     // the ceiling, the old logic had each task independently compute
     // `want_forget` against the stale `current=8`, each enqueue 4
     // into debt, and the 8 subsequent completions drive effective

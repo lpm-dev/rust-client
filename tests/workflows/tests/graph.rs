@@ -856,8 +856,8 @@ fn graph_why_json_output_returns_empty_applied_patches_when_no_state_file() {
     assert!(arr.is_empty(), "applied_patches should be empty");
 }
 
-/// Audit fix (2026-04-12, Low): patch provenance must include the
-/// recorded `originalIntegrity` in both human and JSON output. Pre-fix,
+/// Patch provenance must include the recorded `originalIntegrity` in both
+/// human and JSON output. Pre-fix,
 /// human emitted the literal "originalIntegrity recorded" placeholder
 /// and JSON omitted the field.
 #[test]

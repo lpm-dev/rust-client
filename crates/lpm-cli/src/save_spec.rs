@@ -260,10 +260,10 @@ fn split_name_and_version_token(spec: &str) -> (String, Option<&str>) {
 /// [`SpecifierParseError::UnknownProtocol`] or
 /// [`SpecifierParseError::WindowsDriveLetterPath`], propagate the error
 /// instead of silently falling through. Pre-fix the bug at the manifest
-/// layer (item #2 v1) only covered `package.json`-side specifiers;
+/// layer only covered `package.json`-side specifiers;
 /// argv-side tokens (`lpm install foo@magic:bar`) silently became
 /// `DistTag("magic:bar")` and the resolver installed `latest` with a
-/// placeholder. GPT-audit follow-up plugs that gap.
+/// placeholder. The argv-side guard plugs that gap.
 fn classify_version_token(token: &str) -> Result<UserSaveIntent, LpmError> {
     // Empty token after `@` (e.g. `zod@`) — treat as bare. This is a
     // degenerate user input but a valid one to recover from.
@@ -291,9 +291,9 @@ fn classify_version_token(token: &str) -> Result<UserSaveIntent, LpmError> {
     // The error message stays surface-neutral: `parse_user_save_intent`
     // is shared by `lpm install`, `lpm add`, `lpm global install`, and
     // `lpm global update`, and the offending token is already in the
-    // message — the user knows which command they ran. Earlier commits
-    // hardcoded "on the install command line" here, which read wrong
-    // under `lpm global update foo@magic:bar` (GPT-audit follow-up).
+    // message — the user knows which command they ran. Hardcoding
+    // "on the install command line" here reads wrong under
+    // `lpm global update foo@magic:bar`.
     if let Err(
         err @ (SpecifierParseError::UnknownProtocol { .. }
         | SpecifierParseError::WindowsDriveLetterPath(_)),
@@ -417,7 +417,7 @@ pub fn decide_saved_dependency_spec(
 #[cfg(test)]
 mod tests {
     /// Test helper: unwrap the `Result` for the happy paths that pre-date
-    /// the GPT-audit error variant. Keeps the existing test bodies tight
+    /// the unknown-protocol error variant. Keeps the existing test bodies tight
     /// and routes new error-path tests through the raw `parse_user_save_intent`.
     fn parse_user_save_intent_unwrap(spec: &str) -> (String, super::UserSaveIntent) {
         super::parse_user_save_intent(spec).expect("test fixture: spec must parse")
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(intent, UserSaveIntent::Workspace("workspace:1.2.3".into()));
     }
 
-    // ─── GPT-audit follow-up: unknown protocol on the CLI argv token ────
+    // ─── Unknown protocol on the CLI argv token ────────────────────────
     //
     // Pre-fix `parse_user_save_intent("foo@magic:bar")` returned
     // `DistTag("magic:bar")` and the resolver fell back to `latest`,

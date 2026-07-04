@@ -1090,8 +1090,7 @@ mod tests {
 
     #[test]
     fn legacy_binding_approves_baseline_request() {
-        // Reviewer acceptance #2: legacy approval approves the
-        // baseline (no extras) request.
+        // Legacy approval approves the baseline (no extras) request.
         let baseline = CapabilitySet::default();
         assert!(baseline.is_at_baseline());
         assert!(baseline.is_approved_by(&legacy_binding()));
@@ -1099,8 +1098,8 @@ mod tests {
 
     #[test]
     fn legacy_binding_rejects_widened_pass_env() {
-        // Reviewer acceptance #3a: a legacy approval must NOT
-        // satisfy a request with non-empty passEnv. Widening the
+        // A legacy approval must NOT satisfy a request with non-empty passEnv.
+        // Widening the
         // env-var passthrough requires a user review the legacy
         // approval never performed.
         let widened = set_from(&["SSH_AUTH_SOCK"], ReadProjectMode::Narrow, &[]);
@@ -1109,16 +1108,14 @@ mod tests {
 
     #[test]
     fn legacy_binding_rejects_full_read_project() {
-        // Reviewer acceptance #3b: readProject = Full is a
-        // loosening, not covered by a legacy approval.
+        // readProject = Full is a loosening, not covered by a legacy approval.
         let widened = set_from(&[], ReadProjectMode::Full, &[]);
         assert!(!widened.is_approved_by(&legacy_binding()));
     }
 
     #[test]
     fn legacy_binding_rejects_non_empty_sandbox_limits() {
-        // Reviewer acceptance #3c: any sandboxLimits entry
-        // (regardless of value) is a loosening request not
+        // Any sandboxLimits entry (regardless of value) is a loosening request not
         // covered by a legacy approval. Enforcement-time logic
         // further distinguishes at-or-below-ceiling from above-ceiling;
         // at the storage-level match, ANY non-baseline capability
@@ -1133,8 +1130,8 @@ mod tests {
 
     #[test]
     fn binding_with_matching_hash_approves_set() {
-        // Reviewer acceptance #4: new-record approval with the
-        // exact granted hash authorizes the matching request.
+        // New-record approval with the exact granted hash authorizes the
+        // matching request.
         let requested = set_from(
             &["NODE_AUTH_TOKEN"],
             ReadProjectMode::Full,
@@ -1146,8 +1143,7 @@ mod tests {
 
     #[test]
     fn binding_with_mismatched_hash_rejects_non_baseline() {
-        // Reviewer acceptance #5: new-record approval whose stored
-        // hash DOESN'T match the current request is distinguishable
+        // New-record approval whose stored hash DOESN'T match the current request is distinguishable
         // from a legacy-None approval. Both reject the request,
         // but the diagnostic reason differs (the former is "drift,"
         // the latter is "legacy approval doesn't cover extras").

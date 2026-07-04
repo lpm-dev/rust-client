@@ -158,8 +158,8 @@ fn prune_human_output_uses_slim_status_lines() {
 
 #[test]
 fn prune_apply_with_no_registry_degrades_to_tombstone_only() {
-    // The Medium-severity audit fix: `--apply` with no registry and no
-    // `--project` must NOT abort. It must succeed, skip orphan removal
+    // `--apply` with no registry and no `--project` must NOT abort.
+    // It must succeed, skip orphan removal
     // (we have no roots — every link entry would look unreachable),
     // and still run the tombstone sweep so `lpm uninstall -g`'s
     // deferred cleanup retry remains reachable without a populated

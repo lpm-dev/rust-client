@@ -747,8 +747,8 @@ mod tests {
 
     #[test]
     fn needs_layout_migration_true_when_new_root_has_only_version_file() {
-        // Audit fix: `cleanup_stale_entries` writes `.version` to the
-        // new wrapper root BEFORE any wrapper is materialized. A
+        // `cleanup_stale_entries` writes `.version` to the new wrapper root
+        // BEFORE any wrapper is materialized. A
         // `.version`-only directory is NOT evidence of a populated
         // layout — a half-completed install (interrupted between
         // `.version` write and first wrapper materialization) must

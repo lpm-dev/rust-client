@@ -3207,8 +3207,8 @@ async fn install_json_output_contains_package_list() {
     // routes through `batch_metadata` and the provider's wait-loop
     // may observe transient timeouts before falling through to the
     // escape-hatch fetch. The shape-present + produced-≥1 checks
-    // above cover the reviewer's  CLI-surface gap
-    // without being sensitive to orchestration timing.
+    // above cover the CLI-surface gap without being sensitive to orchestration
+    // timing.
 }
 
 // ─── Lockfile Fast Path (Up-to-date) ────────────────────────────
@@ -4726,8 +4726,8 @@ async fn install_existing_dep_bare_reinstall_no_churn() {
     );
 }
 
-/// **Audit Finding B regression (Medium).** When the user runs `lpm
-/// install ms --filter app` from inside `packages/app/` of a workspace,
+/// When the user runs `lpm install ms --filter app` from inside
+/// `packages/app/` of a workspace,
 /// the project-tier `lpm.toml` MUST be read from the WORKSPACE ROOT, not
 /// from `cwd` (which is `packages/app/`). Save policy is a workspace-wide
 /// preference; per-member overrides would create incoherent multi-member
@@ -5227,13 +5227,12 @@ fn install_contradictory_save_flags_fail() {
     );
 }
 
-// **audit Finding 1 regression coverage lives in unit tests.**
+// **Direct-version regression coverage lives in unit tests.**
 //
-// The audit flagged a defensive-correctness issue in
-// `collect_resolved_versions_from_lockfile`: a flat name-scan over
-// `lockfile.packages` would pick the wrong version if the lockfile ever
-// contained two entries for the same package name (one direct, one
-// transitive at a different version).
+// `collect_resolved_versions_from_lockfile` had a defensive-correctness issue:
+// a flat name-scan over `lockfile.packages` would pick the wrong version if
+// the lockfile ever contained two entries for the same package name (one direct,
+// one transitive at a different version).
 //
 // We attempted a workflow test that staged `legacy-pkg → ms@~1.5.0` as a
 // transitive and then ran `lpm install ms` to add a new direct edge — but
@@ -5242,16 +5241,16 @@ fn install_contradictory_save_flags_fail() {
 // intersects `*` with the existing transitive `~1.5.0`, and resolves to a
 // SINGLE version. The lockfile never grows a duplicate via this path.
 //
-// The Finding 1 fix is therefore a defensive correctness change with no
-// reachable workflow-level reproduction in the current resolver. The
+// The fix is therefore a defensive correctness change with no reachable
+// workflow-level reproduction in the current resolver. The
 // regression coverage is the unit test
 // `commands::install::tests::collect_direct_versions_*` in install.rs,
 // which calls the helper directly with hand-built `Vec<InstallPackage>`
 // fixtures that include both a direct and a transitive entry for the
 // same name.
 
-/// **audit Finding 2 regression.** When an `lpm install` against
-/// an already-installed project fails partway through, the rollback MUST
+/// When an `lpm install` against an already-installed project fails
+/// partway through, the rollback MUST
 /// cover the lockfile and the install-hash, not just the manifest. The
 /// pre-fix transaction guard only snapshotted `package.json`, so a failed
 /// finalize (or a failed multi-member install) left:
@@ -6232,9 +6231,8 @@ fn install_workspace_star_dep_plants_root_symlink_to_member() {
 }
 
 /// `workspace:^` is a published-time hint — the member is still installed
-/// locally as a symlink. Pins the [audit fix](crates/lpm-cli/src/commands/install.rs#L3209)
-/// that previously rewrote `workspace:^` into a registry range and 404'd
-/// against the upstream proxy.
+/// locally as a symlink. Pre-fix, install rewrote `workspace:^` into a
+/// registry range and 404'd against the upstream proxy.
 #[test]
 fn install_workspace_caret_dep_resolves_to_local_member() {
     let project = TempProject::empty(
@@ -10142,8 +10140,8 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
         !flipped_stderr.to_lowercase().contains("up to date"),
         "freshness cache MUST invalidate on `LPM_LINKER` flip — second \
          install short-circuited as `up to date` despite the layout \
-         change. This is the bug GPT's audit caught: pre-fix, the install-\
-         hash didn't fold in the linker mode, so a post-install env flip \
+         change. Pre-fix, the install-hash didn't fold in the linker mode, \
+         so a post-install env flip \
          left the cache warm and the project stayed on the prior layout. \
          Got stderr:\n{flipped_stderr}"
     );
@@ -10221,8 +10219,8 @@ async fn install_invalid_lpm_linker_surfaces_through_sync_fast_lane() {
         String::from_utf8_lossy(&warmed.stderr),
     );
 
-    // GPT's repro, hardened: a TRULY bare `lpm install` with
-    // `LPM_LINKER=symlink` against the warm cache. Critically NO
+    // A TRULY bare `lpm install` with `LPM_LINKER=symlink` against
+    // the warm cache. Critically NO
     // disqualifying flags — no `--registry`, no `--insecure`, no
     // `--no-*`. Registry override moves to `LPM_REGISTRY_URL` so the
     // mock is still reachable if the fast lane falls through, but the

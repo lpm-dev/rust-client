@@ -149,8 +149,8 @@ pub struct IntentPayload {
     pub new_aliases_json: serde_json::Value,
     /// Explicit, typed list of ownership mutations this
     /// transaction will apply. Recovery replays this list directly
-    /// rather than diff-deriving from pre/post manifest states — per
-    /// the audit, diff-based reconstruction is fragile and the
+    /// rather than diff-deriving from pre/post manifest states; diff-based
+    /// reconstruction is fragile and the
     /// intent should be the source of truth.
     ///
     /// Populated by `commit_locked` when the user resolved one or more
@@ -998,10 +998,9 @@ mod tests {
 
     #[test]
     fn old_intent_payload_without_new_aliases_field_still_deserializes() {
-        // Before the audit fix, IntentPayload had no
-        // `new_aliases_json`. `#[serde(default)]` must let those
-        // older payloads still parse during the first recovery on
-        // a host upgrading across the field addition.
+        // Older IntentPayload records had no `new_aliases_json`.
+        // `#[serde(default)]` must let those older payloads still parse during
+        // the first recovery on a host upgrading across the field addition.
         let json = serde_json::json!({
             "op": "intent",
             "tx_id": "tx-old",

@@ -193,10 +193,9 @@ mod tests {
 
     // Canonical stable-fields identity used as the base for drift
     // tests. `axios_v114_0` vs `axios_v114_1` cover the "same repo,
-    // same workflow file, different release" case — the scenario the
-    // reviewer flagged as catastrophically misclassified by the
-    // original `==`-based comparator. All identity-equal pairs must
-    // resolve to `NoDrift`.
+    // same workflow file, different release" case. The original
+    // `==`-based comparator misclassified this as catastrophic drift.
+    // All identity-equal pairs must resolve to `NoDrift`.
     const PUB_AXIOS: &str = "github:axios/axios";
     const WORKFLOW_PATH: &str = ".github/workflows/publish.yml";
 
@@ -228,8 +227,7 @@ mod tests {
         );
     }
 
-    /// **Reviewer finding — Finding 1 primary regression guard.** A
-    /// legitimate v1.14.0 → v1.14.1 release from the same repo + same
+    /// A legitimate v1.14.0 → v1.14.1 release from the same repo + same
     /// workflow file necessarily carries a different `workflow_ref`
     /// (release tag) and a different `attestation_cert_sha256`
     /// (Fulcio's ephemeral leaf rotates per signing). Pre-fix, the
@@ -258,7 +256,6 @@ mod tests {
         );
     }
 
-    /// **Reviewer finding — Finding 1 secondary regression guard.**
     /// Even with identical publisher + workflow_path + workflow_ref,
     /// two signings of the same workflow necessarily produce
     /// different Fulcio leaf certs (the leaf is ephemeral, bound to

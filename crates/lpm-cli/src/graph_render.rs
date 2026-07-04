@@ -925,13 +925,13 @@ pub fn render_why(
     // surface patch hits that touched this
     // package. Same matching pattern as overrides above.
     //
-    // **Audit fix :** the human render now surfaces the
-    // actual `original_integrity` SRI hash (truncated for display)
+    // The human render now surfaces the actual `original_integrity`
+    // SRI hash (truncated for display)
     // instead of the literal placeholder "originalIntegrity recorded".
     // The integrity comes from `AppliedPatchHit.original_integrity`,
     // which the install pipeline plumbs through from
     // `lpm.patchedDependencies[<key>].originalIntegrity`. State files
-    // written before the audit fix have the field absent (Option::None);
+    // written before this field existed have the field absent (Option::None);
     // we degrade to the legacy placeholder in that case so old state
     // files don't break the render.
     if let Some(state) = patch_state {
@@ -1045,8 +1045,7 @@ pub fn render_why_json(
     // field, filtered to entries matching `target_name`. Empty array
     // when no state file exists or no hits matched.
     //
-    // **Audit fix :** include `original_integrity` so
-    // agents can read the patch baseline directly from `lpm graph
+    // Include `original_integrity` so agents can read the patch baseline directly from `lpm graph
     // --why --json` without re-reading `package.json`.
     let patch_hits: Vec<serde_json::Value> = patch_state
         .map(|s| {
@@ -2050,7 +2049,7 @@ mod tests {
         assert_eq!(mermaid_escape("a[b&c"), "a&#91;b&amp;c");
     }
 
-    // ── re-audit: depth off-by-one ──────────────────────────
+    // ── Depth accounting ────────────────────────────────────
 
     #[test]
     fn root_node_has_depth_zero() {
@@ -2082,7 +2081,7 @@ mod tests {
         assert_eq!(graph.nodes["ms@2.0.0"].depth, 3);
     }
 
-    // ── re-audit: render_why shows all paths for direct deps ─
+    // ── render_why shows all paths for direct deps ──────────
 
     #[test]
     fn why_direct_dep_also_shows_path() {
@@ -2096,7 +2095,7 @@ mod tests {
         assert!(why.contains("→"), "should contain path arrows: {why}");
     }
 
-    // ── re-audit: JSON root field ────────────────────────────
+    // ── JSON root field ─────────────────────────────────────
 
     #[test]
     fn json_output_has_root_field() {
@@ -2110,7 +2109,7 @@ mod tests {
         );
     }
 
-    // ── re-audit: Mermaid sanitize whitelist ─────────────────
+    // ── Mermaid sanitize whitelist ──────────────────────────
 
     #[test]
     fn mermaid_sanitize_replaces_special_chars() {
@@ -2182,7 +2181,7 @@ mod tests {
         }
     }
 
-    // ── re-audit: HTML template property names match JSON ────
+    // ── HTML template property names match JSON ─────────────
 
     #[test]
     fn html_uses_snake_case_properties() {
@@ -2207,7 +2206,7 @@ mod tests {
         );
     }
 
-    // ── re-audit: search debounce ────────────────────────────
+    // ── Search debounce ─────────────────────────────────────
 
     #[test]
     fn html_search_has_debounce() {
@@ -2223,7 +2222,7 @@ mod tests {
         );
     }
 
-    // ── re-audit: Registry::Unknown handling ─────────────────
+    // ── Registry::Unknown handling ──────────────────────────
 
     #[test]
     fn unknown_registry_handled() {
@@ -2265,7 +2264,7 @@ mod tests {
         let _html = render_html(&graph).expect("render graph HTML");
     }
 
-    // ── re-audit: why with multiple versions ─────────────────
+    // ── why with multiple versions ───────────────────────────
 
     #[test]
     fn why_shows_multiple_version_note() {
@@ -2518,7 +2517,7 @@ mod tests {
 
     #[test]
     fn render_why_falls_back_to_placeholder_when_integrity_missing() {
-        // State files written before the audit fix have
+        // State files written before this field existed have
         // `original_integrity == None`. The render must degrade
         // gracefully to the legacy placeholder rather than crash or
         // omit the section.
@@ -2628,7 +2627,7 @@ mod tests {
         assert!(arr.is_empty());
     }
 
-    // ── re-audit: circular dependency handling ───────────────
+    // ── Circular dependency handling ────────────────────────
 
     #[test]
     fn tree_handles_circular_deps() {
@@ -2675,7 +2674,7 @@ mod tests {
         );
     }
 
-    // ── re-audit: no source field ────────────────────────────
+    // ── No source field ─────────────────────────────────────
 
     #[test]
     fn no_source_field_defaults_to_unknown() {
@@ -2700,7 +2699,7 @@ mod tests {
         assert_eq!(graph.nodes["local-pkg@0.1.0"].registry, Registry::Unknown);
     }
 
-    // ── second re-audit: graph-level filter ──────────────────
+    // ── Graph-level filter ──────────────────────────────────
 
     #[test]
     fn filter_graph_removes_unmatched_subtrees() {

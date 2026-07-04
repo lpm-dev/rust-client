@@ -2622,10 +2622,8 @@ mod tests {
         );
 
         // Disclaimer: sandboxWriteDirs does NOT bypass for built-in roots.
-        // This is the assertion that pins the GPT-flagged misleading
-        // workaround from the original PR-1 plan — if a future regression
-        // re-introduces 'declare via sandboxWriteDirs' as the only fix,
-        // this assertion fails.
+        // If a future regression re-introduces 'declare via sandboxWriteDirs'
+        // as the only fix, this assertion fails.
         assert!(
             reason.contains("sandboxWriteDirs cannot bypass")
                 || reason.contains("cannot bypass this refusal"),

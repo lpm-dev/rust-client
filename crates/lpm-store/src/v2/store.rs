@@ -5246,9 +5246,9 @@ mod tests {
 
     #[test]
     fn extract_object_recovers_from_partial_object_dir() {
-        // Audit finding 3: a leftover `objects/<sri>/` from a crashed
-        // extract (no `package.json`, no `.integrity`) used to be
-        // treated as a hit. After the tightening, `extract_object`
+        // A leftover `objects/<sri>/` from a crashed extract
+        // (no `package.json`, no `.integrity`) used to be treated as a hit.
+        // After the tightening, `extract_object`
         // detects the incompleteness and removes the leftover before
         // re-extracting.
         //
@@ -5286,9 +5286,9 @@ mod tests {
 
     #[test]
     fn populate_overwrites_incomplete_final_dir_on_rename_collision() {
-        // Audit finding 3: if `final_dir` exists but is incomplete
-        // when populate_link_entry's atomic rename runs (a crashed
-        // peer process left a half-written entry), the rename retry
+        // If `final_dir` exists but is incomplete when populate_link_entry's
+        // atomic rename runs (a crashed peer process left a half-written entry),
+        // the rename retry
         // path removes the leftover and tries once more.
         //
         // We simulate a crashed-peer leftover by manually creating
@@ -6196,8 +6196,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn create_dir_symlink_uses_lpm_common_helper() {
-        // Audit finding 1: lpm-store v2 shares lpm-common's symlink
-        // helper so the Windows junction fallback isn't accidentally
+        // lpm-store v2 shares lpm-common's symlink helper so the Windows
+        // junction fallback isn't accidentally
         // dropped. On Unix we just confirm the function reference
         // resolves and produces a working symlink — the Windows
         // fallback is exercised by lpm-common's own test module

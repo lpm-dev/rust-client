@@ -227,16 +227,15 @@ pub struct ProvenanceSnapshot {
     /// `refs/heads/<branch>`, or `refs/pull/<n>/merge`. **Varies per
     /// release** — excluded from the identity tuple. Retained for
     /// audit / UX: the drift-gate renders it in the "last approved
-    /// via X at REF" line so reviewers can see which specific
+    /// via X at REF" line so users can see which specific
     /// release produced the approved reference.
     ///
     /// **Why this is NOT part of identity equality:** axios v1.14.0
     /// and v1.14.1 from the same repo + workflow carry the same
     /// publisher and workflow_path but necessarily different refs.
     /// Comparing refs would falsely mark every patch bump as
-    /// "identity changed" — the exact "reviewer finding: drift
-    /// comparator flags normal provenance-preserving releases" bug
-    /// this field split prevents.
+    /// "identity changed"; this field split prevents that false
+    /// positive for normal provenance-preserving releases.
     #[serde(
         default,
         rename = "workflowRef",

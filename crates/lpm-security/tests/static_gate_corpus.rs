@@ -76,10 +76,9 @@ fn is_adversarial(id: &str) -> bool {
 /// every manifest entry has a `scripts/*.txt` file. Both directions
 /// must match; an orphan in either direction is a hard-fail.
 ///
-/// Added after an audit found the earlier harness only
-/// loaded the manifest (silently ignoring orphan script files) and
-/// only opened `scripts/<id>.txt` for manifest-listed ids (silently
-/// ignoring stale manifest entries whose script file was deleted).
+/// The harness must not only load the manifest (silently ignoring orphan
+/// script files) or only open `scripts/<id>.txt` for manifest-listed ids
+/// (silently ignoring stale manifest entries whose script file was deleted).
 /// The current harness must make both classes visible.
 fn assert_manifest_matches_filesystem(entries: &[CorpusEntry]) {
     let scripts_dir = fixtures_dir().join("scripts");

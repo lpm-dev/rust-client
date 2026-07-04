@@ -518,7 +518,7 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         "fork_not_allowed" => Some(
             "The OIDC token was minted by a fork PR but the policy has allowForks=false. \
              Add --allow-forks to lpm env oidc allow if this is intentional (note: only \
-             enable for public repos with trusted reviewers — pull_request_target events \
+             enable for public repos with trusted maintainers — pull_request_target events \
              from forks run with BASE secrets).",
         ),
         "missing_branch_claim" => Some(

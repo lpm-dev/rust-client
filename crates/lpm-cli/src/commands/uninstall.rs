@@ -1579,9 +1579,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_uninstall_filter_no_match_with_fail_flag_includes_d2_hint_for_bare_names() {
-        // audit regression: when --fail-if-no-match fires AND the
-        // filter list contains bare names that would have substring-matched
-        // Previously, the error message must surface the D2 migration hint.
+        // When --fail-if-no-match fires and the filter list contains bare names
+        // that would have substring-matched previously, the error message must
+        // surface the D2 migration hint.
         let dir = tempfile::tempdir().unwrap();
         write_workspace_fixture(dir.path(), &[("foo", "packages/foo", &[("bar", "1.0.0")])]);
         let client = lpm_registry::RegistryClient::new();
@@ -1590,8 +1590,7 @@ mod tests {
             &client,
             dir.path(),
             &["bar".to_string()],
-            // bare name filter that matches nothing — exact 'core' substring scenario
-            // GPT cited in the audit
+            // Bare name filter that matches nothing: exact 'core' substring scenario.
             &["core".to_string()],
             false,
             true,  // fail_if_no_match
@@ -1724,7 +1723,7 @@ mod tests {
         );
     }
 
-    // ── audit fix: install pipeline runs at member dir for filtered installs ──
+    // ── Install pipeline runs at member dir for filtered installs ───────────
 
     #[tokio::test]
     async fn run_uninstall_targets_member_dir_lockfile_for_in_member_dir_default() {

@@ -257,8 +257,8 @@ async fn two_concurrent_installs_on_same_project_leave_well_formed_manifest() {
         });
     }
 
-    // POST-CONDITION 3 (load-bearing — finding #77 fix): both installs
-    // succeeded AND both packages landed in the manifest AND both are
+    // POST-CONDITION 3: both installs succeeded AND both packages landed
+    // in the manifest AND both are
     // linked into `node_modules/`. Pre-fix this section was diagnostic-
     // only because `lpm install` held only a shared `store_lock` and
     // the per-process `ManifestTransaction` snapshots didn't coordinate
@@ -302,8 +302,7 @@ async fn two_concurrent_installs_on_same_project_leave_well_formed_manifest() {
     assert!(
         pkg_a_in_deps,
         "pkg-a missing from package.json dependencies after concurrent \
-         install — manifest race is still occurring (finding #77 has \
-         regressed). manifest deps: {:?}",
+         install — manifest race is still occurring. manifest deps: {:?}",
         deps.keys().collect::<Vec<_>>()
     );
     assert!(
@@ -441,8 +440,7 @@ async fn install_with_shared_store_lock_blocks_concurrent_store_clean() {
 
 /// **A.4 — two concurrent `lpm install -g` produce a coherent global state.**
 ///
-/// Unlike project installs (no project-lock, finding #77), global
-/// installs wrap their **commit** sections with `global_tx_lock` held
+/// Unlike project installs, global installs wrap their **commit** sections with `global_tx_lock` held
 /// exclusively (see the global install and update command facades).
 /// The fetch+extract+link phases run in parallel; only the WAL-commit
 /// regions serialize. The user-facing contract is therefore not "total
@@ -1273,8 +1271,8 @@ async fn install_retries_tarball_5xx_until_success() {
 /// then surfaces the last failure as `LpmError::Http { status: 503, ... }`.
 /// Install fails non-zero with the 503 visible in stderr.
 ///
-/// **Backoff knob (finding #78 fix).** The default exponential schedule
-/// (1+2+4+8 seconds, capped at 10s) makes retry-exhaustion tests
+/// **Backoff knob.** The default exponential schedule (1+2+4+8 seconds,
+/// capped at 10s) makes retry-exhaustion tests
 /// take ~15s wall-clock per fetch site (~28s with the install
 /// pipeline's 2 distinct `download_tarball_*` call sites — see C.3
 /// docstring). To keep the test in the workflow-suite's <5s
@@ -1294,7 +1292,7 @@ async fn install_retries_tarball_5xx_until_success() {
 /// - **Elapsed < 2s**. With the knob (10ms × 8 attempts × 2 fetch
 ///   sites), worst case is ~160ms of sleep. 2s gives slack for
 ///   resolver overhead. Without the knob, this assertion FAILS
-///   (~28s elapsed) — which is the whole point of finding #78.
+///   (~28s elapsed) — which is why this override exists.
 /// - Tarball attempts ≥ 4 — proves the retry loop ran the full
 ///   schedule, not just one attempt.
 #[cfg(debug_assertions)]
@@ -1401,13 +1399,12 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
          loop may have a regression."
     );
     // Load-bearing: with the knob, retry-exhaustion fits well under
-    // the suite's <5s determinism budget. Without the knob (finding
-    // #78 not yet fixed), this assertion fails at ~28s.
+    // the suite's <5s determinism budget. Without the knob, this assertion
+    // fails at ~28s.
     assert!(
         elapsed < Duration::from_secs(2),
         "retry exhaustion took {elapsed:?} — LPM_RETRY_BACKOFF_MS_OVERRIDE \
-         (finding #78) is not being honored, OR the retry budget grew. \
-         attempts={attempt_count}"
+         is not being honored, OR the retry budget grew. attempts={attempt_count}"
     );
     // Surface the HTTP class so users / CI can grep for the failure.
     let stderr_l = stderr.to_lowercase();

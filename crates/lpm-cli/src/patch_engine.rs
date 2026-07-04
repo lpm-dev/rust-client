@@ -658,7 +658,7 @@ fn has_nul(bytes: &[u8]) -> bool {
 ///   is followed by a plain `---/+++` chunk for a DIFFERENT file: the
 ///   `---` path mismatch against `rename from` is the signal that the
 ///   prior section ended. Without this rule the two sections collapse
-///   into one chunk (GPT audit).
+///   into one chunk.
 ///
 /// Hunk content lines start with ` `, `+`, `-`, or `\` (single
 /// character + content), so a line beginning with `diff --git ` or
@@ -693,7 +693,7 @@ pub fn split_multi_file_patch(text: &str) -> Vec<&str> {
             //       prior `rename from` and the `---` path matches it
             //       — rename+edit's old-side header.
             // The mismatch case under (b) is the mixed git→plain
-            // boundary the GPT audit flagged.
+            // boundary.
             let emit_boundary = if !in_git_header {
                 true
             } else if let Some(rf) = current_rename_from {
@@ -1856,8 +1856,8 @@ mod tests {
         assert!(chunks[0].contains("--- a/x.js"));
     }
 
-    /// **GPT audit regression .** A mixed-format patch with
-    /// a git rename-only section followed by a plain `---`/`+++` chunk
+    /// Mixed-format patch regression: a git rename-only section
+    /// followed by a plain `---`/`+++` chunk
     /// for a DIFFERENT file must produce two chunks. Pre-fix the
     /// state-machine kept `in_git_header` true after the rename-only
     /// section (no `@@` to clear it), so the plain `--- a/x.js` got

@@ -1292,8 +1292,8 @@ mod tests {
 
     #[test]
     fn syntactically_invalid_json_returns_not_up_to_date() {
-        // GPT audit round 1: a malformed package.json with a forged matching
-        // install-hash must NOT exit the fast lane with "success: true".
+        // A malformed package.json with a forged matching install-hash must not
+        // exit the fast lane with "success: true".
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let _home = scoped_home_for(p);

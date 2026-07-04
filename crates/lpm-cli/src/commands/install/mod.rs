@@ -1328,11 +1328,11 @@ async fn run_with_options_under_store_lock(
     ensure_lpm_wrappers_gitignore(project_dir);
     ensure_lpm_hoisted_gitignore(project_dir);
 
-    //: surface silent additions to `trustedDependencies`
+    // Surface silent additions to `trustedDependencies`
     // BEFORE the install pipeline does any work.
     // A "bump dep" PR that quietly grew the trust list would otherwise
-    // slip past local review; this diff is the local-reviewer safety
-    // net. Emission is suppressed in --json mode (no stable JSON
+    // slip past review; this diff is the local safety net.
+    // Emission is suppressed in --json mode (no stable JSON
     // schema for this surface yet — callers will learn the additions
     // via `lpm trust diff` once that lands in chunk C).
     if !json_output {
@@ -5164,9 +5164,8 @@ async fn run_with_options_under_store_lock(
     // object. Without threading these through the capture call,
     // capability-widened packages with matching script-hash
     // approvals would slip past the blocked-set (build_state.rs's
-    // compute_blocked_packages_with_metadata filter) — the
-    // reviewer's High finding. Fix makes install-time capture
-    // consistent with 6c's runtime enforcement.
+    // compute_blocked_packages_with_metadata filter). This keeps
+    // install-time capture consistent with 6c's runtime enforcement.
     let install_requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;

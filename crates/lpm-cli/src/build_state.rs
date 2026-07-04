@@ -711,8 +711,8 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                 // pipeline's per-package provenance fetch. Populated
                 // for EVERY blocked package that went through the
                 // drift gate, not just those whose drift fired —
-                // fixes the reviewer-flagged "hardcoded None"
-                // underfill and closes the approve-scripts
+                // prevents the previous "hardcoded None" underfill
+                // and closes the approve-scripts
                 // write-path (binding.provenance_at_approval is
                 // written from this value on approval).
                 provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
@@ -2761,8 +2761,8 @@ mod tests {
     // ── capability widening
     //    must land in the blocked set even under strict match ──
 
-    /// Reviewer's High finding: a package whose script-hash
-    /// approval satisfies `TrustMatch::Strict` but whose current
+    /// A package whose script-hash approval satisfies `TrustMatch::Strict`
+    /// but whose current
     /// capability request widens beyond the user bound MUST be
     /// included in the blocked set so `lpm approve-scripts`
     /// surfaces it. Without this, install-time capture silently

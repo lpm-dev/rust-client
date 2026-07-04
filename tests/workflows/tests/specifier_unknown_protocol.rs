@@ -82,7 +82,7 @@ fn install_suggests_file_for_filee_typo() {
     );
 }
 
-// ─── CLI argv path (GPT-audit follow-up) ─────────────────────────────────────
+// ─── CLI argv path ───────────────────────────────────────────────────────────
 //
 // Pre-fix the manifest-side parser guard didn't cover the explicit-token CLI
 // path: `lpm install foo@magic:bar` ran through `save_spec::classify_version_token`

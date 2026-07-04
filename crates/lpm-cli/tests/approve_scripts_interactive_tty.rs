@@ -105,15 +105,15 @@ fn approve_scripts_interactive_walk_without_tty_fails_with_helpful_alternatives(
 }
 
 /// `lpm --json approve-scripts` in a non-TTY shell emits an error
-/// envelope on stdout. Per finding #74, the `--json`-specific guard
-/// fires BEFORE the TTY gate (since every `--json` caller is
+/// envelope on stdout. The `--json`-specific guard fires BEFORE the
+/// TTY gate (since every `--json` caller is
 /// non-interactive by definition, the TTY message was always
 /// unhelpful for the CI/agent case). The contract pinned here:
 ///
 /// 1. stdout contains a valid JSON envelope, with `success: false`
 ///    and a populated `error` field.
 /// 2. Exit code is `1` — the envelope's `success` field and the
-///    process exit code must agree (finding #73 contract).
+///    process exit code must agree.
 /// 3. The error message explicitly names the `--json`-compatible
 ///    flag pairs (`--list --json`, `--yes --json`, `<pkg> --json`)
 ///    so the user knows EXACTLY which fix to apply, instead of the
@@ -154,7 +154,7 @@ fn approve_scripts_interactive_with_json_emits_failure_envelope_on_stdout() {
     assert!(
         error_msg.contains("cannot be combined with `--json`"),
         "error must surface the --json-specific guard message, not the \
-         generic TTY one (finding #74): got {error_msg:?}",
+         generic TTY one: got {error_msg:?}",
     );
     assert!(
         error_msg.contains("--list --json")

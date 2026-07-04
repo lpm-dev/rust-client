@@ -79,8 +79,7 @@ pub fn target_has_install_scripts(meta: &VersionMetadata) -> bool {
 
 /// Peer-dep satisfaction analysis for an upgrade candidate.
 ///
-/// **D-design-1 audit fix (MEDIUM):** the `basis` field explicitly marks
-/// that the analysis is against the CURRENT lockfile, not a projected
+/// The `basis` field explicitly marks that the analysis is against the CURRENT lockfile, not a projected
 /// post-upgrade state. Recomputing against the proposed selection set is
 /// deferred to a future release.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -429,7 +428,7 @@ mod tests {
 
     #[test]
     fn peer_impact_basis_is_always_current_lockfile() {
-        // D-design-1 MEDIUM fix: basis field is always "current_lockfile"
+        // The basis field is always "current_lockfile".
         let impact = compute_peer_impact(&HashMap::new(), None);
         assert_eq!(impact.basis, "current_lockfile");
         let lf = make_lockfile(&[("react", "17.0.0")]);

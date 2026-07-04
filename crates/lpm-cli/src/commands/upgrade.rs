@@ -73,7 +73,7 @@ fn validate_major_for_mode(major: bool, mode: ResolvedMode) -> Result<(), LpmErr
 // ── Candidate types ─────────────────────────────────────────────────
 
 /// Distinguishes the two rows a single package can produce in interactive
-/// mode (D-design-1 dual-row model).
+/// mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetKind {
     WithinMajor,
@@ -384,7 +384,7 @@ pub async fn run(
                 });
             }
             ResolvedMode::Interactive => {
-                // D-design-1 dual-row: compute within-major AND absolute-latest
+                // Dual-row mode: compute within-major AND absolute-latest.
                 let (within_target, within_range) =
                     compute_upgrade(&dep.range, &latest, &available_versions, false);
                 let (abs_target, abs_range) =
@@ -1073,8 +1073,8 @@ fn compute_upgrade(
 /// body doesn't look like a version (e.g., `"*"`), returns it as-is
 /// — the caller's `classify_semver_change` will return `Unknown`.
 ///
-/// ** audit fix:** when no lockfile exists, `installed_ver` is
-/// `None` and the old code used `"?"` as the "from" version, which
+/// When no lockfile exists, `installed_ver` is `None` and the old code
+/// used `"?"` as the "from" version, which
 /// `classify_semver_change` can't parse → `Unknown` → patches/minors
 /// don't get pre-checked. This helper extracts a real version from
 /// the manifest range so classification works correctly even without
@@ -1367,7 +1367,7 @@ mod tests {
         assert!(hint.is_empty());
     }
 
-    // ── dual-row model (D-design-1) ─────────────────────────────────
+    // ── Dual-row model ──────────────────────────────────────────────
 
     #[test]
     fn deduplicate_takes_major_when_both_selected() {

@@ -49,8 +49,8 @@ pub const MANIFEST_FILENAME: &str = "manifest.toml";
 /// Top-level shape of `~/.lpm/global/manifest.toml`.
 ///
 /// `BTreeMap` (rather than `HashMap`) so on-disk ordering is deterministic
-/// — important for diffability when a future reviewer wants to see what
-/// changed between two installs.
+/// — important for diffability when comparing what changed between two
+/// installs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalManifest {
     pub schema_version: u32,

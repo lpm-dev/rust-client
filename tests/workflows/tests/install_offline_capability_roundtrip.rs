@@ -8,10 +8,9 @@
 //! paths, over file-backed `.lpm/build-state.json` + `package.json`
 //! state transitions.
 //!
-//! Closes the validation gap the reviewer flagged in the final
-//! audit pass: the helper-level invariants were already covered by
-//! unit tests, but the subprocess-level offline command path + its
-//! file-backed state transitions were not.
+//! Closes the validation gap between helper-level unit coverage and
+//! the subprocess-level offline command path with file-backed state
+//! transitions.
 //!
 //! # Scenario
 //!
@@ -157,9 +156,8 @@ async fn offline_install_capability_round_trip_end_to_end() {
     // ── Author a rich strict approval (no capabilityHash) + a
     //    widening `passEnv` declaration ──
     //
-    // Reviewer high-finding scenario:
-    // strict script-hash trust would pass, but the capability
-    // gate should still block. The
+    // Strict script-hash trust would pass, but the capability gate should still
+    // block. The
     // pre-fix offline path would have silently dropped this row
     // from build-state.json.
     let rewritten_pkg = serde_json::json!({

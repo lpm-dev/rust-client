@@ -549,7 +549,8 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
     if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(cwd) {
         // Resolve BOTH paths through the same normalization function so the
         // comparison is meaningful regardless of which form (canonical vs
-        // lexical-with-symlinks) the inputs arrive in. This is the         // audit fix: the old code compared a mix of forms and missed the
+        // lexical-with-symlinks) the inputs arrive in. The old code compared
+        // a mix of forms and missed the
         // macOS `/tmp → /private/tmp` symlink case.
         let workspace_canonical = canonicalize_or_partial(&workspace.root);
         let output_canonical = canonicalize_or_partial(&normalized);
@@ -572,7 +573,6 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
     // validation succeeds. That ordering matters: validate_output_dir is
     // the safety gate that confirms the output is OUTSIDE the workspace,
     // and we deliberately never remove anything until the gate has passed.
-    // audit fix Medium  wired the cleanup in `run`.
     if normalized.exists() {
         let is_empty =
             std::fs::read_dir(&normalized).map_or(true, |mut iter| iter.next().is_none());

@@ -1,6 +1,6 @@
 //! Workflow tests for the process-wide color policy.
 //!
-//! Pins the GPT-audit-2026-05-15 fixes:
+//! Pins the process-wide color policy:
 //! - `--color` / `NO_COLOR` / `FORCE_COLOR` are honored on the
 //!   pre-`Cli::parse` fast paths (top-of-`main()` `--version` notice
 //!   and bare-install fast lane), not just inside `async_main`.

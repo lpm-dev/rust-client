@@ -55,7 +55,7 @@ fn assert_sandbox_blocks_write(fx: &SandboxFixture, target: &Path, script: &str)
     // Positive control: under Disabled the write must succeed. If
     // it doesn't, the target isn't actually reachable and the test
     // is incapable of discriminating sandbox denial from ambient
-    // denial — panic loudly so a confused reviewer sees WHY.
+    // denial — panic loudly so the failure explains WHY.
     let noop = try_build_sandbox(fx.spec.clone(), SandboxMode::Disabled)
         .expect("NoopSandbox must always succeed");
     let control_status = run_script(noop.as_ref(), &fx.pkg_dir, script);

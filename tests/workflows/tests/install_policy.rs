@@ -286,7 +286,7 @@ async fn install_policy_with_invalid_value_is_rejected() {
 /// as a JSON envelope on stdout. The invalid-value error is raised by
 /// `script_policy_config::collapse_policy_flags` inside the install
 /// arm — prior to the per-arm async wrap it short-circuited past the
-/// `--json` envelope handler (finding #76 in private/findings.md).
+/// `--json` envelope handler.
 /// This test pins that the wrap restored the contract.
 #[tokio::test]
 async fn install_policy_with_invalid_value_under_json_emits_error_envelope_on_stdout() {

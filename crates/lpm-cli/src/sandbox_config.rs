@@ -604,8 +604,7 @@ pub fn decide_runtime_sandbox_mode(
 /// the same banner regardless of source, so the gating must be on
 /// the resolved mode, not on which tier supplied it.
 ///
-/// follow-up (same day, second pass): the banner must
-/// ALSO gate on the final [`SandboxMode`], not just the resolved
+/// The banner must also gate on the final [`SandboxMode`], not just the resolved
 /// tier. `--sandbox-log` (macOS Seatbelt diagnostic) wins over
 /// resolved Strict in [`decide_runtime_sandbox_mode`] and produces
 /// [`SandboxMode::LogOnly`] — observed-but-not-enforced. Emitting
@@ -620,7 +619,7 @@ pub fn decide_runtime_sandbox_mode(
 /// Wording is intentionally neutral (no `--strict-sandbox` prefix)
 /// because the banner runs the same for config / env / CLI sources;
 /// claiming a source the install can't actually attribute would be
-/// the inverse of the first bug GPT-5 caught. The provenance
+/// misleading. The provenance
 /// ("which tier set strict") belongs on `lpm doctor`, which DOES
 /// have the resolver result available and a stable surface for it.
 pub fn strict_banner_for_runtime(
@@ -1124,7 +1123,7 @@ allow-degraded = "maybe"
         let banner = strict_banner_for_runtime(SandboxMode::Enforce, ResolvedSandboxMode::Strict);
         let line = banner.expect(
             "strict mode under Enforce MUST emit a runtime banner — DX-doc walkthroughs / / \
-             all require it regardless of source. This was the GPT-5 audit Low finding (round 1).",
+             all require it regardless of source.",
         );
         assert!(
             line.contains("outbound network"),
@@ -1166,7 +1165,7 @@ allow-degraded = "maybe"
 
     #[test]
     fn strict_banner_suppressed_under_logonly_runtime_even_when_resolved_strict() {
-        // round 2 (Medium): the failure mode.
+        // LogOnly runtime: the failure mode.
         //
         // `lpm rebuild --strict-sandbox --sandbox-log` (or env/config
         // strict + CLI `--sandbox-log`) collapses to LogOnly in
@@ -1184,7 +1183,7 @@ allow-degraded = "maybe"
             banner.is_none(),
             "strict banner MUST suppress itself under LogOnly — saying `outbound network \
              will be denied` while the next line says `logged but NOT enforced` is \
-             contradictory UX. GPT-5 audit round 2 finding. got: {banner:?}",
+             contradictory UX. got: {banner:?}",
         );
     }
 
