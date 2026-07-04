@@ -325,9 +325,8 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
         "audit envelope must succeed against the migrated lockfile + installed tree"
     );
 
-    // Step 4 (Item 4 plan #1 completion — 2026-05-14): rebuild closes
-    // the migrate → install → audit → rebuild lifecycle. The migrated
-    // tree has `ms@2.1.3` which carries no lifecycle scripts, so
+    // Rebuild closes the migrate -> install -> audit -> rebuild lifecycle. The
+    // migrated tree has `ms@2.1.3` which carries no lifecycle scripts, so
     // `rebuild --dry-run --policy=deny` exits 0 with an empty packages
     // list. The load-bearing contract here isn't "rebuild does work";
     // it's "rebuild reads the post-install state coherently and emits
@@ -1213,15 +1212,13 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
     );
 }
 
-// ─── Item 4 plan #5: workspace filter isolation (2026-05-14) ─────────
+// ─── Workspace filter isolation ─────────
 //
 // Catches: a `lpm install <pkg> --filter @test/app` invocation that
 // accidentally ALSO mutates @test/core's package.json / lockfile /
 // install-hash, breaking the workspace-member isolation contract.
-// The plan's original phrasing was "run --filter member-b doesn't
-// refetch member-a's deps" — the variant pinned here checks the
-// FILE-STATE invariant, which is checkable without counting mock
-// requests:
+// This variant pins the file-state invariant, which is checkable without
+// counting mock requests:
 //
 //   1. Bare install at workspace root → all 3 members get
 //      node_modules + per-member lpm.lock + .lpm/install-hash.
@@ -1416,13 +1413,12 @@ async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
     );
 }
 
-// ─── Item 4 additional candidate flows (added 2026-05-14) ──────────────
+// ─── Additional cross-command flows ──────────────
 //
-// These rows extend Item 4's "Additional candidate flows" list beyond
-// the 6 baseline flows. Each pins a hand-off the existing single-
-// command and baseline-flow tests don't cover.
+// Each flow pins a hand-off the existing single-command and baseline-flow
+// tests don't cover.
 
-/// **Item 4 candidate #1 — install → uninstall → install → graph round-trip.**
+/// **Install -> uninstall -> install -> graph round-trip.**
 ///
 /// Single-command tests prove each step in isolation. The flow test
 /// proves the state-transfer between steps is coherent: uninstall
@@ -1551,7 +1547,7 @@ async fn flow_install_uninstall_install_graph_round_trip() {
     );
 }
 
-/// **Item 4 candidate #4 — cache clean does not break offline install.**
+/// **Cache clean does not break offline install.**
 ///
 /// Pins the boundary between **ephemeral caches** (`~/.lpm/cache/`)
 /// and the **global content-addressed store** (`~/.lpm/store/`). The

@@ -1000,9 +1000,7 @@ impl MockRegistry {
     /// polluted every install test's stderr AND the `shape_mismatch`
     /// counter — documented as "BUG signal — the writer should never
     /// emit a gate-rejectable URL" — fired on every test run, making
-    /// the counter useless for catching real bugs. See
-    /// `private/test-coverage-followup-plan.md` ("offline-install
-    /// observation, 2026-05-14") for the full investigation.
+    /// the counter useless for catching real bugs.
     ///
     /// **Future tests:** use this helper, or inline the same shape
     /// (`/tarballs/{name}/-/{name}-{version}.tgz`). Do NOT re-introduce

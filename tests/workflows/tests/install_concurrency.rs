@@ -1,8 +1,7 @@
 //! Concurrency and recovery contract tests for `lpm install`.
 //!
-//! Item 2 of `private/test-coverage-followup-plan.md`. Pins behavior
-//! under the production failure modes that have **zero coverage** in
-//! the existing suite:
+//! These tests pin behavior under production failure modes that need
+//! workflow-level coverage:
 //!
 //! - **Category A — process racing.** Two `lpm` processes on the same
 //!   project, install + cache-clean, install + store-clean, two
@@ -31,12 +30,8 @@
 //!   [`lpm_global::recover()`](../../../crates/lpm-global/src/recover.rs) fires
 //!   from the dispatcher at [main.rs:2515](../../../crates/lpm-cli/src/main.rs).
 //!
-//! Findings surfaced during this work are filed in
-//! `private/findings.md`. Tests that pin a buggy current state carry a
-//! `// TODO #NN — tighten when finding #NN fixed` comment.
-//!
-//! See `private/test-coverage-followup-plan.md` for the full design
-//! and the verified architectural facts each test rests on.
+//! Keep the verified architectural facts close to the behavior each test
+//! protects.
 
 mod support;
 
@@ -918,11 +913,9 @@ fn assert_lockfile_well_formed_or_absent(project_dir: &std::path::Path, context:
 /// and restores them in its `Drop` impl unless `tx.commit()` ran. A
 /// panic between snapshot and commit MUST trigger that rollback.
 ///
-/// **Pre-test hook (added 2026-05-14).** This test was deferred in
-/// the original Item 2 tranche because there was no deterministic
-/// way to trigger a panic inside the install pipeline from a workflow
-/// test — recoverable errors fire `?`-rollback (already covered by
-/// E.1/E.2/E.3) but the panic-rollback path was unprovable. The
+/// **Pre-test hook.** Recoverable errors fire `?`-rollback, but there
+/// was no deterministic way to trigger a panic inside the install pipeline
+/// from a workflow test. The
 /// `maybe_test_panic(stage)` hook at [install.rs](../../../crates/lpm-cli/src/commands/install.rs)
 /// reads `LPM_TEST_PANIC_AT` and panics deterministically when the
 /// stage matches. The hook is honored only by debug builds so
@@ -1432,7 +1425,7 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
 ///    gzip/tar decoder hits EOF and surfaces a non-retryable
 ///    `LpmError::Integrity`-class error on the first attempt.
 ///
-/// **Observed behavior on this stack (wiremock 0.6 / hyper 1.9 / reqwest 0.12, 2026-05-14):**
+/// **Observed behavior on this stack (wiremock 0.6 / hyper 1.9 / reqwest 0.12):**
 /// the server-side hyper writer rejects the Content-Length lie with
 /// an internal panic before any bytes reach the wire (`payload claims
 /// content-length of N, custom content-length header claims 2N`). The
@@ -2397,11 +2390,11 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
     );
 }
 
-// ─── Category G — Additional concurrency/recovery hardening (2026-05-14) ─
+// ─── Category G — Additional concurrency/recovery hardening ─
 
 /// **G.4 — `lpm cache clean` racing a slow in-flight install does not corrupt the install.**
 ///
-/// **Architectural facts** (verified against source 2026-05-14):
+/// **Architectural facts:**
 ///
 /// - `lpm cache clean` removes ONLY `~/.lpm/cache/{metadata,tasks,dlx}`
 ///   (see [crates/lpm-cli/src/commands/cache.rs:64](../../../crates/lpm-cli/src/commands/cache.rs#L64)).
