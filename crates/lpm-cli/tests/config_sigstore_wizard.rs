@@ -26,6 +26,14 @@ fn lpm_isolated() -> (Command, TempDir, TempDir) {
     cmd.env("NO_COLOR", "1");
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
     cmd.env("LPM_DISABLE_TELEMETRY", "1");
+    cmd.env("LPM_FORCE_FILE_AUTH", "1");
+    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
+    cmd.env("LPM_FORCE_FILE_VAULT", "1");
+    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
+    cmd.env(
+        "LPM_SECURITY_POLICY_PATH",
+        home.path().join(".lpm/security-policy.toml"),
+    );
     cmd.env_remove("RUST_LOG");
     cmd.env_remove("LPM_PROVENANCE_ENFORCE");
     (cmd, project, home)

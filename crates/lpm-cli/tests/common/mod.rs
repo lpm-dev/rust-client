@@ -56,8 +56,9 @@ pub struct MockPackage {
 }
 
 /// Spawn `lpm-rs` with the standard isolated env (HOME, LPM_HOME,
-/// `PATH` prefixed with `lpm_home/bin`, `NO_COLOR`, telemetry off,
-/// `RUST_LOG` removed). Returns `(status, stdout, stderr)`.
+/// file-backed auth/security state, `PATH` prefixed with
+/// `lpm_home/bin`, `NO_COLOR`, telemetry off, `RUST_LOG` removed).
+/// Returns `(status, stdout, stderr)`.
 pub fn run_lpm(
     cwd: &Path,
     lpm_home: &Path,
@@ -120,10 +121,19 @@ pub fn lpm_command_with_env(
         .env("NO_COLOR", "1")
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env("LPM_DISABLE_TELEMETRY", "1")
+        .env("LPM_FORCE_FILE_AUTH", "1")
+        .env("LPM_TEST_FAST_SCRYPT", "1")
+        .env("LPM_FORCE_FILE_VAULT", "1")
+        .env("LPM_DISABLE_HOST_CLI_AUTH", "1")
         .env(
             "LPM_SECURITY_POLICY_PATH",
             lpm_home.join("security-policy.toml"),
         )
+        .env_remove("LPM_TOKEN")
+        .env_remove("NPM_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GITLAB_TOKEN")
+        .env_remove("CI_JOB_TOKEN")
         .env_remove("RUST_LOG");
     match registry_url {
         Some(url) => {

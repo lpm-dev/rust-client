@@ -24,8 +24,18 @@ fn install_without_package_json_fails() {
     let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").unwrap();
     cmd.current_dir(dir.path());
     cmd.env("HOME", home.path());
+    cmd.env("LPM_HOME", home.path().join(".lpm"));
     cmd.env("NO_COLOR", "1");
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
+    cmd.env("LPM_DISABLE_TELEMETRY", "1");
+    cmd.env("LPM_FORCE_FILE_AUTH", "1");
+    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
+    cmd.env("LPM_FORCE_FILE_VAULT", "1");
+    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
+    cmd.env(
+        "LPM_SECURITY_POLICY_PATH",
+        home.path().join(".lpm/security-policy.toml"),
+    );
     cmd.env_remove("LPM_TOKEN");
 
     let output = cmd
@@ -376,6 +386,15 @@ async fn install_add_walks_up_to_parent_package_json() {
     cmd.env("HOME", project.home());
     cmd.env("LPM_HOME", project.home().join(".lpm"));
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
+    cmd.env("LPM_DISABLE_TELEMETRY", "1");
+    cmd.env("LPM_FORCE_FILE_AUTH", "1");
+    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
+    cmd.env("LPM_FORCE_FILE_VAULT", "1");
+    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
+    cmd.env(
+        "LPM_SECURITY_POLICY_PATH",
+        project.home().join(".lpm/security-policy.toml"),
+    );
     cmd.env("NO_COLOR", "1");
     cmd.env_remove("LPM_TOKEN");
     cmd.args([
@@ -564,6 +583,15 @@ async fn install_bare_walks_up_to_parent_package_json() {
     cmd.env("HOME", project.home());
     cmd.env("LPM_HOME", project.home().join(".lpm"));
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
+    cmd.env("LPM_DISABLE_TELEMETRY", "1");
+    cmd.env("LPM_FORCE_FILE_AUTH", "1");
+    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
+    cmd.env("LPM_FORCE_FILE_VAULT", "1");
+    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
+    cmd.env(
+        "LPM_SECURITY_POLICY_PATH",
+        project.home().join(".lpm/security-policy.toml"),
+    );
     cmd.env("NO_COLOR", "1");
     cmd.env_remove("LPM_TOKEN");
     cmd.args([

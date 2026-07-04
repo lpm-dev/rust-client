@@ -48,16 +48,27 @@ async fn gitlab_snippet_lpm_oidc_token_drives_setup_oidc() {
 
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    fs::create_dir_all(cwd.join(".home")).unwrap();
+    let home = cwd.join(".home");
+    let lpm_home = home.join(".lpm");
+    fs::create_dir_all(&home).unwrap();
 
     let exe = env!("CARGO_BIN_EXE_lpm-rs");
     let output = Command::new(exe)
         .args(["setup", "ci", "npmrc", "--oidc", "--registry", &server_url])
         .current_dir(cwd)
-        .env("HOME", cwd.join(".home"))
+        .env("HOME", &home)
+        .env("LPM_HOME", &lpm_home)
         .env("NO_COLOR", "1")
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env("LPM_DISABLE_TELEMETRY", "1")
+        .env("LPM_FORCE_FILE_AUTH", "1")
+        .env("LPM_TEST_FAST_SCRYPT", "1")
+        .env("LPM_FORCE_FILE_VAULT", "1")
+        .env("LPM_DISABLE_HOST_CLI_AUTH", "1")
+        .env(
+            "LPM_SECURITY_POLICY_PATH",
+            lpm_home.join("security-policy.toml"),
+        )
         .env("LPM_OIDC_TOKEN", SNIPPET_JWT)
         // Strip any inherited CI signals so the bypass is the only valid path.
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
