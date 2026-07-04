@@ -204,9 +204,9 @@ fn helper_denies_read_to_path_outside_any_allow_set() {
 
 #[test]
 fn helper_refuses_reparse_point_root_with_named_error() {
-    // PR-1 contract: refuse a reparse-point root as a writable-dir
-    // / readable-dir grant target. Same shape as the SACL refusal
-    // pinned at `windows::tests::apply_low_il_label_refuses_reparse_point_root_*`
+    // Refuse a reparse-point root as a writable-dir / readable-dir
+    // grant target. Same shape as the SACL refusal pinned at
+    // `windows::tests::apply_low_il_label_refuses_reparse_point_root_*`,
     // but for the AppContainer DACL path.
     //
     // Build a junction inside a tmpdir pointing at the parent

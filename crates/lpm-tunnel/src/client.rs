@@ -1457,7 +1457,7 @@ mod tests {
         assert!(is_safe_local_url("/path/to/resource#fragment"));
         assert!(is_safe_local_url("/api/v1"));
 
-        // Double slashes in query string are allowed (#11)
+        // Double slashes in query string are allowed.
         assert!(is_safe_local_url("/callback?redirect=https://example.com"));
         assert!(is_safe_local_url("/api?url=http://localhost:3000//path"));
 
@@ -1479,14 +1479,14 @@ mod tests {
 
     #[test]
     fn ws_config_constants_are_reasonable() {
-        // #1: Verify WebSocket message size limits are set and sane
+        // Verify WebSocket message size limits are set and sane.
         assert_eq!(MAX_WS_MESSAGE_SIZE, 50 * 1024 * 1024);
         assert_eq!(MAX_WS_FRAME_SIZE, 16 * 1024 * 1024);
     }
 
     #[test]
     fn pong_timeout_detection() {
-        // #3: Pong timeout should detect dead relays
+        // Pong timeout should detect dead relays.
         let now = std::time::Instant::now();
 
         // Just connected — should not be timed out
@@ -1503,7 +1503,7 @@ mod tests {
 
     #[test]
     fn backoff_jitter_is_bounded() {
-        // #15: Jitter must be non-negative and <= base_delay / 2
+        // Jitter must be non-negative and <= base_delay / 2.
         for base in [1u64, 2, 4, 8, 16, 30] {
             for _ in 0..20 {
                 let j = backoff_jitter(base);
@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn healthy_connection_resets_retry_logic() {
-        // #10: Verify the constant is reasonable
+        // Verify the constants are reasonable.
         assert_eq!(HEALTHY_CONNECTION_SECS, 60);
         assert_eq!(SHUTDOWN_TIMEOUT_SECS, 5);
     }

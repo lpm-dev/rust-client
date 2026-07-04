@@ -94,8 +94,8 @@ pub enum SpecifierParseError {
     InvalidJsrPackageName { pkg_name: String },
     #[error("JSR specifier '{specifier}' is missing a package name")]
     JsrMissingPackageName { specifier: String },
-    /// Defaults-fixes #2: input has a colon-shaped prefix that doesn't
-    /// match any known protocol. Pre-fix these fell through to
+    /// Input has a colon-shaped prefix that doesn't match any known
+    /// protocol. Earlier parser behavior fell through to
     /// SemverRange and produced a confusing downstream node_semver
     /// error; this surfaces the actual problem at the parser boundary
     /// with the supported set + a close-match suggestion when one
@@ -115,7 +115,7 @@ pub enum SpecifierParseError {
         prefix: String,
         suggestion: Option<String>,
     },
-    /// Defaults-fixes #2: input looks like a Windows drive-letter path
+    /// Input looks like a Windows drive-letter path
     /// (`C:\foo`, `c:/bar`). npm-style manifests express path
     /// dependencies via the `file:` prefix even on Windows; raw drive
     /// letters would otherwise hit the unknown-protocol path with
@@ -229,14 +229,14 @@ impl Specifier {
             return Ok(expand_github_shorthand(s));
         }
 
-        // Defaults-fixes #2: catch colon-shaped protocol prefixes that
-        // none of the parser arms above matched. Pre-fix `magic:bar`
-        // and `filee:./foo` fell through to SemverRange and produced a
+        // Catch colon-shaped protocol prefixes that none of the parser
+        // arms above matched. Earlier parser behavior let `magic:bar`
+        // and `filee:./foo` fall through to SemverRange and produced a
         // confusing downstream node_semver parse error; the guard
         // converts that into a clear `UnknownProtocol` at the parser
         // boundary with a close-match suggestion. Known-but-malformed
         // prefixes (e.g. `https:foo` without `//`) are left to fall
-        // through — different bug, not in scope for #2.
+        // through — different bug, outside this guard's scope.
         if let Some(err) = detect_unknown_protocol(s) {
             return Err(err);
         }
@@ -250,7 +250,7 @@ impl Specifier {
     }
 }
 
-// ── Unknown-protocol detection (defaults-fixes #2) ──────────────────────────
+// ── Unknown-protocol detection ──────────────────────────────────────────────
 
 /// Known protocol prefix tokens (the part before `:` only — `git+http`
 /// etc. counts as one token here even though the parser dispatches on
@@ -260,7 +260,7 @@ impl Specifier {
 /// 1. **Whitelist check** — if `prefix` matches one of these tokens
 ///    exactly, the parser's arms upstream should have matched. Reaching
 ///    the guard means a malformed-known-protocol shape (`https:foo` w/o
-///    `//`) — out of scope for #2, falls through to SemverRange.
+///    `//`) — outside this guard's scope, falls through to SemverRange.
 /// 2. **Suggestion source** — `closest_known_prefix` returns the
 ///    Levenshtein-nearest entry within distance 2 for "did you mean".
 ///
@@ -1452,7 +1452,7 @@ mod tests {
         ));
     }
 
-    // ── Unknown protocol guard (defaults-fixes #2) ───────────────────────────
+    // ── Unknown protocol guard ───────────────────────────────────────────────
     //
     // Pre-fix, any `magic:bar`-shaped input fell through to SemverRange and
     // produced a confusing downstream parse error from node_semver

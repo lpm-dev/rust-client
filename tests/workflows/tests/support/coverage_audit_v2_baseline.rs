@@ -1483,7 +1483,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "triage policy: greens auto-execute, ambers/reds block",
             "version-diff card surfaces on update",
             "trusted entries bypass scriptHash check",
-            "Rich-form trustedDependencies surfaces approved pkg as trusted (cross-flow #6)",
+            "Rich-form trustedDependencies surfaces approved pkg as trusted across the approval flow",
         ],
         failure_modes_known: &[
             "rebuild during a concurrent install",
@@ -2209,7 +2209,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios: 10,
         failure_modes_tested: &[
             "pull overwrites local state with remote environments",
-            "cross-machine push→pull plaintext byte-equality under shared wrapping key (flow #7)",
+            "cross-machine push→pull plaintext byte-equality under shared wrapping key",
             "pull-oidc writes env file with sorted + quoted values",
             "pull-oidc uses LPM_OIDC_TOKEN canonical + ignores CI_JOB_JWT_V2",
             "pull-oidc gitlab envelope shape locked (snapshot)",

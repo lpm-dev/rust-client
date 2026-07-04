@@ -1206,9 +1206,9 @@ mod tests {
     ///
     /// Routes through the same `acquire_env_override_lock` as the
     /// async wiremock tests so plain `cargo test` (parallel by default)
-    /// doesn't race this against them — a previous version held no
-    /// lock and reproduced GitHub rate-limit bleed-through during PR
-    /// #42 review.
+    /// doesn't race this against them — without the lock, concurrent
+    /// tests can hit the real GitHub rate limit through env-var
+    /// bleed-through.
     #[test]
     fn npm_registry_url_respects_override_env_var() {
         let _restore = acquire_env_override_lock();
@@ -1458,7 +1458,7 @@ mod tests {
     // `LPM_GITHUB_RELEASES_URL_OVERRIDE`). Under default `cargo test`
     // parallelism these races caused flakes — when two wiremock tests
     // ran concurrently they could swap each other's URLs mid-probe and
-    // hit the real registries. PR #42 review reproduced GitHub
+    // hit the real registries. The GitHub release probe can reproduce
     // rate-limit bleed-through in exactly this shape.
     //
     // Lock is a plain `std::sync::Mutex<()>` (held across `.await` in
