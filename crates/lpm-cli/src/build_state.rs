@@ -2471,8 +2471,7 @@ mod tests {
 
     #[test]
     fn slice1_advisor_approved_amber_excluded_from_blocked_set() {
-        // **Locked semantic (review finding Medium 1).** A package
-        // the advisor approves this run must NOT appear in the
+        // A package the advisor approves this run must NOT appear in the
         // blocked set written to `.lpm/build-state.json`. Without
         // this, post-install JSON + the "remain blocked after auto-
         // build" pointer would emit stale state for packages whose
@@ -2539,8 +2538,7 @@ mod tests {
         // NOT remove this install's package from the blocked set.
         // Without integrity in the key, the previous run's approval
         // on the registry copy could silently mask the workspace
-        // copy's blocked entry — the exact safety property finding
-        // High was about.
+        // copy's blocked entry.
         let project = tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
         let store = lpm_store::PackageStore::at(project.path().join("store"));

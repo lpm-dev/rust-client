@@ -4130,8 +4130,9 @@ mod tests {
     }
 
     #[test]
-    fn install_bare_with_no_packages_and_no_phase2_flags_parses() {
-        // Sanity: `lpm install` with no flags must still parse —         // does not break the bare-refresh path.
+    fn install_bare_with_no_packages_and_no_filters_parses() {
+        // Sanity: `lpm install` with no flags must still parse so this
+        // does not break the bare-refresh path.
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
             Commands::Install {
