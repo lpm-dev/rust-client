@@ -1,5 +1,4 @@
-//! End-to-end coverage for the unknown-protocol parser guard
-//! (defaults-fixes #2).
+//! End-to-end coverage for the unknown-protocol parser guard.
 //!
 //! Pre-fix, a `package.json` dependency entry with an unknown protocol
 //! (`magic:bar`, `filee:./foo`, ...) silently slipped through

@@ -12,7 +12,7 @@
 //!    runs.
 //! 2. **Allow-set DACL grants.** For each `--readable-dir` and
 //!    `--writable-dir` from the parent, walk the tree once (skipping
-//!    reparse points per the PR-1 contract) and add an inheritable
+//!    reparse points) and add an inheritable
 //!    DACL ACE granting the AppContainer SID the matching access
 //!    rights. ACEs are added with [`SetEntriesInAclW`], merged into
 //!    the existing DACL via [`GetNamedSecurityInfoW`] +
@@ -163,7 +163,7 @@ pub enum AppContainerError {
         win32_error: u32,
     },
     /// The supplied root path is a reparse point (symlink / junction).
-    /// PR-1 contract: refuse rather than silently follow.
+    /// Refuse rather than silently follow.
     #[error(
         "allow-set root {path} is a reparse point (symlink / junction / mount point); refusing to follow it because the DACL grant would apply to the reparse-point target, potentially outside the intended allow-set tree"
     )]
@@ -652,7 +652,7 @@ fn build_capability_attr(
 /// Apply an inheritable DACL ACE granting `sid` the given access
 /// mask to `root` and every existing descendant.
 ///
-/// **Reparse-point handling (PR-1 contract).** A reparse-point root
+/// **Reparse-point handling.** A reparse-point root
 /// (junction / symlink / mount point) is refused — `SetNamedSecurityInfoW`
 /// follows reparse points and would apply the grant to the
 /// reparse-point target, potentially outside the intended allow-set
@@ -687,7 +687,7 @@ fn grant_dacl_ace_to_tree(
             // Spec-derived entries are under the install pipeline's
             // control — a reparse-point root means the
             // `sandboxWriteDirs` / spec config points at a junction
-            // or symlink, which the PR-1 contract refuses to follow
+            // or symlink, which this path refuses to follow
             // (would apply the grant to the link's TARGET,
             // potentially outside the allow-set). Surface to the
             // user so they can fix their config.

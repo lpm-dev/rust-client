@@ -189,7 +189,7 @@ fn skills_validate_accepts_a_well_formed_skill() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     // Validator gates: (a) YAML frontmatter required (content must
     // start with `---`), (b) total content length >= 100 chars,
-    // (c) file size <= 15 KB. The pre-#72 test seeded a 40-char body
+    // (c) file size <= 15 KB. An earlier test seeded a 40-char body
     // with no frontmatter and still passed because the validator
     // unconditionally returned Ok — the fix to fail-closed exposed
     // the fixture gap. Rebuild the skill with all three constraints

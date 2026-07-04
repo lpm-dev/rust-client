@@ -514,7 +514,7 @@ fn apply_low_il_label(path: &Path) -> Result<(), SandboxError> {
         return Ok(());
     }
 
-    // PR-1 finding S1: refuse reparse-point roots.
+    // Refuse reparse-point roots.
     //
     // `set_low_il_label_on` uses the name-form `SetNamedSecurityInfoW`
     // which follows reparse points by default — labelling a junction
@@ -888,11 +888,9 @@ fn set_low_il_label_on(path: &Path, sacl_ptr: *mut ACL) -> Result<(), SandboxErr
 /// `IO_REPARSE_TAG_SYMLINK`. Directory junctions
 /// (`IO_REPARSE_TAG_MOUNT_POINT`, created by `mklink /J`) are NOT
 /// flagged. Mount points and several other reparse tags are also
-/// missed. The walk used `is_symlink()` and recursed
-/// through junctions, which is the gap PR-1 (finding S1)
-/// closes by switching the check to the `FILE_ATTRIBUTE_REPARSE_POINT`
-/// bit — set by the filesystem for every reparse-tagged object
-/// regardless of the specific tag.
+/// missed. Switching to the `FILE_ATTRIBUTE_REPARSE_POINT` bit closes
+/// that gap because the filesystem sets it for every reparse-tagged
+/// object regardless of the specific tag.
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
@@ -908,7 +906,7 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 /// trees (deeply nested `node_modules`, `.cache` with thousands of
 /// hashed subdirs) don't risk stack overflow.
 ///
-/// **Reparse-point skip (PR-1 finding S1).** Every entry
+/// **Reparse-point skip.** Every entry
 /// whose `FILE_ATTRIBUTE_REPARSE_POINT` bit is set — symbolic links,
 /// NTFS directory junctions, mount points, OneDrive placeholders — is
 /// skipped with a `tracing::debug!` line and not descended into.
@@ -2092,7 +2090,7 @@ mod tests {
         );
     }
 
-    // ── PR-1 (S1) — reparse-point hardening ───────────────
+    // ── Reparse-point hardening ───────────────────────────
 
     // Test-only windows-sys symbols. Kept inside `mod tests` so the
     // lib build doesn't carry these as unused imports.

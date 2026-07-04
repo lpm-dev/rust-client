@@ -98,7 +98,7 @@ fn parse_envelope_labeled(stdout: &[u8], stderr: &[u8], label: &str) -> serde_js
     })
 }
 
-// ─── Flow #2: install → patch → patch-commit → install ─────────────────
+// ─── install → patch → patch-commit → install ──────────────────────────
 //
 // catches: second install must re-apply the patch from disk + invalidate
 // the original store integrity in favor of the patched binding.
@@ -248,7 +248,7 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
     );
 }
 
-// ─── Flow #1: migrate → install → audit ─────────────────────────────────
+// ─── migrate → install → audit ─────────────────────────────────────────
 //
 // catches: migration produces a lockfile that audit can read; behavioral
 // analysis fires on installed packages, not on a synthesized lockfile-only
@@ -360,7 +360,7 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
     );
 }
 
-// ─── Flow #6: install → rebuild → approve-scripts → rebuild ─────────────
+// ─── install → rebuild → approve-scripts → rebuild ─────────────────────
 //
 // catches: first rebuild reports the blocked set; approve-scripts unblocks;
 // second rebuild actually executes the previously-blocked scripts.
@@ -486,7 +486,7 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
     assert_security_approval_scope(&out_approve, "trust-bulk-approve");
 }
 
-// ─── Flow #10: doctor --fix → install ───────────────────────────────────
+// ─── doctor --fix → install ─────────────────────────────────────────────
 //
 // catches: the fixes doctor applied actually produce a healthy state for
 // install; install does not re-trigger the same fixable issues.
@@ -587,7 +587,7 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
     );
 }
 
-// ─── Flow #3: add → install → graph ─────────────────────────────────────
+// ─── add → install → graph ──────────────────────────────────────────────
 //
 // catches: graph sees the freshly added dep without a manual lockfile
 // refresh; filter resolves the just-added member correctly.
@@ -674,7 +674,7 @@ async fn flow_add_install_graph_added_dep_visible() {
     );
 }
 
-// ─── Flow #4: install → upgrade --major → audit ─────────────────────────
+// ─── install → upgrade --major → audit ─────────────────────────────────
 //
 // catches: audit refreshes vuln data against the new major version, not
 // the cached pre-upgrade response.
@@ -807,7 +807,7 @@ async fn flow_install_upgrade_major_audit_picks_new_version() {
     );
 }
 
-// ─── Flow #5: token-rotate → publish --dry-run --check ──────────────────
+// ─── token-rotate → publish --dry-run --check ──────────────────────────
 //
 // catches: rotation invalidates the previously-stored bearer; the next
 // publish call picks up the new token from the same storage path.
@@ -886,7 +886,7 @@ async fn flow_token_rotate_publish_dry_run_picks_new_token() {
     }
 }
 
-// ─── Flow #9: publish --dry-run --check → publish (real) ────────────────
+// ─── publish --dry-run --check → publish (real) ────────────────────────
 //
 // catches: every concern --check surfaces (quality, OIDC eligibility,
 // registry routing) must match what the real publish actually does — no
@@ -961,7 +961,7 @@ async fn flow_publish_check_then_real_publish_agree_on_target() {
     );
 }
 
-// ─── Flow #8: install -g → run shimmed binary → uninstall -g ────────────
+// ─── install -g → run shimmed binary → uninstall -g ────────────────────
 //
 // catches: shim repair + PATH integration end-to-end. The cli-binary
 // survivor probes the shim creation; this flow probes the user-visible
@@ -1044,7 +1044,7 @@ async fn flow_install_g_run_uninstall_g_shim_lifecycle() {
         // tier owns this contract via `global_install_state_mutation.rs`;
         // this flow gracefully degrades when the shim isn't created.
         eprintln!(
-            "flow #8: install -g completed without writing a shim — skipping uninstall step.\n\
+            "global install flow completed without writing a shim — skipping uninstall step.\n\
              stdout: {}\nstderr: {}",
             String::from_utf8_lossy(&out_install.stdout),
             String::from_utf8_lossy(&out_install.stderr)
@@ -1075,7 +1075,7 @@ async fn flow_install_g_run_uninstall_g_shim_lifecycle() {
     );
 }
 
-// ─── Flow #7: env push → env pull on a different machine ────────────────
+// ─── env push → env pull on a different machine ────────────────────────
 //
 // catches: round-trip encryption — the pulled value matches the pushed
 // value byte-for-byte after device-key wrap/unwrap.
@@ -1327,7 +1327,7 @@ async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
     let core_install_hash_before = std::fs::read(core_dir.join(".lpm/install-hash")).ok();
 
     eprintln!(
-        "[plan#5 baseline] core lpm.lock={:?} lockb={:?} install_hash={:?}",
+        "[filter install baseline] core lpm.lock={:?} lockb={:?} install_hash={:?}",
         core_lock_before.as_ref().map(|b| b.len()),
         core_lockb_before.as_ref().map(|b| b.len()),
         core_install_hash_before.as_ref().map(|b| b.len())

@@ -349,7 +349,7 @@ async fn explicit_tarball_dependency_is_not_bound_to_registry_metadata() {
     );
 }
 
-/// **Plan #1 — `..` path entry must be rejected.**
+/// **Path traversal entries must be rejected.**
 ///
 /// Tarball includes a regular file whose path resolves above the
 /// extraction root after npm's `package/` prefix is stripped. The
@@ -401,7 +401,7 @@ async fn tarball_with_dot_dot_path_entry_is_rejected_by_install() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     eprintln!(
-        "[Plan#1 dotdot] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        "[dotdot traversal] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         output.status
     );
 
@@ -522,10 +522,9 @@ async fn tarball_with_case_fold_path_collision_is_rejected_by_install() {
     );
 }
 
-/// **Plan #3 — absolute-path entry is normalized to relative under the package dir.**
+/// **Absolute-path entries are normalized to relative paths under the package dir.**
 ///
-/// **Plan-vs-actual:** the plan's name said "rejected"; the
-/// extractor's actual behavior is to **normalize** an absolute-path
+/// The extractor's behavior is to **normalize** an absolute-path
 /// entry into a relative path under the package's `node_modules`
 /// directory. The mechanism is incidental but worth pinning:
 ///
@@ -589,7 +588,7 @@ async fn tarball_with_absolute_path_entry_is_normalized_to_relative_under_packag
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     eprintln!(
-        "[Plan#3 abspath-normalize] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        "[absolute-path normalize] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         output.status
     );
 
@@ -620,15 +619,14 @@ async fn tarball_with_absolute_path_entry_is_normalized_to_relative_under_packag
         .path()
         .join("node_modules/abspath-pkg/etc/lpm-pwned.txt");
     eprintln!(
-        "[Plan#3 abspath-normalize] normalized landing exists={}, path={normalized:?}",
+        "[absolute-path normalize] normalized landing exists={}, path={normalized:?}",
         normalized.exists()
     );
 }
 
-/// **Plan #2 — symlink to outside path is silently skipped (current behavior).**
+/// **Symlinks to outside paths are silently skipped (current behavior).**
 ///
-/// **Plan-vs-actual:** the plan's name said "rejected"; the
-/// extractor's actual contract is to **silently skip** any tar entry
+/// The extractor's contract is to **silently skip** any tar entry
 /// whose `header.entry_type()` is not `is_file()`. See
 /// [lib.rs:398](../../../crates/lpm-extractor/src/lib.rs#L398) — the
 /// regular-files-only branch swallows symlinks, hardlinks, FIFOs,
@@ -687,7 +685,7 @@ async fn tarball_with_symlink_to_outside_path_is_silently_skipped() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     eprintln!(
-        "[Plan#2 symlink-skip] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        "[symlink skip] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         output.status
     );
 
@@ -721,9 +719,9 @@ async fn tarball_with_symlink_to_outside_path_is_silently_skipped() {
     );
 }
 
-/// **Plan #5 — hard link to outside file is silently skipped (current behavior).**
+/// **Hard links to outside files are silently skipped (current behavior).**
 ///
-/// Same posture as #2: tar entry type 'Link' (`hardlink`) is not
+/// Same posture as the symlink case: tar entry type 'Link' (`hardlink`) is not
 /// `is_file()`, so the extractor's regular-files-only branch silently
 /// drops it. The install succeeds, no hardlink lands on disk.
 ///
@@ -768,7 +766,7 @@ async fn tarball_with_hard_link_to_outside_file_is_silently_skipped() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!(
-        "[Plan#5 hardlink-skip] status={:?}\nstderr:\n{stderr}",
+        "[hardlink skip] status={:?}\nstderr:\n{stderr}",
         output.status
     );
 
@@ -801,7 +799,7 @@ async fn tarball_with_hard_link_to_outside_file_is_silently_skipped() {
     );
 }
 
-/// **Plan #8 — setuid/setgid executable extracts with setuid bits stripped.**
+/// **Setuid/setgid executables extract with setuid bits stripped.**
 ///
 /// `set_preserve_permissions(false)` at [lib.rs:240](../../../crates/lpm-extractor/src/lib.rs#L240)
 /// disables tar's SUID-bit preservation. Subsequent post-write
@@ -847,7 +845,7 @@ async fn tarball_with_setuid_executable_extracts_with_setuid_bit_stripped() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!(
-        "[Plan#8 setuid-strip] status={:?}\nstderr:\n{stderr}",
+        "[setuid strip] status={:?}\nstderr:\n{stderr}",
         output.status
     );
 
@@ -902,7 +900,7 @@ async fn tarball_with_setuid_executable_extracts_with_setuid_bit_stripped() {
 
 // ──────────────────────────────────────────────────────────────────────
 
-/// **Plan #4 — Unicode-bearing entry path is taken as literal bytes, not normalized.**
+/// **Unicode-bearing entry paths are taken as literal bytes, not normalized.**
 ///
 /// The extractor's `Component::ParentDir` check at
 /// [lib.rs:347](../../../crates/lpm-extractor/src/lib.rs#L347) compares
@@ -927,8 +925,7 @@ async fn tarball_with_setuid_executable_extracts_with_setuid_bit_stripped() {
 /// path-component layer. The bytes become a normal filename. The
 /// only Unicode-trick that COULD escape would be one whose bytes
 /// are byte-identical to ASCII `..` at the OS layer — by
-/// construction, that's the regular `..` case (Plan #1), already
-/// pinned.
+/// construction, that's the regular `..` case, already pinned.
 ///
 /// Pin the no-escape contract: outside sentinel byte-identical, the
 /// extracted file (if any) lives strictly under
@@ -968,7 +965,7 @@ async fn tarball_with_unicode_lookalike_parent_dir_extracts_safely_as_literal_by
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     eprintln!(
-        "[Plan#4 unicode-literal] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        "[unicode literal] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         output.status
     );
 
@@ -1011,7 +1008,7 @@ async fn tarball_with_unicode_lookalike_parent_dir_extracts_safely_as_literal_by
     let pkg_dir = project.path().join("node_modules/unicode-pkg");
     let unicode_subdir = pkg_dir.join("．．");
     eprintln!(
-        "[Plan#4 unicode-literal] unicode_subdir_exists={} pkg_dir_exists={} files_under_pkg={:?}",
+        "[unicode literal] unicode_subdir_exists={} pkg_dir_exists={} files_under_pkg={:?}",
         unicode_subdir.exists(),
         pkg_dir.exists(),
         pkg_dir
@@ -1021,13 +1018,13 @@ async fn tarball_with_unicode_lookalike_parent_dir_extracts_safely_as_literal_by
     );
 }
 
-/// **Plan #6 — character-device entry is silently skipped (POSIX-only).**
+/// **Character-device entries are silently skipped (POSIX-only).**
 ///
 /// Tarball entry type `EntryType::Char` (or `Block`) is not
 /// `is_file()`, so the extractor's regular-files-only branch at
 /// [lib.rs:398](../../../crates/lpm-extractor/src/lib.rs#L398)
 /// silently drops it. Same posture as the symlink/hardlink tests
-/// in phase 1.
+/// above.
 ///
 /// Defensible: npm packages don't legitimately ship device files.
 /// Silent-skip avoids ever materializing a /dev/null-like entry
@@ -1069,7 +1066,7 @@ async fn tarball_with_character_device_entry_is_silently_skipped() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!(
-        "[Plan#6 chardev-skip] status={:?}\nstderr:\n{stderr}",
+        "[character-device skip] status={:?}\nstderr:\n{stderr}",
         output.status
     );
 
@@ -1092,10 +1089,10 @@ async fn tarball_with_character_device_entry_is_silently_skipped() {
     );
 }
 
-/// **Plan #7 — FIFO entry is silently skipped (POSIX-only).**
+/// **FIFO entries are silently skipped (POSIX-only).**
 ///
 /// Tarball entry type `EntryType::Fifo` is not `is_file()`. Same
-/// silent-skip posture as #6 (character device). Pinned for
+/// silent-skip posture as the character-device case. Pinned for
 /// completeness so a future regression that flips the gate (e.g.,
 /// `EntryType::Fifo` accidentally treated as Regular) is detected
 /// here.
@@ -1127,10 +1124,7 @@ async fn tarball_with_fifo_entry_is_silently_skipped() {
         .expect("run install");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    eprintln!(
-        "[Plan#7 fifo-skip] status={:?}\nstderr:\n{stderr}",
-        output.status
-    );
+    eprintln!("[fifo skip] status={:?}\nstderr:\n{stderr}", output.status);
 
     assert!(
         output.status.success(),
@@ -1149,7 +1143,7 @@ async fn tarball_with_fifo_entry_is_silently_skipped() {
     );
 }
 
-/// **Plan #9 — zero-byte regular file extracts as an empty file (sanity).**
+/// **Zero-byte regular files extract as empty files (sanity).**
 ///
 /// Pure sanity check that the size-0 edge case isn't swallowed by
 /// the size-limit / hardening branches. Many npm packages ship
@@ -1182,10 +1176,7 @@ async fn tarball_with_zero_byte_regular_file_extracts_as_empty_file() {
         .expect("run install");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    eprintln!(
-        "[Plan#9 zero-byte] status={:?}\nstderr:\n{stderr}",
-        output.status
-    );
+    eprintln!("[zero-byte] status={:?}\nstderr:\n{stderr}", output.status);
 
     assert!(
         output.status.success(),
@@ -1212,7 +1203,7 @@ async fn tarball_with_zero_byte_regular_file_extracts_as_empty_file() {
     );
 }
 
-/// **Plan #10 — entry path with a single 300-byte component fails cleanly.**
+/// **Entry paths with a single 300-byte component fail cleanly.**
 ///
 /// POSIX `NAME_MAX` is 255 on most filesystems (ext4/APFS/HFS+);
 /// Windows `MAX_PATH` is 260 by default. A single 300-byte path
@@ -1267,7 +1258,7 @@ async fn tarball_with_single_path_component_exceeding_name_max_fails_cleanly() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     eprintln!(
-        "[Plan#10 long-path] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        "[long-path] status={:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         output.status
     );
 

@@ -5132,7 +5132,7 @@ mod tests {
     fn tunnel_inspect_port_default_is_none() {
         // No `--inspect-port` → `None` → call site auto-picks via bind(0).
         // Distinguishing "user didn't pass" from "user passed 4400" is the
-        // contract change behind #16.
+        // contract this test protects.
         let cli = Cli::try_parse_from(["lpm", "tunnel", "3000"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
             Commands::Tunnel { inspect_port, .. } => {

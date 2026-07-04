@@ -3061,7 +3061,7 @@ async fn run_with_options_under_store_lock(
                 // Post-resolution peer dependency check: warn about unmet peers
                 // using each package's actual selected version (not a union).
                 //
-                // #33: peer rules from `package.json > lpm.peerDependencyRules`
+                // Peer rules from `package.json > lpm.peerDependencyRules`
                 // (translated from `pnpm.peerDependencyRules` by `lpm migrate`)
                 // are compiled once and applied inside the warning loop.
                 // `ignore_missing` suppresses missing-peer warnings,

@@ -59,8 +59,8 @@ fn isolated_project_with_package_json() -> (TempDir, TempDir) {
     (project, lpm_home)
 }
 
-/// One row of the matrix below. Each row pins both contracts (#76
-/// envelope universality, #73 exit-code mirror) on one arm-body
+/// One row of the matrix below. Each row pins both contracts
+/// (envelope universality and exit-code mirror) on one arm-body
 /// shape that the outer-wrap fix must handle uniformly.
 struct DispatchCase {
     /// Stable identifier surfaced in assertion failure messages — the
