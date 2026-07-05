@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use lpm_linker::MaterializedPackage;
 
 use super::*;
 
@@ -44,6 +45,9 @@ pub(super) struct V2LinkTaskResult {
     pub(super) ms: u128,
     pub(super) timings: lpm_store::v2::LinkEntryTimings,
 }
+
+pub(super) type LinkHandle =
+    tokio::task::JoinHandle<Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>>;
 
 pub(super) type V2LinkHandle = tokio::task::JoinHandle<Result<V2LinkTaskResult, LpmError>>;
 

@@ -6,7 +6,7 @@ use crate::patch_state;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
+use lpm_linker::LinkTarget;
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
     CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,
@@ -1888,11 +1888,7 @@ async fn run_with_options_under_store_lock(
     // Collection of per-package link handles. Cached packages push into this
     // before the fetch loop; fetch tasks push as each tarball materializes.
     // Awaited during the link-finalize step below.
-    let mut event_link_handles: Vec<
-        tokio::task::JoinHandle<
-            Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
-        >,
-    > = Vec::new();
+    let mut event_link_handles: Vec<LinkHandle> = Vec::new();
 
     // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
     // CAS-backed target arrives with both
@@ -2990,9 +2986,6 @@ async fn run_with_options_under_store_lock(
             let fetch_extract_limiter_c = fetch_extract_limiter.clone();
 
             handles.push(tokio::spawn(async move {
-                type LinkHandle = tokio::task::JoinHandle<
-                    Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
-                >;
                 // v2-shaped link handle. Mutually exclusive with `LinkHandle`
                 // at runtime: under v2_mode,
                 // `event_link` is false (so `LinkHandle` is always None);
@@ -3400,144 +3393,37 @@ async fn run_with_options_under_store_lock(
     // human output is intentionally quiet here — the persistent
     // `› Installing N packages` line above already narrates this phase.
 
-    // Link targets were already built before the fetch loop so the
-    // event-driven path could dispatch per-package link work during fetch.
-    // No-op here to keep the surrounding structure stable.
-    let _ = &link_targets; // retained for downstream consumers below
-
-    // Step 5: Link into node_modules
-    let wf_link_start_ms = start.elapsed().as_millis();
-    let link_start = Instant::now();
-    // Split of `link_ms` on the v2 event-driven path: time spent awaiting
-    // per-package materialization tasks that spilled past fetch vs the
-    // serial finalize pass (top-level symlinks + bin linking). Zero on the
-    // other link paths.
-    let mut wf_link_await_ms = 0u128;
-    let mut wf_link_finalize_ms = 0u128;
-    let mut wf_link_reconcile_ms = 0u128;
-    let mut wf_link_root_symlinks_ms = 0u128;
-    let mut wf_link_compatibility_ms = 0u128;
-    let mut wf_link_bin_shims_ms = 0u128;
-
-    let mut link_result = if event_driven_link {
-        // Event-driven path: per-package tasks were spawned inside the fetch
-        // loop and for each cached package before the loop. Await them here,
-        // aggregate counters, then run final project wiring via
-        // `link_finalize`. `link_ms` measures only the tail: any per-package
-        // link task still running past `fetch_ms` plus the final finalize
-        // pass. Well-overlapped installs show a near-zero link_ms.
-        let mut linked_count = 0usize;
-        let mut skipped_count = 0usize;
-        let mut symlinked_count = 0usize;
-        let mut materialized_all: Vec<MaterializedPackage> =
-            Vec::with_capacity(event_link_handles.len());
-
-        for lh in event_link_handles.drain(..) {
-            let (m, r) = lh
-                .await
-                .map_err(|e| LpmError::Registry(format!("link task panicked: {e}")))??;
-            materialized_all.push(m);
-            if r.linked {
-                linked_count += 1;
-            } else {
-                skipped_count += 1;
-            }
-            symlinked_count += r.symlinks_created;
-        }
-
-        let finalize = lpm_linker::link_finalize(project_dir, &link_targets, pkg.name.as_deref())?;
-        symlinked_count += finalize.symlinks_created;
-
-        LinkResult {
-            linked: linked_count,
-            symlinked: symlinked_count,
-            bin_linked: finalize.bin_count,
-            skipped: skipped_count,
-            self_referenced: finalize.self_referenced,
-            materialized: materialized_all,
-        }
-    } else if v2_mode {
-        let store_v2 = store_v2_handle
-            .as_deref()
-            .expect("v2_mode implies v2 store handle is available");
-        let v2_targets = build_v2_targets(&packages, &link_targets)?;
-
-        // When `v2_event_driven` was true, `link_v2_prepare` already
-        // ran above and per-package `link_v2_one` tasks were spawned
-        // by the cache-hit short-circuits and the fetch tasks.
-        // Here we just await those handles, run `link_v2_finalize`,
-        // and assemble the same `LinkResult` shape `link_packages_v2`
-        // would have produced. The serial fallback below handles installs
-        // that didn't pass the gate, such as `Source::Tarball` TOFU before
-        // the SRI is known.
-        if v2_event_driven {
-            let plan = v2_plan
-                .as_ref()
-                .expect("v2_event_driven implies v2_plan is Some");
-            let mut materialized_all: Vec<MaterializedPackage> =
-                Vec::with_capacity(v2_event_link_handles.len());
-            let mut linked_count = 0usize;
-            let link_await_start = Instant::now();
-            for h in v2_event_link_handles.drain(..) {
-                let task = h
-                    .await
-                    .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))??;
-                let package_display = timing_detail_mode
-                    .trace()
-                    .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
-                v2_link_task_timings.record(task.ms, task.freshly_populated);
-                if let Some(package_display) = package_display.as_deref() {
-                    slow_package_timings.record_link_v2_one(package_display, task.ms, task.timings);
-                }
-                if task.freshly_populated {
-                    linked_count += 1;
-                }
-                materialized_all.push(task.materialized);
-            }
-            wf_link_await_ms = link_await_start.elapsed().as_millis();
-            let link_finalize_start = Instant::now();
-            let finalize =
-                lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, pkg.name.as_deref())?;
-            wf_link_finalize_ms = link_finalize_start.elapsed().as_millis();
-            wf_link_reconcile_ms = finalize.reconcile_ms;
-            wf_link_root_symlinks_ms = finalize.root_symlinks_ms;
-            wf_link_compatibility_ms = finalize.compatibility_ms;
-            wf_link_bin_shims_ms = finalize.bin_shims_ms;
-            let target_total = plan.augmented_targets.len();
-            LinkResult {
-                linked: linked_count,
-                symlinked: finalize.symlinked,
-                bin_linked: finalize.bin_count,
-                skipped: target_total.saturating_sub(linked_count),
-                self_referenced: finalize.self_referenced,
-                materialized: materialized_all,
-            }
-        } else {
-            lpm_linker::v2::link_packages_v2_with_compatibility_bin_names(
-                project_dir,
-                v2_targets,
-                store_v2,
-                linker_mode,
-                pkg.name.as_deref(),
-                compatibility_bin_names,
-            )?
-        }
-    } else {
-        match linker_mode {
-            lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
-                project_dir,
-                &link_targets,
-                force,
-                pkg.name.as_deref(),
-            )?,
-            lpm_linker::LinkerMode::Isolated => {
-                lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
-            }
-        }
-    };
-
-    let link_ms = link_start.elapsed().as_millis();
-    let wf_link_end_ms = start.elapsed().as_millis();
+    let link_phase = run_online_link_phase(OnlineLinkPhaseInput {
+        start,
+        project_dir,
+        package_name: pkg.name.as_deref(),
+        packages: &packages,
+        link_targets: &link_targets,
+        event_driven_link,
+        event_link_handles,
+        v2_mode,
+        store_v2: store_v2_handle.as_deref(),
+        v2_event_driven,
+        v2_plan: v2_plan.as_deref(),
+        v2_event_link_handles,
+        v2_link_task_timings: &mut v2_link_task_timings,
+        slow_package_timings: &mut slow_package_timings,
+        timing_detail_mode,
+        linker_mode,
+        force,
+        compatibility_bin_names,
+    })
+    .await?;
+    let mut link_result = link_phase.link_result;
+    let link_ms = link_phase.link_ms;
+    let wf_link_start_ms = link_phase.waterfall_start_ms;
+    let wf_link_end_ms = link_phase.waterfall_end_ms;
+    let wf_link_await_ms = link_phase.await_ms;
+    let wf_link_finalize_ms = link_phase.finalize_ms;
+    let wf_link_reconcile_ms = link_phase.reconcile_ms;
+    let wf_link_root_symlinks_ms = link_phase.root_symlinks_ms;
+    let wf_link_compatibility_ms = link_phase.compatibility_ms;
+    let wf_link_bin_shims_ms = link_phase.bin_shims_ms;
     let mut wf_tail_blocked_metadata_ms = 0u128;
     let wf_tail_trust_snapshot_ms;
     // `link_ms` lands in the verbose footer and the JSON timing object;
