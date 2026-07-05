@@ -2,7 +2,7 @@
 	"name": "lpm-bun-large-fixture",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 49 F2 bench fixture. 21 direct deps → ~266 transitive packages — the 'webpack-adjacent mix' the Phase 49 ship gate anchors on. Pinned at commit time so future perf phases can reproduce against a fixed artifact rather than rebuilding from memory. See DOCS/new-features/37-rust-client-RUNNER-VISION-phase49-streaming-resolver-preplan.md §10.1 for the bench methodology.",
+	"_comment": "Large install benchmark fixture. 21 direct deps → ~266 transitive packages — the webpack-adjacent mix used for install-path performance measurements. Pinned so future perf runs can reproduce against a fixed artifact rather than rebuilding from memory.",
 	"dependencies": {
 		"lodash": "^4.17.21",
 		"axios": "^1.7.0",

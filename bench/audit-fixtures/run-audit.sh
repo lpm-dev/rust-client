@@ -16,7 +16,6 @@ FIXTURE_DIR="$HERE/$FIXTURE_REL"
 RESULTS_DIR="$HERE/results"
 source "$REPO_ROOT/bench/audit-install-args.sh"
 
-# confidence-followup — Windows portability.
 # On Git Bash (Windows-latest runner), the binary lands at
 # `target/release/lpm-rs.exe` and `/tmp` resolves to the host's MSYS
 # tmp dir (per-user, not shared) which is fine. Auto-append `.exe` and

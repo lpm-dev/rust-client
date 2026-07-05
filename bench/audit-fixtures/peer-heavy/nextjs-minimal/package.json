@@ -2,7 +2,7 @@
 	"name": "audit-fixture-nextjs-minimal",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: Next.js + React. Next has the deepest peer-dep chain of the major JS frameworks. Originally also pulled eslint-config-next for plugin-chain coverage, but that depends on @rushstack/eslint-patch which doesn't support ESLint 9 — fixture-ecosystem incompatibility, not an lpm bug. ESLint plugin-chain coverage is provided by tooling/eslint-flat-config, which uses ESLint 9 directly without the rushstack patch layer.",
+	"_comment": "Hoisted compatibility audit. Peer-heavy fixture: Next.js + React. Next has the deepest peer-dep chain of the major JS frameworks. Originally also pulled eslint-config-next for plugin-chain coverage, but that depends on @rushstack/eslint-patch which doesn't support ESLint 9 — fixture-ecosystem incompatibility, not an lpm bug. ESLint plugin-chain coverage is provided by tooling/eslint-flat-config, which uses ESLint 9 directly without the rushstack patch layer.",
 	"dependencies": {
 		"next": "^14.2.0",
 		"react": "^18.3.0",

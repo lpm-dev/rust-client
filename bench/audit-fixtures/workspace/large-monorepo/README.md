@@ -3,17 +3,16 @@
 **Tests:** workspace correctness at 10 members (3.3× `monorepo-basic`)
 with a multi-level internal cross-dep DAG, plus shared externals.
 
-**Risk model:** the followup doc's §2g — "O(N²) hoisting decisions
-might surface at scale; large workspace symlink count might trip
-path-walk limits." `monorepo-basic` covers the 3-member happy-path;
-this fixture is the same shape but pushed to where mode-specific
-asymmetric behavior is more likely to materialize (more wrappers
-under isolated, more top-level entries under hoisted, denser symlink
-graph either way). Externals (lodash, chalk) sit at the root and must
-resolve from inside a deep workspace member via Node's walk-up — that
-exercises the layout's ability to keep externals reachable from
-workspace consumers under both linker modes simultaneously with the
-internal DAG.
+**Risk model:** O(N²) hoisting decisions might surface at scale, and
+large workspace symlink counts might trip path-walk limits.
+`monorepo-basic` covers the 3-member happy path; this fixture is the
+same shape but pushed to where mode-specific asymmetric behavior is more
+likely to materialize (more wrappers under isolated, more top-level
+entries under hoisted, denser symlink graph either way). Externals
+(lodash, chalk) sit at the root and must resolve from inside a deep
+workspace member via Node's walk-up, which exercises the layout's ability
+to keep externals reachable from workspace consumers under both linker
+modes simultaneously with the internal DAG.
 
 **DAG shape:**
 

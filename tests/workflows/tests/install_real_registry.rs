@@ -1,8 +1,8 @@
 //! Real-registry smoke test for `lpm install` using a local Verdaccio.
 //!
-//! This is the first phase-65.1 slice: publish a package to a real npm
-//! registry process, install it through a project `.npmrc`, and assert the
-//! lockfile records the actual registry mirror URL rather than npmjs.org.
+//! Publishes a package to a real npm registry process, installs it through a
+//! project `.npmrc`, and asserts the lockfile records the actual registry
+//! mirror URL rather than npmjs.org.
 
 mod support;
 

@@ -3,7 +3,7 @@
 	"version": "1.0.0",
 	"private": true,
 	"main": "./index.js",
-	"_comment": "Phase 66 confidence-followup §2d. Tests lpm's self-reference symlink (`node_modules/<self_name>` → project root) under both linker modes. lpm-linker creates this in Phase 3.5 (lib.rs `create_self_ref`) so a package can `require('itself')` and `require('itself/some/sub/path')` from its own source — a feature SE-0292/Node both support and that monorepo apps lean on for cleaner internal imports. Risk: hoisted's flat node_modules might race with a same-named published dep that gets hoisted to top-level first, displacing the self-ref symlink. There's no real-named dep that collides with `audit-fixture-self-ref-pkg` (synthetic name), but the smoke also pulls in lodash (a published dep) so the layout has at least one external sibling to verify the self-ref doesn't get clobbered by hoisting.",
+	"_comment": "Tests lpm's self-reference symlink (`node_modules/<self_name>` → project root) under both linker modes. lpm-linker creates this via `create_self_ref` so a package can `require('itself')` and `require('itself/some/sub/path')` from its own source — a feature SE-0292/Node both support and that monorepo apps lean on for cleaner internal imports. Risk: hoisted's flat node_modules might race with a same-named published dep that gets hoisted to top-level first, displacing the self-ref symlink. There's no real-named dep that collides with `audit-fixture-self-ref-pkg` (synthetic name), but the smoke also pulls in lodash (a published dep) so the layout has at least one external sibling to verify the self-ref doesn't get clobbered by hoisting.",
 	"dependencies": {
 		"lodash": "^4.17.21"
 	}

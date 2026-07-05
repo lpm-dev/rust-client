@@ -1,9 +1,8 @@
 #!/bin/bash
-# confidence-followup — run the generated top-N fixtures
-# in parallel and emit a consolidated summary. Wrapper around
-# bench/audit-fixtures/run-audit.sh; reuses the existing single-fixture
-# harness so the smoke contract stays consistent across audit + top-N
-# tiers.
+# Run the generated top-N fixtures in parallel and emit a consolidated
+# summary. Wrapper around bench/audit-fixtures/run-audit.sh; reuses the
+# existing single-fixture harness so the smoke contract stays consistent
+# across audit + top-N tiers.
 #
 # Parallelism: defaults to 4 concurrent fixtures. Override with
 # LPM_TOP_NPM_PARALLEL=N. Each parallel slot needs ~30 MB of network

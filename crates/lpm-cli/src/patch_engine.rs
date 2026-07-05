@@ -282,10 +282,10 @@ fn is_dist_tag(v: &str) -> bool {
 /// registry + tarball-URL — see [`PackageKey`] regression coverage at
 /// `lpm-lockfile/src/lib.rs`'s
 /// `find_package_by_key_disambiguates_cross_source_collisions`) is a
-/// failure mode of the persisted-key shape (which is `name@version`
-/// only, no `source_id` — see "Explicitly out of scope" in
-/// `private/patch.md`). Rather than silently pick one side, refuse
-/// with an explicit "this codebase has multiple sources for X" error.
+/// failure mode of the persisted-key shape, which is `name@version`
+/// only and does not carry `source_id`. Rather than silently pick one
+/// side, refuse with an explicit "this codebase has multiple sources for
+/// X" error.
 ///
 /// Range selectors filter the candidate set by `lpm_semver::VersionReq::matches`
 /// before disambiguation runs.
@@ -370,10 +370,9 @@ pub fn resolve_patch_selector(
                      (or narrow with `lpm patch {name}@^<version>`)"
                 )
             } else {
-                // Single version under multiple sources — the persisted-
-                // key shape can't distinguish them. Refuse rather than
-                // silently pick one (see "Explicitly out of scope" in
-                // private/patch.md).
+                // Single version under multiple sources — the persisted-key
+                // shape can't distinguish them. Refuse rather than silently
+                // pick one.
                 format!(
                     "this project has multiple sources for `{name}@{}`. \
                      `lpm.patchedDependencies` keys are `name@version` \
@@ -1528,10 +1527,8 @@ mod tests {
     }
 
     /// **Cross-source collision** — same `(name, version)` under two
-    /// distinct `source_id`s. The persisted-key shape can't
-    /// distinguish them, so the selector refuses rather than silently
-    /// picking one (see "Explicitly out of scope" in
-    /// `private/patch.md`).
+    /// distinct `source_id`s. The persisted-key shape can't distinguish them,
+    /// so the selector refuses rather than silently picking one.
     ///
     /// Mirrors the regression coverage at
     /// `lpm-lockfile/src/lib.rs::find_package_by_key_disambiguates_cross_source_collisions`.
@@ -2151,10 +2148,9 @@ mod tests {
 
     #[test]
     fn verify_integrity_fails_when_no_store_entry_resolvable() {
-        // confidence-followup S2: with the v2-aware lookup,
-        // a v1 dir present but missing `.integrity` is treated as "no
-        // resolvable baseline" — same outcome as v1+v2 both empty —
-        // because `find_installed_package_baseline` only returns Some
+        // With the v2-aware lookup, a v1 dir present but missing `.integrity`
+        // is treated as "no resolvable baseline", the same outcome as v1+v2
+        // both empty, because `find_installed_package_baseline` only returns Some
         // when an integrity is recoverable. The user-facing error
         // wording shifted from "missing .integrity" to "no v1 or v2
         // store entry"; both convey the same actionable next step

@@ -1,17 +1,14 @@
 # top-npm-audit — long-tail npm package install audit
 
-Closes Phase 66 confidence-followup §1b. Generates a fixture
-per package in [`top-100.txt`](./top-100.txt), runs each
-under both isolated and hoisted modes, and reports any
-mode-asymmetric outcomes.
+Generates a fixture per package in [`top-100.txt`](./top-100.txt), runs each
+under both isolated and hoisted modes, and reports any mode-asymmetric
+outcomes.
 
 ## Why this exists
 
-The curated `bench/audit-fixtures` suite tests ~30 representative
-dep-graph shapes. This suite tests **breadth at scale** — long-tail
-breakage that only surfaces with real-world download volume. Together
-they form the §1b coverage tier described in
-[the confidence-followup doc](../../DOCS/new-features/37-rust-client-RUNNER-VISION-phase66-confidence-followup.md).
+The curated `bench/audit-fixtures` suite tests representative dep-graph
+shapes. This suite tests **breadth at scale**: long-tail breakage that only
+surfaces with real-world download volume.
 
 ## Usage
 

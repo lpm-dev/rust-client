@@ -1052,9 +1052,9 @@ async fn resolve_with_prefetch_retries_until_all_conflicts_are_split() {
 /// ajv@^6; ajv@8 and ajv@6 each declare DIFFERENT json-schema-traverse
 /// version ranges.
 ///
-/// bun resolves this fine — two ajv's coexist in node_modules (top-
-/// level ajv@8 + nested eslint/node_modules/ajv@6), each with its own
-/// json-schema-traverse.
+/// A hoisted layout can resolve this by keeping two ajv versions in
+/// node_modules: top-level ajv@8 plus nested eslint/node_modules/ajv@6,
+/// each with its own json-schema-traverse.
 ///
 /// Before the fix, lpm's pubgrub concluded NoSolution because the
 /// split-retry logic could split `ajv` into `ajv[<root>]` vs

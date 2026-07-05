@@ -91,10 +91,9 @@ thiserror = "2"
 
 # Hashing & crypto
 sha2 = "0.10"
-# Phase 66 Phase 4a: BLAKE3 for v2 store graph-key derivation. ~3× faster
-# than SHA-256 on common hardware; runs once per resolved package per
-# install (hot path, post-resolution). Not used for content-integrity
-# (that stays SHA-512 SRI per registry contract).
+# BLAKE3 is used for v2 store graph-key derivation. It is much faster than
+# SHA-256 on common hardware and runs once per resolved package per install.
+# Content integrity remains SHA-512 SRI per the registry contract.
 blake3 = "1"
 base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -142,19 +141,19 @@ secrecy = "0.10"
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
 # p384 for Fulcio root chain verification: Sigstore's Fulcio roots are
 # ECDSA P-384 with SHA-384, while leaf certs are P-256 (per the
-# profile). C1 Phase 1.3 verifies both link types.
+# profile). Verification covers both link types.
 p384 = { version = "0.13", features = ["ecdsa", "pem"] }
 elliptic-curve = { version = "0.13", features = ["sec1"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 
 # Interactive prompts & terminal UI
 cliclack = "0.3"
-# Phase 58.3 (mTLS) — encrypted PKCS#8 private-key decryption.
-# Pure-Rust (RustCrypto), no openssl transitive dep.
+# Encrypted PKCS#8 private-key decryption for mTLS.
+# Pure-Rust (RustCrypto), no OpenSSL transitive dependency.
 # Features: pkcs5 + encryption for the EncryptedPrivateKeyInfo API,
 # pem for PEM I/O (decode_vec / encode_string / PemLabel).
 pkcs8 = { version = "0.10", features = ["pkcs5", "encryption", "pem"] }
-# Phase 58.3 (mTLS) — TTY passphrase prompt for encrypted keyfiles.
+# TTY passphrase prompt for encrypted mTLS keyfiles.
 rpassword = "7"
 
 # Browser open
@@ -180,14 +179,14 @@ hex = "0.4"
 rmp-serde = "1"
 filetime = "0.2"
 
-# Phase 32 Phase 6: unified-diff generation + strict apply for `lpm patch`.
+# Unified-diff generation and strict apply for `lpm patch`.
 # Pure-Rust, GNU patch format, no fuzzy matching by default.
 diffy = "0.4"
 
-# Phase 46 P2: POSIX shell tokenizer for the Layer 1 static-gate
-# classifier. Pure-Rust, no dependencies, understands standard shell
-# quoting so `lpm-security::static_gate` can split script bodies into
-# argv without spawning a real shell.
+# POSIX shell tokenizer for the static-gate classifier. Pure-Rust, no
+# dependencies, understands standard shell quoting so
+# `lpm-security::static_gate` can split script bodies into argv without
+# spawning a real shell.
 shlex = "1.3"
 
 [profile.release]

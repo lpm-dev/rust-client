@@ -2,7 +2,7 @@
 	"name": "audit-fixture-cyclic-deps",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 66 confidence-followup §2e. Two workspace members declare each other as dependencies, producing an A→B→A cycle. Risk: Node's CommonJS handles cycles via partial-export semantics (the second require returns whatever the first module has exported so far — possibly an empty object). Hoisted's flat layout doesn't change that algorithm, but if workspace symlink wiring routes cycle-b's require('audit-cycle-a') through a different physical path than cycle-a's own load, Node's module cache miss-matches and the cycle deadlocks or returns wrong values. Both members are listed at root because lpm's v1 resolver does not recurse into workspace member dependencies (same shape as monorepo-basic).",
+	"_comment": "Two workspace members declare each other as dependencies, producing an A→B→A cycle. Risk: Node's CommonJS handles cycles via partial-export semantics (the second require returns whatever the first module has exported so far — possibly an empty object). Hoisted's flat layout doesn't change that algorithm, but if workspace symlink wiring routes cycle-b's require('audit-cycle-a') through a different physical path than cycle-a's own load, Node's module cache miss-matches and the cycle deadlocks or returns wrong values. Both members are listed at root because lpm's v1 resolver does not recurse into workspace member dependencies (same shape as monorepo-basic).",
 	"dependencies": {
 		"audit-cycle-a": "workspace:*",
 		"audit-cycle-b": "workspace:*"

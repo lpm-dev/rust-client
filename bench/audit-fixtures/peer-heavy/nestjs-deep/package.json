@@ -2,7 +2,7 @@
 	"name": "audit-fixture-nestjs-deep",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: NestJS has the deepest peer-dep chain in mainstream backend Node. @nestjs/common, @nestjs/core, reflect-metadata, rxjs — all interconnected via peers. Decorator-based DI relies on metadata reflection working consistently across packages; a hoisting bug that gives different rxjs or reflect-metadata instances to different parts of the chain breaks DI silently.",
+	"_comment": "Hoisted compatibility audit. Peer-heavy fixture: NestJS has the deepest peer-dep chain in mainstream backend Node. @nestjs/common, @nestjs/core, reflect-metadata, rxjs — all interconnected via peers. Decorator-based DI relies on metadata reflection working consistently across packages; a hoisting bug that gives different rxjs or reflect-metadata instances to different parts of the chain breaks DI silently.",
 	"dependencies": {
 		"@nestjs/common": "^10.4.0",
 		"@nestjs/core": "^10.4.0",

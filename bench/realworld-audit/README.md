@@ -1,11 +1,11 @@
 # Real-world project audit
 
-Closes Phase 66 confidence-followup §1a. Companion to `bench/audit-fixtures` —
-where the fixture suite tests **isolated dep-graph shapes** (one risk
-per fixture), this suite tests **whole real-world projects** end to
-end. Same mode-asymmetric signal: `PASS/FAIL` or `FAIL/PASS` between
-isolated and hoisted is a regression; symmetric failures are upstream
-ecosystem incompat or lpm bugs equally on both modes.
+Companion to `bench/audit-fixtures`: where the fixture suite tests
+**isolated dep-graph shapes** (one risk per fixture), this suite tests
+**whole real-world projects** end to end. Same mode-asymmetric signal:
+`PASS/FAIL` or `FAIL/PASS` between isolated and hoisted is a regression;
+symmetric failures are upstream ecosystem incompat or lpm bugs equally on
+both modes.
 
 ## Usage
 

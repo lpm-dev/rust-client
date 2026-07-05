@@ -2,7 +2,7 @@
 	"name": "audit-fixture-better-sqlite3",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Native fixture: better-sqlite3 compiles native code via node-gyp on install. Postinstall builds .node binary; runtime loads it. Different compile-vs-download model than sharp.",
+	"_comment": "Hoisted compatibility audit. Native fixture: better-sqlite3 compiles native code via node-gyp on install. Postinstall builds .node binary; runtime loads it. Different compile-vs-download model than sharp.",
 	"dependencies": {
 		"better-sqlite3": "^11.0.0"
 	}

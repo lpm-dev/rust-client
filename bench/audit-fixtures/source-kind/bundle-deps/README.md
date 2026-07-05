@@ -9,9 +9,9 @@ installing the npm CLI as a dep depends on this surviving — npm's
 own runtime `require()` walks into its bundled subtree to find its
 internal helpers.
 
-**Risk:** the followup doc's §2a — "hoisted layout might overwrite
-vendored deps if the same package name appears at top level via
-another transitive path." More fundamentally: lpm has no explicit
+**Risk:** hoisted layout might overwrite vendored deps if the same
+package name appears at top level via another transitive path. More
+fundamentally: lpm has no explicit
 bundleDependencies handling (verified via `grep bundleDep crates/`),
 so we're testing the implicit invariant — the extractor preserves
 tarball-internal `node_modules/` as part of the package source, and
@@ -41,12 +41,10 @@ the linker doesn't strip or shadow it.
    handling intact.
 
 **Why npm specifically:** of all real-world packages surveyed, npm is
-the only one with active bundleDependencies usage. (`npm-packlist` —
-mentioned in the doc as an example — has not used bundleDependencies
-in any version I sampled; the doc's example was historical.) npm's
-heavy install (~30MB) is acceptable for an audit fixture: existing
-fixtures like apollo-graphql and nestjs-deep are similar order of
-magnitude, and the audit is correctness, not perf.
+the only one with active bundleDependencies usage. npm's heavy install
+(~30MB) is acceptable for an audit fixture: existing fixtures like
+apollo-graphql and nestjs-deep are similar order of magnitude, and
+the audit is correctness, not perf.
 
 **Expected today:** both isolated and hoisted should pass. Symmetric
 failure means lpm's extractor strips tarball-internal `node_modules/`

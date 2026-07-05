@@ -1,5 +1,5 @@
 {
-  "_comment": "Real-world project audit manifest. Phase 66 confidence-followup §1a. Each entry: a real-world project pinned to a specific commit, its install directory (sometimes a subpath inside a monorepo), and a smoke command that exercises a meaningful slice of the project. The harness clones --depth 1 at the pinned ref, replaces the project's install with `lpm install --linker hoisted` and `--linker isolated` separately, and reports asymmetric outcomes the same way as bench/audit-fixtures. Add new entries here; the suite runner picks them up automatically.",
+  "_comment": "Real-world project audit manifest. Each entry pins a real-world project, its install directory (sometimes a subpath inside a monorepo), and a smoke command that exercises a meaningful slice of the project. The harness clones --depth 1 at the pinned ref, runs `lpm install --linker hoisted` and `--linker isolated` separately, and reports asymmetric outcomes the same way as bench/audit-fixtures. Add new entries here; the suite runner picks them up automatically.",
   "projects": [
     {
       "name": "next-blog-starter",

@@ -2,7 +2,7 @@
 	"name": "audit-fixture-optional-peers",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 66 confidence-followup §2b. react-redux@9 declares `redux` and `@types/react` in `peerDependenciesMeta` as optional — meaning the package is supposed to install + load without them. We install only react (the *required* peer) and rely on react-redux's runtime not crashing during load. Risk: hoisted's conflict-nesting algorithm should treat unmet optional peers gracefully (no install failure, no false unmet-peer crash on require). Symmetric failure here means lpm's resolver/linker doesn't honor the `meta.optional: true` flag — which is a both-modes resolver bug. Asymmetric failure would be a hoisting-specific behavior change for optional peers.",
+	"_comment": "react-redux@9 declares `redux` and `@types/react` in `peerDependenciesMeta` as optional — meaning the package is supposed to install + load without them. We install only react (the *required* peer) and rely on react-redux's runtime not crashing during load. Risk: hoisted's conflict-nesting algorithm should treat unmet optional peers gracefully (no install failure, no false unmet-peer crash on require). Symmetric failure here means lpm's resolver/linker doesn't honor the `meta.optional: true` flag — which is a both-modes resolver bug. Asymmetric failure would be a hoisting-specific behavior change for optional peers.",
 	"dependencies": {
 		"react": "^18.0.0",
 		"react-redux": "^9.0.0"

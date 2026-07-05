@@ -367,8 +367,8 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // workflow tests assert on v1 layout shape
     // (e.g., `<project>/.lpm/wrappers/<seg>/`, hoisted-flat
     // `node_modules/<dep>` real dirs, hardlink-detach behavior). The
-    // Phase-4d default flip to v2 changes these to symlinks-into-the-
-    // global-store, which would break shape assertions wholesale.
+    // The v2 store changes these to symlinks into the global store, which
+    // would break shape assertions wholesale.
     //
     // Pin the legacy workflow default to v1 explicitly. v2 regression
     // coverage lives in explicit workflow tests that opt into or restore

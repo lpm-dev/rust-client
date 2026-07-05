@@ -12,12 +12,9 @@ use super::*;
 /// - `effective_policy == ScriptPolicy::Allow`. The user
 ///   explicitly opted into "run all lifecycle scripts" via `--yolo`,
 ///   `--policy=allow`, `package.json > lpm > scriptPolicy = "allow"`,
-///   or `~/.lpm/config.toml > script-policy = "allow"`. Today's
-///   pre-existing behavior required a SECOND `--auto-build` flag to
-///   actually run the scripts; that two-step was an apples-to-oranges
-///   gap vs `npm`/`pnpm`/`bun` (which all run scripts during install
-///   by default) AND was redundant ceremony given the user already
-///   consented via `--policy=allow`.
+///   or `~/.lpm/config.toml > script-policy = "allow"`. Requiring a
+///   second `--auto-build` flag would be redundant ceremony after the
+///   user already consented via `--policy=allow`.
 ///
 /// Triage policy is unchanged: greens auto-trust via `evaluate_trust`
 /// and ride the `all_trusted` path; ambers/reds still require explicit

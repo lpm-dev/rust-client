@@ -610,14 +610,14 @@ async fn install_drift_does_not_block_for_project_with_no_approvals() {
     );
 }
 
-// ─── Phase 2.2 SILENT-DROP regression guards ──────────────────────────
+// ─── Silent-drop regression guards ────────────────────────────────────
 
 /// Mount a scripted package whose `dist.attestations.url` points at an
 /// unverifiable (structurally-valid v0.2 minimal) Sigstore bundle. The
-/// post-Phase-2.1 verifier rejects these on the dsseEnvelope /
-/// tlogEntries pre-flight, so the bundle reaches `approve-scripts`
-/// only via `fetch_provenance_for_pkgs` and the verifier signal IS
-/// the SILENT-DROP regression's load-bearing input.
+/// verifier rejects these on the dsseEnvelope / tlogEntries pre-flight,
+/// so the bundle reaches `approve-scripts` only via
+/// `fetch_provenance_for_pkgs` and the verifier signal IS the
+/// SILENT-DROP regression's load-bearing input.
 ///
 /// Bypasses `MockRegistry::with_package` deliberately — that helper
 /// mounts a basic metadata document WITHOUT an `attestations` URL,
@@ -806,9 +806,9 @@ async fn mount_scripted_pkg_with_identity_matched_unverifiable_bundle(
         .await;
 }
 
-/// **Phase 2.2.a SILENT-DROP regression guard — default deny path.**
+/// **Silent-drop regression guard — default deny path.**
 ///
-/// Pre-fix, `fetch_provenance_for_pkgs` collapsed
+/// Before the fix, `fetch_provenance_for_pkgs` collapsed
 /// `Err(LpmError::ProvenanceVerification)` into `None` via
 /// `.ok().flatten()`. The approve-scripts capture path then recorded
 /// `provenance_at_approval: None`, and every subsequent install's
@@ -816,7 +816,7 @@ async fn mount_scripted_pkg_with_identity_matched_unverifiable_bundle(
 /// permanently disarming publisher-swap detection after one
 /// attack-window approval.
 ///
-/// Post-fix, under the default `EnforceMode::Deny` posture, an
+/// Under the default `EnforceMode::Deny` posture, an
 /// unverifiable bundle MUST refuse the approval rather than silently
 /// blank the binding. This test pins:
 /// 1. `lpm approve-scripts --yes` exits non-zero

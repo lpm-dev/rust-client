@@ -5,12 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Phase 66 confidence-followup §1a — manual + weekly real-world audit.
-  # `workflow_dispatch` lets developers run on demand; `schedule`
-  # catches "real-world project X broke under hoisted" without waiting
-  # on a user report. The realworld-audit job below is gated to these
-  # triggers — it clones whole projects + runs their builds, which is
-  # too expensive for every PR.
+  # `workflow_dispatch` lets developers run the long audits on demand;
+  # `schedule` catches real-world project regressions without waiting on a
+  # user report. The jobs are gated to these triggers because they clone
+  # whole projects and run their builds, which is too expensive for every PR.
   workflow_dispatch:
   schedule:
     # Every Monday 09:00 UTC. Fires off-peak relative to the
@@ -86,7 +84,7 @@ jobs:
       - name: Reject fancy-regex (ReDoS prevention)
         run: |
           if grep -r 'fancy-regex' crates/*/Cargo.toml; then
-            echo "::error::fancy-regex found in Cargo.toml dependencies. The regex crate (linear-time) must be used for scanning untrusted input. See phase-25-todo.md §S1."
+            echo "::error::fancy-regex found in Cargo.toml dependencies. The regex crate (linear-time) must be used for scanning untrusted input."
             exit 1
           fi
           echo "✓ No fancy-regex dependencies found"
@@ -351,15 +349,12 @@ jobs:
     # shape. Equal-outcome failures across modes don't gate the build;
     # only asymmetric outcomes do.
     #
-    # Phase 66 Phase 4d: matrix runs the suite under both the new
-    # default (v2 — virtual store) AND the explicit-downgrade v1
-    # path (`LPM_STORE_VERSION=v1`). Both must produce the same
-    # per-fixture outcomes:
+    # The matrix runs the suite under both the active v2 virtual store
+    # backend and the explicit v1 rollback path (`LPM_STORE_VERSION=v1`).
+    # Both must produce the same per-fixture outcomes:
     # - v2 row gates the active production install pipeline.
-    # - v1 row gates the downgrade-rollback path that ships post-4d
-    #   for users hitting a v2 regression.
-    # Pre-Phase-4d this matrix was inverted (v1 default + v2 opt-in)
-    # while v2 was a dev-only flag.
+    # - v1 row gates the downgrade-rollback path for users hitting a v2
+    #   regression.
     #
     # Cross-platform audit: Linux covers both store backends; Windows
     # covers the v2 default through Git Bash. All matrix rows hard-gate
@@ -442,11 +437,10 @@ jobs:
     name: Real-world project audit
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # Phase 66 confidence-followup §1a — gated to workflow_dispatch +
-    # weekly schedule. Each project clones whole repos and runs their
-    # build/test, so per-PR coverage is too expensive. The
-    # audit-fixtures job catches ~95% of mode-asymmetric regressions
-    # in <2 minutes; this job is the long-tail safety net.
+    # Gated to workflow_dispatch and the weekly schedule. Each project clones
+    # whole repos and runs their build/test, so per-PR coverage is too
+    # expensive. The audit-fixtures job catches most mode-asymmetric
+    # regressions quickly; this job is the long-tail safety net.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -503,13 +497,11 @@ jobs:
     name: Top-N npm package audit
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # Phase 66 confidence-followup §1b — gated to workflow_dispatch +
-    # weekly schedule. Generates ~100 single-dep fixtures and smokes
-    # each package's programmatic entrypoint under both modes
-    # (require-first, with import fallback only for genuine ESM-only
-    # surfaces). Asymmetric outcomes are the regression signal;
-    # symmetric failures are bin-only packages / upstream load issues
-    # and don't gate.
+    # Gated to workflow_dispatch and the weekly schedule. Generates single-dep
+    # fixtures and smokes each package's programmatic entrypoint under both
+    # modes (require-first, with import fallback only for genuine ESM-only
+    # surfaces). Asymmetric outcomes are the regression signal; symmetric
+    # failures are bin-only packages or upstream load issues and don't gate.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
