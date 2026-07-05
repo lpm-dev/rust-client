@@ -39,6 +39,7 @@ mod package;
 mod patches;
 mod peer;
 pub(crate) mod policy_extensions;
+mod setup;
 mod skills;
 mod source_resolution;
 mod state;
@@ -88,6 +89,7 @@ use policy_extensions::{
     policy_extensions_disable_tarball_prefetch,
     reject_remote_tarball_url_deps_with_policy_extensions, run_policy_extensions,
 };
+use setup::*;
 use skills::*;
 use source_resolution::*;
 use state::*;
@@ -434,184 +436,55 @@ async fn run_with_options_under_store_lock(
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
-    lpm_registry::timing::reset_metadata_http_versions();
-    lpm_registry::timing::reset_metadata_detail();
-    crate::build_state::reset_write_timing();
-    crate::security_floor::clear_recorded_suppressions();
-    let timing_detail_mode = TimingDetailMode::from_env();
-    let emit_timing = crate::json_contract::install_timing_requested(timing);
-    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
-    let object_integrity_policy =
-        crate::commands::config::resolve_object_integrity_policy(&global_config)?;
-    let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
-    let registry_signature_timings = timing_detail_mode
-        .enabled()
-        .then(|| Arc::new(crate::registry_signatures::RegistrySignatureTimings::default()));
-    let provenance_timings = timing_detail_mode
-        .enabled()
-        .then(crate::provenance_fetch::ProvenanceTimings::default);
-    let npm_firewall_lookup_mode = NpmFirewallLookupMode::from_env();
-    let npm_firewall_chunk_size = npm_firewall_chunk_size_from_env();
-    let policy_extension_configs = load_policy_extension_configs(&global_config)?;
+    let InstallSetupContext {
+        timing_detail_mode,
+        emit_timing,
+        global_config,
+        object_integrity_policy,
+        verify_registry_signatures,
+        registry_signature_timings,
+        provenance_timings,
+        npm_firewall_lookup_mode,
+        npm_firewall_chunk_size,
+        policy_extension_configs,
+        force_security_floor,
+        pkg_json_path,
+        lockfile_path,
+        frozen_lockfile_active,
+        pkg,
+        npm_firewall_mode,
+        effective_min_age_secs,
+        resolver_min_age_secs,
+        release_age_policy,
+        resolver_trust_policy,
+        minimum_release_age_exclude,
+        auto_install_peers,
+        strict_peer_dependencies,
+        pubgrub_opt_out,
+        configured_linker_mode,
+        peer_conflict_auto_isolation_allowed,
+        mut auto_isolated_peer_conflicts,
+        mut linker_mode,
+        requested_v2_mode,
+        manifest_deps,
+        production_dependency_names,
+    } = prepare_install_setup_context(InstallSetupInput {
+        project_dir,
+        json_output,
+        frozen_lockfile,
+        allow_new,
+        strict_peer_dependencies_override,
+        linker_override,
+        min_release_age_override,
+        min_release_age_exclude,
+        timing,
+    })?;
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_lockfile_write_ms = 0u128;
     let mut wf_tail_lockfile_write_count = 0u64;
     let mut wf_tail_audit_after_install_ms = 0u128;
-    let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
     let mut drift_ignore_policy = drift_ignore_policy;
     let mut verify_policy = verify_policy;
-
-    // Step 1: Read package.json
-    let pkg_json_path = project_dir.join("package.json");
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let frozen_lockfile_active = frozen_lockfile.is_active(&lockfile_path);
-    if !pkg_json_path.exists() {
-        return Err(LpmError::NotFound(
-            "no package.json found in current directory or any parent. \
-             Run `lpm init` to create one, or `lpm install <pkg>` to auto-create."
-                .to_string(),
-        ));
-    }
-
-    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
-
-    crate::security_approval::ensure_project_policy_authorized(
-        project_dir,
-        json_output,
-        crate::security_approval::ApprovalSource::ProjectConfig,
-    )?;
-    let npm_firewall_mode =
-        crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
-    crate::typosquat_guard::guard_manifest_direct_dependencies(
-        project_dir,
-        &pkg_json_path,
-        &pkg,
-        json_output,
-    )?;
-
-    let release_age_config = crate::release_age_config::ReleaseAgeResolver::resolve_config(
-        project_dir,
-        min_release_age_override,
-        min_release_age_exclude,
-        json_output,
-    )?;
-    let effective_min_age_secs = release_age_config.minimum_release_age_secs;
-    if allow_new && effective_min_age_secs > 0 {
-        crate::security_approval::approve_project_runtime_override(
-            crate::security_approval::ApprovalScope::CooldownBypass,
-            project_dir,
-            json_output,
-            crate::security_approval::ApprovalSource::CliFlag,
-            "This install bypasses the minimum release age for this project.",
-            &[],
-        )?;
-    }
-    let resolver_min_age_secs = if allow_new { 0 } else { effective_min_age_secs };
-    let release_age_policy = release_age_config.minimum_release_age_policy;
-    let resolver_trust_policy = match global_config.get_trust_policy().as_deref() {
-        Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
-        _ => lpm_resolver::TrustPolicyMode::Off,
-    };
-    let minimum_release_age_exclude = release_age_config.minimum_release_age_exclude;
-
-    // Hoisted
-    // here (above the empty-deps short-circuit, the lockfile fast
-    // path, and the freshness check) so the v1-lockfile gate AND
-    // the pubgrub-mismatch warning fire regardless of which install
-    // codepath ultimately runs. Same precedence chain documented on
-    // `LpmConfig.auto_install_peers`:
-    // `package.json > lpm > autoInstallPeers`
-    // → `~/.lpm/config.toml > auto-install-peers`
-    // → default `true`.
-    let auto_install_peers: bool = pkg
-        .lpm
-        .as_ref()
-        .and_then(|l| l.auto_install_peers)
-        .or_else(|| global_config.get_bool("auto-install-peers"))
-        .unwrap_or(true);
-    let strict_peer_dependencies =
-        resolve_strict_peer_dependencies(strict_peer_dependencies_override, &pkg, &global_config);
-    let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
-
-    // pubgrub-mismatch warning.
-    //
-    // Previously this warning was emitted only when `!json_output`,
-    // which silenced it for any wrapper, CI, or tooling using
-    // `--json` — exactly the audience that needs the signal MOST,
-    // since they consume the install programmatically and otherwise
-    // silently take the install-tree-divergence between
-    // `LPM_RESOLVER=pubgrub` (no auto-install) and the default
-    // greedy-fusion (auto-install on).
-    //
-    // Post-fix the warning fires unconditionally on stderr.
-    // `--json` consumers parse stdout for the envelope; stderr is
-    // separate. Matches every other warning in the install pipeline
-    // (`output::warn` → stderr).
-    //
-    // Hoisted above the empty-deps short-circuit + lockfile fast
-    // path so the warning surfaces even on installs that don't run
-    // the resolver — the same env-var + config combination produces
-    // a different install tree on a non-empty `lpm install` later,
-    // and surfacing the warning early gives the user a chance to
-    // notice before they hit it.
-    if pubgrub_opt_out && auto_install_peers {
-        output::warn(
-            "LPM_RESOLVER=pubgrub does not support eager peer auto-install \
-             (lpm.autoInstallPeers = true). Missing peers will surface as \
-             warnings only — the install tree will differ from the default \
-             greedy-fusion resolver. To silence this warning, either unset \
-             LPM_RESOLVER or set `lpm.autoInstallPeers = false` in package.json.",
-        );
-    }
-
-    // Resolve the effective linker BEFORE the freshness check so:
-    // 1. Invalid CLI / config.toml / `LPM_LINKER` / `package.json > lpm
-    // > linker` values fail loudly here, regardless of whether the
-    // cache would otherwise short-circuit the install. Previously, an
-    // invalid env value was silently masked on the up-to-date path.
-    // 2. The resolved mode folds into the install-hash via
-    // `check_install_state_with_linker`, so a post-install flip of
-    // `LPM_LINKER` or `~/.lpm/config.toml > linker` invalidates the
-    // "up to date" cache and triggers a re-link.
-    // Precedence: caller-supplied CLI override > config.toml > env >
-    // `package.json > lpm > linker` > workspace auto-detection > default
-    // hoisted. A persisted peer-conflict auto-isolation flag can override
-    // that final default on warm installs without taking over explicit
-    // linker choices.
-    let (configured_linker_mode, linker_source) =
-        crate::linker_config::resolve_effective_linker_with_source(
-            linker_override,
-            &pkg,
-            &global_config,
-            project_dir,
-        )
-        .map_err(|e| {
-            LpmError::Script(format!(
-                "{e} \
-             Update the offending surface or override with \
-             `--linker=<isolated|hoisted>`."
-            ))
-        })?;
-    let peer_conflict_auto_isolation_allowed = matches!(
-        linker_source,
-        crate::linker_config::LinkerModeSource::Default
-    );
-    let mut auto_isolated_peer_conflicts = peer_conflict_auto_isolation_allowed
-        && lockfile_has_auto_isolated_peer_conflicts(&lockfile_path);
-    let mut linker_mode = if auto_isolated_peer_conflicts {
-        lpm_linker::LinkerMode::Isolated
-    } else {
-        configured_linker_mode
-    };
-    let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
-    let mut manifest_deps = manifest_install_deps(&pkg);
-    normalize_jsr_manifest_deps(&mut manifest_deps)?;
-    let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
-    reject_remote_tarball_url_deps_with_policy_extensions(
-        &policy_extension_configs,
-        &manifest_deps,
-    )?;
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
     // resolved linker and object-integrity policy match the prior
