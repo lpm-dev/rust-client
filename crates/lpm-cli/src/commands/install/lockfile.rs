@@ -116,6 +116,184 @@ pub(super) fn select_lockfile_install_plan(
     }
 }
 
+pub(super) struct EmptyDependencyInstallInput<'a> {
+    pub(super) project_dir: &'a Path,
+    pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
+    pub(super) cleanup_catalogs_in_pipeline: bool,
+    pub(super) json_output: bool,
+    pub(super) start: Instant,
+    pub(super) timing_detail_mode: TimingDetailMode,
+    pub(super) setup_install_state_ms: u128,
+    pub(super) setup_route_table_ms: u128,
+    pub(super) emit_timing: bool,
+    pub(super) target_set: Option<&'a [String]>,
+    pub(super) force_security_floor: bool,
+    pub(super) override_set: &'a OverrideSet,
+    pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+}
+
+pub(super) async fn run_empty_dependency_install_phase(
+    input: EmptyDependencyInstallInput<'_>,
+) -> Result<(), LpmError> {
+    let EmptyDependencyInstallInput {
+        project_dir,
+        policy_extension_configs,
+        cleanup_catalogs_in_pipeline,
+        json_output,
+        start,
+        timing_detail_mode,
+        setup_install_state_ms,
+        setup_route_table_ms,
+        emit_timing,
+        target_set,
+        force_security_floor,
+        override_set,
+        linker_mode,
+        object_integrity_policy,
+    } = input;
+
+    if cleanup_catalogs_in_pipeline {
+        cleanup_unused_catalogs_after_install(project_dir)?;
+    }
+    let policy_extension_stats =
+        run_policy_extensions(policy_extension_configs, project_dir, &[], json_output).await?;
+    let elapsed = start.elapsed();
+    let total_ms = elapsed.as_millis();
+    if json_output {
+        let mut json = serde_json::json!({
+            "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
+            "success": true,
+            "no_dependencies": true,
+            "duration_ms": total_ms as u64,
+            "timing": {
+                "resolve_ms": 0u128,
+                "fetch_ms": 0u128,
+                "link_ms": 0u128,
+                "total_ms": total_ms,
+                "waterfall": {
+                    "setup_ms": total_ms,
+                    "resolve_ms": 0u128,
+                    "pre_fetch_ms": 0u128,
+                    "fetch_ms": 0u128,
+                    "pre_link_ms": 0u128,
+                    "link_ms": 0u128,
+                    "link_await_ms": 0u128,
+                    "link_finalize_ms": 0u128,
+                    "tail_ms": 0u128,
+                    "total_ms": total_ms,
+                },
+            },
+            "peer_conflicts": [],
+            "peer_issues": peer_issues_json_value(&[], &[]),
+            "security": {
+                "policy_extensions": policy_extension_stats.to_json(),
+            },
+        });
+        json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
+        if timing_detail_mode.enabled() {
+            json["timing"]["detail"] = setup_only_timing_detail_json(
+                timing_detail_mode,
+                total_ms,
+                setup_install_state_ms,
+                setup_route_table_ms,
+            );
+        }
+        if !emit_timing && let Some(obj) = json.as_object_mut() {
+            obj.remove("timing");
+        }
+        if let Some(targets) = target_set {
+            json["target_set"] =
+                serde_json::Value::Array(targets.iter().map(|s| serde_json::json!(s)).collect());
+        }
+        crate::security_floor::attach_security_posture(&mut json, force_security_floor);
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else {
+        output::success("No dependencies to install");
+    }
+
+    if override_set.is_empty()
+        && overrides_state::read_state(project_dir).is_some()
+        && let Err(e) = overrides_state::delete_state(project_dir)
+    {
+        tracing::warn!("failed to delete stale overrides-state.json: {e}");
+    }
+    materialize_empty_install_artifacts(project_dir)?;
+    write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
+    Ok(())
+}
+
+pub(super) struct LockfileDriftInput<'a> {
+    pub(super) project_dir: &'a Path,
+    pub(super) lockfile_path: &'a Path,
+    pub(super) pkg: &'a lpm_workspace::PackageJson,
+    pub(super) override_set: &'a OverrideSet,
+    pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
+    pub(super) current_patch_fingerprint: &'a str,
+}
+
+pub(super) struct LockfileDriftState {
+    pub(super) prior_overrides_state: Option<overrides_state::OverridesState>,
+    pub(super) overrides_changed: bool,
+    pub(super) prior_patch_state: Option<patch_state::PatchState>,
+    pub(super) patches_changed: bool,
+    pub(super) pre_install_direct_versions: HashMap<String, String>,
+}
+
+pub(super) fn prepare_lockfile_drift_state(input: LockfileDriftInput<'_>) -> LockfileDriftState {
+    let LockfileDriftInput {
+        project_dir,
+        lockfile_path,
+        pkg,
+        override_set,
+        current_patches,
+        current_patch_fingerprint,
+    } = input;
+
+    let prior_overrides_state = overrides_state::read_state(project_dir);
+    let overrides_changed = prior_overrides_state
+        .as_ref()
+        .map_or(!override_set.is_empty(), |s| {
+            s.fingerprint != override_set.fingerprint()
+        });
+    if overrides_changed {
+        tracing::debug!(
+            "overrides changed since last install (fingerprint drift) - \
+             invalidating lockfile fast path"
+        );
+    }
+
+    let prior_patch_state = patch_state::read_state(project_dir);
+    let patches_changed = prior_patch_state
+        .as_ref()
+        .map_or(!current_patches.is_empty(), |s| {
+            s.fingerprint != current_patch_fingerprint
+        });
+    if patches_changed {
+        tracing::debug!(
+            "patches changed since last install (fingerprint drift) - \
+             invalidating lockfile fast path"
+        );
+    }
+
+    let pre_install_direct_versions = if lockfile_path.exists() {
+        lpm_lockfile::Lockfile::read_fast(lockfile_path)
+            .ok()
+            .map(|lf| collect_locked_direct_versions(pkg, &lf))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    LockfileDriftState {
+        prior_overrides_state,
+        overrides_changed,
+        prior_patch_state,
+        patches_changed,
+        pre_install_direct_versions,
+    }
+}
+
 pub(super) struct OfflineInstallInput<'a> {
     pub(super) client: &'a RegistryClient,
     pub(super) project_dir: &'a Path,
