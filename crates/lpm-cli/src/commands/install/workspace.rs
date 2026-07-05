@@ -27,6 +27,108 @@ pub(super) struct WorkspaceMemberLink {
     pub(super) source_dir: PathBuf,
 }
 
+pub(super) struct WorkspaceInstallContext {
+    pub(super) workspace: Option<lpm_workspace::Workspace>,
+    pub(super) workspace_member_deps: Vec<WorkspaceMemberLink>,
+    pub(super) direct_workspace_member_deps: Vec<WorkspaceMemberLink>,
+    pub(super) all_workspace_members: Vec<WorkspaceMemberLink>,
+    pub(super) catalog_resolutions: Vec<lpm_workspace::CatalogProtocolResolution>,
+}
+
+pub(super) fn prepare_workspace_install_context(
+    project_dir: &Path,
+    pkg: &lpm_workspace::PackageJson,
+    deps: &mut HashMap<String, String>,
+    requested_v2_mode: bool,
+    json_output: bool,
+) -> Result<WorkspaceInstallContext, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .ok()
+        .flatten();
+
+    let (mut workspace_member_deps, catalog_resolutions) = if let Some(ref ws) = workspace {
+        let extracted = extract_workspace_protocol_deps(deps, ws)?;
+        if !extracted.is_empty() && !json_output {
+            for member in &extracted {
+                tracing::debug!(
+                    "workspace member (local): {} @ {} from {}",
+                    member.name,
+                    member.version,
+                    member.source_dir.display()
+                );
+            }
+        }
+
+        let catalog_resolutions =
+            resolve_install_catalogs(deps, &ws.root_package.catalogs, json_output)?;
+        (extracted, catalog_resolutions)
+    } else {
+        let catalog_resolutions = resolve_install_catalogs(deps, &pkg.catalogs, json_output)?;
+        (Vec::new(), catalog_resolutions)
+    };
+
+    let direct_workspace_member_deps = if requested_v2_mode {
+        workspace_member_deps.clone()
+    } else {
+        Vec::new()
+    };
+    let all_workspace_members = all_workspace_members(workspace.as_ref());
+
+    pre_extract_file_link_workspace_members(
+        deps,
+        &mut workspace_member_deps,
+        &all_workspace_members,
+        project_dir,
+        json_output,
+    );
+
+    Ok(WorkspaceInstallContext {
+        workspace,
+        workspace_member_deps,
+        direct_workspace_member_deps,
+        all_workspace_members,
+        catalog_resolutions,
+    })
+}
+
+fn resolve_install_catalogs(
+    deps: &mut HashMap<String, String>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+    json_output: bool,
+) -> Result<Vec<lpm_workspace::CatalogProtocolResolution>, LpmError> {
+    if catalogs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let resolved = lpm_workspace::resolve_catalog_protocol(deps, catalogs)
+        .map_err(catalog_protocol_error_to_lpm)?;
+    if !resolved.is_empty() && !json_output {
+        for entry in &resolved {
+            tracing::debug!("catalog: {} -> {}", entry.package_name, entry.specifier);
+        }
+    }
+    Ok(resolved)
+}
+
+fn all_workspace_members(workspace: Option<&lpm_workspace::Workspace>) -> Vec<WorkspaceMemberLink> {
+    workspace
+        .map(|ws| {
+            ws.members
+                .iter()
+                .filter_map(|m| {
+                    let name = m.package.name.as_deref()?.to_string();
+                    let version = m.package.version.as_deref().unwrap_or("0.0.0").to_string();
+                    Some(WorkspaceMemberLink {
+                        name,
+                        version,
+                        source_dir: m.path.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Interactive confirmation for multi-member workspace mutations.
 ///
 /// Prints the target set (always, in human mode) and asks "Proceed? [y/N]"

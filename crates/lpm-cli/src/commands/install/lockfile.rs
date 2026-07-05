@@ -45,6 +45,342 @@ pub(super) fn lockfile_needs_peer_state_repair(
         && lockfile.metadata.lockfile_version < MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE
 }
 
+pub(super) struct LockfileSelectionInput<'a> {
+    pub(super) lockfile_path: &'a Path,
+    pub(super) deps: &'a HashMap<String, String>,
+    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) client: &'a RegistryClient,
+    pub(super) gate_stats: &'a GateStats,
+    pub(super) frozen_lockfile_active: bool,
+    pub(super) force: bool,
+    pub(super) overrides_changed: bool,
+    pub(super) patches_changed: bool,
+    pub(super) is_add_invocation: bool,
+    pub(super) auto_install_peers: bool,
+    pub(super) json_output: bool,
+}
+
+pub(super) fn select_lockfile_install_plan(
+    input: LockfileSelectionInput<'_>,
+) -> Result<Option<LockfileFastPath>, LpmError> {
+    if input.frozen_lockfile_active {
+        let candidate = try_lockfile_fast_path(
+            input.lockfile_path,
+            input.deps,
+            input.catalog_resolutions,
+            input.client,
+            input.gate_stats,
+            false,
+        )
+        .ok_or_else(|| {
+            LpmError::Registry(
+                "Frozen lockfile mismatch\n  lockfile    lpm.lock\n  hint        lockfile cannot satisfy the current manifest; run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile"
+                    .into(),
+            )
+        })?;
+        if lockfile_needs_peer_state_repair(&candidate.lockfile, input.auto_install_peers) {
+            return Err(LpmError::Registry(format!(
+                "Frozen lockfile mismatch\n  lockfile    v{}\n  required    v{}\n  hint        run `lpm install` locally and commit the upgraded lpm.lock",
+                candidate.lockfile.metadata.lockfile_version,
+                lpm_lockfile::LOCKFILE_VERSION,
+            )));
+        }
+        return Ok(Some(candidate));
+    }
+
+    if input.force || input.overrides_changed || input.patches_changed || input.is_add_invocation {
+        return Ok(None);
+    }
+
+    let candidate = try_lockfile_fast_path(
+        input.lockfile_path,
+        input.deps,
+        input.catalog_resolutions,
+        input.client,
+        input.gate_stats,
+        false,
+    );
+    match candidate {
+        Some(fast)
+            if lockfile_needs_peer_state_repair(&fast.lockfile, input.auto_install_peers) =>
+        {
+            if !input.json_output {
+                output::info(
+                    "Lockfile is in an older format; rebuilding to capture \
+                     peer auto-install state. Subsequent installs will be fast.",
+                );
+            }
+            Ok(None)
+        }
+        other => Ok(other),
+    }
+}
+
+pub(super) struct OfflineInstallInput<'a> {
+    pub(super) client: &'a RegistryClient,
+    pub(super) project_dir: &'a Path,
+    pub(super) deps: &'a HashMap<String, String>,
+    pub(super) pkg: &'a lpm_workspace::PackageJson,
+    pub(super) lockfile_path: &'a Path,
+    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) gate_stats: &'a GateStats,
+    pub(super) override_set: &'a OverrideSet,
+    pub(super) prior_overrides_state: Option<&'a crate::overrides_state::OverridesState>,
+    pub(super) overrides_changed: bool,
+    pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
+    pub(super) current_patch_fingerprint: &'a str,
+    pub(super) prior_patch_state: Option<&'a crate::patch_state::PatchState>,
+    pub(super) patches_changed: bool,
+    pub(super) auto_install_peers: bool,
+    pub(super) omit_policy: InstallOmitPolicy,
+    pub(super) production_dependency_names: &'a HashSet<String>,
+    pub(super) requested_v2_mode: bool,
+    pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) lpm_root: &'a lpm_common::LpmRoot,
+    pub(super) json_output: bool,
+    pub(super) verify_registry_signatures: bool,
+    pub(super) registry_signature_timings:
+        Option<Arc<crate::registry_signatures::RegistrySignatureTimings>>,
+    pub(super) arc_client: &'a Arc<RegistryClient>,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) npm_firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
+    pub(super) npm_firewall_lookup_mode: NpmFirewallLookupMode,
+    pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
+    pub(super) workspace_member_deps: &'a mut Vec<WorkspaceMemberLink>,
+    pub(super) all_workspace_members: &'a [WorkspaceMemberLink],
+    pub(super) v2_workspace_root_pre_resolve: &'a V2WorkspaceRootPreResolveResult,
+    pub(super) start: Instant,
+    pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) force: bool,
+    pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    pub(super) global_config: &'a crate::commands::config::GlobalConfig,
+    pub(super) auto_build: bool,
+    pub(super) no_sandbox: bool,
+    pub(super) strict_sandbox: bool,
+    pub(super) emit_timing: bool,
+    pub(super) strict_integrity: bool,
+    pub(super) compatibility_bin_names: &'a [String],
+}
+
+pub(super) async fn run_offline_install_phase(
+    input: OfflineInstallInput<'_>,
+) -> Result<(), LpmError> {
+    let OfflineInstallInput {
+        client,
+        project_dir,
+        deps,
+        pkg,
+        lockfile_path,
+        catalog_resolutions,
+        gate_stats,
+        override_set,
+        prior_overrides_state,
+        overrides_changed,
+        current_patches,
+        current_patch_fingerprint,
+        prior_patch_state,
+        patches_changed,
+        auto_install_peers,
+        omit_policy,
+        production_dependency_names,
+        requested_v2_mode,
+        object_integrity_policy,
+        lpm_root,
+        json_output,
+        verify_registry_signatures,
+        registry_signature_timings,
+        arc_client,
+        route_table,
+        npm_firewall_mode,
+        npm_firewall_lookup_mode,
+        policy_extension_configs,
+        workspace_member_deps,
+        all_workspace_members,
+        v2_workspace_root_pre_resolve,
+        start,
+        linker_mode,
+        force,
+        script_policy_override,
+        global_config,
+        auto_build,
+        no_sandbox,
+        strict_sandbox,
+        emit_timing,
+        strict_integrity,
+        compatibility_bin_names,
+    } = input;
+
+    if overrides_changed {
+        let detail = match prior_overrides_state {
+            Some(prior) => format!(
+                "previous fingerprint {} differs from current {}",
+                prior.fingerprint,
+                override_set.fingerprint()
+            ),
+            None if !override_set.is_empty() => {
+                "no previously-recorded override fingerprint; the lockfile may have \
+                 been generated without these overrides"
+                    .to_string()
+            }
+            None => "override state inconsistency".to_string(),
+        };
+        return Err(LpmError::Registry(format!(
+            "--offline: override set differs from the lockfile's recorded set ({detail}). \
+             Run `lpm install` (online) to re-resolve, then retry --offline."
+        )));
+    }
+
+    if patches_changed {
+        let detail = match prior_patch_state {
+            Some(prior) => format!(
+                "previous fingerprint {} differs from current {}",
+                prior.fingerprint, current_patch_fingerprint
+            ),
+            None if !current_patches.is_empty() => {
+                "no previously-recorded patch fingerprint; the lockfile may have \
+                 been written without these patches"
+                    .to_string()
+            }
+            None => "patch state inconsistency".to_string(),
+        };
+        return Err(LpmError::Registry(format!(
+            "--offline: lpm.patchedDependencies differs from the previously-recorded \
+             patch set ({detail}). Run `lpm install` (online) to re-resolve, then retry \
+             --offline."
+        )));
+    }
+
+    // Offline replay cannot fresh-resolve, so it trusts lockfile-local source entries.
+    let fast = try_lockfile_fast_path(
+        lockfile_path,
+        deps,
+        catalog_resolutions,
+        client,
+        gate_stats,
+        true,
+    )
+    .ok_or_else(|| {
+        LpmError::Registry(
+            "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
+                     missing — run `lpm install` online first; (2) lpm.lock is corrupted — \
+                     delete it and re-run online; (3) a root dependency in package.json is \
+                     absent from the lockfile (e.g., declared but never installed online). \
+                     Run `lpm install` online to reconcile."
+                .into(),
+        )
+    })?;
+
+    if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) {
+        return Err(LpmError::Registry(
+            "--offline cannot use a pre-R2.5 lockfile under \
+             `lpm.autoInstallPeers = true`: the lockfile may be missing \
+             ambient-peer-install state. Run \
+             `lpm install` (online) once to re-derive and upgrade the \
+             lockfile to v2, then retry --offline. To bypass this check \
+             and accept warn-only peer semantics, set \
+             `lpm.autoInstallPeers = false` in package.json."
+                .into(),
+        ));
+    }
+
+    let mut locked = fast.packages;
+    if omit_policy.dev {
+        filter_dev_packages(&mut locked, production_dependency_names);
+    }
+    let _platform_skipped = filter_platform_packages(&mut locked)?;
+    if !json_output {
+        output::info(&format!(
+            "Offline: using lockfile ({} packages)",
+            locked.len().to_string().bold()
+        ));
+    }
+
+    let store = PackageStore::from_root(lpm_root);
+    let store_v2 = requested_v2_mode.then(|| {
+        lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+            lpm_root,
+            object_integrity_policy,
+        )
+    });
+    let mut missing = Vec::new();
+    for p in &locked {
+        // Source-aware lookup prevents registry cache hits from satisfying local/tarball entries.
+        if !p.store_has_for_install_layout(&store, store_v2.as_ref(), project_dir) {
+            missing.push(format!("{}@{}", p.name, p.version));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "--offline: {} package(s) not in global store: {}",
+            missing.len(),
+            missing[..missing.len().min(5)].join(", ")
+        )));
+    }
+
+    merge_workspace_member_links(
+        workspace_member_deps,
+        v2_workspace_root_pre_resolve
+            .additional_workspace_links
+            .iter()
+            .cloned(),
+    );
+    expand_workspace_member_deps_with_transitives(workspace_member_deps, all_workspace_members)?;
+    enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
+    if verify_registry_signatures {
+        enforce_registry_signature_policy(
+            Arc::clone(arc_client),
+            route_table,
+            &locked,
+            json_output,
+            false,
+            registry_signature_timings,
+        )
+        .await?;
+    }
+    let npm_firewall_stats = run_npm_firewall_preflight(
+        npm_firewall_mode,
+        npm_firewall_lookup_mode,
+        arc_client,
+        route_table,
+        &locked,
+        true,
+        json_output,
+    )
+    .await?;
+    let policy_extension_stats =
+        run_policy_extensions(policy_extension_configs, project_dir, &locked, json_output).await?;
+
+    run_link_and_finish(
+        client,
+        project_dir,
+        deps,
+        pkg,
+        locked,
+        &v2_workspace_root_pre_resolve.install_pkgs,
+        &v2_workspace_root_pre_resolve.source_deps,
+        0,
+        0,
+        true,
+        npm_firewall_stats,
+        policy_extension_stats,
+        json_output,
+        start,
+        linker_mode,
+        force,
+        workspace_member_deps,
+        script_policy_override,
+        lpm_root,
+        global_config,
+        object_integrity_policy,
+        auto_build,
+        no_sandbox,
+        strict_sandbox,
+        emit_timing,
+        compatibility_bin_names,
+    )
+    .await
+}
+
 pub(super) fn catalog_protocol_error_to_lpm(
     error: lpm_workspace::CatalogProtocolError,
 ) -> LpmError {

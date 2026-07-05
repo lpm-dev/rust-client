@@ -817,159 +817,19 @@ async fn run_with_options_under_store_lock(
 
     let declared_deps = deps.clone();
 
-    // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
-    // before anything else (lockfile fast path, resolver). This ensures the
-    // `deps` HashMap contains only real registry ranges by the time the
-    // resolver sees it.
-    //
-    // previously
-    // we called `lpm_workspace::resolve_workspace_protocol` which rewrote
-    // `"@scope/member": "workspace:^"` to `"@scope/member": "^1.5.0"` and
-    // LEFT IT in `deps`. The resolver then tried to fetch
-    // `@scope/member@^1.5.0` from npm/lpm.dev and 404'd against the upstream
-    // proxy, because unpublished workspace members can't be looked up
-    // remotely. Post-fix, we strip workspace member references from `deps`
-    // entirely; they are linked from disk after the install pipeline
-    // finishes via [`link_workspace_members`].
-    //
-    // Catalog resolution must use the workspace ROOT catalogs when inside a
-    // workspace, because workspace members define `"catalog:"` references
-    // that point to centralized version definitions in the root package.json.
-    let workspace = lpm_workspace::discover_workspace(project_dir)
-        .ok()
-        .flatten();
-
-    let (mut workspace_member_deps, mut catalog_resolutions): (
-        Vec<WorkspaceMemberLink>,
-        Vec<lpm_workspace::CatalogProtocolResolution>,
-    ) = if let Some(ref ws) = workspace {
-        // workspace:* extraction (NEW: replaces resolve_workspace_protocol)
-        let extracted = extract_workspace_protocol_deps(&mut deps, ws)?;
-        if !extracted.is_empty() && !json_output {
-            for member in &extracted {
-                tracing::debug!(
-                    "workspace member (local): {} @ {} from {}",
-                    member.name,
-                    member.version,
-                    member.source_dir.display()
-                );
-            }
-        }
-
-        // catalog: protocol — resolve from workspace root catalogs
-        let mut catalog_resolutions: Vec<lpm_workspace::CatalogProtocolResolution> = Vec::new();
-
-        if !ws.root_package.catalogs.is_empty() {
-            match lpm_workspace::resolve_catalog_protocol(&mut deps, &ws.root_package.catalogs) {
-                Ok(resolved) => {
-                    if !resolved.is_empty() && !json_output {
-                        for entry in &resolved {
-                            tracing::debug!(
-                                "catalog: {} → {}",
-                                entry.package_name,
-                                entry.specifier
-                            );
-                        }
-                    }
-                    catalog_resolutions = resolved;
-                }
-                Err(e) => {
-                    return Err(catalog_protocol_error_to_lpm(e));
-                }
-            }
-        }
-        (extracted, catalog_resolutions)
-    } else {
-        // Standalone project (no workspace): no workspace member deps possible.
-        // Local catalogs are still resolved if present.
-        let mut catalog_resolutions = Vec::new();
-        if !pkg.catalogs.is_empty() {
-            match lpm_workspace::resolve_catalog_protocol(&mut deps, &pkg.catalogs) {
-                Ok(resolved) => {
-                    if !resolved.is_empty() && !json_output {
-                        for entry in &resolved {
-                            tracing::debug!(
-                                "catalog: {} → {}",
-                                entry.package_name,
-                                entry.specifier
-                            );
-                        }
-                    }
-                    catalog_resolutions = resolved;
-                }
-                Err(e) => {
-                    return Err(catalog_protocol_error_to_lpm(e));
-                }
-            }
-        }
-        (Vec::new(), catalog_resolutions)
-    };
-    let direct_workspace_member_deps = if requested_v2_mode {
-        workspace_member_deps.clone()
-    } else {
-        Vec::new()
-    };
-
-    //
-    // `workspace_member_deps` above is the extracted top-level subset
-    // (entries the consumer's manifest declared via `workspace:*`).
-    // That set drives `link_workspace_members` (which plants root
-    // node_modules symlinks for explicit references).
-    //
-    // `pre_resolve_non_registry_deps` needs a different set: every
-    // member of the workspace, regardless of whether the consumer's
-    // top-level manifest references it via `workspace:*`. Reusing the
-    // extracted slice meant a workspace member was visible to overlap
-    // detection and transitive `workspace:` checks only when the consumer's
-    // root explicitly imported it via `workspace:*`. Regression shape:
-    // root depends on `foo` via `file:`, and
-    // foo's `package.json` declares `bar: workspace:*` — bar is a
-    // valid sibling member, but because the root never wrote
-    // `"bar": "workspace:*"`, `extracted` is empty and the invariant
-    // (correctly, given its inputs) errored "not a workspace member."
-    //
-    // The fix: build a separate `all_workspace_members` slice
-    // straight from `ws.members`, independent of extraction. This is
-    // the slice + the invariant should have used all along (membership
-    // is membership; transitive `workspace:` resolution must not depend
-    // on a top-level reference).
-    let all_workspace_members: Vec<WorkspaceMemberLink> = workspace
-        .as_ref()
-        .map(|ws| {
-            ws.members
-                .iter()
-                .filter_map(|m| {
-                    let name = m.package.name.as_deref()?.to_string();
-                    let version = m.package.version.as_deref().unwrap_or("0.0.0").to_string();
-                    Some(WorkspaceMemberLink {
-                        name,
-                        version,
-                        source_dir: m.path.clone(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // dedupe pre-pass.
-    // Replaces the dedupe that lived only in the online path's
-    // `pre_resolve_non_registry_deps`. By running BEFORE the
-    // offline/online dispatch and BEFORE the lockfile fast-path,
-    // both modes converge on the same `(deps, workspace_member_deps)`
-    // shape:
-    // - `file:./packages/foo` (a workspace member) → removed from
-    // `deps`, added to `workspace_member_deps`.
-    // - The lockfile fast-path no longer sees `foo` as a missing
-    // root dep (it WAS removed before the check).
-    // - `link_workspace_members` plants `node_modules/foo` because
-    // the entry is in `workspace_member_deps`.
-    pre_extract_file_link_workspace_members(
-        &mut deps,
-        &mut workspace_member_deps,
-        &all_workspace_members,
+    let WorkspaceInstallContext {
+        workspace,
+        mut workspace_member_deps,
+        direct_workspace_member_deps,
+        all_workspace_members,
+        mut catalog_resolutions,
+    } = prepare_workspace_install_context(
         project_dir,
+        &pkg,
+        &mut deps,
+        requested_v2_mode,
         json_output,
-    );
+    )?;
     reject_remote_tarball_url_deps_with_policy_extensions(&policy_extension_configs, &deps)?;
 
     let resolver_excludes = minimum_release_age_exclude
@@ -1398,324 +1258,68 @@ async fn run_with_options_under_store_lock(
         workspace_member_deps.clear();
     }
 
-    // Offline mode: require lockfile, no network
     if offline {
-        // Offline
-        // mode cannot re-resolve, so any fingerprint drift is
-        // unsafe: the lockfile would silently shadow the user's
-        // override edits. Refuse with a clear, actionable message
-        // that tells the user how to recover.
-        if overrides_changed {
-            let detail = match prior_overrides_state.as_ref() {
-                Some(prior) => format!(
-                    "previous fingerprint {} differs from current {}",
-                    prior.fingerprint,
-                    override_set.fingerprint()
-                ),
-                None if !override_set.is_empty() => {
-                    "no previously-recorded override fingerprint; the lockfile may have \
-                     been generated without these overrides"
-                        .to_string()
-                }
-                None => "override state inconsistency".to_string(),
-            };
-            return Err(LpmError::Registry(format!(
-                "--offline: override set differs from the lockfile's recorded set ({detail}). \
-                 Run `lpm install` (online) to re-resolve, then retry --offline."
-            )));
-        }
-
-        // same hard-error semantics for the
-        // patch set. Offline mode can't re-resolve OR re-fetch a
-        // possibly-changed store baseline, so any drift in the
-        // declared patch set leaves the install in an unknown state.
-        if patches_changed {
-            let detail = match prior_patch_state.as_ref() {
-                Some(prior) => format!(
-                    "previous fingerprint {} differs from current {}",
-                    prior.fingerprint, current_patch_fingerprint
-                ),
-                None if !current_patches.is_empty() => {
-                    "no previously-recorded patch fingerprint; the lockfile may have \
-                     been written without these patches"
-                        .to_string()
-                }
-                None => "patch state inconsistency".to_string(),
-            };
-            return Err(LpmError::Registry(format!(
-                "--offline: lpm.patchedDependencies differs from the previously-recorded \
-                 patch set ({detail}). Run `lpm install` (online) to re-resolve, then retry \
-                 --offline."
-            )));
-        }
-
-        // **Invariant:** offline mode passes `accept_unsafe_sources =
-        // true` so the fast-path admits `directory+`/`link+`/
-        // `tarball+local` lockfile entries that fresh-resolve fallback
-        // would otherwise reject. Online installs at line 3514 stay
-        // strict (`false`) — they have the fresh-resolve fallback for
-        // any non-admissible lockfile shape, and skipping the fresh-
-        // resolve re-checks would be a real correctness regression.
-        let fast = try_lockfile_fast_path(
-            &lockfile_path,
-            &deps,
-            &catalog_resolutions,
-            client,
-            &gate_stats,
-            true,
-        )
-        .ok_or_else(|| {
-            LpmError::Registry(
-                "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
-                         missing — run `lpm install` online first; (2) lpm.lock is corrupted — \
-                         delete it and re-run online; (3) a root dependency in package.json is \
-                         absent from the lockfile (e.g., declared but never installed online). \
-                         Run `lpm install` online to reconcile."
-                    .into(),
-            )
-        })?;
-        // Same repair-gate semantic as
-        // the online path, but `--offline` can't re-resolve to
-        // re-derive the missing. The choice is between
-        // replaying a known-broken tree (older lockfiles from builds
-        // with the peer-tracking bug were missing
-        // `ambient-peer-installs` and per-package `peers`, so
-        // `node_modules/<auto-installed-peer>/` is dropped on
-        // replay and `require('react-redux')` hard-fails at runtime)
-        // and refusing the install with an actionable message.
-        // Refusing is the only safe answer: the offline path
-        // cannot detect whether the v1 lockfile was ever buggy or
-        // always correct, so it has to assume the worst when
-        // `auto_install_peers` is on.
-        if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) {
-            return Err(LpmError::Registry(
-                "--offline cannot use a pre-R2.5 lockfile under \
-                 `lpm.autoInstallPeers = true`: the lockfile may be missing \
-                 ambient-peer-install state. Run \
-                 `lpm install` (online) once to re-derive and upgrade the \
-                 lockfile to v2, then retry --offline. To bypass this check \
-                 and accept warn-only peer semantics, set \
-                 `lpm.autoInstallPeers = false` in package.json."
-                    .into(),
-            ));
-        }
-        let mut locked = fast.packages; // Offline mode skips the writeback machinery —
-        // no fetch happens, no URLs diverge, and any v1
-        // → v2 binary migration is deferred to the next
-        // online install (intentional — `--offline` is
-        // the "don't touch anything remote" mode).
-        if omit_policy.dev {
-            filter_dev_packages(&mut locked, &production_dependency_names);
-        }
-        let _platform_skipped = filter_platform_packages(&mut locked)?;
-        if !json_output {
-            output::info(&format!(
-                "Offline: using lockfile ({} packages)",
-                locked.len().to_string().bold()
-            ));
-        }
-
-        // Verify all packages are in the global store
-        let store = PackageStore::from_root(lpm_root);
-        let store_v2 = requested_v2_mode.then(|| {
-            lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
-                lpm_root,
-                object_integrity_policy,
-            )
-        });
-        let mut missing = Vec::new();
-        for p in &locked {
-            // Source-aware existence check for the offline gate.
-            // Source::Tarball lives in the integrity-keyed CAS, so
-            // a `(name, version)`-keyed registry hit doesn't satisfy
-            // it. Trust-on-first-use Source::Tarball (no integrity
-            // recorded) is treated as missing — offline mode can't
-            // legally fetch, so the install must abort with a clear
-            // missing-package signal.
-            if !p.store_has_for_install_layout(&store, store_v2.as_ref(), project_dir) {
-                missing.push(format!("{}@{}", p.name, p.version));
-            }
-        }
-        if !missing.is_empty() {
-            return Err(LpmError::Registry(format!(
-                "--offline: {} package(s) not in global store: {}",
-                missing.len(),
-                missing[..missing.len().min(5)].join(", ")
-            )));
-        }
-
-        // **— state file lifecycle in offline mode
-        // .** Reaching this point means the fingerprint
-        // check above passed — i.e., the on-disk state file matches
-        // the current parsed override set, OR both sides are empty.
-        // Two sub-cases:
-        //
-        // - **Both empty** (`prior` is `None`, `current.is_empty()`):
-        // no state file exists and none should — nothing to do.
-        // - **Both have the SAME non-empty fingerprint**: the state
-        // file is already correct; preserving it across an offline
-        // install matches what `lpm graph --why` consumers expect.
-        //
-        // We do NOT rewrite the state file here. The `applied` trace
-        // belongs to the most recent FRESH resolution; offline mode
-        // never re-resolves and would produce an empty trace, which
-        // would be a regression for `graph --why`. Preserving the
-        // existing trace is correct.
-        //
-        // The "user removed all overrides offline" cleanup case is
-        // handled UPSTREAM by the fingerprint hard-error: removing
-        // overrides flips the fingerprint, which trips the
-        // `overrides_changed` branch above, returning a clear
-        // "re-resolve online" error.
-
-        // Offline installs still need the workspace-member BFS. The offline
-        // arm otherwise passes only the extracted top-level
-        // `workspace_member_deps` slice to `run_link_and_finish` and misses
-        // transitive `workspace:` refs in member manifests, dropping root
-        // symlinks the online path would plant. The helper expands the slice
-        // before dispatch so both modes produce the same root-symlink set.
-        merge_workspace_member_links(
-            &mut workspace_member_deps,
-            v2_workspace_root_pre_resolve
-                .additional_workspace_links
-                .iter()
-                .cloned(),
-        );
-        expand_workspace_member_deps_with_transitives(
-            &mut workspace_member_deps,
-            &all_workspace_members,
-        )?;
-        enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
-        if verify_registry_signatures {
-            enforce_registry_signature_policy(
-                Arc::clone(&arc_client),
-                &route_table,
-                &locked,
-                json_output,
-                false,
-                registry_signature_timings.clone(),
-            )
-            .await?;
-        }
-        let npm_firewall_stats = run_npm_firewall_preflight(
-            npm_firewall_mode,
-            npm_firewall_lookup_mode,
-            &arc_client,
-            &route_table,
-            &locked,
-            offline,
-            json_output,
-        )
-        .await?;
-        let policy_extension_stats =
-            run_policy_extensions(&policy_extension_configs, project_dir, &locked, json_output)
-                .await?;
-
-        // Go directly to link step (skip resolution and download).
-        // forward the already-resolved
-        // script-policy override so the link-and-finish path shows
-        // the same triage summary line the fresh-resolution path
-        // would.
-        return run_link_and_finish(
+        return run_offline_install_phase(OfflineInstallInput {
             client,
             project_dir,
-            &deps,
-            &pkg,
-            locked,
-            &v2_workspace_root_pre_resolve.install_pkgs,
-            &v2_workspace_root_pre_resolve.source_deps,
-            0,
-            0,
-            true,
-            npm_firewall_stats,
-            policy_extension_stats,
+            deps: &deps,
+            pkg: &pkg,
+            lockfile_path: &lockfile_path,
+            catalog_resolutions: &catalog_resolutions,
+            gate_stats: &gate_stats,
+            override_set: &override_set,
+            prior_overrides_state: prior_overrides_state.as_ref(),
+            overrides_changed,
+            current_patches: &current_patches,
+            current_patch_fingerprint: &current_patch_fingerprint,
+            prior_patch_state: prior_patch_state.as_ref(),
+            patches_changed,
+            auto_install_peers,
+            omit_policy,
+            production_dependency_names: &production_dependency_names,
+            requested_v2_mode,
+            object_integrity_policy,
+            lpm_root,
             json_output,
+            verify_registry_signatures,
+            registry_signature_timings: registry_signature_timings.clone(),
+            arc_client: &arc_client,
+            route_table: &route_table,
+            npm_firewall_mode,
+            npm_firewall_lookup_mode,
+            policy_extension_configs: &policy_extension_configs,
+            workspace_member_deps: &mut workspace_member_deps,
+            all_workspace_members: &all_workspace_members,
+            v2_workspace_root_pre_resolve: &v2_workspace_root_pre_resolve,
             start,
             linker_mode,
             force,
-            &workspace_member_deps,
             script_policy_override,
-            lpm_root,
-            &global_config,
-            object_integrity_policy,
             auto_build,
             no_sandbox,
             strict_sandbox,
             emit_timing,
+            global_config: &global_config,
+            strict_integrity,
             compatibility_bin_names,
-        )
+        })
         .await;
     }
 
-    // `auto_install_peers` and `pubgrub_opt_out` are
-    // computed at the top of `run_with_options` (above the empty-deps
-    // short-circuit) so the pubgrub-mismatch warning fires regardless
-    // of which install codepath ultimately runs. The lockfile-repair
-    // gate below reuses the same `auto_install_peers` value.
-
-    // --force skips lockfile fast path to force fresh resolution from registry.
-    // --overrides-changed also skips it.
-    // --patches-changed also skips it — re-applying a
-    // patch that's been added or moved since the last install requires
-    // a clean re-link from store before the patch engine runs, and the
-    // lockfile fast path bypasses linker work.
-    // Add-path installs also skip it: once the manifest has been
-    // staged with new top-level entries, a stale lockfile can contain
-    // the same package name only transitively, which is insufficient to
-    // answer what concrete direct version the add path should pick.
-    let lockfile_result = if frozen_lockfile_active {
-        let candidate = try_lockfile_fast_path(
-            &lockfile_path,
-            &deps,
-            &catalog_resolutions,
-            client,
-            &gate_stats,
-            false,
-        )
-        .ok_or_else(|| {
-            LpmError::Registry(
-                "Frozen lockfile mismatch\n  lockfile    lpm.lock\n  hint        lockfile cannot satisfy the current manifest; run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile"
-                    .into(),
-            )
-        })?;
-        if lockfile_needs_peer_state_repair(&candidate.lockfile, auto_install_peers) {
-            return Err(LpmError::Registry(format!(
-                "Frozen lockfile mismatch\n  lockfile    v{}\n  required    v{}\n  hint        run `lpm install` locally and commit the upgraded lpm.lock",
-                candidate.lockfile.metadata.lockfile_version,
-                lpm_lockfile::LOCKFILE_VERSION,
-            )));
-        }
-        Some(candidate)
-    } else if force || overrides_changed || patches_changed || is_add_invocation {
-        None
-    } else {
-        // Online installs keep the safety gate strict
-        // (`accept_unsafe_sources = false`): if the lockfile contains
-        // a `directory+` / `link+` / `tarball+local` source, bail to
-        // fresh resolve. The offline arm at line 3395 passes `true`
-        // and trusts the lockfile because fresh-resolve isn't
-        // available offline.
-        let candidate = try_lockfile_fast_path(
-            &lockfile_path,
-            &deps,
-            &catalog_resolutions,
-            client,
-            &gate_stats,
-            false,
-        );
-        match candidate {
-            Some(fast) if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) => {
-                if !json_output {
-                    output::info(
-                        "Lockfile is in an older format; rebuilding to capture \
-                         peer auto-install state. Subsequent installs will be fast.",
-                    );
-                }
-                None
-            }
-            other => other,
-        }
-    };
+    let lockfile_result = select_lockfile_install_plan(LockfileSelectionInput {
+        lockfile_path: &lockfile_path,
+        deps: &deps,
+        catalog_resolutions: &catalog_resolutions,
+        client,
+        gate_stats: &gate_stats,
+        frozen_lockfile_active,
+        force,
+        overrides_changed,
+        patches_changed,
+        is_add_invocation,
+        auto_install_peers,
+        json_output,
+    })?;
     // applied-override trace for the rest of the
     // install pipeline. Empty for the lockfile-fast-path branch (we
     // preserve the previously-recorded trace from disk in that case);
