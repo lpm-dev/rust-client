@@ -41,6 +41,59 @@ fn fake_resolved(name: &str, version: &str, context: Option<&str>) -> ResolvedPa
 }
 
 #[test]
+fn prepare_override_resolution_state_resolves_catalog_backed_override_maps() {
+    let mut package = lpm_workspace::PackageJson {
+        catalogs: HashMap::from([
+            (
+                "default".to_string(),
+                HashMap::from([("react".to_string(), "^19.0.0".to_string())]),
+            ),
+            (
+                "testing".to_string(),
+                HashMap::from([("left-pad".to_string(), "~1.3.0".to_string())]),
+            ),
+        ]),
+        overrides: HashMap::from([("left-pad".to_string(), "catalog:testing".to_string())]),
+        resolutions: HashMap::from([("chalk".to_string(), "^5.0.0".to_string())]),
+        ..Default::default()
+    };
+    package.lpm = Some(lpm_workspace::LpmConfig {
+        overrides: HashMap::from([("react".to_string(), "catalog:".to_string())]),
+        ..Default::default()
+    });
+    let mut catalog_resolutions = vec![lpm_workspace::CatalogProtocolResolution {
+        catalog_name: "default".to_string(),
+        package_name: "existing".to_string(),
+        reference: "catalog:".to_string(),
+        specifier: "^1.0.0".to_string(),
+    }];
+
+    let state = prepare_override_resolution_state(OverrideResolutionInput {
+        package: &package,
+        workspace: None,
+        catalog_resolutions: &mut catalog_resolutions,
+    })
+    .expect("catalog-backed overrides should resolve");
+
+    assert_eq!(
+        state.lpm_overrides.get("react").map(String::as_str),
+        Some("^19.0.0")
+    );
+    assert_eq!(
+        state.overrides.as_ref().get("left-pad").map(String::as_str),
+        Some("~1.3.0")
+    );
+    assert_eq!(
+        state.resolutions.as_ref().get("chalk").map(String::as_str),
+        Some("^5.0.0")
+    );
+    assert_eq!(state.override_set.len(), 3);
+    assert_eq!(state.dependency_catalog_resolution_count, 1);
+    assert_eq!(state.override_catalog_resolutions.len(), 2);
+    assert_eq!(catalog_resolutions.len(), 3);
+}
+
+#[test]
 fn resolved_to_install_packages_dedups_p4_split_duplicates() {
     // Four resolver outputs for `cross-spawn@7.0.6`: one un-scoped
     // + three scoped under different parents. `canonical_name()`
