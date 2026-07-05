@@ -116,6 +116,273 @@ pub(super) fn select_lockfile_install_plan(
     }
 }
 
+pub(super) struct OnlineLockfileWritePhaseInput<'a> {
+    pub(super) project_dir: &'a Path,
+    pub(super) lockfile_path: &'a Path,
+    pub(super) used_lockfile: bool,
+    pub(super) resolved_with: &'a str,
+    pub(super) auto_isolated_peer_conflicts: bool,
+    pub(super) workspace_install_packages: &'a [InstallPackage],
+    pub(super) packages_for_lockfile: &'a [InstallPackage],
+    pub(super) deps: &'a HashMap<String, String>,
+    pub(super) ambient_peer_installs_for_lockfile: &'a [String],
+    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) dependency_catalog_resolution_count: usize,
+    pub(super) override_catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) applied_overrides: &'a [OverrideHit],
+    pub(super) current_lockfile_patches: &'a lpm_lockfile::LockfilePatches,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
+    pub(super) frozen_lockfile_active: bool,
+    pub(super) fast_path_lockfile: Option<lpm_lockfile::Lockfile>,
+    pub(super) fresh_urls: &'a HashMap<String, String>,
+    pub(super) needs_binary_upgrade: bool,
+    pub(super) json_output: bool,
+}
+
+#[derive(Default)]
+pub(super) struct OnlineLockfileWritePhaseResult {
+    pub(super) write_ms: u128,
+    pub(super) write_count: u64,
+}
+
+impl OnlineLockfileWritePhaseResult {
+    fn record_write(&mut self, write_ms: u128) {
+        self.write_ms = self.write_ms.saturating_add(write_ms);
+        self.write_count = self.write_count.saturating_add(1);
+    }
+}
+
+pub(super) fn run_online_lockfile_write_phase(
+    input: OnlineLockfileWritePhaseInput<'_>,
+) -> Result<OnlineLockfileWritePhaseResult, LpmError> {
+    let mut result = OnlineLockfileWritePhaseResult::default();
+
+    if !input.used_lockfile {
+        let lockfile = fresh_resolved_lockfile(&input)?;
+        result.record_write(write_lockfile_and_measure(
+            &lockfile,
+            input.lockfile_path,
+            "write",
+        )?);
+        lpm_lockfile::ensure_gitattributes(input.project_dir)
+            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+        return Ok(result);
+    }
+
+    if !input.frozen_lockfile_active
+        && let Some(lockfile) = input.fast_path_lockfile
+        && let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
+            lockfile,
+            input.lockfile_path,
+            input.current_lockfile_patches,
+            input.current_importer_snapshot,
+            input.fresh_urls,
+            input.needs_binary_upgrade,
+            input.json_output,
+        )?
+    {
+        result.record_write(write_ms);
+    }
+
+    Ok(result)
+}
+
+fn fresh_resolved_lockfile(
+    input: &OnlineLockfileWritePhaseInput<'_>,
+) -> Result<lpm_lockfile::Lockfile, LpmError> {
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(input.resolved_with);
+    lockfile.metadata.auto_isolated_peer_conflicts = input.auto_isolated_peer_conflicts;
+
+    let ephemeral_workspace_pkg_keys: HashSet<String> = input
+        .workspace_install_packages
+        .iter()
+        .map(install_pkg_key)
+        .collect();
+    let persisted_packages: Vec<InstallPackage> = input
+        .packages_for_lockfile
+        .iter()
+        .filter(|package| !ephemeral_workspace_pkg_keys.contains(&install_pkg_key(package)))
+        .cloned()
+        .collect();
+
+    for package in &persisted_packages {
+        lockfile.add_package(locked_package_from_install_package(package));
+    }
+
+    lockfile.root_aliases = root_aliases_for_lockfile(&persisted_packages, input.deps);
+    lockfile.ambient_peer_installs = input.ambient_peer_installs_for_lockfile.to_vec();
+    let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
+        &input.catalog_resolutions[..input.dependency_catalog_resolution_count],
+        input.override_catalog_resolutions,
+        input.applied_overrides,
+    );
+    lockfile.catalogs =
+        catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, &persisted_packages)?;
+    lockfile.patches = input.current_lockfile_patches.clone();
+    lockfile
+        .importers
+        .insert(".".to_string(), input.current_importer_snapshot.clone());
+
+    Ok(lockfile)
+}
+
+fn locked_package_from_install_package(package: &InstallPackage) -> lpm_lockfile::LockedPackage {
+    let dependencies = package
+        .dependencies
+        .iter()
+        .map(|(dep_name, dep_version)| format!("{dep_name}@{dep_version}"))
+        .collect();
+    let alias_dependencies = package
+        .aliases
+        .iter()
+        .map(|(local, target)| [local.clone(), target.clone()])
+        .collect();
+    let peers = package
+        .peers
+        .iter()
+        .map(|(name, version)| format!("{name}@{version}"))
+        .collect();
+    let tarball = if matches!(
+        package.source_kind(),
+        Ok(lpm_lockfile::Source::Registry { .. })
+    ) {
+        package.tarball_url.clone()
+    } else {
+        None
+    };
+
+    lpm_lockfile::LockedPackage {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        source: Some(package.source.clone()),
+        integrity: package.integrity.clone(),
+        registry_signatures: lockfile_registry_signatures(&package.registry_signatures),
+        registry_published_at: package.registry_published_at.clone(),
+        os: package
+            .platform
+            .as_ref()
+            .map_or_else(Vec::new, |platform| platform.os.clone()),
+        cpu: package
+            .platform
+            .as_ref()
+            .map_or_else(Vec::new, |platform| platform.cpu.clone()),
+        libc: package
+            .platform
+            .as_ref()
+            .map_or_else(Vec::new, |platform| platform.libc.clone()),
+        optional: package.optional,
+        dependencies,
+        alias_dependencies,
+        peers,
+        tarball,
+    }
+}
+
+fn rewrite_fast_path_lockfile_if_needed(
+    mut lockfile: lpm_lockfile::Lockfile,
+    lockfile_path: &Path,
+    current_lockfile_patches: &lpm_lockfile::LockfilePatches,
+    current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
+    fresh_urls: &HashMap<String, String>,
+    needs_binary_upgrade: bool,
+    json_output: bool,
+) -> Result<Option<u128>, LpmError> {
+    let url_churn = !fresh_urls.is_empty();
+    let importer_snapshot_changed = lockfile.importers.get(".") != Some(current_importer_snapshot);
+    let patch_records_changed = lockfile.patches != *current_lockfile_patches;
+    let schema_version_changed =
+        lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION;
+
+    if importer_snapshot_changed || patch_records_changed || schema_version_changed {
+        lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+        lockfile.patches = current_lockfile_patches.clone();
+        lockfile
+            .importers
+            .insert(".".to_string(), current_importer_snapshot.clone());
+    }
+
+    if !url_churn
+        && !needs_binary_upgrade
+        && !importer_snapshot_changed
+        && !patch_records_changed
+        && !schema_version_changed
+    {
+        return Ok(None);
+    }
+
+    patch_fresh_tarball_urls(&mut lockfile, fresh_urls);
+    let write_ms = write_lockfile_and_measure(&lockfile, lockfile_path, "rewrite")?;
+    emit_fast_path_lockfile_rewrite_notice(
+        json_output,
+        url_churn,
+        needs_binary_upgrade,
+        fresh_urls.len(),
+    );
+    Ok(Some(write_ms))
+}
+
+fn patch_fresh_tarball_urls(
+    lockfile: &mut lpm_lockfile::Lockfile,
+    fresh_urls: &HashMap<String, String>,
+) {
+    for package in &mut lockfile.packages {
+        if let Some(url) = fresh_urls.get(&locked_package_key(package)) {
+            package.tarball = Some(url.clone());
+        }
+    }
+}
+
+fn locked_package_key(package: &lpm_lockfile::LockedPackage) -> String {
+    let source = package.source.as_deref().unwrap_or("");
+    let mut key =
+        String::with_capacity(package.name.len() + 1 + package.version.len() + 1 + source.len());
+    key.push_str(&package.name);
+    key.push('\x00');
+    key.push_str(&package.version);
+    key.push('\x00');
+    key.push_str(source);
+    key
+}
+
+fn write_lockfile_and_measure(
+    lockfile: &lpm_lockfile::Lockfile,
+    lockfile_path: &Path,
+    verb: &str,
+) -> Result<u128, LpmError> {
+    let lockfile_write_start = Instant::now();
+    lockfile
+        .write_all(lockfile_path)
+        .map_err(|e| LpmError::Registry(format!("failed to {verb} lockfile: {e}")))?;
+    Ok(lockfile_write_start.elapsed().as_millis())
+}
+
+fn emit_fast_path_lockfile_rewrite_notice(
+    json_output: bool,
+    url_churn: bool,
+    needs_binary_upgrade: bool,
+    fresh_url_count: usize,
+) {
+    if json_output {
+        return;
+    }
+
+    if url_churn && needs_binary_upgrade {
+        output::info(&format!(
+            "Refreshed {fresh_url_count} stale tarball URL(s) + upgraded lpm.lockb to v{}",
+            lpm_lockfile::binary::BINARY_VERSION,
+        ));
+    } else if url_churn {
+        output::info(&format!(
+            "Refreshed {fresh_url_count} stale tarball URL(s) in lockfile",
+        ));
+    } else {
+        output::info(&format!(
+            "Upgraded lpm.lockb to v{} format",
+            lpm_lockfile::binary::BINARY_VERSION,
+        ));
+    }
+}
+
 pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
