@@ -208,34 +208,34 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // dispatcher errors loudly for multi-package invocations, but recovery still runs so
         // a prior crashed install gets reconciled before the user
         // retries).
-        Commands::Install { global: true, .. } => true,
+        Commands::Install(args) if args.global => true,
         // `uninstall -g`: same reasoning as `install -g` —
         // recovery must run first so an orphaned `[pending.<pkg>]` from
         // a crashed install gets cleaned up before uninstall sees it
         // and bails with the in-flight-install error message.
-        Commands::Uninstall { global: true, .. } => true,
+        Commands::Uninstall(args) if args.global => true,
         // Every `lpm global *` subcommand reads at minimum the manifest.
-        Commands::Global { .. } => true,
+        Commands::Global(_) => true,
         // `store verify` needs the manifest settled so the walker sees
         // the right per-package state. `cache prune` covers the
         // reachability-aware union (which is itself listed below).
-        Commands::Store { action, .. } if action == "verify" => true,
+        Commands::Store(args) if args.action == "verify" => true,
         // `cache prune --apply` walks every globally-installed package's
         // lockfile + sweeps deferred tombstones — the manifest must be
         // settled before either step runs.
-        Commands::Cache { action, .. } if action == "prune" => true,
+        Commands::Cache(args) if args.action == "prune" => true,
         // Any `cache clean` invocation, regardless of subcategory.
         // Bare `cache clean` cleans metadata + tasks + dlx, so the dlx
         // dir is always in scope; the per-subcategory form trivially is
         // too.
-        Commands::Cache { action, .. } => action == "clean",
+        Commands::Cache(args) => args.action == "clean",
         // `doctor` reports on global state and may surface mid-tx
         // anomalies that recovery would have already cleaned up.
-        Commands::Doctor { .. } => true,
+        Commands::Doctor(_) => true,
         // `approve-scripts --global` reads the global
         // manifest + aggregates per-install build-state files, both
         // of which need recovery to settle first.
-        Commands::ApproveScripts { global: true, .. } => true,
+        Commands::ApproveScripts(args) if args.global => true,
         _ => false,
     }
 }
@@ -676,12 +676,12 @@ mod tests {
                 .map(std::ffi::OsString::from),
         );
         let cli = Cli::try_parse_from(args).unwrap();
-        let Some(Commands::Dlx { package, args, .. }) = cli.command else {
+        let Some(Commands::Dlx(args)) = cli.command else {
             panic!("lpx executable alias must parse as the dlx command");
         };
 
-        assert_eq!(package, "cowsay");
-        assert_eq!(args, vec!["--version"]);
+        assert_eq!(args.package, "cowsay");
+        assert_eq!(args.args, vec!["--version"]);
     }
 
     #[test]
@@ -692,12 +692,12 @@ mod tests {
                 .map(std::ffi::OsString::from),
         );
         let cli = Cli::try_parse_from(args).unwrap();
-        let Some(Commands::RunFile { file, args, .. }) = cli.command else {
+        let Some(Commands::RunFile(args)) = cli.command else {
             panic!("naked source file must parse as hidden run-file command");
         };
 
-        assert_eq!(file, "scripts/seed.ts");
-        assert_eq!(args, vec!["--flag"]);
+        assert_eq!(args.file, "scripts/seed.ts");
+        assert_eq!(args.args, vec!["--flag"]);
     }
 
     #[test]
@@ -708,16 +708,13 @@ mod tests {
                 .map(std::ffi::OsString::from),
         );
         let cli = Cli::try_parse_from(args).unwrap();
-        let Some(Commands::RunFile {
-            file, env, watch, ..
-        }) = cli.command
-        else {
+        let Some(Commands::RunFile(args)) = cli.command else {
             panic!("leading source-file flags must parse as hidden run-file command");
         };
 
-        assert_eq!(file, "scripts/seed.ts");
-        assert_eq!(env.as_deref(), Some("staging"));
-        assert!(watch);
+        assert_eq!(args.file, "scripts/seed.ts");
+        assert_eq!(args.env.as_deref(), Some("staging"));
+        assert!(args.watch);
     }
 
     #[test]
@@ -728,19 +725,13 @@ mod tests {
                 .map(std::ffi::OsString::from),
         );
         let cli = Cli::try_parse_from(args).unwrap();
-        let Some(Commands::RunFile {
-            file,
-            env,
-            plain_node,
-            ..
-        }) = cli.command
-        else {
+        let Some(Commands::RunFile(args)) = cli.command else {
             panic!("trailing source-file flags must parse as hidden run-file command");
         };
 
-        assert_eq!(file, "scripts/seed.ts");
-        assert_eq!(env.as_deref(), Some("staging"));
-        assert!(plain_node);
+        assert_eq!(args.file, "scripts/seed.ts");
+        assert_eq!(args.env.as_deref(), Some("staging"));
+        assert!(args.plain_node);
     }
 
     #[test]
@@ -766,11 +757,11 @@ mod tests {
                 .map(std::ffi::OsString::from),
         );
         let cli = Cli::try_parse_from(args).unwrap();
-        let Some(Commands::Run { scripts, .. }) = cli.command else {
+        let Some(Commands::Run(args)) = cli.command else {
             panic!("explicit run command must stay a script invocation");
         };
 
-        assert_eq!(scripts, vec!["scripts/seed.ts"]);
+        assert_eq!(args.scripts, vec!["scripts/seed.ts"]);
     }
 
     #[test]
@@ -910,10 +901,10 @@ mod tests {
     fn install_prod_and_omit_flags_parse() {
         let cli = Cli::try_parse_from(["lpm", "install", "--prod"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Install { omit, prod, .. } => {
-                assert!(omit.is_empty());
-                assert!(prod);
-                let policy = install_omit_policy_from_cli(&omit, prod);
+            Commands::Install(args) => {
+                assert!(args.omit.is_empty());
+                assert!(args.prod);
+                let policy = install_omit_policy_from_cli(&args.omit, args.prod);
                 assert!(policy.dev);
                 assert!(!policy.optional);
             }
@@ -923,9 +914,9 @@ mod tests {
         let cli = Cli::try_parse_from(["lpm", "install", "--omit=dev,optional", "--omit", "dev"])
             .unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Install { omit, prod, .. } => {
-                assert!(!prod);
-                let policy = install_omit_policy_from_cli(&omit, prod);
+            Commands::Install(args) => {
+                assert!(!args.prod);
+                let policy = install_omit_policy_from_cli(&args.omit, args.prod);
                 assert!(policy.dev);
                 assert!(policy.optional);
             }
@@ -934,8 +925,8 @@ mod tests {
 
         let cli = Cli::try_parse_from(["lpm", "install", "--production"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Install { prod, .. } => {
-                assert!(prod);
+            Commands::Install(args) => {
+                assert!(args.prod);
             }
             _ => panic!("expected Install command"),
         }
@@ -945,27 +936,19 @@ mod tests {
     fn install_global_rejects_project_scoped_yes_flag() {
         let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "-y"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Install {
-                save_dev,
-                filter,
-                workspace_root,
-                fail_if_no_match,
-                yes,
-                global,
-                ..
-            } => {
-                assert!(global);
-                assert!(yes);
+            Commands::Install(args) => {
+                assert!(args.global);
+                assert!(args.yes);
 
                 let err = validate_global_install_project_scoped_flags(
-                    save_dev,
-                    &filter,
+                    args.save_dev,
+                    &args.filter,
                     &[],
                     &[],
                     &[],
-                    workspace_root,
-                    fail_if_no_match,
-                    yes,
+                    args.workspace_root,
+                    args.fail_if_no_match,
+                    args.yes,
                     false,
                     false,
                 )
@@ -1390,25 +1373,18 @@ mod tests {
     fn uninstall_global_rejects_project_scoped_yes_flag() {
         let cli = Cli::try_parse_from(["lpm", "uninstall", "-g", "eslint", "-y"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            Commands::Uninstall {
-                filter,
-                workspace_root,
-                fail_if_no_match,
-                yes,
-                global,
-                ..
-            } => {
-                assert!(global);
-                assert!(yes);
+            Commands::Uninstall(args) => {
+                assert!(args.global);
+                assert!(args.yes);
 
                 let err = validate_global_uninstall_project_scoped_flags(
-                    &filter,
+                    &args.filter,
                     &[],
                     &[],
                     &[],
-                    workspace_root,
-                    fail_if_no_match,
-                    yes,
+                    args.workspace_root,
+                    args.fail_if_no_match,
+                    args.yes,
                 )
                 .unwrap_err();
 

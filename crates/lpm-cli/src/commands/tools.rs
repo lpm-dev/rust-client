@@ -1905,21 +1905,13 @@ mod tests {
         let cli =
             crate::Cli::try_parse_from(["lpm", "lint", "--affected", "--base", "develop"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
-            crate::Commands::Lint {
-                all,
-                affected,
-                base,
-                args,
-                filter,
-                fail_if_no_match,
-                ..
-            } => {
-                assert!(!all);
-                assert!(affected);
-                assert_eq!(base, "develop");
-                assert!(args.is_empty());
-                assert!(filter.is_empty());
-                assert!(!fail_if_no_match);
+            crate::Commands::Lint(args) => {
+                assert!(!args.all);
+                assert!(args.affected);
+                assert_eq!(args.base, "develop");
+                assert!(args.args.is_empty());
+                assert!(args.filter.is_empty());
+                assert!(!args.fail_if_no_match);
             }
             _ => panic!("expected Lint command"),
         }
@@ -1939,16 +1931,12 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Lint {
-                filter,
-                fail_if_no_match,
-                ..
-            } => {
+            crate::Commands::Lint(args) => {
                 assert_eq!(
-                    filter,
+                    args.filter,
                     vec!["@scope/*".to_string(), "!web-tests".to_string()]
                 );
-                assert!(fail_if_no_match);
+                assert!(args.fail_if_no_match);
             }
             _ => panic!("expected Lint command"),
         }
@@ -1960,9 +1948,9 @@ mod tests {
         let cli =
             crate::Cli::try_parse_from(["lpm", "fmt", "--filter", "./apps/*", "--check"]).unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Fmt { check, filter, .. } => {
-                assert!(check);
-                assert_eq!(filter, vec!["./apps/*".to_string()]);
+            crate::Commands::Fmt(args) => {
+                assert!(args.check);
+                assert_eq!(args.filter, vec!["./apps/*".to_string()]);
             }
             _ => panic!("expected Fmt command"),
         }
@@ -1980,13 +1968,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Check {
-                filter,
-                fail_if_no_match,
-                ..
-            } => {
-                assert_eq!(filter, vec!["{./packages/core}".to_string()]);
-                assert!(fail_if_no_match);
+            crate::Commands::Check(args) => {
+                assert_eq!(args.filter, vec!["{./packages/core}".to_string()]);
+                assert!(args.fail_if_no_match);
             }
             _ => panic!("expected Check command"),
         }
@@ -2039,18 +2023,13 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Test {
-                filter,
-                fail_if_no_match,
-                args,
-                ..
-            } => {
+            crate::Commands::Test(args) => {
                 assert_eq!(
-                    filter,
+                    args.filter,
                     vec!["@scope/*".to_string(), "!web-tests".to_string()]
                 );
-                assert!(fail_if_no_match);
-                assert!(args.is_empty());
+                assert!(args.fail_if_no_match);
+                assert!(args.args.is_empty());
             }
             _ => panic!("expected Test command"),
         }
@@ -2065,16 +2044,14 @@ mod tests {
         let cli = crate::Cli::try_parse_from(["lpm", "test", "--", "--all", "--filter", "pattern"])
             .unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Test {
-                all, filter, args, ..
-            } => {
-                assert!(!all, "--all after `--` must NOT be claimed by clap");
+            crate::Commands::Test(args) => {
+                assert!(!args.all, "--all after `--` must NOT be claimed by clap");
                 assert!(
-                    filter.is_empty(),
+                    args.filter.is_empty(),
                     "--filter after `--` must NOT be claimed by clap"
                 );
                 assert_eq!(
-                    args,
+                    args.args,
                     vec![
                         "--all".to_string(),
                         "--filter".to_string(),
@@ -2093,15 +2070,13 @@ mod tests {
         let cli =
             crate::Cli::try_parse_from(["lpm", "bench", "--", "--all", "--affected"]).unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Bench {
-                all,
-                affected,
-                args,
-                ..
-            } => {
-                assert!(!all);
-                assert!(!affected);
-                assert_eq!(args, vec!["--all".to_string(), "--affected".to_string()]);
+            crate::Commands::Bench(args) => {
+                assert!(!args.all);
+                assert!(!args.affected);
+                assert_eq!(
+                    args.args,
+                    vec!["--all".to_string(), "--affected".to_string()]
+                );
             }
             _ => panic!("expected Bench command"),
         }
@@ -2142,10 +2117,10 @@ mod tests {
         let cli =
             crate::Cli::try_parse_from(["lpm", "test", "src/foo.test.ts", "--coverage"]).unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Test { all, args, .. } => {
-                assert!(!all);
+            crate::Commands::Test(args) => {
+                assert!(!args.all);
                 assert_eq!(
-                    args,
+                    args.args,
                     vec!["src/foo.test.ts".to_string(), "--coverage".to_string()]
                 );
             }
@@ -2250,7 +2225,7 @@ mod tests {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "lint", "--affected"]).unwrap();
         match cli.command.unwrap() {
-            crate::Commands::Lint { base, .. } => assert_eq!(base, "main"),
+            crate::Commands::Lint(args) => assert_eq!(args.base, "main"),
             _ => panic!("expected Lint command"),
         }
     }

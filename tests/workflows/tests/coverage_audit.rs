@@ -2,7 +2,7 @@
 //!
 //! This is the lightweight 65.1 enforcement pass:
 //! - the corrected 137-row surface inventory is checked into the repo
-//! - every top-level `Commands` variant is pinned against `cli/args.rs`
+//! - every top-level `Commands` variant is pinned against `cli/args/mod.rs`
 //! - every surface marked as covered must still point at live evidence files
 //!
 //! It intentionally does NOT require the currently-uncovered rows to gain
@@ -144,8 +144,9 @@ fn covered_surfaces_still_have_live_evidence_paths() {
 
 #[test]
 fn commands_enum_variants_match_audit_baseline() {
-    let args_rs = std::fs::read_to_string(workspace_root().join("crates/lpm-cli/src/cli/args.rs"))
-        .expect("failed to read crates/lpm-cli/src/cli/args.rs");
+    let args_rs =
+        std::fs::read_to_string(workspace_root().join("crates/lpm-cli/src/cli/args/mod.rs"))
+            .expect("failed to read crates/lpm-cli/src/cli/args/mod.rs");
 
     let actual = extract_command_variants(&args_rs);
     let expected: BTreeSet<&str> = EXPECTED_COMMAND_VARIANTS.iter().copied().collect();
