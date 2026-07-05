@@ -1041,7 +1041,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: false,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/deploy.rs",
+            "crates/lpm-cli/src/commands/deploy/mod.rs",
             "tests/workflows/tests/deploy.rs",
         ],
     },
