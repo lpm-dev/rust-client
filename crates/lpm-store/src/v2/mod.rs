@@ -37,10 +37,15 @@
 //!
 //! See [`GraphKey::derive`] for the exact byte layout fed into BLAKE3.
 
+pub(crate) mod finalize_permits;
+pub(crate) mod fs_util;
 pub mod graph_key;
+pub(crate) mod integrity;
 pub mod link_meta;
+pub(crate) mod local_source;
 pub mod platform;
 pub mod store;
+pub(crate) mod tree_hash;
 
 pub use graph_key::{DepEdge, GraphKey, GraphKeyInputs, LinkerModeTag, PeerEntry};
 pub use link_meta::{
