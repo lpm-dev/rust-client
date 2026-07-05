@@ -480,8 +480,6 @@ async fn run_with_options_under_store_lock(
         timing,
     })?;
     let mut slow_package_timings = SlowPackageTimings::default();
-    let mut wf_tail_lockfile_write_ms = 0u128;
-    let mut wf_tail_lockfile_write_count = 0u64;
     let mut wf_tail_audit_after_install_ms = 0u128;
     let mut drift_ignore_policy = drift_ignore_policy;
     let mut verify_policy = verify_policy;
@@ -3841,218 +3839,30 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    // Step 9: Write lockfile (only if we resolved fresh)
-    if !used_lockfile {
-        let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(resolved_with);
-        lockfile.metadata.auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
-        let ephemeral_workspace_pkg_keys: HashSet<String> = v2_workspace_root_pre_resolve
-            .install_pkgs
-            .iter()
-            .map(install_pkg_key)
-            .collect();
-        let persisted_packages: Vec<InstallPackage> = packages_for_lockfile
-            .iter()
-            .filter(|p| !ephemeral_workspace_pkg_keys.contains(&install_pkg_key(p)))
-            .cloned()
-            .collect();
-        for p in &persisted_packages {
-            let dep_strings: Vec<String> = p
-                .dependencies
-                .iter()
-                .map(|(dep_name, dep_ver)| format!("{dep_name}@{dep_ver}"))
-                .collect();
-
-            // — persist npm-alias edges as `[local, target]`
-            // pairs. The matching `<local>@<version>` entry is already
-            // in `dep_strings`; this map keys the alias target so the
-            // warm-install path can rebuild `InstallPackage.aliases`
-            // without re-running the resolver.
-            let alias_pairs: Vec<[String; 2]> = p
-                .aliases
-                .iter()
-                .map(|(local, target)| [local.clone(), target.clone()])
-                .collect();
-
-            // persist resolved peers per package as
-            // `<peer_name>@<version>` strings (same shape as
-            // `dependencies`). Sorted upstream by `format_solution` /
-            // `into_resolved_packages`; copied verbatim. Empty for
-            // packages without peers — the serde
-            // `skip_serializing_if = "Vec::is_empty"` keeps lockfiles
-            // of older projects byte-identical.
-            let peer_strings: Vec<String> = p
-                .peers
-                .iter()
-                .map(|(name, version)| format!("{name}@{version}"))
-                .collect();
-            let tarball_field_hint =
-                if matches!(p.source_kind(), Ok(lpm_lockfile::Source::Registry { .. })) {
-                    p.tarball_url.clone()
-                } else {
-                    None
-                };
-
-            lockfile.add_package(lpm_lockfile::LockedPackage {
-                name: p.name.clone(),
-                version: p.version.clone(),
-                source: Some(p.source.clone()),
-                integrity: p.integrity.clone(),
-                registry_signatures: lockfile_registry_signatures(&p.registry_signatures),
-                registry_published_at: p.registry_published_at.clone(),
-                os: p.platform.as_ref().map_or_else(Vec::new, |m| m.os.clone()),
-                cpu: p.platform.as_ref().map_or_else(Vec::new, |m| m.cpu.clone()),
-                libc: p
-                    .platform
-                    .as_ref()
-                    .map_or_else(Vec::new, |m| m.libc.clone()),
-                optional: p.optional,
-                dependencies: dep_strings,
-                alias_dependencies: alias_pairs,
-                peers: peer_strings,
-                // — persist the tarball URL the registry
-                // returned at resolve time so warm installs can skip
-                // the per-package metadata round-trip. Consumed by
-                // `try_lockfile_fast_path` through `evaluate_cached_url`.
-                tarball: tarball_field_hint,
-            });
-        }
-
-        // — persist the root-level alias map so warm
-        // installs can rebuild `node_modules/<local>/` symlinks
-        // without re-resolving. The HashMap → BTreeMap conversion
-        // gives deterministic serialized order, matching the
-        // sort-by-name policy on `packages`.
-        lockfile.root_aliases = root_aliases_for_lockfile(&persisted_packages, &deps);
-
-        // persist the resolver's `ambient_peer_installs`
-        // set so the warm-install fast path knows which canonicals
-        // to surface as top-level node_modules entries. Without this,
-        // `rm -rf node_modules && lpm install` from the lockfile
-        // would skip the auto-installed peer (it isn't in
-        // `pkg.dependencies`) and produce a broken tree.
-        lockfile.ambient_peer_installs = ambient_peer_installs_for_lockfile.clone();
-        let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
-            &catalog_resolutions[..dependency_catalog_resolution_count],
-            &override_catalog_resolutions,
-            &applied_overrides,
-        );
-        lockfile.catalogs = catalog_snapshot_from_install_packages(
-            &lockfile_catalog_resolutions,
-            &persisted_packages,
-        )?;
-        lockfile.patches = current_lockfile_patches.clone();
-        lockfile
-            .importers
-            .insert(".".to_string(), current_importer_snapshot.clone());
-
-        let lockfile_write_start = std::time::Instant::now();
-        lockfile
-            .write_all(&lockfile_path)
-            .map_err(|e| LpmError::Registry(format!("failed to write lockfile: {e}")))?;
-        wf_tail_lockfile_write_ms =
-            wf_tail_lockfile_write_ms.saturating_add(lockfile_write_start.elapsed().as_millis());
-        wf_tail_lockfile_write_count = wf_tail_lockfile_write_count.saturating_add(1);
-
-        lpm_lockfile::ensure_gitattributes(project_dir)
-            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
-
-    // The lockfile-size line moved into the `--verbose` footer at
-    // the end of the install, alongside the per-phase timing
-    // breakdown.
-    } else if !frozen_lockfile_active && let Some(mut lockfile) = fast_path_lockfile.take() {
-        // When the fast path ran, we skip the fresh-resolve writer
-        // above. A few lockfile-maintenance signals can still require
-        // a rewrite:
-        //
-        // 1. `fresh_urls` is non-empty — at least one URL diverged
-        // from the stored value (stale-URL recovery and/or
-        // origin-mismatch rebase). Without the rewrite, the
-        // divergence recurs on every subsequent install.
-        // 2. `needs_binary_upgrade` — the `lpm.lockb` was
-        // missing or out-of-version. Fast-path-only runs would
-        // otherwise defer the binary migration indefinitely.
-        // 3. Importer snapshots are missing/stale, or the TOML schema
-        // version predates the current frozen-install contract.
-        //
-        // On the true happy path, all signals are clean and no write
-        // fires, so lockfiles stay byte-identical.
-        let url_churn = !fresh_urls.is_empty();
-        let importer_snapshot_changed =
-            lockfile.importers.get(".") != Some(&current_importer_snapshot);
-        let patch_records_changed = lockfile.patches != current_lockfile_patches;
-        let schema_version_changed =
-            lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION;
-        if importer_snapshot_changed || patch_records_changed || schema_version_changed {
-            lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
-            lockfile.patches = current_lockfile_patches.clone();
-            lockfile
-                .importers
-                .insert(".".to_string(), current_importer_snapshot.clone());
-        }
-
-        if url_churn
-            || needs_binary_upgrade
-            || importer_snapshot_changed
-            || patch_records_changed
-            || schema_version_changed
-        {
-            // Patch `lp.tarball` in place for every package whose
-            // final URL diverged. Linear scan over `fresh_urls` is
-            // fine — even large workspaces have <1k packages and
-            // churn is rare in steady state.
-            for lp in &mut lockfile.packages {
-                // Build the same compound key used during insertion
-                // ("name\x00version\x00source"). LockedPackage.source
-                // matches InstallPackage.source for all packages written
-                //+; pre-59 lockfiles have source=None but
-                // fresh_urls will be empty for those warm installs.
-                let src = lp.source.as_deref().unwrap_or("");
-                let lp_key = {
-                    let mut k =
-                        String::with_capacity(lp.name.len() + 1 + lp.version.len() + 1 + src.len());
-                    k.push_str(&lp.name);
-                    k.push('\x00');
-                    k.push_str(&lp.version);
-                    k.push('\x00');
-                    k.push_str(src);
-                    k
-                };
-                if let Some(url) = fresh_urls.get(&lp_key) {
-                    lp.tarball = Some(url.clone());
-                }
-            }
-
-            let lockfile_write_start = std::time::Instant::now();
-            lockfile
-                .write_all(&lockfile_path)
-                .map_err(|e| LpmError::Registry(format!("failed to rewrite lockfile: {e}")))?;
-            wf_tail_lockfile_write_ms = wf_tail_lockfile_write_ms
-                .saturating_add(lockfile_write_start.elapsed().as_millis());
-            wf_tail_lockfile_write_count = wf_tail_lockfile_write_count.saturating_add(1);
-
-            if !json_output {
-                // Observable output so the user can see why the
-                // lockfile's mtime changed.
-                if url_churn && needs_binary_upgrade {
-                    output::info(&format!(
-                        "Refreshed {} stale tarball URL(s) + upgraded lpm.lockb to v{}",
-                        fresh_urls.len(),
-                        lpm_lockfile::binary::BINARY_VERSION,
-                    ));
-                } else if url_churn {
-                    output::info(&format!(
-                        "Refreshed {} stale tarball URL(s) in lockfile",
-                        fresh_urls.len(),
-                    ));
-                } else {
-                    output::info(&format!(
-                        "Upgraded lpm.lockb to v{} format",
-                        lpm_lockfile::binary::BINARY_VERSION,
-                    ));
-                }
-            }
-        }
-    }
+    let lockfile_write_result = run_online_lockfile_write_phase(OnlineLockfileWritePhaseInput {
+        project_dir,
+        lockfile_path: &lockfile_path,
+        used_lockfile,
+        resolved_with,
+        auto_isolated_peer_conflicts,
+        workspace_install_packages: &v2_workspace_root_pre_resolve.install_pkgs,
+        packages_for_lockfile: &packages_for_lockfile,
+        deps: &deps,
+        ambient_peer_installs_for_lockfile: &ambient_peer_installs_for_lockfile,
+        catalog_resolutions: &catalog_resolutions,
+        dependency_catalog_resolution_count,
+        override_catalog_resolutions: &override_catalog_resolutions,
+        applied_overrides: &applied_overrides,
+        current_lockfile_patches: &current_lockfile_patches,
+        current_importer_snapshot: &current_importer_snapshot,
+        frozen_lockfile_active,
+        fast_path_lockfile,
+        fresh_urls: &fresh_urls,
+        needs_binary_upgrade,
+        json_output,
+    })?;
+    let wf_tail_lockfile_write_ms = lockfile_write_result.write_ms;
+    let wf_tail_lockfile_write_count = lockfile_write_result.write_count;
 
     // Step 10: Auto-build trusted packages (after lockfile is written)
     // Triggers when: --auto-build flag, lpm.scripts.autoBuild config,
