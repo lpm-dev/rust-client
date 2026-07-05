@@ -581,6 +581,77 @@ pub(super) type OverrideCatalogResolution<'a> = (
     Vec<lpm_workspace::CatalogProtocolResolution>,
 );
 
+pub(super) struct OverrideResolutionInput<'a> {
+    pub(super) package: &'a lpm_workspace::PackageJson,
+    pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
+    pub(super) catalog_resolutions: &'a mut Vec<lpm_workspace::CatalogProtocolResolution>,
+}
+
+pub(super) struct OverrideResolutionState<'a> {
+    pub(super) lpm_overrides: HashMap<String, String>,
+    pub(super) overrides: Cow<'a, HashMap<String, String>>,
+    pub(super) resolutions: Cow<'a, HashMap<String, String>>,
+    pub(super) override_catalogs: &'a HashMap<String, HashMap<String, String>>,
+    pub(super) override_catalog_resolutions: Vec<lpm_workspace::CatalogProtocolResolution>,
+    pub(super) dependency_catalog_resolution_count: usize,
+    pub(super) override_set: OverrideSet,
+}
+
+pub(super) fn prepare_override_resolution_state<'a>(
+    input: OverrideResolutionInput<'a>,
+) -> Result<OverrideResolutionState<'a>, LpmError> {
+    let lpm_overrides_map = input
+        .package
+        .lpm
+        .as_ref()
+        .map(|lpm| lpm.overrides.clone())
+        .unwrap_or_default();
+    let dependency_catalog_resolution_count = input.catalog_resolutions.len();
+    let override_catalogs = input
+        .workspace
+        .map_or(&input.package.catalogs, |ws| &ws.root_package.catalogs);
+    let (lpm_overrides_map, lpm_override_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&lpm_overrides_map, override_catalogs)?;
+    let (overrides_map, npm_override_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&input.package.overrides, override_catalogs)?;
+    let (resolutions_map, resolution_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&input.package.resolutions, override_catalogs)?;
+    let mut override_catalog_resolutions = Vec::new();
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        lpm_override_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        npm_override_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        resolution_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        input.catalog_resolutions,
+        override_catalog_resolutions.clone(),
+    );
+
+    let override_set = OverrideSet::parse(
+        lpm_overrides_map.as_ref(),
+        overrides_map.as_ref(),
+        resolutions_map.as_ref(),
+    )
+    .map_err(|error| LpmError::Script(format!("invalid override in package.json: {error}")))?;
+
+    Ok(OverrideResolutionState {
+        lpm_overrides: lpm_overrides_map.into_owned(),
+        overrides: overrides_map,
+        resolutions: resolutions_map,
+        override_catalogs,
+        override_catalog_resolutions,
+        dependency_catalog_resolution_count,
+        override_set,
+    })
+}
+
 pub(super) fn resolve_catalog_protocol_in_override_map<'a>(
     overrides: &'a HashMap<String, String>,
     catalogs: &HashMap<String, HashMap<String, String>>,

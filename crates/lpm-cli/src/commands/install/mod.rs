@@ -617,58 +617,19 @@ async fn run_with_options_under_store_lock(
     let minimum_release_age_exclude: std::collections::HashSet<String> =
         minimum_release_age_exclude.into_iter().collect();
 
-    // fully parse and validate the override set
-    // up-front (fail-closed). This runs BEFORE the empty-deps
-    // short-circuit so a malformed override is surfaced even when
-    // the project has zero dependencies — otherwise users would only
-    // discover the validation failure after adding their first dep.
-    //
-    // The three sources are merged through the resolver's parser. Any
-    // malformed selector, target, or multi-segment path is a HARD
-    // ERROR here, surfaced to the user as a clear validation message.
-    //
-    // - `lpm.overrides` (LPM-native, wins on conflict)
-    // - `overrides` (npm-standard, top-level)
-    // - `resolutions` (yarn-style alias for overrides)
-    let lpm_overrides_map = pkg
-        .lpm
-        .as_ref()
-        .map(|l| l.overrides.clone())
-        .unwrap_or_default();
-    let dependency_catalog_resolution_count = catalog_resolutions.len();
-    let override_catalogs = workspace
-        .as_ref()
-        .map_or(&pkg.catalogs, |ws| &ws.root_package.catalogs);
-    let (lpm_overrides_map, lpm_override_catalog_resolutions) =
-        resolve_catalog_protocol_in_override_map(&lpm_overrides_map, override_catalogs)?;
-    let (overrides_map, npm_override_catalog_resolutions) =
-        resolve_catalog_protocol_in_override_map(&pkg.overrides, override_catalogs)?;
-    let (resolutions_map, resolution_catalog_resolutions) =
-        resolve_catalog_protocol_in_override_map(&pkg.resolutions, override_catalogs)?;
-    let mut override_catalog_resolutions = Vec::new();
-    extend_catalog_resolutions(
-        &mut override_catalog_resolutions,
-        lpm_override_catalog_resolutions,
-    );
-    extend_catalog_resolutions(
-        &mut override_catalog_resolutions,
-        npm_override_catalog_resolutions,
-    );
-    extend_catalog_resolutions(
-        &mut override_catalog_resolutions,
-        resolution_catalog_resolutions,
-    );
-    extend_catalog_resolutions(
-        &mut catalog_resolutions,
-        override_catalog_resolutions.clone(),
-    );
-
-    let override_set = OverrideSet::parse(
-        lpm_overrides_map.as_ref(),
-        overrides_map.as_ref(),
-        resolutions_map.as_ref(),
-    )
-    .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
+    let OverrideResolutionState {
+        lpm_overrides,
+        overrides,
+        resolutions,
+        override_catalogs,
+        override_catalog_resolutions,
+        dependency_catalog_resolution_count,
+        override_set,
+    } = prepare_override_resolution_state(OverrideResolutionInput {
+        package: &pkg,
+        workspace: workspace.as_ref(),
+        catalog_resolutions: &mut catalog_resolutions,
+    })?;
 
     // Manifest-side compatibility warnings (pnpm overrides / patches
     // / peer rules drift, ignored other-PM `engines.*` keys) fire from
@@ -707,9 +668,9 @@ async fn run_with_options_under_store_lock(
         project_dir,
         lockfile_path: &lockfile_path,
         package: &pkg,
-        lpm_overrides: lpm_overrides_map.as_ref(),
-        overrides: overrides_map.as_ref(),
-        resolutions: resolutions_map.as_ref(),
+        lpm_overrides: &lpm_overrides,
+        overrides: overrides.as_ref(),
+        resolutions: resolutions.as_ref(),
         catalogs: override_catalogs,
         auto_install_peers,
         frozen_lockfile_active,
