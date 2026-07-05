@@ -332,6 +332,14 @@ async fn async_main() -> Result<()> {
                                     tx.tx_id
                                 );
                             }
+                            lpm_global::ReconciliationOutcome::InFlight { reason } => {
+                                tracing::debug!(
+                                    "global recovery: skipped live tx for '{}' (tx {}, reason: {})",
+                                    tx.package,
+                                    tx.tx_id,
+                                    reason
+                                );
+                            }
                             lpm_global::ReconciliationOutcome::Deferred { reason } => {
                                 // Surface deferred transactions to the user;
                                 // they're typically transient (Windows AV

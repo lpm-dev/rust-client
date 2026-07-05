@@ -14,6 +14,7 @@
 //! and persistence rules have a single source of truth, independent of
 //! the command-layer wiring.
 
+mod inflight;
 pub mod install_root;
 pub mod manifest;
 pub mod recover;
@@ -22,6 +23,7 @@ pub mod sweep;
 pub mod trusted_deps;
 pub mod wal;
 
+pub use inflight::tx_lock_path as inflight_tx_lock;
 pub use install_root::{
     InstallReadyMarker, InstallRootStatus, MARKER_SCHEMA_VERSION, MINIMAL_VALID_LOCKFILE_TOML,
     read_marker, validate_install_root, write_marker,

@@ -8,8 +8,8 @@
 //!
 //! ## Algorithm
 //!
-//! 1. `try_lock` the global `.tx.lock`. If another process holds it
-//!    (a long install in progress), return an empty report — recovery
+//! 1. `try_lock` the global `.tx.lock`. If another process holds a
+//!    manifest/WAL critical section, return an empty report — recovery
 //!    is safe to defer to the next invocation.
 //! 2. Scan the WAL via [`crate::wal::WalReader::scan`].
 //!    - `ScanStop::UnknownOp` → bail with "WAL written by newer lpm";
@@ -25,12 +25,14 @@
 //!    the WAL is ahead of the manifest — could happen if the manifest
 //!    write was rolled back without a WAL ABORT; treat as a
 //!    roll-back-needed case (clean up install root if any).
-//!    b. Call [`validate_install_root`]. If `Ready`:
+//!    b. If the tx-local in-flight lock is held, leave the transaction
+//!    untouched; the owning process is still doing slow install work.
+//!    c. Call [`validate_install_root`]. If `Ready`:
 //!    Roll forward — emit shims for `new_row.commands` and
 //!    `new_aliases_json`, flip `[pending.<package>]` into
 //!    `[packages.<package>]`, queue the prior root (if upgrade) in
 //!    `manifest.tombstones`, write COMMIT to WAL.
-//!    c. Otherwise:
+//!    d. Otherwise:
 //!    Roll back — if the prior active row exists, restore
 //!    `[packages.<package>]` from `prior_active_row_json` and restore
 //!    prior alias state from `prior_command_ownership_json`. Remove
@@ -88,6 +90,12 @@ pub enum ReconciliationOutcome {
     /// because doing so would wedge every subsequent global-state
     /// command.
     Deferred {
+        reason: String,
+    },
+    /// Another live `lpm` process owns this staged transaction. Recovery
+    /// leaves it untouched and retries on a later invocation after the
+    /// owner has either committed or exited.
+    InFlight {
         reason: String,
     },
 }
@@ -351,6 +359,12 @@ fn reconcile_one(
     }
 
     let pending = manifest.pending.get(&intent.package).cloned().unwrap();
+    if tx_inflight_lock_is_held(root, intent)? {
+        return Ok(ReconciliationOutcome::InFlight {
+            reason: "transaction is still owned by another lpm process".into(),
+        });
+    }
+
     // Validate against the pending row's commands when it has any. Fresh
     // installs have `pending.commands == []` (commands are discovered
     // during step 2 and recorded in the marker), so we pass
@@ -403,6 +417,11 @@ fn reconcile_one(
     }
 
     roll_forward(root, manifest, wal, intent, pending, marker_commands)
+}
+
+fn tx_inflight_lock_is_held(root: &LpmRoot, intent: &IntentPayload) -> Result<bool, LpmError> {
+    let lock_path = crate::inflight_tx_lock(root, &intent.tx_id);
+    Ok(try_with_exclusive_lock(lock_path, || Ok(()))?.is_none())
 }
 
 /// True when `manifest.packages[intent.package]` equals the row this
