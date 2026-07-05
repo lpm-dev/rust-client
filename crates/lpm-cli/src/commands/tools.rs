@@ -2058,8 +2058,8 @@ mod tests {
 
     #[test]
     fn test_compat_seam_double_dash_forwards_recognized_flags() {
-        // Load-bearing: a user who today passes --all to bun/jest must be
-        // able to keep doing so by adding `--`. The trailing_var_arg
+        // Load-bearing: a user who passes runner-specific flags like --all
+        // must be able to keep doing so by adding `--`. The trailing_var_arg
         // capture must claim everything after `--` regardless of name.
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(["lpm", "test", "--", "--all", "--filter", "pattern"])

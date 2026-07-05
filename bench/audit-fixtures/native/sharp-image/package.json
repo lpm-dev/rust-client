@@ -2,7 +2,7 @@
 	"name": "audit-fixture-sharp-image",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Native fixture: sharp downloads platform-specific libvips binary in postinstall, then dlopens it via the binding layer at runtime. Tests both lifecycle-script execution AND post-install binary lookup.",
+	"_comment": "Hoisted compatibility audit. Native fixture: sharp downloads platform-specific libvips binary in postinstall, then dlopens it via the binding layer at runtime. Tests both lifecycle-script execution AND post-install binary lookup.",
 	"dependencies": {
 		"sharp": "^0.33.0"
 	}

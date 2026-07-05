@@ -1,5 +1,5 @@
 #!/bin/bash
-# Real-world project audit harness — confidence-followup
+# Real-world project audit harness
 #
 # Clones a project pinned in projects.json, replaces its install with
 # `lpm install --linker <mode>` for both isolated and hoisted, and runs

@@ -1,8 +1,6 @@
 # Hoisted-mode compatibility audit fixtures
 
-Real-world fixture set for the Phase 2 hoisted-mode compatibility audit.
-See [`DOCS/new-features/37-rust-client-hoisted-compat-audit-preplan.md`](https://github.com/tolga-ergin/lpm/blob/main/DOCS/new-features/37-rust-client-hoisted-compat-audit-preplan.md)
-in the lpm repo for full methodology.
+Real-world fixture set for the hoisted-mode compatibility audit.
 
 Each fixture is a minimal `package.json` that exercises one specific
 real-world failure mode. Three risk buckets:

@@ -1247,10 +1247,9 @@ async fn env_oidc_allow_missing_repo_emits_json_error() {
 
 #[tokio::test]
 async fn env_oidc_allow_missing_workflow_flag_errors_loudly() {
-    // Phase 8 of plan-security-findings-c3.md makes `--workflow` required
-    // at the CLI layer. Without it the server's Zod `.min(1)` on
-    // `allowedWorkflows` would reject anyway; we surface the failure
-    // client-side so the user gets a fast, actionable error.
+    // `--workflow` is required at the CLI layer. Without it the server's Zod
+    // `.min(1)` on `allowedWorkflows` would reject anyway; we surface the
+    // failure client-side so the user gets a fast, actionable error.
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-allow-missing-workflow","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1292,10 +1291,10 @@ async fn env_oidc_allow_missing_workflow_flag_errors_loudly() {
 
 #[tokio::test]
 async fn env_oidc_allow_rejects_workflow_in_subdirectory() {
-    // The Phase 3.2 regex pins .github/workflows/<file>.{yml,yaml} only.
-    // Subdirectories aren't supported by GitHub Actions and aren't
-    // accepted by the server's Zod schema either; the CLI catches it
-    // before the network round-trip.
+    // The workflow regex pins .github/workflows/<file>.{yml,yaml} only.
+    // Subdirectories aren't supported by GitHub Actions and aren't accepted
+    // by the server's Zod schema either; the CLI catches it before the
+    // network round-trip.
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-allow-workflow-subdir","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -2027,11 +2026,10 @@ async fn env_oidc_list_emits_json_response() {
 
 #[tokio::test]
 async fn env_oidc_list_human_output_renders_new_fields() {
-    // Phase 8 of plan-security-findings-c3.md added allowedWorkflows
-    // and allowedEvents to the policy schema. The CLI's human-readable
-    // `lpm env oidc list` output must surface both — without this the
-    // dashboard-vs-CLI inspection paths drift (CLI users wouldn't see
-    // the policy fields that gate their next CI mint).
+    // The CLI's human-readable `lpm env oidc list` output must surface
+    // allowedWorkflows and allowedEvents; without this the dashboard-vs-CLI
+    // inspection paths drift and CLI users would not see the policy fields
+    // that gate their next CI mint.
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-list-human-fields","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

@@ -1453,19 +1453,18 @@ async fn run_with_options_under_store_lock(
     };
 
     //
-    // `workspace_member_deps` above is the EXTRACTED top-level subset
+    // `workspace_member_deps` above is the extracted top-level subset
     // (entries the consumer's manifest declared via `workspace:*`).
     // That set drives `link_workspace_members` (which plants root
     // node_modules symlinks for explicit references).
     //
-    // `pre_resolve_non_registry_deps` needs a DIFFERENT set: every
+    // `pre_resolve_non_registry_deps` needs a different set: every
     // member of the workspace, regardless of whether the consumer's
-    // top-level manifest references it via `workspace:*`. Pre-the invariant
-    // the same `workspace_member_deps` slice was reused, but that
-    // meant a workspace member was visible to overlap detection
-    // and to the invariant's transitive `workspace:` check ONLY when the
-    // consumer's root explicitly imported it via `workspace:*`. The
-    // regression the invariant repro: root depends on `foo` via `file:`, and
+    // top-level manifest references it via `workspace:*`. Reusing the
+    // extracted slice meant a workspace member was visible to overlap
+    // detection and transitive `workspace:` checks only when the consumer's
+    // root explicitly imported it via `workspace:*`. Regression shape:
+    // root depends on `foo` via `file:`, and
     // foo's `package.json` declares `bar: workspace:*` — bar is a
     // valid sibling member, but because the root never wrote
     // `"bar": "workspace:*"`, `extracted` is empty and the invariant
@@ -2150,21 +2149,12 @@ async fn run_with_options_under_store_lock(
         // `overrides_changed` branch above, returning a clear
         // "re-resolve online" error.
 
-        // **invariant (round 6) — offline path runs
-        // workspace-member BFS too.** Pre-the invariant the offline arm
-        // passed the EXTRACTED top-level `workspace_member_deps`
-        // slice straight to `run_link_and_finish` and missed
-        // transitive `workspace:` refs in member manifests, dropping
-        // root symlinks the online path would have planted. The
-        // helper expands the slice before dispatch so both modes
-        // produce the same root-symlink set. Pre-the invariant/6 the
-        // -deduped + the invariant-transitive merge step ran at the
-        // online callsite — in offline mode there's no pre_resolve
-        // (nothing to merge), so the BFS is the only expansion that
-        // applies. (The the invariant pre-pass at install start has
-        // already populated `workspace_member_deps` with file:/link:
-        // deps that match members, so the BFS seed set already
-        // includes those.)
+        // Offline installs still need the workspace-member BFS. The offline
+        // arm otherwise passes only the extracted top-level
+        // `workspace_member_deps` slice to `run_link_and_finish` and misses
+        // transitive `workspace:` refs in member manifests, dropping root
+        // symlinks the online path would plant. The helper expands the slice
+        // before dispatch so both modes produce the same root-symlink set.
         merge_workspace_member_links(
             &mut workspace_member_deps,
             v2_workspace_root_pre_resolve
@@ -2337,9 +2327,9 @@ async fn run_with_options_under_store_lock(
     // `resolve_result.ambient_peer_installs`.
     let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
 
-    //: fetch semaphore hoisted out of the fetch loop so the
-    // optional speculative dispatcher can share the download
-    // pool with the post-resolve real-fetch loop. Without sharing, a
+    // The fetch semaphore is hoisted out of the fetch loop so the optional
+    // speculative dispatcher can share the download pool with the
+    // post-resolve real-fetch loop. Without sharing, a
     // spec dispatcher racing alongside the later real loop would
     // saturate the network for no wall-clock win. One pool,
     // used first by speculation, then drained by real fetch.
@@ -2348,18 +2338,15 @@ async fn run_with_options_under_store_lock(
     // `LPM_STREAM_FETCH=0` falls back to the temp-file spool path for both
     // early overlap fetches and the post-resolve fetch loop.
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
-    //: also hoist the `PackageStore` so the speculative
-    // dispatcher can write tarballs into the real store during the
-    // resolve phase. Post-resolve, the fetch loop rebinds to the same
-    // handle (cheap Arc-style clone underneath).
+    // Hoist the `PackageStore` so the speculative dispatcher can write
+    // tarballs into the real store during the resolve phase. Post-resolve,
+    // the fetch loop rebinds to the same handle (cheap Arc-style clone
+    // underneath).
     let store = PackageStore::from_root(lpm_root);
-    // confidence-followup S5b — `lpm_root` lifted to function
-    // scope so post-install helpers (`show_install_build_hint`,
-    // `all_scripted_packages_trusted`) can reach the v2 store via
-    // `find_installed_package_baseline`. Previously, those helpers took
-    // `&PackageStore` (v1-only) and silently dropped every v2-installed
-    // scripted package — auto-build never fired, build hints reported
-    // 0 packages even when prisma / esbuild / sharp were waiting.
+    // `lpm_root` stays in function scope so post-install helpers can reach
+    // the v2 store via `find_installed_package_baseline`. Those helpers need
+    // the actual install root to find v2-installed scripted packages for
+    // auto-build and build-hint decisions.
     // — read the store-version flag once per
     // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
     // pipeline; everything else (unset, "v1", typos) takes the v1
@@ -3321,29 +3308,22 @@ async fn run_with_options_under_store_lock(
     let mut fetch_stage_timings = FetchStageTimings::default();
     let mut v2_link_task_timings = V2LinkTaskTimings::default();
 
-    // — aggregation buffer for the generalized writeback.
-    // Populated inside the fetch block with every (name, version) →
-    // final-URL pair (only when the final URL diverges from the
-    // stored lockfile URL). Consumed at install-end to trigger a
-    // lockfile rewrite. Hoisted out of the fetch block so the
-    // writeback logic (below the block) can see it.
-    // ( completion) — keyed on PackageKey so
-    // a registry react@19.0.0 and a tarball-URL react@19.0.0 don't
-    // clobber each other's writeback URL. Pre-used a
-    // (name, version) tuple key.
+    // Aggregation buffer for fetch writeback. Populated inside the fetch
+    // block with final-URL pairs only when the final URL diverges from the
+    // stored lockfile URL. Keyed on PackageKey so a registry react@19.0.0
+    // and a tarball-URL react@19.0.0 don't clobber each other's writeback.
     let mut fresh_urls: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut integrity_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    // Pre-compute the per-target
-    // patch fingerprint map so each `LinkTarget` carries its own
-    // `Some("p-…")` when patched. v2's GraphKey folds it in, splitting
-    // patched installs into project-isolated link entries.
+    // Pre-compute the per-target patch fingerprint map so each `LinkTarget`
+    // carries its own `Some("p-…")` when patched. v2's GraphKey folds it in,
+    // splitting patched installs into project-isolated link entries.
     let patch_fingerprints = compute_patch_fingerprints(&current_patches, project_dir)?;
 
-    //b: build link_targets up front so the event-driven
-    // path can start per-package linking as each tarball lands.
+    // Build link targets up front so the event-driven path can start
+    // per-package linking as each tarball lands.
     // `LinkTarget` fields don't depend on fetch completion — just on
     // resolver output — so building them here is safe. Reused by both
     // the event-driven and serial link paths.
@@ -3378,13 +3358,11 @@ async fn run_with_options_under_store_lock(
         })
         .collect::<Result<_, _>>()?;
 
-    //b: event-driven link mode. Per-packagea future release2 work
-    // runs inside the fetch pipeline (parallel with tarball downloads
-    // of other packages).a future release3.5+4 run as a final batch. Default
-    // on for the isolated linker; `LPM_SERIAL_LINK=1` reverts to the
-    // single-shot `link_packages` path. Hoisted linker always uses
-    // the serial path — it has a different layout model and isn't the
-    // hot path for the default `lpm install`.
+    // Event-driven link mode runs per-package work inside the fetch pipeline,
+    // parallel with sibling tarball downloads, then runs final project wiring
+    // as one batch. `LPM_SERIAL_LINK=1` reverts to the single-shot
+    // `link_packages` path. The hoisted linker uses the serial path because
+    // it has a different layout model.
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
     if v2_mode {
@@ -3402,26 +3380,21 @@ async fn run_with_options_under_store_lock(
             store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
         }
     }
-    // — under v2 mode, link_packages_v2 needs the
-    // full LinkTarget set in one batch so the GraphKey pre-pass can
-    // resolve cross-references. Per-package event-driven linking
-    // (which v1's isolated path uses) doesn't fit the v2 dispatcher's
-    // shape, so v2 always takes the serial path.
+    // Under v2 mode, `link_packages_v2` needs the full LinkTarget set in one
+    // batch so the GraphKey pre-pass can resolve cross-references. The v2
+    // event-driven path below uses a separate prepare/one/finalize split.
     let event_driven_link =
         !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
-    //b: collection of per-package link handles. Cached
-    // packages push into this before the fetch loop; fetch tasks push
-    // as each tarball materializes. Awaited during the link-finalize
-    // step below (post-fetch).
+    // Collection of per-package link handles. Cached packages push into this
+    // before the fetch loop; fetch tasks push as each tarball materializes.
+    // Awaited during the link-finalize step below.
     let mut event_link_handles: Vec<
         tokio::task::JoinHandle<
             Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
         >,
     > = Vec::new();
 
-    // followup #6b — event-driven v2 link dispatch.
-    //
     // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
     // CAS-backed target arrives with both
     // (a) a known SRI (`p.integrity = Some(_)`), and
@@ -3597,14 +3570,13 @@ async fn run_with_options_under_store_lock(
     fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
     let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
-    //b: stale-entry cleanup runs once, up front — must
-    // happen before any per-pkg link spawn touches `.lpm/` so the
-    // `read_dir` scan sees a stable snapshot.
+    // Stale-entry cleanup runs once, up front. It must happen before any
+    // per-package link spawn touches `.lpm/` so the `read_dir` scan sees a
+    // stable snapshot.
     //
-    // followup #6b: under v2_event_driven, `link_v2_prepare`
-    // above already ran `cleanup_v1_state` (the v2-side equivalent),
-    // so this v1-shaped cleanup is skipped — running it would wipe
-    // node_modules a second time with no benefit.
+    // Under v2 event-driven linking, `link_v2_prepare` already ran
+    // `cleanup_v1_state`, so this v1-shaped cleanup is skipped. Running it
+    // would wipe node_modules a second time with no benefit.
     if event_driven_link {
         lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
     }
@@ -3677,8 +3649,6 @@ async fn run_with_options_under_store_lock(
             continue;
         }
 
-        // — v2 native cache-hit short-circuit.
-        //
         // When v2 mode is active AND the v2 object dir for this
         // package's SRI already exists (populated by a prior install
         // OR by the speculative pre-fetcher earlier in this install),
@@ -3687,14 +3657,10 @@ async fn run_with_options_under_store_lock(
         // is needed here — same shape as the v1 cache-hit gate
         // below.
         //
-        // Pre-this branch was missing because the v2 fetch
-        // path is itself idempotent (`extract_object_from_bytes`
-        // short-circuits on object hits), so a duplicate fetch was
-        // "free" in correctness terms but wasted network on every
-        // package. Workflow tests that mock the registry with
-        // `expect(1)` per tarball relied on the speculation path
-        // being a no-op (pre-4d drain) and broke under the wired-up
-        // 4d spec path because every package was downloaded twice.
+        // The v2 fetch path is idempotent (`extract_object_from_bytes`
+        // short-circuits on object hits), so a duplicate fetch is safe but
+        // wastes network on every package. Mock-registry workflow tests also
+        // expect one tarball request per package.
         let package_key = install_pkg_key(p);
         if !force
             && v2_mode
@@ -3704,10 +3670,9 @@ async fn run_with_options_under_store_lock(
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             spec_tracker.mark_consumed_if_completed(&package_key);
-            // followup #6b — dispatch link_v2_one immediately.
             // The v2 object is already populated, so the link entry's
-            // clonefile pass can run on the blocking pool in parallel
-            // with sibling fetches. Awaited at the link stage below.
+            // clonefile pass can run on the blocking pool in parallel with
+            // sibling fetches. Awaited at the link stage below.
             if v2_event_driven
                 && let Some(plan) = v2_plan.as_ref()
                 && let Some(target) = v2_target_by_key.get(&package_key).cloned()
@@ -3773,9 +3738,8 @@ async fn run_with_options_under_store_lock(
                 Ok(_) => {
                     fetch_stage_timings.v1_to_v2_translate_count += 1;
                     cached += 1;
-                    // followup #6b — see the v2 SRI-direct
-                    // cache-hit branch above. Translation populated
-                    // `objects/<sri>/`; dispatch link immediately.
+                    // Translation populated `objects/<sri>/`, so dispatch the
+                    // v2 link entry immediately.
                     if v2_event_driven
                         && let Some(plan) = v2_plan.as_ref()
                         && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
@@ -3825,8 +3789,9 @@ async fn run_with_options_under_store_lock(
             cached += 1;
             fetch_stage_timings.v1_cache_hit_count += 1;
             spec_tracker.mark_consumed_if_completed(&package_key);
-            //b: spawn per-pkg link task immediately — this
-            // package is already materialized in the store, so // can run in parallel with the fetch loop below.
+            // Spawn per-package link task immediately. This package is already
+            // materialized in the store, so linking can run in parallel with
+            // the fetch loop below.
             if event_driven_link {
                 // Source-aware store path keeps the linker pointed at
                 // the correct slot (tarball CAS for remote tarballs,
@@ -4137,9 +4102,9 @@ async fn run_with_options_under_store_lock(
                 .trusted_dependencies;
 
         // Short-circuit the whole gate when there's no rich-form
-        // approval to compare against. Pre- projects with only
-        // Legacy approvals (or no `trustedDependencies` at all) skip
-        // the gate entirely — zero network cost.
+        // approval to compare against. Projects with only legacy approvals
+        // (or no `trustedDependencies` at all) skip the gate entirely: zero
+        // network cost.
         let has_rich_approvals = matches!(
             &trusted,
             lpm_workspace::TrustedDependencies::Rich(map) if !map.is_empty()
@@ -4487,9 +4452,9 @@ async fn run_with_options_under_store_lock(
             let sem = semaphore.clone();
             let client = arc_client.clone();
             let store_ref = store.clone();
-            // — clone the Optional v2 handle into the
-            // per-package spawn. `Option::clone` is a Some/None match
-            // and `Arc::clone` is a refcount bump; cheap.
+            // Clone the optional v2 handle into the per-package spawn.
+            // `Option::clone` is a Some/None match and `Arc::clone` is a
+            // refcount bump.
             let store_v2_ref = store_v2_handle.clone();
             let coord = fetch_coord.clone();
             let overall = overall.clone();
@@ -4500,14 +4465,12 @@ async fn run_with_options_under_store_lock(
             // Shared gate/retry counters for the stale-URL recovery path
             // in `fetch_and_store_*`.
             let gate_stats_c = gate_stats.clone();
-            // — `.npmrc`-derived routing carried into
-            // the per-package fetch task. Cheap clone (Arc ref-bump
-            // for the inner NpmrcConfig).
+            // `.npmrc`-derived routing carried into the per-package fetch
+            // task. Cheap clone: Arc ref-bump for the inner NpmrcConfig.
             let route_table_c = route_table.clone();
-            // followup #6b — per-task v2 event-driven link
-            // captures. `v2_plan_arc` is None on the !v2_event_driven
-            // path; `v2_target_for_pkg` resolved here once so the
-            // per-task closure doesn't carry the whole index map.
+            // Per-task v2 event-driven link captures. `v2_plan_arc` is None
+            // on the !v2_event_driven path; `v2_target_for_pkg` resolves here
+            // once so the per-task closure doesn't carry the whole index map.
             let v2_plan_arc = v2_plan.as_ref().map(std::sync::Arc::clone);
             let v2_target_for_pkg = if v2_event_driven {
                 v2_target_by_key.get(&install_pkg_key(&p)).cloned()
@@ -4516,11 +4479,10 @@ async fn run_with_options_under_store_lock(
             };
             let v2_link_task_semaphore_c = Arc::clone(&v2_link_task_semaphore);
             let spec_tracker_c = spec_tracker.clone();
-            // confidence-followup — pre-resolve THIS
-            // package's patch fingerprint outside the move closure so
-            // the closure doesn't carry the whole map. `None` for the
-            // overwhelmingly common case (package has no
-            // `lpm.patchedDependencies` entry).
+            // Resolve this package's patch fingerprint outside the move
+            // closure so the closure doesn't carry the whole map. `None` for
+            // the common case where the package has no
+            // `lpm.patchedDependencies` entry.
             let patch_fingerprint_for_pkg = patch_fingerprints
                 .get(&(p.name.clone(), p.version.clone()))
                 .cloned();
@@ -4532,8 +4494,8 @@ async fn run_with_options_under_store_lock(
                 type LinkHandle = tokio::task::JoinHandle<
                     Result<(MaterializedPackage, lpm_linker::OnePackageResult), LpmError>,
                 >;
-                // followup #6b — v2-shape link handle. Mutually
-                // exclusive with `LinkHandle` at runtime: under v2_mode,
+                // v2-shaped link handle. Mutually exclusive with `LinkHandle`
+                // at runtime: under v2_mode,
                 // `event_link` is false (so `LinkHandle` is always None);
                 // under !v2_mode, `v2_plan_arc` is None (so this is
                 // always None).
@@ -4548,10 +4510,10 @@ async fn run_with_options_under_store_lock(
                 );
 
                 // timing: spawn→key-lock→permit captures the full time this
-                // task sat queued.: now also covers the
-                // FetchCoordinator wait — if a speculation is mid-fetch for
-                // the same `(name, ver)`, we wait on the per-key lock and
-                // short-circuit via the store-hit check below.
+                // task sat queued. It also covers the FetchCoordinator wait:
+                // if a speculation is mid-fetch for the same `(name, ver)`,
+                // we wait on the per-key lock and short-circuit via the
+                // store-hit check below.
                 let queue_start = std::time::Instant::now();
                 let package_display =
                     trace_slow_packages.then(|| format!("{}@{}", p.name, p.version));
@@ -4659,8 +4621,8 @@ async fn run_with_options_under_store_lock(
                     }
                 }
 
-                //b: only honour the store-hit short-circuit when
-                // NOT in `--force` mode. `--force` is the "re-verify
+                // Only honour the store-hit short-circuit when not in
+                // `--force` mode. `--force` is the "re-verify
                 // integrity against registry" path: the user explicitly
                 // wants every tarball re-downloaded and re-hashed, even if
                 // the store already has a valid copy. Without this gate, a
@@ -4690,12 +4652,9 @@ async fn run_with_options_under_store_lock(
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None)?;
-                    // followup #6b — sibling-skip path. The
-                    // v2 object dir was populated by the sibling's
-                    // fetch task (or the sibling is in the middle of
-                    // populating it; the per-key fetch lock above
-                    // ensures we observe the post-extract state).
-                    // Dispatch the v2 link entry materialization in
+                    // The v2 object dir was populated by the sibling's fetch
+                    // task. The per-key fetch lock above ensures we observe
+                    // the post-extract state, so dispatch the v2 link entry in
                     // the same shape as the post-fetch path below.
                     let v2_link_h: Option<V2LinkHandle> =
                         if let (Some(plan), Some(target), Some(store_v2)) = (
@@ -4865,9 +4824,8 @@ async fn run_with_options_under_store_lock(
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
             }
-            // followup #6b — funnel v2 link handles emitted
-            // by the fetch tasks into the same drain queue the cache-
-            // hit branches above feed.
+            // Funnel v2 link handles emitted by the fetch tasks into the same
+            // drain queue the cache-hit branches above feed.
             if let Some(lh) = v2_link_h {
                 v2_event_link_handles.push(lh);
             }
@@ -4943,8 +4901,9 @@ async fn run_with_options_under_store_lock(
     // human output is intentionally quiet here — the persistent
     // `› Installing N packages` line above already narrates this phase.
 
-    // Step 4: link_targets — already built before the fetch loop ( //b) so the event-driven path could dispatch per-pkg link work
-    // during fetch. No-op here to keep the surrounding structure stable.
+    // Link targets were already built before the fetch loop so the
+    // event-driven path could dispatch per-package link work during fetch.
+    // No-op here to keep the surrounding structure stable.
     let _ = &link_targets; // retained for downstream consumers below
 
     // Step 5: Link into node_modules
@@ -4962,13 +4921,12 @@ async fn run_with_options_under_store_lock(
     let mut wf_link_bin_shims_ms = 0u128;
 
     let mut link_result = if event_driven_link {
-        //b: event-driven path. Per-pkga future release2 tasks were
-        // spawned inside the fetch loop and for each cached package
-        // before the loop; await them here, aggregate counters, then
-        // runa future release3.5+4 via `link_finalize`. `link_ms` measures
-        // only the tail: any per-pkg link task still running past
-        // `fetch_ms` plus the final finalize pass. Well-overlapped
-        // installs show a near-zero link_ms.
+        // Event-driven path: per-package tasks were spawned inside the fetch
+        // loop and for each cached package before the loop. Await them here,
+        // aggregate counters, then run final project wiring via
+        // `link_finalize`. `link_ms` measures only the tail: any per-package
+        // link task still running past `fetch_ms` plus the final finalize
+        // pass. Well-overlapped installs show a near-zero link_ms.
         let mut linked_count = 0usize;
         let mut skipped_count = 0usize;
         let mut symlinked_count = 0usize;
@@ -5005,16 +4963,14 @@ async fn run_with_options_under_store_lock(
             .expect("v2_mode implies v2 store handle is available");
         let v2_targets = build_v2_targets(&packages, &link_targets)?;
 
-        // followup #6b — event-driven v2 path.
-        //
         // When `v2_event_driven` was true, `link_v2_prepare` already
         // ran above and per-package `link_v2_one` tasks were spawned
         // by the cache-hit short-circuits and the fetch tasks.
         // Here we just await those handles, run `link_v2_finalize`,
         // and assemble the same `LinkResult` shape `link_packages_v2`
-        // would have produced. The serial fall-back below keeps the
-        // shape of the pre-#6b path for installs that didn't pass the
-        // gate (e.g. `Source::Tarball` TOFU before the SRI is known).
+        // would have produced. The serial fallback below handles installs
+        // that didn't pass the gate, such as `Source::Tarball` TOFU before
+        // the SRI is known.
         if v2_event_driven {
             let plan = v2_plan
                 .as_ref()
@@ -5445,14 +5401,8 @@ async fn run_with_options_under_store_lock(
                 .and_then(|l| l.strict_deps.as_deref()) // reuse as quality gate
                 .map_or(30, |_| 50u32); // default: only warn below 30
 
-            // Step 6 fix (empty-bearer regression #1).
-            // Previously this site constructed a fresh RegistryClient and
-            // attached `crate::auth::get_token(...).unwrap_or_default()`,
-            // which sent literal `Authorization: Bearer ` (empty value)
-            // headers when no token was stored. Now we use the
-            // injected client directly — its `current_bearer` filters
-            // empty strings and its `SessionManager` carries the
-            // refresh-eligible session.
+            // Use the injected client directly so empty bearer tokens are
+            // filtered and refresh-eligible sessions are preserved.
             let warnings = crate::intelligence::check_install_quality(
                 client,
                 &lpm_packages,
@@ -5478,10 +5428,8 @@ async fn run_with_options_under_store_lock(
                     .iter()
                     .map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
                     .collect();
-                // Step 6 fix (empty-bearer regression #2).
-                // Same defect as the intelligence::check_install_quality
-                // site above; resolved the same way — use the injected
-                // client.
+                // Use the same injected client for the security summary so
+                // auth handling matches the quality check above.
                 crate::security_check::post_install_security_summary(
                     client,
                     &store,

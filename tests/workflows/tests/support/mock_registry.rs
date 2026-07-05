@@ -828,9 +828,8 @@ impl MockRegistry {
 
     /// Mount a successful OIDC policy creation endpoint.
     ///
-    /// Phase 3+4 of plan-security-findings-c3.md added `allowedWorkflows`
-    /// and `allowedEvents` to the policy schema. The mock verifies the
-    /// CLI sends both, so a regression that drops a field is caught here
+    /// The mock verifies the CLI sends both `allowedWorkflows` and
+    /// `allowedEvents`, so a regression that drops a field is caught here
     /// (the mock's `.expect(1)` only fires if every `body_string_contains`
     /// gate matches the actual request body).
     ///

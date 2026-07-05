@@ -2,7 +2,7 @@
 	"name": "audit-fixture-file-protocol",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Source-kind fixture: `file:./path` protocol. Depends on a local directory rather than a registry package. Tests lpm's file:-source extraction + workspace:/file: pre-extract link path.",
+	"_comment": "Hoisted compatibility audit. Source-kind fixture: `file:./path` protocol. Depends on a local directory rather than a registry package. Tests lpm's file:-source extraction + workspace:/file: pre-extract link path.",
 	"dependencies": {
 		"local-greeter": "file:./local/greeter",
 		"lodash": "^4.17.21"

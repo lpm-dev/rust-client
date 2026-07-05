@@ -2,8 +2,8 @@
 //!
 //! This complements `MockRegistry` when a test needs a real npm-compatible
 //! registry server: auth bootstrap, `npm publish`, and install through a
-//! project `.npmrc`. The first phase-65.1 slice uses it for a smoke test
-//! proving that `lpm install` records the actual mirror URL in `lpm.lock`.
+//! project `.npmrc`. Real-registry smoke tests use it to prove that
+//! `lpm install` records the actual mirror URL in `lpm.lock`.
 
 use std::fs::File;
 use std::io::Read;

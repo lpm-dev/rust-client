@@ -1,4 +1,4 @@
-# Phase 46.1 sandbox-network-audit — curated candidate list.
+# Sandbox-network audit curated candidate list.
 #
 # This file is the second seed for `build-input-list.sh`. It lists
 # packages we want this audit to keep covering as the ecosystem

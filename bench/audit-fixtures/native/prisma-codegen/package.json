@@ -2,7 +2,7 @@
 	"name": "audit-fixture-prisma-codegen",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Native/postinstall fixture: Prisma's `prisma generate` produces JS code derived from a schema, written to `node_modules/.prisma/client/` — sibling-write pattern. The smoke runs `prisma generate` explicitly (same as the typical project's `postinstall: prisma generate`), then loads `@prisma/client` post-generate. `@prisma/client` is in devDependencies rather than dependencies because the require check would fire BEFORE smoke generates it.",
+	"_comment": "Hoisted compatibility audit. Native/postinstall fixture: Prisma's `prisma generate` produces JS code derived from a schema, written to `node_modules/.prisma/client/` — sibling-write pattern. The smoke runs `prisma generate` explicitly (same as the typical project's `postinstall: prisma generate`), then loads `@prisma/client` post-generate. `@prisma/client` is in devDependencies rather than dependencies because the require check would fire BEFORE smoke generates it.",
 	"dependencies": {
 		"prisma": "^5.22.0"
 	},

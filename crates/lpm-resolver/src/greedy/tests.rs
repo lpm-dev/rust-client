@@ -1306,7 +1306,7 @@ fn process_edge_allocates_second_version_on_incompatible_range() {
     // Two parents wanting INCOMPATIBLE ranges of the same canonical
     // (^4.0.0 picks 4.17.21; ^3.0.0 cannot reuse 4.17.21 → must
     // allocate a new node for 3.10.1). Both versions live in the
-    // resolved tree as distinct nodes — bun + npm + pnpm semantics.
+    // resolved tree as distinct nodes.
     // This is the case the PubGrub split-retry workaround was
     // grafted on for; greedy handles it natively.
     let info = mk_info(&["4.17.21", "4.0.0", "3.10.1", "3.0.0"], &[]);
@@ -2719,7 +2719,7 @@ async fn peer_drain_best_effort_synthesizes_for_incompatible_required_ranges() {
     // ajv-keywords chain). Now: pick the version satisfying the most
     // consumers, ambient-install it, and record the unsatisfied ones in
     // `state.peer_conflicts` for the install pipeline to warn about.
-    // Mirrors npm v7+ / pnpm hoisted behavior.
+    // Mirrors hoisted peer-resolution behavior.
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
     let consumer_a = push_node(&mut state, CanonicalKey::npm("legacy-pkg"), "1.0.0");

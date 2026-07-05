@@ -1,4 +1,4 @@
-# Smoke-test slice for Phase 46.1 sandbox-network-denial audit.
+# Smoke-test slice for the sandbox-network-denial audit.
 #
 # ~10 well-known packages chosen to exercise each family the
 # classifier in `run.sh` recognises. Use this list to verify the

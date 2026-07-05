@@ -2,7 +2,7 @@
 	"name": "audit-fixture-npm-aliases",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 66 confidence-followup §2c. Three aliases of `lodash` plus one alias of a scoped target (`@babel/code-frame`), alongside an unaliased `lodash` install. Per the followup doc: 'Three+ aliases of the same target stress the wrapper-segment handling.' Risk: hoisted's same-name handling might confuse the alias-target relationship — `node_modules/lodash-x` should contain lodash's contents (resolved through the alias) rather than try to install a non-existent npm package literally named `lodash-x`. Each alias gets its own root-level entry; isolated mode wraps each alias's identity into the wrappers tree (4 wrapper segments for 4 lodash-shaped surfaces); hoisted mode places each alias as its own top-level entry in the flat layout. Both must produce the same require() result for each alias.",
+	"_comment": "Three aliases of `lodash` plus one alias of a scoped target (`@babel/code-frame`), alongside an unaliased `lodash` install. This stresses wrapper-segment handling with three aliases of the same target. Risk: hoisted's same-name handling might confuse the alias-target relationship — `node_modules/lodash-x` should contain lodash's contents (resolved through the alias) rather than try to install a non-existent npm package literally named `lodash-x`. Each alias gets its own root-level entry; isolated mode wraps each alias's identity into the wrappers tree (4 wrapper segments for 4 lodash-shaped surfaces); hoisted mode places each alias as its own top-level entry in the flat layout. Both must produce the same require() result for each alias.",
 	"dependencies": {
 		"lodash": "^4.17.21",
 		"lodash-a": "npm:lodash@^4.17.21",

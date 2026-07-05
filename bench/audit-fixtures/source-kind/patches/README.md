@@ -1,20 +1,18 @@
 # patches — lpm patch system compat fixture
 
-**Tests:** `lpm.patchedDependencies` (Phase 32 P6) under both linker
-modes. The contract: when `package.json > lpm.patchedDependencies`
+**Tests:** `lpm.patchedDependencies` under both linker modes. The
+contract: when `package.json > lpm.patchedDependencies`
 declares a patch, the install pipeline applies it to every physical
 destination of the target package and the patched bytes survive
 through to runtime require.
 
-**Risk:** the followup doc's §2f — "hoisted's materialized-package
-list is computed differently than isolated's; patches that worked in
-isolated might not find their target in hoisted's flat layout." The
-[`apply_patches_for_install` function in `install.rs`](../../../crates/lpm-cli/src/commands/install.rs#L1022)
-filters `link_result.materialized` to find each location of the
-target package. The linker reports every shape (isolated wrapper,
-hoisted root, hoisted-nested fallback at `<project>/.lpm/hoisted/nested/`),
-so `apply_patches_for_install` should be mode-agnostic — but the
-audit verifies that empirically.
+**Risk:** hoisted materialized-package lists are computed differently
+than isolated lists, so a patch that works in isolated mode might not
+find its target in hoisted's flat layout. `apply_patches_for_install`
+filters `link_result.materialized` to find each location of the target
+package. The linker reports every shape (isolated wrapper, hoisted root,
+hoisted-nested fallback at `<project>/.lpm/hoisted/nested/`), so patch
+application should be mode-agnostic; the audit verifies that empirically.
 
 **Patch contents:** `patches/ms@2.1.3.patch` is a unified diff that
 appends a sentinel function (`lpmPatchProof`) to ms@2.1.3's
@@ -38,7 +36,7 @@ file and refuses to apply if it differs (drift detection).
    patch landed somewhere but not the loaded copy → wrong sentinel
    value, distinct exit code.
 
-**Adjacent issue (current state, 2026-05-08):** lpm's
+**Adjacent issue:** lpm's
 `patch_engine::apply_patch` reads the original baseline from
 `PackageStore::package_dir(name, version)` which is hardcoded to the
 v1 layout (`~/.lpm/store/v1/<key>/`). With v2 store now active by

@@ -2,20 +2,14 @@
 # 5-cell bench harness — 3 lpm arms + bun control on bench/fixture-large COLD.
 #
 # Cells (round-robin per outer iteration so each arm sees similar network state):
-#   - pubgrub-stream  — control:   PubGrub resolver + streaming walker (today's default)
+#   - pubgrub-stream  — control:   PubGrub resolver + streaming walker
 #   - greedy-stream   — baseline:  greedy resolver + streaming walker
-#   - greedy-fusion   — NEW:       greedy resolver  + fused dispatcher (LPM_GREEDY_FUSION=1)
+#   - greedy-fusion   — default:   greedy resolver  + fused dispatcher
 #
 # Bun control: separate cold installs (default n=10).
 #
-# At HEAD (no fusion code yet) the LPM_GREEDY_FUSION env var is unread, so the
-# greedy-fusion arm collapses to "greedy with no walker env var" (default walker mode).
-# That is intentional — the ship-or-drop measurement is "all 4 lpm cells produce
-# stable medians within ±200 ms across runs" (harness-validation), not a fusion-vs-
-# walker delta. The fusion delta lands when wires `resolve_greedy_fused`.
-#
-# Per pre-plan the fixture path and clean targets match
-# exactly so wall medians are directly comparable.
+# Fixture path, clean targets, and round-robin ordering stay fixed so wall
+# medians are directly comparable across runs.
 #
 # Usage: $0 <n_iters> [<tag>]
 #
@@ -60,11 +54,9 @@ for i in $(seq 1 "$N"); do
                 export LPM_WALKER=stream
                 ;;
             greedy-stream)
-                # fusion is the default under LPM_RESOLVER=greedy,
+                # Fusion is the default under LPM_RESOLVER=greedy,
                 # so this cell pins to the legacy walker arm via
-                # `LPM_GREEDY_FUSION=0` — explicit opt-out. Pre-W4 this
-                # was unset; setting it to "0" preserves the cell's
-                # walker-arm semantics regardless of repo HEAD.
+                # `LPM_GREEDY_FUSION=0`.
                 export LPM_RESOLVER=greedy
                 export LPM_WALKER=stream
                 export LPM_GREEDY_FUSION=0
@@ -72,9 +64,7 @@ for i in $(seq 1 "$N"); do
             greedy-fusion)
                 # `LPM_GREEDY_FUSION=1` is now redundant (fusion is
                 # the default for LPM_RESOLVER=greedy), but kept here
-                # explicitly so the cell self-documents its intent and
-                # so the harness still works against pre-W4 HEADs for
-                # comparison runs.
+                # explicitly so the cell self-documents its intent.
                 export LPM_RESOLVER=greedy
                 export LPM_GREEDY_FUSION=1
                 export LPM_WALKER=stream

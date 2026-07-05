@@ -4,15 +4,14 @@
 for siblings (e.g., `@grpc/grpc-js`, react-native native-binding
 loaders) under both linker modes.
 
-**Risk:** the followup doc's §2h — "hoisted's flat layout means the
-walker finds different siblings than under isolated." A real
-postinstall script runs from inside its own package dir; `process.cwd()`
-is the package's resolved real path, and `..` is whichever node_modules
-parent the linker planted (top-level `node_modules/` under hoisted, or
-a wrappers tree segment under isolated). The walker observes
-different *counts* of siblings between modes, but the runtime contract
-— each declared sibling reachable via `require()` — must hold the
-same.
+**Risk:** hoisted's flat layout means the walker finds different siblings
+than under isolated. A real postinstall script runs from inside its own
+package dir; `process.cwd()` is the package's resolved real path, and `..`
+is whichever node_modules parent the linker planted (top-level
+`node_modules/` under hoisted, or a wrappers tree segment under isolated).
+The walker observes different *counts* of siblings between modes, but the
+runtime contract — each declared sibling reachable via `require()` — must
+hold the same.
 
 **Why simulate, not run the postinstall:** the audit runs with
 `script-policy=deny` (the default), which blocks every package's

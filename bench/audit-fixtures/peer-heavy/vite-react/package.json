@@ -2,7 +2,7 @@
 	"name": "audit-fixture-vite-react",
 	"version": "1.0.0",
 	"private": true,
-	"_comment": "Phase 2 hoisted compat audit. Peer-heavy fixture: Vite + @vitejs/plugin-react + React. The plugin imports React via peer; Vite imports the plugin; longer peer chain than react-ssr. Risk: hoisting picking inconsistent React versions across the chain would crash plugin init.",
+	"_comment": "Hoisted compatibility audit. Peer-heavy fixture: Vite + @vitejs/plugin-react + React. The plugin imports React via peer; Vite imports the plugin; longer peer chain than react-ssr. Risk: hoisting picking inconsistent React versions across the chain would crash plugin init.",
 	"dependencies": {
 		"vite": "^5.4.0",
 		"@vitejs/plugin-react": "^4.3.0",

@@ -121,8 +121,7 @@ fn auto_build_fires_under_allow_policy_alone() {
     // --policy=allow / --yolo / package.json scriptPolicy:"allow"
     // / config.toml script-policy="allow" all resolve to ScriptPolicy::Allow,
     // which auto-fires rebuild::run at install time without requiring an
-    // additional --auto-build flag. This is the apples-to-apples fix vs
-    // npm/pnpm/bun (which run scripts during install by default).
+    // additional --auto-build flag.
     assert!(should_auto_build(false, false, false, ScriptPolicy::Allow));
     // And every other-input combination still trips it (no regression):
     assert!(should_auto_build(true, false, false, ScriptPolicy::Allow));

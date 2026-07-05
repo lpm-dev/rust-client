@@ -1,14 +1,13 @@
 # npm-aliases — alias resolution compat fixture
 
-**Tests:** the `npm:<target>@<range>` alias syntax (Phase 40 P2 in
-lpm) under both linker modes, with three aliases of the same target +
-one alias of a scoped target + an unaliased install of the same
-target running side-by-side.
+**Tests:** the `npm:<target>@<range>` alias syntax under both linker
+modes, with three aliases of the same target, one alias of a scoped
+target, and an unaliased install of the same target running side-by-side.
 
-**Risk:** the followup doc's §2c — "hoisted's same-name handling
-might confuse the alias-target relationship. Three+ aliases of the
-same target stress the wrapper-segment handling." Each alias is its
-own dependency identity at the layout level (a unique
+**Risk:** hoisted same-name handling might confuse the alias-target
+relationship. Three or more aliases of the same target stress the
+wrapper-segment handling. Each alias is its own dependency identity
+at the layout level (a unique
 `node_modules/<alias>` entry) but resolves to the SAME target tarball
 in the content-addressed store. Both modes have to thread that
 identity-vs-content distinction:

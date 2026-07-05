@@ -1,7 +1,6 @@
 #!/bin/bash
-# measurement-sprint C — samply flamegraph on a single
-# fusion install, bench/fixture-large COLD. Identifies the residual
-# ~100 ms hot symbols below the ~900 ms total wall.
+# Samply flamegraph on a single cold fusion install over bench/fixture-large.
+# Identifies the residual hot symbols below the roughly 900 ms total wall.
 
 set -euo pipefail
 
