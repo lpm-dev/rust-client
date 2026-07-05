@@ -1,8 +1,9 @@
-//! Yarn v1 lockfile parser.
+//! Yarn lockfile parser.
 //!
-//! yarn.lock v1 uses a custom format (not YAML, not JSON).
-//! This parser uses a two-pass approach:
-//! 1. Parse all entries with their specifiers, version, resolved URL, integrity, and dependency ranges.
+//! Yarn v1 uses a custom format (not YAML, not JSON). Yarn Berry (v2+)
+//! uses a YAML mapping keyed by descriptors. Both paths normalize into
+//! `YarnEntry`, then use the same two-pass approach:
+//! 1. Parse all entries with their specifiers, version, resolved source, integrity, and dependency ranges.
 //! 2. Build a specifier→version map, then resolve each dependency range to an exact version.
 
 use crate::MigratedPackage;
@@ -16,14 +17,85 @@ pub fn parse(path: &Path, _project_dir: &Path) -> Result<Vec<MigratedPackage>, L
 }
 
 pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
-    let entries = parse_entries(content)?;
+    if is_berry_lockfile(content) {
+        return parse_berry_str(content);
+    }
 
+    parse_v1_str(content)
+}
+
+fn parse_v1_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
+    let entries = parse_entries(content)?;
+    Ok(resolve_entries(entries))
+}
+
+fn parse_berry_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
+    let root: serde_yaml::Value = serde_yaml::from_str(content)
+        .map_err(|e| LpmError::Script(format!("failed to parse Yarn Berry lockfile: {e}")))?;
+    let Some(root) = root.as_mapping() else {
+        return Err(LpmError::Script(
+            "Yarn Berry lockfile root must be a mapping".to_string(),
+        ));
+    };
+
+    let mut entries = Vec::with_capacity(root.len().saturating_sub(1));
+
+    for (key, value) in root {
+        let Some(descriptor_key) = key.as_str() else {
+            continue;
+        };
+        if descriptor_key == "__metadata" {
+            continue;
+        }
+
+        let Some(entry) = value.as_mapping() else {
+            tracing::debug!(
+                descriptor = descriptor_key,
+                "skipping non-mapping Yarn entry"
+            );
+            continue;
+        };
+
+        let Some(version) = mapping_string(entry, "version") else {
+            tracing::debug!(
+                descriptor = descriptor_key,
+                "skipping Yarn entry without version"
+            );
+            continue;
+        };
+        let Some(name) = yarn_descriptor_name(descriptor_key).map(str::to_owned) else {
+            tracing::debug!(
+                descriptor = descriptor_key,
+                "skipping Yarn entry with unparseable descriptor"
+            );
+            continue;
+        };
+
+        let resolution = mapping_string(entry, "resolution");
+        let mut deps_with_ranges = extract_berry_deps(entry, "dependencies");
+        deps_with_ranges.extend(extract_berry_deps(entry, "optionalDependencies"));
+
+        entries.push(YarnEntry {
+            specifiers: split_descriptor_list(descriptor_key),
+            name,
+            version,
+            resolved: unsupported_berry_resolution(resolution.as_deref()),
+            integrity: None,
+            deps_with_ranges,
+        });
+    }
+
+    Ok(resolve_entries(entries))
+}
+
+fn resolve_entries(entries: Vec<YarnEntry>) -> Vec<MigratedPackage> {
     // Build specifier → version map for dependency resolution.
     // Uses owned Strings so the map doesn't borrow `entries`, allowing consumption below.
     let mut spec_map: HashMap<String, String> = HashMap::with_capacity(entries.len() * 2);
     for entry in &entries {
         for spec in &entry.specifiers {
             spec_map.insert(spec.clone(), entry.version.clone());
+            insert_npm_protocol_aliases(&mut spec_map, spec, &entry.version);
         }
     }
 
@@ -36,13 +108,8 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
                 .deps_with_ranges
                 .iter()
                 .filter_map(|(name, range)| {
-                    buf.clear();
-                    buf.push_str(name);
-                    buf.push('@');
-                    buf.push_str(range);
-                    spec_map
-                        .get(buf.as_str())
-                        .map(|v| (name.clone(), v.clone()))
+                    resolve_dependency_version(&spec_map, name, range, &mut buf)
+                        .map(|v| (name.clone(), v.to_owned()))
                 })
                 .collect();
 
@@ -58,7 +125,75 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         })
         .collect();
 
-    Ok(packages)
+    packages
+}
+
+fn is_berry_lockfile(content: &str) -> bool {
+    content.lines().any(|line| line.trim() == "__metadata:")
+}
+
+fn split_descriptor_list(descriptor_key: &str) -> Vec<String> {
+    descriptor_key
+        .split(", ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn insert_npm_protocol_aliases(spec_map: &mut HashMap<String, String>, spec: &str, version: &str) {
+    let Some((name, range)) = split_specifier(spec) else {
+        return;
+    };
+
+    if let Some(range) = range.strip_prefix("npm:") {
+        spec_map
+            .entry(format!("{name}@{range}"))
+            .or_insert_with(|| version.to_owned());
+    } else {
+        spec_map
+            .entry(format!("{name}@npm:{range}"))
+            .or_insert_with(|| version.to_owned());
+    }
+}
+
+fn resolve_dependency_version<'a>(
+    spec_map: &'a HashMap<String, String>,
+    name: &str,
+    range: &str,
+    buf: &mut String,
+) -> Option<&'a str> {
+    lookup_spec(spec_map, name, range, buf)
+        .or_else(|| {
+            range
+                .strip_prefix("npm:")
+                .and_then(|r| lookup_spec(spec_map, name, r, buf))
+        })
+        .or_else(|| {
+            if range.starts_with("npm:") {
+                None
+            } else {
+                buf.clear();
+                buf.push_str(name);
+                buf.push('@');
+                buf.push_str("npm:");
+                buf.push_str(range);
+                spec_map.get(buf.as_str()).map(String::as_str)
+            }
+        })
+}
+
+fn lookup_spec<'a>(
+    spec_map: &'a HashMap<String, String>,
+    name: &str,
+    range: &str,
+    buf: &mut String,
+) -> Option<&'a str> {
+    buf.clear();
+    buf.push_str(name);
+    buf.push('@');
+    buf.push_str(range);
+    spec_map.get(buf.as_str()).map(String::as_str)
 }
 
 struct YarnEntry {
@@ -104,6 +239,93 @@ fn split_specifier(spec: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, range))
+}
+
+fn yarn_descriptor_name(descriptor: &str) -> Option<&str> {
+    split_yarn_descriptor(descriptor).map(|(name, _)| name)
+}
+
+fn split_yarn_descriptor(descriptor: &str) -> Option<(&str, &str)> {
+    let descriptor = descriptor.trim();
+    if descriptor.starts_with('@') {
+        let slash_pos = descriptor.find('/')?;
+        let search_from = slash_pos + 1;
+        let at_pos = descriptor[search_from..]
+            .find('@')
+            .map(|i| search_from + i)?;
+        let name = &descriptor[..at_pos];
+        let range = &descriptor[at_pos + 1..];
+        if name.is_empty() || range.is_empty() {
+            return None;
+        }
+        return Some((name, range));
+    }
+
+    let at_pos = descriptor.find('@')?;
+    let name = &descriptor[..at_pos];
+    let range = &descriptor[at_pos + 1..];
+    if name.is_empty() || range.is_empty() {
+        return None;
+    }
+    Some((name, range))
+}
+
+fn mapping_string(mapping: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    mapping
+        .get(serde_yaml::Value::String(key.to_string()))
+        .and_then(yaml_scalar_to_string)
+        .filter(|s| !s.is_empty())
+}
+
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_berry_deps(entry: &serde_yaml::Mapping, field: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(deps) = entry
+        .get(serde_yaml::Value::String(field.to_string()))
+        .and_then(|v| v.as_mapping())
+    else {
+        return out;
+    };
+
+    out.reserve(deps.len());
+    for (name, range) in deps {
+        let (Some(name), Some(range)) = (name.as_str(), yaml_scalar_to_string(range)) else {
+            continue;
+        };
+        if !name.is_empty() && !range.is_empty() {
+            out.push((name.to_owned(), range));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn unsupported_berry_resolution(resolution: Option<&str>) -> Option<String> {
+    let (_, reference) = split_yarn_descriptor(resolution?)?;
+    const UNSUPPORTED_PREFIXES: &[&str] = &[
+        "exec:",
+        "file:",
+        "git:",
+        "git+",
+        "github:",
+        "link:",
+        "patch:",
+        "portal:",
+        "workspace:",
+    ];
+
+    UNSUPPORTED_PREFIXES
+        .iter()
+        .any(|prefix| reference.starts_with(prefix))
+        .then(|| reference.to_owned())
 }
 
 /// Flush the current entry and attempt to start a new one from a top-level specifier line.
@@ -363,6 +585,96 @@ mime-types@~2.1.34:
         assert_eq!(accepts.dependencies[0].0, "mime-types");
         // Range ~2.1.34 resolves to exact version 2.1.35.
         assert_eq!(accepts.dependencies[0].1, "2.1.35");
+    }
+
+    #[test]
+    fn parse_berry_with_dependencies() {
+        let input = r#"# This file is generated by running "yarn install" inside your project.
+
+__metadata:
+  version: 6
+  cacheKey: 8
+
+"accepts@npm:~1.3.8":
+  version: 1.3.8
+  resolution: "accepts@npm:1.3.8"
+  checksum: 10c0/accepts
+  languageName: node
+  linkType: hard
+
+"express@npm:^4.18.2":
+  version: 4.22.1
+  resolution: "express@npm:4.22.1"
+  dependencies:
+    accepts: "npm:~1.3.8"
+  checksum: 10c0/express
+  languageName: node
+  linkType: hard
+"#;
+        let packages = parse_str(input).unwrap();
+        assert_eq!(packages.len(), 2);
+
+        let express = packages.iter().find(|p| p.name == "express").unwrap();
+        assert_eq!(express.version, "4.22.1");
+        assert_eq!(
+            express.dependencies,
+            vec![("accepts".to_string(), "1.3.8".to_string())]
+        );
+        assert!(express.integrity.is_none());
+    }
+
+    #[test]
+    fn parse_berry_scoped_packages() {
+        let input = r#"
+__metadata:
+  version: 8
+  cacheKey: 10
+
+"@babel/core@npm:^7.0.0":
+  version: 7.24.5
+  resolution: "@babel/core@npm:7.24.5"
+  dependencies:
+    "@babel/parser": "npm:^7.24.5"
+  languageName: node
+  linkType: hard
+
+"@babel/parser@npm:^7.24.5":
+  version: 7.24.6
+  resolution: "@babel/parser@npm:7.24.6"
+  languageName: node
+  linkType: hard
+"#;
+        let packages = parse_str(input).unwrap();
+        let core = packages.iter().find(|p| p.name == "@babel/core").unwrap();
+
+        assert_eq!(core.version, "7.24.5");
+        assert_eq!(
+            core.dependencies,
+            vec![("@babel/parser".to_string(), "7.24.6".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_berry_marks_workspace_resolution_as_unsupported() {
+        let input = r#"
+__metadata:
+  version: 6
+  cacheKey: 8
+
+"workspace-a@workspace:packages/workspace-a":
+  version: 0.0.0-use.local
+  resolution: "workspace-a@workspace:packages/workspace-a"
+  languageName: unknown
+  linkType: soft
+"#;
+        let packages = parse_str(input).unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "workspace-a");
+        assert_eq!(
+            packages[0].resolved.as_deref(),
+            Some("workspace:packages/workspace-a")
+        );
     }
 
     #[test]

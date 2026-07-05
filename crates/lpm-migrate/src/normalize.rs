@@ -1,7 +1,7 @@
 //! Conversion from `Vec<MigratedPackage>` to `lpm_lockfile::Lockfile`.
 //!
 //! Handles:
-//! - Skipping unsupported dependency types (file:, link:, git:, git+, github:)
+//! - Skipping unsupported dependency types (file:, link:, workspace:, patch:, git:, etc.)
 //! - Inferring the source registry from the resolved URL
 //! - Deduplicating same name+version pairs
 //! - Formatting dependencies as `"name@version"` strings
@@ -13,8 +13,12 @@ use std::collections::HashSet;
 
 /// Prefixes that indicate non-registry dependencies (to be skipped).
 const SKIP_PREFIXES: &[&str] = &[
+    "exec:",
     "file:",
     "link:",
+    "portal:",
+    "workspace:",
+    "patch:",
     "git:",
     "git+",
     "github:",
@@ -474,6 +478,35 @@ mod tests {
         let (lockfile, skipped) = to_lockfile(packages);
         assert_eq!(lockfile.packages.len(), 0);
         assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn skips_workspace_and_patch_protocols() {
+        let packages = vec![
+            MigratedPackage {
+                name: "workspace-a".to_string(),
+                version: "0.0.0-use.local".to_string(),
+                resolved: Some("workspace:packages/workspace-a".to_string()),
+                integrity: None,
+                dependencies: Vec::new(),
+                is_optional: false,
+                is_dev: false,
+            },
+            MigratedPackage {
+                name: "patched".to_string(),
+                version: "1.0.0".to_string(),
+                resolved: Some("patch:patched@npm%3A1.0.0#./patched.patch".to_string()),
+                integrity: None,
+                dependencies: Vec::new(),
+                is_optional: false,
+                is_dev: false,
+            },
+        ];
+
+        let (lockfile, skipped) = to_lockfile(packages);
+
+        assert!(lockfile.packages.is_empty());
+        assert_eq!(skipped.len(), 2);
     }
 
     #[test]
