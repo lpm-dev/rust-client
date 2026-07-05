@@ -1,3 +1,5 @@
+use lpm_linker::{LinkResult, MaterializedPackage};
+
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,183 @@ pub(super) fn relink_bins_after_lifecycle_build(
         }
     };
     Ok(result.bin_linked)
+}
+
+pub(super) struct OnlineLinkPhaseInput<'a> {
+    pub(super) start: Instant,
+    pub(super) project_dir: &'a Path,
+    pub(super) package_name: Option<&'a str>,
+    pub(super) packages: &'a [InstallPackage],
+    pub(super) link_targets: &'a [LinkTarget],
+    pub(super) event_driven_link: bool,
+    pub(super) event_link_handles: Vec<LinkHandle>,
+    pub(super) v2_mode: bool,
+    pub(super) store_v2: Option<&'a lpm_store::v2::Store>,
+    pub(super) v2_event_driven: bool,
+    pub(super) v2_plan: Option<&'a lpm_linker::v2::LinkPlanV2>,
+    pub(super) v2_event_link_handles: Vec<V2LinkHandle>,
+    pub(super) v2_link_task_timings: &'a mut V2LinkTaskTimings,
+    pub(super) slow_package_timings: &'a mut SlowPackageTimings,
+    pub(super) timing_detail_mode: TimingDetailMode,
+    pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) force: bool,
+    pub(super) compatibility_bin_names: &'a [String],
+}
+
+pub(super) struct OnlineLinkPhaseResult {
+    pub(super) link_result: LinkResult,
+    pub(super) link_ms: u128,
+    pub(super) waterfall_start_ms: u128,
+    pub(super) waterfall_end_ms: u128,
+    pub(super) await_ms: u128,
+    pub(super) finalize_ms: u128,
+    pub(super) reconcile_ms: u128,
+    pub(super) root_symlinks_ms: u128,
+    pub(super) compatibility_ms: u128,
+    pub(super) bin_shims_ms: u128,
+}
+
+pub(super) async fn run_online_link_phase(
+    input: OnlineLinkPhaseInput<'_>,
+) -> Result<OnlineLinkPhaseResult, LpmError> {
+    let OnlineLinkPhaseInput {
+        start,
+        project_dir,
+        package_name,
+        packages,
+        link_targets,
+        event_driven_link,
+        mut event_link_handles,
+        v2_mode,
+        store_v2,
+        v2_event_driven,
+        v2_plan,
+        mut v2_event_link_handles,
+        v2_link_task_timings,
+        slow_package_timings,
+        timing_detail_mode,
+        linker_mode,
+        force,
+        compatibility_bin_names,
+    } = input;
+
+    let waterfall_start_ms = start.elapsed().as_millis();
+    let link_start = Instant::now();
+    let mut await_ms = 0u128;
+    let mut finalize_ms = 0u128;
+    let mut reconcile_ms = 0u128;
+    let mut root_symlinks_ms = 0u128;
+    let mut compatibility_ms = 0u128;
+    let mut bin_shims_ms = 0u128;
+
+    let link_result = if event_driven_link {
+        let mut linked_count = 0usize;
+        let mut skipped_count = 0usize;
+        let mut symlinked_count = 0usize;
+        let mut materialized_all: Vec<MaterializedPackage> =
+            Vec::with_capacity(event_link_handles.len());
+
+        for handle in event_link_handles.drain(..) {
+            let (materialized, result) = handle
+                .await
+                .map_err(|e| LpmError::Registry(format!("link task panicked: {e}")))??;
+            materialized_all.push(materialized);
+            if result.linked {
+                linked_count += 1;
+            } else {
+                skipped_count += 1;
+            }
+            symlinked_count += result.symlinks_created;
+        }
+
+        let finalize = lpm_linker::link_finalize(project_dir, link_targets, package_name)?;
+        symlinked_count += finalize.symlinks_created;
+
+        LinkResult {
+            linked: linked_count,
+            symlinked: symlinked_count,
+            bin_linked: finalize.bin_count,
+            skipped: skipped_count,
+            self_referenced: finalize.self_referenced,
+            materialized: materialized_all,
+        }
+    } else if v2_mode {
+        let store_v2 = store_v2.expect("v2_mode implies v2 store handle is available");
+        let v2_targets = build_v2_targets(packages, link_targets)?;
+
+        if v2_event_driven {
+            let plan = v2_plan.expect("v2_event_driven implies v2_plan is Some");
+            let mut materialized_all: Vec<MaterializedPackage> =
+                Vec::with_capacity(v2_event_link_handles.len());
+            let mut linked_count = 0usize;
+            let link_await_start = Instant::now();
+            for handle in v2_event_link_handles.drain(..) {
+                let task = handle
+                    .await
+                    .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))??;
+                let package_display = timing_detail_mode
+                    .trace()
+                    .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
+                v2_link_task_timings.record(task.ms, task.freshly_populated);
+                if let Some(package_display) = package_display.as_deref() {
+                    slow_package_timings.record_link_v2_one(package_display, task.ms, task.timings);
+                }
+                if task.freshly_populated {
+                    linked_count += 1;
+                }
+                materialized_all.push(task.materialized);
+            }
+            await_ms = link_await_start.elapsed().as_millis();
+            let link_finalize_start = Instant::now();
+            let finalize =
+                lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, package_name)?;
+            finalize_ms = link_finalize_start.elapsed().as_millis();
+            reconcile_ms = finalize.reconcile_ms;
+            root_symlinks_ms = finalize.root_symlinks_ms;
+            compatibility_ms = finalize.compatibility_ms;
+            bin_shims_ms = finalize.bin_shims_ms;
+            let target_total = plan.augmented_targets.len();
+            LinkResult {
+                linked: linked_count,
+                symlinked: finalize.symlinked,
+                bin_linked: finalize.bin_count,
+                skipped: target_total.saturating_sub(linked_count),
+                self_referenced: finalize.self_referenced,
+                materialized: materialized_all,
+            }
+        } else {
+            lpm_linker::v2::link_packages_v2_with_compatibility_bin_names(
+                project_dir,
+                v2_targets,
+                store_v2,
+                linker_mode,
+                package_name,
+                compatibility_bin_names,
+            )?
+        }
+    } else {
+        match linker_mode {
+            lpm_linker::LinkerMode::Hoisted => {
+                lpm_linker::link_packages_hoisted(project_dir, link_targets, force, package_name)?
+            }
+            lpm_linker::LinkerMode::Isolated => {
+                lpm_linker::link_packages(project_dir, link_targets, force, package_name)?
+            }
+        }
+    };
+
+    Ok(OnlineLinkPhaseResult {
+        link_result,
+        link_ms: link_start.elapsed().as_millis(),
+        waterfall_start_ms,
+        waterfall_end_ms: start.elapsed().as_millis(),
+        await_ms,
+        finalize_ms,
+        reconcile_ms,
+        root_symlinks_ms,
+        compatibility_ms,
+        bin_shims_ms,
+    })
 }
 
 /// Offline/shared path: link packages from store, write lockfile, print output.

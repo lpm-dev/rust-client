@@ -1,4 +1,5 @@
 use super::*;
+use lpm_linker::{LinkResult, MaterializedPackage};
 
 pub(super) fn applied_patch_to_state_hit(
     a: &patch_engine::AppliedPatch,
