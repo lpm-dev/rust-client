@@ -31,6 +31,189 @@ pub(super) fn write_post_install_hash(
     }
 }
 
+pub(super) struct InstallFreshnessInput<'a> {
+    pub(super) client: &'a RegistryClient,
+    pub(super) project_dir: &'a Path,
+    pub(super) pkg_json_path: &'a Path,
+    pub(super) lockfile_path: &'a Path,
+    pub(super) manifest_deps: &'a HashMap<String, String>,
+    pub(super) production_dependency_names: &'a HashSet<String>,
+    pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
+    pub(super) force: bool,
+    pub(super) offline: bool,
+    pub(super) omit_policy: InstallOmitPolicy,
+    pub(super) strict_peer_dependencies: bool,
+    pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) requested_v2_mode: bool,
+    pub(super) compatibility_bin_names: &'a [String],
+    pub(super) requested_add_count: Option<usize>,
+    pub(super) json_output: bool,
+    pub(super) emit_timing: bool,
+    pub(super) timing_detail_mode: TimingDetailMode,
+    pub(super) force_security_floor: bool,
+    pub(super) target_set: Option<&'a [String]>,
+    pub(super) start: Instant,
+}
+
+pub(super) struct InstallFreshnessResult {
+    pub(super) setup_install_state_ms: u128,
+    pub(super) cleanup_catalogs_in_pipeline: bool,
+    pub(super) completed: bool,
+}
+
+pub(super) async fn run_install_freshness_phase(
+    input: InstallFreshnessInput<'_>,
+) -> Result<InstallFreshnessResult, LpmError> {
+    let pkg_content_for_state = std::fs::read_to_string(input.pkg_json_path).unwrap_or_default();
+    let setup_state_t = Instant::now();
+    let install_state = crate::install_state::check_install_state_with_linker_and_integrity(
+        input.project_dir,
+        &pkg_content_for_state,
+        input.linker_mode,
+        input.object_integrity_policy,
+    );
+    let setup_install_state_ms = setup_state_t.elapsed().as_millis();
+    let compatibility_bins_ready = !input.requested_v2_mode
+        || input.compatibility_bin_names.is_empty()
+        || lpm_linker::v2::project_compatibility_bins_ready(
+            input.project_dir,
+            input.compatibility_bin_names,
+        );
+    let cleanup_catalogs_in_pipeline = input.requested_add_count.is_none();
+    let fast_path_base_eligible = !input.force
+        && !input.offline
+        && input.omit_policy.is_default()
+        && !input.strict_peer_dependencies
+        && install_state.up_to_date
+        && compatibility_bins_ready;
+    let fast_path_policy_extension_stats =
+        if !fast_path_base_eligible || input.policy_extension_configs.is_empty() {
+            None
+        } else {
+            let gate_stats = GateStats::default();
+            if let Some(fast) = try_lockfile_fast_path(
+                input.lockfile_path,
+                input.manifest_deps,
+                &[],
+                input.client,
+                &gate_stats,
+                false,
+            ) {
+                let mut policy_packages = fast.packages;
+                if input.omit_policy.dev {
+                    filter_dev_packages(&mut policy_packages, input.production_dependency_names);
+                }
+                filter_platform_packages(&mut policy_packages)?;
+                Some(
+                    run_policy_extensions(
+                        input.policy_extension_configs,
+                        input.project_dir,
+                        &policy_packages,
+                        input.json_output,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        };
+    if fast_path_base_eligible
+        && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
+    {
+        let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
+            stats
+        } else {
+            run_policy_extensions(
+                input.policy_extension_configs,
+                input.project_dir,
+                &[],
+                input.json_output,
+            )
+            .await?
+        };
+        let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
+            cleanup_unused_catalogs_after_install(input.project_dir)?
+        } else {
+            false
+        };
+        if catalogs_cleaned {
+            write_post_install_hash(
+                input.project_dir,
+                input.linker_mode,
+                input.object_integrity_policy,
+            );
+        }
+        let elapsed = input.start.elapsed();
+        let total_ms = elapsed.as_millis();
+        if input.json_output {
+            let mut json = serde_json::json!({
+                "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
+                "success": true,
+                "up_to_date": true,
+                "duration_ms": total_ms as u64,
+                "timing": {
+                    "resolve_ms": 0u128,
+                    "fetch_ms": 0u128,
+                    "link_ms": 0u128,
+                    "total_ms": total_ms,
+                    "waterfall": {
+                        "setup_ms": total_ms,
+                        "resolve_ms": 0u128,
+                        "pre_fetch_ms": 0u128,
+                        "fetch_ms": 0u128,
+                        "pre_link_ms": 0u128,
+                        "link_ms": 0u128,
+                        "link_await_ms": 0u128,
+                        "link_finalize_ms": 0u128,
+                        "tail_ms": 0u128,
+                        "total_ms": total_ms,
+                    },
+                },
+                "peer_conflicts": [],
+                "peer_issues": peer_issues_json_value(&[], &[]),
+                "security": {
+                    "policy_extensions": policy_extension_stats.to_json(),
+                },
+            });
+            json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
+            if input.timing_detail_mode.enabled() {
+                json["timing"]["detail"] = setup_only_timing_detail_json(
+                    input.timing_detail_mode,
+                    total_ms,
+                    setup_install_state_ms,
+                    0,
+                );
+            }
+            if !input.emit_timing
+                && let Some(obj) = json.as_object_mut()
+            {
+                obj.remove("timing");
+            }
+            if let Some(targets) = input.target_set {
+                json["target_set"] = serde_json::Value::Array(
+                    targets.iter().map(|s| serde_json::json!(s)).collect(),
+                );
+            }
+            crate::security_floor::attach_security_posture(&mut json, input.force_security_floor);
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        } else {
+            install_ui::done(&format!("Up to date · {total_ms}ms"));
+        }
+        return Ok(InstallFreshnessResult {
+            setup_install_state_ms,
+            cleanup_catalogs_in_pipeline,
+            completed: true,
+        });
+    }
+
+    Ok(InstallFreshnessResult {
+        setup_install_state_ms,
+        cleanup_catalogs_in_pipeline,
+        completed: false,
+    })
+}
+
 /// Empty installs still need the same durable on-disk markers the
 /// freshness cache keys on: `lpm.lock`, `node_modules/`, and the
 /// standard `lpm.lockb`/`.gitattributes` sidecar written by the main

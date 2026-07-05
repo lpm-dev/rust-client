@@ -486,145 +486,36 @@ async fn run_with_options_under_store_lock(
     let mut drift_ignore_policy = drift_ignore_policy;
     let mut verify_policy = verify_policy;
 
-    // Fast-exit: if package.json + lockfile haven't changed AND the
-    // resolved linker and object-integrity policy match the prior
-    // install, skip the entire install pipeline. Two stats + one read
-    // + one SHA-256 hash ≈ 1-2ms vs 82ms for a full warm install.
-    // --force bypasses this check to force a full re-install.
-    //
-    // Linker/integrity freshness: the install-state check folds both
-    // resolved config values into the hash. The mtime fast path also
-    // reads the `l:<mode>` and `i:<source|tree>` lines to detect the same
-    // flips without re-hashing.
-    // Strict peer mode runs a fresh peer check because the fast path
-    // does not have the resolver metadata needed to prove the tree is clean.
-    let pkg_content_for_state = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
-    let setup_state_t = Instant::now();
-    let install_state = crate::install_state::check_install_state_with_linker_and_integrity(
+    let InstallFreshnessResult {
+        setup_install_state_ms: wf_setup_install_state_ms,
+        cleanup_catalogs_in_pipeline,
+        completed: freshness_completed,
+    } = run_install_freshness_phase(InstallFreshnessInput {
+        client,
         project_dir,
-        &pkg_content_for_state,
+        pkg_json_path: &pkg_json_path,
+        lockfile_path: &lockfile_path,
+        manifest_deps: &manifest_deps,
+        production_dependency_names: &production_dependency_names,
+        policy_extension_configs: &policy_extension_configs,
+        force,
+        offline,
+        omit_policy,
+        strict_peer_dependencies,
         linker_mode,
         object_integrity_policy,
-    );
-    let wf_setup_install_state_ms = setup_state_t.elapsed().as_millis();
-    let compatibility_bins_ready = !requested_v2_mode
-        || compatibility_bin_names.is_empty()
-        || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
-    let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
-    let fast_path_base_eligible = !force
-        && !offline
-        && omit_policy.is_default()
-        && !strict_peer_dependencies
-        && install_state.up_to_date
-        && compatibility_bins_ready;
-    let fast_path_policy_extension_stats =
-        if !fast_path_base_eligible || policy_extension_configs.is_empty() {
-            None
-        } else {
-            let gate_stats = GateStats::default();
-            if let Some(fast) = try_lockfile_fast_path(
-                &lockfile_path,
-                &manifest_deps,
-                &[],
-                client,
-                &gate_stats,
-                false,
-            ) {
-                let mut policy_packages = fast.packages;
-                if omit_policy.dev {
-                    filter_dev_packages(&mut policy_packages, &production_dependency_names);
-                }
-                filter_platform_packages(&mut policy_packages)?;
-                Some(
-                    run_policy_extensions(
-                        &policy_extension_configs,
-                        project_dir,
-                        &policy_packages,
-                        json_output,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            }
-        };
-    if fast_path_base_eligible
-        && (policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
-    {
-        let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
-            stats
-        } else {
-            run_policy_extensions(&policy_extension_configs, project_dir, &[], json_output).await?
-        };
-        let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
-            cleanup_unused_catalogs_after_install(project_dir)?
-        } else {
-            false
-        };
-        if catalogs_cleaned {
-            write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
-        }
-        let elapsed = start.elapsed();
-        let total_ms = elapsed.as_millis();
-        if json_output {
-            // Emit the same `timing` object shape as the main and offline paths
-            // so benchmark scripts can parse install output uniformly regardless
-            // of which fast-path was taken. Stages are zero because no real work
-            // ran — the entire pipeline was skipped.
-            let mut json = serde_json::json!({
-                           "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
-                           "success": true,
-                           "up_to_date": true,
-                           "duration_ms": total_ms as u64,
-                           "timing": {
-                               "resolve_ms": 0u128,
-                               "fetch_ms": 0u128,
-                               "link_ms": 0u128,
-                               "total_ms": total_ms,
-                               "waterfall": {
-                                   "setup_ms": total_ms,
-                                   "resolve_ms": 0u128,
-                                   "pre_fetch_ms": 0u128,
-                                   "fetch_ms": 0u128,
-                                   "pre_link_ms": 0u128,
-                                   "link_ms": 0u128,
-                                   "link_await_ms": 0u128,
-                                   "link_finalize_ms": 0u128,
-                                   "tail_ms": 0u128,
-                                   "total_ms": total_ms,
-                               },
-                           },
-            //always-present empty array: up-to-date fast
-            // path runs no resolve, so no fresh conflict trace.
-                           "peer_conflicts": [],
-                           "peer_issues": peer_issues_json_value(&[], &[]),
-                           "security": {
-                               "policy_extensions": policy_extension_stats.to_json(),
-                           },
-                       });
-            json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
-            if timing_detail_mode.enabled() {
-                json["timing"]["detail"] = setup_only_timing_detail_json(
-                    timing_detail_mode,
-                    total_ms,
-                    wf_setup_install_state_ms,
-                    0,
-                );
-            }
-            if !emit_timing && let Some(obj) = json.as_object_mut() {
-                obj.remove("timing");
-            }
-            // surface workspace target set for agents.
-            if let Some(targets) = target_set {
-                json["target_set"] = serde_json::Value::Array(
-                    targets.iter().map(|s| serde_json::json!(s)).collect(),
-                );
-            }
-            crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            install_ui::done(&format!("Up to date · {total_ms}ms"));
-        }
+        requested_v2_mode,
+        compatibility_bin_names,
+        requested_add_count,
+        json_output,
+        emit_timing,
+        timing_detail_mode,
+        force_security_floor,
+        target_set,
+        start,
+    })
+    .await?;
+    if freshness_completed {
         return Ok(());
     }
 
