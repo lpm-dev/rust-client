@@ -133,6 +133,130 @@ pub(super) struct LocalSourceExpansionResult {
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
 }
 
+pub(super) struct InstallRoutingContext {
+    pub(super) route_table: RouteTable,
+    pub(super) eager_origins: Vec<lpm_registry::OriginKey>,
+    pub(super) setup_route_table_ms: u128,
+}
+
+pub(super) fn prepare_install_routing_context(
+    project_dir: &Path,
+    deps: &HashMap<String, String>,
+    client: &RegistryClient,
+    pkg_name: &str,
+    is_add_invocation: bool,
+    json_output: bool,
+) -> Result<InstallRoutingContext, LpmError> {
+    let setup_route_t = Instant::now();
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    let setup_route_table_ms = setup_route_t.elapsed().as_millis();
+
+    if !json_output {
+        for warning in route_table.npmrc_warnings() {
+            output::warn(warning);
+        }
+    }
+    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+        && !tagged.value
+    {
+        output::warn(&format!(
+            "strict-ssl=false in {}:{} — TLS certificate verification is \
+             DISABLED for this install across ALL registries. This is a \
+             security risk.",
+            tagged.source, tagged.line
+        ));
+    }
+    for warning in route_table.npmrc_security_warnings() {
+        output::warn(warning);
+    }
+
+    let top_level_specs = top_level_registry_specs(deps);
+    let eager_origins = route_table.effective_registry_origins(
+        &top_level_specs,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
+    maybe_emit_install_resolving_phase(
+        client,
+        pkg_name,
+        &eager_origins,
+        is_add_invocation,
+        json_output,
+    );
+
+    Ok(InstallRoutingContext {
+        route_table,
+        eager_origins,
+        setup_route_table_ms,
+    })
+}
+
+fn top_level_registry_specs(deps: &HashMap<String, String>) -> Vec<String> {
+    deps.iter()
+        .filter_map(
+            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
+                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
+                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+fn maybe_emit_install_resolving_phase(
+    client: &RegistryClient,
+    pkg_name: &str,
+    eager_origins: &[lpm_registry::OriginKey],
+    is_add_invocation: bool,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+
+    let hosts_label = if eager_origins.is_empty() {
+        install_ui::yellow(&install_ui::short_registry_host(client.base_url()))
+    } else {
+        eager_origins
+            .iter()
+            .map(|origin| {
+                let host = origin
+                    .host_lower
+                    .strip_prefix("registry.")
+                    .unwrap_or(&origin.host_lower)
+                    .to_owned();
+                install_ui::yellow(&host)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let line = if is_add_invocation {
+        format!("Resolving dependencies from {hosts_label}")
+    } else {
+        format!(
+            "Resolving dependencies from {hosts_label} for {}",
+            install_ui::bold(pkg_name)
+        )
+    };
+    install_ui::phase(&line);
+}
+
+pub(super) fn configure_install_client_for_routing(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    eager_origins: &[lpm_registry::OriginKey],
+    json_output: bool,
+) -> Result<RegistryClient, LpmError> {
+    let owned_client = client
+        .clone_with_config()
+        .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
+    if !json_output && let Some(line) = owned_client.render_effective_tls_summary() {
+        output::info(&line);
+    }
+    Ok(owned_client)
+}
+
 pub(super) fn expand_local_source_install_packages(
     project_dir: &Path,
     deps: &mut HashMap<String, String>,
