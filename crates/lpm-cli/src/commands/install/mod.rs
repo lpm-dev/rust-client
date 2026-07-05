@@ -3,7 +3,6 @@ use crate::output;
 use crate::overrides_state;
 use crate::patch_engine;
 use crate::patch_state;
-use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -25,6 +24,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 
 mod catalog;
+mod concurrency;
+mod diff_util;
 mod fetch;
 mod fetch_overlap;
 mod firewall;
@@ -42,12 +43,15 @@ mod skills;
 mod source_resolution;
 mod state;
 mod swift;
+mod test_support;
 #[cfg(test)]
 mod tests;
 mod timing;
+mod validation;
 mod workspace;
 
 use catalog::*;
+use concurrency::*;
 use fetch::*;
 use fetch_overlap::*;
 use firewall::{
@@ -88,7 +92,12 @@ use skills::*;
 use source_resolution::*;
 use state::*;
 use swift::*;
+use test_support::{maybe_test_audit_after_install_should_fail, maybe_test_panic};
 use timing::*;
+pub(crate) use validation::{FrozenLockfileMode, install_running_in_ci};
+use validation::{
+    LockfileValidationInput, LockfileValidationState, validate_install_lockfile_state,
+};
 pub(crate) use workspace::confirm_multi_member_mutation;
 use workspace::*;
 
@@ -117,100 +126,11 @@ fn publish_ages_from_resolved_metadata(
     map
 }
 
-fn manifest_install_deps(pkg: &lpm_workspace::PackageJson) -> HashMap<String, String> {
-    let mut deps = pkg.dependencies.clone();
-    for (name, range) in &pkg.dev_dependencies {
-        deps.entry(name.clone()).or_insert_with(|| range.clone());
-    }
-    deps
-}
-
-fn normalize_jsr_manifest_deps(deps: &mut HashMap<String, String>) -> Result<(), LpmError> {
-    for (name, spec) in deps.iter_mut() {
-        if let Some(normalized) =
-            lpm_resolver::normalize_jsr_dependency(name, spec).map_err(|err| {
-                LpmError::Registry(format!(
-                    "dep '{name}' in package.json has invalid spec '{spec}': {err}"
-                ))
-            })?
-        {
-            *spec = normalized;
-        }
-    }
-    Ok(())
-}
-
 fn release_age_policy_applies_to_install_package(
     policy: crate::release_age_config::ReleaseAgePolicy,
     package: &InstallPackage,
 ) -> bool {
     policy.is_strict() || package.is_direct
-}
-
-fn direct_release_age_canonicals(deps: &HashMap<String, String>) -> Vec<CanonicalKey> {
-    let mut canonicals: Vec<CanonicalKey> = deps
-        .iter()
-        .map(|(name, range)| {
-            lpm_resolver::ranges::parse_npm_alias(range).map_or_else(
-                || CanonicalKey::from_dep_name(name),
-                |alias| CanonicalKey::from_dep_name(&alias.target),
-            )
-        })
-        .collect();
-    canonicals.sort_by_key(ToString::to_string);
-    canonicals.dedup();
-    canonicals
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum FrozenLockfileMode {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-impl FrozenLockfileMode {
-    fn is_active(self, lockfile_path: &Path) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Never => false,
-            Self::Auto => lockfile_path.exists() && install_running_in_ci(),
-        }
-    }
-}
-
-pub(crate) fn install_running_in_ci() -> bool {
-    crate::install_state::ci_env_is_truthy()
-}
-
-const V2_CACHE_CHECK_MAX_CONCURRENCY: usize = 16;
-const V2_LINK_TASK_MAX_CONCURRENCY: usize = 16;
-const ENV_V2_LINK_TASKS: &str = "LPM_V2_LINK_TASKS";
-
-fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(4);
-    parallelism
-        .clamp(1, V2_CACHE_CHECK_MAX_CONCURRENCY)
-        .min(candidate_count.max(1))
-}
-
-fn v2_link_task_concurrency(target_count: usize) -> usize {
-    if let Some(configured) = std::env::var(ENV_V2_LINK_TASKS)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-    {
-        return configured.min(target_count.max(1));
-    }
-    let parallelism = std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(4);
-    parallelism
-        .clamp(1, V2_LINK_TASK_MAX_CONCURRENCY)
-        .min(target_count.max(1))
 }
 
 fn timing_detail_start(enabled: bool) -> Option<Instant> {
@@ -221,468 +141,6 @@ fn record_timing_detail_ms(bucket: &mut u128, start: Option<Instant>) {
     if let Some(start) = start {
         *bucket = bucket.saturating_add(start.elapsed().as_millis());
     }
-}
-
-struct V2ReusablePrevalidation {
-    hits: HashMap<String, lpm_store::v2::ReusableObject>,
-    candidate_count: usize,
-    concurrency: usize,
-    validation_timings: V2ReusableValidationTimings,
-}
-
-struct V2LinkTaskResult {
-    materialized: MaterializedPackage,
-    freshly_populated: bool,
-    ms: u128,
-    timings: lpm_store::v2::LinkEntryTimings,
-}
-
-type V2LinkHandle = tokio::task::JoinHandle<Result<V2LinkTaskResult, LpmError>>;
-
-fn spawn_v2_link_task(
-    plan: std::sync::Arc<lpm_linker::v2::LinkPlanV2>,
-    target: lpm_linker::v2::V2Target,
-    store: std::sync::Arc<lpm_store::v2::Store>,
-    semaphore: Arc<Semaphore>,
-) -> V2LinkHandle {
-    tokio::spawn(async move {
-        let _permit = semaphore
-            .acquire_owned()
-            .await
-            .map_err(|_| LpmError::Registry("v2 link semaphore closed".into()))?;
-        tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-            let (materialized, freshly_populated, timings) =
-                lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store)?;
-            Ok(V2LinkTaskResult {
-                materialized,
-                freshly_populated,
-                ms: start.elapsed().as_millis(),
-                timings,
-            })
-        })
-        .await
-        .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))?
-    })
-}
-
-async fn prevalidate_v2_reusable_objects(
-    packages: &[InstallPackage],
-    store_v2: Arc<lpm_store::v2::Store>,
-) -> Result<V2ReusablePrevalidation, LpmError> {
-    let candidates: Vec<(String, String)> = packages
-        .iter()
-        .filter(|package| {
-            !matches!(
-                package.source_kind(),
-                Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
-            )
-        })
-        .filter_map(|package| {
-            Some((
-                install_pkg_key(package),
-                package.integrity.as_ref()?.clone(),
-            ))
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return Ok(V2ReusablePrevalidation {
-            hits: HashMap::new(),
-            candidate_count: 0,
-            concurrency: 0,
-            validation_timings: V2ReusableValidationTimings::default(),
-        });
-    }
-
-    let candidate_count = candidates.len();
-    let concurrency = v2_cache_check_concurrency(candidate_count);
-    let mut checks = futures::stream::iter(candidates.into_iter().map(|(key, sri)| {
-        let store_v2 = Arc::clone(&store_v2);
-        tokio::task::spawn_blocking(move || {
-            store_v2
-                .reusable_object_with_timings(&sri)
-                .map(|(hit, timings)| (key, hit, timings))
-        })
-    }))
-    .buffer_unordered(concurrency);
-
-    let mut hits = HashMap::with_capacity(candidate_count);
-    let mut validation_timings = V2ReusableValidationTimings::default();
-    while let Some(result) = checks.next().await {
-        let (key, hit, timings) = result
-            .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??;
-        validation_timings.record(timings, hit.is_some());
-        if let Some(hit) = hit {
-            hits.insert(key, hit);
-        }
-    }
-    Ok(V2ReusablePrevalidation {
-        hits,
-        candidate_count,
-        concurrency,
-        validation_timings,
-    })
-}
-
-fn btree_from_hash_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
-    map.iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn nested_btree_from_hash_map(
-    map: &HashMap<String, HashMap<String, String>>,
-) -> BTreeMap<String, BTreeMap<String, String>> {
-    map.iter()
-        .map(|(key, value)| (key.clone(), btree_from_hash_map(value)))
-        .collect()
-}
-
-fn peer_rules_fingerprint(pkg: &lpm_workspace::PackageJson) -> Option<String> {
-    let rules = pkg.lpm.as_ref().map(|lpm| &lpm.peer_dependency_rules)?;
-    if rules == &lpm_workspace::PeerDependencyRules::default() {
-        return None;
-    }
-    let bytes = serde_json::to_vec(rules).ok()?;
-    use sha2::{Digest, Sha256};
-    Some(format!("sha256-{}", hex::encode(Sha256::digest(bytes))))
-}
-
-fn importer_snapshot_for_current_manifest(
-    pkg: &lpm_workspace::PackageJson,
-    lpm_overrides: &HashMap<String, String>,
-    overrides: &HashMap<String, String>,
-    resolutions: &HashMap<String, String>,
-    catalogs: &HashMap<String, HashMap<String, String>>,
-    patches_fingerprint: Option<&str>,
-    auto_install_peers: bool,
-) -> lpm_lockfile::ImporterSnapshot {
-    lpm_lockfile::ImporterSnapshot {
-        dependencies: btree_from_hash_map(&pkg.dependencies),
-        dev_dependencies: btree_from_hash_map(&pkg.dev_dependencies),
-        optional_dependencies: btree_from_hash_map(&pkg.optional_dependencies),
-        peer_dependencies: btree_from_hash_map(&pkg.peer_dependencies),
-        lpm_overrides: btree_from_hash_map(lpm_overrides),
-        overrides: btree_from_hash_map(overrides),
-        resolutions: btree_from_hash_map(resolutions),
-        catalogs: nested_btree_from_hash_map(catalogs),
-        patches_fingerprint: patches_fingerprint.map(str::to_string),
-        peer_dependency_rules_fingerprint: peer_rules_fingerprint(pkg),
-        auto_install_peers: Some(auto_install_peers),
-    }
-}
-
-fn validate_frozen_importer_snapshot(
-    lockfile_path: &Path,
-    lockfile: &lpm_lockfile::Lockfile,
-    current: &lpm_lockfile::ImporterSnapshot,
-) -> Result<(), LpmError> {
-    if lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION {
-        return Err(LpmError::Registry(format!(
-            "Frozen lockfile mismatch\n  lockfile    {}\n  found       v{}\n  required    v{}\n  hint        run `lpm install` locally and commit lpm.lock before running a frozen install",
-            lockfile_path.display(),
-            lockfile.metadata.lockfile_version,
-            lpm_lockfile::LOCKFILE_VERSION,
-        )));
-    }
-    let locked = lockfile.importers.get(".").ok_or_else(|| {
-        LpmError::Registry(format!(
-            "Frozen lockfile mismatch\n  lockfile    {}\n  importer    .\n  hint        run `lpm install` locally and commit the v5 lpm.lock",
-            lockfile_path.display()
-        ))
-    })?;
-
-    if let Some(diff) = first_importer_snapshot_diff(current, locked) {
-        return Err(LpmError::Registry(format!(
-            "Frozen lockfile mismatch\n  {}  {}\n  manifest    {}\n  lockfile    {}\n  hint        run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile",
-            diff.kind, diff.name, diff.manifest, diff.lockfile,
-        )));
-    }
-
-    Ok(())
-}
-
-fn validate_lockfile_patch_records(
-    lockfile_path: &Path,
-    lockfile: &lpm_lockfile::Lockfile,
-    current: &lpm_lockfile::LockfilePatches,
-) -> Result<(), LpmError> {
-    if lockfile.patches == *current {
-        return Ok(());
-    }
-
-    let diff = first_lockfile_patch_diff(current, &lockfile.patches).unwrap_or_else(|| {
-        LockfilePatchDiff {
-            selector: "<unknown>".to_string(),
-            field: "patches",
-            current: "<unknown>".to_string(),
-            lockfile: "<unknown>".to_string(),
-        }
-    });
-    Err(LpmError::Registry(format!(
-        "Patch lockfile mismatch\n  patch       {}\n  field       {}\n  current     {}\n  lockfile    {}\n  file        {}\n  hint        restore the patch file recorded in lpm.lock, or re-run `lpm patch` and `lpm patch-commit`",
-        diff.selector,
-        diff.field,
-        diff.current,
-        diff.lockfile,
-        lockfile_path.display(),
-    )))
-}
-
-struct LockfilePatchDiff {
-    selector: String,
-    field: &'static str,
-    current: String,
-    lockfile: String,
-}
-
-fn first_lockfile_patch_diff(
-    current: &lpm_lockfile::LockfilePatches,
-    locked: &lpm_lockfile::LockfilePatches,
-) -> Option<LockfilePatchDiff> {
-    let selectors: BTreeSet<&String> = current.keys().chain(locked.keys()).collect();
-    for selector in selectors {
-        match (current.get(selector), locked.get(selector)) {
-            (Some(current), Some(locked)) => {
-                if current.path != locked.path {
-                    return Some(LockfilePatchDiff {
-                        selector: selector.clone(),
-                        field: "path",
-                        current: current.path.clone(),
-                        lockfile: locked.path.clone(),
-                    });
-                }
-                if current.sha256 != locked.sha256 {
-                    return Some(LockfilePatchDiff {
-                        selector: selector.clone(),
-                        field: "sha256",
-                        current: current.sha256.clone(),
-                        lockfile: locked.sha256.clone(),
-                    });
-                }
-                if current.original_integrity != locked.original_integrity {
-                    return Some(LockfilePatchDiff {
-                        selector: selector.clone(),
-                        field: "original-integrity",
-                        current: current.original_integrity.clone(),
-                        lockfile: locked.original_integrity.clone(),
-                    });
-                }
-            }
-            (Some(current), None) => {
-                return Some(LockfilePatchDiff {
-                    selector: selector.clone(),
-                    field: "record",
-                    current: format!(
-                        "{} {} {}",
-                        current.path, current.sha256, current.original_integrity
-                    ),
-                    lockfile: "<absent>".to_string(),
-                });
-            }
-            (None, Some(locked)) => {
-                return Some(LockfilePatchDiff {
-                    selector: selector.clone(),
-                    field: "record",
-                    current: "<absent>".to_string(),
-                    lockfile: format!(
-                        "{} {} {}",
-                        locked.path, locked.sha256, locked.original_integrity
-                    ),
-                });
-            }
-            (None, None) => {}
-        }
-    }
-    None
-}
-
-struct ImporterSnapshotDiff {
-    kind: &'static str,
-    name: String,
-    manifest: String,
-    lockfile: String,
-}
-
-fn first_importer_snapshot_diff(
-    current: &lpm_lockfile::ImporterSnapshot,
-    locked: &lpm_lockfile::ImporterSnapshot,
-) -> Option<ImporterSnapshotDiff> {
-    compare_string_maps("dependency", &current.dependencies, &locked.dependencies)
-        .or_else(|| {
-            compare_string_maps(
-                "dev dependency",
-                &current.dev_dependencies,
-                &locked.dev_dependencies,
-            )
-        })
-        .or_else(|| {
-            compare_string_maps(
-                "optional dependency",
-                &current.optional_dependencies,
-                &locked.optional_dependencies,
-            )
-        })
-        .or_else(|| {
-            compare_string_maps(
-                "peer dependency",
-                &current.peer_dependencies,
-                &locked.peer_dependencies,
-            )
-        })
-        .or_else(|| {
-            compare_string_maps(
-                "lpm override",
-                &current.lpm_overrides,
-                &locked.lpm_overrides,
-            )
-        })
-        .or_else(|| compare_string_maps("override", &current.overrides, &locked.overrides))
-        .or_else(|| compare_string_maps("resolution", &current.resolutions, &locked.resolutions))
-        .or_else(|| compare_nested_string_maps("catalog", &current.catalogs, &locked.catalogs))
-        .or_else(|| {
-            compare_option(
-                "patches",
-                &current.patches_fingerprint,
-                &locked.patches_fingerprint,
-            )
-        })
-        .or_else(|| {
-            compare_option(
-                "peer dependency rules",
-                &current.peer_dependency_rules_fingerprint,
-                &locked.peer_dependency_rules_fingerprint,
-            )
-        })
-        .or_else(|| {
-            let manifest = current.auto_install_peers.map(|value| value.to_string());
-            let lockfile = locked.auto_install_peers.map(|value| value.to_string());
-            compare_option("auto install peers", &manifest, &lockfile)
-        })
-}
-
-fn compare_string_maps(
-    kind: &'static str,
-    current: &BTreeMap<String, String>,
-    locked: &BTreeMap<String, String>,
-) -> Option<ImporterSnapshotDiff> {
-    let keys: BTreeSet<&String> = current.keys().chain(locked.keys()).collect();
-    for key in keys {
-        if current.get(key) != locked.get(key) {
-            return Some(ImporterSnapshotDiff {
-                kind,
-                name: key.clone(),
-                manifest: current
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| "<absent>".to_string()),
-                lockfile: locked
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| "<absent>".to_string()),
-            });
-        }
-    }
-    None
-}
-
-fn compare_nested_string_maps(
-    kind: &'static str,
-    current: &BTreeMap<String, BTreeMap<String, String>>,
-    locked: &BTreeMap<String, BTreeMap<String, String>>,
-) -> Option<ImporterSnapshotDiff> {
-    let outer_keys: BTreeSet<&String> = current.keys().chain(locked.keys()).collect();
-    for outer in outer_keys {
-        let empty = BTreeMap::new();
-        if let Some(diff) = compare_string_maps(
-            kind,
-            current.get(outer).unwrap_or(&empty),
-            locked.get(outer).unwrap_or(&empty),
-        ) {
-            return Some(ImporterSnapshotDiff {
-                name: format!("{outer}.{}", diff.name),
-                ..diff
-            });
-        }
-    }
-    None
-}
-
-fn compare_option(
-    name: &'static str,
-    current: &Option<String>,
-    locked: &Option<String>,
-) -> Option<ImporterSnapshotDiff> {
-    (current != locked).then(|| ImporterSnapshotDiff {
-        kind: "setting",
-        name: name.to_string(),
-        manifest: current.clone().unwrap_or_else(|| "<absent>".to_string()),
-        lockfile: locked.clone().unwrap_or_else(|| "<absent>".to_string()),
-    })
-}
-
-/// Test-only deterministic-panic injection hook.
-///
-/// In debug builds only, when `LPM_TEST_PANIC_AT` matches the stage
-/// argument, panics with a recognizable message that includes the stage
-/// name. Release builds silently treat this as a no-op.
-///
-/// **Why a panic, not an error.** The hook exists to drive workflow
-/// tests that pin the [`crate::manifest_tx::ManifestTransaction`]
-/// Drop-based rollback. Drop fires on `?` early-return AND on panic
-/// AND during normal scope exit. A `?`-early-return path can already
-/// be tested by injecting a recoverable error (e.g., an invalid
-/// `--policy=` flag); the panic path needed a separate hook because
-/// no recoverable error reliably triggers Drop after EVERY stage
-/// in the install pipeline. SIGKILL bypasses Drop entirely.
-///
-/// **Stages currently wired in [`run_add_packages`]:**
-///
-/// - `"after-snapshot"` — right after
-///   `snapshot_install_state` succeeds; the manifest is unchanged.
-///   Drop should be a no-op (snapshot bytes == on-disk bytes).
-/// - `"after-stage"` — right after
-///   `stage_packages_to_manifest` writes the `*` placeholder into
-///   `package.json`. Drop must restore the pre-stage bytes — this
-///   is the load-bearing test for the rollback contract.
-/// - `"after-install"` — right after
-///   `run_with_options` returns Ok. The lockfile is now fresh; the
-///   manifest still has `*` placeholders. Drop must restore both.
-/// - `"after-finalize"` — right after
-///   `finalize_packages_in_manifest` resolves the `*` to concrete
-///   versions. Drop runs ONE step before commit; the test asserts
-///   the manifest snaps back to its pre-stage shape rather than
-///   landing in a half-committed state.
-///
-/// Used by [B.4](../../../tests/workflows/tests/install_concurrency.rs)
-/// (`install_panics_mid_pipeline_rollback_restores_manifest`).
-fn maybe_test_panic(stage: &str) {
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    if std::env::var("LPM_TEST_PANIC_AT").as_deref() == Ok(stage) {
-        panic!("LPM_TEST_PANIC_AT={stage} (test-only panic injection)");
-    }
-}
-
-/// Test-only failure injection for the audit-after-install wrapper.
-///
-/// Returns `true` when the workflow harness has asked us to simulate
-/// an audit-pass failure. The install pipeline then skips the real
-/// `audit::run_install_summary` call, logs a `tracing::warn!`, and
-/// proceeds as if the audit had errored — letting the workflow test
-/// pin the "errors degrade to no envelope field, install still exits
-/// 0" contract without depending on a real audit failure mode
-/// (network outage, store-lock contention, lockfile corruption).
-///
-/// Gated the same way as [`maybe_test_panic`]: enabled only in debug
-/// builds. Production release builds never honor the trigger env.
-fn maybe_test_audit_after_install_should_fail() -> bool {
-    if !cfg!(debug_assertions) {
-        return false;
-    }
-    std::env::var("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL").as_deref() == Ok("1")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1720,62 +1178,23 @@ async fn run_with_options_under_store_lock(
     // freshness (post-install env/config flips invalidate the cache).
     // No re-resolution here.
 
-    let current_patches: HashMap<String, PatchedDependencyEntry> = pkg
-        .lpm
-        .as_ref()
-        .map(|l| l.patched_dependencies.clone())
-        .unwrap_or_default();
-    let current_patch_fingerprint = patch_state::compute_fingerprint(&current_patches);
-    let current_importer_patch_fingerprint =
-        (!current_patches.is_empty()).then_some(current_patch_fingerprint.as_str());
-    let current_lockfile_patches =
-        patch_state::lockfile_patches_from_manifest(project_dir, &current_patches)?;
-    let current_importer_snapshot = importer_snapshot_for_current_manifest(
-        &pkg,
-        lpm_overrides_map.as_ref(),
-        overrides_map.as_ref(),
-        resolutions_map.as_ref(),
-        override_catalogs,
-        current_importer_patch_fingerprint,
+    let LockfileValidationState {
+        current_patches,
+        current_patch_fingerprint,
+        current_lockfile_patches,
+        current_importer_snapshot,
+    } = validate_install_lockfile_state(LockfileValidationInput {
+        project_dir,
+        lockfile_path: &lockfile_path,
+        package: &pkg,
+        lpm_overrides: lpm_overrides_map.as_ref(),
+        overrides: overrides_map.as_ref(),
+        resolutions: resolutions_map.as_ref(),
+        catalogs: override_catalogs,
         auto_install_peers,
-    );
-    let lockfile_for_validation = if lockfile_path.exists() || frozen_lockfile_active {
-        match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
-            Ok(lockfile) => Some(lockfile),
-            Err(e) if frozen_lockfile_active => {
-                return Err(LpmError::Registry(format!(
-                    "Frozen lockfile mismatch\n  lockfile    {}\n  error       {}\n  hint        run `lpm install` locally and commit lpm.lock before running a frozen install",
-                    lockfile_path.display(),
-                    e,
-                )));
-            }
-            Err(e) if !current_lockfile_patches.is_empty() => {
-                return Err(LpmError::Registry(format!(
-                    "Patch lockfile mismatch\n  lockfile    {}\n  error       {}\n  hint        run `lpm install` after restoring a readable lpm.lock",
-                    lockfile_path.display(),
-                    e,
-                )));
-            }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    if let Some(lockfile) = lockfile_for_validation.as_ref() {
-        validate_lockfile_patch_records(&lockfile_path, lockfile, &current_lockfile_patches)?;
-    }
-    if frozen_lockfile_active {
-        if force {
-            return Err(LpmError::Registry(
-                "Frozen lockfile mismatch\n  flag        --force\n  hint        frozen installs cannot force fresh resolution; pass --no-frozen-lockfile for a mutable install"
-                    .into(),
-            ));
-        }
-        let lockfile = lockfile_for_validation
-            .as_ref()
-            .expect("frozen lockfile validation loaded lockfile or returned");
-        validate_frozen_importer_snapshot(&lockfile_path, lockfile, &current_importer_snapshot)?;
-    }
+        frozen_lockfile_active,
+        force,
+    })?;
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
         if cleanup_catalogs_in_pipeline {

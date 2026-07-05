@@ -10,6 +10,46 @@ use super::*;
 /// accepts it. `*` is the canonical "any version" spec.
 pub(super) const STAGE_PLACEHOLDER: &str = "*";
 
+pub(super) fn manifest_install_deps(pkg: &lpm_workspace::PackageJson) -> HashMap<String, String> {
+    let mut deps = pkg.dependencies.clone();
+    for (name, range) in &pkg.dev_dependencies {
+        deps.entry(name.clone()).or_insert_with(|| range.clone());
+    }
+    deps
+}
+
+pub(super) fn normalize_jsr_manifest_deps(
+    deps: &mut HashMap<String, String>,
+) -> Result<(), LpmError> {
+    for (name, spec) in deps.iter_mut() {
+        if let Some(normalized) =
+            lpm_resolver::normalize_jsr_dependency(name, spec).map_err(|err| {
+                LpmError::Registry(format!(
+                    "dep '{name}' in package.json has invalid spec '{spec}': {err}"
+                ))
+            })?
+        {
+            *spec = normalized;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn direct_release_age_canonicals(deps: &HashMap<String, String>) -> Vec<CanonicalKey> {
+    let mut canonicals: Vec<CanonicalKey> = deps
+        .iter()
+        .map(|(name, range)| {
+            lpm_resolver::ranges::parse_npm_alias(range).map_or_else(
+                || CanonicalKey::from_dep_name(name),
+                |alias| CanonicalKey::from_dep_name(&alias.target),
+            )
+        })
+        .collect();
+    canonicals.sort_by_key(ToString::to_string);
+    canonicals.dedup();
+    canonicals
+}
+
 /// Outcome of staging a single dependency into the manifest.
 #[derive(Debug, Clone)]
 pub(crate) enum StagedKind {
