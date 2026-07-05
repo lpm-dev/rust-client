@@ -13,6 +13,9 @@
 //! 3. **Atomic shim swap at commit.** Same command names, new install
 //!    root — `emit_shim` does the rename-over-existing dance. Old
 //!    install root goes onto `manifest.tombstones` for `store gc`.
+//!    Slow install work is covered by the same tx-local in-flight lock
+//!    as `install -g`, so startup recovery never rolls back a live
+//!    update while unrelated global installs can still overlap fetches.
 //!
 //! `lpm global update` (no arg) iterates every package and re-resolves
 //! against its persisted `saved_spec`. `lpm global update <pkg>` does
@@ -33,13 +36,15 @@ mod test_support;
 use self::commit::{UpgradeOutput, commit_upgrade_locked};
 use self::inner::do_install_upgrade;
 use self::prepare::{UpgradePrep, active_matches_planned_snapshot, prepare_upgrade_locked};
-use super::global_util::{discover_bin_commands, pick_version_with_policy};
+use super::global_util::{discover_bin_commands, mk_tx_id, pick_version_with_policy};
 use crate::output;
 use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
 };
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
+use lpm_common::{
+    LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock, with_exclusive_lock_async,
+};
 use lpm_global::{InstallReadyMarker, PackageSource, read_for, write_for, write_marker};
 use lpm_registry::RegistryClient;
 use lpm_semver::Version;
@@ -471,38 +476,31 @@ async fn execute_upgrade(
     prep: Box<UpgradePrep>,
     suppress_nested_output: bool,
 ) -> Result<UpgradeOutput, (String, LpmError)> {
-    let staged = with_exclusive_lock(root.global_tx_lock(), || {
-        prepare_upgrade_locked(root, &prep)
-    })
-    .map_err(|e| (prep.name.clone(), e))?;
+    let package_name = prep.name.clone();
+    let tx_id = mk_tx_id();
+    let inflight_lock = lpm_global::inflight_tx_lock(root, &tx_id);
+    with_exclusive_lock_async(inflight_lock, async {
+        let staged = with_exclusive_lock(root.global_tx_lock(), || {
+            prepare_upgrade_locked(root, &prep, tx_id)
+        })?;
 
-    if let Err(e) = do_install_upgrade(registry, &prep, &staged, suppress_nested_output).await {
-        return Err((prep.name.clone(), e));
-    }
-    let commands = match discover_bin_commands(&staged.install_root, &prep.name) {
-        Ok(c) => c,
-        Err(e) => return Err((prep.name.clone(), e)),
-    };
-    if commands.is_empty() {
-        return Err((
-            prep.name.clone(),
-            LpmError::Script(format!(
+        do_install_upgrade(registry, &prep, &staged, suppress_nested_output).await?;
+        let commands = discover_bin_commands(&staged.install_root, &prep.name)?;
+        if commands.is_empty() {
+            return Err(LpmError::Script(format!(
                 "package '{}' exposes no bin entries — refusing to upgrade",
                 prep.name
-            )),
-        ));
-    }
-    let marker = InstallReadyMarker::new(commands);
-    if let Err(e) = write_marker(&staged.install_root, &marker) {
-        return Err((prep.name.clone(), e));
-    }
+            )));
+        }
+        let marker = InstallReadyMarker::new(commands);
+        write_marker(&staged.install_root, &marker)?;
 
-    let output = with_exclusive_lock(root.global_tx_lock(), || {
-        commit_upgrade_locked(root, &prep, &staged)
+        with_exclusive_lock(root.global_tx_lock(), || {
+            commit_upgrade_locked(root, &prep, &staged)
+        })
     })
-    .map_err(|e| (prep.name.clone(), e))?;
-
-    Ok(output)
+    .await
+    .map_err(|e| (package_name, e))
 }
 
 // ─── Output ──────────────────────────────────────────────────────────

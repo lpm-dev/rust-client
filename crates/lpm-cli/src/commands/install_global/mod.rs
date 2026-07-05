@@ -8,7 +8,10 @@
 //!    INTENT to WAL, write `[pending.<pkg>]` to manifest with empty
 //!    `commands` (the install pipeline discovers commands at step 2),
 //!    release lock.
-//! 2. Slow work, no lock held. Self-hosted install via
+//! 2. Slow work, no global tx lock held. A tx-local in-flight lock
+//!    prevents startup recovery from treating this live install as
+//!    orphaned while still allowing unrelated global installs to
+//!    overlap their fetch/link phases. Self-hosted install via
 //!    `commands::install::run_with_options` against the per-package
 //!    install root. After install, discover commands from the
 //!    installed package's `package.json` `bin` field, then write the
@@ -35,14 +38,16 @@ mod rollback;
 pub use collision_ux::CollisionResolution;
 pub use inner::InstallGlobalOverrides;
 
-use super::global_util::discover_materialized_bin_commands;
+use super::global_util::{discover_materialized_bin_commands, mk_tx_id};
 use crate::output;
 use collision_ux::maybe_prompt_for_collisions;
 use commit::commit_locked;
 use display::{emit_post_install_blocked_warning, print_success};
 use inner::do_install;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
+use lpm_common::{
+    LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock, with_exclusive_lock_async,
+};
 use lpm_global::{InstallReadyMarker, write_marker};
 use lpm_registry::RegistryClient;
 use prepare::prepare_locked;
@@ -87,99 +92,108 @@ pub async fn run(
         ));
     }
 
-    // ─── Step 1: prepare under .tx.lock ────────────────────────────
-    let prep = with_exclusive_lock(root.global_tx_lock(), || prepare_locked(&root, &resolved))?;
+    let tx_id = mk_tx_id();
+    let inflight_lock = lpm_global::inflight_tx_lock(&root, &tx_id);
+    with_exclusive_lock_async(inflight_lock, async {
+        // ─── Step 1: prepare under .tx.lock ────────────────────────────
+        let prep = with_exclusive_lock(root.global_tx_lock(), || {
+            prepare_locked(&root, &resolved, tx_id)
+        })?;
 
-    // ─── Step 2: slow install (no lock) ────────────────────────────
-    if !json_output {
-        let spec_safe = sanitize_for_terminal(spec);
-        output::info(&format!("installing {}...", spec_safe.bold()));
-    }
-    // Step 2 failures (network, resolution, extract, link) are
-    // intentionally NOT cleaned up here: recovery's roll-back path on
-    // the next `lpm` invocation sees the uncompleted INTENT,
-    // validate_install_root returns MissingMarker, and roll-back
-    // removes the pending row + cleans the install root. Single
-    // cleanup code path, called from one place.
-    do_install(&root, &registry, &prep, json_output, &overrides).await?;
-    let commands = match discover_materialized_bin_commands(&prep.install_root, &prep.name) {
-        Ok(commands) => commands,
-        Err(e) => {
+        // ─── Step 2: slow install (no global tx lock) ──────────────────
+        if !json_output {
+            let spec_safe = sanitize_for_terminal(spec);
+            output::info(&format!("installing {}...", spec_safe.bold()));
+        }
+        // Step 2 failures (network, resolution, extract, link) are
+        // intentionally NOT cleaned up here: recovery's roll-back path on
+        // the next `lpm` invocation sees the uncompleted INTENT,
+        // validate_install_root returns MissingMarker, and roll-back
+        // removes the pending row + cleans the install root. Single
+        // cleanup code path, called from one place.
+        do_install(&root, &registry, &prep, json_output, &overrides).await?;
+        let commands = match discover_materialized_bin_commands(&prep.install_root, &prep.name) {
+            Ok(commands) => commands,
+            Err(e) => {
+                rollback_after_install_failure(&root, &prep, &e.to_string())?;
+                return Err(e);
+            }
+        };
+        if commands.is_empty() {
+            let name_safe = sanitize_for_terminal(&prep.name);
+            let reason = format!(
+                "package '{name_safe}' exposes no bin entries — `lpm install -g` is for executable tools. \
+                 Install it as a project dep with `lpm install {name_safe}` and `require()`/`import` it."
+            );
+            rollback_after_install_failure(&root, &prep, &reason)?;
+            return Err(LpmError::Script(reason));
+        }
+        let marker = InstallReadyMarker::new(commands);
+        if let Err(e) = write_marker(&prep.install_root, &marker) {
             rollback_after_install_failure(&root, &prep, &e.to_string())?;
             return Err(e);
         }
-    };
-    if commands.is_empty() {
-        let name_safe = sanitize_for_terminal(&prep.name);
-        let reason = format!(
-            "package '{name_safe}' exposes no bin entries — `lpm install -g` is for executable tools. \
-             Install it as a project dep with `lpm install {name_safe}` and `require()`/`import` it."
-        );
-        rollback_after_install_failure(&root, &prep, &reason)?;
-        return Err(LpmError::Script(reason));
-    }
-    let marker = InstallReadyMarker::new(commands);
-    if let Err(e) = write_marker(&prep.install_root, &marker) {
-        rollback_after_install_failure(&root, &prep, &e.to_string())?;
-        return Err(e);
-    }
 
-    // ─── Step 3a: TTY interactive prompt ───────────────────
-    //
-    // Runs BEFORE the commit lock. No-ops when the user already
-    // supplied `--replace-bin` / `--alias` flags, when JSON mode is
-    // set, or when stdin isn't a TTY. Otherwise inspects the current
-    // (unlocked) manifest view, finds collisions, and prompts per-
-    // collision. The returned resolution feeds `commit_locked`'s
-    // planner via the same code path as flag-driven resolution.
-    //
-    // Drift between prompt and commit is handled by the planner's
-    // residual-collision check under the tx lock — a user who took
-    // 30 seconds to pick alias names while another process landed
-    // a conflicting install sees a ResidualCollision error with the
-    // new state, prompting them to re-run.
-    let resolution = maybe_prompt_for_collisions(&root, &prep, resolution, json_output)?;
+        // ─── Step 3a: TTY interactive prompt ───────────────────
+        //
+        // Runs BEFORE the commit lock. No-ops when the user already
+        // supplied `--replace-bin` / `--alias` flags, when JSON mode is
+        // set, or when stdin isn't a TTY. Otherwise inspects the current
+        // (unlocked) manifest view, finds collisions, and prompts per-
+        // collision. The returned resolution feeds `commit_locked`'s
+        // planner via the same code path as flag-driven resolution.
+        //
+        // Drift between prompt and commit is handled by the planner's
+        // residual-collision check under the tx lock — a user who took
+        // 30 seconds to pick alias names while another process landed
+        // a conflicting install sees a ResidualCollision error with the
+        // new state, prompting them to re-run.
+        let resolution = maybe_prompt_for_collisions(&root, &prep, resolution, json_output)?;
 
-    // ─── Step 3b: validate + commit under .tx.lock ──────────────────
-    //
-    // `resolution` threads through to commit_locked so collision
-    // resolution uses marker_commands as the authority. The resolution
-    // is validated AGAINST marker_commands inside the lock (not
-    // earlier), since only the marker is the
-    // authoritative post-extract command set.
-    let active = with_exclusive_lock(root.global_tx_lock(), || {
-        commit_locked(&root, &prep, &resolution)
-    })?;
+        // ─── Step 3b: validate + commit under .tx.lock ──────────────────
+        //
+        // `resolution` threads through to commit_locked so collision
+        // resolution uses marker_commands as the authority. The resolution
+        // is validated AGAINST marker_commands inside the lock (not
+        // earlier), since only the marker is the
+        // authoritative post-extract command set.
+        let active = with_exclusive_lock(root.global_tx_lock(), || {
+            commit_locked(&root, &prep, &resolution)
+        })?;
 
-    // ─── Step 4: opportunistic tombstone sweep ─────────────
-    // Fresh installs rarely tombstone (the rollback branch does),
-    // but running a sweep post-commit means any leftover tombstones
-    // from a prior failed tx get cleared as part of the happy path —
-    // users don't have to remember to `lpm cache prune --apply`.
-    //
-    // `try_*` (non-blocking): another global command may be running in
-    // parallel; we'd rather move on than wait. Errors are logged and
-    // swallowed — the tx already committed, and the sweep retries on
-    // next run.
-    crate::commands::global::run_opportunistic_sweep(&root);
+        // ─── Step 4: opportunistic tombstone sweep ─────────────
+        // Fresh installs rarely tombstone (the rollback branch does),
+        // but running a sweep post-commit means any leftover tombstones
+        // from a prior failed tx get cleared as part of the happy path —
+        // users don't have to remember to `lpm cache prune --apply`.
+        //
+        // `try_*` (non-blocking): another global command may be running in
+        // parallel; we'd rather move on than wait. Errors are logged and
+        // swallowed — the tx already committed, and the sweep retries on
+        // next run.
+        crate::commands::global::run_opportunistic_sweep(&root);
 
-    // ─── Step 5: PATH onboarding hint ──────────────────────
-    // Idempotent: at most one banner per host. The helper handles
-    // marker stickiness and JSON-mode silence internally; we just
-    // call it post-success and pass the report into print_success
-    // so JSON consumers can see it as structured data.
-    let hint = crate::path_onboarding::maybe_show_path_hint(&root, json_output);
+        // ─── Step 5: PATH onboarding hint ──────────────────────
+        // Idempotent: at most one banner per host. The helper handles
+        // marker stickiness and JSON-mode silence internally; we just
+        // call it post-success and pass the report into print_success
+        // so JSON consumers can see it as structured data.
+        let hint = crate::path_onboarding::maybe_show_path_hint(&root, json_output);
 
-    // ─── Output ────────────────────────────────────────────────────
-    print_success(&active, &hint, json_output);
+        // ─── Output ────────────────────────────────────────────────────
+        print_success(&active, &hint, json_output);
 
-    // ─── Step 6: post-install blocked-scripts warning ──────
-    // Mirrors the project-level post-install security summary
-    // (suppressed inside the inner pipeline via `no_security_summary:
-    // true`). Emits AFTER print_success so the happy-path "Installed
-    // eslint@9.24.0" line lands first, then points at
-    // `lpm approve-scripts --global`.
-    emit_post_install_blocked_warning(&root, &prep, json_output);
+        // ─── Step 6: post-install blocked-scripts warning ──────
+        // Mirrors the project-level post-install security summary
+        // (suppressed inside the inner pipeline via `no_security_summary:
+        // true`). Emits AFTER print_success so the happy-path "Installed
+        // eslint@9.24.0" line lands first, then points at
+        // `lpm approve-scripts --global`.
+        emit_post_install_blocked_warning(&root, &prep, json_output);
+
+        Ok(())
+    })
+    .await?;
 
     Ok(())
 }

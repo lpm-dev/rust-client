@@ -156,6 +156,62 @@ fn fresh_install_with_partial_root_rolls_back() {
     assert!(!install_root.exists());
 }
 
+#[test]
+fn recovery_defers_partial_install_while_inflight_tx_lock_is_held() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+
+    let tx_id = "tx-live";
+    let install_root = root.install_root_for("pkg", "1.0.0");
+    std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+    std::fs::write(install_root.join("package.json"), "{}").unwrap();
+    std::fs::write(install_root.join("lpm.lock"), b"x").unwrap();
+
+    let mut manifest = GlobalManifest::default();
+    manifest.pending.insert(
+        "pkg".into(),
+        pending_install("pkg", "installs/pkg@1.0.0", &["pkg"]),
+    );
+    write_for(&root, &manifest).unwrap();
+
+    let mut w = WalWriter::open(root.global_wal()).unwrap();
+    w.append(&intent_install(tx_id, "pkg", &install_root, &["pkg"]))
+        .unwrap();
+    drop(w);
+
+    let lock_path = crate::inflight_tx_lock(&root, tx_id);
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+    let lock_thread = std::thread::spawn(move || {
+        lpm_common::with_exclusive_lock(&lock_path, || {
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<(), lpm_common::LpmError>(())
+        })
+    });
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("inflight lock was not acquired");
+
+    let report = recover(&root).unwrap();
+
+    release_tx.send(()).unwrap();
+    lock_thread.join().unwrap().unwrap();
+
+    assert_eq!(report.reconciled.len(), 1);
+    assert!(matches!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::InFlight { .. }
+    ));
+
+    let final_manifest = read_for(&root).unwrap();
+    assert!(final_manifest.pending.contains_key("pkg"));
+    assert!(
+        install_root.exists(),
+        "recovery must not delete a partial root owned by a live install"
+    );
+}
+
 // ─── Roll-forward paths ────────────────────────────────────────
 
 #[test]

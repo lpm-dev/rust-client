@@ -1,4 +1,3 @@
-use super::super::global_util::mk_tx_id;
 use super::resolve::ResolvedSpec;
 use chrono::Utc;
 use lpm_common::{LpmError, LpmRoot};
@@ -23,6 +22,7 @@ pub(super) struct PrepResult {
 pub(super) fn prepare_locked(
     root: &LpmRoot,
     resolved: &ResolvedSpec,
+    tx_id: String,
 ) -> Result<PrepResult, LpmError> {
     let mut manifest = read_for(root)?;
 
@@ -54,8 +54,6 @@ pub(super) fn prepare_locked(
     // on POSIX; load-bearing for Windows (and for any scenario where
     // third-party tooling does not honour `\\?\` long-path prefixes).
     lpm_common::check_install_path_budget(&install_root)?;
-
-    let tx_id = mk_tx_id();
 
     // Write Intent + pending atomically: Intent first (fsynced), then
     // pending row. Crash between the two = recovery sees Intent without

@@ -1,4 +1,3 @@
-use super::super::global_util::mk_tx_id;
 use chrono::Utc;
 use lpm_common::{LpmError, LpmRoot};
 use lpm_global::{
@@ -36,6 +35,7 @@ pub(super) struct StagedUpgrade {
 pub(super) fn prepare_upgrade_locked(
     root: &LpmRoot,
     prep: &UpgradePrep,
+    tx_id: String,
 ) -> Result<StagedUpgrade, LpmError> {
     let mut manifest = read_for(root)?;
     // Re-check active state under the lock (prior fetch was outside).
@@ -79,8 +79,6 @@ pub(super) fn prepare_upgrade_locked(
     // errors when the new install root would push us over the
     // 247-char budget.
     lpm_common::check_install_path_budget(&install_root)?;
-
-    let tx_id = mk_tx_id();
 
     // Write Intent FIRST, then pending row. Crash between the two →
     // recovery sees Intent without pending → Case C orphan cleanup.
