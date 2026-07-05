@@ -8,7 +8,9 @@ use crate::{
 
 use super::args::{
     Cli, Commands, DoctorAction, InitPackageTargetCli, LinkerCli, OutdatedRegistryScope,
-    ReleaseCommands, ReleaseSelectionArgs, SetupAction, StageCommands,
+    ReleaseCommands, ReleaseSelectionArgs, SetupAction, StageCommands, build as build_args,
+    lifecycle as lifecycle_args, network as network_args, registry as registry_args,
+    release as release_args, security as security_args,
 };
 use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
 use super::helpers::{
@@ -182,8 +184,8 @@ async fn async_main() -> Result<()> {
         std::process::exit(2);
     };
 
-    if let Commands::InternalTsTransform { persistent } = &command {
-        let result = if *persistent {
+    if let Commands::InternalTsTransform(args) = &command {
+        let result = if args.persistent {
             lpm_runner::ts_transform::run_persistent_stdio()
         } else {
             lpm_runner::ts_transform::run_stdio()
@@ -390,7 +392,7 @@ async fn async_main() -> Result<()> {
     // already explained why it didn't proceed. Suppressing here keeps the
     // suppression scoped to this invocation only; the next command still
     // sees the banner.
-    let is_self_update_command = matches!(command, Commands::SelfUpdate { .. });
+    let is_self_update_command = matches!(command, Commands::SelfUpdate(_));
 
     // Wrap the entire dispatch in an async block so every
     // `?` inside a match arm body propagates to THIS block's
@@ -405,27 +407,35 @@ async fn async_main() -> Result<()> {
     // no remaining defense-in-depth.
     let result: Result<(), lpm_common::LpmError> = async {
     match command {
-        Commands::Info {
-            package,
-            package_version,
-        } => {
+        Commands::Info(args) => {
+            let registry_args::InfoArgs {
+                package,
+                package_version,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::info::run(&client, &cwd, &package, package_version.as_deref(), cli.json)
                 .await
         }
-        Commands::Search { query, limit } => {
+        Commands::Search(args) => {
+            let registry_args::SearchArgs {
+                query,
+                limit,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::search::run(&client, &cwd, &query, limit, cli.json).await
         }
-        Commands::Quality { package } => commands::quality::run(&client, &package, cli.json).await,
+        Commands::Quality(args) => {
+            commands::quality::run(&client, &args.package, cli.json).await
+        }
         Commands::Whoami => commands::whoami::run(&client, cli.json).await,
         Commands::Health => commands::health::run(&client, registry_url, cli.json).await,
-        Commands::Download {
-            package,
-            package_version,
-            output,
-            allow_unverified,
-        } => {
+        Commands::Download(args) => {
+            let registry_args::DownloadArgs {
+                package,
+                package_version,
+                output,
+                allow_unverified,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::download::run(
                 &client,
@@ -438,68 +448,78 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Fetch { platform } => {
+        Commands::Fetch(args) => {
+            let lifecycle_args::FetchArgs {
+                platform,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::fetch::run(&client, &cwd, platform.as_deref(), cli.json).await
         }
-        Commands::Tidy { fix } => {
+        Commands::Tidy(args) => {
+            let lifecycle_args::TidyArgs {
+                fix,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::tidy::run(&client, &cwd, fix, cli.json).await
         }
-        Commands::Resolve { packages } => {
+        Commands::Resolve(args) => {
+            let lifecycle_args::ResolveArgs {
+                packages,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::resolve::run(&client, &cwd, &packages, cli.json).await
         }
-        Commands::Install {
-            packages,
-            save_dev,
-            omit,
-            prod,
-            offline,
-            frozen_lockfile,
-            no_frozen_lockfile,
-            force,
-            allow_new,
-            strict_integrity,
-            strict_peer_dependencies,
-            no_strict_peer_dependencies,
-            min_release_age,
-            min_release_age_exclude,
-            ignore_provenance_drift,
-            ignore_provenance_drift_all,
-            unverified_provenance,
-            unverified_provenance_all,
-            linker,
-            no_skills,
-            no_editor_setup,
-            no_security_summary,
-            timing,
-            auto_build,
-            no_engine_strict,
-            audit_after_install,
-            no_audit_after_install,
-            filter,
-            filter_prod,
-            changed_files_ignore_pattern,
-            test_pattern,
-            workspace_root,
-            fail_if_no_match,
-            yes,
-            exact,
-            tilde,
-            save_prefix,
-            catalog,
-            global,
-            replace_bin,
-            alias,
-            policy,
-            yolo,
-            triage_alias,
-            advisor,
-            strict_sandbox,
-            paranoid,
-            no_sandbox,
-        } => {
+        Commands::Install(args) => {
+            let lifecycle_args::InstallArgs {
+                packages,
+                save_dev,
+                omit,
+                prod,
+                offline,
+                frozen_lockfile,
+                no_frozen_lockfile,
+                force,
+                allow_new,
+                strict_integrity,
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                min_release_age,
+                min_release_age_exclude,
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+                unverified_provenance,
+                unverified_provenance_all,
+                linker,
+                no_skills,
+                no_editor_setup,
+                no_security_summary,
+                timing,
+                auto_build,
+                no_engine_strict,
+                audit_after_install,
+                no_audit_after_install,
+                filter,
+                filter_prod,
+                changed_files_ignore_pattern,
+                test_pattern,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                exact,
+                tilde,
+                save_prefix,
+                catalog,
+                global,
+                replace_bin,
+                alias,
+                policy,
+                yolo,
+                triage_alias,
+                advisor,
+                strict_sandbox,
+                paranoid,
+                no_sandbox,
+            } = args;
             let cli_strict_peer_dependencies =
                 match (strict_peer_dependencies, no_strict_peer_dependencies) {
                     (true, false) => Some(true),
@@ -955,7 +975,8 @@ async fn async_main() -> Result<()> {
                 // resolution — so we ALWAYS prefer it for workspace mode.
                 // For pure standalone projects with NO workspace, the
                 // legacy `run_add_packages` is still preferred because it
-                // handles per-package Swift (SE-0292) routing, which                 // intentionally defers from the workspace path.
+                // handles per-package Swift (SE-0292) routing, which
+                // intentionally defers from the workspace path.
                 let workspace = lpm_workspace::discover_workspace(&cwd).ok().flatten();
                 if workspace.is_some() {
                     commands::install::run_install_filtered_add(
@@ -1020,17 +1041,18 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
-        Commands::Uninstall {
-            packages,
-            filter,
-            filter_prod,
-            changed_files_ignore_pattern,
-            test_pattern,
-            workspace_root,
-            fail_if_no_match,
-            yes,
-            global,
-        } => {
+        Commands::Uninstall(args) => {
+            let lifecycle_args::UninstallArgs {
+                packages,
+                filter,
+                filter_prod,
+                changed_files_ignore_pattern,
+                test_pattern,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+            } = args;
             // `lpm uninstall -g <pkg>` routes to the
             // global uninstall pipeline. Project flags are mutually
             // exclusive with -g — no `--filter` / `-w` /
@@ -1081,20 +1103,21 @@ async fn async_main() -> Result<()> {
                 .await
             }
         }
-        Commands::Add {
-            package,
-            path,
-            yes,
-            force,
-            dry_run,
-            no_install_deps,
-            no_skills,
-            no_editor_setup,
-            pm,
-            alias,
-            target,
-            no_engine_strict,
-        } => {
+        Commands::Add(args) => {
+            let lifecycle_args::AddArgs {
+                package,
+                path,
+                yes,
+                force,
+                dry_run,
+                no_install_deps,
+                no_skills,
+                no_editor_setup,
+                pm,
+                alias,
+                target,
+                no_engine_strict,
+            } = args;
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
@@ -1129,21 +1152,22 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Publish {
-            dry_run,
-            check,
-            yes,
-            provenance,
-            min_score,
-            allow_secrets,
-            npm,
-            lpm,
-            github,
-            gitlab,
-            publish_registry,
-            no_provenance,
-            provenance_file,
-        } => {
+        Commands::Publish(args) => {
+            let registry_args::PublishArgs {
+                dry_run,
+                check,
+                yes,
+                provenance,
+                min_score,
+                allow_secrets,
+                npm,
+                lpm,
+                github,
+                gitlab,
+                publish_registry,
+                no_provenance,
+                provenance_file,
+            } = args;
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
@@ -1174,13 +1198,14 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Version {
-            bump,
-            dry_run,
-            no_git_tag_version,
-            tag_prefix,
-            message,
-        } => {
+        Commands::Version(args) => {
+            let registry_args::VersionArgs {
+                bump,
+                dry_run,
+                no_git_tag_version,
+                tag_prefix,
+                message,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let message = commands::version::default_message(message);
             commands::version::run(
@@ -1193,7 +1218,8 @@ async fn async_main() -> Result<()> {
                 &message,
             )
         }
-        Commands::Release { command } => {
+        Commands::Release(args) => {
+            let release_args::ReleaseArgs { command } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             match command {
                 ReleaseCommands::Plan { selection, bump } => {
@@ -1247,7 +1273,8 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
-        Commands::Stage { command } => {
+        Commands::Stage(args) => {
+            let registry_args::StageArgs { command } = args;
             if argv_has_global_registry_flag(std::env::args_os()) {
                 return Err(lpm_common::LpmError::Registry(
                     "`lpm stage` uses npm registries; use --npm-registry instead of global --registry.".into(),
@@ -1358,13 +1385,14 @@ async fn async_main() -> Result<()> {
                 }
             }
         }
-        Commands::Login {
-            npm,
-            github,
-            gitlab,
-            login_registry,
-            token,
-        } => {
+        Commands::Login(args) => {
+            let registry_args::LoginArgs {
+                npm,
+                github,
+                gitlab,
+                login_registry,
+                token,
+            } = args;
             if npm {
                 commands::third_party_login::run_npm(token, cli.json).await
             } else if github {
@@ -1382,14 +1410,15 @@ async fn async_main() -> Result<()> {
                 commands::login::run(registry, cli.json).await
             }
         }
-        Commands::Logout {
-            revoke,
-            npm,
-            github,
-            gitlab,
-            all,
-            logout_registry,
-        } => {
+        Commands::Logout(args) => {
+            let registry_args::LogoutArgs {
+                revoke,
+                npm,
+                github,
+                gitlab,
+                all,
+                logout_registry,
+            } = args;
             let has_specific = npm || github || gitlab || logout_registry.is_some();
 
             if all || (!has_specific) {
@@ -1449,7 +1478,7 @@ async fn async_main() -> Result<()> {
 
             Ok(())
         }
-        Commands::Setup { action } => match action {
+        Commands::Setup(args) => match args.action {
             SetupAction::Ci {
                 target,
                 env,
@@ -1488,7 +1517,10 @@ async fn async_main() -> Result<()> {
             }
         },
         Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
-        Commands::Outdated { registry_only } => {
+        Commands::Outdated(args) => {
+            let lifecycle_args::OutdatedArgs {
+                registry_only,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::outdated::run(
                 &client,
@@ -1498,13 +1530,14 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Upgrade {
-            packages,
-            major,
-            dry_run,
-            interactive,
-            yes,
-        } => {
+        Commands::Upgrade(args) => {
+            let lifecycle_args::UpgradeArgs {
+                packages,
+                major,
+                dry_run,
+                interactive,
+                yes,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::upgrade::run(
                 &client,
@@ -1518,14 +1551,15 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Init {
-            yes,
-            lpm,
-            npm,
-            name,
-            owner,
-            no_agents,
-        } => {
+        Commands::Init(args) => {
+            let lifecycle_args::InitArgs {
+                yes,
+                lpm,
+                npm,
+                name,
+                owner,
+                no_agents,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let target = if lpm {
                 Some(InitPackageTargetCli::Lpm)
@@ -1548,12 +1582,13 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Config {
-            action,
-            key,
-            value,
-            set,
-        } => {
+        Commands::Config(args) => {
+            let security_args::ConfigArgs {
+                action,
+                key,
+                value,
+                set,
+            } = args;
             commands::config::run(
                 action.as_deref(),
                 key.as_deref(),
@@ -1563,18 +1598,22 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Policy { action } => {
+        Commands::Policy(args) => {
+            let security_args::PolicyArgs {
+                action,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::policy::run(action, &cwd, cli.json).await
         }
-        Commands::Security { action } => commands::security::run(&action, cli.json).await,
-        Commands::Cache {
-            action,
-            subcategory,
-            apply,
-            max_age,
-            project,
-        } => {
+        Commands::Security(args) => commands::security::run(&args.action, cli.json).await,
+        Commands::Cache(args) => {
+            let lifecycle_args::CacheArgs {
+                action,
+                subcategory,
+                apply,
+                max_age,
+                project,
+            } = args;
             commands::cache::run(
                 &action,
                 subcategory.as_deref(),
@@ -1587,35 +1626,54 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Store { action, deep, fix } => {
+        Commands::Store(args) => {
+            let lifecycle_args::StoreArgs {
+                action,
+                deep,
+                fix,
+            } = args;
             commands::store::run(&action, deep, fix, cli.json).await
         }
-        Commands::Catalog { action } => {
+        Commands::Catalog(args) => {
+            let lifecycle_args::CatalogArgs {
+                action,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::catalog::run(&cwd, action, cli.json)
         }
-        Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
-        Commands::Trust { action } => {
+        Commands::Global(args) => commands::global::run(&client, args.action, cli.json).await,
+        Commands::Trust(args) => {
+            let security_args::TrustArgs {
+                action,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::trust::run(&action, &cwd, cli.json).await
         }
         Commands::Pool => commands::pool::run(&client, cli.json).await,
-        Commands::Skills { action, package } => {
+        Commands::Skills(args) => {
+            let lifecycle_args::SkillsArgs {
+                action,
+                package,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::skills::run(&client, &action, package.as_deref(), &cwd, cli.json).await
         }
-        Commands::Remove { package } => {
+        Commands::Remove(args) => {
+            let lifecycle_args::RemoveArgs {
+                package,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::remove::run(&cwd, &package, cli.json).await
         }
-        Commands::Audit {
-            action,
-            level,
-            fail_on,
-            secrets,
-            fix,
-            dry_run,
-        } => {
+        Commands::Audit(args) => {
+            let security_args::AuditArgs {
+                action,
+                level,
+                fail_on,
+                secrets,
+                fix,
+                dry_run,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if let Some(commands::audit::AuditCmd::Fix { dry_run }) = action.as_ref() {
                 if fix {
@@ -1656,13 +1714,14 @@ async fn async_main() -> Result<()> {
                 .await
             }
         }
-        Commands::Query {
-            selector,
-            count,
-            query_verbose,
-            assert_none,
-            format,
-        } => {
+        Commands::Query(args) => {
+            let security_args::QueryArgs {
+                selector,
+                count,
+                query_verbose,
+                assert_none,
+                format,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::query::run(
                 &client,
@@ -1676,26 +1735,31 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Licenses { fail_on, deny } => {
+        Commands::Licenses(args) => {
+            let security_args::LicensesArgs {
+                fail_on,
+                deny,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::licenses::run(&cwd, &fail_on, &deny, cli.json)
         }
-        Commands::Rebuild {
-            packages,
-            all,
-            dry_run,
-            force,
-            timeout,
-            deny_all,
-            policy,
-            yolo,
-            triage_alias,
-            no_sandbox,
-            strict_sandbox,
-            paranoid,
-            sandbox_log,
-            no_engine_strict,
-        } => {
+        Commands::Rebuild(args) => {
+            let lifecycle_args::RebuildArgs {
+                packages,
+                all,
+                dry_run,
+                force,
+                timeout,
+                deny_all,
+                policy,
+                yolo,
+                triage_alias,
+                no_sandbox,
+                strict_sandbox,
+                paranoid,
+                sandbox_log,
+                no_engine_strict,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // engines.* enforcement: rebuild executes lifecycle scripts
             // under the project's engine constraints, so the gate runs
@@ -1770,12 +1834,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Doctor {
-            all,
-            fix,
-            yes,
-            action,
-        } => match action {
+        Commands::Doctor(args) => match args.action {
             Some(DoctorAction::List { code, category }) => {
                 commands::doctor::list(cli.json, code.as_deref(), category.as_deref())
             }
@@ -1786,53 +1845,65 @@ async fn async_main() -> Result<()> {
                     registry_url,
                     &cwd,
                     cli.json,
-                    all,
-                    fix || yes,
-                    yes,
+                    args.all,
+                    args.fix || args.yes,
+                    args.yes,
                 )
                 .await
             }
         },
-        Commands::SwiftRegistry { force } => {
+        Commands::SwiftRegistry(args) => {
+            let registry_args::SwiftRegistryArgs {
+                force,
+            } = args;
             commands::swift_registry::run(registry_url, cli.json, force).await
         },
-        Commands::Mcp { action, name } => {
+        Commands::Mcp(args) => {
+            let security_args::McpArgs {
+                action,
+                name,
+            } = args;
             commands::mcp::run(&action, name.as_deref(), cli.json).await
         },
-        Commands::Use {
-            args,
-            list,
-            pin,
-            remove,
-        } => {
+        Commands::Use(args) => {
+            let lifecycle_args::UseArgs {
+                args,
+                list,
+                pin,
+                remove,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::r#use::run_cli(&args, list, pin, remove, &cwd, cli.json).await
         },
-        Commands::Env { extra: _ } => {
+        Commands::Env(args) => {
+            let network_args::EnvArgs {
+                extra: _,
+            } = args;
             // Subcommand args are re-parsed from raw argv inside run().
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::env::run(&client, &cwd, cli.json).await
         },
-        Commands::Run {
-            scripts,
-            env,
-            parallel,
-            continue_on_error,
-            workspace_concurrency,
-            stream,
-            all,
-            filter,
-            filter_prod,
-            fail_if_no_match,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            no_cache,
-            no_env_check,
-            watch,
-            args,
-        } => {
+        Commands::Run(args) => {
+            let network_args::RunArgs {
+                scripts,
+                env,
+                parallel,
+                continue_on_error,
+                workspace_concurrency,
+                stream,
+                all,
+                filter,
+                filter_prod,
+                fail_if_no_match,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                no_cache,
+                no_env_check,
+                watch,
+                args,
+            } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let workspace_mode = all || !filter.is_empty() || !filter_prod.is_empty() || affected;
@@ -1894,23 +1965,25 @@ async fn async_main() -> Result<()> {
                 .await
             }
         }
-        Commands::Exec {
-            env,
-            no_env_check,
-            command,
-            args,
-        } => {
+        Commands::Exec(args) => {
+            let network_args::ExecArgs {
+                env,
+                no_env_check,
+                command,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::exec(&cwd, &command, &args, env.as_deref(), no_env_check).await
         }
-        Commands::RunFile {
-            env,
-            file,
-            no_env_check,
-            plain_node,
-            watch,
-            args,
-        } => {
+        Commands::RunFile(args) => {
+            let network_args::RunFileArgs {
+                env,
+                file,
+                no_env_check,
+                plain_node,
+                watch,
+                args,
+            } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
@@ -1935,14 +2008,15 @@ async fn async_main() -> Result<()> {
                 .await
             }
         }
-        Commands::Dlx {
-            package,
-            refresh,
-            allow_new,
-            min_release_age,
-            min_release_age_exclude,
-            args,
-        } => {
+        Commands::Dlx(args) => {
+            let network_args::DlxArgs {
+                package,
+                refresh,
+                allow_new,
+                min_release_age,
+                min_release_age_exclude,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let min_release_age_override = match min_release_age.as_deref() {
                 Some(s) => Some(release_age_config::parse_duration(s)?),
@@ -1962,14 +2036,15 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Filter {
-            exprs,
-            filter_prod,
-            changed_files_ignore_pattern,
-            test_pattern,
-            explain,
-            fail_if_no_match,
-        } => {
+        Commands::Filter(args) => {
+            let lifecycle_args::FilterArgs {
+                exprs,
+                filter_prod,
+                changed_files_ignore_pattern,
+                test_pattern,
+                explain,
+                fail_if_no_match,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::filter::run(
                 &cwd,
@@ -1983,18 +2058,19 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Deploy {
-            output,
-            filter,
-            filter_prod,
-            changed_files_ignore_pattern,
-            test_pattern,
-            force,
-            prod,
-            dev,
-            no_optional,
-            dry_run,
-        } => {
+        Commands::Deploy(args) => {
+            let lifecycle_args::DeployArgs {
+                output,
+                filter,
+                filter_prod,
+                changed_files_ignore_pattern,
+                test_pattern,
+                force,
+                prod,
+                dev,
+                no_optional,
+                dry_run,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let output_path = std::path::PathBuf::from(&output);
             commands::deploy::run(
@@ -2014,14 +2090,15 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::ApproveScripts {
-            package,
-            yes,
-            list,
-            global,
-            group,
-            dry_run,
-        } => {
+        Commands::ApproveScripts(args) => {
+            let security_args::ApproveScriptsArgs {
+                package,
+                yes,
+                list,
+                global,
+                group,
+                dry_run,
+            } = args;
             if global {
                 // global-scoped approve-scripts reads the
                 // aggregate across every `lpm install -g` install root
@@ -2060,45 +2137,58 @@ async fn async_main() -> Result<()> {
                 .await
             }
         }
-        Commands::Patch { key } => {
+        Commands::Patch(args) => {
+            let lifecycle_args::PatchArgs {
+                key,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::patch::run_patch(&cwd, &key, cli.json).await
         }
-        Commands::PatchCommit { staging_dir } => {
+        Commands::PatchCommit(args) => {
+            let lifecycle_args::PatchCommitArgs {
+                staging_dir,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let staging = std::path::PathBuf::from(staging_dir);
             commands::patch::run_patch_commit(&cwd, &staging, cli.json).await
         }
-        Commands::PatchRemove {
-            selectors,
-            dry_run,
-            keep_file,
-        } => {
+        Commands::PatchRemove(args) => {
+            let lifecycle_args::PatchRemoveArgs {
+                selectors,
+                dry_run,
+                keep_file,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::patch::run_patch_remove(&cwd, &selectors, dry_run, keep_file, cli.json).await
         }
-        Commands::Sbom {
-            format,
-            output,
-            registry_metadata,
-        } => {
+        Commands::Sbom(args) => {
+            let security_args::SbomArgs {
+                format,
+                output,
+                registry_metadata,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::sbom::run(&client, &cwd, format, output.as_deref(), registry_metadata).await
         }
-        Commands::Plugin { action, name } => {
+        Commands::Plugin(args) => {
+            let build_args::PluginArgs {
+                action,
+                name,
+            } = args;
             commands::plugin::run(&action, name.as_deref(), cli.json).await
         }
-        Commands::Lint {
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            args,
-        } => {
+        Commands::Lint(args) => {
+            let build_args::LintArgs {
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
@@ -2123,18 +2213,19 @@ async fn async_main() -> Result<()> {
                 commands::tools::lint(&cwd, &args, cli.json).await
             }
         }
-        Commands::Fmt {
-            check,
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            args,
-        } => {
+        Commands::Fmt(args) => {
+            let build_args::FmtArgs {
+                check,
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
@@ -2159,18 +2250,19 @@ async fn async_main() -> Result<()> {
                 commands::tools::fmt(&cwd, &args, check, cli.json).await
             }
         }
-        Commands::Check {
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            engine,
-            args,
-        } => {
+        Commands::Check(args) => {
+            let build_args::CheckArgs {
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                engine,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
@@ -2195,24 +2287,25 @@ async fn async_main() -> Result<()> {
                 commands::tools::check(&cwd, &args, engine, cli.json).await
             }
         }
-        Commands::Bundle {
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            entry,
-            out_dir,
-            config,
-            format,
-            platform,
-            minify,
-            sourcemap,
-            args,
-        } => {
+        Commands::Bundle(args) => {
+            let build_args::BundleArgs {
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                entry,
+                out_dir,
+                config,
+                format,
+                platform,
+                minify,
+                sourcemap,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             let options = commands::bundle::BundleOptions {
@@ -2240,27 +2333,28 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Pack {
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            entry,
-            out_dir,
-            config,
-            tsconfig,
-            target,
-            format,
-            platform,
-            dts,
-            minify,
-            sourcemap,
-            args,
-        } => {
+        Commands::Pack(args) => {
+            let build_args::PackArgs {
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                entry,
+                out_dir,
+                config,
+                tsconfig,
+                target,
+                format,
+                platform,
+                dts,
+                minify,
+                sourcemap,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let options = commands::pack::PackOptions {
                 entry,
@@ -2290,18 +2384,19 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Test {
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            workspace_concurrency,
-            args,
-        } => {
+        Commands::Test(args) => {
+            let build_args::TestArgs {
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                workspace_concurrency,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             commands::tools::dispatch_test_or_bench(
@@ -2321,18 +2416,19 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Bench {
-            all,
-            filter,
-            filter_prod,
-            affected,
-            base,
-            changed_files_ignore_pattern,
-            test_pattern,
-            fail_if_no_match,
-            workspace_concurrency,
-            args,
-        } => {
+        Commands::Bench(args) => {
+            let build_args::BenchArgs {
+                all,
+                filter,
+                filter_prod,
+                affected,
+                base,
+                changed_files_ignore_pattern,
+                test_pattern,
+                fail_if_no_match,
+                workspace_concurrency,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             commands::tools::dispatch_test_or_bench(
@@ -2352,36 +2448,37 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Ci {
-            omit,
-            prod,
-            offline,
-            allow_new,
-            strict_integrity,
-            strict_peer_dependencies,
-            no_strict_peer_dependencies,
-            min_release_age,
-            min_release_age_exclude,
-            ignore_provenance_drift,
-            ignore_provenance_drift_all,
-            unverified_provenance,
-            unverified_provenance_all,
-            linker,
-            no_skills,
-            no_editor_setup,
-            no_security_summary,
-            auto_build,
-            no_engine_strict,
-            audit_after_install,
-            no_audit_after_install,
-            policy,
-            yolo,
-            triage_alias,
-            advisor,
-            strict_sandbox,
-            paranoid,
-            no_sandbox,
-        } => {
+        Commands::Ci(args) => {
+            let build_args::CiArgs {
+                omit,
+                prod,
+                offline,
+                allow_new,
+                strict_integrity,
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                min_release_age,
+                min_release_age_exclude,
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+                unverified_provenance,
+                unverified_provenance_all,
+                linker,
+                no_skills,
+                no_editor_setup,
+                no_security_summary,
+                auto_build,
+                no_engine_strict,
+                audit_after_install,
+                no_audit_after_install,
+                policy,
+                yolo,
+                triage_alias,
+                advisor,
+                strict_sandbox,
+                paranoid,
+                no_sandbox,
+            } = args;
             let cli_strict_peer_dependencies =
                 match (strict_peer_dependencies, no_strict_peer_dependencies) {
                     (true, false) => Some(true),
@@ -2539,29 +2636,30 @@ async fn async_main() -> Result<()> {
             commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
                 .run_after_successful_install(&cwd, cli.json)
         }
-        Commands::Dev {
-            https,
-            tunnel,
-            network,
-            port,
-            host,
-            domain,
-            env,
-            no_open,
-            no_install,
-            no_tunnel,
-            no_https,
-            no_env_check,
-            tunnel_auth,
-            quiet,
-            dashboard,
-            no_dashboard,
-            no_inspect,
-            inspect_port,
-            yes,
-            allow_ca_bootstrap,
-            args,
-        } => {
+        Commands::Dev(args) => {
+            let build_args::DevArgs {
+                https,
+                tunnel,
+                network,
+                port,
+                host,
+                domain,
+                env,
+                no_open,
+                no_install,
+                no_tunnel,
+                no_https,
+                no_env_check,
+                tunnel_auth,
+                quiet,
+                dashboard,
+                no_dashboard,
+                no_inspect,
+                inspect_port,
+                yes,
+                allow_ca_bootstrap,
+                args,
+            } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
 
@@ -2632,14 +2730,15 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Cert {
-            action,
-            host,
-            project,
-            keep_old_trusted,
-            fail_on_missing,
-            dry_run,
-        } => {
+        Commands::Cert(args) => {
+            let security_args::CertArgs {
+                action,
+                host,
+                project,
+                keep_old_trusted,
+                fail_on_missing,
+                dry_run,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::cert::run(
                 &action,
@@ -2655,16 +2754,17 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Graph {
-            package,
-            format,
-            why,
-            depth,
-            filter,
-            prod,
-            dev,
-            no_open,
-        } => {
+        Commands::Graph(args) => {
+            let lifecycle_args::GraphArgs {
+                package,
+                format,
+                why,
+                depth,
+                filter,
+                prod,
+                dev,
+                no_open,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::graph::run(
                 &cwd,
@@ -2680,7 +2780,10 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Why { package } => {
+        Commands::Why(args) => {
+            let lifecycle_args::WhyArgs {
+                package,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::graph::run(
                 &cwd,
@@ -2696,27 +2799,29 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Ports {
-            action,
-            target,
-            all,
-            yes,
-            pid,
-        } => {
+        Commands::Ports(args) => {
+            let network_args::PortsArgs {
+                action,
+                target,
+                all,
+                yes,
+                pid,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::ports::run(&action, target.as_deref(), &cwd, cli.json, all, yes, pid).await
         }
-        Commands::Hosts { action, yes } => commands::hosts::run(&action, cli.json, yes),
-        Commands::Proxy {
-            action,
-            detach,
-            privileged_ports,
-            replace,
-            http_port,
-            http_redirect_port,
-            tls_port,
-            forwarder_config,
-        } => {
+        Commands::Hosts(args) => commands::hosts::run(&args.action, cli.json, args.yes),
+        Commands::Proxy(args) => {
+            let network_args::ProxyArgs {
+                action,
+                detach,
+                privileged_ports,
+                replace,
+                http_port,
+                http_redirect_port,
+                tls_port,
+                forwarder_config,
+            } = args;
             let project_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::proxy::run(commands::proxy::ProxyRunOptions {
                 action: &action,
@@ -2732,22 +2837,23 @@ async fn async_main() -> Result<()> {
             })
             .await
         }
-        Commands::InternalHostsFile {
-            action,
-            block_id,
-            hosts,
-        } => commands::hosts::run_internal_hosts_file(&action, block_id.as_deref(), &hosts),
-        Commands::Tunnel {
-            action,
-            domain,
-            org,
-            tunnel_auth,
-            auto_ack,
-            session,
-            no_inspect,
-            inspect_port,
-            args,
-        } => {
+        Commands::InternalHostsFile(args) => commands::hosts::run_internal_hosts_file(
+            &args.action,
+            args.block_id.as_deref(),
+            &args.hosts,
+        ),
+        Commands::Tunnel(args) => {
+            let network_args::TunnelArgs {
+                action,
+                domain,
+                org,
+                tunnel_auth,
+                auto_ack,
+                session,
+                no_inspect,
+                inspect_port,
+                args,
+            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
@@ -2787,17 +2893,18 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Migrate {
-            skip_verify,
-            no_npmrc,
-            no_ci,
-            ci,
-            no_install,
-            dry_run,
-            force,
-            rollback,
-            yes: _yes,
-        } => {
+        Commands::Migrate(args) => {
+            let lifecycle_args::MigrateArgs {
+                skip_verify,
+                no_npmrc,
+                no_ci,
+                ci,
+                no_install,
+                dry_run,
+                force,
+                rollback,
+                yes: _yes,
+            } = args;
             // `-y` is reserved (non-interactive flag) and intentionally
             // does NOT imply `--force`. The migrate flow has no
             // interactive prompts today; if the user wants to clobber
@@ -2818,13 +2925,16 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Vault { action } => commands::vault::run(&action, cli.json).await,
-        Commands::SelfUpdate { refresh } => commands::self_update::run(cli.json, refresh).await,
-        Commands::Completions { shell } => {
+        Commands::Vault(args) => commands::vault::run(&args.action, cli.json).await,
+        Commands::SelfUpdate(args) => commands::self_update::run(cli.json, args.refresh).await,
+        Commands::Completions(args) => {
+            let build_args::CompletionsArgs {
+                shell,
+            } = args;
             commands::completions::run(shell);
             Ok(())
         }
-        Commands::Schema { kind, out } => commands::schema::run(&kind, out.as_deref()),
+        Commands::Schema(args) => commands::schema::run(&args.kind, args.out.as_deref()),
         Commands::InternalUpdateCheck => {
             // hidden subcommand — unconditionally refresh the
             // update cache. The parent already checked is_stale() before
@@ -2838,7 +2948,7 @@ async fn async_main() -> Result<()> {
             update_check::refresh_cache_now().await;
             std::process::exit(0);
         }
-        Commands::InternalTsTransform { .. } => unreachable!("handled before async command dispatch"),
+        Commands::InternalTsTransform(_) => unreachable!("handled before async command dispatch"),
         Commands::External(args) => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::run_external_shortcut(&cwd, &args, cli.json).await
