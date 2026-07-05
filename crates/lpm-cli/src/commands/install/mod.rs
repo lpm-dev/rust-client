@@ -717,163 +717,40 @@ async fn run_with_options_under_store_lock(
     })?;
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
-        if cleanup_catalogs_in_pipeline {
-            cleanup_unused_catalogs_after_install(project_dir)?;
-        }
-        let policy_extension_stats =
-            run_policy_extensions(&policy_extension_configs, project_dir, &[], json_output).await?;
-        // invariant: emit a proper JSON object even on the
-        // empty-deps short-circuit so agents driving install always get a
-        // parseable result. Previously this branch returned silently in JSON
-        // mode, which combined with the workspace-aware filtered install
-        // path produced a complete output silence on fresh workspaces.
-        let elapsed = start.elapsed();
-        let total_ms = elapsed.as_millis();
-        if json_output {
-            let mut json = serde_json::json!({
-                           "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
-                           "success": true,
-                           "no_dependencies": true,
-                           "duration_ms": total_ms as u64,
-                           "timing": {
-                               "resolve_ms": 0u128,
-                               "fetch_ms": 0u128,
-                               "link_ms": 0u128,
-                               "total_ms": total_ms,
-                               "waterfall": {
-                                   "setup_ms": total_ms,
-                                   "resolve_ms": 0u128,
-                                   "pre_fetch_ms": 0u128,
-                                   "fetch_ms": 0u128,
-                                   "pre_link_ms": 0u128,
-                                   "link_ms": 0u128,
-                                   "link_await_ms": 0u128,
-                                   "link_finalize_ms": 0u128,
-                                   "tail_ms": 0u128,
-                                   "total_ms": total_ms,
-                               },
-                           },
-            //always-present empty array: zero deps means
-            // zero peer requirements means zero conflicts.
-                           "peer_conflicts": [],
-                           "peer_issues": peer_issues_json_value(&[], &[]),
-                           "security": {
-                               "policy_extensions": policy_extension_stats.to_json(),
-                           },
-                       });
-            json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
-            if timing_detail_mode.enabled() {
-                json["timing"]["detail"] = setup_only_timing_detail_json(
-                    timing_detail_mode,
-                    total_ms,
-                    wf_setup_install_state_ms,
-                    wf_setup_route_table_ms,
-                );
-            }
-            if !emit_timing && let Some(obj) = json.as_object_mut() {
-                obj.remove("timing");
-            }
-            if let Some(targets) = target_set {
-                json["target_set"] = serde_json::Value::Array(
-                    targets.iter().map(|s| serde_json::json!(s)).collect(),
-                );
-            }
-            crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            output::success("No dependencies to install");
-        }
-        // clean up stale overrides-state.json
-        // when the user removes all overrides from a no-dep project.
-        // We can't write a fresh state because there are no overrides,
-        // and a stale state would cause `lpm graph --why` to surface
-        // ghost trace data. Mirrors the same logic in the main path.
-        if override_set.is_empty()
-            && overrides_state::read_state(project_dir).is_some()
-            && let Err(e) = overrides_state::delete_state(project_dir)
-        {
-            tracing::warn!("failed to delete stale overrides-state.json: {e}");
-        }
-        // Single-writer ownership: the install pipeline writes the v6
-        // install-hash on EVERY successful exit path so `dev.rs` and
-        // the freshness helpers don't need a parallel writer that
-        // would (a) duplicate the write and (b) clobber the v6 mtime
-        // / linker metadata with a stale single-line bare hash. The
-        // empty-deps case is meaningful when the project transitioned
-        // from "had deps" → "removed all deps": the hash captures the
-        // post-removal state so a future freshness check sees a
-        // consistent fingerprint instead of the pre-removal hash.
-        materialize_empty_install_artifacts(project_dir)?;
-        write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
+        run_empty_dependency_install_phase(EmptyDependencyInstallInput {
+            project_dir,
+            policy_extension_configs: &policy_extension_configs,
+            cleanup_catalogs_in_pipeline,
+            json_output,
+            start,
+            timing_detail_mode,
+            setup_install_state_ms: wf_setup_install_state_ms,
+            setup_route_table_ms: wf_setup_route_table_ms,
+            emit_timing,
+            target_set,
+            force_security_floor,
+            override_set: &override_set,
+            linker_mode,
+            object_integrity_policy,
+        })
+        .await?;
         return Ok(());
     }
 
-    // read the persisted override state and
-    // compute whether the override set has drifted since the last
-    // recorded install. This MUST run BEFORE the `--offline` branch
-    // so that:
-    //
-    // 1. **Online mode** can drop the lockfile fast path on drift and
-    // force a fresh resolve.
-    // 2. **Offline mode** can hard-error on drift (since it can't
-    // re-resolve) and can write/delete the state file alongside
-    // the link step.
-    //
-    // This must run before the offline branch can return; otherwise the
-    // offline path silently shadows override edits, never writes a state
-    // file, and never cleans up stale state.
-    let prior_overrides_state = overrides_state::read_state(project_dir);
-    let overrides_changed = prior_overrides_state
-        .as_ref()
-        .map_or(!override_set.is_empty(), |s| {
-            s.fingerprint != override_set.fingerprint()
-        });
-    if overrides_changed {
-        tracing::debug!(
-            "overrides changed since last install (fingerprint drift) — \
-             invalidating lockfile fast path"
-        );
-    }
-
-    //
-    // Mirror of the overrides drift detection. Patches must be
-    // checked BEFORE the offline branch so:
-    // 1. Online mode can drop the lockfile fast path on drift and
-    // force a fresh resolve (the patches themselves don't affect
-    // resolution, but a re-applied patch is required after any
-    // re-link).
-    // 2. Offline mode can hard-error on drift since it can't
-    // re-resolve to bring the lockfile in sync.
-    let prior_patch_state = patch_state::read_state(project_dir);
-    let patches_changed = prior_patch_state
-        .as_ref()
-        .map_or(!current_patches.is_empty(), |s| {
-            s.fingerprint != current_patch_fingerprint
-        });
-    if patches_changed {
-        tracing::debug!(
-            "patches changed since last install (fingerprint drift) — \
-             invalidating lockfile fast path"
-        );
-    }
-
-    // Step 2: Try lockfile fast path, else resolve
-    // Capture pre-install direct-dep versions BEFORE the resolver writes
-    // a fresh lockfile. The Done block compares against this snapshot to
-    // print the `+ pkg@version` diff list — only direct deps that
-    // CHANGED in this run (newly installed or upgraded). A bare
-    // `lpm install` that does no work prints no list; `lpm i react`
-    // prints just `+ react@…`; a hand-edited manifest prints exactly the
-    // diff. Reading from the lockfile (not from `node_modules`) keeps
-    // the snapshot cheap and robust against partial installs.
-    let pre_install_direct_versions: HashMap<String, String> = if lockfile_path.exists() {
-        lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-            .ok()
-            .map(|lf| collect_locked_direct_versions(&pkg, &lf))
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    let LockfileDriftState {
+        prior_overrides_state,
+        overrides_changed,
+        prior_patch_state,
+        patches_changed,
+        pre_install_direct_versions,
+    } = prepare_lockfile_drift_state(LockfileDriftInput {
+        project_dir,
+        lockfile_path: &lockfile_path,
+        pkg: &pkg,
+        override_set: &override_set,
+        current_patches: &current_patches,
+        current_patch_fingerprint: &current_patch_fingerprint,
+    });
 
     let owned_client =
         configure_install_client_for_routing(client, &route_table, &eager_origins, json_output)?;
