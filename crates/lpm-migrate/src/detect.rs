@@ -93,8 +93,8 @@ fn detect_npm_version(path: &Path) -> Result<u32, LpmError> {
     Ok(version)
 }
 
-/// yarn: check for `# yarn lockfile v1` header. Yarn v1 uses a custom format;
-/// Yarn Berry (v2+) uses YAML but is less common for migration.
+/// yarn: check for `# yarn lockfile v1` or Berry's `__metadata` block.
+/// Yarn v1 uses a custom format; Yarn Berry (v2+) uses YAML.
 fn detect_yarn_version(path: &Path) -> Result<u32, LpmError> {
     let content = std::fs::read_to_string(path)?;
 
@@ -188,6 +188,20 @@ mod tests {
         let result = detect_source(dir.path()).unwrap();
         assert_eq!(result.kind, SourceKind::Yarn);
         assert_eq!(result.version, 1);
+    }
+
+    #[test]
+    fn detect_yarn_berry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("yarn.lock"),
+            "__metadata:\n  version: 8\n  cacheKey: 10\n",
+        )
+        .unwrap();
+
+        let result = detect_source(dir.path()).unwrap();
+        assert_eq!(result.kind, SourceKind::Yarn);
+        assert_eq!(result.version, 8);
     }
 
     #[test]
