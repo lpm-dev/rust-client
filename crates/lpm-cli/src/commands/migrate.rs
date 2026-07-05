@@ -459,7 +459,7 @@ pub async fn run(
     } else {
         if !result.skipped.is_empty() {
             install_ui::skipped(&format!(
-                "{} packages skipped (file:/git:/link: deps)",
+                "{} packages skipped (unsupported dependency protocols)",
                 result.skipped.len()
             ));
         }
