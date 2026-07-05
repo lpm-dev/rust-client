@@ -915,123 +915,19 @@ async fn run_with_options_under_store_lock(
     // from `lpm doctor --json`, where every issue lands as a
     // `Check::warn` with a stable code.
 
-    // — build the RouteTable (npmrc) early and surface its
-    // warnings. The `strict-ssl=false` install-start warning must fire
-    // regardless of whether deps actually need fetching: a user who
-    // explicitly disabled TLS verification deserves the diagnostic, and
-    // the empty-deps short-circuit below shouldn't suppress it.
-    //
-    // Cost: 4 npmrc-layer file reads on every install, including the
-    // empty-deps short-circuit below. Measured at ms-scale on a cold
-    // disk; acceptable trade for never silencing the security warning.
-    // If the empty-deps fast path becomes a measured hot path for any
-    // workflow, the right escape valve is a "did any layer touch TLS?"
-    // probe (4 stat() calls) gating the full parse — not relocating
-    // the warning back inside the deps-bearing path, which would
-    // regress the fix.
-    //
-    // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
-    // install before any further work — npm parity.
-    let setup_route_t = Instant::now();
-    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
-        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
-    let wf_setup_route_table_ms = setup_route_t.elapsed().as_millis();
-    if !json_output {
-        // Routine npmrc warnings (per-origin TLS deferred to 58.3,
-        // path-prefix token loose-binding, etc.) are advisory and
-        // human-targeted. They stay inside the json_output guard so
-        // they don't compete with the structured stdout JSON.
-        for w in route_table.npmrc_warnings() {
-            output::warn(w);
-        }
-    }
-    // The `strict-ssl=false` warning is a SECURITY signal — it must
-    // reach automation / CI logs regardless of output mode. JSON output
-    // goes to stdout; this warning is on stderr, so the structured
-    // contract is unaffected. Previously this lived inside the
-    // `json_output` guard above and silenced exactly the users
-    // (`--json`-driven CI / agents) most likely to need it.
-    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
-        && !tagged.value
-    {
-        output::warn(&format!(
-            "strict-ssl=false in {}:{} — TLS certificate verification is \
-             DISABLED for this install across ALL registries. This is a \
-             security risk.",
-            tagged.source, tagged.line
-        ));
-    }
-    // Project-local `.npmrc` security refusals are surfaced even in JSON
-    // mode: agent/CI runs need to see when repo-owned config tried to
-    // downgrade TLS or expand env-backed auth/routing, even when refused.
-    for w in route_table.npmrc_security_warnings() {
-        output::warn(w);
-    }
-
-    // Compute the actual set of registry hosts the resolver will hit
-    // for THIS project's top-level deps. Workspace-member file refs
-    // and other non-registry protocols contribute no origin — they
-    // don't route through a registry. Reused below as `eager_origins`
-    // for the per-origin TLS overrides; computing once here keeps the
-    // slim-UI resolving line and the TLS plumbing in lockstep.
-    //
-    // Showing `client.base_url()` (always `lpm.dev`) for every project
-    // would be a lie for any tree without `@lpm.dev/*` deps — the most
-    // common case. The route table knows the real destination per
-    // package; this line surfaces that truth.
-    let top_level_specs: Vec<String> = deps
-        .iter()
-        .filter_map(
-            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
-                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
-                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
-                _ => None,
-            },
-        )
-        .collect();
-    let eager_origins = route_table.effective_registry_origins(
-        &top_level_specs,
-        client.base_url(),
-        client.npm_registry_url(),
-    );
-
-    // Persistent `› Resolving …` phase line. Sits ABOVE the resolver so
-    // the user sees what hosts are about to be hit before any network
-    // I/O. `is_add_invocation` distinguishes `lpm i <pkg>` (already named
-    // the target on the command line) from bare `lpm install` (where the
-    // project name is the only handle the user has on what's being
-    // resolved).
     let is_add_invocation = requested_add_count.is_some();
-    if !json_output {
-        let hosts_label = if eager_origins.is_empty() {
-            // No top-level registry deps (workspace-only or empty
-            // install). Fall back to the configured worker host so the
-            // line isn't empty in the user's terminal.
-            install_ui::yellow(&install_ui::short_registry_host(client.base_url()))
-        } else {
-            eager_origins
-                .iter()
-                .map(|o| {
-                    let host = o
-                        .host_lower
-                        .strip_prefix("registry.")
-                        .unwrap_or(&o.host_lower)
-                        .to_owned();
-                    install_ui::yellow(&host)
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let line = if is_add_invocation {
-            format!("Resolving dependencies from {hosts_label}")
-        } else {
-            format!(
-                "Resolving dependencies from {hosts_label} for {}",
-                install_ui::bold(pkg_name)
-            )
-        };
-        install_ui::phase(&line);
-    }
+    let InstallRoutingContext {
+        route_table,
+        eager_origins,
+        setup_route_table_ms: wf_setup_route_table_ms,
+    } = prepare_install_routing_context(
+        project_dir,
+        &deps,
+        client,
+        pkg_name,
+        is_add_invocation,
+        json_output,
+    )?;
 
     // `linker_mode` was resolved above — before `check_install_state` —
     // so it covers both validation (fail-loud on invalid values) and
@@ -1215,31 +1111,9 @@ async fn run_with_options_under_store_lock(
         HashMap::new()
     };
 
-    // — apply `.npmrc`-derived TLS overrides to the cloned
-    // client BEFORE any network use, then shadow the parameter so every
-    // downstream callsite (including the `try_lockfile_fast_path` /
-    // `download_tarball_streaming_routed` paths that take `client`
-    // directly, not `arc_client`) sees the configured client. The
-    // `route_table` itself was built earlier (above the empty-deps
-    // short-circuit) so its warnings always surface.
-    //
-    // `top_level_specs` + `eager_origins` are computed above (where the
-    // slim-UI resolving line consumes them) — both surfaces must agree
-    // on the same route map, so they share one derivation. Workspace-
-    // member file refs, link/file/tarball/git specs, and unparseable
-    // ranges all contribute no origin per `Specifier::parse`.
-    let owned_client = client
-        .clone_with_config()
-        .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
+    let owned_client =
+        configure_install_client_for_routing(client, &route_table, &eager_origins, json_output)?;
     let client = &owned_client;
-    // — emit a one-line summary of EFFECTIVE TLS overrides
-    // (default surface + eager per-origin clients). `None` ⇒ nothing
-    // active ⇒ no line. Suppressed under `--json` so structured stdout
-    // stays clean; the strict-ssl=false security warning above remains
-    // unconditional regardless.
-    if !json_output && let Some(line) = client.render_effective_tls_summary() {
-        output::info(&line);
-    }
 
     let arc_client = Arc::new(client.clone_with_config());
 
