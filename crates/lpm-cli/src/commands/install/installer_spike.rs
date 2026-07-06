@@ -1,6 +1,7 @@
 use super::resolve::{
-    MetadataCaches, MetadataRequestContext, MetadataStats, PackageIdentity, ResolveRequest,
-    metadata_for_package,
+    InstallerSpikeParity, InstallerSpikeParityMode, InstallerSpikeStageTimings,
+    InstallerSpikeStats, MetadataCaches, MetadataRequestContext, MetadataStats, PackageIdentity,
+    ResolveRequest, compare_package_parity_with_baseline, metadata_for_package,
 };
 use super::*;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -14,11 +15,9 @@ const ENV_EXPERIMENTAL_INSTALLER_SPIKE: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE
 const ENV_INSTALLER_SPIKE_CONCURRENCY: &str = "LPM_INSTALLER_SPIKE_CONCURRENCY";
 const ENV_INSTALLER_SPIKE_METADATA_CONCURRENCY: &str = "LPM_INSTALLER_SPIKE_METADATA_CONCURRENCY";
 const ENV_INSTALLER_SPIKE_GRAPH: &str = "LPM_INSTALLER_SPIKE_GRAPH";
-const ENV_INSTALLER_SPIKE_PARITY: &str = "LPM_INSTALLER_SPIKE_PARITY";
 const ENV_INSTALLER_SPIKE_BENCHMARK_ONLY: &str = "LPM_INSTALLER_SPIKE_BENCHMARK_ONLY";
 const DEFAULT_INSTALLER_SPIKE_CONCURRENCY: usize = 64;
 const DEFAULT_INSTALLER_SPIKE_METADATA_CONCURRENCY: usize = 192;
-const PARITY_SAMPLE_LIMIT: usize = 25;
 
 pub(super) fn enabled() -> bool {
     std::env::var(ENV_EXPERIMENTAL_INSTALLER_SPIKE).as_deref() == Ok("1")
@@ -235,138 +234,10 @@ struct FetchOutcome {
     cached: bool,
 }
 
-#[derive(Debug, Default)]
-struct InstallerSpikeStats {
-    metadata_requests: u64,
-    metadata_cache_hits: u64,
-    root_requests: u64,
-    dependency_requests_enqueued: u64,
-    peer_requests_enqueued: u64,
-    selected_nodes: u64,
-    inserted_nodes: u64,
-    duplicate_nodes: u64,
-    reused_existing_versions: u64,
-    inline_reused_edges: u64,
-    inline_reuse_deferred_promotions: u64,
-    skipped_optional: u64,
-    platform_pre_skipped: u64,
-    fetch_dispatched: u64,
-}
-
-#[derive(Debug, Default)]
-struct InstallerSpikeStageTimings {
-    resolve_worklist_ms: u128,
-    peer_drain_ms: u128,
-    package_graph_ms: u128,
-    parity_ms: u128,
-    link_targets_ms: u128,
-    v2_targets_ms: u128,
-    v2_prepare_ms: u128,
-    v2_index_ms: u128,
-    pre_fetch_overlap_ms: u128,
-    fetch_join_ms: u128,
-    link_task_await_ms: u128,
-    link_finalize_ms: u128,
-}
-
-impl InstallerSpikeStageTimings {
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "resolve_worklist_ms": self.resolve_worklist_ms,
-            "peer_drain_ms": self.peer_drain_ms,
-            "package_graph_ms": self.package_graph_ms,
-            "parity_ms": self.parity_ms,
-            "link_targets_ms": self.link_targets_ms,
-            "v2_targets_ms": self.v2_targets_ms,
-            "v2_prepare_ms": self.v2_prepare_ms,
-            "v2_index_ms": self.v2_index_ms,
-            "pre_fetch_overlap_ms": self.pre_fetch_overlap_ms,
-            "fetch_join_ms": self.fetch_join_ms,
-            "link_task_await_ms": self.link_task_await_ms,
-            "link_finalize_ms": self.link_finalize_ms,
-        })
-    }
-}
-
 struct LinkOutcomeWithTimings {
     result: LinkResult,
     task_await_ms: u128,
     finalize_ms: u128,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct PackageFingerprint {
-    dependencies: Vec<(String, String)>,
-    aliases: Vec<(String, String)>,
-    peers: Vec<(String, String)>,
-    root_link_names: Vec<String>,
-    is_direct: bool,
-    optional: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PackageFingerprintMismatch {
-    package: String,
-    candidate: PackageFingerprint,
-    baseline: PackageFingerprint,
-}
-
-#[derive(Debug, Clone)]
-struct InstallerSpikeParity {
-    enabled: bool,
-    matches: bool,
-    baseline: &'static str,
-    candidate_count: usize,
-    baseline_count: usize,
-    count_delta: isize,
-    extra_count: usize,
-    missing_count: usize,
-    fingerprint_mismatch_count: usize,
-    extra: Vec<String>,
-    missing: Vec<String>,
-    fingerprint_mismatches: Vec<PackageFingerprintMismatch>,
-}
-
-impl InstallerSpikeParity {
-    fn disabled() -> Self {
-        Self {
-            enabled: false,
-            matches: true,
-            baseline: "disabled",
-            candidate_count: 0,
-            baseline_count: 0,
-            count_delta: 0,
-            extra_count: 0,
-            missing_count: 0,
-            fingerprint_mismatch_count: 0,
-            extra: Vec::new(),
-            missing: Vec::new(),
-            fingerprint_mismatches: Vec::new(),
-        }
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "enabled": self.enabled,
-            "matches": self.matches,
-            "baseline": self.baseline,
-            "candidate_count": self.candidate_count,
-            "baseline_count": self.baseline_count,
-            "count_delta": self.count_delta,
-            "extra_count": self.extra_count,
-            "missing_count": self.missing_count,
-            "fingerprint_mismatch_count": self.fingerprint_mismatch_count,
-            "extra": &self.extra,
-            "missing": &self.missing,
-            "fingerprint_mismatches": self.fingerprint_mismatches.iter().map(|mismatch| {
-                serde_json::json!({
-                    "package": &mismatch.package,
-                    "candidate": package_fingerprint_json(&mismatch.candidate),
-                    "baseline": package_fingerprint_json(&mismatch.baseline),
-                })
-            }).collect::<Vec<_>>(),
-        })
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1013,48 +884,6 @@ impl InstallerSpikeGraphSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum InstallerSpikeParityMode {
-    Disabled,
-    FreshResolve { deny: bool },
-    Lockfile { deny: bool },
-}
-
-impl InstallerSpikeParityMode {
-    fn from_env() -> Self {
-        Self::from_value(std::env::var(ENV_INSTALLER_SPIKE_PARITY).ok().as_deref())
-    }
-
-    fn from_value(value: Option<&str>) -> Self {
-        match value {
-            Some("1" | "true" | "warn") => Self::FreshResolve { deny: false },
-            Some("deny") => Self::FreshResolve { deny: true },
-            Some("lock" | "lockfile" | "seed-lock") => Self::Lockfile { deny: false },
-            Some("lock-deny" | "lockfile-deny" | "seed-lock-deny") => Self::Lockfile { deny: true },
-            Some(_) | None => Self::Disabled,
-        }
-    }
-
-    fn enabled(self) -> bool {
-        !matches!(self, Self::Disabled)
-    }
-
-    fn deny(self) -> bool {
-        matches!(
-            self,
-            Self::FreshResolve { deny: true } | Self::Lockfile { deny: true }
-        )
-    }
-
-    fn baseline(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::FreshResolve { .. } => "fresh-greedy",
-            Self::Lockfile { .. } => "lockfile",
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn compute_parity_if_requested(
     client: Arc<RegistryClient>,
@@ -1176,117 +1005,6 @@ async fn compute_parity_if_requested(
     }
 
     Ok(parity)
-}
-
-fn compare_package_parity_with_baseline(
-    candidate_packages: &[InstallPackage],
-    baseline_packages: &[InstallPackage],
-    baseline_name: &'static str,
-) -> InstallerSpikeParity {
-    let candidate = package_parity_index(candidate_packages);
-    let baseline = package_parity_index(baseline_packages);
-
-    let mut extra = Vec::new();
-    for (key, (display, _)) in &candidate {
-        if !baseline.contains_key(key) {
-            extra.push(display.clone());
-        }
-    }
-
-    let mut missing = Vec::new();
-    for (key, (display, _)) in &baseline {
-        if !candidate.contains_key(key) {
-            missing.push(display.clone());
-        }
-    }
-
-    let mut fingerprint_mismatches = Vec::new();
-    for (key, (display, candidate_fp)) in &candidate {
-        let Some((_, baseline_fp)) = baseline.get(key) else {
-            continue;
-        };
-        if candidate_fp != baseline_fp {
-            fingerprint_mismatches.push(PackageFingerprintMismatch {
-                package: display.clone(),
-                candidate: candidate_fp.clone(),
-                baseline: baseline_fp.clone(),
-            });
-        }
-    }
-
-    let extra_count = extra.len();
-    let missing_count = missing.len();
-    let fingerprint_mismatch_count = fingerprint_mismatches.len();
-    extra.truncate(PARITY_SAMPLE_LIMIT);
-    missing.truncate(PARITY_SAMPLE_LIMIT);
-    fingerprint_mismatches.truncate(PARITY_SAMPLE_LIMIT);
-    let matches = extra_count == 0 && missing_count == 0 && fingerprint_mismatch_count == 0;
-
-    InstallerSpikeParity {
-        enabled: true,
-        matches,
-        baseline: baseline_name,
-        candidate_count: candidate_packages.len(),
-        baseline_count: baseline_packages.len(),
-        count_delta: candidate_packages.len() as isize - baseline_packages.len() as isize,
-        extra_count,
-        missing_count,
-        fingerprint_mismatch_count,
-        extra,
-        missing,
-        fingerprint_mismatches,
-    }
-}
-
-fn package_parity_index(
-    packages: &[InstallPackage],
-) -> BTreeMap<String, (String, PackageFingerprint)> {
-    packages
-        .iter()
-        .map(|package| {
-            (
-                install_pkg_key(package),
-                (
-                    format!("{}@{} {}", package.name, package.version, package.source),
-                    package_fingerprint(package),
-                ),
-            )
-        })
-        .collect()
-}
-
-fn package_fingerprint(package: &InstallPackage) -> PackageFingerprint {
-    let mut dependencies = package.dependencies.clone();
-    dependencies.sort();
-    let mut aliases: Vec<_> = package
-        .aliases
-        .iter()
-        .map(|(alias, target)| (alias.clone(), target.clone()))
-        .collect();
-    aliases.sort();
-    let mut peers = package.peers.clone();
-    peers.sort();
-    let mut root_link_names = package.root_link_names.clone().unwrap_or_default();
-    root_link_names.sort();
-    PackageFingerprint {
-        dependencies,
-        aliases,
-        peers,
-        root_link_names,
-        is_direct: package.is_direct,
-        optional: package.optional,
-    }
-}
-
-fn package_fingerprint_json(fingerprint: &PackageFingerprint) -> serde_json::Value {
-    serde_json::json!({
-        "dependencies": &fingerprint.dependencies,
-        "aliases": &fingerprint.aliases,
-        "peers": &fingerprint.peers,
-        "root_link_names": &fingerprint.root_link_names,
-        "direct": fingerprint.is_direct,
-        "optional": fingerprint.optional,
-    })
 }
 
 fn load_lockfile_graph_packages(
