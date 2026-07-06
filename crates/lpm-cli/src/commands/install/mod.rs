@@ -3422,8 +3422,6 @@ async fn run_with_options_under_store_lock(
     let wf_link_root_symlinks_ms = link_phase.root_symlinks_ms;
     let wf_link_compatibility_ms = link_phase.compatibility_ms;
     let wf_link_bin_shims_ms = link_phase.bin_shims_ms;
-    let mut wf_tail_blocked_metadata_ms = 0u128;
-    let wf_tail_trust_snapshot_ms;
     // `link_ms` lands in the verbose footer and the JSON timing object;
     // no dedicated "Linked in Xms" line.
 
@@ -3458,242 +3456,36 @@ async fn run_with_options_under_store_lock(
         json_output,
     )?;
 
-    // Lifecycle script security audit + trusted script execution.
-    let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
-
-    // capture the install-time blocked set into
-    // `<project_dir>/.lpm/build-state.json` so that:
-    // 1. `lpm approve-scripts` doesn't have to re-walk the store on startup
-    // 2. The post-install warning is suppressed when the blocked set is
-    // unchanged from the previous install (the spam-prevention rule)
-    // 3. Agents driving install via JSON output get a structured
-    // `blocked_count` / `blocked_set_changed` summary
-    let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
-        .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
-    let blocked_metadata_start = std::time::Instant::now();
-    let blocked_set_metadata = if used_lockfile {
-        let metadata = blocked_set_metadata_from_previous_state(project_dir);
-        tracing::debug!(
-            "perf.reuse_blocked_set_metadata pkgs={} entries={} ms={}",
-            packages.len(),
-            metadata.by_pkg.len(),
-            blocked_metadata_start.elapsed().as_millis()
-        );
-        metadata
-    } else {
-        let metadata = lpm_registry::timing::with_metadata_purpose(
-            lpm_registry::timing::MetadataPurpose::BlockedSet,
-            build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages),
-        )
-        .await;
-        wf_tail_blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
-        tracing::debug!(
-            "perf.build_blocked_set_metadata pkgs={} ms={}",
-            packages.len(),
-            wf_tail_blocked_metadata_ms
-        );
-        metadata
-    };
-    // Parse the project
-    // capability request + user bound ONCE per install so the
-    // install-time blocked-set capture, the autoBuild trust check
-    // below, and approve-scripts later all see the same canonical
-    // object. Without threading these through the capture call,
-    // capability-widened packages with matching script-hash
-    // approvals would slip past the blocked-set (build_state.rs's
-    // compute_blocked_packages_with_metadata filter). This keeps
-    // install-time capture consistent with 6c's runtime enforcement.
-    let install_requested_capabilities =
-        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
-            .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let install_user_bound = crate::security_approval::authorized_capability_user_bound();
-
-    // **Resolve script-policy + preflight advisor BEFORE the blocked-set capture.**
-    //
-    // The capture writes to `.lpm/build-state.json`. If the advisor
-    // approves an amber package this run, that package's scripts run
-    // via the AdvisorApprovedThisRun trust path during autoBuild; we
-    // therefore want it EXCLUDED from the persisted blocked set so
-    // post-install JSON + the "remain blocked after auto-build"
-    // pointer don't report stale state.
-    //
-    // Order:
-    // 1. Read project script-policy config (one disk read; reused
-    // by the autoBuild branch later).
-    // 2. Resolve effective policy through the precedence chain.
-    // 3. Build the AdvisorSession (preflight + classify amber).
-    // 4. Pass `session.approvals()` into the capture call below.
-    let step10_script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-    let config_auto_build = step10_script_policy_cfg.auto_build;
-    let step10_effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+    let OnlineLifecyclePrepareResult {
+        policy,
+        installed_with_integrity,
+        blocked_set_metadata,
+        requested_capabilities: install_requested_capabilities,
+        user_bound: install_user_bound,
+        effective_policy: lifecycle_effective_policy,
+        advisor_session,
+        auto_build_attempted,
+        blocked_capture,
+        blocked_metadata_ms: wf_tail_blocked_metadata_ms,
+        trust_snapshot_ms: wf_tail_trust_snapshot_ms,
+    } = run_online_lifecycle_prepare_phase(OnlineLifecyclePrepareInput {
+        client: arc_client.as_ref(),
+        route_table: &route_table,
         project_dir,
+        packages: &packages,
+        package: &pkg,
+        store: &store,
+        used_lockfile,
         script_policy_override,
-        &step10_script_policy_cfg,
-        json_output,
-    )?;
-
-    //: include integrity so the auto-build predicate's
-    // strict gate matches what `rebuild::run` will do. Same data
-    // shape as `installed_with_integrity` above; named separately
-    // because it's consumed by `all_scripted_packages_trusted`
-    // later and historically lived next to that call.
-    let all_pkgs_for_build: Vec<(String, String, Option<String>)> = packages
-        .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
-
-    //
-    //
-    // Preflight the configured advisor ONCE per run. Session stays
-    // active only when:
-    // - script-policy resolved to `triage`,
-    // - `triage-advisor` is set to something other than `none`,
-    // - detect + test-invoke succeed.
-    //
-    // Any failure degrades to none with a single warning. Per-
-    // package classification failures later stay silent — preflight
-    // already warned (or didn't, if the user configured `none`).
-    //
-    // Precedence chain for `triage-advisor` (highest first):
-    // - CLI `--advisor` flag (slug validated at the clap layer in
-    // `main.rs::parse_advisor_slug`; `Some` here is guaranteed to
-    // be `"none"` or a known provider).
-    // - `package.json > lpm > triageAdvisor`
-    // - `~/.lpm/config.toml` `triage-advisor` key
-    // - default `none`
-    let advisor_session =
-        if step10_effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
-            let triage_advisor_pkg_json = step10_script_policy_cfg.triage_advisor.as_deref();
-            let triage_advisor_global = global_config.get_str("triage-advisor");
-            let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
-                advisor_override.as_deref(),
-                triage_advisor_pkg_json,
-                triage_advisor_global,
-                json_output,
-            )
-            .await;
-            // If the session is active, classify every amber package
-            // declared in the current install set. The advisor's
-            // `Approve` verdicts populate an in-memory approval set
-            // that's threaded into the blocked-set capture (so
-            // approved packages are excluded from the persisted
-            // blocked set), the autoBuild predicate, AND
-            // `rebuild::run` (the actual script-execution path).
-            // The set never persists.
-            if session.is_active() {
-                let amber_requests = collect_amber_classification_requests(
-                    &store,
-                    &installed_with_integrity,
-                    &publish_ages,
-                    cooldown_policy.minimum_release_age_secs,
-                );
-                // `classify_amber` is async + serial. Slice 1 keeps
-                // it simple; future parallel-fanout can ride on top.
-                session.classify_amber(&amber_requests).await;
-            }
-            Some(session)
-        } else {
-            None
-        };
-
-    // Compute the
-    // auto-build decision BEFORE the blocked-set capture so the
-    // capture can condition the advisor-approval exclusion on
-    // whether scripts will actually run this install.
-    //
-    // The bug we are closing: an advisor `Approve` verdict has two
-    // observable effects — (1) the package's scripts run via the
-    // AdvisorApprovedThisRun trust path during autoBuild, and
-    // (2) the package is omitted from the persisted blocked set
-    // (so post-install messaging + `lpm approve-scripts` don't
-    // report stale "still blocked" state). Effect (2) is only
-    // valid when (1) actually fires. In a mixed-triage install
-    // where the advisor approves A but leaves B blocked, with
-    // `--auto-build` off and `autoBuild: false`, `all_trusted` is
-    // false → autoBuild does not fire → A's scripts never run, AND
-    // A vanishes from `build-state.json` → unreachable via
-    // `approve-scripts` either. "Stranded: not executed, not
-    // reviewable."
-    //
-    // Fix: pass `advisor_approvals` to the capture iff
-    // `auto_build_attempted` is true. When auto-build won't fire,
-    // the persisted blocked set continues to surface the
-    // advisor-approved-but-not-run package, and the user can review
-    // it explicitly via `lpm approve-scripts` (the ephemeral
-    // approval is gone after this run — by design, since approvals
-    // never persist).
-    //
-    // `all_scripted_packages_trusted` ALWAYS receives the approvals
-    // — its purpose is to decide whether autoBuild should fire, and
-    // an advisor-approved amber correctly counts as trusted for
-    // that gate.
-    let force_security_floor = global_config
-        .get_bool("force-security-floor")
-        .unwrap_or(false);
-    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
-        lpm_root,
-        &all_pkgs_for_build,
-        &policy,
-        project_dir,
-        step10_effective_policy,
-        force_security_floor,
-        &install_requested_capabilities,
-        &install_user_bound,
-        advisor_session.as_ref().map(|s| s.approvals()),
-    );
-    let auto_build_attempted = should_auto_build(
+        advisor_override: advisor_override.as_deref(),
+        global_config: &global_config,
+        publish_ages: &publish_ages,
+        min_release_age_secs: cooldown_policy.minimum_release_age_secs,
         auto_build,
-        config_auto_build,
-        all_trusted_for_auto_build,
-        step10_effective_policy,
-    );
-    let auto_build_will_execute = auto_build_attempted && !step10_script_policy_cfg.deny_all;
-
-    let capture_start = std::time::Instant::now();
-    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
-        project_dir,
-        &store,
-        &installed_with_integrity,
-        &policy,
-        &blocked_set_metadata,
-        &install_requested_capabilities,
-        &install_user_bound,
-        // Conditional: only exclude advisor-approved triples when
-        // autoBuild will actually execute their scripts this run.
-        // See `select_approvals_for_capture` for the rationale —
-        // closes the "stranded approval" bug.
-        select_approvals_for_capture(
-            auto_build_will_execute,
-            advisor_session.as_ref().map(|s| s.approvals()),
-        ),
-    )?;
-    tracing::debug!(
-        "perf.capture_blocked_set pkgs={} ms={}",
-        installed_with_integrity.len(),
-        capture_start.elapsed().as_millis()
-    );
-
-    //: persist the current `trustedDependencies` as a
-    // snapshot so the NEXT install's diff has a baseline. Write
-    // failures are non-fatal — an install that reached this point has
-    // already succeeded as far as the user cares, and the worst-case
-    // of a missing snapshot is "the next install's diff notice
-    // doesn't fire," which degrades to the pre-46 behavior.
-    {
-        let trust_snap_start = std::time::Instant::now();
-        let snap = crate::trust_snapshot::TrustSnapshot::capture_current(pkg.lpm.as_ref().map_or(
-            &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
-            |l| &l.trusted_dependencies,
-        ));
-        if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
-            tracing::warn!("failed to write trust-snapshot.json: {e}");
-        }
-        wf_tail_trust_snapshot_ms = trust_snap_start.elapsed().as_millis();
-        tracing::debug!("perf.trust_snapshot ms={}", wf_tail_trust_snapshot_ms);
-    }
+        json_output,
+        lpm_root,
+    })
+    .await?;
 
     // Step 7: LPM-Native Intelligence
     // Read strictness from package.json "lpm" config
@@ -3864,139 +3656,36 @@ async fn run_with_options_under_store_lock(
     let wf_tail_lockfile_write_ms = lockfile_write_result.write_ms;
     let wf_tail_lockfile_write_count = lockfile_write_result.write_count;
 
-    // Step 10: Auto-build trusted packages (after lockfile is written)
-    // Triggers when: --auto-build flag, lpm.scripts.autoBuild config,
-    // ALL scripted packages are individually trusted, OR the effective
-    // policy is Allow (`--yolo` / `--policy=allow` runs scripts at
-    // install time).
-    //
-    //: consolidated into ScriptPolicyConfig so all four
-    // script-related keys come from a single read.
-    //
-    // Script-policy resolution + advisor preflight runs before the
-    // blocked-set capture (so approved packages can be excluded from the
-    // persisted set). The
-    // `step10_*` locals + `all_pkgs_for_build` + `advisor_session`
-    // they produce are still in scope here; only the autoBuild
-    // predicate + the rebuild::run call read them. No duplication.
-
-    // These values are computed before blocked-set capture so the
-    // advisor-approval exclusion can depend on whether auto-build will
-    // actually execute.
-    if auto_build_attempted {
-        //: preflight version-diff cards for any green
-        // about to auto-execute that has a prior-approved binding
-        // for a strictly-lesser version. Renders BEFORE `rebuild::run`
-        // so the user sees the unified script-body diff and the
-        // behavioral-tag delta before any code runs. No-ops for
-        // non-triage policies and json mode (gates inside the helper).
-        maybe_emit_pre_autobuild_version_diff_cards(
-            project_dir,
-            &store,
-            auto_build_attempted,
-            step10_effective_policy,
-            &blocked_capture,
-            json_output,
-        );
-    }
-    let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
-    if auto_build_attempted {
-        match crate::commands::rebuild::run_with_report(
-            project_dir,
-            &[],   // no specific packages — build all trusted
-            false, // not --all
-            false, // not dry-run
-            false, // not --force
-            None,  // default timeout
-            json_output,
-            false, // not --deny-all
-            // forward the user's CLI
-            // sandbox-mode choice to the auto-build rebuild call.
-            // When the user explicitly opts into strict, the
-            // auto-build greens run under strict too. When the user
-            // explicitly drops the sandbox (`--no-sandbox`), the
-            // auto-build greens skip containment too — consistent
-            // with the user's chosen capability boundary. The
-            // env / config / default precedence stays intact when
-            // both flags are false (the chain resolver inside
-            // `rebuild::run_under_store_lock` walks lpm.toml /
-            // `~/.lpm/config.toml` / `LPM_STRICT_SANDBOX` env).
-            //
-            // `sandbox_log` stays false: it's a diagnostic-only
-            // override the user must spell out explicitly on
-            // `lpm rebuild`, not a default that auto-build inherits.
-            no_sandbox,
-            strict_sandbox,
-            false, // sandbox_log
-            step10_effective_policy,
-            advisor_session.as_ref().map(|s| s.approvals()),
-        )
-        .await
-        {
-            Ok(report) => {
-                auto_build_report = report;
-            }
-            Err(e) => {
-                if !json_output {
-                    output::warn(&format!("Auto-build failed: {e}"));
-                }
-                return Err(e);
-            }
-        }
-    }
-
-    if auto_build_report.covered_any_packages() {
-        let execution_exclusions = auto_build_report
-            .covered_packages
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        blocked_capture =
-            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
-                project_dir,
-                &store,
-                &installed_with_integrity,
-                &policy,
-                &blocked_set_metadata,
-                &install_requested_capabilities,
-                &install_user_bound,
-                select_approvals_for_capture(true, advisor_session.as_ref().map(|s| s.approvals())),
-                Some(&execution_exclusions),
-            )?;
-    }
-
-    if auto_build_report.covered_any_packages() || auto_build_report.built_any_packages() {
-        let relinked_bins = relink_bins_after_lifecycle_build(
-            project_dir,
-            &packages,
-            &link_targets,
-            linker_mode,
-            lpm_root,
-            object_integrity_policy,
-            pkg.name.as_deref(),
-            compatibility_bin_names,
-        )?;
-        link_result.bin_linked = relinked_bins;
-    }
-
-    // post-auto-build canonical pointer.
-    //
-    // Under `script-policy = "triage"` the rebuild helper runs green
-    // packages when auto-build fires, while amber / red packages remain
-    // in `build-state.json`. The pre-auto-build triage summary line is
-    // then stale, so emit a follow-up pointer for the remaining reviews.
-    //
-    // JSON mode: per-entry `static_tier` enrichment below in the
-    // JSON output block gives agents the machine-readable shape; no
-    // extra line here. Non-JSON: one concise warn line after a
-    // successful auto-build that still leaves amber/red packages for
-    // explicit review.
-    maybe_emit_post_auto_build_triage_pointer(
-        auto_build_attempted,
-        step10_effective_policy,
-        &blocked_capture,
+    let OnlineAutoBuildPhaseResult {
+        blocked_capture,
+        bin_linked,
+    } = run_online_auto_build_phase(OnlineAutoBuildPhaseInput {
+        project_dir,
+        packages: &packages,
+        link_targets: &link_targets,
+        package_name: pkg.name.as_deref(),
+        store: &store,
+        lpm_root,
+        object_integrity_policy,
+        linker_mode,
+        compatibility_bin_names,
         json_output,
-    );
+        no_sandbox,
+        strict_sandbox,
+        auto_build_attempted,
+        effective_policy: lifecycle_effective_policy,
+        advisor_session: advisor_session.as_ref(),
+        blocked_capture,
+        installed_with_integrity: &installed_with_integrity,
+        policy: &policy,
+        blocked_set_metadata: &blocked_set_metadata,
+        requested_capabilities: &install_requested_capabilities,
+        user_bound: &install_user_bound,
+    })
+    .await?;
+    if let Some(bin_linked) = bin_linked {
+        link_result.bin_linked = bin_linked;
+    }
 
     let elapsed = start.elapsed();
 

@@ -58,9 +58,9 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
     assert!(metadata.get("scripted-empty", "1.0.0").is_none());
 }
 
-/// The drift gate must appear before the rebuild auto-build
-/// call site. If a future refactor moves the drift check past the build
-/// call, a drifted approval could spawn scripts before containment is
+/// The drift gate must appear before the install pipeline hands off to
+/// auto-build. If a future refactor moves the drift check past that
+/// handoff, a drifted approval could spawn scripts before containment is
 /// established.
 ///
 /// This test is source-level by design. The drift check's
@@ -74,14 +74,19 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
 /// message names what needs updating.
 #[test]
 fn provenance_drift_gate_precedes_build_run_call_site() {
-    let src = include_str!(concat!(
+    let install_src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/commands/install/mod.rs"
     ));
+    let lifecycle_src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/install/lifecycle.rs"
+    ));
     const DRIFT_MARKER: &str = "provenance-drift gate";
     const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const AUTO_BUILD_HANDOFF: &str = "run_online_auto_build_phase(OnlineAutoBuildPhaseInput";
 
-    let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
+    let drift_pos = install_src.find(DRIFT_MARKER).unwrap_or_else(|| {
         panic!(
             "drift-gate marker `{DRIFT_MARKER}` disappeared from install/mod.rs — \
              if the comment was legitimately renamed, update this test with the \
@@ -89,17 +94,22 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
              that needs explicit signoff."
         )
     });
-    let build_run_pos = src.find(BUILD_RUN_CALL).unwrap_or_else(|| {
+    let handoff_pos = install_src.find(AUTO_BUILD_HANDOFF).unwrap_or_else(|| {
         panic!(
-            "rebuild call site (`{BUILD_RUN_CALL}`) not found — the \
-             install → auto-build handoff was removed or renamed; update this \
-             test to target the new call."
+            "auto-build handoff (`{AUTO_BUILD_HANDOFF}`) not found in \
+             install/mod.rs — update this test if the handoff was legitimately renamed."
         )
     });
     assert!(
-        drift_pos < build_run_pos,
+        lifecycle_src.contains(BUILD_RUN_CALL),
+        "rebuild call site (`{BUILD_RUN_CALL}`) not found in install/lifecycle.rs — \
+         the install → auto-build handoff was removed or renamed; update this test \
+         to target the new call."
+    );
+    assert!(
+        drift_pos < handoff_pos,
         "Order invariant broken: the provenance-drift gate (byte {drift_pos}) \
-         MUST appear before the rebuild call site (byte {build_run_pos}) in \
+         MUST appear before the auto-build handoff (byte {handoff_pos}) in \
          install/mod.rs. Reordering them means a drifted approval could spawn scripts \
          before the drift check fires — violating the approved execution order."
     );

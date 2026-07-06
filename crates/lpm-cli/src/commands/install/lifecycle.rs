@@ -217,6 +217,345 @@ pub(super) fn maybe_emit_post_install_lifecycle_hint(
     Ok(())
 }
 
+pub(super) struct OnlineLifecyclePrepareInput<'a> {
+    pub(super) client: &'a lpm_registry::RegistryClient,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) project_dir: &'a Path,
+    pub(super) packages: &'a [InstallPackage],
+    pub(super) package: &'a lpm_workspace::PackageJson,
+    pub(super) store: &'a lpm_store::PackageStore,
+    pub(super) used_lockfile: bool,
+    pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    pub(super) advisor_override: Option<&'a str>,
+    pub(super) global_config: &'a crate::commands::config::GlobalConfig,
+    pub(super) publish_ages: &'a HashMap<(String, String), u64>,
+    pub(super) min_release_age_secs: u64,
+    pub(super) auto_build: bool,
+    pub(super) json_output: bool,
+    pub(super) lpm_root: &'a lpm_common::LpmRoot,
+}
+
+pub(super) struct OnlineLifecyclePrepareResult {
+    pub(super) policy: lpm_security::SecurityPolicy,
+    pub(super) installed_with_integrity: Vec<(String, String, Option<String>)>,
+    pub(super) blocked_set_metadata: crate::build_state::BlockedSetMetadata,
+    pub(super) requested_capabilities: crate::capability::CapabilitySet,
+    pub(super) user_bound: crate::capability::UserBound,
+    pub(super) effective_policy: crate::script_policy_config::ScriptPolicy,
+    pub(super) advisor_session: Option<crate::triage_advisor_session::AdvisorSession>,
+    pub(super) auto_build_attempted: bool,
+    pub(super) blocked_capture: crate::build_state::BlockedSetCapture,
+    pub(super) blocked_metadata_ms: u128,
+    pub(super) trust_snapshot_ms: u128,
+}
+
+pub(super) async fn run_online_lifecycle_prepare_phase(
+    input: OnlineLifecyclePrepareInput<'_>,
+) -> Result<OnlineLifecyclePrepareResult, LpmError> {
+    let OnlineLifecyclePrepareInput {
+        client,
+        route_table,
+        project_dir,
+        packages,
+        package,
+        store,
+        used_lockfile,
+        script_policy_override,
+        advisor_override,
+        global_config,
+        publish_ages,
+        min_release_age_secs,
+        auto_build,
+        json_output,
+        lpm_root,
+    } = input;
+
+    let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+    let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .collect();
+
+    let blocked_metadata_start = std::time::Instant::now();
+    let mut blocked_metadata_ms = 0u128;
+    let blocked_set_metadata = if used_lockfile {
+        let metadata = blocked_set_metadata_from_previous_state(project_dir);
+        tracing::debug!(
+            "perf.reuse_blocked_set_metadata pkgs={} entries={} ms={}",
+            packages.len(),
+            metadata.by_pkg.len(),
+            blocked_metadata_start.elapsed().as_millis()
+        );
+        metadata
+    } else {
+        let metadata = lpm_registry::timing::with_metadata_purpose(
+            lpm_registry::timing::MetadataPurpose::BlockedSet,
+            build_blocked_set_metadata(client, route_table, packages),
+        )
+        .await;
+        blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
+        tracing::debug!(
+            "perf.build_blocked_set_metadata pkgs={} ms={}",
+            packages.len(),
+            blocked_metadata_ms
+        );
+        metadata
+    };
+
+    let requested_capabilities =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    let user_bound = crate::security_approval::authorized_capability_user_bound();
+
+    let script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let config_auto_build = script_policy_cfg.auto_build;
+    let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+        project_dir,
+        script_policy_override,
+        &script_policy_cfg,
+        json_output,
+    )?;
+
+    let advisor_session = if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
+        let triage_advisor_pkg_json = script_policy_cfg.triage_advisor.as_deref();
+        let triage_advisor_global = global_config.get_str("triage-advisor");
+        let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
+            advisor_override,
+            triage_advisor_pkg_json,
+            triage_advisor_global,
+            json_output,
+        )
+        .await;
+        if session.is_active() {
+            let amber_requests = collect_amber_classification_requests(
+                store,
+                &installed_with_integrity,
+                publish_ages,
+                min_release_age_secs,
+            );
+            session.classify_amber(&amber_requests).await;
+        }
+        Some(session)
+    } else {
+        None
+    };
+
+    let force_security_floor = global_config
+        .get_bool("force-security-floor")
+        .unwrap_or(false);
+    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
+        lpm_root,
+        &installed_with_integrity,
+        &policy,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        &requested_capabilities,
+        &user_bound,
+        advisor_session.as_ref().map(|s| s.approvals()),
+    );
+    let auto_build_attempted = should_auto_build(
+        auto_build,
+        config_auto_build,
+        all_trusted_for_auto_build,
+        effective_policy,
+    );
+    let auto_build_will_execute = auto_build_attempted && !script_policy_cfg.deny_all;
+
+    let capture_start = std::time::Instant::now();
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
+        project_dir,
+        store,
+        &installed_with_integrity,
+        &policy,
+        &blocked_set_metadata,
+        &requested_capabilities,
+        &user_bound,
+        select_approvals_for_capture(
+            auto_build_will_execute,
+            advisor_session.as_ref().map(|s| s.approvals()),
+        ),
+    )?;
+    tracing::debug!(
+        "perf.capture_blocked_set pkgs={} ms={}",
+        installed_with_integrity.len(),
+        capture_start.elapsed().as_millis()
+    );
+
+    let trust_snap_start = std::time::Instant::now();
+    let snap = crate::trust_snapshot::TrustSnapshot::capture_current(package.lpm.as_ref().map_or(
+        &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
+        |l| &l.trusted_dependencies,
+    ));
+    if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+        tracing::warn!("failed to write trust-snapshot.json: {e}");
+    }
+    let trust_snapshot_ms = trust_snap_start.elapsed().as_millis();
+    tracing::debug!("perf.trust_snapshot ms={}", trust_snapshot_ms);
+
+    Ok(OnlineLifecyclePrepareResult {
+        policy,
+        installed_with_integrity,
+        blocked_set_metadata,
+        requested_capabilities,
+        user_bound,
+        effective_policy,
+        advisor_session,
+        auto_build_attempted,
+        blocked_capture,
+        blocked_metadata_ms,
+        trust_snapshot_ms,
+    })
+}
+
+pub(super) struct OnlineAutoBuildPhaseInput<'a> {
+    pub(super) project_dir: &'a Path,
+    pub(super) packages: &'a [InstallPackage],
+    pub(super) link_targets: &'a [LinkTarget],
+    pub(super) package_name: Option<&'a str>,
+    pub(super) store: &'a lpm_store::PackageStore,
+    pub(super) lpm_root: &'a lpm_common::LpmRoot,
+    pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) compatibility_bin_names: &'a [String],
+    pub(super) json_output: bool,
+    pub(super) no_sandbox: bool,
+    pub(super) strict_sandbox: bool,
+    pub(super) auto_build_attempted: bool,
+    pub(super) effective_policy: crate::script_policy_config::ScriptPolicy,
+    pub(super) advisor_session: Option<&'a crate::triage_advisor_session::AdvisorSession>,
+    pub(super) blocked_capture: crate::build_state::BlockedSetCapture,
+    pub(super) installed_with_integrity: &'a [(String, String, Option<String>)],
+    pub(super) policy: &'a lpm_security::SecurityPolicy,
+    pub(super) blocked_set_metadata: &'a crate::build_state::BlockedSetMetadata,
+    pub(super) requested_capabilities: &'a crate::capability::CapabilitySet,
+    pub(super) user_bound: &'a crate::capability::UserBound,
+}
+
+pub(super) struct OnlineAutoBuildPhaseResult {
+    pub(super) blocked_capture: crate::build_state::BlockedSetCapture,
+    pub(super) bin_linked: Option<usize>,
+}
+
+pub(super) async fn run_online_auto_build_phase(
+    input: OnlineAutoBuildPhaseInput<'_>,
+) -> Result<OnlineAutoBuildPhaseResult, LpmError> {
+    let OnlineAutoBuildPhaseInput {
+        project_dir,
+        packages,
+        link_targets,
+        package_name,
+        store,
+        lpm_root,
+        object_integrity_policy,
+        linker_mode,
+        compatibility_bin_names,
+        json_output,
+        no_sandbox,
+        strict_sandbox,
+        auto_build_attempted,
+        effective_policy,
+        advisor_session,
+        mut blocked_capture,
+        installed_with_integrity,
+        policy,
+        blocked_set_metadata,
+        requested_capabilities,
+        user_bound,
+    } = input;
+
+    if auto_build_attempted {
+        maybe_emit_pre_autobuild_version_diff_cards(
+            project_dir,
+            store,
+            auto_build_attempted,
+            effective_policy,
+            &blocked_capture,
+            json_output,
+        );
+    }
+
+    let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
+    if auto_build_attempted {
+        match crate::commands::rebuild::run_with_report(
+            project_dir,
+            &[],
+            false,
+            false,
+            false,
+            None,
+            json_output,
+            false,
+            no_sandbox,
+            strict_sandbox,
+            false,
+            effective_policy,
+            advisor_session.map(|s| s.approvals()),
+        )
+        .await
+        {
+            Ok(report) => {
+                auto_build_report = report;
+            }
+            Err(e) => {
+                if !json_output {
+                    output::warn(&format!("Auto-build failed: {e}"));
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    if auto_build_report.covered_any_packages() {
+        let execution_exclusions = auto_build_report
+            .covered_packages
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        blocked_capture =
+            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
+                project_dir,
+                store,
+                installed_with_integrity,
+                policy,
+                blocked_set_metadata,
+                requested_capabilities,
+                user_bound,
+                select_approvals_for_capture(true, advisor_session.map(|s| s.approvals())),
+                Some(&execution_exclusions),
+            )?;
+    }
+
+    let bin_linked =
+        if auto_build_report.covered_any_packages() || auto_build_report.built_any_packages() {
+            Some(relink_bins_after_lifecycle_build(
+                project_dir,
+                packages,
+                link_targets,
+                linker_mode,
+                lpm_root,
+                object_integrity_policy,
+                package_name,
+                compatibility_bin_names,
+            )?)
+        } else {
+            None
+        };
+
+    maybe_emit_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        effective_policy,
+        &blocked_capture,
+        json_output,
+    );
+
+    Ok(OnlineAutoBuildPhaseResult {
+        blocked_capture,
+        bin_linked,
+    })
+}
+
 /// Compute per-package terse version-diff
 /// hints for the post-install blocked-set warning.
 ///

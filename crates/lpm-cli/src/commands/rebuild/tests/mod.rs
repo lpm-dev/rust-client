@@ -1335,25 +1335,36 @@ fn triage_pointer_routes_to_approve_scripts() {
 
 #[test]
 fn auto_build_call_site_threads_effective_policy() {
-    // Pin the install → auto-build handoff: the `rebuild::run` call
-    // in install/mod.rs must carry the resolved effective policy into
-    // `rebuild::run`'s last arg. Without this invariant the
-    // tier-promotion logic would never see triage at the auto-
-    // build site (install/mod.rs today resolves effective_policy for
-    // the blocked-hint block only).
+    // Pin the install → auto-build handoff: both the trust predicate
+    // and the `rebuild::run` call must carry the same resolved
+    // effective policy. Without this invariant the tier-promotion
+    // logic would never see triage at the auto-build site.
     let src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/commands/install/mod.rs"
+        "/src/commands/install/lifecycle.rs"
     ));
-    const MARKER: &str = "step10_effective_policy";
-    let count = src.matches(MARKER).count();
+    const TRUST_CALL: &str = "crate::commands::rebuild::all_scripted_packages_trusted(";
+    const REBUILD_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const POLICY_ARG: &str = "effective_policy";
+
+    let trust_pos = src
+        .find(TRUST_CALL)
+        .unwrap_or_else(|| panic!("trust predicate call `{TRUST_CALL}` disappeared"));
+    let rebuild_pos = src
+        .find(REBUILD_CALL)
+        .unwrap_or_else(|| panic!("auto-build call `{REBUILD_CALL}` disappeared"));
+    let trust_window = &src[trust_pos..trust_pos.saturating_add(700).min(src.len())];
+    let rebuild_window = &src[rebuild_pos..rebuild_pos.saturating_add(700).min(src.len())];
+
     assert!(
-        count >= 3,
-        "expected at least 3 references to `{MARKER}` in install/mod.rs (the \
-             `let` binding + `all_scripted_packages_trusted` arg + `rebuild::run` \
-             arg). Found {count}. If the auto-build handoff was refactored, \
-             update this assertion — but make sure both callees still receive \
-             the same resolved value."
+        trust_window.contains(POLICY_ARG),
+        "`{TRUST_CALL}` must receive `{POLICY_ARG}` so the auto-build \
+         decision uses the resolved install policy"
+    );
+    assert!(
+        rebuild_window.contains(POLICY_ARG),
+        "`{REBUILD_CALL}` must receive `{POLICY_ARG}` so the rebuild \
+         execution path uses the same resolved install policy"
     );
 }
 
