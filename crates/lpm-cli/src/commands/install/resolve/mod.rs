@@ -1,7 +1,13 @@
 pub(super) mod metadata;
+pub(super) mod metrics;
+pub(super) mod parity;
 
 pub(super) use metadata::{
     MetadataCaches, MetadataRequestContext, MetadataStats, metadata_for_package,
+};
+pub(super) use metrics::{InstallerSpikeStageTimings, InstallerSpikeStats};
+pub(super) use parity::{
+    InstallerSpikeParity, InstallerSpikeParityMode, compare_package_parity_with_baseline,
 };
 
 pub(super) type PackageIdentity = (String, String);
