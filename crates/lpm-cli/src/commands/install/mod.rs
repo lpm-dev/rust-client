@@ -90,6 +90,7 @@ use policy_extensions::{
     reject_remote_tarball_url_deps_with_policy_extensions, run_policy_extensions,
 };
 use reporting::*;
+use resolve::*;
 use setup::*;
 use skills::*;
 use source_resolution::*;
@@ -464,8 +465,8 @@ async fn run_with_options_under_store_lock(
         pubgrub_opt_out,
         configured_linker_mode,
         peer_conflict_auto_isolation_allowed,
-        mut auto_isolated_peer_conflicts,
-        mut linker_mode,
+        auto_isolated_peer_conflicts,
+        linker_mode,
         requested_v2_mode,
         manifest_deps,
         production_dependency_names,
@@ -793,36 +794,6 @@ async fn run_with_options_under_store_lock(
         auto_install_peers,
         json_output,
     })?;
-    // applied-override trace for the rest of the
-    // install pipeline. Empty for the lockfile-fast-path branch (we
-    // preserve the previously-recorded trace from disk in that case);
-    // populated for fresh resolution from the resolver's apply log.
-    let mut applied_overrides: Vec<OverrideHit> = Vec::new();
-
-    // best-effort peer-conflict
-    // reports from the resolver. Each entry is one peer canonical
-    // whose required consumer ranges were pairwise-incompatible: the
-    // resolver picked the version satisfying the most consumers and
-    // recorded the unsatisfied ones here. Surfaced as a `WARN` block
-    // in text mode AND as the always-present `peer_conflicts` array
-    // on `--json` output so machine consumers (CI, dashboards, audit
-    // tooling) can rely on the field's existence.
-    //
-    // Empty for the lockfile-fast-path (no fresh resolve); empty when
-    // the peer graph is clean. Always serialized as an array — even
-    // empty — to match the `applied_patches` shape contract that
-    // tooling already depends on.
-    let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
-    let mut peer_warnings: Vec<PeerWarning> = Vec::new();
-
-    // ambient peer installs synthesized by the resolver,
-    // captured here so the cold-resolve lockfile-write site below
-    // can persist them. Empty when the fast path takes over (we
-    // already have the lockfile, no need to re-derive); populated by
-    // the fresh-resolve branch from
-    // `resolve_result.ambient_peer_installs`.
-    let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
-
     // The fetch semaphore is hoisted out of the fetch loop so the optional
     // speculative dispatcher can share the download pool with the
     // post-resolve real-fetch loop. Without sharing, a
@@ -1018,721 +989,76 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
-    // pre-resolve direct
-    // tarball-URL deps from the manifest BEFORE the resolver runs.
-    // Each tarball-URL dep is downloaded, extracted into the
-    // integrity-keyed CAS, and turned into an InstallPackage with
-    // `source = "tarball+<url>"`. The resolver only sees the
-    // remaining registry-style deps. The merged package list is
-    // assembled post-resolver below.
-    let NonRegistryPreResolveResult {
-        install_pkgs: tarball_url_install_pkgs,
-        source_deps: non_registry_source_deps,
-        additional_workspace_links,
-    } = pre_resolve_non_registry_deps(
-        &arc_client,
-        &store,
-        project_dir,
-        &mut deps,
-        json_output,
-        strict_integrity,
-        // Invariant invariant: pass the FULL workspace membership
-        // set (`all_workspace_members`), not the extracted top-level
-        // subset (`workspace_member_deps`). overlap detection AND
-        // the the invariant transitive `workspace:` check both need to see
-        // every member, regardless of whether the consumer's root
-        // explicitly references them via `workspace:*`. See the
-        // construction comment near line 2807.
-        &all_workspace_members,
-    )
-    .await?;
-
-    // Merge the workspace members discovered through dedupe
-    // (immediate file:/link: + transitive walker) and the transitive
-    // `workspace:` arm into the slice that drives `link_workspace_members`.
-    // Dropping either branch leaves the root-symlink set incomplete:
-    // - `"foo": "file:./packages/foo"` where foo is a member
-    // produced no `node_modules/foo` after install.
-    // - `"foo": "workspace:*"` + foo's `bar: workspace:*` produced
-    // `node_modules/foo` but no `node_modules/bar`.
-    //
-    // Dedupe key: `(name, canonical source_dir)`. Same name pointing
-    // at the same realpath = one entry; aliased references (e.g.,
-    // consumer's `"alias-of-foo": "file:./packages/foo"` plus
-    // `"foo": "workspace:*"`) get distinct entries so each gets its
-    // own `node_modules/<name>` symlink. (`workspace_member_deps` is
-    // mutable from its declaration site; the invariant hoisted the
-    // pre-pass before the offline/online dispatch.)
-    merge_workspace_member_links(
-        &mut workspace_member_deps,
-        additional_workspace_links.into_iter().chain(
-            v2_workspace_root_pre_resolve
-                .additional_workspace_links
-                .iter()
-                .cloned(),
-        ),
-    );
-
-    // **Invariant invariant — factor BFS into helper.** The
-    // the invariant BFS lived inline here, which left the offline branch
-    // at `run_link_and_finish` (install.rs:3252) without expansion
-    // — the regression reproduced an offline install dropping
-    // `node_modules/bar`. Helper now lives at
-    // `expand_workspace_member_deps_with_transitives` and is called
-    // from BOTH the online path (here, after merge of
-    // `additional_workspace_links`) AND the offline path (right
-    // before `run_link_and_finish` is invoked).
-    expand_workspace_member_deps_with_transitives(
-        &mut workspace_member_deps,
-        &all_workspace_members,
-    )?;
-
-    // stats — filled by the speculation dispatcher drain.
-    let spec_tracker = SpeculativeKeyTracker::default();
-
-    //: shared fetch coordinator — serializes per-key fetch
-    // work across the speculative dispatcher and the real fetch loop
-    // now that the drain-wait between them is gone.
     let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
-
-    // Speculation handles are hoisted out of the fresh-resolve arm so
-    // the main task drains them after the real fetch loop. Awaiting
-    // the dispatcher early removes the resolve/fetch overlap.
-    let mut speculation_join: Option<SpeculationJoin> = None;
-    let mut fetch_overlap_join: Option<FetchOverlapJoin> = None;
-    let mut npm_firewall_preflight_join: Option<NpmFirewallPreflightJoin> = None;
-    let mut post_firewall_fetch_overlap_allowed = false;
-    // Post-lockfile metadata: which resolver actually ran.
-    // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
-    // write site below. Defaults to the greedy-fusion install default
-    // (matches `Lockfile::new()`) and is overridden inside the fresh-
-    // resolve dispatch branch when the legacy walker arm or the
-    // PubGrub escape hatch fires. Previously this field was hardcoded
-    // to "pubgrub" inside `Lockfile::new`, so every default install
-    // post-v0.28.0 wrote a lie into the lockfile.
-    let mut resolved_with: &'static str = "greedy-fusion";
-    //: streaming-BFS observability counters. Shared Arc
-    // between the resolver (incrementing inside `ensure_cached` +
-    // `direct_fetch_and_cache`) and the JSON-output block that
-    // snapshots the counts for `timing.resolve.streaming_bfs`.
-    // Declared at outer scope because the JSON emit is outside the
-    // fresh-resolve arm. Stays default-zero on the warm lockfile-
-    // fast-path where the walker never runs.
-    let streaming_metrics = lpm_resolver::StreamingBfsMetrics::new();
-
-    //a — substage breakdown of cold-resolve wall-clock.
-    // Captured here (outside the fresh/warm branch) so the JSON output
-    // code path can surface a consistent shape whether the lockfile
-    // fast path kicked in or not. Zeros on lockfile-fast-path;
-    // populated from the resolver on fresh resolution.
-    let mut initial_batch_ms: u128 = 0;
-    let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
-
-    // — stash the parsed lockfile + `needs_binary_upgrade`
-    // flag from the fast path so the writeback step at install-end
-    // can patch + re-emit it. `None` on fresh-resolve branches (the
-    // resolver builds its own lockfile via `resolved_to_install_packages`
-    // and the writer at install-end already handles that case).
-    let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
-    let mut lockfile_peer_context_authoritative = false;
-    let mut needs_binary_upgrade = false;
-
-    // `route_table` is built upstream of this fork (
-    // hoisted it above the lockfile-vs-resolve match so custom-
-    // registry tarball auth + stale-tarball invalidation work on both
-    // arms; hoisted it further to above the empty-deps
-    // short-circuit so TLS overrides + `strict-ssl=false` security
-    // warning surface for empty-deps installs too).
-    let wf_setup_ms = start.elapsed().as_millis();
-    let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
-        match lockfile_result {
-            Some(fast_path) => {
-                if !json_output {
-                    output::info(&format!(
-                        "Using lockfile ({} packages)",
-                        fast_path.packages.len().to_string().bold()
-                    ));
-                }
-                lockfile_peer_context_authoritative = fast_path.lockfile.metadata.lockfile_version
-                    >= MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE;
-                fast_path_lockfile = Some(fast_path.lockfile);
-                needs_binary_upgrade = fast_path.needs_binary_upgrade;
-                // Fast path doesn't run the resolver, so we have no
-                // registry metadata — the `+` list's "(vX.Y.Z available)"
-                // hint is suppressed in this branch. Honest > guessing.
-                (fast_path.packages, 0u128, true, 0usize, HashMap::new())
-            }
-            None => {
-                let resolve_start = Instant::now();
-                // The persistent `› Resolving …` phase line above already
-                // narrates that resolution is in flight — no spinner needed.
-
-                // route_table is constructed above the lockfile match
-                // () — we just borrow/clone it here.
-
-                // **Default flip .** Greedy-fusion is now the
-                // global install default. The fused dispatcher
-                // (`resolve_greedy_fused`) skips the walker spawn entirely
-                // and IS the metadata fetch dispatcher.
-                //
-                // Resolver dispatch matrix:
-                //
-                // | LPM_RESOLVER | LPM_GREEDY_FUSION | Result |
-                // |-----------------|-------------------|-------------------------|
-                // | unset (default) | unset / non-"0" | greedy-fusion (new) |
-                // | unset (default) | "0" | greedy + legacy walker |
-                // | "greedy" | unset / non-"0" | greedy-fusion |
-                // | "greedy" | "0" | greedy + legacy walker |
-                // | "pubgrub" | (any) | PubGrub + legacy walker |
-                //
-                // Escape hatches:
-                // - `LPM_RESOLVER=pubgrub` — full opt-out to the previous
-                // install default (PubGrub-with-split-retry + walker).
-                // Use only if you hit a greedy-fusion edge case in the
-                // wild and need a tested fallback while we land a fix.
-                // - `LPM_GREEDY_FUSION=0` — opt-out from the fused
-                // dispatcher to the legacy walker arm ( // orchestration: walker + dispatcher +
-                // resolver_with_shared_cache in parallel) while still
-                // using the greedy resolver. Useful for debugging
-                // dispatcher-specific issues with greedy-resolver
-                // behavior held constant.
-                //
-                // Reference n=20 bench (median, bench/fixture-large):
-                // greedy-stream (walker) 4,521 ms total
-                // greedy-fusion 918 ms total
-                // -3,603 ms median delta, paired t = -23.27. The default-
-                // flip preserves these numbers (now reachable without the
-                // `LPM_RESOLVER=greedy` opt-in env var).
-                // `pubgrub_opt_out` and `auto_install_peers`
-                // are computed at the top of `run_with_options` (above
-                // the lockfile fast-path call) so the v1-lockfile gate
-                // and the pubgrub-mismatch warning fire even on warm
-                // installs that take the lockfile fast path. The two
-                // values are reused unchanged here.
-                let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
-                let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
-
-                // Stamp `lpm.lock`'s `resolved-with` field with the arm
-                // that's about to run. Mirrors the dispatch matrix in the
-                // comment block above. Read by the cold-resolve writer
-                // at the bottom of `run_with_options`.
-                resolved_with = if pubgrub_opt_out {
-                    "pubgrub"
-                } else if fusion_disabled {
-                    "greedy"
-                } else {
-                    "greedy-fusion"
-                };
-                let speculation_deps: HashMap<String, String> = if omit_policy.dev {
-                    deps.iter()
-                        .filter(|(name, _)| production_dependency_names.contains(*name))
-                        .map(|(name, range)| (name.clone(), range.clone()))
-                        .collect()
-                } else {
-                    deps.clone()
-                };
-
-                let (resolve_res, initial_batch_ms_measured): (
-                    Result<lpm_resolver::ResolveResult, LpmError>,
-                    u128,
-                ) = if fusion_enabled_local {
-                    // ── FUSION PATH ─────────────────────────────────────
-                    let fetch_overlap_allowed_local =
-                        fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev);
-                    let preflight_disables_tarball_prefetch = npm_firewall_mode
-                        .disables_tarball_prefetch()
-                        || policy_extensions_disable_tarball_prefetch(&policy_extension_configs);
-                    let fetch_overlap_downloads_during_resolve =
-                        fetch_overlap_allowed_local && !preflight_disables_tarball_prefetch;
-                    if preflight_disables_tarball_prefetch && fetch_overlap_allowed_local {
-                        post_firewall_fetch_overlap_allowed = true;
-                    }
-                    let npm_fanout = positive_usize_env_or_default(
-                        "LPM_NPM_FANOUT",
-                        default_fusion_npm_fanout(
-                            fetch_overlap_downloads_during_resolve,
-                            resolver_min_age_secs,
-                        ),
-                    );
-                    let speculation_permits = positive_usize_env_or_default(
-                        ENV_FUSION_SPECULATION_PERMITS,
-                        DEFAULT_FUSION_SPECULATION_PERMITS,
-                    );
-
-                    let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members)?;
-                    let (spec_tx, spec_rx) =
-                        tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
-                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                        spec_rx,
-                        arc_client.clone(),
-                        route_table.clone(),
-                        store.clone(),
-                        fetch_semaphore.clone(),
-                        Some(Arc::new(Semaphore::new(speculation_permits))),
-                        fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch()
-                            || policy_extensions_disable_tarball_prefetch(&policy_extension_configs)
-                        {
-                            HashMap::new()
-                        } else {
-                            speculation_deps
-                        },
-                        spec_tracker.clone(),
-                        store_v2_handle.clone(),
-                        fetch_extract_limiter.clone(),
-                    );
-                    let selected_package_fetch_overlap_allowed = fetch_overlap_allowed_local
-                        && !policy_extensions_disable_tarball_prefetch(&policy_extension_configs);
-                    let selected_package_tx = if selected_package_fetch_overlap_allowed {
-                        if npm_firewall_mode.is_enabled() {
-                            let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
-                            let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
-                            fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
-                                fetch_rx,
-                                arc_client.clone(),
-                                route_table.clone(),
-                                store.clone(),
-                                store_v2_handle.clone(),
-                                fetch_semaphore.clone(),
-                                fetch_coord.clone(),
-                                project_dir.to_path_buf(),
-                                gate_stats.clone(),
-                                fetch_extract_limiter.clone(),
-                                streaming_fetch,
-                                1,
-                            ));
-                            npm_firewall_preflight_join =
-                                Some(spawn_chunked_npm_firewall_preflight(
-                                    selected_rx,
-                                    fetch_tx,
-                                    arc_client.clone(),
-                                    NpmFirewallChunkedPreflightConfig {
-                                        route_table: route_table.clone(),
-                                        mode: npm_firewall_mode,
-                                        lookup_mode: npm_firewall_lookup_mode,
-                                        offline,
-                                        chunk_size: npm_firewall_chunk_size,
-                                    },
-                                ));
-                            Some(selected_tx)
-                        } else {
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                            fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
-                                rx,
-                                arc_client.clone(),
-                                route_table.clone(),
-                                store.clone(),
-                                store_v2_handle.clone(),
-                                fetch_semaphore.clone(),
-                                fetch_coord.clone(),
-                                project_dir.to_path_buf(),
-                                gate_stats.clone(),
-                                fetch_extract_limiter.clone(),
-                                streaming_fetch,
-                                fetch_overlap_min_selected(),
-                            ));
-                            Some(tx)
-                        }
-                    } else {
-                        None
-                    };
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events(
-                        arc_client.clone(),
-                        deps.clone(),
-                        override_set.clone(),
-                        route_table.clone(),
-                        npm_fanout,
-                        Some(spec_tx),
-                        shared_cache,
-                        auto_install_peers,
-                        !omit_policy.optional,
-                        resolver_policy.clone(),
-                        selected_package_tx,
-                    )
-                    .await
-                    .map_err(crate::resolver_error::resolver_error_to_lpm);
-
-                    // initial_batch_ms is meaningless under fusion (no
-                    // walker → no roots-ready boundary); 0 reads as
-                    // "lockfile fast path" in --json which is technically
-                    // wrong but harmless — the real story is in
-                    // `timing.resolve.dispatcher.*` (W1 plumbing).
-                    speculation_join = Some(SpeculationJoin {
-                        producer: None,
-                        dispatcher: dispatcher_handle,
-                        dispatched: dispatcher_counters.dispatched,
-                        completed: dispatcher_counters.completed,
-                        task_ms_sum: dispatcher_counters.task_ms_sum,
-                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                        max_depth_reached: dispatcher_counters.max_depth_reached,
-                        no_version_match: dispatcher_counters.no_version_match,
-                        unresolved_parked: dispatcher_counters.unresolved_parked,
-                        failed: dispatcher_counters.failed,
-                        skipped_no_permit: dispatcher_counters.skipped_no_permit,
-                        skipped_auth: dispatcher_counters.skipped_auth,
-                    });
-                    (res, 0u128)
-                } else {
-                    // ── LEGACY PATH (walker + spec dispatcher) ──
-                    let dep_names: Vec<String> = deps.keys().cloned().collect();
-
-                    // orchestration (design): spawn walker +
-                    // dispatcher; resolve concurrently waiting on roots_ready.
-                    // Walker is the manifest producer; the dispatcher is the
-                    // pure consumer of the existing `(name, SpeculativePackageMetadata)`
-                    // mpsc. The three run in parallel — walker fetches,
-                    // dispatcher speculates tarballs, resolver waits on
-                    // roots_ready_rx then solves against the shared cache.
-                    //
-                    // Critically: walker + dispatcher `JoinHandle`s are NOT
-                    // awaited here. They're bundled into `SpeculationJoin` below
-                    // and drained at the existing post-fetch drain point —
-                    // preserving the speculation overlap and
-                    // matching design's "tail drains post-fetch, not
-                    // aborted" invariant.
-                    use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
-                    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members)?;
-                    let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
-                    // wait-loop shutdown handshake: the walker stores
-                    // `true` (Release) and broadcasts `notify_waiters()` across
-                    // every notify_map entry at the end of its `run()`. The
-                    // resolver's wait-loop in `ensure_cached` checks this flag
-                    // after `Notified::enable()` and short-circuits to the
-                    // escape-hatch fetch in microseconds, instead of burning
-                    // the full `fetch_wait_timeout` for keys the walker decided
-                    // not to fetch. Same Arc on both sides — must be allocated
-                    // before either is constructed.
-                    let walker_done: WalkerDone =
-                        Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let (spec_tx, spec_rx) =
-                        tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
-                    let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
-
-                    let batch_start = Instant::now();
-
-                    // Walker — metadata producer.
-                    let walker_handle = if dep_names.is_empty() {
-                        // No deps → fire roots_ready immediately + flip the
-                        // walker_done flag so any (vacuously-empty) wait-loop
-                        // sleeper short-circuits, then spawn a no-op task so
-                        // the `SpeculationJoin` shape stays uniform.
-                        let _ = roots_ready_tx.send(());
-                        walker_done.store(true, std::sync::atomic::Ordering::Release);
-                        tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
-                    } else {
-                        tokio::spawn(
-                            BfsWalker::new(
-                                arc_client.clone(),
-                                shared_cache.clone(),
-                                notify_map.clone(),
-                                walker_done.clone(),
-                                spec_tx,
-                                roots_ready_tx,
-                                dep_names.clone(),
-                                route_table.clone(),
-                            )
-                            .run(),
-                        )
-                    };
-
-                    // Dispatcher — speculation consumer.
-                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                        spec_rx,
-                        arc_client.clone(),
-                        route_table.clone(),
-                        store.clone(),
-                        fetch_semaphore.clone(),
-                        None,
-                        fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch()
-                            || policy_extensions_disable_tarball_prefetch(&policy_extension_configs)
-                        {
-                            HashMap::new()
-                        } else {
-                            speculation_deps
-                        },
-                        spec_tracker.clone(),
-                        store_v2_handle.clone(),
-                        fetch_extract_limiter.clone(),
-                    );
-
-                    // Resolver — awaits roots_ready then solves against the
-                    // shared cache. `fetch_wait_timeout` = 5s is the design
-                    // default: the provider waits on the per-canonical
-                    // Notify for up to 5s before falling through to its
-                    // escape-hatch fetch.
-                    let resolve_client = arc_client.clone();
-                    let resolve_deps = deps.clone();
-                    let resolve_overrides = override_set.clone();
-                    let shared_cache_for_resolve = shared_cache.clone();
-                    let notify_map_for_resolve = notify_map.clone();
-                    let walker_done_for_resolve = walker_done.clone();
-                    //: clone the outer-scope metrics Arc for the
-                    // resolver's ownership; the outer `streaming_metrics`
-                    // stays readable by the JSON-emit block via its own Arc
-                    // handle.
-                    let streaming_metrics_for_resolve = streaming_metrics.clone();
-                    // `initial_batch_ms` captures the time from
-                    // orchestration start to the moment the resolver could
-                    // begin solving — i.e. roots-ready fire. This is the
-                    // new-shape analog of the pre-49 "batch prefetch done"
-                    // timestamp. Measuring it at the end of resolve (as the
-                    // previously code did) lumped in PubGrub wall-clock, which
-                    // made the JSON output internally inconsistent — PubGrub
-                    // timing is already reported separately by
-                    // `resolver_stage_timing.pubgrub_ms`.
-                    let (resolve_res_legacy, batch_ms): (
-                        Result<lpm_resolver::ResolveResult, LpmError>,
-                        u128,
-                    ) = async {
-                        let _ = roots_ready_rx.await;
-                        let roots_ready_at = batch_start.elapsed().as_millis();
-                        let w2_resolve_start = Instant::now();
-                        let result = lpm_resolver::resolve_with_shared_cache_options_and_policy(
-                            resolve_client,
-                            resolve_deps,
-                            resolve_overrides,
-                            shared_cache_for_resolve,
-                            notify_map_for_resolve,
-                            walker_done_for_resolve,
-                            std::time::Duration::from_secs(5),
-                            route_table.clone(),
-                            streaming_metrics_for_resolve,
-                            auto_install_peers,
-                            !omit_policy.optional,
-                            resolver_policy.clone(),
-                        )
-                        .await
-                        .map_err(crate::resolver_error::resolver_error_to_lpm);
-                        tracing::debug!(
-                            "perf.w2_resolve_after_roots ms={}",
-                            w2_resolve_start.elapsed().as_millis()
-                        );
-                        (result, roots_ready_at)
-                    }
-                    .await;
-
-                    speculation_join = Some(SpeculationJoin {
-                        producer: Some(walker_handle),
-                        dispatcher: dispatcher_handle,
-                        dispatched: dispatcher_counters.dispatched,
-                        completed: dispatcher_counters.completed,
-                        task_ms_sum: dispatcher_counters.task_ms_sum,
-                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                        max_depth_reached: dispatcher_counters.max_depth_reached,
-                        no_version_match: dispatcher_counters.no_version_match,
-                        unresolved_parked: dispatcher_counters.unresolved_parked,
-                        failed: dispatcher_counters.failed,
-                        skipped_no_permit: dispatcher_counters.skipped_no_permit,
-                        skipped_auth: dispatcher_counters.skipped_auth,
-                    });
-
-                    (resolve_res_legacy, batch_ms)
-                };
-                initial_batch_ms = initial_batch_ms_measured;
-
-                let resolve_result = resolve_res?;
-
-                // The speculation join drains after fetch so downloads
-                // dispatched during resolution can overlap the authoritative
-                // fetch phase without being awaited early.
-                let ms = resolve_start.elapsed().as_millis();
-
-                // Post-resolution peer dependency check: warn about unmet peers
-                // using each package's actual selected version (not a union).
-                //
-                // Peer rules from `package.json > lpm.peerDependencyRules`
-                // (translated from `pnpm.peerDependencyRules` by `lpm migrate`)
-                // are compiled once and applied inside the warning loop.
-                // `ignore_missing` suppresses missing-peer warnings,
-                // `allow_any` suppresses version-mismatch warnings, and
-                // `allowed_versions` widens the accepted range as a fallback.
-                //
-                // Compile is **fail-closed** — any unparseable selector key
-                // or version range in `allowed_versions` aborts the install
-                // before any further work. Mirrors the `OverrideSet::parse`
-                // posture for `lpm.overrides`. Hand-authored typos surface
-                // here rather than silently no-op'ing the rule.
-                let peer_rules_cfg = pkg.lpm.as_ref().map(|l| &l.peer_dependency_rules);
-                let compiled_peer_rules = match peer_rules_cfg {
-                    Some(r) => CompiledPeerRules::compile(
-                        &r.ignore_missing,
-                        &r.allowed_versions,
-                        &r.allow_any,
-                    )
-                    .map_err(|e| {
-                        LpmError::Script(format!("invalid lpm.peerDependencyRules: {e}"))
-                    })?,
-                    None => CompiledPeerRules::default(),
-                };
-                peer_warnings = check_unmet_peers(
-                    &resolve_result.packages,
-                    &resolve_result.cache,
-                    &compiled_peer_rules,
-                );
-                if !peer_warnings.is_empty() && !json_output {
-                    for w in &peer_warnings {
-                        output::warn(&format!("peer dep: {w}"));
-                    }
-                }
-
-                // capture the override apply trace
-                // from this fresh resolution. We surface it to the install
-                // summary, the JSON output, and `.lpm/overrides-state.json`.
-                applied_overrides = resolve_result.applied_overrides.clone();
-
-                //capture best-effort peer-conflict reports. Drained
-                // alongside applied_overrides so the JSON envelope below
-                // can serialize them whether or not the user is running
-                // with `--json`. Cloned (not moved) because
-                // `resolve_result` is consumed by `resolved_to_install_packages`
-                // a few lines down.
-                peer_conflicts = resolve_result.peer_conflicts.clone();
-
-                if strict_peer_dependencies
-                    && let Some(err) = strict_peer_dependency_error(&peer_warnings, &peer_conflicts)
-                {
-                    return Err(err);
-                }
-
-                if peer_conflict_auto_isolation_allowed {
-                    auto_isolated_peer_conflicts = !peer_conflicts.is_empty();
-                    linker_mode = if auto_isolated_peer_conflicts {
-                        if matches!(configured_linker_mode, lpm_linker::LinkerMode::Hoisted)
-                            && !json_output
-                        {
-                            output::info(
-                                "Peer conflicts detected; using isolated linker for this install.",
-                            );
-                        }
-                        lpm_linker::LinkerMode::Isolated
-                    } else {
-                        configured_linker_mode
-                    };
-                }
-
-                // — capture the platform-filtered optional
-                // skip count. Surfaced as `timing.resolve.platform_skipped`
-                // in `--json` output.
-                let platform_skipped = resolve_result.platform_skipped;
-
-                // capture the resolver substage
-                // breakdown. Combined with the `initial_batch_ms`
-                // measurement above, these feed the cold-resolve
-                // observability story in `timing.resolve.*`.
-                resolver_stage_timing = resolve_result.stage_timing;
-
-                // clone the ambient peer install set BEFORE we
-                // hand `resolve_result` off to `resolved_to_install_packages`
-                // (which only borrows it). Persisted to the lockfile far
-                // below at the cold-resolve write site so warm reinstalls
-                // reproduce the same top-level node_modules layout.
-                ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
-
-                let mut packages = resolved_to_install_packages_with_workspace_members(
-                    &resolve_result.packages,
-                    &deps,
-                    &resolve_result.root_aliases,
-                    &resolve_result.ambient_peer_installs,
-                    &resolve_result.cache,
-                    &route_table,
-                    &all_workspace_members,
-                    project_dir,
-                );
-
-                // Snapshot the resolver's metadata cache as
-                // `canonical_name → latest stable version`. The map drives
-                // the post-install `+` list's `(vX.Y.Z available)` hint
-                // when a direct dep was pinned to an older version than
-                // the registry's current `latest` stable release.
-                let latest_stable = build_latest_stable_versions(&resolve_result.cache);
-
-                // + (manifest wiring): merge
-                // in the non-registry InstallPackages produced by
-                // `pre_resolve_non_registry_deps`. They were fetched +
-                // extracted before the resolver ran (so the source-aware
-                // fast-path will mark them cached on the next iteration),
-                // but they aren't part of the resolver's output — append
-                // them here so the install loop sees the full set.
-                packages.extend(tarball_url_install_pkgs.iter().cloned());
-
-                // (-transitive): post-resolve fix-up.
-                // Now that BOTH the resolver output AND the non-registry
-                // InstallPackages are in `packages`, populate each
-                // directory/link InstallPackage's `dependencies` field
-                // from its stashed source-deps. Resolver-agnostic per
-                // plan — runs once after the merge regardless of
-                // PubGrub vs fusion.
-                apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
-                enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
-
-                if !json_output {
-                    // Persistent second phase line. Sub-second resolves don't
-                    // need their own "Resolved in Xms" beat — the count is
-                    // the signal, the timing lands in the verbose footer.
-                    let reported_install_count = requested_add_count.unwrap_or(packages.len());
-                    let firewall_active = npm_firewall_mode.is_enabled()
-                        && npm_firewall_has_packages(
-                            &packages,
-                            &route_table,
-                            arc_client.as_ref(),
-                            npm_firewall_lookup_mode,
-                        );
-                    let install_message = format!(
-                        "Installing {} {}",
-                        reported_install_count.to_string().bold(),
-                        install_ui::packages_word(reported_install_count),
-                    );
-                    install_ui::phase(&install_ui::with_firewall_badge(
-                        install_message,
-                        firewall_active,
-                    ));
-                    //surface best-effort peer-conflict reports as
-                    // warnings so the user knows which transitive
-                    // consumers got a peer version outside their declared
-                    // range. Mirrors npm v7+'s unconditional `npm WARN`
-                    // behavior. Suppressed under `--json` to keep
-                    // machine-readable output clean; `--json` consumers
-                    // get the same data on the always-present
-                    // `peer_conflicts` array in the install JSON envelope
-                    // (constructed below).
-                    for report in &resolve_result.peer_conflicts {
-                        let unsatisfied_str = report
-                            .unsatisfied_consumers
-                            .iter()
-                            .map(|(c, r)| format!("{c} wants {r}"))
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        output::warn(&format!(
-                            "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
-                            report.canonical.bold(),
-                            report.chosen_version,
-                            report.unsatisfied_consumers.len(),
-                            unsatisfied_str,
-                        ));
-                    }
-                }
-                (packages, ms, false, platform_skipped, latest_stable)
-            }
-        };
-    let wf_resolve_end_ms = start.elapsed().as_millis();
-
-    if requested_v2_mode && !v2_workspace_root_pre_resolve.install_pkgs.is_empty() {
-        packages.extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
-        apply_post_resolve_directory_link_fixup(
-            &mut packages,
-            &v2_workspace_root_pre_resolve.source_deps,
-        );
-    }
-    dedupe_install_packages_by_identity(&mut packages);
-
-    let packages_for_lockfile = packages.clone();
-    if omit_policy.dev {
-        filter_dev_packages(&mut packages, &production_dependency_names);
-    }
-    platform_skipped += filter_platform_packages(&mut packages)?;
+    let OnlineResolutionPhaseResult {
+        packages,
+        packages_for_lockfile,
+        resolve_ms,
+        used_lockfile,
+        platform_skipped,
+        latest_stable_versions,
+        applied_overrides,
+        peer_conflicts,
+        peer_warnings,
+        ambient_peer_installs_for_lockfile,
+        spec_tracker,
+        speculation_join,
+        mut fetch_overlap_join,
+        mut npm_firewall_preflight_join,
+        post_firewall_fetch_overlap_allowed,
+        resolved_with,
+        streaming_metrics,
+        initial_batch_ms,
+        resolver_stage_timing,
+        fast_path_lockfile,
+        lockfile_peer_context_authoritative,
+        needs_binary_upgrade,
+        wf_setup_ms,
+        wf_resolve_end_ms,
+        auto_isolated_peer_conflicts,
+        linker_mode,
+    } = run_online_resolution_phase(OnlineResolutionPhaseInput {
+        start,
+        lockfile_result,
+        arc_client: arc_client.clone(),
+        route_table: route_table.clone(),
+        project_dir,
+        deps: &mut deps,
+        pkg: &pkg,
+        requested_add_count,
+        json_output,
+        requested_v2_mode,
+        v2_workspace_root_pre_resolve: &v2_workspace_root_pre_resolve,
+        workspace_member_deps: &mut workspace_member_deps,
+        all_workspace_members: &all_workspace_members,
+        store: store.clone(),
+        store_v2_handle: store_v2_handle.clone(),
+        fetch_semaphore: fetch_semaphore.clone(),
+        fetch_extract_limiter: fetch_extract_limiter.clone(),
+        fetch_coord: fetch_coord.clone(),
+        gate_stats: gate_stats.clone(),
+        npm_firewall_mode,
+        npm_firewall_lookup_mode,
+        npm_firewall_chunk_size,
+        policy_extension_configs: &policy_extension_configs,
+        force,
+        offline,
+        omit_policy,
+        production_dependency_names: &production_dependency_names,
+        pubgrub_opt_out,
+        auto_install_peers,
+        resolver_policy: resolver_policy.clone(),
+        strict_peer_dependencies,
+        peer_conflict_auto_isolation_allowed,
+        configured_linker_mode,
+        auto_isolated_peer_conflicts,
+        linker_mode,
+        strict_integrity,
+        streaming_fetch,
+        resolver_min_age_secs,
+        override_set: override_set.clone(),
+    })
+    .await?;
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
