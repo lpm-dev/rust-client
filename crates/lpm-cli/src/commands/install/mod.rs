@@ -38,6 +38,7 @@ mod patches;
 mod peer;
 pub(crate) mod policy_extensions;
 mod reporting;
+mod resolve;
 mod setup;
 mod skills;
 mod source_resolution;
