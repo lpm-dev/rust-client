@@ -1,5 +1,5 @@
 #[derive(Debug, Default)]
-pub(in crate::commands::install) struct InstallerSpikeStats {
+pub(in crate::commands::install) struct ExperimentalResolverStats {
     pub(in crate::commands::install) metadata_requests: u64,
     pub(in crate::commands::install) metadata_cache_hits: u64,
     pub(in crate::commands::install) root_requests: u64,
@@ -17,7 +17,7 @@ pub(in crate::commands::install) struct InstallerSpikeStats {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::commands::install) struct InstallerSpikeStageTimings {
+pub(in crate::commands::install) struct ExperimentalResolverStageTimings {
     pub(in crate::commands::install) resolve_worklist_ms: u128,
     pub(in crate::commands::install) peer_drain_ms: u128,
     pub(in crate::commands::install) package_graph_ms: u128,
@@ -32,7 +32,7 @@ pub(in crate::commands::install) struct InstallerSpikeStageTimings {
     pub(in crate::commands::install) link_finalize_ms: u128,
 }
 
-impl InstallerSpikeStageTimings {
+impl ExperimentalResolverStageTimings {
     pub(in crate::commands::install) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "resolve_worklist_ms": self.resolve_worklist_ms,
