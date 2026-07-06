@@ -82,16 +82,26 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/commands/install/lifecycle.rs"
     ));
+    let fetch_src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/install/fetch.rs"
+    ));
     const DRIFT_MARKER: &str = "provenance-drift gate";
     const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const FETCH_HANDOFF: &str = "run_online_fetch_phase(OnlineFetchPhaseInput";
     const AUTO_BUILD_HANDOFF: &str = "run_online_auto_build_phase(OnlineAutoBuildPhaseInput";
 
-    let drift_pos = install_src.find(DRIFT_MARKER).unwrap_or_else(|| {
+    assert!(
+        fetch_src.contains(DRIFT_MARKER),
+        "drift-gate marker `{DRIFT_MARKER}` disappeared from install/fetch.rs — \
+         if the comment was legitimately renamed, update this test with the \
+         new marker. If the drift gate was removed, that's a major regression \
+         that needs explicit signoff."
+    );
+    let fetch_pos = install_src.find(FETCH_HANDOFF).unwrap_or_else(|| {
         panic!(
-            "drift-gate marker `{DRIFT_MARKER}` disappeared from install/mod.rs — \
-             if the comment was legitimately renamed, update this test with the \
-             new marker. If the drift gate was removed, that's a major regression \
-             that needs explicit signoff."
+            "fetch handoff (`{FETCH_HANDOFF}`) not found in install/mod.rs — \
+             update this test if the handoff was legitimately renamed."
         )
     });
     let handoff_pos = install_src.find(AUTO_BUILD_HANDOFF).unwrap_or_else(|| {
@@ -107,9 +117,10 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
          to target the new call."
     );
     assert!(
-        drift_pos < handoff_pos,
-        "Order invariant broken: the provenance-drift gate (byte {drift_pos}) \
-         MUST appear before the auto-build handoff (byte {handoff_pos}) in \
+        fetch_pos < handoff_pos,
+        "Order invariant broken: the fetch phase containing the provenance-drift \
+         gate (byte {fetch_pos}) MUST appear before the auto-build handoff \
+         (byte {handoff_pos}) in \
          install/mod.rs. Reordering them means a drifted approval could spawn scripts \
          before the drift check fires — violating the approved execution order."
     );
