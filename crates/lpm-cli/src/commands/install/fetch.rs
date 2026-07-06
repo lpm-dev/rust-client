@@ -1,3 +1,6 @@
+use indicatif::{ProgressBar, ProgressStyle};
+use tokio::sync::Mutex as AsyncMutex;
+
 use super::*;
 
 pub(super) type FetchLock = Arc<AsyncMutex<()>>;
@@ -106,6 +109,1736 @@ async fn acquire_fetch_extract_permit(
         )?)),
         None => Ok(None),
     }
+}
+
+pub(super) struct OnlineFetchPhaseInput<'a> {
+    pub(super) start: Instant,
+    pub(super) arc_client: Arc<RegistryClient>,
+    pub(super) route_table: RouteTable,
+    pub(super) project_dir: &'a Path,
+    pub(super) packages: Vec<InstallPackage>,
+    pub(super) packages_for_lockfile: Vec<InstallPackage>,
+    pub(super) store: PackageStore,
+    pub(super) store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
+    pub(super) fetch_semaphore: Arc<Semaphore>,
+    pub(super) fetch_extract_limiter: FetchExtractLimiter,
+    pub(super) fetch_coord: Arc<FetchCoordinator>,
+    pub(super) speculation_join: Option<SpeculationJoin>,
+    pub(super) fetch_overlap_join: Option<FetchOverlapJoin>,
+    pub(super) spec_tracker: SpeculativeKeyTracker,
+    pub(super) gate_stats: Arc<GateStats>,
+    pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
+    pub(super) used_lockfile: bool,
+    pub(super) lockfile_peer_context_authoritative: bool,
+    pub(super) force: bool,
+    pub(super) force_security_floor: bool,
+    pub(super) allow_new: bool,
+    pub(super) effective_min_age_secs: u64,
+    pub(super) release_age_policy: crate::release_age_config::ReleaseAgePolicy,
+    pub(super) minimum_release_age_exclude: &'a HashSet<String>,
+    pub(super) drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    pub(super) verify_policy: crate::provenance_fetch::VerifyPolicy,
+    pub(super) global_config: &'a crate::commands::config::GlobalConfig,
+    pub(super) lpm_root: &'a lpm_common::LpmRoot,
+    pub(super) provenance_timings: &'a Option<crate::provenance_fetch::ProvenanceTimings>,
+    pub(super) json_output: bool,
+    pub(super) streaming_fetch: bool,
+    pub(super) timing_detail_mode: TimingDetailMode,
+    pub(super) slow_package_timings: &'a mut SlowPackageTimings,
+    pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) compatibility_bin_names: &'a [String],
+}
+
+pub(super) struct OnlineFetchPhaseResult {
+    pub(super) packages: Vec<InstallPackage>,
+    pub(super) packages_for_lockfile: Vec<InstallPackage>,
+    pub(super) link_targets: Vec<LinkTarget>,
+    pub(super) event_driven_link: bool,
+    pub(super) event_link_handles: Vec<LinkHandle>,
+    pub(super) v2_mode: bool,
+    pub(super) v2_event_driven: bool,
+    pub(super) v2_plan: Option<Arc<lpm_linker::v2::LinkPlanV2>>,
+    pub(super) v2_event_link_handles: Vec<V2LinkHandle>,
+    pub(super) v2_link_task_timings: V2LinkTaskTimings,
+    pub(super) fetch_ms: u128,
+    pub(super) waterfall_start_ms: u128,
+    pub(super) waterfall_end_ms: u128,
+    pub(super) fetch_stage_timings: FetchStageTimings,
+    pub(super) cached: usize,
+    pub(super) downloaded: usize,
+    pub(super) fetch_breakdown: FetchBreakdown,
+    pub(super) walker_summary_final: Option<lpm_resolver::WalkerSummary>,
+    pub(super) spec_stats: SpeculativeStats,
+    pub(super) publish_ages: HashMap<(String, String), u64>,
+    pub(super) min_release_age_secs: u64,
+    pub(super) install_provenance_status_map:
+        HashMap<(String, String), lpm_common::ProvenanceStatus>,
+    pub(super) fresh_urls: HashMap<String, String>,
+}
+
+pub(super) async fn run_online_fetch_phase(
+    input: OnlineFetchPhaseInput<'_>,
+) -> Result<OnlineFetchPhaseResult, LpmError> {
+    let OnlineFetchPhaseInput {
+        start,
+        arc_client,
+        route_table,
+        project_dir,
+        mut packages,
+        mut packages_for_lockfile,
+        store,
+        store_v2_handle,
+        fetch_semaphore,
+        fetch_extract_limiter,
+        fetch_coord,
+        mut speculation_join,
+        mut fetch_overlap_join,
+        spec_tracker,
+        gate_stats,
+        current_patches,
+        used_lockfile,
+        lockfile_peer_context_authoritative,
+        force,
+        force_security_floor,
+        allow_new,
+        effective_min_age_secs,
+        release_age_policy,
+        minimum_release_age_exclude,
+        mut drift_ignore_policy,
+        mut verify_policy,
+        global_config,
+        lpm_root,
+        provenance_timings,
+        json_output,
+        streaming_fetch,
+        timing_detail_mode,
+        slow_package_timings,
+        linker_mode,
+        compatibility_bin_names,
+    } = input;
+    let mut spec_stats = SpeculativeStats::default();
+    let mut walker_summary_final: Option<lpm_resolver::WalkerSummary> = None;
+    // Step 3: Download & store (parallel).: `store` is
+    // already bound above — speculative dispatcher writes into it
+    // during resolve, so by the time we reach here the store may hold
+    // tarballs the `has_package` loop below picks up as cache hits.
+    let wf_fetch_start_ms = start.elapsed().as_millis();
+    let fetch_start = Instant::now();
+    let fetch_plan_start = Instant::now();
+    let mut fetch_stage_timings = FetchStageTimings::default();
+    let v2_link_task_timings = V2LinkTaskTimings::default();
+
+    // Aggregation buffer for fetch writeback. Populated inside the fetch
+    // block with final-URL pairs only when the final URL diverges from the
+    // stored lockfile URL. Keyed on PackageKey so a registry react@19.0.0
+    // and a tarball-URL react@19.0.0 don't clobber each other's writeback.
+    let mut fresh_urls: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut integrity_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    // Pre-compute the per-target patch fingerprint map so each `LinkTarget`
+    // carries its own `Some("p-…")` when patched. v2's GraphKey folds it in,
+    // splitting patched installs into project-isolated link entries.
+    let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
+
+    // Build link targets up front so the event-driven path can start
+    // per-package linking as each tarball lands.
+    // `LinkTarget` fields don't depend on fetch completion — just on
+    // resolver output — so building them here is safe. Reused by both
+    // the event-driven and serial link paths.
+    let source_index = Arc::new(source_dependency_index(&packages));
+    let link_targets: Vec<LinkTarget> = packages
+        .iter()
+        .map(|p| -> Result<LinkTarget, LpmError> {
+            // Typed-error path for the source-aware store path.
+            // - Source::Tarball (https://) routes to the integrity-
+            // keyed CAS.
+            // - Source::Tarball (file:) routes to the local-CAS
+            // ( follow-up).
+            // - Source::Directory / Link routes to the source's
+            // canonicalized realpath .
+            // - Source::Registry routes to the
+            // (name, version)-keyed slot.
+            Ok(LinkTarget {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                store_path: p.store_path_or_err(&store, project_dir, None)?,
+                dependencies: link_dependencies_for_package(p, &source_index)?,
+                aliases: p.aliases.clone(),
+                is_direct: p.is_direct,
+                root_link_names: p.root_link_names.clone(),
+                wrapper_id: p.wrapper_id_for_source(),
+                materialization: p.materialization_for_source(),
+                peers: p.peers.clone(),
+                patch_fingerprint: patch_fingerprints
+                    .get(&(p.name.clone(), p.version.clone()))
+                    .cloned(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Event-driven link mode runs per-package work inside the fetch pipeline,
+    // parallel with sibling tarball downloads, then runs final project wiring
+    // as one batch. `LPM_SERIAL_LINK=1` reverts to the single-shot
+    // `link_packages` path. The hoisted linker uses the serial path because
+    // it has a different layout model.
+    let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
+    let v2_mode = store_v2_handle.is_some();
+    if v2_mode {
+        let store_v2 = store_v2_handle
+            .as_deref()
+            .expect("v2_mode implies v2 store handle is available");
+        for target in &link_targets {
+            if !matches!(
+                target.materialization,
+                lpm_linker::Materialization::DirectorySource
+            ) {
+                continue;
+            }
+            let sri = local_source_sri_for_target(target);
+            store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+        }
+    }
+    // Under v2 mode, `link_packages_v2` needs the full LinkTarget set in one
+    // batch so the GraphKey pre-pass can resolve cross-references. The v2
+    // event-driven path below uses a separate prepare/one/finalize split.
+    let event_driven_link =
+        !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
+
+    // Collection of per-package link handles. Cached packages push into this
+    // before the fetch loop; fetch tasks push as each tarball materializes.
+    // Awaited during the link-finalize step below.
+    let mut event_link_handles: Vec<LinkHandle> = Vec::new();
+
+    // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
+    // CAS-backed target arrives with both
+    // (a) a known SRI (`p.integrity = Some(_)`), and
+    // (b) resolver-threaded peers (`LinkTarget.peers` populated, or
+    // the package declares no peer dependencies).
+    // Otherwise `link_v2_prepare` would silently produce an
+    // empty-peer-context graph key for any target whose peers are
+    // discovered post-fetch by reading `objects/<sri>/package.json`,
+    // diverging from the serial path. On predicate failure we fall
+    // through to today's serial v2 link at the link stage.
+    //
+    // Local-source targets now get synthetic v2 objects keyed by a
+    // stable sha512 of their resolved source identity, so they stay in
+    // the same target set as CAS-backed packages during GraphKey
+    // derivation and link-entry population.
+    //
+    // Mode independence: `link_v2_prepare` / `link_v2_one` /
+    // `link_v2_finalize` are linker-mode-agnostic for per-package
+    // work. `linker_mode` feeds into `LinkerModeTag` which is folded
+    // into graph-key derivation (Isolated vs Hoisted both produce
+    // valid keys), and `link_v2_finalize` handles project-side
+    // wiring identically across modes. So the gate does NOT require
+    // Isolated — the post-Hoisted default is fully
+    // supported.
+    let v2_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
+        let mut acc: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+        let mut all_have_sri = true;
+        for (lt, p) in link_targets.iter().zip(packages.iter()) {
+            match lt.materialization {
+                lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
+                    Some(sri) => acc.push(lpm_linker::v2::V2Target {
+                        target: lt.clone(),
+                        source_sri: sri.to_string(),
+                        verified_object_integrity: None,
+                        fresh_object: None,
+                    }),
+                    None => {
+                        all_have_sri = false;
+                        break;
+                    }
+                },
+                lpm_linker::Materialization::DirectorySource => {
+                    acc.push(lpm_linker::v2::V2Target {
+                        target: lt.clone(),
+                        source_sri: local_source_sri_for_target(lt),
+                        verified_object_integrity: None,
+                        fresh_object: None,
+                    });
+                }
+            }
+        }
+        if all_have_sri { acc } else { Vec::new() }
+    } else {
+        Vec::new()
+    };
+    // Why `v2_linking_can_prepare_before_fetch` instead of
+    // `LinkPlanV2::all_targets_have_resolver_threaded_peers`:
+    // `LinkTarget.peers` is empty for THREE reasons documented on the
+    // field — (a) package declares no peer deps, (b) all declared
+    // peers absent from install set, (c) an old lockfile fast-path
+    // didn't thread peers. (a) + (b) are legitimate empty results
+    // from a live resolver or a current-schema lockfile; (c) is the
+    // actual hazard the gate must catch.
+    // The library helper `all_targets_have_resolver_threaded_peers`
+    // uses `peers.is_empty()` as its sole signal, which conflates
+    // (a)+(b) with (c) and would reject most installs (any package
+    // with no peer deps fails it). On a fresh resolution, the
+    // resolver always traverses peer-context. On a current-schema
+    // lockfile fast path, the `peers` field is authoritative: empty
+    // means "no resolved peers", not "unknown". Older lockfiles
+    // remain conservative and fall back to serial v2.
+    let v2_event_driven = v2_linking_can_prepare_before_fetch(
+        v2_mode,
+        serial_link,
+        !v2_targets_pre.is_empty(),
+        used_lockfile,
+        lockfile_peer_context_authoritative,
+    );
+
+    // Plan + per-key V2Target index — both shared across the cache-hit
+    // dispatch loop and every per-pkg fetch task. `Arc<LinkPlanV2>`
+    // because the plan is read-only after build and lives across many
+    // blocking tasks. Empty on the !v2_event_driven path; the link
+    // stage falls through to `link_packages_v2` unchanged.
+    let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
+        let store_v2 = store_v2_handle
+            .as_deref()
+            .expect("v2_event_driven implies v2 store");
+        let plan = if used_lockfile && lockfile_peer_context_authoritative {
+            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
+                project_dir,
+                v2_targets_pre,
+                store_v2,
+                linker_mode,
+                compatibility_bin_names,
+            )?
+        } else {
+            lpm_linker::v2::link_v2_prepare_with_compatibility_bin_names(
+                project_dir,
+                v2_targets_pre,
+                store_v2,
+                linker_mode,
+                compatibility_bin_names,
+            )?
+        };
+        Some(std::sync::Arc::new(plan))
+    } else {
+        None
+    };
+    let v2_target_by_key: std::collections::HashMap<String, lpm_linker::v2::V2Target> =
+        if v2_event_driven {
+            packages
+                .iter()
+                .zip(link_targets.iter())
+                .filter_map(|(p, lt)| {
+                    let sri = match lt.materialization {
+                        lpm_linker::Materialization::CasBacked => {
+                            p.integrity.as_deref()?.to_string()
+                        }
+                        lpm_linker::Materialization::DirectorySource => {
+                            local_source_sri_for_target(lt)
+                        }
+                    };
+                    Some((
+                        install_pkg_key(p),
+                        lpm_linker::v2::V2Target {
+                            target: lt.clone(),
+                            source_sri: sri,
+                            verified_object_integrity: None,
+                            fresh_object: None,
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    // Per-package v2 link handles populated by both the cache-hit
+    // short-circuits below and the fetch tasks further down. Drained
+    // at the link stage and folded into the LinkResult.
+    let v2_link_task_semaphore = Arc::new(Semaphore::new(v2_link_task_concurrency(
+        v2_target_by_key.len(),
+    )));
+    let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
+    fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
+    let v2_prevalidate_start = Instant::now();
+    let v2_reusable_prevalidation = if !force && v2_mode {
+        match store_v2_handle.as_ref() {
+            Some(store_v2) => {
+                prevalidate_v2_reusable_objects(&packages, std::sync::Arc::clone(store_v2)).await?
+            }
+            None => V2ReusablePrevalidation {
+                hits: HashMap::new(),
+                candidate_count: 0,
+                concurrency: 0,
+                validation_timings: V2ReusableValidationTimings::default(),
+            },
+        }
+    } else {
+        V2ReusablePrevalidation {
+            hits: HashMap::new(),
+            candidate_count: 0,
+            concurrency: 0,
+            validation_timings: V2ReusableValidationTimings::default(),
+        }
+    };
+    fetch_stage_timings.v2_reusable_prevalidate_ms = v2_prevalidate_start.elapsed().as_millis();
+    fetch_stage_timings.v2_reusable_candidate_count =
+        v2_reusable_prevalidation.candidate_count as u64;
+    fetch_stage_timings.v2_reusable_concurrency = v2_reusable_prevalidation.concurrency as u64;
+    fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation.hits.len() as u64;
+    fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
+    let v2_reusable_objects = v2_reusable_prevalidation.hits;
+
+    // Stale-entry cleanup runs once, up front. It must happen before any
+    // per-package link spawn touches `.lpm/` so the `read_dir` scan sees a
+    // stable snapshot.
+    //
+    // Under v2 event-driven linking, `link_v2_prepare` already ran
+    // `cleanup_v1_state`, so this v1-shaped cleanup is skipped. Running it
+    // would wipe node_modules a second time with no benefit.
+    if event_driven_link {
+        lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
+    }
+
+    let mut to_download = Vec::new();
+    let mut cached = 0usize;
+    let cache_classify_start = Instant::now();
+    let fetch_detail_timing_enabled = timing_detail_mode.enabled();
+
+    for p in &packages {
+        // --force: re-download everything to verify integrity against registry,
+        // even if the store already has it. The store's extract-to-temp + atomic
+        // rename handles the case where the existing entry is valid.
+        //
+        // Use a source-aware existence check. For Source::Tarball, this consults the
+        // integrity-keyed CAS layout — a coincidentally-named
+        // registry copy in the legacy `(name, version)` slot does
+        // NOT satisfy the tarball dependency. Trust-on-first-use Source::Tarball
+        // (no recorded integrity) returns false → fetch runs.
+        //
+        // — under v2 mode, a hit in v1's
+        // `<HOME>/.lpm/store/v1/` does NOT mean v2's
+        // `objects/<sri>/` is populated. Force a fetch so the v2
+        // path repopulates the object. (follow-up:
+        // detect-and-translate v1 → v2 to skip re-download for
+        // already-extracted bytes.)
+        //
+        // Per-source carve-out: local sources (`Source::Directory`
+        // / `Source::Link`) still skip the fetch loop, but under v2
+        // they now flow through pre-populated synthetic objects
+        // instead of a project-root-only post-link step.
+        let is_local_source = matches!(
+            p.source_kind(),
+            Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
+        );
+        if is_local_source {
+            fetch_stage_timings.local_source_count += 1;
+        }
+
+        if v2_mode && is_local_source {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            cached += 1;
+            if v2_event_driven
+                && let Some(plan) = v2_plan.as_ref()
+                && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
+            {
+                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+                let plan_arc = std::sync::Arc::clone(plan);
+                let store_arc = std::sync::Arc::clone(
+                    store_v2_handle
+                        .as_ref()
+                        .expect("v2_event_driven implies v2 store"),
+                );
+                fetch_stage_timings.link_dispatch_count += 1;
+                v2_event_link_handles.push(spawn_v2_link_task(
+                    plan_arc,
+                    target,
+                    store_arc,
+                    Arc::clone(&v2_link_task_semaphore),
+                ));
+                record_timing_detail_ms(
+                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                    link_dispatch_start,
+                );
+            }
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_local_source_ms,
+                classification_start,
+            );
+            continue;
+        }
+
+        // When v2 mode is active AND the v2 object dir for this
+        // package's SRI already exists (populated by a prior install
+        // OR by the speculative pre-fetcher earlier in this install),
+        // skip the fetch entirely. The v2 link dispatch reads
+        // `objects/<sri>/` directly, so no per-package linker hint
+        // is needed here — same shape as the v1 cache-hit gate
+        // below.
+        //
+        // The v2 fetch path is idempotent (`extract_object_from_bytes`
+        // short-circuits on object hits), so a duplicate fetch is safe but
+        // wastes network on every package. Mock-registry workflow tests also
+        // expect one tarball request per package.
+        let package_key = install_pkg_key(p);
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(reusable_object) = v2_reusable_objects.get(&package_key)
+        {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            cached += 1;
+            spec_tracker.mark_consumed_if_completed(&package_key);
+            // The v2 object is already populated, so the link entry's
+            // clonefile pass can run on the blocking pool in parallel with
+            // sibling fetches. Awaited at the link stage below.
+            if v2_event_driven
+                && let Some(plan) = v2_plan.as_ref()
+                && let Some(target) = v2_target_by_key.get(&package_key).cloned()
+            {
+                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+                let mut target = target;
+                target.verified_object_integrity = Some(reusable_object.object_integrity.clone());
+                let plan_arc = std::sync::Arc::clone(plan);
+                let store_arc = std::sync::Arc::clone(
+                    store_v2_handle
+                        .as_ref()
+                        .expect("v2_event_driven implies v2 store"),
+                );
+                fetch_stage_timings.link_dispatch_count += 1;
+                v2_event_link_handles.push(spawn_v2_link_task(
+                    plan_arc,
+                    target,
+                    store_arc,
+                    Arc::clone(&v2_link_task_semaphore),
+                ));
+                record_timing_detail_ms(
+                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                    link_dispatch_start,
+                );
+            }
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_v2_reusable_hit_ms,
+                classification_start,
+            );
+            continue;
+        }
+
+        // — v1 → v2 cache-hit translation.
+        //
+        // When we're under v2 mode AND v1 already has the extracted
+        // bytes for this package AND we know the SRI (lockfile-fast-
+        // path or prior install populated `p.integrity`), copy the
+        // bytes from `~/.lpm/store/v1/<name>/<version>/` into
+        // `~/.lpm/store/v2/objects/<sri>/` instead of forcing a fresh
+        // tarball download. The translation is bounded by a single
+        // `copy_dir_recursively` (kernel CoW reflink on supporting
+        // filesystems, plain copy elsewhere) — cheaper than the
+        // network + extract round-trip.
+        //
+        // After translation, this package falls into the same
+        // `cached += 1; continue;` slot as the v1 cache-hit gate
+        // below, because the v2 link dispatch (around L5325) reads
+        // `~/.lpm/store/v2/objects/<sri>/` directly and the object
+        // is now populated.
+        //
+        // Falls through to the regular fetch path on any error — the
+        // re-download is the correct fallback and matches pre- // behavior under v2 mode.
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(v2_store) = store_v2_handle.as_deref()
+            && let Some(sri) = p.integrity.as_deref()
+            && p.store_has_source_aware(&store, project_dir)
+            && let Ok(v1_pkg_dir) = p.store_path_or_err(&store, project_dir, None)
+        {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
+                Ok(_) => {
+                    fetch_stage_timings.v1_to_v2_translate_count += 1;
+                    cached += 1;
+                    // Translation populated `objects/<sri>/`, so dispatch the
+                    // v2 link entry immediately.
+                    if v2_event_driven
+                        && let Some(plan) = v2_plan.as_ref()
+                        && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
+                    {
+                        let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+                        let plan_arc = std::sync::Arc::clone(plan);
+                        let store_arc = std::sync::Arc::clone(
+                            store_v2_handle
+                                .as_ref()
+                                .expect("v2_event_driven implies v2 store"),
+                        );
+                        fetch_stage_timings.link_dispatch_count += 1;
+                        v2_event_link_handles.push(spawn_v2_link_task(
+                            plan_arc,
+                            target,
+                            store_arc,
+                            Arc::clone(&v2_link_task_semaphore),
+                        ));
+                        record_timing_detail_ms(
+                            &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                            link_dispatch_start,
+                        );
+                    }
+                    record_timing_detail_ms(
+                        &mut fetch_stage_timings.cache_classify_v1_to_v2_translate_ms,
+                        classification_start,
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    fetch_stage_timings.v1_to_v2_translate_failure_count += 1;
+                    record_timing_detail_ms(
+                        &mut fetch_stage_timings.cache_classify_v1_to_v2_translate_ms,
+                        classification_start,
+                    );
+                    tracing::debug!(
+                        "v1→v2 translation for {}@{} failed: {e} (falling back to fetch)",
+                        p.name,
+                        p.version
+                    );
+                }
+            }
+        }
+
+        if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            cached += 1;
+            fetch_stage_timings.v1_cache_hit_count += 1;
+            spec_tracker.mark_consumed_if_completed(&package_key);
+            // Spawn per-package link task immediately. This package is already
+            // materialized in the store, so linking can run in parallel with
+            // the fetch loop below.
+            if event_driven_link {
+                // Source-aware store path keeps the linker pointed at
+                // the correct slot (tarball CAS for remote tarballs,
+                // tarball-local CAS for file: tarballs, source
+                // realpath for directory/link deps, registry CAS for
+                // Registry). `store_has_source_aware()` returned true
+                // above, so the SRI / source-path invariant holds —
+                // `store_path_or_err` can't fail.
+                let store_path = p.store_path_or_err(&store, project_dir, None)?;
+                let target = LinkTarget {
+                    name: p.name.clone(),
+                    version: p.version.clone(),
+                    store_path,
+                    dependencies: link_dependencies_for_package(p, &source_index)?,
+                    aliases: p.aliases.clone(),
+                    is_direct: p.is_direct,
+                    root_link_names: p.root_link_names.clone(),
+                    wrapper_id: p.wrapper_id_for_source(),
+                    materialization: p.materialization_for_source(),
+                    peers: p.peers.clone(),
+                    patch_fingerprint: patch_fingerprints
+                        .get(&(p.name.clone(), p.version.clone()))
+                        .cloned(),
+                };
+                let pd = project_dir.to_path_buf();
+                let force_flag = force;
+                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+                fetch_stage_timings.link_dispatch_count += 1;
+                event_link_handles.push(tokio::task::spawn_blocking(move || {
+                    lpm_linker::link_one_package(&pd, &target, force_flag)
+                }));
+                record_timing_detail_ms(
+                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                    link_dispatch_start,
+                );
+            }
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_v1_cache_hit_ms,
+                classification_start,
+            );
+        } else {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            to_download.push(p.clone());
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_download_candidate_ms,
+                classification_start,
+            );
+        }
+    }
+    fetch_stage_timings.cache_classify_ms = cache_classify_start.elapsed().as_millis();
+
+    let policy_gate_start = Instant::now();
+    let drift_ignore_packages: Vec<String> = match &drift_ignore_policy {
+        crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
+            let mut values: Vec<_> = names.iter().cloned().collect();
+            values.sort();
+            values
+        }
+        _ => Vec::new(),
+    };
+    let drift_ignore_unlock_authorized = if !matches!(
+        drift_ignore_policy,
+        crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+    ) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::ProvenanceIgnoreDrift,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install waives provenance drift checks for this project.",
+            None,
+            &drift_ignore_packages,
+        )?;
+        true
+    } else {
+        false
+    };
+    if force_security_floor
+        && !matches!(
+            drift_ignore_policy,
+            crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+        )
+        && !drift_ignore_unlock_authorized
+    {
+        let requested = match &drift_ignore_policy {
+            crate::provenance_fetch::DriftIgnorePolicy::EnforceAll => "enforce-all".to_string(),
+            crate::provenance_fetch::DriftIgnorePolicy::IgnoreAll => "ignore-all".to_string(),
+            crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
+                let mut values: Vec<_> = names.iter().cloned().collect();
+                values.sort();
+                values.join(",")
+            }
+        };
+        crate::security_floor::record_suppression(
+            crate::security_floor::SuppressionRecord::new(
+                crate::security_floor::GuardedControl::ProvenanceDriftWaiver,
+                crate::security_floor::SuppressionSource::Cli,
+                requested,
+                "enforce-all",
+            ),
+            json_output,
+        );
+        drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::EnforceAll;
+    }
+    let (_resolved_runtime_sigstore, runtime_sigstore_source) =
+        crate::provenance_fetch::EnforceMode::resolve_from_chain(
+            std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+            || global_config.get_sigstore_verify(),
+        );
+    crate::security_approval::ensure_runtime_sigstore_posture(
+        project_dir,
+        json_output,
+        verify_policy.enforce,
+        runtime_sigstore_source,
+    )?;
+    let unverified_provenance_packages: Vec<String> = match &verify_policy.skip {
+        crate::provenance_fetch::SkipPolicy::Names(names) => {
+            let mut values: Vec<_> = names.iter().cloned().collect();
+            values.sort();
+            values
+        }
+        _ => Vec::new(),
+    };
+    let unverified_provenance_unlock_authorized = if !matches!(
+        verify_policy.skip,
+        crate::provenance_fetch::SkipPolicy::None
+    ) && !matches!(
+        verify_policy.enforce,
+        crate::provenance_fetch::EnforceMode::Off
+    ) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::ProvenanceUnverified,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install skips Sigstore verification for one or more packages in this project.",
+            None,
+            &unverified_provenance_packages,
+        )?;
+        true
+    } else {
+        false
+    };
+    if force_security_floor
+        && !matches!(
+            verify_policy.skip,
+            crate::provenance_fetch::SkipPolicy::None
+        )
+        && !matches!(
+            verify_policy.enforce,
+            crate::provenance_fetch::EnforceMode::Off
+        )
+        && !unverified_provenance_unlock_authorized
+    {
+        let requested = match &verify_policy.skip {
+            crate::provenance_fetch::SkipPolicy::None => "none".to_string(),
+            crate::provenance_fetch::SkipPolicy::All => "all".to_string(),
+            crate::provenance_fetch::SkipPolicy::Names(names) => {
+                let mut values: Vec<_> = names.iter().cloned().collect();
+                values.sort();
+                values.join(",")
+            }
+        };
+        crate::security_floor::record_suppression(
+            crate::security_floor::SuppressionRecord::new(
+                crate::security_floor::GuardedControl::UnverifiedProvenance,
+                crate::security_floor::SuppressionSource::Cli,
+                requested,
+                "none",
+            ),
+            json_output,
+        );
+        verify_policy.skip = crate::provenance_fetch::SkipPolicy::None;
+    }
+    let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
+        &project_dir.join("package.json"),
+        effective_min_age_secs,
+    );
+
+    let publish_ages: HashMap<(String, String), u64> = if cooldown_policy.minimum_release_age_secs
+        > 0
+        && (!used_lockfile || release_age_policy.is_strict())
+    {
+        publish_ages_from_resolved_metadata(&packages)
+    } else {
+        HashMap::new()
+    };
+
+    // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
+    // The default policy checks direct packages on fresh resolution only; strict mode
+    // also revalidates lockfile replay from stored registry-published-at timestamps.
+    if !allow_new
+        && cooldown_policy.minimum_release_age_secs > 0
+        && (!used_lockfile || release_age_policy.is_strict())
+    {
+        let mut too_new = Vec::new();
+        for p in &packages {
+            if !release_age_policy_applies_to_install_package(release_age_policy, p) {
+                continue;
+            }
+            if minimum_release_age_exclude.contains(&p.name) {
+                continue;
+            }
+            let key = (p.name.clone(), p.version.clone());
+            let age_secs = publish_ages.get(&key).copied();
+            // Use the existing `check_release_age` semantics:
+            // `None` age = no timestamp available → no warning
+            // (matches pre-46b behaviour). Below-threshold age =
+            // warning carrying the time-remaining info. Match the
+            // existing ts-string-based API by re-running it; the
+            // `publish_ages` map only carries successful parses, so
+            // missing entries collapse to the `None` case here.
+            if age_secs.is_none() {
+                continue;
+            }
+            // Reconstruct a synthetic check by hand: if the age is
+            // below the threshold, build a warning with the same
+            // shape the helper would have returned. Keeps the
+            // user-visible message identical.
+            let age = age_secs.unwrap();
+            if age < cooldown_policy.minimum_release_age_secs {
+                let remaining = cooldown_policy.minimum_release_age_secs.saturating_sub(age);
+                let hours = remaining / 3600;
+                let minutes = (remaining % 3600) / 60;
+                too_new.push((p.name.clone(), p.version.clone(), hours, minutes));
+            }
+        }
+
+        if !too_new.is_empty() {
+            if !json_output {
+                output::warn(&format!(
+                    "{} package(s) blocked by minimumReleaseAge ({}s):",
+                    too_new.len(),
+                    cooldown_policy.minimum_release_age_secs,
+                ));
+                for (name, version, hours, minutes) in &too_new {
+                    eprintln!(
+                        "    {}@{} — {}h {}m remaining",
+                        name, version, hours, minutes
+                    );
+                }
+                //: three override paths, ordered narrowest
+                // to broadest persistence:
+                // (1) --min-release-age=0 per-install, numeric
+                // (2) --allow-new per-install, blanket bypass
+                // (3) package.json persistent, repo-wide
+                eprintln!(
+                    "  To override: {} for one package, {} or {} (this install), or set {} in package.json.",
+                    "--min-release-age-exclude <pkg>".bold(),
+                    "--min-release-age=0".bold(),
+                    "--allow-new".bold(),
+                    "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
+                );
+            }
+            return Err(LpmError::Registry(format!(
+                "{} package(s) published too recently (minimumReleaseAge={}s). Use --min-release-age-exclude <pkg>, --allow-new, or --min-release-age=<dur> to override.",
+                too_new.len(),
+                cooldown_policy.minimum_release_age_secs,
+            )));
+        }
+    }
+
+    // provenance-drift gate.
+    //
+    // For every resolved package with a prior approval that captured
+    // `provenance_at_approval`, fetch the candidate version's
+    // Sigstore attestation and compare identities. Block on
+    // "provenance dropped" (axios signal) or "identity changed"
+    // (publisher rotation without explicit re-approval).
+    //
+    // **Gating:** fires only on fresh resolution — lockfile fast-path
+    // is skipped by design (the lockfile locks integrity, not
+    // attestation identity). `--allow-new`
+    // does NOT bypass this gate because provenance and cooldown
+    // are orthogonal signals, and the cooldown override doesn't
+    // imply acknowledgement of publisher drift. The caller wires the
+    // `--ignore-provenance-drift[-all]` override below.
+    //
+    // **Performance:** sequential fetches per package. The fetcher's
+    // 7-day cache under `cache/metadata/attestations/` makes repeat
+    // installs O(1) per package. Revisit concurrency if sequential
+    // round-trips on first install prove too costly in practice.
+    //
+    // **Override short-circuit:** `--ignore-provenance-drift-all`
+    // skips the entire gate (no trusted-dependencies read, no
+    // per-package fetch). `--ignore-provenance-drift <pkg>` skips
+    // the per-package fetch for the named entries. Both paths emit a
+    // concise advisory to stderr so the waived drift is auditable
+    // (users explicitly asked for the opt-out; silent skip would
+    // hide that they're accepting a non-zero-risk identity).
+    if !used_lockfile && drift_ignore_policy.ignores_all() && !json_output {
+        output::warn(
+            "provenance-drift check waived for this install by --ignore-provenance-drift-all",
+        );
+    }
+    // Per-package `ProvenanceStatus` map for the install --json
+    // envelope. Declared at this scope (rather than inside the
+    // `if has_rich_approvals` block) so the JSON emission below at
+    // the `blocked_packages` enumeration can consume it. Sparse —
+    // only packages the drift gate fetched for are present; the
+    // `blocked_to_json_with_provenance` helper omits the
+    // `provenance` block when the key is absent.
+    let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
+        HashMap::new();
+    if !used_lockfile && !drift_ignore_policy.ignores_all() {
+        let trusted =
+            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
+                .trusted_dependencies;
+
+        // Short-circuit the whole gate when there's no rich-form
+        // approval to compare against. Projects with only legacy approvals
+        // (or no `trustedDependencies` at all) skip the gate entirely: zero
+        // network cost.
+        let has_rich_approvals = matches!(
+            &trusted,
+            lpm_workspace::TrustedDependencies::Rich(map) if !map.is_empty()
+        );
+
+        if has_rich_approvals {
+            let cache_root = lpm_root.cache_metadata_attestations();
+            let http = reqwest::Client::new();
+
+            // (name, version, verdict, approved_version, approved_snapshot)
+            let mut drifted: Vec<(
+                String,
+                String,
+                lpm_security::provenance::DriftVerdict,
+                String,
+                Option<lpm_workspace::ProvenanceSnapshot>,
+            )> = Vec::new();
+
+            for p in &packages {
+                let Some((approved_version, reference_binding)) =
+                    trusted.provenance_reference_for_candidate(&p.name, &p.version)
+                else {
+                    continue;
+                };
+
+                // Per-package override: user explicitly waived this
+                // name. Emit a one-line advisory so the opt-out is
+                // visible in the install log, then skip the fetch +
+                // compare.
+                if drift_ignore_policy.ignores_name(&p.name) {
+                    if !json_output {
+                        output::warn(&format!(
+                            "{}@{} — provenance-drift check waived by \
+                             --ignore-provenance-drift (approved reference: v{approved_version})",
+                            p.name, p.version,
+                        ));
+                    }
+                    continue;
+                }
+                let approved_snapshot = reference_binding.provenance_at_approval.as_ref();
+
+                // Extract the candidate version's attestation ref
+                // from the resolver's TTL cache (same pattern as the
+                // cooldown gate above).
+                let attestation_ref = if p.is_lpm {
+                    match lpm_common::PackageName::parse(&p.name) {
+                        Ok(pkg_name) => lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_package_metadata(&pkg_name),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|meta| {
+                            meta.versions
+                                .get(&p.version)
+                                .and_then(|v| v.dist.as_ref())
+                                .and_then(|d| d.attestations.clone())
+                        }),
+                        Err(_) => None,
+                    }
+                } else {
+                    // follow-up: route via RouteTable so
+                    // the provenance-drift gate doesn't fall through to
+                    // public npm for a custom-registry package.
+                    let route = route_table.route_for_package(&p.name);
+                    lpm_registry::timing::with_metadata_purpose(
+                        lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                        arc_client.get_npm_metadata_routed(&p.name, route),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|meta| {
+                        meta.versions
+                            .get(&p.version)
+                            .and_then(|v| v.dist.as_ref())
+                            .and_then(|d| d.attestations.clone())
+                    })
+                };
+
+                // When the operator skip-listed this name (CLI
+                // `--unverified-provenance`) OR set the fleet-wide
+                // enforce mode to `Off` (env / config), route the
+                // fetch through the `Unverified` path — bytes
+                // through the legacy identity-only parser, no
+                // cryptographic checks. The drift gate still gets
+                // a populated snapshot so publisher / workflow_path
+                // identity drift is detected even when the operator
+                // opted out of crypto.
+                let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
+                    .should_skip_verification_for(&p.name)
+                {
+                    let raw = crate::provenance_fetch::fetch_unverified_snapshot(
+                        &http,
+                        &p.name,
+                        &p.version,
+                        attestation_ref.as_ref(),
+                    )
+                    .await;
+                    // Re-label `Unverified` → `Disabled` when fleet-
+                    // wide `EnforceMode::Off` was the trigger, so the
+                    // JSON envelope distinguishes wholesale opt-out
+                    // (`"disabled"`) from per-package CLI carve-out
+                    // (`"skipped"`). Logic shared with the batch
+                    // caller in `provenance_fetch.rs` so the two
+                    // sites cannot drift on the labeling rule.
+                    let status = crate::provenance_fetch::relabel_skip_status_for_enforce_mode(
+                        raw,
+                        verify_policy.enforce,
+                    );
+                    // Record for the install --json envelope
+                    // before consuming for the drift gate.
+                    install_provenance_status_map
+                        .insert((p.name.clone(), p.version.clone()), status.clone());
+                    // Projection: `Unverified(snap)` / `Disabled(snap)`
+                    // → Some(snap), `Absent` → Some(present:false),
+                    // `TransportDegraded` → None. `VerificationRejected`
+                    // is unreachable on the skip path (the verifier
+                    // didn't run).
+                    status.into_snapshot_for_binding(&p.name, &p.version)?
+                } else {
+                    let raw = crate::provenance_fetch::fetch_provenance_snapshot(
+                        &http,
+                        &cache_root,
+                        &p.name,
+                        &p.version,
+                        attestation_ref.as_ref(),
+                        provenance_timings.as_ref(),
+                    )
+                    .await;
+                    // Branch arms:
+                    // - `Ok(Some(snap))`: Verified (snap.present)
+                    // or Absent (registry served no attestation).
+                    // - `Ok(None)`: transport-degraded; drift
+                    // comparator absorbs as NoDrift.
+                    // - `Err(ProvenanceVerification)`: policy
+                    // decision per `verify_policy.enforce`.
+                    // Warn degrades to None + loud log; Deny
+                    // propagates the typed error and `?`
+                    // refuses the install.
+                    // - `Err(other)`: infrastructure failure
+                    // (cache unwritable, etc.) — propagate
+                    // as-is so the user sees a real diagnostic,
+                    // not a silent degrade.
+                    let (snapshot_for_drift, status_for_map) = match raw {
+                        Ok(Some(snap)) if snap.present => {
+                            let status = lpm_common::ProvenanceStatus::Verified(snap.clone());
+                            (Some(snap), status)
+                        }
+                        Ok(Some(_)) => (
+                            Some(lpm_workspace::ProvenanceSnapshot {
+                                present: false,
+                                ..Default::default()
+                            }),
+                            lpm_common::ProvenanceStatus::Absent,
+                        ),
+                        Ok(None) => (None, lpm_common::ProvenanceStatus::TransportDegraded),
+                        Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {
+                            let status = lpm_common::ProvenanceStatus::VerificationRejected {
+                                reason: reason.clone(),
+                            };
+                            let snapshot = match verify_policy.enforce {
+                                crate::provenance_fetch::EnforceMode::Warn => {
+                                    if !json_output {
+                                        crate::output::warn(&format!(
+                                            "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
+                                             LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
+                                             verified provenance for this package. Re-run with \
+                                             LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
+                                             `--unverified-provenance {pkg}` to opt out explicitly.",
+                                            pkg = p.name,
+                                            ver = p.version,
+                                        ));
+                                    }
+                                    tracing::warn!(
+                                        target = "lpm::provenance",
+                                        pkg = %p.name,
+                                        version = %p.version,
+                                        reason = %reason,
+                                        enforce_mode = "warn",
+                                        "install drift gate: verifier rejected bundle \
+                                         under warn enforce-mode — degrading to NoDrift",
+                                    );
+                                    None
+                                }
+                                // `Off` short-circuits the verifier
+                                // upstream via `should_skip_verification_for`,
+                                // so the verifier-rejection path is
+                                // unreachable in `Off` mode. Defensive
+                                // arm to keep the match exhaustive if
+                                // a future refactor accidentally
+                                // bypasses the skip-route — degrade
+                                // identically to Warn so the install
+                                // doesn't fail on a state that the
+                                // operator already declared "fleet-wide
+                                // off".
+                                crate::provenance_fetch::EnforceMode::Off => None,
+                                crate::provenance_fetch::EnforceMode::Deny => {
+                                    // Surface the status in the map before
+                                    // returning so a `--json` consumer that
+                                    // tees stderr can correlate the failure
+                                    // with the per-package envelope.
+                                    install_provenance_status_map
+                                        .insert((p.name.clone(), p.version.clone()), status);
+                                    return Err(LpmError::ProvenanceVerification(reason));
+                                }
+                            };
+                            (snapshot, status)
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    install_provenance_status_map
+                        .insert((p.name.clone(), p.version.clone()), status_for_map);
+                    snapshot_for_drift
+                };
+
+                let verdict = lpm_security::provenance::check_provenance_drift(
+                    approved_snapshot,
+                    now_snapshot.as_ref(),
+                );
+
+                if !matches!(verdict, lpm_security::provenance::DriftVerdict::NoDrift) {
+                    drifted.push((
+                        p.name.clone(),
+                        p.version.clone(),
+                        verdict,
+                        approved_version.to_string(),
+                        reference_binding.provenance_at_approval.clone(),
+                    ));
+                }
+            }
+
+            if !drifted.is_empty() {
+                // UX. extends the footer with the
+                // `--ignore-provenance-drift` override suggestion.
+                if !json_output {
+                    output::warn(&format!(
+                        "{} package(s) blocked by provenance drift:",
+                        drifted.len(),
+                    ));
+                    for (name, version, verdict, approved_version, approved_snap) in &drifted {
+                        let kind = match verdict {
+                            lpm_security::provenance::DriftVerdict::ProvenanceDropped => {
+                                "provenance dropped"
+                            }
+                            lpm_security::provenance::DriftVerdict::IdentityChanged => {
+                                "publisher identity changed"
+                            }
+                            lpm_security::provenance::DriftVerdict::NoDrift => {
+                                unreachable!("NoDrift is filtered out above")
+                            }
+                        };
+                        // Registry- and lockfile-supplied identifiers
+                        // pass through `sanitize_for_terminal` before
+                        // hitting the TTY so a crafted name like
+                        // `\x1b]8;;file:///etc/passwd\x07evil\x1b]8;;\x07`
+                        // can't render as a clickable hyperlink or
+                        // mutate the clipboard via OSC 52.
+                        let name_safe = lpm_common::sanitize_for_terminal(name);
+                        let version_safe = lpm_common::sanitize_for_terminal(version);
+                        let approved_version_safe =
+                            lpm_common::sanitize_for_terminal(approved_version);
+                        eprintln!("    {}@{} — {}", name_safe, version_safe, kind);
+                        let identity = approved_snap.as_ref().and_then(|s| {
+                            match (s.publisher.as_deref(), s.workflow_path.as_deref()) {
+                                (Some(pub_), Some(path)) => Some(format!(
+                                    "{} / {}",
+                                    lpm_common::sanitize_for_terminal(pub_),
+                                    lpm_common::sanitize_for_terminal(path),
+                                )),
+                                (Some(pub_), None) => Some(lpm_common::sanitize_for_terminal(pub_)),
+                                _ => None,
+                            }
+                        });
+                        let ref_hint = approved_snap
+                            .as_ref()
+                            .and_then(|s| s.workflow_ref.as_deref())
+                            .map(|r| format!(" (ref: {})", lpm_common::sanitize_for_terminal(r)))
+                            .unwrap_or_default();
+                        match identity {
+                            Some(ident) => eprintln!(
+                                "      last approved: v{approved_version_safe} via {ident}{ref_hint}",
+                            ),
+                            None => eprintln!(
+                                "      last approved: v{approved_version_safe} with attestation{ref_hint}",
+                            ),
+                        }
+                        if matches!(
+                            verdict,
+                            lpm_security::provenance::DriftVerdict::ProvenanceDropped
+                        ) {
+                            eprintln!("      this version: (no provenance attestation)");
+                        }
+                    }
+                    eprintln!();
+                    eprintln!(
+                        "  This pattern was seen in the axios 1.14.1 compromise (March 2026).",
+                    );
+                    // narrowest-to-broadest
+                    // recovery paths. Prefer re-approval (captures
+                    // the new identity and tightens the subsequent
+                    // gate). Per-package override for single-case
+                    // acknowledged migrations. Blanket override for
+                    // users consciously suspending the entire check
+                    // — listed last on purpose.
+                    eprintln!(
+                        "  Recovery: re-approve via {}; or opt out with {} / {}.",
+                        "lpm approve-scripts".bold(),
+                        "--ignore-provenance-drift <pkg>".bold(),
+                        "--ignore-provenance-drift-all".bold(),
+                    );
+                }
+                return Err(LpmError::Registry(format!(
+                    "{} package(s) blocked by provenance drift. Review the identity change and re-approve via `lpm approve-scripts`, or opt out per-package via `--ignore-provenance-drift <pkg>` / blanket via `--ignore-provenance-drift-all`.",
+                    drifted.len(),
+                )));
+            }
+        }
+    }
+    fetch_stage_timings.policy_gate_ms = policy_gate_start.elapsed().as_millis();
+
+    let downloaded = to_download.len();
+    //: accumulate per-task timings across the parallel pool so we
+    // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
+    // breakdown on the cached-everything path; filled in below when work runs.
+    let mut fetch_breakdown = FetchBreakdown::default();
+    spec_stats.completed_before_fetch = spec_tracker.completed_count();
+    if !to_download.is_empty() {
+        let download_wall_start = Instant::now();
+        let overall = ProgressBar::new(to_download.len() as u64);
+        overall.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.cyan} Downloading [{bar:30.cyan/dim}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("━╸─"),
+        );
+        overall.enable_steady_tick(std::time::Duration::from_millis(80));
+
+        //: share the hoisted `fetch_semaphore` so speculative
+        // dispatches (pre-resolve) and real fetches (post-resolve) draw
+        // from the same 24-permit pool.
+        let semaphore = fetch_semaphore.clone();
+        let mut handles = Vec::new();
+
+        for p in to_download {
+            let sem = semaphore.clone();
+            let client = arc_client.clone();
+            let store_ref = store.clone();
+            // Clone the optional v2 handle into the per-package spawn.
+            // `Option::clone` is a Some/None match and `Arc::clone` is a
+            // refcount bump.
+            let store_v2_ref = store_v2_handle.clone();
+            let coord = fetch_coord.clone();
+            let overall = overall.clone();
+            let force_flag = force;
+            // Per-task link scheduling captures.
+            let event_link = event_driven_link;
+            let project_dir_buf = project_dir.to_path_buf();
+            // Shared gate/retry counters for the stale-URL recovery path
+            // in `fetch_and_store_*`.
+            let gate_stats_c = gate_stats.clone();
+            // `.npmrc`-derived routing carried into the per-package fetch
+            // task. Cheap clone: Arc ref-bump for the inner NpmrcConfig.
+            let route_table_c = route_table.clone();
+            // Per-task v2 event-driven link captures. `v2_plan_arc` is None
+            // on the !v2_event_driven path; `v2_target_for_pkg` resolves here
+            // once so the per-task closure doesn't carry the whole index map.
+            let v2_plan_arc = v2_plan.as_ref().map(std::sync::Arc::clone);
+            let v2_target_for_pkg = if v2_event_driven {
+                v2_target_by_key.get(&install_pkg_key(&p)).cloned()
+            } else {
+                None
+            };
+            let v2_link_task_semaphore_c = Arc::clone(&v2_link_task_semaphore);
+            let spec_tracker_c = spec_tracker.clone();
+            // Resolve this package's patch fingerprint outside the move
+            // closure so the closure doesn't carry the whole map. `None` for
+            // the common case where the package has no
+            // `lpm.patchedDependencies` entry.
+            let patch_fingerprint_for_pkg = patch_fingerprints
+                .get(&(p.name.clone(), p.version.clone()))
+                .cloned();
+            let source_index_for_pkg = Arc::clone(&source_index);
+            let trace_slow_packages = timing_detail_mode.trace();
+            let fetch_extract_limiter_c = fetch_extract_limiter.clone();
+
+            handles.push(tokio::spawn(async move {
+                // v2-shaped link handle. Mutually exclusive with `LinkHandle`
+                // at runtime: under v2_mode,
+                // `event_link` is false (so `LinkHandle` is always None);
+                // under !v2_mode, `v2_plan_arc` is None (so this is
+                // always None).
+                type FetchTaskResult = (
+                    String,
+                    Option<String>,
+                    String,
+                    TaskTimings,
+                    Option<LinkHandle>,
+                    Option<V2LinkHandle>,
+                    Option<String>,
+                );
+
+                // timing: spawn→key-lock→permit captures the full time this
+                // task sat queued. It also covers the FetchCoordinator wait:
+                // if a speculation is mid-fetch for the same `(name, ver)`,
+                // we wait on the per-key lock and short-circuit via the
+                // store-hit check below.
+                let queue_start = std::time::Instant::now();
+                let package_display =
+                    trace_slow_packages.then(|| format!("{}@{}", p.name, p.version));
+                let package_key = install_pkg_key(&p);
+
+                //: per-key fetch coordination. Acquired BEFORE
+                // the download permit — if a sibling (speculation) is
+                // already fetching this key, we wait here without consuming
+                // a permit. On wake, `has_package` is true and we skip the
+                // real fetch entirely (zero bandwidth, zero CPU).
+                let key_lock = coord.lock_for(package_key.clone()).await;
+                let _key_guard = key_lock.lock().await;
+
+                // Spawn the per-pkg link task once the tarball is in the
+                // store. Used in both the sibling-skip path and the normal
+                // fetch path — in either case the package is materialized
+                // by the time we call `link_one_package`.
+                //
+                // The closure takes an optional sri_override so the post-fetch
+                // path can pass the freshly-computed SRI before it
+                // reaches `p.integrity`. Source-aware store_path
+                // routes Source::Tarball to the integrity-keyed CAS,
+                // never to the registry-keyed path.
+                let spawn_link = |p: &InstallPackage,
+                                  sri_override: Option<&str>|
+                 -> Result<Option<LinkHandle>, LpmError> {
+                    if !event_link {
+                        return Ok(None);
+                    }
+                    // (reviewed): store_path_or_err
+                    // surfaces the missing-SRI invariant violation
+                    // as a typed error with full package context
+                    // instead of panicking. Reachable only on a
+                    // malformed lockfile that bypassed the
+                    // writer guard — should never fire in practice.
+                    let store_path =
+                        p.store_path_or_err(&store_ref, &project_dir_buf, sri_override)?;
+                    let target = LinkTarget {
+                        name: p.name.clone(),
+                        version: p.version.clone(),
+                        store_path,
+                        dependencies: link_dependencies_for_package(p, &source_index_for_pkg)?,
+                        aliases: p.aliases.clone(),
+                        is_direct: p.is_direct,
+                        root_link_names: p.root_link_names.clone(),
+                        wrapper_id: p.wrapper_id_for_source(),
+                        materialization: p.materialization_for_source(),
+                        peers: p.peers.clone(),
+                        patch_fingerprint: patch_fingerprint_for_pkg.clone(),
+                    };
+                    let pd = project_dir_buf.clone();
+                    Ok(Some(tokio::task::spawn_blocking(move || {
+                        lpm_linker::link_one_package(&pd, &target, force_flag)
+                    })))
+                };
+
+                if !force_flag
+                    && let (Some(store_v2), Some(expected_sri)) =
+                        (store_v2_ref.as_ref(), p.integrity.clone())
+                {
+                    let sri_for_result = expected_sri.clone();
+                    let store_v2_check = std::sync::Arc::clone(store_v2);
+                    let reusable_object = tokio::task::spawn_blocking(move || {
+                        store_v2_check.reusable_object(&expected_sri)
+                    })
+                    .await
+                    .map_err(|e| {
+                        LpmError::Registry(format!("v2 cache check task panicked: {e}"))
+                    })??;
+                    if let Some(reusable_object) = reusable_object {
+                        let v2_link_h: Option<V2LinkHandle> =
+                            if let (Some(plan), Some(target), Some(store_v2)) = (
+                                v2_plan_arc.as_ref(),
+                                v2_target_for_pkg.as_ref(),
+                                store_v2_ref.as_ref(),
+                            ) {
+                                let plan_c = std::sync::Arc::clone(plan);
+                                let mut target_c = target.clone();
+                                target_c.verified_object_integrity =
+                                    Some(reusable_object.object_integrity);
+                                let store_c = std::sync::Arc::clone(store_v2);
+                                Some(spawn_v2_link_task(
+                                    plan_c,
+                                    target_c,
+                                    store_c,
+                                    Arc::clone(&v2_link_task_semaphore_c),
+                                ))
+                            } else {
+                                None
+                            };
+                        overall.inc(1);
+                        spec_tracker_c.mark_consumed_if_completed(&package_key);
+                        return Ok::<FetchTaskResult, LpmError>((
+                            package_key,
+                            package_display,
+                            sri_for_result,
+                            TaskTimings {
+                                queue_wait_ms: queue_start.elapsed().as_millis(),
+                                ..Default::default()
+                            },
+                            None,
+                            v2_link_h,
+                            None,
+                        ));
+                    }
+                }
+
+                // Only honour the store-hit short-circuit when not in
+                // `--force` mode. `--force` is the "re-verify
+                // integrity against registry" path: the user explicitly
+                // wants every tarball re-downloaded and re-hashed, even if
+                // the store already has a valid copy. Without this gate, a
+                // sibling task (or a prior install) making the store hot
+                // would neuter `--force`.
+                //
+                // Source-aware existence check: a registry-CAS hit must NOT
+                // satisfy a Source::Tarball pkg with the same
+                // (name, version).
+                let store_path_pre_fetch = (!force_flag)
+                    .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
+                    .flatten();
+                if !force_flag
+                    && p.store_has_source_aware(&store_ref, &project_dir_buf)
+                    && let Some(existing_path) = store_path_pre_fetch
+                {
+                    // A sibling completed the fetch while we waited on the
+                    // key lock. Use the stored SRI for lockfile output;
+                    // task_timings stays at defaults (no download work done
+                    // on THIS task's critical path — the sibling's timings
+                    // covered it). `None` for `final_url` here
+                    // because THIS task didn't hit the registry — the
+                    // sibling's task already reported the URL it used
+                    // (via its own return value) and will be folded into
+                    // the writeback aggregator. Reporting `None` avoids
+                    // double-counting a divergence or conflicting on the
+                    // URL value.
+                    let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
+                    let link_h = spawn_link(&p, None)?;
+                    // The v2 object dir was populated by the sibling's fetch
+                    // task. The per-key fetch lock above ensures we observe
+                    // the post-extract state, so dispatch the v2 link entry in
+                    // the same shape as the post-fetch path below.
+                    let v2_link_h: Option<V2LinkHandle> =
+                        if let (Some(plan), Some(target), Some(store_v2)) = (
+                            v2_plan_arc.as_ref(),
+                            v2_target_for_pkg.as_ref(),
+                            store_v2_ref.as_ref(),
+                        ) {
+                            let plan_c = std::sync::Arc::clone(plan);
+                            let target_c = target.clone();
+                            let store_c = std::sync::Arc::clone(store_v2);
+                            Some(spawn_v2_link_task(
+                                plan_c,
+                                target_c,
+                                store_c,
+                                Arc::clone(&v2_link_task_semaphore_c),
+                            ))
+                        } else {
+                            None
+                        };
+                    overall.inc(1);
+                    spec_tracker_c.mark_consumed_if_completed(&package_key);
+                    return Ok::<FetchTaskResult, LpmError>((
+                        package_key,
+                        package_display,
+                        sri,
+                        TaskTimings {
+                            queue_wait_ms: queue_start.elapsed().as_millis(),
+                            ..Default::default()
+                        },
+                        link_h,
+                        v2_link_h,
+                        None,
+                    ));
+                }
+
+                // W6a — `acquire_owned` so the permit can be
+                // *moved* into the fetch fn and dropped between
+                // download and extract. The fn drops it as soon as
+                // bytes are on the heap (streaming) or on temp disk
+                // (legacy), letting the next download start while this
+                // task continues with extract on the blocking pool.
+                let permit = sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
+                let queue_wait_ms = queue_start.elapsed().as_millis();
+
+                overall.set_message(format!("{}@{}", p.name, p.version));
+
+                // — Source::Tarball install packages
+                // bypass the registry-routed legacy/streaming paths
+                // entirely. The URL is the source identity; the
+                // store path is content-addressable by integrity.
+                let is_tarball_source =
+                    matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
+                let store_v2_arg = store_v2_ref.as_deref();
+                let (computed_sri, task_timings, final_url, fresh_object) = if is_tarball_source {
+                    fetch_and_store_tarball_url(
+                        &client,
+                        &store_ref,
+                        store_v2_arg,
+                        &p,
+                        queue_wait_ms,
+                        permit,
+                        &fetch_extract_limiter_c,
+                    )
+                    .await?
+                } else if streaming_fetch {
+                    fetch_and_store_streaming(
+                        &client,
+                        &route_table_c,
+                        &store_ref,
+                        store_v2_arg,
+                        &p,
+                        queue_wait_ms,
+                        &project_dir_buf,
+                        TarballNotFoundRecovery::DeleteProjectLockfiles,
+                        &gate_stats_c,
+                        permit,
+                        &fetch_extract_limiter_c,
+                    )
+                    .await?
+                } else {
+                    fetch_and_store_legacy(
+                        &client,
+                        &route_table_c,
+                        &store_ref,
+                        store_v2_arg,
+                        &p,
+                        queue_wait_ms,
+                        &project_dir_buf,
+                        TarballNotFoundRecovery::DeleteProjectLockfiles,
+                        &gate_stats_c,
+                        permit,
+                        &fetch_extract_limiter_c,
+                    )
+                    .await?
+                };
+                // Spawn per-pkg link immediately; the package is
+                // now materialized. Runs on the blocking pool in parallel
+                // with sibling fetch tasks still downloading.
+                //
+                // Pass the freshly-computed SRI as override so Source::Tarball
+                // packages link from the integrity-keyed CAS path
+                // (the freshly-stored content), not the legacy
+                // registry slot. Registry sources ignore the override.
+                let link_h = spawn_link(&p, Some(&computed_sri))?;
+
+                // Dispatch v2 link entry materialization on the blocking pool now that the
+                // tarball is extracted into `objects/<sri>/`. Runs in
+                // parallel with sibling fetch tasks still downloading
+                // and (importantly) cuts the post-fetch link-stage tail.
+                let v2_link_h: Option<V2LinkHandle> =
+                    if let (Some(plan), Some(target), Some(store_v2)) = (
+                        v2_plan_arc.as_ref(),
+                        v2_target_for_pkg.as_ref(),
+                        store_v2_ref.as_ref(),
+                    ) {
+                        let plan_c = std::sync::Arc::clone(plan);
+                        let mut target_c = target.clone();
+                        if let Some(object) = fresh_object {
+                            target_c.source_sri = computed_sri.clone();
+                            target_c.fresh_object = Some(object);
+                        }
+                        let store_c = std::sync::Arc::clone(store_v2);
+                        Some(spawn_v2_link_task(
+                            plan_c,
+                            target_c,
+                            store_c,
+                            Arc::clone(&v2_link_task_semaphore_c),
+                        ))
+                    } else {
+                        None
+                    };
+
+                overall.inc(1);
+                spec_tracker_c.mark_duplicated_if_failed(&package_key);
+                Ok::<FetchTaskResult, LpmError>((
+                    package_key,
+                    package_display,
+                    computed_sri,
+                    task_timings,
+                    link_h,
+                    v2_link_h,
+                    Some(final_url),
+                ))
+            }));
+        }
+
+        // Collect computed integrity hashes and fold per-task timings into
+        // the aggregate breakdown. `fresh_urls` aggregates
+        // the URL that actually served bytes for each (name, version),
+        // so the writeback step at install-end can detect divergence
+        // from the stored lockfile URL (stale-URL recovery) or from
+        // `None` (origin-mismatch rebase that on-demand-resolved a
+        // fresh URL).
+        for handle in handles {
+            let (pkg_key, package_display, sri, timings, link_h, v2_link_h, final_url) = handle
+                .await
+                .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
+            integrity_map.insert(pkg_key.clone(), sri);
+            fetch_breakdown.record(timings);
+            if let Some(package_display) = package_display.as_deref() {
+                slow_package_timings.record_fetch(package_display, timings);
+            }
+            if let Some(lh) = link_h {
+                event_link_handles.push(lh);
+            }
+            // Funnel v2 link handles emitted by the fetch tasks into the same
+            // drain queue the cache-hit branches above feed.
+            if let Some(lh) = v2_link_h {
+                v2_event_link_handles.push(lh);
+            }
+            if let Some(url) = final_url {
+                fresh_urls.insert(pkg_key, url);
+            }
+        }
+
+        overall.finish_and_clear();
+        fetch_stage_timings.download_wall_ms = download_wall_start.elapsed().as_millis();
+    }
+
+    if let Some(join) = fetch_overlap_join.take() {
+        let drain = join.drain().await?;
+        fetch_stage_timings.overlap = drain.stats;
+        for outcome in drain.outcomes {
+            if let Some(sri) = outcome.computed_sri {
+                integrity_map.entry(outcome.key.clone()).or_insert(sri);
+            }
+            if let Some(timings) = outcome.timings {
+                slow_package_timings.record_fetch(&outcome.package_display, timings);
+            }
+            if let Some(url) = outcome.final_url {
+                fresh_urls.entry(outcome.key).or_insert(url);
+            }
+        }
+    }
+
+    let apply_fetch_writebacks = |packages: &mut [InstallPackage]| {
+        for p in packages {
+            let key = install_pkg_key(p);
+            if let Some(sri) = integrity_map.get(&key) {
+                p.integrity = Some(sri.clone());
+            }
+            if let Some(url) = fresh_urls.get(&key) {
+                p.tarball_url = Some(url.clone());
+            }
+        }
+    };
+    apply_fetch_writebacks(&mut packages);
+    apply_fetch_writebacks(&mut packages_for_lockfile);
+
+    let fetch_ms = fetch_start.elapsed().as_millis();
+    let wf_fetch_end_ms = start.elapsed().as_millis();
+
+    // Drain any speculation tail after the authoritative fetch phase.
+    // This preserves resolve/fetch overlap while making completed
+    // speculation visible in the JSON counters.
+    //
+    // The walker summary is folded into
+    // `timing.resolve.streaming_bfs` in the JSON-output block below.
+    // `None` on warm lockfile-fast-path installs (walker never ran).
+    if let Some(join) = speculation_join.take() {
+        let summary = join.drain(&mut spec_stats).await;
+        tracing::debug!(
+            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
+            summary.manifests_fetched,
+            summary.cache_hits,
+            summary.max_depth,
+            summary.spec_tx_send_wait_ms,
+            summary.walker_wall_ms,
+        );
+        walker_summary_final = Some(summary);
+    }
+    let final_graph_keys: HashSet<String> = packages.iter().map(install_pkg_key).collect();
+    spec_stats.consumed_by_fetch = spec_tracker.consumed_count();
+    spec_stats.duplicated_with_fetch = spec_tracker.duplicated_count();
+    spec_stats.failed = spec_tracker.failed_count();
+    spec_stats.wasted = spec_tracker.wasted_count(&final_graph_keys);
+
+    // Fetch / cache-hit counters are recorded into `fetch_ms` etc. and
+    // surfaced via the verbose footer and JSON envelope. The default
+    // human output is intentionally quiet here — the persistent
+    // `› Installing N packages` line above already narrates this phase.
+
+    Ok(OnlineFetchPhaseResult {
+        packages,
+        packages_for_lockfile,
+        link_targets,
+        event_driven_link,
+        event_link_handles,
+        v2_mode,
+        v2_event_driven,
+        v2_plan,
+        v2_event_link_handles,
+        v2_link_task_timings,
+        fetch_ms,
+        waterfall_start_ms: wf_fetch_start_ms,
+        waterfall_end_ms: wf_fetch_end_ms,
+        fetch_stage_timings,
+        cached,
+        downloaded,
+        fetch_breakdown,
+        walker_summary_final,
+        spec_stats,
+        publish_ages,
+        min_release_age_secs: cooldown_policy.minimum_release_age_secs,
+        install_provenance_status_map,
+        fresh_urls,
+    })
 }
 
 #[cfg(test)]
