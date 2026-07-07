@@ -81,7 +81,7 @@ pub(in crate::commands::install) fn should_run(
         return Ok(true);
     }
     Err(LpmError::Registry(format!(
-        "experimental resolver is limited to benchmark installs; unsupported for this invocation: {}",
+        "experimental installer spike is limited to benchmark installs; unsupported for this invocation: {}",
         reasons.join("; ")
     )))
 }
