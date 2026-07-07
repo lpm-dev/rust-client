@@ -5,13 +5,13 @@ const ENV_INSTALLER_SPIKE_PARITY: &str = "LPM_INSTALLER_SPIKE_PARITY";
 const PARITY_SAMPLE_LIMIT: usize = 25;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(in crate::commands::install) enum InstallerSpikeParityMode {
+pub(in crate::commands::install) enum ExperimentalResolverParityMode {
     Disabled,
     FreshResolve { deny: bool },
     Lockfile { deny: bool },
 }
 
-impl InstallerSpikeParityMode {
+impl ExperimentalResolverParityMode {
     pub(in crate::commands::install) fn from_env() -> Self {
         Self::from_value(std::env::var(ENV_INSTALLER_SPIKE_PARITY).ok().as_deref())
     }
@@ -64,7 +64,7 @@ pub(in crate::commands::install) struct PackageFingerprintMismatch {
 }
 
 #[derive(Debug, Clone)]
-pub(in crate::commands::install) struct InstallerSpikeParity {
+pub(in crate::commands::install) struct ExperimentalResolverParity {
     pub(in crate::commands::install) enabled: bool,
     pub(in crate::commands::install) matches: bool,
     pub(in crate::commands::install) baseline: &'static str,
@@ -79,7 +79,7 @@ pub(in crate::commands::install) struct InstallerSpikeParity {
     pub(in crate::commands::install) fingerprint_mismatches: Vec<PackageFingerprintMismatch>,
 }
 
-impl InstallerSpikeParity {
+impl ExperimentalResolverParity {
     pub(in crate::commands::install) fn disabled() -> Self {
         Self {
             enabled: false,
@@ -125,7 +125,7 @@ pub(in crate::commands::install) fn compare_package_parity_with_baseline(
     candidate_packages: &[InstallPackage],
     baseline_packages: &[InstallPackage],
     baseline_name: &'static str,
-) -> InstallerSpikeParity {
+) -> ExperimentalResolverParity {
     let candidate = package_parity_index(candidate_packages);
     let baseline = package_parity_index(baseline_packages);
 
@@ -165,7 +165,7 @@ pub(in crate::commands::install) fn compare_package_parity_with_baseline(
     fingerprint_mismatches.truncate(PARITY_SAMPLE_LIMIT);
     let matches = extra_count == 0 && missing_count == 0 && fingerprint_mismatch_count == 0;
 
-    InstallerSpikeParity {
+    ExperimentalResolverParity {
         enabled: true,
         matches,
         baseline: baseline_name,

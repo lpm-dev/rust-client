@@ -28,7 +28,6 @@ mod fetch;
 mod fetch_overlap;
 mod firewall;
 mod gitignore;
-mod installer_spike;
 mod lifecycle;
 mod linking;
 mod lockfile;
@@ -90,6 +89,7 @@ use policy_extensions::{
     reject_remote_tarball_url_deps_with_policy_extensions, run_policy_extensions,
 };
 use reporting::*;
+use resolve::experimental as experimental_resolver;
 use resolve::*;
 use setup::*;
 use skills::*;
@@ -864,8 +864,8 @@ async fn run_with_options_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
     }
 
-    let installer_spike_requested = installer_spike::enabled();
-    let installer_spike_script_policy_is_default = if installer_spike_requested {
+    let experimental_resolver_requested = experimental_resolver::enabled();
+    let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
         let script_policy_cfg =
             crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
         let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
@@ -880,7 +880,7 @@ async fn run_with_options_under_store_lock(
         true
     };
 
-    if installer_spike::should_run(installer_spike::InstallerSpikeAdmission {
+    if experimental_resolver::should_run(experimental_resolver::ExperimentalResolverAdmission {
         json_output,
         frozen_lockfile_active,
         omit_policy,
@@ -890,7 +890,7 @@ async fn run_with_options_under_store_lock(
             || !v2_workspace_root_pre_resolve
                 .additional_workspace_links
                 .is_empty(),
-        has_tarball_source_deps: installer_spike::has_tarball_source_deps(project_dir, &deps),
+        has_tarball_source_deps: experimental_resolver::has_tarball_source_deps(project_dir, &deps),
         verify_registry_signatures,
         strict_integrity,
         force_security_floor,
@@ -898,7 +898,7 @@ async fn run_with_options_under_store_lock(
         policy_extensions_enabled: !policy_extension_configs.is_empty(),
         auto_build,
         script_policy_override,
-        script_policy_is_default: installer_spike_script_policy_is_default,
+        script_policy_is_default: experimental_resolver_script_policy_is_default,
         has_trusted_dependencies: pkg
             .lpm
             .as_ref()
@@ -960,7 +960,7 @@ async fn run_with_options_under_store_lock(
                 .or_insert_with(|| deps.clone());
         }
 
-        return installer_spike::run(
+        return experimental_resolver::run(
             arc_client.clone(),
             project_dir,
             &deps,

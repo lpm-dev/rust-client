@@ -826,7 +826,7 @@ pub(in crate::commands::install) async fn metadata_for_package(
     context.version_doc_eligible = version_doc_eligible;
     metadata_stats.record_range_call(&context);
 
-    if installer_spike_exact_doc_enabled()
+    if experimental_resolver_exact_doc_enabled()
         && version_doc_eligible
         && !metadata_caches.full.contains_key(&name)
         && let Some(version) = context.range.as_deref().and_then(exact_pin_version)
@@ -891,7 +891,7 @@ async fn metadata_for_full_package(
         let _permit = metadata_queue
             .acquire()
             .await
-            .map_err(|_| LpmError::Registry("experimental installer queue closed".into()))?;
+            .map_err(|_| LpmError::Registry("experimental resolver queue closed".into()))?;
         metadata_stats_for_init.record_queue_wait(queue_start.elapsed().as_millis());
         let fetch_start = Instant::now();
         let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
@@ -956,7 +956,7 @@ async fn metadata_for_exact_version(
         let permit = metadata_queue
             .acquire()
             .await
-            .map_err(|_| LpmError::Registry("experimental installer queue closed".into()))?;
+            .map_err(|_| LpmError::Registry("experimental resolver queue closed".into()))?;
         metadata_stats_for_init.record_queue_wait(queue_start.elapsed().as_millis());
         let fetch_start = Instant::now();
         let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
@@ -1005,7 +1005,7 @@ async fn metadata_for_exact_version(
     .cloned()
 }
 
-fn installer_spike_exact_doc_enabled() -> bool {
+fn experimental_resolver_exact_doc_enabled() -> bool {
     std::env::var(ENV_INSTALLER_SPIKE_EXACT_DOC).as_deref() == Ok("1")
 }
 

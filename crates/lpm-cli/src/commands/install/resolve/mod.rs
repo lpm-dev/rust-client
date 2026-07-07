@@ -1,17 +1,24 @@
+pub(super) mod experimental;
+mod fetch_schedule;
+mod graph;
 pub(super) mod metadata;
 pub(super) mod metrics;
 pub(super) mod online;
 pub(super) mod parity;
+mod peer;
+#[cfg(test)]
+mod tests;
 
 pub(super) use metadata::{
     MetadataCaches, MetadataRequestContext, MetadataStats, metadata_for_package,
 };
-pub(super) use metrics::{InstallerSpikeStageTimings, InstallerSpikeStats};
+pub(super) use metrics::{ExperimentalResolverStageTimings, ExperimentalResolverStats};
 pub(super) use online::{
     OnlineResolutionPhaseInput, OnlineResolutionPhaseResult, run_online_resolution_phase,
 };
 pub(super) use parity::{
-    InstallerSpikeParity, InstallerSpikeParityMode, compare_package_parity_with_baseline,
+    ExperimentalResolverParity, ExperimentalResolverParityMode,
+    compare_package_parity_with_baseline,
 };
 
 pub(super) type PackageIdentity = (String, String);
