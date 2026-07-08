@@ -32,10 +32,10 @@ fn firewall_client() -> lpm_registry::RegistryClient {
 }
 
 #[test]
-fn npm_firewall_mode_parses_report_and_enforce_values() {
+fn npm_firewall_mode_parses_monitor_and_legacy_report_values() {
     assert_eq!(
         NpmFirewallMode::parse("report"),
-        Some(NpmFirewallMode::Report)
+        Some(NpmFirewallMode::Monitor)
     );
     assert_eq!(NpmFirewallMode::parse("1"), Some(NpmFirewallMode::Enforce));
     assert_eq!(
@@ -44,7 +44,7 @@ fn npm_firewall_mode_parses_report_and_enforce_values() {
     );
     assert_eq!(
         NpmFirewallMode::parse(" Report "),
-        Some(NpmFirewallMode::Report)
+        Some(NpmFirewallMode::Monitor)
     );
 }
 
@@ -96,15 +96,15 @@ fn npm_firewall_chunk_size_uses_positive_values_or_default() {
 
 #[test]
 fn npm_firewall_mode_disables_tarball_prefetch_when_enabled() {
-    assert!(NpmFirewallMode::Report.disables_tarball_prefetch());
+    assert!(NpmFirewallMode::Monitor.disables_tarball_prefetch());
     assert!(NpmFirewallMode::Enforce.disables_tarball_prefetch());
     assert!(!NpmFirewallMode::Off.disables_tarball_prefetch());
 }
 
 #[test]
-fn npm_firewall_mode_requires_auth_for_report_and_enforce() {
+fn npm_firewall_mode_requires_auth_for_monitor_and_enforce() {
     assert_eq!(
-        NpmFirewallMode::Report.auth_posture(),
+        NpmFirewallMode::Monitor.auth_posture(),
         lpm_registry::client::AuthPosture::AuthRequired
     );
     assert_eq!(
@@ -141,6 +141,7 @@ async fn enforce_firewall_preflight_maps_legacy_entitlement_denial_to_firewall_e
     let result = request_npm_firewall_preflight(
         NpmFirewallMode::Enforce,
         NpmFirewallLookupMode::PackageOnly,
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
         client,
         vec![lpm_registry::client::NpmFirewallBatchPackage {
             name: "left-pad".to_string(),
@@ -172,7 +173,7 @@ async fn enforce_firewall_preflight_maps_legacy_entitlement_denial_to_firewall_e
 #[test]
 fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
     let mut stats = NpmFirewallPreflightStats {
-        mode: NpmFirewallMode::Report,
+        mode: NpmFirewallMode::Monitor,
         checked_count: 12,
         batch_ms: 34,
         chunk_count: 2,
@@ -240,7 +241,7 @@ fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
     let json = stats.to_json();
 
     assert_eq!(json["enabled"], true);
-    assert_eq!(json["mode"], "report");
+    assert_eq!(json["mode"], "monitor");
     assert_eq!(json["lookup_mode"], "package_only");
     assert_eq!(json["checked_count"], 12);
     assert_eq!(json["batch_ms"], 34);

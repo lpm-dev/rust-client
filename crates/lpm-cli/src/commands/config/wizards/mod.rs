@@ -39,8 +39,10 @@ pub(in crate::commands::config) use common::{
     read_string_value,
 };
 #[cfg(test)]
+pub(in crate::commands::config) use firewall::persist_firewall_policy_profile_in_config_value;
+#[cfg(test)]
 pub(in crate::commands::config) use firewall::{
-    FIREWALL_ENFORCE_HINT, FIREWALL_OFF_HINT, FIREWALL_REPORT_HINT, FIREWALL_WIZARD_PROMPT,
+    FIREWALL_ENFORCE_HINT, FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT, FIREWALL_WIZARD_PROMPT,
 };
 pub(in crate::commands::config) use firewall::{
     FIREWALL_GUIDED_MENU_LABEL, format_current_firewall_mode, parse_firewall_mode_selection,

@@ -390,9 +390,9 @@ async fn download_firewall_enforce_blocks_public_npm_package_before_tarball_fetc
 }
 
 #[tokio::test]
-async fn download_firewall_report_json_includes_verdict_summary_and_decisions() {
+async fn download_firewall_monitor_json_includes_verdict_summary_and_decisions() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
-    write_npm_firewall_global_config(&project, "report");
+    write_npm_firewall_global_config(&project, "monitor");
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("reported-download", "1.0.0");
     mock.with_package("reported-download", "1.0.0", &tarball)
@@ -412,18 +412,18 @@ async fn download_firewall_report_json_includes_verdict_summary_and_decisions() 
             "reported-out",
         ])
         .output()
-        .expect("failed to run lpm download with firewall report");
+        .expect("failed to run lpm download with firewall monitor");
 
     assert!(
         output.status.success(),
-        "firewall report mode must continue:\nstdout: {}\nstderr: {}",
+        "firewall monitor mode must continue:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     let json = parse_json_output(&output.stdout);
     assert_eq!(json["success"], true);
     assert_eq!(json["firewall"]["enabled"], true, "{json:#}");
-    assert_eq!(json["firewall"]["mode"], "report");
+    assert_eq!(json["firewall"]["mode"], "monitor");
     assert_eq!(json["firewall"]["checked_count"], 1);
     assert_eq!(json["firewall"]["block_count"], 1);
     assert_eq!(
@@ -433,7 +433,7 @@ async fn download_firewall_report_json_includes_verdict_summary_and_decisions() 
     assert_eq!(json["firewall"]["decisions"][0]["action"], "block");
     assert!(
         project.file_exists("reported-out/package.json"),
-        "report mode must still extract package files"
+        "monitor mode must still extract package files"
     );
 }
 

@@ -293,16 +293,16 @@ async fn dlx_cache_install_shows_firewall_active_badge_when_public_npm_verdicts_
     .await;
     mock.with_npm_firewall_block("dlx-firewall-tool", "1.0.0")
         .await;
-    write_npm_firewall_global_config(&project, "report");
+    write_npm_firewall_global_config(&project, "monitor");
 
     let output = lpm_with_registry(&project, &mock.url())
         .args(["dlx", "dlx-firewall-tool@1.0.0"])
         .output()
-        .expect("failed to run lpm dlx with firewall report");
+        .expect("failed to run lpm dlx with firewall monitor");
 
     assert!(
         output.status.success(),
-        "report-mode firewall dlx must continue\nstdout: {}\nstderr: {}",
+        "monitor-mode firewall dlx must continue\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

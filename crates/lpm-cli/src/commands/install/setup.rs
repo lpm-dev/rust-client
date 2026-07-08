@@ -22,6 +22,7 @@ pub(super) struct InstallSetupContext {
         Option<Arc<crate::registry_signatures::RegistrySignatureTimings>>,
     pub(super) provenance_timings: Option<crate::provenance_fetch::ProvenanceTimings>,
     pub(super) npm_firewall_lookup_mode: NpmFirewallLookupMode,
+    pub(super) npm_firewall_policy_profile: lpm_registry::client::NpmFirewallPolicyProfile,
     pub(super) npm_firewall_chunk_size: usize,
     pub(super) policy_extension_configs: Vec<policy_extensions::PolicyExtensionConfig>,
     pub(super) force_security_floor: bool,
@@ -68,6 +69,8 @@ pub(super) fn prepare_install_setup_context(
         .enabled()
         .then(crate::provenance_fetch::ProvenanceTimings::default);
     let npm_firewall_lookup_mode = NpmFirewallLookupMode::from_env();
+    let npm_firewall_policy_profile =
+        crate::npm_firewall_config::config_policy_profile(&global_config)?;
     let npm_firewall_chunk_size = npm_firewall_chunk_size_from_env();
     let policy_extension_configs = load_policy_extension_configs(&global_config)?;
     let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
@@ -197,6 +200,7 @@ pub(super) fn prepare_install_setup_context(
         registry_signature_timings,
         provenance_timings,
         npm_firewall_lookup_mode,
+        npm_firewall_policy_profile,
         npm_firewall_chunk_size,
         policy_extension_configs,
         force_security_floor,

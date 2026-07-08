@@ -3605,8 +3605,8 @@ async fn install_offline_with_store_succeeds() {
 }
 
 #[tokio::test]
-async fn install_offline_firewall_report_relinks_and_reports_offline_skip_json() {
-    let project = warm_public_npm_lockfile_project_for_offline_firewall("report").await;
+async fn install_offline_firewall_monitor_relinks_and_reports_offline_skip_json() {
+    let project = warm_public_npm_lockfile_project_for_offline_firewall("monitor").await;
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
         .env("LPM_NPM_ROUTE", "direct")
@@ -3620,25 +3620,25 @@ async fn install_offline_firewall_report_relinks_and_reports_offline_skip_json()
             "--no-editor-setup",
         ])
         .output()
-        .expect("failed to run offline install with firewall report");
+        .expect("failed to run offline install with firewall monitor");
 
     assert!(
         output.status.success(),
-        "report-mode firewall must not block offline lockfile replay\nstdout: {}\nstderr: {}",
+        "monitor-mode firewall must not block offline lockfile replay\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
     let envelope = assertions::parse_json_output(&output.stdout);
     assert_eq!(envelope["offline"], serde_json::json!(true));
-    assert_eq!(envelope["timing"]["firewall"]["mode"], "report");
+    assert_eq!(envelope["timing"]["firewall"]["mode"], "monitor");
     assert_eq!(
         envelope["timing"]["firewall"]["lookup_mode"],
         "package_only"
     );
     assert_eq!(envelope["timing"]["firewall"]["checked_count"], 1);
     assert_eq!(envelope["timing"]["firewall"]["offline_skipped"], true);
-    assert_eq!(envelope["security"]["firewall"]["mode"], "report");
+    assert_eq!(envelope["security"]["firewall"]["mode"], "monitor");
     assertions::assert_in_node_modules(project.path(), "ms");
 }
 
@@ -3657,7 +3657,7 @@ async fn install_package_shows_firewall_active_badge_when_public_npm_verdicts_ar
         "version": "1.0.0"
     }"#,
     );
-    write_npm_firewall_global_config(&project, "report");
+    write_npm_firewall_global_config(&project, "monitor");
 
     let output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -3668,11 +3668,11 @@ async fn install_package_shows_firewall_active_badge_when_public_npm_verdicts_ar
             "--no-editor-setup",
         ])
         .output()
-        .expect("failed to run install with firewall report");
+        .expect("failed to run install with firewall monitor");
 
     assert!(
         output.status.success(),
-        "report-mode firewall install must continue\nstdout: {}\nstderr: {}",
+        "monitor-mode firewall install must continue\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

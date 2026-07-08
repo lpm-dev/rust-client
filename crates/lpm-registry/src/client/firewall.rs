@@ -116,6 +116,10 @@ pub struct NpmFirewallDecision {
     pub scan_run_id: Option<String>,
     pub report_path: Option<String>,
     pub confidence: Option<f64>,
+    #[serde(default)]
+    pub policy: Option<NpmFirewallDecisionPolicy>,
+    #[serde(default)]
+    pub authority: Option<NpmFirewallDecisionAuthority>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -136,6 +140,72 @@ impl NpmFirewallAction {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmFirewallDecisionPolicy {
+    pub group: String,
+    pub key: Option<String>,
+    pub intent: Option<String>,
+    pub default_action: Option<NpmFirewallPolicyAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmFirewallDecisionAuthority {
+    pub source: String,
+    pub source_type: Option<String>,
+    pub external_intel: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NpmFirewallPolicyAction {
+    Allow,
+    Warn,
+    Block,
+}
+
+impl NpmFirewallPolicyAction {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "warn" => Some(Self::Warn),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Warn => "warn",
+            Self::Block => "block",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmFirewallPolicyProfile {
+    pub trusted_public_malicious_advisories: NpmFirewallPolicyAction,
+    pub lpm_ai_confirmed_malware: NpmFirewallPolicyAction,
+    pub lpm_ai_agent_control_surface: NpmFirewallPolicyAction,
+    pub critical_vulnerability: NpmFirewallPolicyAction,
+    pub static_only_suspicious: NpmFirewallPolicyAction,
+}
+
+impl Default for NpmFirewallPolicyProfile {
+    fn default() -> Self {
+        Self {
+            trusted_public_malicious_advisories: NpmFirewallPolicyAction::Block,
+            lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Block,
+            lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Block,
+            critical_vulnerability: NpmFirewallPolicyAction::Warn,
+            static_only_suspicious: NpmFirewallPolicyAction::Warn,
+        }
+    }
+}
+
 impl RegistryClient {
     pub async fn npm_firewall_batch_verdicts(
         &self,
@@ -150,12 +220,27 @@ impl RegistryClient {
         packages: &[NpmFirewallBatchPackage],
         posture: AuthPosture,
     ) -> Result<NpmFirewallBatchResponse, LpmError> {
+        self.npm_firewall_batch_verdicts_with_posture_and_policy(packages, posture, None)
+            .await
+    }
+
+    pub async fn npm_firewall_batch_verdicts_with_posture_and_policy(
+        &self,
+        packages: &[NpmFirewallBatchPackage],
+        posture: AuthPosture,
+        policy_profile: Option<NpmFirewallPolicyProfile>,
+    ) -> Result<NpmFirewallBatchResponse, LpmError> {
         let url = format!("{}/api/registry/-/npm-firewall/verdicts", self.base_url);
-        let body = serde_json::to_vec(&serde_json::json!({
+        let mut request = serde_json::json!({
             "packages": packages,
             "decisionDetail": "actionable",
-        }))
-        .map_err(|error| {
+        });
+        if let Some(policy_profile) = policy_profile {
+            request["policyProfile"] = serde_json::json!({
+                "policies": policy_profile,
+            });
+        }
+        let body = serde_json::to_vec(&request).map_err(|error| {
             LpmError::Registry(format!(
                 "failed to encode npm firewall verdict request: {error}"
             ))

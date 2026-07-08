@@ -23,6 +23,8 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) gate_stats: Arc<GateStats>,
     pub(in crate::commands::install) npm_firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
     pub(in crate::commands::install) npm_firewall_lookup_mode: NpmFirewallLookupMode,
+    pub(in crate::commands::install) npm_firewall_policy_profile:
+        lpm_registry::client::NpmFirewallPolicyProfile,
     pub(in crate::commands::install) npm_firewall_chunk_size: usize,
     pub(in crate::commands::install) policy_extension_configs:
         &'a [policy_extensions::PolicyExtensionConfig],
@@ -98,6 +100,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         gate_stats,
         npm_firewall_mode,
         npm_firewall_lookup_mode,
+        npm_firewall_policy_profile,
         npm_firewall_chunk_size,
         policy_extension_configs,
         force,
@@ -279,6 +282,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                         route_table: route_table.clone(),
                                         mode: npm_firewall_mode,
                                         lookup_mode: npm_firewall_lookup_mode,
+                                        policy_profile: npm_firewall_policy_profile,
                                         offline,
                                         chunk_size: npm_firewall_chunk_size,
                                     },

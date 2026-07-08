@@ -56,8 +56,9 @@ use fetch::*;
 use fetch_overlap::*;
 use firewall::{
     NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallPreflightJoin,
-    NpmFirewallPreflightStats, finish_npm_firewall_preflight, npm_firewall_chunk_size_from_env,
-    npm_firewall_has_packages, run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight,
+    NpmFirewallPreflightRequest, NpmFirewallPreflightStats, finish_npm_firewall_preflight,
+    npm_firewall_chunk_size_from_env, npm_firewall_has_packages, run_npm_firewall_preflight,
+    spawn_chunked_npm_firewall_preflight,
 };
 pub(crate) use firewall::{
     NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
@@ -447,6 +448,7 @@ async fn run_with_options_under_store_lock(
         registry_signature_timings,
         provenance_timings,
         npm_firewall_lookup_mode,
+        npm_firewall_policy_profile,
         npm_firewall_chunk_size,
         policy_extension_configs,
         force_security_floor,
@@ -761,6 +763,7 @@ async fn run_with_options_under_store_lock(
             route_table: &route_table,
             npm_firewall_mode,
             npm_firewall_lookup_mode,
+            npm_firewall_policy_profile,
             policy_extension_configs: &policy_extension_configs,
             workspace_member_deps: &mut workspace_member_deps,
             all_workspace_members: &all_workspace_members,
@@ -1039,6 +1042,7 @@ async fn run_with_options_under_store_lock(
         gate_stats: gate_stats.clone(),
         npm_firewall_mode,
         npm_firewall_lookup_mode,
+        npm_firewall_policy_profile,
         npm_firewall_chunk_size,
         policy_extension_configs: &policy_extension_configs,
         force,
@@ -1071,15 +1075,16 @@ async fn run_with_options_under_store_lock(
         let result = join.drain().await?;
         finish_npm_firewall_preflight(result, json_output)?
     } else {
-        run_npm_firewall_preflight(
-            npm_firewall_mode,
-            npm_firewall_lookup_mode,
-            &arc_client,
-            &route_table,
-            &packages,
+        run_npm_firewall_preflight(NpmFirewallPreflightRequest {
+            mode: npm_firewall_mode,
+            lookup_mode: npm_firewall_lookup_mode,
+            policy_profile: npm_firewall_policy_profile,
+            client: &arc_client,
+            route_table: &route_table,
+            packages: &packages,
             offline,
             json_output,
-        )
+        })
         .await?
     };
     if post_firewall_fetch_overlap_allowed && fetch_overlap_join.is_none() && !packages.is_empty() {
