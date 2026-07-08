@@ -590,6 +590,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) route_table: &'a RouteTable,
     pub(super) npm_firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
     pub(super) npm_firewall_lookup_mode: NpmFirewallLookupMode,
+    pub(super) npm_firewall_policy_profile: lpm_registry::client::NpmFirewallPolicyProfile,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) workspace_member_deps: &'a mut Vec<WorkspaceMemberLink>,
     pub(super) all_workspace_members: &'a [WorkspaceMemberLink],
@@ -638,6 +639,7 @@ pub(super) async fn run_offline_install_phase(
         route_table,
         npm_firewall_mode,
         npm_firewall_lookup_mode,
+        npm_firewall_policy_profile,
         policy_extension_configs,
         workspace_member_deps,
         all_workspace_members,
@@ -785,6 +787,7 @@ pub(super) async fn run_offline_install_phase(
     let npm_firewall_stats = run_npm_firewall_preflight(
         npm_firewall_mode,
         npm_firewall_lookup_mode,
+        npm_firewall_policy_profile,
         arc_client,
         route_table,
         &locked,

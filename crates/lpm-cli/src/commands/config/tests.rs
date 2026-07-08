@@ -1,7 +1,8 @@
 use super::wizards::{
-    CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, FIREWALL_ENFORCE_HINT, FIREWALL_OFF_HINT,
-    FIREWALL_REPORT_HINT, FIREWALL_WIZARD_PROMPT, INTEGRITY_SOURCE_HINT, INTEGRITY_TREE_HINT,
-    INTEGRITY_WIZARD_PROMPT, persist_script_policy, release_age_initial_choice,
+    CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, FIREWALL_ENFORCE_HINT,
+    FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT, FIREWALL_WIZARD_PROMPT, INTEGRITY_SOURCE_HINT,
+    INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT, persist_firewall_policy_profile_in_config_value,
+    persist_script_policy, release_age_initial_choice,
 };
 use super::*;
 use crate::npm_firewall_config::{FIREWALL_CONFIG_MODE_KEY, FIREWALL_CONFIG_PATH};
@@ -46,15 +47,15 @@ fn firewall_wizard_copy_uses_npm_package_language() {
             FIREWALL_GUIDED_MENU_LABEL,
             FIREWALL_WIZARD_PROMPT,
             FIREWALL_OFF_HINT,
-            FIREWALL_REPORT_HINT,
+            FIREWALL_MONITOR_HINT,
             FIREWALL_ENFORCE_HINT,
         ),
         (
             "Firewall for npm",
             "How should LPM handle firewall verdicts for npm packages?",
             "default; use direct npm metadata and tarballs only",
-            "warn without blocking install",
-            "block packages marked malicious by firewall.lpm.dev",
+            "show what would be blocked without stopping install",
+            "recommended policy profile; block high-confidence firewall verdicts",
         )
     );
 }
@@ -395,7 +396,7 @@ fn global_config_get_typosquat_guard_mode_accepts_canonical_values() {
 
 #[tokio::test]
 async fn firewall_wizard_set_persists_each_valid_mode() {
-    for mode in ["off", "report", "enforce"] {
+    for mode in ["off", "monitor", "enforce", "report"] {
         let (_dir, path, _env) = tmp_config();
 
         run_firewall_wizard(&path, Some(mode), true).await.unwrap();
@@ -488,7 +489,7 @@ async fn firewall_wizard_set_rejects_looser_mode_when_force_floor_enabled() {
     )
     .unwrap();
 
-    let err = run_firewall_wizard(&path, Some("report"), true)
+    let err = run_firewall_wizard(&path, Some("monitor"), true)
         .await
         .unwrap_err();
 
@@ -509,7 +510,7 @@ async fn firewall_wizard_preserves_sibling_keys() {
     )
     .unwrap();
 
-    run_firewall_wizard(&path, Some("report"), true)
+    run_firewall_wizard(&path, Some("monitor"), true)
         .await
         .unwrap();
 
@@ -527,11 +528,49 @@ async fn firewall_wizard_preserves_sibling_keys() {
         firewall
             .get(FIREWALL_CONFIG_MODE_KEY)
             .and_then(|v| v.as_str()),
-        Some("report")
+        Some("monitor")
     );
     assert_eq!(
         firewall.get("note").and_then(|v| v.as_str()),
         Some("keep-me")
+    );
+}
+
+#[test]
+fn firewall_policy_profile_persistence_writes_nested_policy_table() {
+    let mut cfg = toml::Value::Table(toml::map::Map::new());
+
+    persist_firewall_policy_profile_in_config_value(
+        &mut cfg,
+        lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_agent_control_surface: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            static_only_suspicious: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        },
+    )
+    .unwrap();
+
+    let policies = cfg
+        .get(FIREWALL_CONFIG_SECTION)
+        .and_then(|value| value.as_table())
+        .and_then(|table| table.get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION))
+        .and_then(|value| value.as_table())
+        .and_then(|table| {
+            table.get(crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION)
+        })
+        .and_then(|value| value.as_table())
+        .unwrap();
+    assert_eq!(
+        policies
+            .get(crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY)
+            .and_then(|value| value.as_str()),
+        Some("warn")
+    );
+    assert_eq!(
+        policies
+            .get(crate::npm_firewall_config::STATIC_ONLY_SUSPICIOUS_POLICY_KEY)
+            .and_then(|value| value.as_str()),
+        Some("allow")
     );
 }
 

@@ -502,17 +502,17 @@ console.log('global-firewall-tool');
     .await;
     mock.with_npm_firewall_block(GLOBAL_NPM_FIREWALL_PKG, "1.0.0")
         .await;
-    write_npm_firewall_global_config(&project, "report");
+    write_npm_firewall_global_config(&project, "monitor");
 
     let spec = format!("{GLOBAL_NPM_FIREWALL_PKG}@1.0.0");
     let out = lpm_with_registry(&project, &mock.url())
         .args(["install", "-g", &spec])
         .output()
-        .expect("spawn lpm install -g with firewall report");
+        .expect("spawn lpm install -g with firewall monitor");
 
     assert!(
         out.status.success(),
-        "report-mode firewall global install must continue\nstdout: {}\nstderr: {}",
+        "monitor-mode firewall global install must continue\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

@@ -1,10 +1,21 @@
 use crate::commands::config::GlobalConfig;
 use lpm_common::LpmError;
+use lpm_registry::client::{NpmFirewallPolicyAction, NpmFirewallPolicyProfile};
 use std::path::Path;
 
 pub(crate) const FIREWALL_CONFIG_SECTION: &str = "firewall";
 pub(crate) const FIREWALL_CONFIG_MODE_KEY: &str = "mode";
 pub(crate) const FIREWALL_CONFIG_PATH: &str = "[firewall].mode";
+pub(crate) const FIREWALL_NPM_CONFIG_SECTION: &str = "npm";
+pub(crate) const FIREWALL_NPM_POLICIES_CONFIG_SECTION: &str = "policies";
+pub(crate) const FIREWALL_NPM_POLICIES_CONFIG_PATH: &str = "[firewall.npm.policies]";
+
+pub(crate) const TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY: &str =
+    "trusted_public_malicious_advisories";
+pub(crate) const LPM_AI_CONFIRMED_MALWARE_POLICY_KEY: &str = "lpm_ai_confirmed_malware";
+pub(crate) const LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY: &str = "lpm_ai_agent_control_surface";
+pub(crate) const CRITICAL_VULNERABILITY_POLICY_KEY: &str = "critical_vulnerability";
+pub(crate) const STATIC_ONLY_SUSPICIOUS_POLICY_KEY: &str = "static_only_suspicious";
 
 const ENV_NPM_FIREWALL: &str = "LPM_NPM_FIREWALL";
 const ENV_EXPERIMENT_NPM_FIREWALL: &str = "LPM_EXPERIMENT_NPM_FIREWALL";
@@ -13,7 +24,7 @@ const ENV_EXPERIMENT_NPM_FIREWALL: &str = "LPM_EXPERIMENT_NPM_FIREWALL";
 pub(crate) enum NpmFirewallMode {
     #[default]
     Off,
-    Report,
+    Monitor,
     Enforce,
 }
 
@@ -50,7 +61,7 @@ impl NpmFirewallMode {
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" | "false" | "0" | "no" | "disabled" => Some(Self::Off),
-            "report" | "warn" => Some(Self::Report),
+            "monitor" | "report" | "warn" => Some(Self::Monitor),
             "enforce" | "deny" | "block" | "true" | "1" | "yes" | "enabled" | "on" => {
                 Some(Self::Enforce)
             }
@@ -61,7 +72,7 @@ impl NpmFirewallMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Report => "report",
+            Self::Monitor => "monitor",
             Self::Enforce => "enforce",
         }
     }
@@ -89,7 +100,7 @@ impl NpmFirewallMode {
     fn rank(self) -> u8 {
         match self {
             Self::Off => 0,
-            Self::Report => 1,
+            Self::Monitor => 1,
             Self::Enforce => 2,
         }
     }
@@ -109,14 +120,77 @@ pub(crate) fn config_mode(global: &GlobalConfig) -> Result<Option<NpmFirewallMod
     };
     let raw = value.as_str().ok_or_else(|| {
         LpmError::Registry(format!(
-            "`{FIREWALL_CONFIG_PATH}` must be a string: off | report | enforce"
+            "`{FIREWALL_CONFIG_PATH}` must be a string: off | monitor | enforce"
         ))
     })?;
     NpmFirewallMode::parse(raw).map(Some).ok_or_else(|| {
         LpmError::Registry(format!(
-            "invalid `{FIREWALL_CONFIG_PATH}` value `{raw}`; must be one of: off | report | enforce"
+            "invalid `{FIREWALL_CONFIG_PATH}` value `{raw}`; must be one of: off | monitor | enforce (`report` is accepted as a legacy alias)"
         ))
     })
+}
+
+pub(crate) fn config_policy_profile(
+    global: &GlobalConfig,
+) -> Result<NpmFirewallPolicyProfile, LpmError> {
+    let Some(section) = global.get_value(FIREWALL_CONFIG_SECTION) else {
+        return Ok(NpmFirewallPolicyProfile::default());
+    };
+    let table = section.as_table().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "`[{FIREWALL_CONFIG_SECTION}]` must be a TOML table"
+        ))
+    })?;
+    let Some(npm) = table.get(FIREWALL_NPM_CONFIG_SECTION) else {
+        return Ok(NpmFirewallPolicyProfile::default());
+    };
+    let npm_table = npm
+        .as_table()
+        .ok_or_else(|| LpmError::Registry("`[firewall.npm]` must be a TOML table".to_string()))?;
+    let Some(policies) = npm_table.get(FIREWALL_NPM_POLICIES_CONFIG_SECTION) else {
+        return Ok(NpmFirewallPolicyProfile::default());
+    };
+    let policies = policies.as_table().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "`{FIREWALL_NPM_POLICIES_CONFIG_PATH}` must be a TOML table"
+        ))
+    })?;
+    let mut profile = NpmFirewallPolicyProfile::default();
+    for (key, value) in policies {
+        let raw = value.as_str().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "`{FIREWALL_NPM_POLICIES_CONFIG_PATH}.{key}` must be a string: allow | warn | block"
+            ))
+        })?;
+        let action = NpmFirewallPolicyAction::parse(raw).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid `{FIREWALL_NPM_POLICIES_CONFIG_PATH}.{key}` value `{raw}`; must be one of: allow | warn | block"
+            ))
+        })?;
+        match key.as_str() {
+            TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY => {
+                profile.trusted_public_malicious_advisories = action;
+            }
+            LPM_AI_CONFIRMED_MALWARE_POLICY_KEY => {
+                profile.lpm_ai_confirmed_malware = action;
+            }
+            LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY => {
+                profile.lpm_ai_agent_control_surface = action;
+            }
+            CRITICAL_VULNERABILITY_POLICY_KEY => {
+                profile.critical_vulnerability = action;
+            }
+            STATIC_ONLY_SUSPICIOUS_POLICY_KEY => {
+                profile.static_only_suspicious = action;
+            }
+            _ => {
+                return Err(LpmError::Registry(format!(
+                    "unknown `{FIREWALL_NPM_POLICIES_CONFIG_PATH}` key `{key}`"
+                )));
+            }
+        }
+    }
+    Ok(profile)
 }
 
 pub(crate) fn env_mode() -> Result<Option<NpmFirewallMode>, LpmError> {
@@ -130,12 +204,12 @@ fn parse_env_mode(key: &str) -> Result<Option<NpmFirewallMode>, LpmError> {
     match std::env::var(key) {
         Ok(raw) => NpmFirewallMode::parse(&raw).map(Some).ok_or_else(|| {
             LpmError::Registry(format!(
-                "invalid `{key}` value `{raw}`; must be one of: off | report | enforce"
+                "invalid `{key}` value `{raw}`; must be one of: off | monitor | enforce (`report` is accepted as a legacy alias)"
             ))
         }),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(LpmError::Registry(format!(
-            "`{key}` must be valid UTF-8: off | report | enforce"
+            "`{key}` must be valid UTF-8: off | monitor | enforce"
         ))),
     }
 }
@@ -189,8 +263,12 @@ mod tests {
     fn npm_firewall_mode_parses_product_values_and_aliases() {
         assert_eq!(NpmFirewallMode::parse("off"), Some(NpmFirewallMode::Off));
         assert_eq!(
+            NpmFirewallMode::parse(" Monitor "),
+            Some(NpmFirewallMode::Monitor)
+        );
+        assert_eq!(
             NpmFirewallMode::parse(" Report "),
-            Some(NpmFirewallMode::Report)
+            Some(NpmFirewallMode::Monitor)
         );
         assert_eq!(
             NpmFirewallMode::parse("TRUE"),
@@ -210,8 +288,68 @@ mod tests {
             NpmFirewallMode::Enforce
         );
         assert_eq!(
-            NpmFirewallMode::Report.stricter(NpmFirewallMode::Enforce),
+            NpmFirewallMode::Monitor.stricter(NpmFirewallMode::Enforce),
             NpmFirewallMode::Enforce
+        );
+    }
+
+    #[test]
+    fn npm_firewall_config_policy_profile_uses_defaults_without_policy_table() {
+        let global = GlobalConfig::empty();
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(
+            profile.trusted_public_malicious_advisories,
+            NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            profile.lpm_ai_agent_control_surface,
+            NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            profile.critical_vulnerability,
+            NpmFirewallPolicyAction::Warn
+        );
+    }
+
+    #[test]
+    fn npm_firewall_config_policy_profile_parses_custom_actions() {
+        let mut policies = toml::map::Map::new();
+        policies.insert(
+            LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY.to_string(),
+            toml::Value::String("warn".to_string()),
+        );
+        policies.insert(
+            TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY.to_string(),
+            toml::Value::String("block".to_string()),
+        );
+        let mut npm = toml::map::Map::new();
+        npm.insert(
+            FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+            toml::Value::Table(policies),
+        );
+        let mut firewall = toml::map::Map::new();
+        firewall.insert(
+            FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+        let mut table = toml::map::Map::new();
+        table.insert(
+            FIREWALL_CONFIG_SECTION.to_string(),
+            toml::Value::Table(firewall),
+        );
+        let global = GlobalConfig::from_table(table);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(
+            profile.lpm_ai_agent_control_surface,
+            NpmFirewallPolicyAction::Warn
+        );
+        assert_eq!(
+            profile.trusted_public_malicious_advisories,
+            NpmFirewallPolicyAction::Block
         );
     }
 

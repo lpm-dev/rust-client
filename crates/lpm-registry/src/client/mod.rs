@@ -33,8 +33,9 @@ pub use self::auth::AuthPosture;
 pub use self::body::parse_capped_api_json;
 pub use self::firewall::{
     NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse, NpmFirewallClientTiming,
-    NpmFirewallDecision, NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics,
-    NpmFirewallLookupDuration, NpmFirewallMatchSources, NpmFirewallSummary,
+    NpmFirewallDecision, NpmFirewallDecisionAuthority, NpmFirewallDecisionPolicy,
+    NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics, NpmFirewallLookupDuration,
+    NpmFirewallMatchSources, NpmFirewallPolicyAction, NpmFirewallPolicyProfile, NpmFirewallSummary,
 };
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{

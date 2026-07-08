@@ -2,7 +2,7 @@ use super::*;
 use lpm_registry::client::{
     AuthPosture, NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse,
     NpmFirewallClientTiming, NpmFirewallDecision, NpmFirewallDiagnostics,
-    NpmFirewallFlaggedPackageIndexDiagnostics,
+    NpmFirewallFlaggedPackageIndexDiagnostics, NpmFirewallPolicyProfile,
 };
 
 pub(super) use crate::npm_firewall_config::NpmFirewallMode;
@@ -53,6 +53,7 @@ pub(crate) type NpmFirewallMaterializationJson = Option<serde_json::Value>;
 pub(crate) struct NpmFirewallMaterializationPreflight {
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
+    policy_profile: NpmFirewallPolicyProfile,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
 }
 
@@ -66,7 +67,7 @@ impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
             Self::Off => AuthPosture::AnonymousPreferred,
-            Self::Report | Self::Enforce => AuthPosture::AuthRequired,
+            Self::Monitor | Self::Enforce => AuthPosture::AuthRequired,
         }
     }
 }
@@ -426,6 +427,7 @@ pub(super) struct NpmFirewallChunkedPreflightConfig {
     pub(super) route_table: RouteTable,
     pub(super) mode: NpmFirewallMode,
     pub(super) lookup_mode: NpmFirewallLookupMode,
+    pub(super) policy_profile: NpmFirewallPolicyProfile,
     pub(super) offline: bool,
     pub(super) chunk_size: usize,
 }
@@ -441,6 +443,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             route_table,
             mode,
             lookup_mode,
+            policy_profile,
             offline,
             chunk_size,
         } = config;
@@ -477,7 +480,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                 let _ = fetch_tx.send(event);
             }
             report_error = Some(format!(
-                "{NPM_FIREWALL_OFFLINE_HINT}; continuing because report mode is active"
+                "{NPM_FIREWALL_OFFLINE_HINT}; continuing because monitor mode is active"
             ));
             stats.batch_ms = total_started.elapsed().as_millis();
             return Ok(NpmFirewallPreflightResult {
@@ -509,6 +512,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                     &fetch_tx,
                                     &client,
                                     mode,
+                                    policy_profile,
                                     &mut stats,
                                     &mut tasks,
                                 );
@@ -521,6 +525,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                 &fetch_tx,
                                 &client,
                                 mode,
+                                policy_profile,
                                 &mut stats,
                                 &mut tasks,
                             );
@@ -589,6 +594,7 @@ fn spawn_or_release_firewall_chunk(
     fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
     client: &Arc<RegistryClient>,
     mode: NpmFirewallMode,
+    policy_profile: NpmFirewallPolicyProfile,
     stats: &mut NpmFirewallPreflightStats,
     tasks: &mut tokio::task::JoinSet<Result<FirewallChunkResult, LpmError>>,
 ) {
@@ -607,23 +613,29 @@ fn spawn_or_release_firewall_chunk(
     let events = std::mem::take(&mut chunk.events);
     let verdict_packages = std::mem::take(&mut chunk.verdict_packages);
     let client = Arc::clone(client);
-    tasks
-        .spawn(async move { request_firewall_chunk(client, mode, events, verdict_packages).await });
+    tasks.spawn(async move {
+        request_firewall_chunk(client, mode, policy_profile, events, verdict_packages).await
+    });
 }
 
 async fn request_firewall_chunk(
     client: Arc<RegistryClient>,
     mode: NpmFirewallMode,
+    policy_profile: NpmFirewallPolicyProfile,
     events: Vec<lpm_resolver::SelectedPackageEvent>,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
 ) -> Result<FirewallChunkResult, LpmError> {
     let started = Instant::now();
     let response = match client
-        .npm_firewall_batch_verdicts_with_posture(&verdict_packages, mode.auth_posture())
+        .npm_firewall_batch_verdicts_with_posture_and_policy(
+            &verdict_packages,
+            mode.auth_posture(),
+            Some(policy_profile),
+        )
         .await
     {
         Ok(response) => response,
-        Err(error) if matches!(mode, NpmFirewallMode::Report) => {
+        Err(error) if matches!(mode, NpmFirewallMode::Monitor) => {
             return Ok(FirewallChunkResult {
                 events,
                 response: None,
@@ -645,7 +657,7 @@ async fn request_firewall_chunk(
 
 fn npm_firewall_preflight_report_error(error: LpmError) -> String {
     let error = normalize_npm_firewall_preflight_error(error);
-    format!("npm firewall verdict preflight failed in report mode: {error}")
+    format!("npm firewall verdict preflight failed in monitor mode: {error}")
 }
 
 fn npm_firewall_preflight_enforce_error(error: LpmError) -> LpmError {
@@ -716,7 +728,7 @@ fn apply_firewall_chunk_result(
             .iter()
             .any(|decision| decision.action == NpmFirewallAction::Block);
     decisions.extend(response.decisions);
-    if matches!(mode, NpmFirewallMode::Report) || !chunk_has_block {
+    if matches!(mode, NpmFirewallMode::Monitor) || !chunk_has_block {
         release_firewall_events(fetch_tx, chunk_result.events);
     }
 }
@@ -733,6 +745,7 @@ fn release_firewall_events(
 pub(super) async fn request_npm_firewall_preflight(
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
+    policy_profile: NpmFirewallPolicyProfile,
     client: Arc<RegistryClient>,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
     offline: bool,
@@ -754,12 +767,12 @@ pub(super) async fn request_npm_firewall_preflight(
     if offline {
         stats.offline_skipped = true;
         let message = NPM_FIREWALL_OFFLINE_HINT.to_string();
-        if matches!(mode, NpmFirewallMode::Report) {
+        if matches!(mode, NpmFirewallMode::Monitor) {
             return Ok(NpmFirewallPreflightResult {
                 stats,
                 decisions: Vec::new(),
                 report_error: Some(format!(
-                    "{message}; continuing because report mode is active"
+                    "{message}; continuing because monitor mode is active"
                 )),
             });
         }
@@ -768,11 +781,15 @@ pub(super) async fn request_npm_firewall_preflight(
 
     let started = Instant::now();
     let response = match client
-        .npm_firewall_batch_verdicts_with_posture(&verdict_packages, mode.auth_posture())
+        .npm_firewall_batch_verdicts_with_posture_and_policy(
+            &verdict_packages,
+            mode.auth_posture(),
+            Some(policy_profile),
+        )
         .await
     {
         Ok(response) => response,
-        Err(error) if matches!(mode, NpmFirewallMode::Report) => {
+        Err(error) if matches!(mode, NpmFirewallMode::Monitor) => {
             stats.batch_ms = started.elapsed().as_millis();
             stats.rpc_failed = true;
             return Ok(NpmFirewallPreflightResult {
@@ -830,10 +847,10 @@ pub(super) fn finish_npm_firewall_preflight(
     let blocked_count = blocked.len().max(stats.block_count as usize);
     let warned_count = warned.len().max(stats.warn_count as usize);
 
-    if matches!(stats.mode, NpmFirewallMode::Report) {
+    if matches!(stats.mode, NpmFirewallMode::Monitor) {
         if !json_output && (blocked_count > 0 || warned_count > 0) {
             output::warn(&format!(
-                "npm firewall report found {} blocked and {} warned package(s); command continues because report mode is active.",
+                "npm firewall monitor found {} would-block and {} warned package(s); command continues because monitor mode is active.",
                 blocked_count, warned_count
             ));
             print_firewall_decisions(&blocked);
@@ -870,6 +887,7 @@ pub(super) fn finish_npm_firewall_preflight(
 pub(super) async fn run_npm_firewall_preflight(
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
+    policy_profile: NpmFirewallPolicyProfile,
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     packages: &[InstallPackage],
@@ -881,6 +899,7 @@ pub(super) async fn run_npm_firewall_preflight(
     let result = request_npm_firewall_preflight(
         mode,
         lookup_mode,
+        policy_profile,
         Arc::clone(client),
         verdict_packages,
         offline,
@@ -1016,6 +1035,7 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     let mode =
         crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
+    let policy_profile = crate::npm_firewall_config::config_policy_profile(&global_config)?;
     let lookup_mode = NpmFirewallLookupMode::from_env();
     let mut verdict_packages = Vec::with_capacity(packages.len());
     for package in packages {
@@ -1024,6 +1044,7 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
     Ok(NpmFirewallMaterializationPreflight {
         mode,
         lookup_mode,
+        policy_profile,
         verdict_packages,
     })
 }
@@ -1036,6 +1057,7 @@ pub(crate) async fn run_prepared_npm_firewall_materialization_preflight(
     let result = request_npm_firewall_preflight(
         preflight.mode,
         preflight.lookup_mode,
+        preflight.policy_profile,
         Arc::new(client.clone_with_config()),
         preflight.verdict_packages,
         false,
@@ -1054,7 +1076,7 @@ fn npm_firewall_materialization_json(
 
     let mut json = result.stats.to_json();
     if let Some(report_error) = &result.report_error {
-        json["report_error"] = serde_json::Value::String(report_error.clone());
+        json["monitor_error"] = serde_json::Value::String(report_error.clone());
     }
     if !result.decisions.is_empty() {
         json["decisions"] = serde_json::Value::Array(
@@ -1069,7 +1091,7 @@ fn npm_firewall_materialization_json(
 }
 
 fn npm_firewall_decision_json(decision: &NpmFirewallDecision) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "decision_id": &decision.decision_id,
         "name": &decision.name,
         "version": &decision.version,
@@ -1084,7 +1106,23 @@ fn npm_firewall_decision_json(decision: &NpmFirewallDecision) -> serde_json::Val
         "scan_run_id": &decision.scan_run_id,
         "report_path": &decision.report_path,
         "confidence": decision.confidence,
-    })
+    });
+    if let Some(policy) = &decision.policy {
+        json["policy"] = serde_json::json!({
+            "group": &policy.group,
+            "key": &policy.key,
+            "intent": &policy.intent,
+            "default_action": policy.default_action.map(|action| action.as_str()),
+        });
+    }
+    if let Some(authority) = &decision.authority {
+        json["authority"] = serde_json::json!({
+            "source": &authority.source,
+            "source_type": &authority.source_type,
+            "external_intel": authority.external_intel,
+        });
+    }
+    json
 }
 
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {
@@ -1093,6 +1131,28 @@ fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {
         let version = lpm_common::sanitize_for_terminal(&decision.version);
         let verdict = lpm_common::sanitize_for_terminal(&decision.verdict);
         let reason = lpm_common::sanitize_for_terminal(&decision.reason);
-        eprintln!("    {name}@{version} - {verdict}: {reason}");
+        let context = firewall_decision_context(decision);
+        eprintln!("    {name}@{version} - {verdict}: {reason}{context}");
+    }
+}
+
+fn firewall_decision_context(decision: &NpmFirewallDecision) -> String {
+    let policy = decision.policy.as_ref().map(|policy| {
+        format!(
+            "policy {}",
+            lpm_common::sanitize_for_terminal(&policy.group)
+        )
+    });
+    let authority = decision.authority.as_ref().map(|authority| {
+        format!(
+            "source {}",
+            lpm_common::sanitize_for_terminal(&authority.source)
+        )
+    });
+    match (policy, authority) {
+        (Some(policy), Some(authority)) => format!(" ({policy}, {authority})"),
+        (Some(policy), None) => format!(" ({policy})"),
+        (None, Some(authority)) => format!(" ({authority})"),
+        (None, None) => String::new(),
     }
 }

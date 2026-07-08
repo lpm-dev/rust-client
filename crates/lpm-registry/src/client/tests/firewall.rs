@@ -169,6 +169,96 @@ async fn npm_firewall_batch_verdicts_maps_firewall_entitlement_denial() {
 }
 
 #[tokio::test]
+async fn npm_firewall_batch_verdicts_sends_policy_profile_when_configured() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new().with_base_url(server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"policyProfile\""))
+        .and(body_string_contains(
+            "\"lpmAiAgentControlSurface\":\"warn\"",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "requestId": "req-policy",
+                    "policyMode": "product_default",
+                    "summary": {
+                        "total": 1,
+                        "allow": 0,
+                        "warn": 1,
+                        "block": 0,
+                        "unknown": 0,
+                        "matched": 1
+                    },
+                    "decisions": [{
+                        "decisionId": "req-policy:1",
+                        "name": "@accio-ai/cli",
+                        "version": "0.1.29",
+                        "action": "warn",
+                        "verdict": "malicious",
+                        "reason": "client policy maps lpm_ai_agent_control_surface to warn",
+                        "matchSource": "package",
+                        "matchedKey": "fw:npm:v1:%40accio-ai%2Fcli@0.1.29",
+                        "policyMode": "product_default",
+                        "policy": {
+                            "key": "ai_agent_control_surface",
+                            "group": "lpm_ai_agent_control_surface",
+                            "intent": "dangerous_capability",
+                            "defaultAction": "block"
+                        },
+                        "authority": {
+                            "source": "lpm_ai",
+                            "sourceType": "lpm",
+                            "externalIntel": false
+                        }
+                    }]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .npm_firewall_batch_verdicts_with_posture_and_policy(
+            &[NpmFirewallBatchPackage {
+                name: "@accio-ai/cli".to_string(),
+                version: "0.1.29".to_string(),
+                integrity: None,
+                published_at: None,
+            }],
+            AuthPosture::AnonymousPreferred,
+            Some(NpmFirewallPolicyProfile {
+                lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Warn,
+                ..NpmFirewallPolicyProfile::default()
+            }),
+        )
+        .await
+        .expect("firewall verdict request should succeed");
+
+    assert_eq!(result.decisions[0].action, NpmFirewallAction::Warn);
+    assert_eq!(
+        result.decisions[0]
+            .policy
+            .as_ref()
+            .map(|policy| policy.group.as_str()),
+        Some("lpm_ai_agent_control_surface")
+    );
+    assert_eq!(
+        result.decisions[0]
+            .authority
+            .as_ref()
+            .map(|authority| authority.source.as_str()),
+        Some("lpm_ai")
+    );
+}
+
+#[tokio::test]
 async fn npm_firewall_batch_verdicts_rejects_unknown_action() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

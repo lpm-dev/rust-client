@@ -59,7 +59,7 @@ use wizards::{
 ///   (operator persistent toggle for npm publisher/provenance downgrade checks).
 /// - `lpm config typosquat` owns `typosquat-guard = default | on | off`
 ///   (operator persistent toggle for suspicious package-name analysis).
-/// - `lpm config firewall` owns `[firewall] mode = off | report | enforce`
+/// - `lpm config firewall` owns `[firewall] mode = off | monitor | enforce`
 ///   (operator persistent toggle for npm package firewall verdict checks).
 /// - `lpm config integrity` owns `integrity = source | tree`
 ///   (operator preference for v2 expanded-store object validation).
