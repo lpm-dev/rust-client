@@ -885,15 +885,18 @@ pub(super) fn finish_npm_firewall_preflight(
 }
 
 pub(super) async fn run_npm_firewall_preflight(
-    mode: NpmFirewallMode,
-    lookup_mode: NpmFirewallLookupMode,
-    policy_profile: NpmFirewallPolicyProfile,
-    client: &Arc<RegistryClient>,
-    route_table: &RouteTable,
-    packages: &[InstallPackage],
-    offline: bool,
-    json_output: bool,
+    request: NpmFirewallPreflightRequest<'_>,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
+    let NpmFirewallPreflightRequest {
+        mode,
+        lookup_mode,
+        policy_profile,
+        client,
+        route_table,
+        packages,
+        offline,
+        json_output,
+    } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
     let result = request_npm_firewall_preflight(
@@ -906,6 +909,17 @@ pub(super) async fn run_npm_firewall_preflight(
     )
     .await?;
     finish_npm_firewall_preflight(result, json_output)
+}
+
+pub(super) struct NpmFirewallPreflightRequest<'a> {
+    pub(super) mode: NpmFirewallMode,
+    pub(super) lookup_mode: NpmFirewallLookupMode,
+    pub(super) policy_profile: NpmFirewallPolicyProfile,
+    pub(super) client: &'a Arc<RegistryClient>,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) packages: &'a [InstallPackage],
+    pub(super) offline: bool,
+    pub(super) json_output: bool,
 }
 
 pub(super) fn npm_firewall_packages(

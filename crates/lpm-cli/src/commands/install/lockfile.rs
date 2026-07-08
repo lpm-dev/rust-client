@@ -784,16 +784,16 @@ pub(super) async fn run_offline_install_phase(
         )
         .await?;
     }
-    let npm_firewall_stats = run_npm_firewall_preflight(
-        npm_firewall_mode,
-        npm_firewall_lookup_mode,
-        npm_firewall_policy_profile,
-        arc_client,
+    let npm_firewall_stats = run_npm_firewall_preflight(NpmFirewallPreflightRequest {
+        mode: npm_firewall_mode,
+        lookup_mode: npm_firewall_lookup_mode,
+        policy_profile: npm_firewall_policy_profile,
+        client: arc_client,
         route_table,
-        &locked,
-        true,
+        packages: &locked,
+        offline: true,
         json_output,
-    )
+    })
     .await?;
     let policy_extension_stats =
         run_policy_extensions(policy_extension_configs, project_dir, &locked, json_output).await?;
