@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/security.rs
+expression: disable_envelope
+---
+{
+  "success": true,
+  "change": "disabled",
+  "protect": {
+    "path": "[POLICY_PATH]",
+    "active": false
+  }
+}

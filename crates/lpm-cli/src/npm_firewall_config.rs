@@ -35,6 +35,22 @@ pub(crate) struct NpmFirewallModeRequest {
 }
 
 impl NpmFirewallModeRequest {
+    #[cfg(test)]
+    pub(crate) fn from_config(mode: NpmFirewallMode) -> Self {
+        Self {
+            mode,
+            source: NpmFirewallModeRequestSource::Config,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_env(mode: NpmFirewallMode) -> Self {
+        Self {
+            mode,
+            source: NpmFirewallModeRequestSource::Env,
+        }
+    }
+
     pub(crate) fn mode(self) -> NpmFirewallMode {
         self.mode
     }
@@ -45,6 +61,32 @@ impl NpmFirewallModeRequest {
             NpmFirewallModeRequestSource::Env => "environment",
             NpmFirewallModeRequestSource::ConfigAndEnv => {
                 "~/.lpm/config.toml [firewall].mode + environment"
+            }
+        }
+    }
+
+    pub(crate) fn approval_source(self) -> crate::security_approval::ApprovalSource {
+        match self.source {
+            NpmFirewallModeRequestSource::Config => {
+                crate::security_approval::ApprovalSource::GlobalConfig
+            }
+            NpmFirewallModeRequestSource::Env => crate::security_approval::ApprovalSource::EnvVar,
+            NpmFirewallModeRequestSource::ConfigAndEnv => {
+                crate::security_approval::ApprovalSource::ConfigAndEnv
+            }
+        }
+    }
+
+    pub(crate) fn downgrade_message(self) -> &'static str {
+        match self.source {
+            NpmFirewallModeRequestSource::Config => {
+                "The persisted global [firewall].mode setting weakens npm firewall checks for this project."
+            }
+            NpmFirewallModeRequestSource::Env => {
+                "The environment npm firewall setting weakens npm firewall checks for this project."
+            }
+            NpmFirewallModeRequestSource::ConfigAndEnv => {
+                "The combined persisted global [firewall].mode and environment npm firewall settings weaken npm firewall checks for this project."
             }
         }
     }
@@ -250,7 +292,7 @@ pub(crate) fn resolve_runtime_mode(
         &effective,
         project_dir,
         json_output,
-        request.mode(),
+        request,
     )?;
     Ok(request.mode())
 }
@@ -305,7 +347,7 @@ mod tests {
         );
         assert_eq!(
             profile.lpm_ai_agent_control_surface,
-            NpmFirewallPolicyAction::Block
+            NpmFirewallPolicyAction::Warn
         );
         assert_eq!(
             profile.critical_vulnerability,

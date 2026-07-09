@@ -28,8 +28,367 @@ pub(super) fn managed_policy_error(path: &Path, message: impl Into<String>) -> L
     ))
 }
 
-#[cfg_attr(test, allow(dead_code))]
-#[cfg(unix)]
+fn managed_protection_status(
+    path: &Path,
+    policy: Option<ManagedPolicy>,
+) -> ManagedProtectionStatus {
+    let firewall_mode = policy
+        .as_ref()
+        .and_then(|policy| policy.firewall_mode)
+        .map(|mode| mode.as_str().to_string());
+    ManagedProtectionStatus {
+        path: path.display().to_string(),
+        active: firewall_mode.is_some(),
+        firewall_mode,
+        managed_policy: policy.map(|policy| policy.status),
+    }
+}
+
+pub(crate) fn load_managed_protection_status() -> Result<ManagedProtectionStatus, LpmError> {
+    let path = managed_policy_path();
+    let policy = load_managed_policy()?;
+    Ok(managed_protection_status(&path, policy))
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn canonical_policy_path(path: &Path, default_path: &Path) -> Result<PathBuf, LpmError> {
+    let canonical = std::fs::canonicalize(path)?;
+    let canonical_default = std::fs::canonicalize(default_path)?;
+    if canonical != canonical_default {
+        return Err(managed_policy_error(
+            path,
+            format!("must resolve to {}", default_path.display()),
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn canonical_policy_parent(path: &Path, default_path: &Path) -> Result<PathBuf, LpmError> {
+    let Some(parent) = path.parent() else {
+        return Err(managed_policy_error(
+            path,
+            "must have a managed parent directory",
+        ));
+    };
+    let Some(default_parent) = default_path.parent() else {
+        return Err(managed_policy_error(
+            default_path,
+            "must have a managed parent directory",
+        ));
+    };
+    let Some(file_name) = path.file_name() else {
+        return Err(managed_policy_error(path, "must have a managed file name"));
+    };
+    let Some(default_file_name) = default_path.file_name() else {
+        return Err(managed_policy_error(
+            default_path,
+            "must have a managed file name",
+        ));
+    };
+
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let canonical_default_parent = std::fs::canonicalize(default_parent)?;
+    let canonical_path = canonical_parent.join(file_name);
+    let canonical_default_path = canonical_default_parent.join(default_file_name);
+    if canonical_path != canonical_default_path {
+        return Err(managed_policy_error(
+            path,
+            format!("must resolve to {}", default_path.display()),
+        ));
+    }
+    Ok(canonical_parent)
+}
+
+#[cfg(all(unix, not(any(debug_assertions, test))))]
+fn validate_managed_policy_parent_authority(path: &Path) -> Result<(), LpmError> {
+    let default_path = Path::new(DEFAULT_SECURITY_POLICY_PATH);
+    let parent = canonical_policy_parent(path, default_path)?;
+    let mut current = Some(parent.as_path());
+    while let Some(dir) = current {
+        validate_root_owned_path(dir, true)?;
+        current = dir.parent();
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, not(any(debug_assertions, test))))]
+fn validate_managed_policy_parent_authority(path: &Path) -> Result<(), LpmError> {
+    let default_path = PathBuf::from(DEFAULT_SECURITY_POLICY_PATH);
+    if path != default_path {
+        return Err(managed_policy_error(
+            path,
+            format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(managed_policy_error(
+            path,
+            "must have a managed parent directory",
+        ));
+    };
+    validate_windows_admin_owned_path(parent, true)
+}
+
+#[cfg(any(debug_assertions, test))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "debug/test stub must preserve the fallible production signature"
+)]
+fn validate_managed_policy_parent_authority(_path: &Path) -> Result<(), LpmError> {
+    Ok(())
+}
+
+fn privileged_policy_io_error(path: &Path, action: &str, err: std::io::Error) -> LpmError {
+    LpmError::Registry(format!(
+        "could not {action} managed security policy {}: {err}. Re-run with administrator privileges.",
+        path.display()
+    ))
+}
+
+fn ensure_policy_parent_for_write(path: &Path) -> Result<(), LpmError> {
+    let Some(parent) = path.parent() else {
+        return Err(managed_policy_error(
+            path,
+            "must have a managed parent directory",
+        ));
+    };
+    let parent_existed = parent.exists();
+    std::fs::create_dir_all(parent)
+        .map_err(|err| privileged_policy_io_error(path, "prepare", err))?;
+    #[cfg(unix)]
+    if !parent_existed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .map_err(|err| privileged_policy_io_error(path, "secure parent for", err))?;
+    }
+    validate_managed_policy_parent_authority(path)
+}
+
+fn read_managed_policy_value(path: &Path) -> Result<toml::Value, LpmError> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    validate_managed_policy_authority(path)?;
+    let content = std::fs::read_to_string(path)?;
+    toml::from_str(&content).map_err(|e| managed_policy_error(path, format!("parse error: {e}")))
+}
+
+fn table_mut<'a>(
+    value: &'a mut toml::Value,
+    path: &Path,
+    label: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>, LpmError> {
+    value
+        .as_table_mut()
+        .ok_or_else(|| managed_policy_error(path, format!("must set `{label}` to a TOML table")))
+}
+
+fn child_table_mut<'a>(
+    table: &'a mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>, LpmError> {
+    table
+        .entry(key.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| managed_policy_error(path, format!("must set `[{key}]` to a TOML table")))
+}
+
+fn ensure_protect_policy_metadata(
+    table: &mut toml::map::Map<String, toml::Value>,
+    path: &Path,
+) -> Result<bool, LpmError> {
+    let policy = child_table_mut(table, "policy", path)?;
+    let mut changed = false;
+    if !policy.contains_key("name") {
+        policy.insert(
+            "name".to_string(),
+            toml::Value::String("lpm local protection".to_string()),
+        );
+        changed = true;
+    }
+    if !policy.contains_key("source") {
+        policy.insert(
+            "source".to_string(),
+            toml::Value::String("lpm security protect".to_string()),
+        );
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn policy_value_has_enforced_controls(value: &toml::Value) -> bool {
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+    table.contains_key("script-policy")
+        || table.contains_key("minimum-release-age-secs")
+        || table.contains_key(crate::release_age_config::GLOBAL_POLICY_KEY)
+        || table.contains_key(crate::commands::config::TYPOSQUAT_GUARD_KEY)
+        || table
+            .get("sandbox")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|sandbox| {
+                sandbox.contains_key("mode") || sandbox.contains_key("allow-degraded")
+            })
+        || table
+            .get("sigstore")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|sigstore| sigstore.contains_key("verify"))
+        || table
+            .get(crate::npm_firewall_config::FIREWALL_CONFIG_SECTION)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|firewall| {
+                firewall.contains_key(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY)
+            })
+}
+
+fn remove_empty_table(table: &mut toml::map::Map<String, toml::Value>, key: &str) {
+    if table
+        .get(key)
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::map::Map::is_empty)
+    {
+        table.remove(key);
+    }
+}
+
+fn write_managed_policy_value(path: &Path, value: &toml::Value) -> Result<(), LpmError> {
+    if path.exists() {
+        validate_managed_policy_authority(path)?;
+    } else {
+        ensure_policy_parent_for_write(path)?;
+    }
+    let content = toml::to_string_pretty(value)
+        .map_err(|e| managed_policy_error(path, format!("serialize error: {e}")))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| managed_policy_error(path, "must have a managed parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("security-policy.toml");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write_result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|err| privileged_policy_io_error(path, "write", err))?;
+        file.write_all(content.as_bytes())
+            .map_err(|err| privileged_policy_io_error(path, "write", err))?;
+        file.sync_all()
+            .map_err(|err| privileged_policy_io_error(path, "flush", err))?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o644))
+                .map_err(|err| privileged_policy_io_error(path, "secure", err))?;
+        }
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|err| privileged_policy_io_error(path, "replace", err))?;
+        }
+        std::fs::rename(&temp_path, path)
+            .map_err(|err| privileged_policy_io_error(path, "replace", err))?;
+        validate_managed_policy_authority(path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+pub(crate) fn install_managed_firewall_protection(
+    mode: crate::npm_firewall_config::NpmFirewallMode,
+) -> Result<ManagedProtectionReport, LpmError> {
+    if matches!(mode, crate::npm_firewall_config::NpmFirewallMode::Off) {
+        return Err(LpmError::Registry(
+            "`lpm security protect enable` requires `--firewall monitor` or `--firewall enforce`; `off` would not protect against LPM_HOME bypass".into(),
+        ));
+    }
+
+    let path = managed_policy_path();
+    let mut value = read_managed_policy_value(&path)?;
+    let top = table_mut(&mut value, &path, "policy")?;
+    let metadata_changed = ensure_protect_policy_metadata(top, &path)?;
+    let firewall = child_table_mut(
+        top,
+        crate::npm_firewall_config::FIREWALL_CONFIG_SECTION,
+        &path,
+    )?;
+    let previous_mode = firewall
+        .get(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY)
+        .and_then(toml::Value::as_str)
+        .and_then(crate::npm_firewall_config::NpmFirewallMode::parse);
+    firewall.insert(
+        crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY.to_string(),
+        toml::Value::String(mode.as_str().to_string()),
+    );
+    let changed = metadata_changed || previous_mode != Some(mode);
+    if changed {
+        write_managed_policy_value(&path, &value)?;
+    }
+    Ok(ManagedProtectionReport {
+        change: if changed {
+            ManagedProtectionChange::Enabled
+        } else {
+            ManagedProtectionChange::Unchanged
+        },
+        status: load_managed_protection_status()?,
+    })
+}
+
+pub(crate) fn remove_managed_firewall_protection() -> Result<ManagedProtectionReport, LpmError> {
+    let path = managed_policy_path();
+    if !path.exists() {
+        return Ok(ManagedProtectionReport {
+            change: ManagedProtectionChange::Unchanged,
+            status: managed_protection_status(&path, None),
+        });
+    }
+    let mut value = read_managed_policy_value(&path)?;
+    let Some(top) = value.as_table_mut() else {
+        return Err(managed_policy_error(
+            &path,
+            "must be a TOML table at the top level",
+        ));
+    };
+    let removed = top
+        .get_mut(crate::npm_firewall_config::FIREWALL_CONFIG_SECTION)
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|firewall| firewall.remove(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY))
+        .is_some();
+    if !removed {
+        return Ok(ManagedProtectionReport {
+            change: ManagedProtectionChange::Unchanged,
+            status: load_managed_protection_status()?,
+        });
+    }
+    remove_empty_table(top, crate::npm_firewall_config::FIREWALL_CONFIG_SECTION);
+    if policy_value_has_enforced_controls(&value) {
+        write_managed_policy_value(&path, &value)?;
+    } else {
+        validate_managed_policy_authority(&path)?;
+        std::fs::remove_file(&path)
+            .map_err(|err| privileged_policy_io_error(&path, "remove", err))?;
+    }
+    Ok(ManagedProtectionReport {
+        change: ManagedProtectionChange::Disabled,
+        status: load_managed_protection_status()?,
+    })
+}
+
+#[cfg(all(unix, not(any(debug_assertions, test))))]
 fn validate_root_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
@@ -68,29 +427,21 @@ fn validate_root_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmErro
     Ok(())
 }
 
-#[cfg(all(unix, not(test)))]
+#[cfg(all(unix, not(any(debug_assertions, test))))]
 fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
-    let canonical = std::fs::canonicalize(path)?;
-    if canonical != Path::new(DEFAULT_SECURITY_POLICY_PATH) {
-        return Err(managed_policy_error(
-            path,
-            format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
-        ));
-    }
+    let default_path = Path::new(DEFAULT_SECURITY_POLICY_PATH);
+    let canonical = canonical_policy_path(path, default_path)?;
 
     validate_root_owned_path(path, false)?;
-    let mut current = path.parent();
+    let mut current = canonical.parent();
     while let Some(dir) = current {
         validate_root_owned_path(dir, true)?;
-        if dir == Path::new("/etc") {
-            break;
-        }
         current = dir.parent();
     }
     Ok(())
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(all(windows, not(any(debug_assertions, test))))]
 fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmError> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
@@ -279,7 +630,7 @@ fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<()
     Ok(())
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(all(windows, not(any(debug_assertions, test))))]
 fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
     let canonical = std::fs::canonicalize(path)?;
     let default_path = PathBuf::from(DEFAULT_SECURITY_POLICY_PATH);
@@ -306,10 +657,10 @@ fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(debug_assertions, test))]
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "test stub must preserve the fallible production signature"
+    reason = "debug/test stub must preserve the fallible production signature"
 )]
 fn validate_managed_policy_authority(_path: &Path) -> Result<(), LpmError> {
     Ok(())
@@ -523,4 +874,35 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         typosquat_guard,
         firewall_mode,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_policy_path_accepts_default_path_through_symlinked_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_etc = temp.path().join("private/etc");
+        let link_etc = temp.path().join("etc");
+        let real_lpm = real_etc.join("lpm");
+        std::fs::create_dir_all(&real_lpm).unwrap();
+        std::os::unix::fs::symlink(&real_etc, &link_etc).unwrap();
+
+        let default_path = link_etc.join("lpm/security-policy.toml");
+        let real_path = real_lpm.join("security-policy.toml");
+        std::fs::write(&real_path, "[firewall]\nmode = \"enforce\"\n").unwrap();
+        let canonical_real_path = std::fs::canonicalize(&real_path).unwrap();
+        let canonical_real_lpm = std::fs::canonicalize(&real_lpm).unwrap();
+
+        assert_eq!(
+            canonical_policy_path(&default_path, &default_path).unwrap(),
+            canonical_real_path
+        );
+        assert_eq!(
+            canonical_policy_parent(&default_path, &default_path).unwrap(),
+            canonical_real_lpm
+        );
+    }
 }

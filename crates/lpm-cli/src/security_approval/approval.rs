@@ -854,7 +854,7 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized(
         &effective,
         project_dir,
         json_output,
-        requested,
+        crate::npm_firewall_config::NpmFirewallModeRequest::from_config(requested),
     )
 }
 
@@ -862,12 +862,14 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
     effective: &EffectiveAuthorizedPosture,
     project_dir: &Path,
     json_output: bool,
-    requested: crate::npm_firewall_config::NpmFirewallMode,
+    request: crate::npm_firewall_config::NpmFirewallModeRequest,
 ) -> Result<(), LpmError> {
+    let requested = request.mode();
     let approved = effective.posture.firewall_mode();
     if !requested.loosens(approved) {
         return Ok(());
     }
+    let source = request.approval_source();
     if let Some(err) = managed_policy_blocks_scope(effective, ApprovalScope::FirewallDisable) {
         record_audit_event(
             AuditRecord::new(
@@ -876,7 +878,7 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
                 vec![ApprovalScope::FirewallDisable.as_str().to_string()],
             )
             .project_root(canonical_project_root(project_dir))
-            .source(ApprovalSource::GlobalConfig)
+            .source(source)
             .detail("runtime npm firewall posture is weaker than managed policy".to_string()),
         );
         return Err(err);
@@ -885,8 +887,8 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
         ApprovalScope::FirewallDisable,
         project_dir,
         json_output,
-        ApprovalSource::GlobalConfig,
-        "The persisted global [firewall].mode setting weakens npm firewall checks for this project.",
+        source,
+        request.downgrade_message(),
         None,
         &[],
     )

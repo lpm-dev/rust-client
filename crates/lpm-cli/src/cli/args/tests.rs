@@ -86,6 +86,48 @@ fn config_without_action_parses_to_guided_editor() {
 }
 
 #[test]
+fn security_protect_enable_defaults_to_enforced_firewall() {
+    let cli = Cli::try_parse_from(["lpm", "security", "protect", "enable"]).unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Security(security::SecurityArgs {
+            action:
+                commands::security::SecurityCmd::Protect {
+                    action:
+                        commands::security::ProtectCmd::Enable {
+                            firewall: commands::security::ProtectFirewallMode::Enforce,
+                        },
+                },
+        }) => {}
+        _ => panic!("expected security protect enable command"),
+    }
+}
+
+#[test]
+fn security_protect_enable_accepts_monitor_firewall() {
+    let cli = Cli::try_parse_from([
+        "lpm",
+        "security",
+        "protect",
+        "enable",
+        "--firewall",
+        "monitor",
+    ])
+    .unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Security(security::SecurityArgs {
+            action:
+                commands::security::SecurityCmd::Protect {
+                    action:
+                        commands::security::ProtectCmd::Enable {
+                            firewall: commands::security::ProtectFirewallMode::Monitor,
+                        },
+                },
+        }) => {}
+        _ => panic!("expected security protect enable --firewall monitor command"),
+    }
+}
+
+#[test]
 fn lowercase_v_after_subcommand_is_version_not_verbose() {
     // `-v` is reserved for `--version`, matching npm/pnpm/yarn.
     // Verbose output remains long-form only.

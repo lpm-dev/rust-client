@@ -199,7 +199,7 @@ impl Default for NpmFirewallPolicyProfile {
         Self {
             trusted_public_malicious_advisories: NpmFirewallPolicyAction::Block,
             lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Block,
-            lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Block,
+            lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Warn,
             critical_vulnerability: NpmFirewallPolicyAction::Warn,
             static_only_suspicious: NpmFirewallPolicyAction::Warn,
         }
