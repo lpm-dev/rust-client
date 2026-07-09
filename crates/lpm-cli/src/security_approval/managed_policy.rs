@@ -50,26 +50,63 @@ pub(crate) fn load_managed_protection_status() -> Result<ManagedProtectionStatus
     Ok(managed_protection_status(&path, policy))
 }
 
-#[cfg(all(unix, not(any(debug_assertions, test))))]
-fn validate_managed_policy_parent_authority(path: &Path) -> Result<(), LpmError> {
-    if path != Path::new(DEFAULT_SECURITY_POLICY_PATH) {
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn canonical_policy_path(path: &Path, default_path: &Path) -> Result<PathBuf, LpmError> {
+    let canonical = std::fs::canonicalize(path)?;
+    let canonical_default = std::fs::canonicalize(default_path)?;
+    if canonical != canonical_default {
         return Err(managed_policy_error(
             path,
-            format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
+            format!("must resolve to {}", default_path.display()),
         ));
     }
+    Ok(canonical)
+}
+
+#[cfg(all(unix, any(test, not(debug_assertions))))]
+fn canonical_policy_parent(path: &Path, default_path: &Path) -> Result<PathBuf, LpmError> {
     let Some(parent) = path.parent() else {
         return Err(managed_policy_error(
             path,
             "must have a managed parent directory",
         ));
     };
-    let mut current = Some(parent);
+    let Some(default_parent) = default_path.parent() else {
+        return Err(managed_policy_error(
+            default_path,
+            "must have a managed parent directory",
+        ));
+    };
+    let Some(file_name) = path.file_name() else {
+        return Err(managed_policy_error(path, "must have a managed file name"));
+    };
+    let Some(default_file_name) = default_path.file_name() else {
+        return Err(managed_policy_error(
+            default_path,
+            "must have a managed file name",
+        ));
+    };
+
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let canonical_default_parent = std::fs::canonicalize(default_parent)?;
+    let canonical_path = canonical_parent.join(file_name);
+    let canonical_default_path = canonical_default_parent.join(default_file_name);
+    if canonical_path != canonical_default_path {
+        return Err(managed_policy_error(
+            path,
+            format!("must resolve to {}", default_path.display()),
+        ));
+    }
+    Ok(canonical_parent)
+}
+
+#[cfg(all(unix, not(any(debug_assertions, test))))]
+fn validate_managed_policy_parent_authority(path: &Path) -> Result<(), LpmError> {
+    let default_path = Path::new(DEFAULT_SECURITY_POLICY_PATH);
+    let parent = canonical_policy_parent(path, default_path)?;
+    let mut current = Some(parent.as_path());
     while let Some(dir) = current {
         validate_root_owned_path(dir, true)?;
-        if dir == Path::new("/etc") {
-            break;
-        }
         current = dir.parent();
     }
     Ok(())
@@ -392,21 +429,13 @@ fn validate_root_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmErro
 
 #[cfg(all(unix, not(any(debug_assertions, test))))]
 fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
-    let canonical = std::fs::canonicalize(path)?;
-    if canonical != Path::new(DEFAULT_SECURITY_POLICY_PATH) {
-        return Err(managed_policy_error(
-            path,
-            format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
-        ));
-    }
+    let default_path = Path::new(DEFAULT_SECURITY_POLICY_PATH);
+    let canonical = canonical_policy_path(path, default_path)?;
 
     validate_root_owned_path(path, false)?;
-    let mut current = path.parent();
+    let mut current = canonical.parent();
     while let Some(dir) = current {
         validate_root_owned_path(dir, true)?;
-        if dir == Path::new("/etc") {
-            break;
-        }
         current = dir.parent();
     }
     Ok(())
@@ -845,4 +874,35 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         typosquat_guard,
         firewall_mode,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_policy_path_accepts_default_path_through_symlinked_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_etc = temp.path().join("private/etc");
+        let link_etc = temp.path().join("etc");
+        let real_lpm = real_etc.join("lpm");
+        std::fs::create_dir_all(&real_lpm).unwrap();
+        std::os::unix::fs::symlink(&real_etc, &link_etc).unwrap();
+
+        let default_path = link_etc.join("lpm/security-policy.toml");
+        let real_path = real_lpm.join("security-policy.toml");
+        std::fs::write(&real_path, "[firewall]\nmode = \"enforce\"\n").unwrap();
+        let canonical_real_path = std::fs::canonicalize(&real_path).unwrap();
+        let canonical_real_lpm = std::fs::canonicalize(&real_lpm).unwrap();
+
+        assert_eq!(
+            canonical_policy_path(&default_path, &default_path).unwrap(),
+            canonical_real_path
+        );
+        assert_eq!(
+            canonical_policy_parent(&default_path, &default_path).unwrap(),
+            canonical_real_lpm
+        );
+    }
 }

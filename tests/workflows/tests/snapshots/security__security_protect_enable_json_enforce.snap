@@ -1,0 +1,21 @@
+---
+source: tests/workflows/tests/security.rs
+expression: enable_envelope
+---
+{
+  "success": true,
+  "change": "enabled",
+  "protect": {
+    "path": "[POLICY_PATH]",
+    "active": true,
+    "firewall_mode": "enforce",
+    "managed_policy": {
+      "path": "[MANAGED_POLICY_PATH]",
+      "name": "lpm local protection",
+      "source": "lpm security protect",
+      "enforced_controls": [
+        "firewall.mode"
+      ]
+    }
+  }
+}

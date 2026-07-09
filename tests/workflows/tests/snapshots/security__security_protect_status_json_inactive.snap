@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/security.rs
+expression: status_envelope
+---
+{
+  "success": true,
+  "protect": {
+    "path": "[POLICY_PATH]",
+    "active": false
+  }
+}

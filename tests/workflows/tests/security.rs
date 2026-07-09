@@ -9,6 +9,22 @@ fn json_output(output: &std::process::Output, command_name: &str) -> serde_json:
         .unwrap_or_else(|err| panic!("{command_name} must emit valid JSON: {err}\n---\n{stdout}"))
 }
 
+fn redact_protect_policy_paths(envelope: &mut serde_json::Value) {
+    let Some(protect) = envelope.get_mut("protect") else {
+        return;
+    };
+    protect["path"] = serde_json::json!("[POLICY_PATH]");
+    if let Some(managed_policy) = protect
+        .get_mut("managed_policy")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        managed_policy.insert(
+            "path".to_string(),
+            serde_json::json!("[MANAGED_POLICY_PATH]"),
+        );
+    }
+}
+
 fn write_unverified_approved_posture(project: &TempProject) -> std::path::PathBuf {
     let security_dir = project.home().join(".lpm/security");
     std::fs::create_dir_all(&security_dir).expect("create security dir");
@@ -32,6 +48,53 @@ fn write_unverified_approved_posture(project: &TempProject) -> std::path::PathBu
 
 fn signing_secret_path(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm/security/signing-secret.hex")
+}
+
+#[test]
+fn security_protect_json_reports_status_enable_and_disable() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let status_output = lpm(&project)
+        .args(["--json", "security", "protect", "status"])
+        .output()
+        .expect("failed to run lpm --json security protect status");
+    assert!(
+        status_output.status.success(),
+        "security protect status must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status_output.stdout),
+        String::from_utf8_lossy(&status_output.stderr),
+    );
+    let mut status_envelope = json_output(&status_output, "lpm --json security protect status");
+    redact_protect_policy_paths(&mut status_envelope);
+    insta::assert_json_snapshot!("security_protect_status_json_inactive", status_envelope);
+
+    let enable_output = lpm(&project)
+        .args(["--json", "security", "protect", "enable"])
+        .output()
+        .expect("failed to run lpm --json security protect enable");
+    assert!(
+        enable_output.status.success(),
+        "security protect enable must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&enable_output.stdout),
+        String::from_utf8_lossy(&enable_output.stderr),
+    );
+    let mut enable_envelope = json_output(&enable_output, "lpm --json security protect enable");
+    redact_protect_policy_paths(&mut enable_envelope);
+    insta::assert_json_snapshot!("security_protect_enable_json_enforce", enable_envelope);
+
+    let disable_output = lpm(&project)
+        .args(["--json", "security", "protect", "disable"])
+        .output()
+        .expect("failed to run lpm --json security protect disable");
+    assert!(
+        disable_output.status.success(),
+        "security protect disable must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&disable_output.stdout),
+        String::from_utf8_lossy(&disable_output.stderr),
+    );
+    let mut disable_envelope = json_output(&disable_output, "lpm --json security protect disable");
+    redact_protect_policy_paths(&mut disable_envelope);
+    insta::assert_json_snapshot!("security_protect_disable_json", disable_envelope);
 }
 
 #[test]
