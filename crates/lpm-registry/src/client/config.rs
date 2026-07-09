@@ -301,6 +301,27 @@ impl RegistryClient {
         &self.base_url
     }
 
+    /// Return whether this client can attach or recover a bearer for `posture`.
+    pub fn has_bearer_for_posture(&self, posture: AuthPosture) -> bool {
+        if !posture.attaches_bearer() {
+            return false;
+        }
+        if let Some(session) = &self.session {
+            if session.has_token() {
+                return true;
+            }
+            if session
+                .current_source()
+                .is_some_and(|source| source.refresh_policy() == RefreshPolicy::IfRefreshable)
+            {
+                return true;
+            }
+        }
+        self.token
+            .as_ref()
+            .is_some_and(|secret| !secret.expose_secret().is_empty())
+    }
+
     /// Get the configured direct-npm registry URL (default
     /// `https://registry.npmjs.org`). Exposed so install/add can pass it
     /// to [`crate::route::RouteTable::effective_registry_origins`] when

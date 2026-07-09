@@ -1,8 +1,9 @@
 use super::*;
 use crate::commands::install::firewall::{
-    DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallLookupMode, NpmFirewallPreflightStats,
-    npm_firewall_chunk_size, npm_firewall_package, npm_firewall_package_from_selected_event,
-    request_npm_firewall_preflight,
+    DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode,
+    NpmFirewallPreflightStats, npm_firewall_chunk_size, npm_firewall_package,
+    npm_firewall_package_from_selected_event, request_npm_firewall_preflight,
+    spawn_chunked_npm_firewall_preflight,
 };
 use crate::npm_firewall_config::NpmFirewallMode;
 
@@ -168,6 +169,234 @@ async fn enforce_firewall_preflight_maps_legacy_entitlement_denial_to_firewall_e
         }
         other => panic!("expected firewall entitlement error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn enforce_firewall_preflight_exchanges_ci_oidc_token_when_no_bearer_exists() {
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env = crate::test_env::ScopedEnv::update([
+        ("LPM_OIDC_TOKEN", Some(OsString::from("ci-oidc-jwt"))),
+        ("LPM_GITLAB_OIDC_TOKEN", None),
+        ("ACTIONS_ID_TOKEN_REQUEST_URL", None),
+        ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", None),
+        ("LPM_TOKEN", None),
+    ]);
+    let server = MockServer::start().await;
+    let client = Arc::new(lpm_registry::RegistryClient::new().with_base_url(server.uri()));
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .and(query_param("scope", "install"))
+        .and(body_string_contains("\"token\":\"ci-oidc-jwt\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "exchanged-firewall-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(header("authorization", "Bearer exchanged-firewall-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "req-ci",
+            "policyMode": "product_default",
+            "summary": {
+                "total": 1,
+                "allow": 1,
+                "warn": 0,
+                "block": 0,
+                "unknown": 0,
+                "matched": 0
+            },
+            "decisions": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = request_npm_firewall_preflight(
+        NpmFirewallMode::Enforce,
+        NpmFirewallLookupMode::PackageOnly,
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        client,
+        vec![lpm_registry::client::NpmFirewallBatchPackage {
+            name: "left-pad".to_string(),
+            version: "1.3.0".to_string(),
+            integrity: None,
+            published_at: None,
+        }],
+        false,
+    )
+    .await
+    .expect("firewall preflight should use the OIDC-exchanged token");
+
+    assert_eq!(result.stats.checked_count, 1);
+    assert_eq!(result.stats.allow_count, 1);
+}
+
+#[tokio::test]
+async fn enforce_firewall_preflight_prefers_existing_bearer_over_ci_oidc() {
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env = crate::test_env::ScopedEnv::update([
+        ("LPM_OIDC_TOKEN", Some(OsString::from("ci-oidc-jwt"))),
+        ("LPM_GITLAB_OIDC_TOKEN", None),
+        ("ACTIONS_ID_TOKEN_REQUEST_URL", None),
+        ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", None),
+        ("LPM_TOKEN", None),
+    ]);
+    let server = MockServer::start().await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("existing-firewall-token"),
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(header("authorization", "Bearer existing-firewall-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "req-existing",
+            "policyMode": "product_default",
+            "summary": {
+                "total": 1,
+                "allow": 1,
+                "warn": 0,
+                "block": 0,
+                "unknown": 0,
+                "matched": 0
+            },
+            "decisions": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = request_npm_firewall_preflight(
+        NpmFirewallMode::Enforce,
+        NpmFirewallLookupMode::PackageOnly,
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        client,
+        vec![lpm_registry::client::NpmFirewallBatchPackage {
+            name: "left-pad".to_string(),
+            version: "1.3.0".to_string(),
+            integrity: None,
+            published_at: None,
+        }],
+        false,
+    )
+    .await
+    .expect("firewall preflight should keep the existing bearer");
+
+    assert_eq!(result.stats.checked_count, 1);
+    assert_eq!(result.stats.allow_count, 1);
+}
+
+#[tokio::test]
+async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env = crate::test_env::ScopedEnv::update([
+        ("LPM_OIDC_TOKEN", Some(OsString::from("ci-oidc-jwt"))),
+        ("LPM_GITLAB_OIDC_TOKEN", None),
+        ("ACTIONS_ID_TOKEN_REQUEST_URL", None),
+        ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", None),
+        ("LPM_TOKEN", None),
+    ]);
+    let server = MockServer::start().await;
+    let client = Arc::new(lpm_registry::RegistryClient::new().with_base_url(server.uri()));
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .and(query_param("scope", "install"))
+        .and(body_string_contains("\"token\":\"ci-oidc-jwt\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "exchanged-firewall-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(header("authorization", "Bearer exchanged-firewall-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "req-ci",
+            "policyMode": "product_default",
+            "summary": {
+                "total": 1,
+                "allow": 1,
+                "warn": 0,
+                "block": 0,
+                "unknown": 0,
+                "matched": 0
+            },
+            "decisions": []
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let (selected_tx, selected_rx) = mpsc::unbounded_channel();
+    let (fetch_tx, mut fetch_rx) = mpsc::unbounded_channel();
+    let join = spawn_chunked_npm_firewall_preflight(
+        selected_rx,
+        fetch_tx,
+        Arc::clone(&client),
+        NpmFirewallChunkedPreflightConfig {
+            route_table: RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            mode: NpmFirewallMode::Enforce,
+            lookup_mode: NpmFirewallLookupMode::PackageOnly,
+            policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
+            offline: false,
+            chunk_size: 1,
+        },
+    );
+
+    for name in ["left-pad", "is-number"] {
+        selected_tx
+            .send(lpm_resolver::SelectedPackageEvent {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                is_lpm: false,
+                tarball_url: None,
+                integrity: None,
+                platform: None,
+                optional: false,
+            })
+            .expect("selected package receiver should be open");
+    }
+    drop(selected_tx);
+
+    let result = join
+        .drain()
+        .await
+        .expect("chunked firewall preflight should use one exchanged token");
+    drop(client);
+
+    let mut released = Vec::with_capacity(2);
+    while let Ok(event) = fetch_rx.try_recv() {
+        released.push(event.name);
+    }
+
+    released.sort();
+
+    assert_eq!(result.stats.checked_count, 2);
+    assert_eq!(result.stats.chunk_count, 2);
+    assert_eq!(result.stats.allow_count, 2);
+    assert_eq!(released, ["is-number", "left-pad"]);
 }
 
 #[test]

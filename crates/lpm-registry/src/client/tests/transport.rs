@@ -65,6 +65,34 @@ fn current_bearer_filters_empty_token() {
     assert!(client.current_bearer(AuthPosture::AuthRequired).is_none());
 }
 
+#[test]
+fn has_bearer_for_posture_honors_auth_posture_and_direct_token() {
+    let client = RegistryClient::new().with_token("real-token");
+
+    assert!(!client.has_bearer_for_posture(AuthPosture::AnonymousOnly));
+    assert!(!client.has_bearer_for_posture(AuthPosture::AnonymousPreferred));
+    assert!(client.has_bearer_for_posture(AuthPosture::AuthRequired));
+    assert!(client.has_bearer_for_posture(AuthPosture::SessionRequired));
+}
+
+#[test]
+fn has_bearer_for_posture_filters_empty_direct_token() {
+    let client = RegistryClient::new().with_token("");
+
+    assert!(!client.has_bearer_for_posture(AuthPosture::AuthRequired));
+}
+
+#[test]
+fn has_bearer_for_posture_detects_attached_session_token() {
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        "https://example.invalid",
+        Some("session-token".to_string()),
+    ));
+    let client = RegistryClient::new().with_session(session);
+
+    assert!(client.has_bearer_for_posture(AuthPosture::AuthRequired));
+}
+
 #[tokio::test]
 async fn execute_with_recovery_propagates_success_unchanged() {
     let client = RegistryClient::new();

@@ -63,6 +63,43 @@ impl NpmFirewallMaterializationPreflight {
     }
 }
 
+#[derive(Clone)]
+struct NpmFirewallPreflightClient {
+    base: Arc<RegistryClient>,
+    ci_oidc: Arc<tokio::sync::OnceCell<Arc<RegistryClient>>>,
+}
+
+impl NpmFirewallPreflightClient {
+    fn new(base: Arc<RegistryClient>) -> Self {
+        Self {
+            base,
+            ci_oidc: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    async fn for_mode(&self, mode: NpmFirewallMode) -> Result<Arc<RegistryClient>, LpmError> {
+        let posture = mode.auth_posture();
+        if !mode.is_enabled()
+            || self.base.has_bearer_for_posture(posture)
+            || !crate::oidc::registry_exchange_jwt_available()
+        {
+            return Ok(Arc::clone(&self.base));
+        }
+
+        let client = self
+            .ci_oidc
+            .get_or_try_init(|| async {
+                let oidc_token =
+                    crate::oidc::exchange_oidc_token(self.base.base_url(), None, "install").await?;
+                Ok::<Arc<RegistryClient>, LpmError>(Arc::new(
+                    self.base.clone_with_config().with_token(oidc_token.token),
+                ))
+            })
+            .await?;
+        Ok(Arc::clone(client))
+    }
+}
+
 impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
@@ -454,7 +491,6 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
             return Ok(NpmFirewallPreflightResult::empty(mode, lookup_mode));
         }
-
         let chunk_size = chunk_size.max(1);
         let mut stats = NpmFirewallPreflightStats::for_mode(mode, lookup_mode);
         let mut decisions = Vec::new();
@@ -490,6 +526,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             });
         }
 
+        let preflight_client = NpmFirewallPreflightClient::new(Arc::clone(&client));
         let mut chunk = FirewallSelectedChunk::with_capacity(chunk_size);
         let mut receiver_closed = false;
         let mut tasks = tokio::task::JoinSet::new();
@@ -510,7 +547,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                 spawn_or_release_firewall_chunk(
                                     &mut chunk,
                                     &fetch_tx,
-                                    &client,
+                                    &preflight_client,
                                     mode,
                                     policy_profile,
                                     &mut stats,
@@ -523,7 +560,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                             spawn_or_release_firewall_chunk(
                                 &mut chunk,
                                 &fetch_tx,
-                                &client,
+                                &preflight_client,
                                 mode,
                                 policy_profile,
                                 &mut stats,
@@ -592,7 +629,7 @@ fn push_firewall_chunk_event(
 fn spawn_or_release_firewall_chunk(
     chunk: &mut FirewallSelectedChunk,
     fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
-    client: &Arc<RegistryClient>,
+    client: &NpmFirewallPreflightClient,
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
     stats: &mut NpmFirewallPreflightStats,
@@ -612,20 +649,21 @@ fn spawn_or_release_firewall_chunk(
         .saturating_add(chunk.verdict_packages.len() as u64);
     let events = std::mem::take(&mut chunk.events);
     let verdict_packages = std::mem::take(&mut chunk.verdict_packages);
-    let client = Arc::clone(client);
+    let client = client.clone();
     tasks.spawn(async move {
         request_firewall_chunk(client, mode, policy_profile, events, verdict_packages).await
     });
 }
 
 async fn request_firewall_chunk(
-    client: Arc<RegistryClient>,
+    client: NpmFirewallPreflightClient,
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
     events: Vec<lpm_resolver::SelectedPackageEvent>,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
 ) -> Result<FirewallChunkResult, LpmError> {
     let started = Instant::now();
+    let client = client.for_mode(mode).await?;
     let response = match client
         .npm_firewall_batch_verdicts_with_posture_and_policy(
             &verdict_packages,
@@ -779,6 +817,9 @@ pub(super) async fn request_npm_firewall_preflight(
         return Err(LpmError::Registry(message));
     }
 
+    let client = NpmFirewallPreflightClient::new(client)
+        .for_mode(mode)
+        .await?;
     let started = Instant::now();
     let response = match client
         .npm_firewall_batch_verdicts_with_posture_and_policy(
