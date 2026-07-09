@@ -319,8 +319,7 @@ impl RegistryClient {
         }
         self.token
             .as_ref()
-            .map(|secret| !secret.expose_secret().is_empty())
-            .unwrap_or(false)
+            .is_some_and(|secret| !secret.expose_secret().is_empty())
     }
 
     /// Get the configured direct-npm registry URL (default
