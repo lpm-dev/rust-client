@@ -1,5 +1,7 @@
 use super::prelude::*;
+use console::{Key, Term, measure_text_width};
 use lpm_registry::client::{NpmFirewallPolicyAction, NpmFirewallPolicyProfile};
+use std::io::{self, Write};
 
 pub(in crate::commands::config) const FIREWALL_GUIDED_MENU_LABEL: &str = "Firewall for npm";
 pub(in crate::commands::config) const FIREWALL_WIZARD_PROMPT: &str =
@@ -9,9 +11,19 @@ pub(in crate::commands::config) const FIREWALL_OFF_HINT: &str =
 pub(in crate::commands::config) const FIREWALL_MONITOR_HINT: &str =
     "show what would be blocked without stopping install";
 pub(in crate::commands::config) const FIREWALL_ENFORCE_HINT: &str =
-    "recommended policy profile; block high-confidence firewall verdicts";
-pub(in crate::commands::config) const FIREWALL_CUSTOMIZE_HINT: &str =
-    "choose which firewall policy groups block, warn, or allow";
+    "review recommended policy profile before saving";
+const FIREWALL_POLICY_EDITOR_PROMPT: &str = "Review npm firewall enforcement policy";
+const FIREWALL_POLICY_EDITOR_HELP: &str =
+    "Use ↑/↓ to move, ←/→ to change, Enter to save, Esc to cancel.";
+const BLOCK_WARN_ALLOW_ACTIONS: [NpmFirewallPolicyAction; 3] = [
+    NpmFirewallPolicyAction::Block,
+    NpmFirewallPolicyAction::Warn,
+    NpmFirewallPolicyAction::Allow,
+];
+const WARN_ALLOW_ACTIONS: [NpmFirewallPolicyAction; 2] = [
+    NpmFirewallPolicyAction::Warn,
+    NpmFirewallPolicyAction::Allow,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FirewallWizardSelection {
@@ -59,13 +71,19 @@ pub(in crate::commands::config) async fn run_firewall_wizard(
         let new_value: &str = cliclack::select(FIREWALL_WIZARD_PROMPT)
             .item("off", "off", FIREWALL_OFF_HINT)
             .item("monitor", "monitor", FIREWALL_MONITOR_HINT)
-            .item("enforce", "enforce recommended", FIREWALL_ENFORCE_HINT)
-            .item("custom", "customize enforcement", FIREWALL_CUSTOMIZE_HINT)
+            .item("enforce", "enforce", FIREWALL_ENFORCE_HINT)
             .initial_value(current.as_str())
             .interact()
             .map_err(prompt_err)?;
-        if new_value == "custom" {
-            FirewallWizardSelection::CustomEnforce(prompt_firewall_policy_profile()?)
+        if new_value == "enforce" {
+            let initial_profile = read_firewall_policy_profile(config_path)?;
+            let profile = prompt_firewall_policy_profile(initial_profile)?;
+            let existing_cfg = read_config(config_path)?;
+            if should_persist_firewall_policy_profile(&existing_cfg, profile) {
+                FirewallWizardSelection::CustomEnforce(profile)
+            } else {
+                FirewallWizardSelection::Mode(NpmFirewallMode::Enforce)
+            }
         } else {
             FirewallWizardSelection::Mode(parse_firewall_mode_selection(new_value)?)
         }
@@ -244,63 +262,6 @@ fn announce_firewall_selection_set(selection: FirewallWizardSelection, json_outp
     }
 }
 
-fn prompt_firewall_policy_profile() -> Result<NpmFirewallPolicyProfile, LpmError> {
-    Ok(NpmFirewallPolicyProfile {
-        trusted_public_malicious_advisories: prompt_block_warn_allow_policy_action(
-            "Trusted public malicious advisories (OSV/OpenSSF/GHSA)",
-            NpmFirewallPolicyAction::Block,
-        )?,
-        lpm_ai_confirmed_malware: prompt_block_warn_allow_policy_action(
-            "LPM AI-confirmed malware",
-            NpmFirewallPolicyAction::Block,
-        )?,
-        lpm_ai_agent_control_surface: prompt_block_warn_allow_policy_action(
-            "LPM AI-agent control-surface policy",
-            NpmFirewallPolicyAction::Block,
-        )?,
-        critical_vulnerability: prompt_warn_allow_policy_action(
-            "Critical vulnerabilities",
-            NpmFirewallPolicyAction::Warn,
-        )?,
-        static_only_suspicious: prompt_warn_allow_policy_action(
-            "Static-only suspicious signals",
-            NpmFirewallPolicyAction::Warn,
-        )?,
-    })
-}
-
-fn prompt_block_warn_allow_policy_action(
-    prompt: &str,
-    initial: NpmFirewallPolicyAction,
-) -> Result<NpmFirewallPolicyAction, LpmError> {
-    let value: &str = cliclack::select(prompt)
-        .item("block", "block", "stop install")
-        .item("warn", "warn only", "show warning and continue")
-        .item("allow", "allow", "ignore this policy group")
-        .initial_value(initial.as_str())
-        .interact()
-        .map_err(prompt_err)?;
-    parse_policy_action(value)
-}
-
-fn prompt_warn_allow_policy_action(
-    prompt: &str,
-    initial: NpmFirewallPolicyAction,
-) -> Result<NpmFirewallPolicyAction, LpmError> {
-    let value: &str = cliclack::select(prompt)
-        .item("warn", "warn only", "show warning and continue")
-        .item("allow", "allow", "ignore this policy group")
-        .initial_value(initial.as_str())
-        .interact()
-        .map_err(prompt_err)?;
-    parse_policy_action(value)
-}
-
-fn parse_policy_action(value: &str) -> Result<NpmFirewallPolicyAction, LpmError> {
-    NpmFirewallPolicyAction::parse(value)
-        .ok_or_else(|| LpmError::Registry(format!("invalid firewall policy action '{value}'")))
-}
-
 fn policy_action_value(action: NpmFirewallPolicyAction) -> toml::Value {
     toml::Value::String(action.as_str().to_string())
 }
@@ -333,4 +294,430 @@ fn policy_profile_json(profile: NpmFirewallPolicyProfile) -> serde_json::Value {
         serde_json::Value::String(profile.static_only_suspicious.as_str().to_string()),
     );
     serde_json::Value::Object(policies)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirewallPolicyField {
+    TrustedPublicMaliciousAdvisories,
+    LpmAiConfirmedMalware,
+    LpmAiAgentControlSurface,
+    CriticalVulnerability,
+    StaticOnlySuspicious,
+}
+
+impl FirewallPolicyField {
+    fn action(self, profile: NpmFirewallPolicyProfile) -> NpmFirewallPolicyAction {
+        match self {
+            Self::TrustedPublicMaliciousAdvisories => profile.trusted_public_malicious_advisories,
+            Self::LpmAiConfirmedMalware => profile.lpm_ai_confirmed_malware,
+            Self::LpmAiAgentControlSurface => profile.lpm_ai_agent_control_surface,
+            Self::CriticalVulnerability => profile.critical_vulnerability,
+            Self::StaticOnlySuspicious => profile.static_only_suspicious,
+        }
+    }
+
+    fn set_action(self, profile: &mut NpmFirewallPolicyProfile, action: NpmFirewallPolicyAction) {
+        match self {
+            Self::TrustedPublicMaliciousAdvisories => {
+                profile.trusted_public_malicious_advisories = action;
+            }
+            Self::LpmAiConfirmedMalware => profile.lpm_ai_confirmed_malware = action,
+            Self::LpmAiAgentControlSurface => profile.lpm_ai_agent_control_surface = action,
+            Self::CriticalVulnerability => profile.critical_vulnerability = action,
+            Self::StaticOnlySuspicious => profile.static_only_suspicious = action,
+        }
+    }
+
+    fn default_actions(self) -> &'static [NpmFirewallPolicyAction] {
+        match self {
+            Self::TrustedPublicMaliciousAdvisories
+            | Self::LpmAiConfirmedMalware
+            | Self::LpmAiAgentControlSurface
+            | Self::CriticalVulnerability => &BLOCK_WARN_ALLOW_ACTIONS,
+            Self::StaticOnlySuspicious => &WARN_ALLOW_ACTIONS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FirewallPolicyGroup {
+    field: FirewallPolicyField,
+    title: &'static str,
+    detail: &'static str,
+}
+
+const FIREWALL_POLICY_GROUPS: [FirewallPolicyGroup; 5] = [
+    FirewallPolicyGroup {
+        field: FirewallPolicyField::TrustedPublicMaliciousAdvisories,
+        title: "Trusted public malicious advisories",
+        detail: "OSV / OpenSSF / GHSA",
+    },
+    FirewallPolicyGroup {
+        field: FirewallPolicyField::LpmAiConfirmedMalware,
+        title: "LPM AI-confirmed malware",
+        detail: "Credential/data exfiltration, RCE, remote payload execution, persistence, dependency confusion",
+    },
+    FirewallPolicyGroup {
+        field: FirewallPolicyField::LpmAiAgentControlSurface,
+        title: "LPM AI-agent control-surface policy",
+        detail: "Silent install-lifecycle writes into foreign or broad AI-agent control surfaces",
+    },
+    FirewallPolicyGroup {
+        field: FirewallPolicyField::CriticalVulnerability,
+        title: "Critical vulnerabilities",
+        detail: "Legitimate package risk without malicious author intent",
+    },
+    FirewallPolicyGroup {
+        field: FirewallPolicyField::StaticOnlySuspicious,
+        title: "Static-only suspicious signals",
+        detail: "No AI or trusted advisory confirmation yet",
+    },
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FirewallPolicyEditorRow {
+    group: FirewallPolicyGroup,
+    action: NpmFirewallPolicyAction,
+    actions: Vec<NpmFirewallPolicyAction>,
+}
+
+impl FirewallPolicyEditorRow {
+    fn new(group: FirewallPolicyGroup, action: NpmFirewallPolicyAction) -> Self {
+        let default_actions = group.field.default_actions();
+        let mut actions = Vec::with_capacity(default_actions.len() + 1);
+        actions.extend_from_slice(default_actions);
+        if !actions.contains(&action) {
+            insert_missing_policy_action(&mut actions, action);
+        }
+        Self {
+            group,
+            action,
+            actions,
+        }
+    }
+
+    fn step_action(&mut self, step: PolicyActionStep) {
+        let Some(current_index) = self
+            .actions
+            .iter()
+            .position(|candidate| *candidate == self.action)
+        else {
+            return;
+        };
+        let next_index = match step {
+            PolicyActionStep::Previous => {
+                if current_index == 0 {
+                    self.actions.len() - 1
+                } else {
+                    current_index - 1
+                }
+            }
+            PolicyActionStep::Next => {
+                let next = current_index + 1;
+                if next == self.actions.len() { 0 } else { next }
+            }
+        };
+        self.action = self.actions[next_index];
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyActionStep {
+    Previous,
+    Next,
+}
+
+fn insert_missing_policy_action(
+    actions: &mut Vec<NpmFirewallPolicyAction>,
+    action: NpmFirewallPolicyAction,
+) {
+    let index = match action {
+        NpmFirewallPolicyAction::Warn => 0,
+        NpmFirewallPolicyAction::Block => actions
+            .iter()
+            .position(|candidate| *candidate == NpmFirewallPolicyAction::Allow)
+            .unwrap_or(actions.len()),
+        NpmFirewallPolicyAction::Allow => actions.len(),
+    };
+    actions.insert(index, action);
+}
+
+fn read_firewall_policy_profile(
+    config_path: &std::path::Path,
+) -> Result<NpmFirewallPolicyProfile, LpmError> {
+    let cfg = read_config(config_path)?;
+    crate::npm_firewall_config::config_policy_profile(&global_config_view_from_value(&cfg))
+}
+
+fn should_persist_firewall_policy_profile(
+    cfg: &toml::Value,
+    profile: NpmFirewallPolicyProfile,
+) -> bool {
+    profile != NpmFirewallPolicyProfile::default() || firewall_policy_table_exists(cfg)
+}
+
+fn firewall_policy_table_exists(cfg: &toml::Value) -> bool {
+    cfg.get(FIREWALL_CONFIG_SECTION)
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION))
+        .and_then(toml::Value::as_table)
+        .and_then(|table| {
+            table.get(crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION)
+        })
+        .is_some()
+}
+
+fn prompt_firewall_policy_profile(
+    initial_profile: NpmFirewallPolicyProfile,
+) -> Result<NpmFirewallPolicyProfile, LpmError> {
+    let mut term = Term::stderr();
+    run_firewall_policy_editor(&mut term, initial_profile).map_err(prompt_err)
+}
+
+fn run_firewall_policy_editor(
+    term: &mut Term,
+    initial_profile: NpmFirewallPolicyProfile,
+) -> io::Result<NpmFirewallPolicyProfile> {
+    if !term.is_term() {
+        return Err(io::ErrorKind::NotConnected.into());
+    }
+
+    term.hide_cursor()?;
+    let result = interact_firewall_policy_editor(term, initial_profile);
+    let show_cursor_result = term.show_cursor();
+    match (result, show_cursor_result) {
+        (Ok(profile), Ok(())) => Ok(profile),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn interact_firewall_policy_editor(
+    term: &mut Term,
+    initial_profile: NpmFirewallPolicyProfile,
+) -> io::Result<NpmFirewallPolicyProfile> {
+    let mut rows = firewall_policy_rows_from_profile(initial_profile);
+    let mut cursor = 0;
+    let mut previous_line_count = 0;
+
+    loop {
+        let frame = format_firewall_policy_editor_frame(&rows, cursor);
+        if previous_line_count > 0 {
+            term.clear_last_lines(previous_line_count)?;
+        }
+        term.write_all(frame.as_bytes())?;
+        term.flush()?;
+        previous_line_count = rendered_line_count(&frame, usize::from(term.size().1).max(1));
+
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                cursor = if cursor == 0 {
+                    rows.len() - 1
+                } else {
+                    cursor - 1
+                };
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                cursor += 1;
+                if cursor == rows.len() {
+                    cursor = 0;
+                }
+            }
+            Key::ArrowLeft | Key::Char('h') => {
+                rows[cursor].step_action(PolicyActionStep::Previous);
+            }
+            Key::ArrowRight | Key::Char('l') | Key::Char(' ') => {
+                rows[cursor].step_action(PolicyActionStep::Next);
+            }
+            Key::Enter => return Ok(firewall_policy_profile_from_rows(&rows)),
+            Key::Escape | Key::CtrlC => return Err(io::ErrorKind::Interrupted.into()),
+            _ => {}
+        }
+    }
+}
+
+fn firewall_policy_rows_from_profile(
+    profile: NpmFirewallPolicyProfile,
+) -> Vec<FirewallPolicyEditorRow> {
+    let mut rows = Vec::with_capacity(FIREWALL_POLICY_GROUPS.len());
+    for group in FIREWALL_POLICY_GROUPS {
+        rows.push(FirewallPolicyEditorRow::new(
+            group,
+            group.field.action(profile),
+        ));
+    }
+    rows
+}
+
+fn firewall_policy_profile_from_rows(rows: &[FirewallPolicyEditorRow]) -> NpmFirewallPolicyProfile {
+    let mut profile = NpmFirewallPolicyProfile::default();
+    for row in rows {
+        row.group.field.set_action(&mut profile, row.action);
+    }
+    profile
+}
+
+fn format_firewall_policy_editor_frame(rows: &[FirewallPolicyEditorRow], cursor: usize) -> String {
+    let mut frame = String::with_capacity(1_200);
+    frame.push_str(&format!(
+        "◆  {}\n",
+        FIREWALL_POLICY_EDITOR_PROMPT.cyan().bold()
+    ));
+    frame.push_str(&format!("│  {}\n", FIREWALL_POLICY_EDITOR_HELP.dimmed()));
+    frame.push_str("│\n");
+    for (index, row) in rows.iter().enumerate() {
+        let active = index == cursor;
+        let title = if active {
+            row.group.title.bold()
+        } else {
+            row.group.title.to_string()
+        };
+        let marker = if active {
+            "›".cyan().bold()
+        } else {
+            " ".to_string()
+        };
+        frame.push_str(&format!("│  {marker} {title}\n"));
+        frame.push_str(&format!("│    {}\n", row.group.detail.dimmed()));
+        frame.push_str(&format!("│    {}\n", format_policy_action_options(row)));
+        if index + 1 < rows.len() {
+            frame.push_str("│\n");
+        }
+    }
+    frame.push_str("└\n");
+    frame
+}
+
+fn format_policy_action_options(row: &FirewallPolicyEditorRow) -> String {
+    let mut rendered = String::with_capacity(48);
+    for (index, action) in row.actions.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str("  ");
+        }
+        let selected = *action == row.action;
+        let symbol = if selected { "●" } else { "○" };
+        let label = policy_action_label(*action);
+        if selected {
+            rendered.push_str(&format!("{} {}", symbol.cyan(), label.bold()));
+        } else {
+            rendered.push_str(&format!("{symbol} {label}"));
+        }
+    }
+    rendered
+}
+
+fn policy_action_label(action: NpmFirewallPolicyAction) -> &'static str {
+    match action {
+        NpmFirewallPolicyAction::Block => "Block",
+        NpmFirewallPolicyAction::Warn => "Warn only",
+        NpmFirewallPolicyAction::Allow => "Allow",
+    }
+}
+
+fn rendered_line_count(frame: &str, terminal_width: usize) -> usize {
+    let terminal_width = terminal_width.max(1);
+    frame
+        .lines()
+        .map(|line| {
+            let width = measure_text_width(line);
+            width.saturating_sub(1) / terminal_width + 1
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firewall_policy_editor_frame_shows_every_policy_group_on_one_prompt() {
+        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+
+        let frame = format_firewall_policy_editor_frame(&rows, 0);
+        let plain = console::strip_ansi_codes(&frame);
+
+        assert!(plain.contains("Trusted public malicious advisories"));
+        assert!(plain.contains("LPM AI-confirmed malware"));
+        assert!(plain.contains("LPM AI-agent control-surface policy"));
+        assert!(plain.contains("Critical vulnerabilities"));
+        assert!(plain.contains("Static-only suspicious signals"));
+    }
+
+    #[test]
+    fn firewall_policy_editor_orders_critical_vulnerability_actions_like_blocking_groups() {
+        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let critical = rows
+            .iter()
+            .find(|row| row.group.field == FirewallPolicyField::CriticalVulnerability)
+            .expect("critical vulnerability row must exist");
+
+        assert_eq!(
+            critical.actions,
+            [
+                NpmFirewallPolicyAction::Block,
+                NpmFirewallPolicyAction::Warn,
+                NpmFirewallPolicyAction::Allow,
+            ]
+        );
+        assert_eq!(critical.action, NpmFirewallPolicyAction::Warn);
+    }
+
+    #[test]
+    fn firewall_policy_editor_preserves_manual_static_only_block_action() {
+        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile {
+            static_only_suspicious: NpmFirewallPolicyAction::Block,
+            ..NpmFirewallPolicyProfile::default()
+        });
+        let static_only = rows
+            .iter()
+            .find(|row| row.group.field == FirewallPolicyField::StaticOnlySuspicious)
+            .expect("static-only suspicious row must exist");
+
+        assert_eq!(static_only.action, NpmFirewallPolicyAction::Block);
+        assert!(
+            static_only
+                .actions
+                .contains(&NpmFirewallPolicyAction::Block)
+        );
+    }
+
+    #[test]
+    fn default_enforce_policy_without_existing_policy_table_does_not_persist_custom_table() {
+        let cfg = toml::Value::Table(toml::map::Map::new());
+
+        assert!(!should_persist_firewall_policy_profile(
+            &cfg,
+            NpmFirewallPolicyProfile::default()
+        ));
+    }
+
+    #[test]
+    fn default_enforce_policy_with_existing_policy_table_persists_to_reset_custom_values() {
+        let mut policies = toml::map::Map::new();
+        policies.insert(
+            crate::npm_firewall_config::STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("allow".to_string()),
+        );
+        let mut npm = toml::map::Map::new();
+        npm.insert(
+            crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+            toml::Value::Table(policies),
+        );
+        let mut firewall = toml::map::Map::new();
+        firewall.insert(
+            crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+        let mut top = toml::map::Map::new();
+        top.insert(
+            FIREWALL_CONFIG_SECTION.to_string(),
+            toml::Value::Table(firewall),
+        );
+        let cfg = toml::Value::Table(top);
+
+        assert!(should_persist_firewall_policy_profile(
+            &cfg,
+            NpmFirewallPolicyProfile::default()
+        ));
+    }
 }

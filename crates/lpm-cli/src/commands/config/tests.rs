@@ -55,7 +55,7 @@ fn firewall_wizard_copy_uses_npm_package_language() {
             "How should LPM handle firewall verdicts for npm packages?",
             "default; use direct npm metadata and tarballs only",
             "show what would be blocked without stopping install",
-            "recommended policy profile; block high-confidence firewall verdicts",
+            "review recommended policy profile before saving",
         )
     );
 }
