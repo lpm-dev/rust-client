@@ -475,6 +475,97 @@ mode = "enforce"
 }
 
 #[test]
+fn managed_firewall_protection_enforces_floor_when_lpm_home_changes() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let report = install_managed_firewall_protection(
+            crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        )
+        .unwrap();
+
+        assert_eq!(report.change, ManagedProtectionChange::Enabled);
+        assert_eq!(report.status.firewall_mode.as_deref(), Some("enforce"));
+        let alternate_home = temp.path().join("alternate-lpm-home");
+        with_lpm_home(&alternate_home, || {
+            let effective = load_effective_authorized_posture().unwrap();
+            assert_eq!(
+                effective.posture.firewall_mode(),
+                crate::npm_firewall_config::NpmFirewallMode::Enforce
+            );
+            assert_eq!(
+                effective.sources.firewall_mode,
+                PostureSourceKind::ManagedPolicy
+            );
+        });
+    });
+}
+
+#[test]
+fn managed_firewall_protection_enable_preserves_other_managed_controls() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+script-policy = "deny"
+"#,
+        );
+
+        let report = install_managed_firewall_protection(
+            crate::npm_firewall_config::NpmFirewallMode::Monitor,
+        )
+        .unwrap();
+
+        assert_eq!(report.change, ManagedProtectionChange::Enabled);
+        let effective = load_effective_authorized_posture().unwrap();
+        assert_eq!(effective.posture.script_policy(), ScriptPolicy::Deny);
+        assert_eq!(
+            effective.sources.script_policy,
+            PostureSourceKind::ManagedPolicy
+        );
+        assert_eq!(
+            effective.posture.firewall_mode(),
+            crate::npm_firewall_config::NpmFirewallMode::Monitor
+        );
+        assert_eq!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::ManagedPolicy
+        );
+    });
+}
+
+#[test]
+fn managed_firewall_protection_disable_preserves_other_managed_controls() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+script-policy = "deny"
+
+[firewall]
+mode = "enforce"
+"#,
+        );
+
+        let report = remove_managed_firewall_protection().unwrap();
+
+        assert_eq!(report.change, ManagedProtectionChange::Disabled);
+        assert!(!report.status.active);
+        let effective = load_effective_authorized_posture().unwrap();
+        assert_eq!(effective.posture.script_policy(), ScriptPolicy::Deny);
+        assert_eq!(
+            effective.sources.script_policy,
+            PostureSourceKind::ManagedPolicy
+        );
+        assert_eq!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::BuiltinDefault
+        );
+    });
+}
+
+#[test]
 fn security_status_does_not_report_absent_firewall_config_as_runtime_override() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");
@@ -1104,6 +1195,47 @@ fn runtime_firewall_config_downgrade_uses_active_project_unlock() {
             crate::npm_firewall_config::NpmFirewallMode::Off,
         )
         .unwrap();
+    });
+}
+
+#[test]
+fn runtime_firewall_env_downgrade_records_env_source() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        persist_authorized_posture(&AuthorizedPosture {
+            firewall_mode: crate::npm_firewall_config::NpmFirewallMode::Enforce
+                .as_str()
+                .to_string(),
+            ..AuthorizedPosture::default()
+        })
+        .unwrap();
+        let effective = load_effective_authorized_posture().unwrap();
+
+        let err = without_test_native_auth(|| {
+            ensure_runtime_npm_firewall_config_authorized_with_effective(
+                &effective,
+                &project,
+                true,
+                crate::npm_firewall_config::NpmFirewallModeRequest::from_env(
+                    crate::npm_firewall_config::NpmFirewallMode::Off,
+                ),
+            )
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required");
+        let content = std::fs::read_to_string(audit_log_path().unwrap()).unwrap();
+        let envelope: SignedAuditEnvelope = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(envelope.payload.source.as_deref(), Some("env-var"));
+        assert_eq!(
+            envelope.payload.detail.as_deref(),
+            Some(
+                "The environment npm firewall setting weakens npm firewall checks for this project."
+            )
+        );
     });
 }
 

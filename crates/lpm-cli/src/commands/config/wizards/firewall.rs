@@ -663,6 +663,25 @@ mod tests {
     }
 
     #[test]
+    fn firewall_policy_editor_defaults_ai_agent_control_surface_to_warn() {
+        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let ai_agent = rows
+            .iter()
+            .find(|row| row.group.field == FirewallPolicyField::LpmAiAgentControlSurface)
+            .expect("AI-agent control-surface row must exist");
+
+        assert_eq!(
+            ai_agent.actions,
+            [
+                NpmFirewallPolicyAction::Block,
+                NpmFirewallPolicyAction::Warn,
+                NpmFirewallPolicyAction::Allow,
+            ]
+        );
+        assert_eq!(ai_agent.action, NpmFirewallPolicyAction::Warn);
+    }
+
+    #[test]
     fn firewall_policy_editor_preserves_manual_static_only_block_action() {
         let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile {
             static_only_suspicious: NpmFirewallPolicyAction::Block,

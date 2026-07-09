@@ -26,6 +26,22 @@ pub(crate) enum SecurityScopeSelector {
     FloorEdit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum ProtectFirewallMode {
+    Monitor,
+    Enforce,
+}
+
+impl ProtectFirewallMode {
+    fn as_npm_firewall_mode(self) -> crate::npm_firewall_config::NpmFirewallMode {
+        match self {
+            Self::Monitor => crate::npm_firewall_config::NpmFirewallMode::Monitor,
+            Self::Enforce => crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        }
+    }
+}
+
 impl SecurityScopeSelector {
     fn as_str(self) -> &'static str {
         match self {
@@ -199,8 +215,30 @@ pub enum SecurityCmd {
         global: bool,
     },
 
+    /// Install, remove, or inspect OS-managed local protection.
+    Protect {
+        #[command(subcommand)]
+        action: ProtectCmd,
+    },
+
     /// Quarantine signed local security state that can no longer be verified.
     Repair,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProtectCmd {
+    /// Show whether OS-managed local protection is active.
+    Status,
+
+    /// Enable OS-managed protection against user-home security state bypasses.
+    Enable {
+        /// Managed npm firewall mode to enforce.
+        #[arg(long, value_enum, default_value_t = ProtectFirewallMode::Enforce)]
+        firewall: ProtectFirewallMode,
+    },
+
+    /// Remove the managed npm firewall protection entry.
+    Disable,
 }
 
 pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
@@ -496,6 +534,46 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             install_ui::done("Security floor loaded");
             Ok(())
         }
+        SecurityCmd::Protect { action } => match action {
+            ProtectCmd::Status => {
+                let status = security_approval::load_managed_protection_status()?;
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "success": true,
+                            "protect": status,
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    print_protect_status(&status);
+                }
+                Ok(())
+            }
+            ProtectCmd::Enable { firewall } => {
+                let report = security_approval::install_managed_firewall_protection(
+                    firewall.as_npm_firewall_mode(),
+                )?;
+                if json_output {
+                    print_protect_report_json(&report);
+                } else {
+                    print_protect_status(&report.status);
+                    print_protect_change("Protection", report.change);
+                }
+                Ok(())
+            }
+            ProtectCmd::Disable => {
+                let report = security_approval::remove_managed_firewall_protection()?;
+                if json_output {
+                    print_protect_report_json(&report);
+                } else {
+                    print_protect_status(&report.status);
+                    print_protect_change("Protection", report.change);
+                }
+                Ok(())
+            }
+        },
         SecurityCmd::Repair => {
             let report = security_approval::repair_security_state()?;
 
@@ -529,6 +607,57 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 install_ui::done("Security state repaired");
             }
             Ok(())
+        }
+    }
+}
+
+fn print_protect_report_json(report: &security_approval::ManagedProtectionReport) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "success": true,
+            "change": report.change.as_str(),
+            "protect": report.status,
+        }))
+        .unwrap()
+    );
+}
+
+fn print_protect_change(label: &str, change: security_approval::ManagedProtectionChange) {
+    match change {
+        security_approval::ManagedProtectionChange::Enabled => {
+            install_ui::done(&format!("{label} enabled."));
+        }
+        security_approval::ManagedProtectionChange::Disabled => {
+            install_ui::done(&format!("{label} disabled."));
+        }
+        security_approval::ManagedProtectionChange::Unchanged => {
+            install_ui::warn(&format!("{label} unchanged."));
+        }
+    }
+}
+
+fn print_protect_status(status: &security_approval::ManagedProtectionStatus) {
+    println!("{}", install_ui::section("managed protection"));
+    let active = if status.active {
+        install_ui::status_ok("active")
+    } else {
+        install_ui::dim("inactive")
+    };
+    print_status_field("status", &active);
+    print_status_field("policy", &install_ui::cyan(&status.path));
+    if let Some(mode) = status.firewall_mode.as_deref() {
+        print_status_field("firewall", &policy_value(mode));
+    }
+    if let Some(policy) = status.managed_policy.as_ref() {
+        if let Some(name) = policy.name.as_deref() {
+            print_status_field("name", name);
+        }
+        if let Some(source) = policy.source.as_deref() {
+            print_status_field("source", source);
+        }
+        if !policy.enforced_controls.is_empty() {
+            print_status_field("controls", &policy.enforced_controls.join(", "));
         }
     }
 }

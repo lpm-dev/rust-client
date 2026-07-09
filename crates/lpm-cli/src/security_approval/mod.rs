@@ -35,6 +35,10 @@ pub use approval::{
     ensure_runtime_typosquat_guard_config_authorized,
 };
 pub use helpers::format_unlock_duration;
+pub(crate) use managed_policy::{
+    install_managed_firewall_protection, load_managed_protection_status,
+    remove_managed_firewall_protection,
+};
 #[allow(unused_imports)]
 pub use paths::security_dir;
 #[allow(unused_imports)]
@@ -47,7 +51,8 @@ pub use signed_store::repair_security_state;
 #[allow(unused_imports)]
 pub use types::{
     ApprovalScope, ApprovalSource, AuthorizedPosture, AuthorizedPostureView,
-    EffectiveAuthorizedPosture, EffectivePostureSources, ManagedPolicyStatus, PostureSourceKind,
+    EffectiveAuthorizedPosture, EffectivePostureSources, ManagedPolicyStatus,
+    ManagedProtectionChange, ManagedProtectionReport, ManagedProtectionStatus, PostureSourceKind,
     QuarantinedSecurityState, RuntimeOverride, SecurityRepairReport, SecurityStatus, UnlockGrant,
     UnlockLimits, UnlockRevocation, UnlockTargetKind,
 };
@@ -191,6 +196,7 @@ mod prelude {
         ApprovalScope, ApprovalSource, ApprovedGlobalTrustState, ApprovedProjectPolicyState,
         AuditEvent, AuditHead, AuthorizedPosture, AuthorizedPostureView,
         EffectiveAuthorizedPosture, EffectivePostureSources, ManagedPolicy, ManagedPolicyStatus,
+        ManagedProtectionChange, ManagedProtectionReport, ManagedProtectionStatus,
         PostureSourceKind, QuarantinedSecurityState, RuntimeOverride, SecurityRepairReport,
         SecurityStatus, SignedAuditEnvelope, SignedEnvelope, StoredUnlockGrant, UnlockGrant,
         UnlockLimits, UnlockRevocation, UnlockTargetKind,

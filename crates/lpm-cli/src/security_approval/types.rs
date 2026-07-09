@@ -87,6 +87,7 @@ impl ApprovalScope {
 pub enum ApprovalSource {
     CliFlag,
     EnvVar,
+    ConfigAndEnv,
     ProjectConfig,
     GlobalConfig,
     ConfigMutation,
@@ -99,6 +100,7 @@ impl ApprovalSource {
         match self {
             Self::CliFlag => "cli-flag",
             Self::EnvVar => "env-var",
+            Self::ConfigAndEnv => "config-and-env",
             Self::ProjectConfig => "project-config",
             Self::GlobalConfig => "global-config",
             Self::ConfigMutation => "config-mutation",
@@ -268,6 +270,40 @@ pub struct ManagedPolicyStatus {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enforced_controls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedProtectionStatus {
+    pub path: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firewall_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_policy: Option<ManagedPolicyStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedProtectionChange {
+    Enabled,
+    Disabled,
+    Unchanged,
+}
+
+impl ManagedProtectionChange {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedProtectionReport {
+    pub change: ManagedProtectionChange,
+    pub status: ManagedProtectionStatus,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
