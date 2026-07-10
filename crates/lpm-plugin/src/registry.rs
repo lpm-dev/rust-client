@@ -57,7 +57,7 @@ static PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "oxlint",
         binary_name: "oxlint",
-        latest_version: "1.72.0",
+        latest_version: "1.73.0",
         url_template: "https://github.com/oxc-project/oxc/releases/download/apps_v{version}/{platform}",
         platform_map: &[
             ("darwin-arm64", "oxlint-aarch64-apple-darwin.tar.gz"),
@@ -73,23 +73,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "1910f9f8a291c775b84a0522042640cdd96c2d620dd888260db937fdea4a1d94",
+                "f27b2959685ae13694a83a7d420154b440d6b4f62fd2942c136666e2ab3cc2cc",
             ),
             (
                 "darwin-x64",
-                "939007e36894f87ec2d020a04b2c2140a32ea087592993ad06f0c413ba78ade7",
+                "bddfbbdd38cfc7b22def9b6698b9d87e4477730763ce1fa2605afcdcea08ba73",
             ),
             (
                 "linux-x64",
-                "4a3636fbe51a8fe9eb13d5ccf44338c7417c2309e5f4f6251012b9ff7fa5560e",
+                "63c47cfe83fe1cd4e474dc1789d1914f448bd970853950e0256e8c1a1eae0d48",
             ),
             (
                 "linux-arm64",
-                "56efb930a0b5f1d36e95a5b863e1e59ae6555011beeb2ad62ae1a724061f4f25",
+                "093878dd1e01127b8fa5eff39b23407d1b07fda0829f04a77b8754d2f1858ae6",
             ),
             (
                 "win-x64",
-                "60f63dd170effe0cda14ff08d81c86294d81da3d07d7c1fdca6698ae306abb70",
+                "4705fa429bc730cd4663ab5ca227d2bc73bace2a87e6c7d0882012fb4b947619",
             ),
         ],
     },
@@ -99,7 +99,7 @@ static PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "biome",
         binary_name: "biome",
-        latest_version: "2.5.2",
+        latest_version: "2.5.3",
         url_template: "https://github.com/biomejs/biome/releases/download/%40biomejs/biome%40{version}/{platform}",
         platform_map: &[
             ("darwin-arm64", "biome-darwin-arm64"),
@@ -115,23 +115,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "6289b71d281928926a50136f555f0b36b84c1fbdd5090f86f47c98abb2e74128",
+                "610d3e1e770d373368d4ccee5a19c5e1735b0235024fcbed6ae07eb080d3bb09",
             ),
             (
                 "darwin-x64",
-                "e5a8da8fdd6dd8f47027f7a914568d0aa71728b77ed5e9bc909c00afc344f3bf",
+                "4df90556830ed35e6238e4b976b942d369a5378447c8d68b260b7a38e08b26f9",
             ),
             (
                 "linux-x64",
-                "ccd6adc50bb997bf4f5f91140255977f3a5cd12cbdde82d5406b8d7c7154a96b",
+                "ab8e74af2366127306e250652d2f32bd193601f208fcd0604112080c0ca3245b",
             ),
             (
                 "linux-arm64",
-                "fe69df99abdc101a66597dfeb720dd40818fc58fe96d6c53b9c2e32c5065ab7a",
+                "b642ded43aebcad738926b40eefd4dc2187a206d1fbfb37a45f1db4986804dbd",
             ),
             (
                 "win-x64",
-                "04a054ca18527404fce4e7a7aa8b882616ecc1a4afa74cfad0cb54a4b165dfb2",
+                "04c9ca46af43a0d060b22b21f94c7e1a9e8c57963a09778b8ff1d808ed536b31",
             ),
         ],
     },
@@ -179,11 +179,11 @@ mod tests {
         let p = get_plugin("oxlint").unwrap();
         let url = p
             .url_template
-            .replace("{version}", "1.72.0")
+            .replace("{version}", "1.73.0")
             .replace("{platform}", "oxlint-aarch64-apple-darwin.tar.gz");
         assert_eq!(
             url,
-            "https://github.com/oxc-project/oxc/releases/download/apps_v1.72.0/oxlint-aarch64-apple-darwin.tar.gz"
+            "https://github.com/oxc-project/oxc/releases/download/apps_v1.73.0/oxlint-aarch64-apple-darwin.tar.gz"
         );
     }
 
