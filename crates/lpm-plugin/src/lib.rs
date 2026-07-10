@@ -6,12 +6,12 @@
 //! ```text
 //! ~/.lpm/plugins/
 //!   oxlint/
-//!     1.72.0/
+//!     1.73.0/
 //!       darwin-arm64/
 //!         oxlint               ← downloaded binary
 //!         .lpm-plugin.json     ← sidecar (verification metadata)
 //!   biome/
-//!     2.5.2/
+//!     2.5.3/
 //!       linux-x64/
 //!         biome
 //!         .lpm-plugin.json
