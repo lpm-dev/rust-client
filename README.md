@@ -1,165 +1,168 @@
-# LPM — The Package Manager for Modern Software
+<p align="center">
+  <a href="https://cli.lpm.dev">
+    <img src="assets/lpm-icon.svg" alt="LPM logo" height="150">
+  </a>
+</p>
 
-Fast, secure, all-in-one. Written in Rust.
+<h1 align="center">LPM</h1>
+
+<div align="center">
+  <a href="https://cli.lpm.dev"><img src="assets/lpm-icon.svg" alt="" height="18"> CLI Documentation</a>
+  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
+  <a href="https://lpm.dev"><img src="assets/lpm-registry-icon.svg" alt="" height="18"> LPM.dev Registry</a>
+  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
+  <a href="https://firewall.lpm.dev"><img src="assets/lpm-firewall-icon.svg" alt="" height="18"> LPM Firewall</a>
+</div>
+
+## What is LPM?
+
+LPM is a fast, secure package manager and developer platform for modern JavaScript and TypeScript projects. It ships as a single Rust binary called `lpm`, works with the npm ecosystem, and adds secure-by-default installs, built-in developer tooling, hosted registry features, and an npm package firewall.
+
+```bash
+lpm install
+lpm add lpm-source-package
+lpm run dev
+```
+
+LPM has three connected parts:
+
+- **LPM CLI** - an npm-compatible package manager and dev toolkit written in Rust. It installs from npm, lpm.dev, JSR, and private registries; blocks dependency lifecycle scripts by default; and includes a task runner, dev server, test/bench runner, linter, formatter, Node version pinning, local HTTPS, tunnels, secrets, and project health checks.
+- **LPM.dev Registry** - the hosted registry and platform behind the `@lpm.dev/*` scope. Use it for private packages, Pool distribution, Marketplace sales, Swift packages, package quality analysis, generated metadata, access control, and Pro/team platform features.
+- **LPM Firewall** - a hosted verdict service for public npm package versions. It can run in monitor mode or enforcement mode before LPM materializes package bytes, helping teams catch malicious packages, critical vulnerabilities, suspicious lifecycle behavior, and policy violations during install.
+
+## Install
+
+LPM supports macOS, Linux, and Windows x64 through npm. Homebrew and the standalone installer support macOS and Linux.
+
+```bash
+# npm
+npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
+
+# Homebrew
+brew tap lpm-dev/lpm && brew install lpm
+
+# Standalone
+curl -fsSL https://cli.lpm.dev/install | sh
+```
+
+The npm package is a dependency-free launcher for the native Rust binary. npm installs the matching platform package through `optionalDependencies`; the approved `postinstall` verifier checks the native binary and wires the global command where the platform allows it.
+
+If your npm version or policy does not require explicit script approval, this also works:
 
 ```bash
 npm install -g @lpm-registry/cli
 ```
 
-The npm package is a dependency-free launcher for the native Rust binary. npm
-installs the matching platform package automatically through
-`optionalDependencies`; `lpm self-update` keeps using the same npm channel.
-
-<details>
-<summary>Other install methods</summary>
+Update LPM with:
 
 ```bash
-brew tap lpm-dev/lpm && brew install lpm         # Homebrew
-curl -fsSL https://cli.lpm.dev/install | sh       # Standalone
-cargo install --git https://github.com/lpm-dev/rust-client lpm-cli   # Source
+lpm self-update
 ```
 
-Standalone installs and self-updates verify release download integrity before
-swapping the binary.
+## Quick Links
 
-</details>
+- Get Started
+  - [Introduction](https://cli.lpm.dev/docs)
+  - [Installation](https://cli.lpm.dev/docs/installation)
+  - [Your first install](https://cli.lpm.dev/docs/first-install)
+  - [Registries](https://cli.lpm.dev/docs/registries)
+  - [Project setup](https://cli.lpm.dev/docs/project-setup)
+  - [Migrating](https://cli.lpm.dev/docs/migrating)
+  - [Comparison](https://cli.lpm.dev/docs/comparison)
 
-## Commands
+- Packages
+  - [`lpm install`](https://cli.lpm.dev/docs/packages/install)
+  - [`lpm add`](https://cli.lpm.dev/docs/packages/add)
+  - [`lpm publish`](https://cli.lpm.dev/docs/packages/publish)
+  - [`lpm audit`](https://cli.lpm.dev/docs/packages/audit)
+  - [`lpm trust`](https://cli.lpm.dev/docs/packages/trust)
+  - [`lpm approve-scripts`](https://cli.lpm.dev/docs/packages/approve-scripts)
+  - [Workspaces](https://cli.lpm.dev/docs/packages/workspaces)
+  - [Lockfile](https://cli.lpm.dev/docs/packages/lockfile)
+  - [Content-addressable store](https://cli.lpm.dev/docs/packages/content-addressable-store)
+  - [npm compatibility](https://cli.lpm.dev/docs/packages/npm-compatibility)
 
-```bash
-# Package management
-lpm install                    # Install deps (aliases: i)
-lpm add <package>              # Source delivery (any registry: lpm.dev, npm, .npmrc-private)
-lpm remove <package>           # Remove added package (aliases: rm)
-lpm uninstall <packages>       # Remove from deps (aliases: un, unlink)
-lpm publish                    # Publish to lpm.dev (aliases: p)
-lpm upgrade                    # Upgrade deps to latest
-lpm outdated                   # Check for newer versions
-lpm audit                      # Security + quality audit (OSV.dev)
-lpm search <query>             # Search packages
-lpm info <package>             # Package details
-lpm quality <package>          # Quality report
-lpm query <selector>           # CSS-like selector queries on installed packages
-lpm rebuild                    # Run dependency lifecycle scripts (phase 2 of install)
-lpm approve-scripts            # Approve packages blocked by default-deny script policy
-lpm trust                      # Manage `trustedDependencies` in package.json
-lpm patch <package>            # Generate a local patch, `patch-package` style
-lpm patch-commit               # Finalize a patch staging directory
-lpm migrate                    # Migrate from npm/yarn/pnpm/bun
+- Dev
+  - [`lpm dev`](https://cli.lpm.dev/docs/dev/dev)
+  - [`lpm run`](https://cli.lpm.dev/docs/dev/run)
+  - [`lpm exec`](https://cli.lpm.dev/docs/dev/exec)
+  - [`lpm dlx`](https://cli.lpm.dev/docs/dev/dlx)
+  - [`lpm test`](https://cli.lpm.dev/docs/dev/test)
+  - [`lpm bench`](https://cli.lpm.dev/docs/dev/bench)
+  - [`lpm lint`](https://cli.lpm.dev/docs/dev/lint)
+  - [`lpm fmt`](https://cli.lpm.dev/docs/dev/fmt)
+  - [Node version pinning](https://cli.lpm.dev/docs/dev/node-version-pinning)
+  - [Environment variables](https://cli.lpm.dev/docs/dev/env)
 
-# Scripts & execution
-lpm run <scripts...>           # Run scripts (parallel: -p, cached, watch)
-lpm dev                        # Zero-config dev server + HTTPS + tunnel
-lpm <file>                     # Run JS/TS files directly
-lpm exec <bin>                 # Run project-local binaries from node_modules/.bin
-lpm <bin>                      # Shorthand local bin when no built-in/file/script matches
-lpm dlx <package>              # Run without installing
-lpm test                       # Auto-detect test runner
-lpm bench                      # Auto-detect benchmark runner
+- Infra
+  - [`lpm tunnel`](https://cli.lpm.dev/docs/infra/tunnel)
+  - [`lpm cert`](https://cli.lpm.dev/docs/infra/cert)
+  - [`lpm config`](https://cli.lpm.dev/docs/infra/config)
+  - [`lpm doctor`](https://cli.lpm.dev/docs/infra/doctor)
+  - [`lpm store`](https://cli.lpm.dev/docs/infra/store)
+  - [`lpm self-update`](https://cli.lpm.dev/docs/infra/self-update)
+  - [Secrets vault](https://cli.lpm.dev/docs/infra/secrets-vault)
+  - [Port management](https://cli.lpm.dev/docs/infra/port-management)
+  - [Dependency graph](https://cli.lpm.dev/docs/infra/dependency-graph)
 
-# Built-in tools (lazy-downloaded)
-lpm lint                       # Oxlint
-lpm fmt                        # Biome
-lpm check                      # TypeScript (tsc --noEmit)
-lpm plugin list                # Show installed tools
-lpm plugin update              # Update tools
+- Guides
+  - [Publishing a package](https://cli.lpm.dev/docs/guides/publishing-a-package)
+  - [Firewall for npm](https://cli.lpm.dev/docs/guides/firewall)
+  - [Zero-config dev server](https://cli.lpm.dev/docs/guides/zero-config-dev-server)
+  - [Monorepo setup](https://cli.lpm.dev/docs/guides/monorepo-setup)
+  - [Managing secrets](https://cli.lpm.dev/docs/guides/managing-secrets)
+  - [CI/CD setup](https://cli.lpm.dev/docs/guides/ci-cd-setup)
+  - [Docker deploys](https://cli.lpm.dev/docs/guides/docker-deploys)
+  - [Migrating from npm](https://cli.lpm.dev/docs/guides/migrating-from-npm)
+  - [Migrating from pnpm](https://cli.lpm.dev/docs/guides/migrating-from-pnpm)
+  - [Migrating from yarn](https://cli.lpm.dev/docs/guides/migrating-from-yarn)
+  - [Migrating from Bun](https://cli.lpm.dev/docs/guides/migrating-from-bun)
 
-# Runtime & environment
-lpm use node@22                # Install + pin Node.js version
-lpm env <subcommand>           # Project env vars / secrets (set, get, push, pull, …)
-lpm vault                      # Secrets manager (Keychain-backed)
-lpm global                     # Manage globally-installed CLIs (~/.lpm/global/)
-
-# Dev infrastructure
-lpm tunnel <port>              # Expose localhost to the internet
-lpm tunnel claim <domain>      # Claim a stable domain
-lpm tunnel inspect             # View captured webhooks
-lpm tunnel replay <n>          # Replay a webhook
-lpm cert status                # Local HTTPS certificate info
-lpm cert trust                 # Install CA to trust store
-lpm graph                      # Dependency graph (--format tree|dot|mermaid|json|stats|html)
-lpm ports                      # Dev service port management
-
-# Workspaces & deployment
-lpm filter <expr>              # Preview the workspace set a `--filter` expression selects
-lpm deploy <output> --filter <member>  # Materialize a member's deploy closure for `COPY --from=pruned`
-
-# Project health
-lpm doctor                     # Health check (--fix to auto-repair)
-lpm health                     # Check registry health
-lpm store verify               # Verify package store integrity
-lpm store gc                   # Clean unused packages
-lpm cache                      # Manage ephemeral caches (metadata, tasks, dlx)
-lpm self-update                # Update LPM to the latest version
-
-# Debug & inspection
-lpm download <package>         # Download and extract a tarball (no install side-effects)
-lpm resolve <packages...>      # Print the resolved dependency tree without installing
-
-# Auth & config
-lpm login                      # Authenticate (aliases: l)
-lpm logout                     # Clear token (aliases: lo)
-lpm whoami                     # Current user
-lpm token-rotate               # Rotate your auth token
-lpm setup ci npmrc             # Generate .npmrc for CI/CD
-lpm setup ci github-actions    # Print a GitHub Actions OIDC snippet
-lpm setup local                # Read-only `.npmrc` token for local development
-lpm ci                         # Frozen lockfile install for CI
-lpm init                       # Create a new package
-lpm config                     # CLI configuration
-lpm pool                       # Pool revenue stats
-lpm skills                     # AI agent skills (install, list, …)
-lpm swift-registry             # Configure SPM integration (SE-0292)
-lpm mcp setup                  # Configure MCP server for AI editors
-```
-
-## How `lpm dev` Works
-
-One command. Zero config. Everything auto-detected.
-
-```bash
-$ lpm dev
-
-  ● Node     22.12.0 (from .nvmrc)
-  ● Deps     up to date (2ms)
-  ● Env      .env loaded
-  ● HTTPS    certificate valid
-  ● Tunnel   https://acme-api.lpm.llc
-
-  [db]  ✔ ready (0.8s)
-  [web] ✔ ready (1.2s)
-  [api] ✔ ready (3.4s)
-
-  ⌘ Opening https://localhost:3000
-```
-
-Auto-installs deps if stale. Copies `.env.example` if no `.env`. Starts multi-service orchestrator from `lpm.json`. Opens browser after readiness checks. Tunnel domain from config. HTTPS with local CA.
-
-Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Swift packages, dependency graph visualization — built in, not bolted on.
+- Reference
+  - [`package.json` fields](https://cli.lpm.dev/docs/reference/package-json-lpm)
+  - [`lpm.json`](https://cli.lpm.dev/docs/reference/lpm-json)
+  - [`lpm.toml`](https://cli.lpm.dev/docs/reference/lpm-toml)
+  - [Configuration](https://cli.lpm.dev/docs/reference/config-toml)
+  - [Environment variables](https://cli.lpm.dev/docs/reference/env-vars)
+  - [Schemas](https://cli.lpm.dev/docs/reference/schemas)
+  - [Lockfile format](https://cli.lpm.dev/docs/reference/lockfile-format)
+  - [MCP servers](https://cli.lpm.dev/docs/reference/mcp-servers)
+  - [AI agent skills](https://cli.lpm.dev/docs/reference/ai-agent-skills)
+  - [Exit codes](https://cli.lpm.dev/docs/reference/exit-codes)
 
 ## Benchmarks
 
-|                                 |     npm |    pnpm |     bun |         **lpm** |
-| ------------------------------- | ------: | ------: | ------: | --------------: |
-| Cold install, equal footing ¹   | 6,735ms | 1,124ms |   823ms |       **957ms** |
-| Cold install, reset-each-iter ² | 7,146ms | 1,927ms | 1,207ms |       **945ms** |
-| Warm install ³                  |   648ms |   665ms |   263ms |        **23ms** |
-| Up-to-date install ³            |   348ms |   152ms |     8ms |         **6ms** |
-| Script overhead ⁴               |    67ms |   107ms |     6ms |         **9ms** |
-| `lpm lint` vs `npx oxlint` ⁴    |   250ms |       — |       — | **78ms** (3.2×) |
-| `lpm fmt` vs `npx biome` ⁴      |   264ms |       — |       — |  **13ms** (20×) |
+Install benchmarks use the tracked VitePress docs fixture, a real-world workspace graph with 535 packages.
 
-> **¹ Equal-footing cold install — `bench/fixture-large`** — Fresh cache and lockfile resets happen outside the timer, so this row measures install work instead of cleanup work. `lpm` and `bun` alternate per iteration to cancel out CDN warmth bias; `npm` and `pnpm` run sequentially because their install times are much larger.
+| Benchmark                       |       npm |    pnpm |     bun |  **lpm** | **lpm + Firewall monitor** |
+| ------------------------------- | --------: | ------: | ------: | -------: | -------------------------: |
+| Cold install, equal footing ¹   | 17,354ms | 6,125ms | 2,455ms | 2,945ms |                    3,043ms |
+| Warm install ¹                  |  3,819ms | 3,301ms |   451ms | **387ms** |                   **324ms** |
+| Up-to-date install ¹            |    282ms |   522ms |    77ms |  **14ms** |                    **14ms** |
+
+Dev command benchmarks measure already-installed local scripts, local bins, and built-in tools.
+
+| Benchmark                         | npm / npx / tsx |    pnpm | bun / bunx |  **lpm** |
+| --------------------------------- | --------------: | ------: | ---------: | -------: |
+| Script overhead ²                 |            67ms |   153ms |       15ms |  **9ms** |
+| Local bin: `esbuild --version` ²  |           136ms |   163ms |       26ms | **17ms** |
+| Run TSX app, warm cache ³         |           112ms |       — |       19ms | **41ms** |
+| `lpm lint` vs `npx oxlint` ⁴      |           249ms |       — |          — |  **3ms** |
+| `lpm fmt` vs `npx biome` ⁴        |           269ms |       — |          — |  **3ms** |
+
+<details>
+<summary>Benchmark methodology</summary>
+
+> **¹ Install benchmarks** — Generated by [`run-install-readiness.mjs`](bench/scripts/run-install-readiness.mjs) with `--samples 10 --fixtures vitepress --managers lpm,bun,pnpm,npm --modes cold,warm,up-to-date --lpm-firewall-modes off,report`. Each run uses an isolated temporary project, `HOME`, package-manager cache, and `LPM_HOME`; samples are round-robin interleaved to reduce live-network bias. Dependency lifecycle scripts are disabled for all package managers. Raw artifact: [`readme-install-vitepress-20260710T140139.md`](bench/perf-results/readme-install-vitepress-20260710T140139.md).
 >
-> **² Reset-each-iter cold install** — Same fixture as ¹, but every iteration starts cold again. `npm`, `pnpm`, and `bun` wipe inside the timer. `lpm` rotates the previous cache, store, and project state before the timer so the result reflects a cold install without charging recursive deletion.
+> **Firewall monitor mode** — The Firewall monitor column runs the same LPM install with `LPM_NPM_FIREWALL=report`. In the cold install row, LPM checked 535 package versions before materializing package bytes.
 >
-> **³ Warm / Up-to-date — `bench/project`** — Warm install means the cache and lockfile already exist and only `node_modules` gets rebuilt. Up-to-date install means nothing changed, so the package manager just checks state and exits.
+> **² Script and local-bin benchmarks** — Generated by [`run-bin-benchmark.mjs`](bench/scripts/run-bin-benchmark.mjs) with 10 measured iterations after 2 warmups. Dependency installation is setup-only and not timed; rows execute package scripts or already-installed local `node_modules/.bin` entries. Raw artifact: [`readme-run-bin-20260710T141422.md`](bench/perf-results/readme-run-bin-20260710T141422.md).
 >
-> **⁴ Script overhead / lint / fmt — `bench/project`** — Script overhead is the cost of invoking the package runner itself. The lint and format rows compare `lpm`'s built-ins against `npx oxlint` and `npx biome`.
+> **³ TSX benchmark** — Generated by [`exec-runtime-benchmark.mjs`](bench/scripts/exec-runtime-benchmark.mjs) against a generated 10-module TSX ESM app with 10 measured iterations after 2 warmups. The `npm / npx / tsx` column is `tsx`; the `bun / bunx` column is `bun`. Raw artifact: [`readme-exec-runtime-20260710T141510.md`](bench/perf-results/readme-exec-runtime-20260710T141510.md).
 >
-> **Script-policy footing.** `lpm install` runs the root project's install lifecycle (`pnpm:devPreinstall`, then `preinstall`/`install`/`postinstall`/`preprepare`/`prepare`/`postprepare`) on bare installs. Dependency lifecycle scripts stay blocked by default and run only through the trust-gated rebuild/auto-build path. For like-for-like comparisons on script-heavy fixtures, compare dependency skip-vs-skip (`bun install --ignore-scripts`) or dependency run-vs-run (`lpm install --yolo --auto-build`).
->
-> **Bench setup.** Rows ¹-² use a `RUNS=20` cold-install sweep. Rows ³-⁴ come from the `bench/project` sweep.
+> **⁴ Built-in tool benchmarks** — Generated with `RUNS=10 LPM_BIN=target/release/lpm-rs ./bench/run.sh builtin-tools` on `bench/project`. The `npm / npx / tsx` column is `npx oxlint` or `npx @biomejs/biome`.
+</details>
 
 ## License
 

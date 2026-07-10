@@ -9,7 +9,7 @@ not for one-off hand-timed installs.
 It provides:
 
 - isolated temp project, `HOME`, package-manager cache, and `LPM_HOME`
-- cold mode and warm-cache mode
+- cold, warm-cache, and up-to-date modes
 - round-robin interleaving by sample to reduce live-network bias
 - configurable sample count, fixtures, package managers, lpm routes, lpm firewall modes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
@@ -20,6 +20,9 @@ Warm mode first seeds the package-manager cache/store, then removes generated
 project install artifacts before the counted run. That means warm numbers are
 cache/store-warm clean-project reinstalls, not repeat no-op installs over an
 already materialized `node_modules`.
+
+Up-to-date mode runs one more install over the project materialized by the
+previous successful install, so it measures the no-op state check.
 
 Build lpm first:
 
@@ -33,14 +36,14 @@ Run the harness self-test after changing warning or summary logic:
 node bench/scripts/run-install-readiness.mjs --self-test
 ```
 
-Capture the current lpm cold/warm reference first:
+Capture the current lpm cold/warm/up-to-date reference first:
 
 ```bash
 node bench/scripts/run-install-readiness.mjs \
   --samples 10 \
   --fixtures dogfood,nest,vitepress \
   --managers lpm \
-  --modes cold,warm
+  --modes cold,warm,up-to-date
 ```
 
 Capture a one-off firewall-enabled reference without paying that cost on every
@@ -51,7 +54,7 @@ node bench/scripts/run-install-readiness.mjs \
   --samples 1 \
   --fixtures dogfood,nest,vitepress \
   --managers lpm \
-  --modes cold,warm \
+  --modes cold,warm,up-to-date \
   --lpm-firewall-modes off,report
 ```
 
@@ -65,7 +68,8 @@ node bench/scripts/run-install-readiness.mjs \
   --samples 5 \
   --fixtures dogfood,nest,vitepress \
   --managers lpm,bun,pnpm,npm \
-  --modes cold
+  --modes cold,warm,up-to-date \
+  --lpm-firewall-modes off,report
 ```
 
 Compare one candidate lpm knob against current lpm:
@@ -75,7 +79,7 @@ node bench/scripts/run-install-readiness.mjs \
   --samples 10 \
   --fixtures dogfood,nest,vitepress \
   --managers lpm \
-  --modes cold,warm \
+  --modes cold,warm,up-to-date \
   --lpm-cell current \
   --lpm-cell cap:LPM_V2_FINALIZE_PERMITS=2
 ```
@@ -124,10 +128,10 @@ Fixture names built in today:
 The harness also accepts `name=/path/to/project` and `pkg:<name>@<version>`
 fixtures for focused checks and top-package sweeps.
 
-`vitepress` prefers the local real-world audit cache at
-`bench/realworld-audit/.cache/vitepress-docs` when present, because that is
-the full heavy graph used by the recent installer measurements. If the cache
-is absent, the harness falls back to a generated VitePress install fixture.
+`vitepress` prefers `bench/fixtures/vitepress-docs`, a tracked manifest-only
+fixture derived from the VitePress 1.5.0 repository. If that fixture is absent,
+the harness checks the local real-world audit cache and then falls back to a
+generated VitePress install fixture.
 
 For production-default decisions, keep competitor and firewall-enabled runs as
 reference snapshots. Legacy proxy routes remain available for focused routing

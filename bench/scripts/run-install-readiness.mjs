@@ -36,7 +36,10 @@ const BUILTIN_FIXTURES = new Map([
   [
     'vitepress',
     {
-      pathCandidates: ['bench/realworld-audit/.cache/vitepress-docs'],
+      pathCandidates: [
+        'bench/fixtures/vitepress-docs',
+        'bench/realworld-audit/.cache/vitepress-docs',
+      ],
       packageJson: {
         name: 'readiness-vitepress-install',
         version: '1.0.0',
@@ -212,7 +215,8 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
 
     const shouldMeasureCold = modes.includes('cold');
     const shouldMeasureWarm = modes.includes('warm');
-    let warmSeedOk = true;
+    const shouldMeasureUpToDate = modes.includes('up-to-date');
+    let installedOk = true;
 
     if (shouldMeasureCold) {
       const row = measureInstall({
@@ -226,8 +230,8 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
         phase: 'cold',
       });
       rowsForSpec.push(row);
-      warmSeedOk = row.exit_code === 0 && !row.parse_error;
-    } else if (shouldMeasureWarm) {
+      installedOk = row.exit_code === 0 && !row.parse_error;
+    } else if (shouldMeasureWarm || shouldMeasureUpToDate) {
       const row = measureInstall({
         sample,
         fixture,
@@ -240,24 +244,24 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
         counted: false,
       });
       rowsForSpec.push(row);
-      warmSeedOk = row.exit_code === 0 && !row.parse_error;
+      installedOk = row.exit_code === 0 && !row.parse_error;
     }
 
     if (shouldMeasureWarm) {
-      if (warmSeedOk) {
+      if (installedOk) {
         cleanProject(projectDir);
-        rowsForSpec.push(
-          measureInstall({
-            sample,
-            fixture,
-            spec,
-            mode: 'warm',
-            projectDir,
-            env,
-            runDir,
-            phase: 'warm',
-          }),
-        );
+        const row = measureInstall({
+          sample,
+          fixture,
+          spec,
+          mode: 'warm',
+          projectDir,
+          env,
+          runDir,
+          phase: 'warm',
+        });
+        rowsForSpec.push(row);
+        installedOk = row.exit_code === 0 && !row.parse_error;
       } else {
         rowsForSpec.push(
           recordSkippedInstall({
@@ -267,7 +271,36 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
             mode: 'warm',
             runDir,
             phase: 'warm',
-            reason: 'seed install failed',
+            reason: 'previous install failed',
+          }),
+        );
+      }
+    }
+
+    if (shouldMeasureUpToDate) {
+      if (installedOk) {
+        rowsForSpec.push(
+          measureInstall({
+            sample,
+            fixture,
+            spec,
+            mode: 'up-to-date',
+            projectDir,
+            env,
+            runDir,
+            phase: 'up-to-date',
+          }),
+        );
+      } else {
+        rowsForSpec.push(
+          recordSkippedInstall({
+            sample,
+            fixture,
+            spec,
+            mode: 'up-to-date',
+            runDir,
+            phase: 'up-to-date',
+            reason: 'previous install failed',
           }),
         );
       }
@@ -754,6 +787,11 @@ function buildEnv({ homeDir, lpmHome, spec }) {
 function materializeFixture(fixture, projectDir) {
   if (fixture.path) {
     fs.cpSync(fixture.path, projectDir, { recursive: true });
+    const fixtureNpmrc = path.join(projectDir, 'fixture.npmrc');
+    const npmrc = path.join(projectDir, '.npmrc');
+    if (fs.existsSync(fixtureNpmrc) && !fs.existsSync(npmrc)) {
+      fs.copyFileSync(fixtureNpmrc, npmrc);
+    }
     return;
   }
   fs.mkdirSync(projectDir, { recursive: true });
@@ -1176,7 +1214,7 @@ function parseEnvAssignments(raw) {
 function parseModes(raw) {
   const modes = parseList(raw, '--modes');
   for (const mode of modes) {
-    if (!['cold', 'warm'].includes(mode)) {
+    if (!['cold', 'warm', 'up-to-date'].includes(mode)) {
       throw new Error(`unsupported mode: ${mode}`);
     }
   }
@@ -1531,6 +1569,20 @@ function isWarningLikeLine(line) {
 }
 
 function runSelfTests() {
+  assert.deepEqual(parseModes('cold,warm,up-to-date'), ['cold', 'warm', 'up-to-date']);
+  assert.throws(() => parseModes('repeat'), /unsupported mode/);
+  const npmrcFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lpm-readiness-self-test-'));
+  try {
+    const sourceDir = path.join(npmrcFixtureRoot, 'source');
+    const projectDir = path.join(npmrcFixtureRoot, 'project');
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, 'package.json'), '{"name":"fixture","version":"1.0.0"}\n');
+    fs.writeFileSync(path.join(sourceDir, 'fixture.npmrc'), 'shell-emulator=true\n');
+    materializeFixture({ path: sourceDir }, projectDir);
+    assert.equal(fs.readFileSync(path.join(projectDir, '.npmrc'), 'utf8'), 'shell-emulator=true\n');
+  } finally {
+    removeTree(npmrcFixtureRoot);
+  }
   assert.deepEqual(parseLpmFirewallModes('off,enabled,report'), ['off', 'enforce', 'report']);
   assert.throws(() => parseLpmFirewallModes('enabled,enforce'), /duplicate lpm firewall mode/);
   const firewallSpecs = buildRunSpecs(
@@ -1909,7 +1961,7 @@ Options:
       --top-npm-offset N       Zero-based package offset for chunked top-N sweeps
       --top-npm-limit N        Maximum packages from --top-npm-file
       --managers LIST          lpm,bun,pnpm,npm (default: lpm)
-      --modes LIST             cold,warm (default: cold)
+      --modes LIST             cold,warm,up-to-date (default: cold)
       --lpm-routes LIST        direct,proxy for lpm runs (default: direct)
       --lpm-firewall-modes LIST
                                off,report,enforce for lpm runs (default: off)
@@ -1928,8 +1980,8 @@ Options:
   -h, --help                   Show this help
 
 Examples:
-  # Current lpm cold/warm reference.
-  node bench/scripts/run-install-readiness.mjs --samples 10 --modes cold,warm
+  # Current lpm cold/warm/up-to-date reference.
+  node bench/scripts/run-install-readiness.mjs --samples 10 --modes cold,warm,up-to-date
 
   # One-off firewall-enabled reference without fail-closed auth.
   node bench/scripts/run-install-readiness.mjs --samples 1 --lpm-firewall-modes off,report
