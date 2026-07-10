@@ -3276,7 +3276,7 @@ dependencies = [
  "urlencoding",
  "windows",
  "windows-future",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "wiremock",
  "x509-parser",
 ]
@@ -3300,7 +3300,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3355,7 +3355,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3480,7 +3480,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "wiremock",
  "zip",
 ]
@@ -3504,7 +3504,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "x509-parser",
 ]
 
@@ -3597,7 +3597,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3634,7 +3634,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5404,7 +5404,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
