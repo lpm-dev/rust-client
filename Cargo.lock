@@ -1795,7 +1795,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3198,7 +3198,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "cliclack",
- "console 0.15.11",
+ "console 0.16.3",
  "crossterm",
  "dashmap",
  "dhat",
