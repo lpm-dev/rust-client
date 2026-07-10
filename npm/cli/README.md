@@ -3,7 +3,7 @@
 Fast, secure, all-in-one package manager written in Rust.
 
 ```bash
-npm install -g @lpm-registry/cli
+npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
 ```
 
 This package is the npm gateway for the native LPM CLI. It installs a small
@@ -38,8 +38,12 @@ with optional dependencies enabled:
 npm install -g @lpm-registry/cli
 ```
 
-If install scripts were disabled, reinstall without `--ignore-scripts` so npm
-can validate the native binary during installation.
+If your npm policy blocks install scripts, allow LPM's installer script so npm
+can validate the native binary during installation:
+
+```bash
+npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
+```
 
 Other install methods are documented at
 [github.com/lpm-dev/rust-client](https://github.com/lpm-dev/rust-client).

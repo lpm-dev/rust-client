@@ -1,0 +1,610 @@
+{
+  "metadata": {
+    "generatedAt": "2026-07-10T13:14:24.494Z",
+    "gitSha": "22d20109",
+    "gitBranch": "codex/rewrite-readme",
+    "gitDirty": true,
+    "gitStatus": [
+      "M README.md",
+      " M bench/scripts/README.md",
+      " M bench/scripts/run-install-readiness.mjs",
+      " M npm/cli/README.md",
+      "?? assets/",
+      "?? bench/fixtures/",
+      "?? bench/perf-results/readme-run-bin-20260710T141333.json",
+      "?? bench/perf-results/readme-run-bin-20260710T141333.md"
+    ],
+    "iterations": 10,
+    "warmupIterations": 2,
+    "commandTimeoutMs": 30000,
+    "fixtureDependencies": {
+      "esbuild": "0.28.1",
+      "typescript": "6.0.3"
+    },
+    "setup": {
+      "manager": "pnpm",
+      "command": "/Users/tolga/.n/bin/pnpm install --no-frozen-lockfile --config.dangerously-allow-all-builds=true --store-dir /var/folders/p2/32lgcl857ds0wkcnkg0qk51h0000gn/T/lpm-run-bin-bench-gErcPv/project/.pnpm-store"
+    },
+    "binaries": {
+      "lpm": {
+        "path": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs",
+        "source": "LPM_BIN",
+        "available": true,
+        "version": "lpm 0.67.0"
+      },
+      "nub": {
+        "path": "nub",
+        "source": "PATH",
+        "available": false,
+        "version": null
+      },
+      "nubx": {
+        "path": "nubx",
+        "source": "PATH",
+        "available": false,
+        "version": null
+      },
+      "node": {
+        "path": "/Users/tolga/.n/bin/node",
+        "source": "current Node process",
+        "available": true,
+        "version": "v22.22.1"
+      },
+      "npm": {
+        "path": "/Users/tolga/.n/bin/npm",
+        "source": "PATH",
+        "available": true,
+        "version": "10.9.4"
+      },
+      "npx": {
+        "path": "/Users/tolga/.n/bin/npx",
+        "source": "PATH",
+        "available": true,
+        "version": "10.9.4"
+      },
+      "pnpm": {
+        "path": "/Users/tolga/.n/bin/pnpm",
+        "source": "PATH",
+        "available": true,
+        "version": "11.3.0"
+      },
+      "bun": {
+        "path": "/Users/tolga/.bun/bin/bun",
+        "source": "PATH",
+        "available": true,
+        "version": "1.3.14"
+      },
+      "bunx": {
+        "path": "/Users/tolga/.bun/bin/bunx",
+        "source": "PATH",
+        "available": true,
+        "version": "1.3.14"
+      }
+    },
+    "host": {
+      "platform": "darwin",
+      "release": "25.5.0",
+      "arch": "arm64",
+      "cpuModel": "Apple M5 Pro",
+      "cpuCount": 18,
+      "totalMemoryBytes": 51539607552
+    },
+    "filters": {
+      "scenarios": "^(noop|esbuild-version)$",
+      "runners": "lpm-run,npm-run,pnpm-run,bun-run,lpm-exec,pnpm-exec,npx-no-install,npm-exec,bunx-no-install",
+      "groups": "script-runner,local-bin-runner"
+    },
+    "output": {
+      "markdown": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/bench/perf-results/readme-run-bin-20260710T141422.md",
+      "json": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/bench/perf-results/readme-run-bin-20260710T141422.json"
+    }
+  },
+  "fixture": {
+    "packageJson": {
+      "name": "lpm-run-bin-benchmark-fixture",
+      "version": "0.0.0",
+      "private": true,
+      "scripts": {
+        "noop": "echo hi",
+        "node-noop": "node -e \"process.stdout.write('node-noop\\\\n')\"",
+        "esbuild-version": "esbuild --version"
+      },
+      "dependencies": {
+        "esbuild": "0.28.1",
+        "typescript": "6.0.3"
+      }
+    },
+    "setupManager": "pnpm",
+    "setupCommand": "/Users/tolga/.n/bin/pnpm install --no-frozen-lockfile --config.dangerously-allow-all-builds=true --store-dir /var/folders/p2/32lgcl857ds0wkcnkg0qk51h0000gn/T/lpm-run-bin-bench-gErcPv/project/.pnpm-store",
+    "sameProjectForEveryRunner": true
+  },
+  "results": [
+    {
+      "id": "script-noop-lpm-run",
+      "group": "script-runner",
+      "runner": "lpm run",
+      "runnerKey": "lpm-run",
+      "scenario": "noop",
+      "label": "script noop",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs",
+        "args": [
+          "run",
+          "noop"
+        ],
+        "display": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs run noop"
+      },
+      "expectedStdout": "stdout contains \"hi\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 9.1,
+      "p95Ms": 9.31,
+      "avgMs": 9.08,
+      "minMs": 8.7,
+      "maxMs": 9.31,
+      "samplesMs": [
+        9.12,
+        9.03,
+        9.14,
+        8.94,
+        9.1,
+        9.12,
+        9.28,
+        9.1,
+        8.7,
+        9.31
+      ]
+    },
+    {
+      "id": "script-noop-npm-run",
+      "group": "script-runner",
+      "runner": "npm run",
+      "runnerKey": "npm-run",
+      "scenario": "noop",
+      "label": "script noop",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/.n/bin/npm",
+        "args": [
+          "run",
+          "noop"
+        ],
+        "display": "/Users/tolga/.n/bin/npm run noop"
+      },
+      "expectedStdout": "stdout contains \"hi\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 66.94,
+      "p95Ms": 74.91,
+      "avgMs": 68.29,
+      "minMs": 66.19,
+      "maxMs": 74.91,
+      "samplesMs": [
+        66.19,
+        70.01,
+        66.93,
+        66.29,
+        67.28,
+        66.52,
+        67.41,
+        70.45,
+        74.91,
+        66.94
+      ]
+    },
+    {
+      "id": "script-noop-pnpm-run",
+      "group": "script-runner",
+      "runner": "pnpm run",
+      "runnerKey": "pnpm-run",
+      "scenario": "noop",
+      "label": "script noop",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/.n/bin/pnpm",
+        "args": [
+          "run",
+          "noop"
+        ],
+        "display": "/Users/tolga/.n/bin/pnpm run noop"
+      },
+      "expectedStdout": "stdout contains \"hi\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 153.49,
+      "p95Ms": 155.3,
+      "avgMs": 153.8,
+      "minMs": 152.6,
+      "maxMs": 155.3,
+      "samplesMs": [
+        154.05,
+        153.48,
+        153.73,
+        154.3,
+        152.6,
+        154.84,
+        155.3,
+        153.42,
+        152.75,
+        153.49
+      ]
+    },
+    {
+      "id": "script-noop-bun-run",
+      "group": "script-runner",
+      "runner": "bun run",
+      "runnerKey": "bun-run",
+      "scenario": "noop",
+      "label": "script noop",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/.bun/bin/bun",
+        "args": [
+          "run",
+          "noop"
+        ],
+        "display": "/Users/tolga/.bun/bin/bun run noop"
+      },
+      "expectedStdout": "stdout contains \"hi\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 14.61,
+      "p95Ms": 14.85,
+      "avgMs": 14.6,
+      "minMs": 14.32,
+      "maxMs": 14.85,
+      "samplesMs": [
+        14.73,
+        14.61,
+        14.51,
+        14.63,
+        14.85,
+        14.77,
+        14.49,
+        14.46,
+        14.32,
+        14.64
+      ]
+    },
+    {
+      "id": "script-esbuild-version-lpm-run",
+      "group": "script-runner",
+      "runner": "lpm run",
+      "runnerKey": "lpm-run",
+      "scenario": "esbuild-version",
+      "label": "script invokes local native bin",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs",
+        "args": [
+          "run",
+          "esbuild-version"
+        ],
+        "display": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs run esbuild-version"
+      },
+      "expectedStdout": "stdout contains \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 20.09,
+      "p95Ms": 20.67,
+      "avgMs": 20.12,
+      "minMs": 19.52,
+      "maxMs": 20.67,
+      "samplesMs": [
+        20.27,
+        20.67,
+        20.29,
+        19.86,
+        20.09,
+        20.35,
+        19.89,
+        20.14,
+        20.09,
+        19.52
+      ]
+    },
+    {
+      "id": "script-esbuild-version-npm-run",
+      "group": "script-runner",
+      "runner": "npm run",
+      "runnerKey": "npm-run",
+      "scenario": "esbuild-version",
+      "label": "script invokes local native bin",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/.n/bin/npm",
+        "args": [
+          "run",
+          "esbuild-version"
+        ],
+        "display": "/Users/tolga/.n/bin/npm run esbuild-version"
+      },
+      "expectedStdout": "stdout contains \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 78.27,
+      "p95Ms": 81.39,
+      "avgMs": 78.56,
+      "minMs": 77.73,
+      "maxMs": 81.39,
+      "samplesMs": [
+        78.15,
+        77.9,
+        78.53,
+        78.47,
+        78.49,
+        81.39,
+        78.82,
+        78.27,
+        77.83,
+        77.73
+      ]
+    },
+    {
+      "id": "script-esbuild-version-pnpm-run",
+      "group": "script-runner",
+      "runner": "pnpm run",
+      "runnerKey": "pnpm-run",
+      "scenario": "esbuild-version",
+      "label": "script invokes local native bin",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/.n/bin/pnpm",
+        "args": [
+          "run",
+          "esbuild-version"
+        ],
+        "display": "/Users/tolga/.n/bin/pnpm run esbuild-version"
+      },
+      "expectedStdout": "stdout contains \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 165.44,
+      "p95Ms": 167.42,
+      "avgMs": 165.56,
+      "minMs": 164.43,
+      "maxMs": 167.42,
+      "samplesMs": [
+        165.16,
+        165.44,
+        164.43,
+        164.83,
+        165.5,
+        165.62,
+        167.42,
+        166.56,
+        165.56,
+        165.11
+      ]
+    },
+    {
+      "id": "script-esbuild-version-bun-run",
+      "group": "script-runner",
+      "runner": "bun run",
+      "runnerKey": "bun-run",
+      "scenario": "esbuild-version",
+      "label": "script invokes local native bin",
+      "targetBin": null,
+      "command": {
+        "program": "/Users/tolga/.bun/bin/bun",
+        "args": [
+          "run",
+          "esbuild-version"
+        ],
+        "display": "/Users/tolga/.bun/bin/bun run esbuild-version"
+      },
+      "expectedStdout": "stdout contains \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 25.88,
+      "p95Ms": 27.91,
+      "avgMs": 26.09,
+      "minMs": 25.39,
+      "maxMs": 27.91,
+      "samplesMs": [
+        26.19,
+        25.7,
+        25.91,
+        25.82,
+        25.88,
+        25.97,
+        25.41,
+        25.39,
+        26.67,
+        27.91
+      ]
+    },
+    {
+      "id": "local-bin-esbuild-version-lpm-exec",
+      "group": "local-bin-runner",
+      "runner": "lpm exec",
+      "runnerKey": "lpm-exec",
+      "scenario": "esbuild-version",
+      "label": "native CLI local bin",
+      "targetBin": "esbuild",
+      "command": {
+        "program": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs",
+        "args": [
+          "exec",
+          "esbuild",
+          "--version"
+        ],
+        "display": "/Users/tolga/Documents/Projects/lpm-dev/rust-client/target/release/lpm-rs exec esbuild --version"
+      },
+      "expectedStdout": "stdout has a line exactly \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 16.82,
+      "p95Ms": 17.12,
+      "avgMs": 16.84,
+      "minMs": 16.44,
+      "maxMs": 17.12,
+      "samplesMs": [
+        17.12,
+        16.85,
+        17.03,
+        16.92,
+        16.8,
+        16.63,
+        16.79,
+        17.04,
+        16.44,
+        16.82
+      ]
+    },
+    {
+      "id": "local-bin-esbuild-version-pnpm-exec",
+      "group": "local-bin-runner",
+      "runner": "pnpm exec",
+      "runnerKey": "pnpm-exec",
+      "scenario": "esbuild-version",
+      "label": "native CLI local bin",
+      "targetBin": "esbuild",
+      "command": {
+        "program": "/Users/tolga/.n/bin/pnpm",
+        "args": [
+          "exec",
+          "esbuild",
+          "--version"
+        ],
+        "display": "/Users/tolga/.n/bin/pnpm exec esbuild --version"
+      },
+      "expectedStdout": "stdout has a line exactly \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 163.06,
+      "p95Ms": 164.86,
+      "avgMs": 163.19,
+      "minMs": 161.89,
+      "maxMs": 164.86,
+      "samplesMs": [
+        163.01,
+        163.73,
+        164.86,
+        162.77,
+        161.89,
+        163.06,
+        162.49,
+        163.16,
+        163.45,
+        163.46
+      ]
+    },
+    {
+      "id": "local-bin-esbuild-version-npx-no-install",
+      "group": "local-bin-runner",
+      "runner": "npx --no-install",
+      "runnerKey": "npx-no-install",
+      "scenario": "esbuild-version",
+      "label": "native CLI local bin",
+      "targetBin": "esbuild",
+      "command": {
+        "program": "/Users/tolga/.n/bin/npx",
+        "args": [
+          "--no-install",
+          "esbuild",
+          "--version"
+        ],
+        "display": "/Users/tolga/.n/bin/npx --no-install esbuild --version"
+      },
+      "expectedStdout": "stdout has a line exactly \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 135.83,
+      "p95Ms": 138.92,
+      "avgMs": 136.29,
+      "minMs": 135.27,
+      "maxMs": 138.92,
+      "samplesMs": [
+        135.66,
+        138.92,
+        137.47,
+        135.65,
+        136.24,
+        136,
+        135.78,
+        135.27,
+        135.83,
+        136.1
+      ]
+    },
+    {
+      "id": "local-bin-esbuild-version-npm-exec",
+      "group": "local-bin-runner",
+      "runner": "npm exec",
+      "runnerKey": "npm-exec",
+      "scenario": "esbuild-version",
+      "label": "native CLI local bin",
+      "targetBin": "esbuild",
+      "command": {
+        "program": "/Users/tolga/.n/bin/npm",
+        "args": [
+          "exec",
+          "--",
+          "esbuild",
+          "--version"
+        ],
+        "display": "/Users/tolga/.n/bin/npm exec -- esbuild --version"
+      },
+      "expectedStdout": "stdout has a line exactly \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 134.59,
+      "p95Ms": 143.53,
+      "avgMs": 136.47,
+      "minMs": 133.99,
+      "maxMs": 143.53,
+      "samplesMs": [
+        134.51,
+        134.77,
+        140.77,
+        143.53,
+        139.55,
+        134.12,
+        134.59,
+        134.69,
+        133.99,
+        134.18
+      ]
+    },
+    {
+      "id": "local-bin-esbuild-version-bunx-no-install",
+      "group": "local-bin-runner",
+      "runner": "bunx --no-install",
+      "runnerKey": "bunx-no-install",
+      "scenario": "esbuild-version",
+      "label": "native CLI local bin",
+      "targetBin": "esbuild",
+      "command": {
+        "program": "/Users/tolga/.bun/bin/bunx",
+        "args": [
+          "--no-install",
+          "esbuild",
+          "--version"
+        ],
+        "display": "/Users/tolga/.bun/bin/bunx --no-install esbuild --version"
+      },
+      "expectedStdout": "stdout has a line exactly \"0.28.1\"",
+      "status": "pass",
+      "iterations": 10,
+      "p50Ms": 26.41,
+      "p95Ms": 39.17,
+      "avgMs": 27.38,
+      "minMs": 24.78,
+      "maxMs": 39.17,
+      "samplesMs": [
+        24.91,
+        24.78,
+        26.41,
+        26.85,
+        26.77,
+        26.87,
+        27.89,
+        39.17,
+        24.89,
+        25.22
+      ]
+    }
+  ]
+}

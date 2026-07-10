@@ -1,0 +1,1933 @@
+{
+  "meta": {
+    "sourceDir": "/tmp/lpm-readme-vitepress-20260710T140139",
+    "rows": 150,
+    "failedRows": 0,
+    "generatedAt": "2026-07-10T13:16:17.678Z",
+    "fixture": "bench/fixtures/vitepress-docs",
+    "samples": 10,
+    "modes": [
+      "cold",
+      "warm",
+      "up-to-date"
+    ],
+    "managers": [
+      "lpm",
+      "bun",
+      "pnpm",
+      "npm"
+    ],
+    "lpmFirewallModes": [
+      "off",
+      "report"
+    ]
+  },
+  "summary": [
+    {
+      "fixture": "vitepress",
+      "manager": "bun",
+      "spec": "bun",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "cold",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 2454.5,
+          "min": 2046
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "bun",
+      "spec": "bun",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "up-to-date",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 76.5,
+          "min": 66
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "bun",
+      "spec": "bun",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "warm",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 450.5,
+          "min": 357
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "lpm",
+      "spec": "lpm-current-firewall-report",
+      "cell": "current",
+      "route": "direct",
+      "firewall_mode": "report",
+      "mode": "cold",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 3043,
+          "min": 2635
+        },
+        "duration_ms": {
+          "median": 2974.5,
+          "min": 2569
+        },
+        "resolve_ms": {
+          "median": 1260,
+          "min": 1028
+        },
+        "firewall_batch_ms": {
+          "median": 1273.5,
+          "min": 1038
+        },
+        "firewall_chunk_count": {
+          "median": 10,
+          "min": 10
+        },
+        "firewall_chunk_sum_ms": {
+          "median": 166,
+          "min": 133
+        },
+        "firewall_chunk_max_ms": {
+          "median": 59.5,
+          "min": 35
+        },
+        "firewall_checked_count": {
+          "median": 535,
+          "min": 535
+        },
+        "firewall_allow_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_warn_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_block_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_unknown_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_matched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_rpc_failed_count": {
+          "median": 1,
+          "min": 1
+        },
+        "firewall_offline_skipped_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_initial_batch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_followup_rpc_ms": {
+          "median": 61774,
+          "min": 39945
+        },
+        "resolve_followup_rpc_count": {
+          "median": 551,
+          "min": 551
+        },
+        "resolve_walker_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_escape_hatch_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_parse_ndjson_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_pubgrub_ms": {
+          "median": 1258,
+          "min": 1026
+        },
+        "resolve_platform_skipped_count": {
+          "median": 70,
+          "min": 70
+        },
+        "resolve_dispatcher_rpc_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_inflight_high_water": {
+          "median": 189.5,
+          "min": 172
+        },
+        "resolve_dispatcher_tarball_dispatched_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_peer_prefetch_count": {
+          "median": 2,
+          "min": 1
+        },
+        "resolve_streaming_bfs_walk_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_manifests_fetched": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_cache_hits": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_ms": {
+          "median": 1459.5,
+          "min": 1005
+        },
+        "link_ms": {
+          "median": 64.5,
+          "min": 18
+        },
+        "package_count": {
+          "median": 535,
+          "min": 535
+        },
+        "downloaded": {
+          "median": 201,
+          "min": 128
+        },
+        "cached": {
+          "median": 334,
+          "min": 239
+        },
+        "fetch_task_sum_ms": {
+          "median": 121529.5,
+          "min": 36072
+        },
+        "fetch_task_max_ms": {
+          "median": 1395,
+          "min": 950
+        },
+        "fetch_queue_wait_sum_ms": {
+          "median": 121529.5,
+          "min": 36072
+        },
+        "fetch_extract_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_finalize_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_selected_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_dispatched_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_completed_count": {
+          "median": 535,
+          "min": 535
+        },
+        "fetch_overlap_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_skipped_platform_count": {
+          "median": 70,
+          "min": 70
+        },
+        "fetch_overlap_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_dispatch_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_undispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_sum_ms": {
+          "median": 473121.5,
+          "min": 330169
+        },
+        "fetch_overlap_task_max_ms": {
+          "median": 2406.5,
+          "min": 2101
+        },
+        "fetch_overlap_drain_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_calls": {
+          "median": 548,
+          "min": 548
+        },
+        "metadata_body_mb_sum": {
+          "median": 70.5,
+          "min": 70.5
+        },
+        "metadata_version_count_sum": {
+          "median": 55577,
+          "min": 55577
+        },
+        "metadata_raw_fetch_sum_ms": {
+          "median": 60753,
+          "min": 39197
+        },
+        "metadata_http_sum_ms": {
+          "median": 58220,
+          "min": 36749
+        },
+        "metadata_body_read_sum_ms": {
+          "median": 1860,
+          "min": 1351
+        },
+        "metadata_json_decode_sum_ms": {
+          "median": 72.5,
+          "min": 52
+        },
+        "metadata_cache_info_parse_sum_ms": {
+          "median": 18.5,
+          "min": 11
+        },
+        "metadata_policy_release_time_sum_ms": {
+          "median": 985,
+          "min": 783
+        },
+        "metadata_policy_release_time_fetch_sum_ms": {
+          "median": 982.5,
+          "min": 782
+        },
+        "metadata_policy_release_time_fetch_http_sum_ms": {
+          "median": 241,
+          "min": 148
+        },
+        "metadata_policy_release_time_fetch_body_read_sum_ms": {
+          "median": 681.5,
+          "min": 536
+        },
+        "metadata_policy_release_time_fetch_json_decode_sum_ms": {
+          "median": 21.5,
+          "min": 19
+        },
+        "metadata_policy_release_time_fetch_body_mb_sum": {
+          "median": 29.5,
+          "min": 29.5
+        },
+        "metadata_policy_release_time_fetch_version_count_sum": {
+          "median": 9536,
+          "min": 9536
+        },
+        "metadata_policy_release_time_fetch_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_not_modified_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_full_metadata_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_route_npm_direct": {
+          "median": 548,
+          "min": 548
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "lpm",
+      "spec": "lpm-current-firewall-report",
+      "cell": "current",
+      "route": "direct",
+      "firewall_mode": "report",
+      "mode": "up-to-date",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 14,
+          "min": 13
+        },
+        "duration_ms": {
+          "median": 5,
+          "min": 5
+        },
+        "resolve_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "link_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_selected_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_dispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_completed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_skipped_platform_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_dispatch_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_undispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_drain_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_calls": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_version_count_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_raw_fetch_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_cache_info_parse_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_version_count_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_not_modified_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_full_metadata_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_route_npm_direct": {
+          "median": 0,
+          "min": 0
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "lpm",
+      "spec": "lpm-current-firewall-report",
+      "cell": "current",
+      "route": "direct",
+      "firewall_mode": "report",
+      "mode": "warm",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 324,
+          "min": 304
+        },
+        "duration_ms": {
+          "median": 279.5,
+          "min": 266
+        },
+        "resolve_ms": {
+          "median": 48,
+          "min": 46
+        },
+        "firewall_batch_ms": {
+          "median": 66.5,
+          "min": 54
+        },
+        "firewall_chunk_count": {
+          "median": 10,
+          "min": 10
+        },
+        "firewall_chunk_sum_ms": {
+          "median": 365,
+          "min": 321
+        },
+        "firewall_chunk_max_ms": {
+          "median": 51,
+          "min": 43
+        },
+        "firewall_checked_count": {
+          "median": 535,
+          "min": 535
+        },
+        "firewall_allow_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_warn_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_block_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_unknown_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_matched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_rpc_failed_count": {
+          "median": 1,
+          "min": 1
+        },
+        "firewall_offline_skipped_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_initial_batch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_followup_rpc_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_followup_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_walker_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_escape_hatch_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_parse_ndjson_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_pubgrub_ms": {
+          "median": 47,
+          "min": 45
+        },
+        "resolve_platform_skipped_count": {
+          "median": 70,
+          "min": 70
+        },
+        "resolve_dispatcher_rpc_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_inflight_high_water": {
+          "median": 152.5,
+          "min": 138
+        },
+        "resolve_dispatcher_tarball_dispatched_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_peer_prefetch_count": {
+          "median": 2,
+          "min": 2
+        },
+        "resolve_streaming_bfs_walk_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_manifests_fetched": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_cache_hits": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_ms": {
+          "median": 28,
+          "min": 22
+        },
+        "link_ms": {
+          "median": 69,
+          "min": 55
+        },
+        "package_count": {
+          "median": 535,
+          "min": 535
+        },
+        "downloaded": {
+          "median": 0,
+          "min": 0
+        },
+        "cached": {
+          "median": 535,
+          "min": 535
+        },
+        "fetch_task_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_task_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_queue_wait_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_extract_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_finalize_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_selected_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_dispatched_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_completed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_cache_hit_count": {
+          "median": 535,
+          "min": 535
+        },
+        "fetch_overlap_skipped_platform_count": {
+          "median": 70,
+          "min": 70
+        },
+        "fetch_overlap_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_dispatch_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_undispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_drain_ms": {
+          "median": 0.5,
+          "min": 0
+        },
+        "metadata_calls": {
+          "median": 548,
+          "min": 548
+        },
+        "metadata_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_version_count_sum": {
+          "median": 55577,
+          "min": 55577
+        },
+        "metadata_raw_fetch_sum_ms": {
+          "median": 1188.5,
+          "min": 864
+        },
+        "metadata_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_cache_info_parse_sum_ms": {
+          "median": 20.5,
+          "min": 17
+        },
+        "metadata_policy_release_time_sum_ms": {
+          "median": 3.5,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_sum_ms": {
+          "median": 2,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_version_count_sum": {
+          "median": 9536,
+          "min": 9536
+        },
+        "metadata_policy_release_time_fetch_cache_hit_count": {
+          "median": 3,
+          "min": 3
+        },
+        "metadata_policy_release_time_fetch_not_modified_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_full_metadata_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_route_npm_direct": {
+          "median": 548,
+          "min": 548
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "lpm",
+      "spec": "lpm-current",
+      "cell": "current",
+      "route": "direct",
+      "firewall_mode": "off",
+      "mode": "cold",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 2945,
+          "min": 2535
+        },
+        "duration_ms": {
+          "median": 2884.5,
+          "min": 2472
+        },
+        "resolve_ms": {
+          "median": 1337.5,
+          "min": 1125
+        },
+        "firewall_batch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_chunk_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_chunk_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_chunk_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_checked_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_allow_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_warn_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_block_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_unknown_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_matched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_rpc_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_offline_skipped_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_initial_batch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_followup_rpc_ms": {
+          "median": 34642,
+          "min": 29456
+        },
+        "resolve_followup_rpc_count": {
+          "median": 551,
+          "min": 551
+        },
+        "resolve_walker_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_escape_hatch_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_parse_ndjson_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_pubgrub_ms": {
+          "median": 1334.5,
+          "min": 1124
+        },
+        "resolve_platform_skipped_count": {
+          "median": 70,
+          "min": 70
+        },
+        "resolve_dispatcher_rpc_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_inflight_high_water": {
+          "median": 209.5,
+          "min": 197
+        },
+        "resolve_dispatcher_tarball_dispatched_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_peer_prefetch_count": {
+          "median": 2,
+          "min": 2
+        },
+        "resolve_streaming_bfs_walk_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_manifests_fetched": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_cache_hits": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_ms": {
+          "median": 1192.5,
+          "min": 894
+        },
+        "link_ms": {
+          "median": 106,
+          "min": 76
+        },
+        "package_count": {
+          "median": 535,
+          "min": 535
+        },
+        "downloaded": {
+          "median": 120,
+          "min": 45
+        },
+        "cached": {
+          "median": 415,
+          "min": 314
+        },
+        "fetch_task_sum_ms": {
+          "median": 40321.5,
+          "min": 6284
+        },
+        "fetch_task_max_ms": {
+          "median": 1141,
+          "min": 816
+        },
+        "fetch_queue_wait_sum_ms": {
+          "median": 40321.5,
+          "min": 6284
+        },
+        "fetch_extract_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_finalize_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_selected_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_dispatched_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_completed_count": {
+          "median": 491.5,
+          "min": 464
+        },
+        "fetch_overlap_cache_hit_count": {
+          "median": 43.5,
+          "min": 38
+        },
+        "fetch_overlap_skipped_platform_count": {
+          "median": 70,
+          "min": 70
+        },
+        "fetch_overlap_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_count": {
+          "median": 64,
+          "min": 64
+        },
+        "fetch_overlap_buffered_dispatch_count": {
+          "median": 64,
+          "min": 64
+        },
+        "fetch_overlap_buffered_undispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_sum_ms": {
+          "median": 3047,
+          "min": 2526
+        },
+        "fetch_overlap_buffer_wait_max_ms": {
+          "median": 92.5,
+          "min": 83
+        },
+        "fetch_overlap_task_sum_ms": {
+          "median": 145741.5,
+          "min": 84804
+        },
+        "fetch_overlap_task_max_ms": {
+          "median": 2223.5,
+          "min": 1654
+        },
+        "fetch_overlap_drain_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_calls": {
+          "median": 548,
+          "min": 548
+        },
+        "metadata_body_mb_sum": {
+          "median": 70.5,
+          "min": 70.5
+        },
+        "metadata_version_count_sum": {
+          "median": 55577,
+          "min": 55577
+        },
+        "metadata_raw_fetch_sum_ms": {
+          "median": 33743.5,
+          "min": 28570
+        },
+        "metadata_http_sum_ms": {
+          "median": 27651.5,
+          "min": 24247
+        },
+        "metadata_body_read_sum_ms": {
+          "median": 4453,
+          "min": 1771
+        },
+        "metadata_json_decode_sum_ms": {
+          "median": 85,
+          "min": 77
+        },
+        "metadata_cache_info_parse_sum_ms": {
+          "median": 23,
+          "min": 18
+        },
+        "metadata_policy_release_time_sum_ms": {
+          "median": 993,
+          "min": 867
+        },
+        "metadata_policy_release_time_fetch_sum_ms": {
+          "median": 991.5,
+          "min": 865
+        },
+        "metadata_policy_release_time_fetch_http_sum_ms": {
+          "median": 171,
+          "min": 112
+        },
+        "metadata_policy_release_time_fetch_body_read_sum_ms": {
+          "median": 777.5,
+          "min": 575
+        },
+        "metadata_policy_release_time_fetch_json_decode_sum_ms": {
+          "median": 25,
+          "min": 21
+        },
+        "metadata_policy_release_time_fetch_body_mb_sum": {
+          "median": 29.5,
+          "min": 29.5
+        },
+        "metadata_policy_release_time_fetch_version_count_sum": {
+          "median": 9536,
+          "min": 9536
+        },
+        "metadata_policy_release_time_fetch_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_not_modified_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_full_metadata_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_route_npm_direct": {
+          "median": 548,
+          "min": 548
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "lpm",
+      "spec": "lpm-current",
+      "cell": "current",
+      "route": "direct",
+      "firewall_mode": "off",
+      "mode": "up-to-date",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 13.5,
+          "min": 12
+        },
+        "duration_ms": {
+          "median": 6,
+          "min": 5
+        },
+        "resolve_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "link_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_selected_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_dispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_completed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_skipped_platform_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_dispatch_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_undispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_drain_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_calls": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_version_count_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_raw_fetch_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_cache_info_parse_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_version_count_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_cache_hit_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_not_modified_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_full_metadata_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_route_npm_direct": {
+          "median": 0,
+          "min": 0
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "lpm",
+      "spec": "lpm-current",
+      "cell": "current",
+      "route": "direct",
+      "firewall_mode": "off",
+      "mode": "warm",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 386.5,
+          "min": 357
+        },
+        "duration_ms": {
+          "median": 343,
+          "min": 313
+        },
+        "resolve_ms": {
+          "median": 51,
+          "min": 43
+        },
+        "firewall_batch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_chunk_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_chunk_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_chunk_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_checked_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_allow_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_warn_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_block_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_unknown_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_matched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_rpc_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "firewall_offline_skipped_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_initial_batch_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_followup_rpc_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_followup_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_walker_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_escape_hatch_rpc_count": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_parse_ndjson_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_pubgrub_ms": {
+          "median": 50,
+          "min": 42
+        },
+        "resolve_platform_skipped_count": {
+          "median": 70,
+          "min": 70
+        },
+        "resolve_dispatcher_rpc_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_inflight_high_water": {
+          "median": 160,
+          "min": 143
+        },
+        "resolve_dispatcher_tarball_dispatched_count": {
+          "median": 548,
+          "min": 548
+        },
+        "resolve_dispatcher_peer_prefetch_count": {
+          "median": 2,
+          "min": 2
+        },
+        "resolve_streaming_bfs_walk_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_manifests_fetched": {
+          "median": 0,
+          "min": 0
+        },
+        "resolve_streaming_bfs_cache_hits": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_ms": {
+          "median": 23.5,
+          "min": 18
+        },
+        "link_ms": {
+          "median": 9.5,
+          "min": 7
+        },
+        "package_count": {
+          "median": 535,
+          "min": 535
+        },
+        "downloaded": {
+          "median": 0,
+          "min": 0
+        },
+        "cached": {
+          "median": 535,
+          "min": 535
+        },
+        "fetch_task_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_task_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_queue_wait_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_extract_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_finalize_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_selected_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_dispatched_count": {
+          "median": 605,
+          "min": 605
+        },
+        "fetch_overlap_completed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_cache_hit_count": {
+          "median": 535,
+          "min": 535
+        },
+        "fetch_overlap_skipped_platform_count": {
+          "median": 70,
+          "min": 70
+        },
+        "fetch_overlap_failed_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffered_count": {
+          "median": 64,
+          "min": 64
+        },
+        "fetch_overlap_buffered_dispatch_count": {
+          "median": 64,
+          "min": 64
+        },
+        "fetch_overlap_buffered_undispatched_count": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_buffer_wait_sum_ms": {
+          "median": 110.5,
+          "min": 79
+        },
+        "fetch_overlap_buffer_wait_max_ms": {
+          "median": 3,
+          "min": 2
+        },
+        "fetch_overlap_task_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_task_max_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "fetch_overlap_drain_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_calls": {
+          "median": 548,
+          "min": 548
+        },
+        "metadata_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_version_count_sum": {
+          "median": 55577,
+          "min": 55577
+        },
+        "metadata_raw_fetch_sum_ms": {
+          "median": 415,
+          "min": 304
+        },
+        "metadata_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_cache_info_parse_sum_ms": {
+          "median": 24,
+          "min": 17
+        },
+        "metadata_policy_release_time_sum_ms": {
+          "median": 1.5,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_http_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_read_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_json_decode_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_body_mb_sum": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_release_time_fetch_version_count_sum": {
+          "median": 9536,
+          "min": 9536
+        },
+        "metadata_policy_release_time_fetch_cache_hit_count": {
+          "median": 3,
+          "min": 3
+        },
+        "metadata_policy_release_time_fetch_not_modified_count": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_policy_full_metadata_sum_ms": {
+          "median": 0,
+          "min": 0
+        },
+        "metadata_route_npm_direct": {
+          "median": 548,
+          "min": 548
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "npm",
+      "spec": "npm",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "cold",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 17353.5,
+          "min": 14902
+        },
+        "warning_count": {
+          "median": 12,
+          "min": 12
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 12,
+          "min": 12
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "npm",
+      "spec": "npm",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "up-to-date",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 281.5,
+          "min": 249
+        },
+        "warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 0,
+          "min": 0
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "npm",
+      "spec": "npm",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "warm",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 3818.5,
+          "min": 3369
+        },
+        "warning_count": {
+          "median": 12,
+          "min": 12
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 12,
+          "min": 12
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "pnpm",
+      "spec": "pnpm",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "cold",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 6124.5,
+          "min": 5120
+        },
+        "warning_count": {
+          "median": 9,
+          "min": 9
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 9,
+          "min": 9
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "pnpm",
+      "spec": "pnpm",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "up-to-date",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 522,
+          "min": 484
+        },
+        "warning_count": {
+          "median": 4,
+          "min": 4
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 4,
+          "min": 4
+        }
+      }
+    },
+    {
+      "fixture": "vitepress",
+      "manager": "pnpm",
+      "spec": "pnpm",
+      "cell": "default",
+      "route": "default",
+      "firewall_mode": "default",
+      "mode": "warm",
+      "samples": 10,
+      "successful_samples": 10,
+      "metrics": {
+        "wall_ms": {
+          "median": 3301,
+          "min": 2951
+        },
+        "warning_count": {
+          "median": 9,
+          "min": 9
+        },
+        "expected_warning_count": {
+          "median": 0,
+          "min": 0
+        },
+        "unexpected_warning_count": {
+          "median": 9,
+          "min": 9
+        }
+      }
+    }
+  ],
+  "data": {
+    "cold": {
+      "npm": 17353.5,
+      "pnpm": 6124.5,
+      "bun": 2454.5,
+      "lpm-current": 2945,
+      "lpm-current-firewall-report": 3043
+    },
+    "warm": {
+      "npm": 3818.5,
+      "pnpm": 3301,
+      "bun": 450.5,
+      "lpm-current": 386.5,
+      "lpm-current-firewall-report": 324
+    },
+    "up-to-date": {
+      "npm": 281.5,
+      "pnpm": 522,
+      "bun": 76.5,
+      "lpm-current": 13.5,
+      "lpm-current-firewall-report": 14
+    }
+  }
+}
