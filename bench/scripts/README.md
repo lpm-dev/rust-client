@@ -167,6 +167,22 @@ ITERATIONS=3 WARMUP_ITERATIONS=1 \
   node bench/scripts/run-bin-benchmark.mjs
 ```
 
+For a headline package-script runner comparison, use the dedicated preset:
+
+```bash
+bench/scripts/run-script-runner-benchmark.sh
+```
+
+That preset measures `lpm run`, `npm run`, `pnpm run`, and `bun run` on the
+`noop` and `node-noop` package scripts. It writes timestamped Markdown and JSON
+artifacts to `bench/perf-results/`. Include the heavier local-bin package-script
+row with:
+
+```bash
+SCENARIOS='^(noop|node-noop|esbuild-version)$' \
+  bench/scripts/run-script-runner-benchmark.sh
+```
+
 Useful knobs:
 
 ```bash
