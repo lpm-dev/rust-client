@@ -11,8 +11,12 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+const TOOLCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const TOOLCHAIN_PROBE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 pub(super) struct BuildCacheScratch {
     path: PathBuf,
@@ -83,7 +87,9 @@ pub(super) struct BuildCacheInvocation {
     runtime: BuildRuntimeFingerprint,
     sandbox: BuildSandboxFingerprint,
     environment: HashMap<String, String>,
-    toolchain_environment: HashMap<String, String>,
+    trusted_toolchain_environment: HashMap<String, String>,
+    build_executable_environment: HashMap<String, String>,
+    project_dir: PathBuf,
     native_toolchain_hash: OnceLock<Option<String>>,
 }
 
@@ -116,18 +122,19 @@ impl BuildCacheInvocation {
             debug_bypass("project widened lifecycle capabilities");
             return None;
         }
-        let Some(runtime) = detect_node_runtime(environment) else {
+        let trusted_toolchain_environment = trusted_toolchain_environment(environment, project_dir);
+        let Some(runtime) = detect_node_runtime(&trusted_toolchain_environment, project_dir) else {
             debug_bypass("Node runtime fingerprint unavailable");
             return None;
         };
         let platform = PlatformTuple::current();
-        let mut toolchain_environment = environment.clone();
+        let mut build_executable_environment = environment.clone();
         let parent_path = environment
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
             .map(|(_, value)| value.as_str());
-        toolchain_environment.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
-        toolchain_environment.insert(
+        build_executable_environment.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+        build_executable_environment.insert(
             "PATH".into(),
             build_lifecycle_path(project_dir, parent_path),
         );
@@ -148,7 +155,9 @@ impl BuildCacheInvocation {
                 allowed_inputs_hash: hash_allowed_inputs(capabilities),
             },
             environment: environment.clone(),
-            toolchain_environment,
+            trusted_toolchain_environment,
+            build_executable_environment,
+            project_dir: project_dir.to_path_buf(),
             native_toolchain_hash: OnceLock::new(),
         })
     }
@@ -366,14 +375,21 @@ pub(super) fn build_key_for_package(
     let toolchain_hash = if native_kind == NativeBuildKind::NativeToolchain {
         let Some(hash) = invocation
             .native_toolchain_hash
-            .get_or_init(|| hash_toolchain(&invocation.toolchain_environment).ok())
+            .get_or_init(|| {
+                hash_toolchain(
+                    &invocation.trusted_toolchain_environment,
+                    &invocation.build_executable_environment,
+                    &invocation.project_dir,
+                )
+                .ok()
+            })
             .clone()
         else {
             debug_bypass("native toolchain fingerprint unavailable");
             return None;
         };
         let invoked_executables =
-            hash_invoked_build_executables(package, &invocation.toolchain_environment);
+            hash_invoked_build_executables(package, &invocation.build_executable_environment);
         hash_records([hash.as_bytes(), invoked_executables.as_bytes()])
     } else {
         "runtime-and-dependency-graph-v1".to_string()
@@ -411,14 +427,20 @@ pub(super) fn read_v2_graph_key_digest(package_dir: &Path) -> Option<String> {
     (node_modules_dir.join(&metadata.name) == package_dir).then_some(metadata.graph_key_digest_hex)
 }
 
-fn detect_node_runtime(environment: &HashMap<String, String>) -> Option<BuildRuntimeFingerprint> {
-    let output = Command::new("node")
-        .arg("-p")
-        .arg("JSON.stringify({version:process.version,modules:process.versions.modules||'',napi:process.versions.napi||'',engine:process.versions.v8||'',execPath:process.execPath})")
-        .env_clear()
-        .envs(environment)
-        .output()
-        .ok()?;
+fn detect_node_runtime(
+    environment: &HashMap<String, String>,
+    project_dir: &Path,
+) -> Option<BuildRuntimeFingerprint> {
+    let executable = resolve_trusted_executable("node", environment, project_dir)?;
+    let probe_environment = toolchain_probe_environment(environment);
+    let output = run_bounded_toolchain_probe(
+        &executable,
+        &[
+            "-p",
+            "JSON.stringify({version:process.version,modules:process.versions.modules||'',napi:process.versions.napi||'',engine:process.versions.v8||'',execPath:process.execPath})",
+        ],
+        &probe_environment,
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -501,7 +523,180 @@ fn hash_environment_pairs(environment: &[(String, String)]) -> String {
     }))
 }
 
-fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<String> {
+fn trusted_toolchain_environment(
+    environment: &HashMap<String, String>,
+    project_dir: &Path,
+) -> HashMap<String, String> {
+    let mut trusted = environment.clone();
+    let inherited_path = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map_or(default_toolchain_path(), |(_, value)| value.as_str());
+    let search_dirs = std::env::split_paths(inherited_path)
+        .filter(|directory| !is_project_controlled_path(directory, project_dir))
+        .collect::<Vec<_>>();
+    let path = std::env::join_paths(search_dirs)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_toolchain_path().into());
+    trusted.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+    trusted.insert("PATH".into(), path.to_string_lossy().into_owned());
+    trusted
+}
+
+fn default_toolchain_path() -> &'static str {
+    #[cfg(unix)]
+    {
+        "/usr/local/bin:/usr/bin:/bin"
+    }
+    #[cfg(windows)]
+    {
+        r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "/usr/bin:/bin"
+    }
+}
+
+fn is_project_controlled_path(path: &Path, project_dir: &Path) -> bool {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+        || path.starts_with(project_dir)
+    {
+        return true;
+    }
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let canonical_project =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    canonical.starts_with(canonical_project)
+        || canonical
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+}
+
+fn resolve_trusted_executable(
+    executable: &str,
+    environment: &HashMap<String, String>,
+    project_dir: &Path,
+) -> Option<PathBuf> {
+    let path = resolve_executable(executable, environment)?;
+    let canonical = std::fs::canonicalize(path).ok()?;
+    (!is_project_controlled_path(&canonical, project_dir)).then_some(canonical)
+}
+
+fn toolchain_probe_environment(
+    trusted_environment: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    // The full lifecycle environment can contain loader/runtime hooks that execute code
+    // before the lifecycle sandbox exists. Probes receive only data-bearing inputs.
+    const PASSTHROUGH: &[&str] = &[
+        "PATH",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+    ];
+    let mut probe_environment = HashMap::with_capacity(PASSTHROUGH.len() + 2);
+    for name in PASSTHROUGH {
+        if let Some((key, value)) = trusted_environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            probe_environment.insert(key.clone(), value.clone());
+        }
+    }
+    probe_environment.insert("LANG".into(), "C".into());
+    probe_environment.insert("LC_ALL".into(), "C".into());
+    probe_environment
+}
+
+fn read_bounded_probe_stream<R: Read>(mut reader: R) -> Vec<u8> {
+    let mut retained = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0_u8; 64 * 1024];
+    while let Ok(read) = reader.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        let remaining = TOOLCHAIN_PROBE_OUTPUT_LIMIT.saturating_sub(retained.len());
+        retained.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+    retained
+}
+
+fn terminate_toolchain_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // SAFETY: the child is placed in a fresh process group immediately before spawn.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+fn run_bounded_toolchain_probe(
+    executable: &Path,
+    args: &[&str],
+    environment: &HashMap<String, String>,
+) -> Option<std::process::Output> {
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        terminate_toolchain_probe(&mut child);
+        let _ = child.wait();
+        return None;
+    };
+    let stdout_reader = std::thread::spawn(move || read_bounded_probe_stream(stdout));
+    let stderr_reader = std::thread::spawn(move || read_bounded_probe_stream(stderr));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < TOOLCHAIN_PROBE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                terminate_toolchain_probe(&mut child);
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return None;
+            }
+        }
+    };
+    let stdout = stdout_reader.join().ok()?;
+    let stderr = stderr_reader.join().ok()?;
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn hash_toolchain(
+    trusted_environment: &HashMap<String, String>,
+    build_environment: &HashMap<String, String>,
+    project_dir: &Path,
+) -> std::io::Result<String> {
     const PROBES: &[(&str, &[&str])] = &[
         ("python3", &["--version"]),
         ("make", &["--version"]),
@@ -539,7 +734,8 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         ("ldd", &["--version"]),
     ];
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-toolchain-v3\0");
+    hasher.update(b"lpm-toolchain-v4\0");
+    let probe_environment = toolchain_probe_environment(trusted_environment);
     let probe_outputs = std::thread::scope(|scope| {
         #[expect(
             clippy::needless_collect,
@@ -548,13 +744,11 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         let handles = PROBES
             .iter()
             .map(|(program, args)| {
+                let probe_environment = &probe_environment;
                 scope.spawn(move || {
-                    Command::new(program)
-                        .args(*args)
-                        .env_clear()
-                        .envs(environment)
-                        .output()
-                        .ok()
+                    let executable =
+                        resolve_trusted_executable(program, trusted_environment, project_dir)?;
+                    run_bounded_toolchain_probe(&executable, args, probe_environment)
                 })
             })
             .collect::<Vec<_>>();
@@ -563,16 +757,28 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
             .map(|handle| handle.join().ok().flatten())
             .collect::<Vec<_>>()
     });
-    for ((program, _), output) in PROBES.iter().zip(probe_outputs) {
+    for ((program, args), output) in PROBES.iter().zip(&probe_outputs) {
         hasher.update(program.as_bytes());
         hasher.update(b"\0");
-        if let Some(output) = output {
-            hasher.update(&output.stdout[..output.stdout.len().min(4 * 1024 * 1024)]);
-            hasher.update(&output.stderr[..output.stderr.len().min(4 * 1024 * 1024)]);
+        for argument in *args {
+            hasher.update(argument.as_bytes());
+            hasher.update(b"\0");
         }
-        if let Some(executable) = resolve_executable(program, environment)
+        if let Some(output) = output {
+            hasher.update(&output.stdout);
+            hasher.update(&output.stderr);
+        }
+        if let Some(executable) =
+            resolve_trusted_executable(program, trusted_environment, project_dir)
             && let Ok(identity) = runtime_executable_identity(&executable)
         {
+            hasher.update(b"trusted\0");
+            hasher.update(identity.as_bytes());
+        }
+        if let Some(executable) = resolve_executable(program, build_environment)
+            && let Ok(identity) = runtime_executable_identity(&executable)
+        {
+            hasher.update(b"build-visible\0");
             hasher.update(identity.as_bytes());
         }
         hasher.update(b"\x1e");
@@ -589,7 +795,18 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         .map(Path::new)
         .collect::<Vec<_>>();
     hash_host_package_state(&host_state_paths, &mut hasher)?;
-    hash_pkg_config_directories(environment, &mut hasher)?;
+    let pkg_config_pc_path =
+        PROBES
+            .iter()
+            .zip(&probe_outputs)
+            .find_map(|((program, args), output)| {
+                (*program == "pkg-config"
+                    && *args == ["--variable=pc_path", "pkg-config"]
+                    && output.as_ref().is_some_and(|value| value.status.success()))
+                .then(|| output.as_ref().map(|value| value.stdout.as_slice()))
+                .flatten()
+            });
+    hash_pkg_config_directories(trusted_environment, pkg_config_pc_path, &mut hasher)?;
     for cellar in [
         Path::new("/opt/homebrew/Cellar"),
         Path::new("/usr/local/Cellar"),
@@ -604,7 +821,7 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
     ] {
         hash_directory_files_with_extension(receipts, "plist", &mut hasher)?;
     }
-    if let Some(home) = environment
+    if let Some(home) = trusted_environment
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("HOME"))
         .map(|(_, value)| PathBuf::from(value))
@@ -648,6 +865,7 @@ fn hash_host_package_state(paths: &[&Path], hasher: &mut Sha256) -> std::io::Res
 
 fn hash_pkg_config_directories(
     environment: &HashMap<String, String>,
+    default_search_path: Option<&[u8]>,
     hasher: &mut Sha256,
 ) -> std::io::Result<()> {
     let mut search_path = environment
@@ -655,17 +873,11 @@ fn hash_pkg_config_directories(
         .find(|(key, _)| key.eq_ignore_ascii_case("PKG_CONFIG_PATH"))
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
-    if let Ok(output) = Command::new("pkg-config")
-        .args(["--variable=pc_path", "pkg-config"])
-        .env_clear()
-        .envs(environment)
-        .output()
-        && output.status.success()
-    {
+    if let Some(default_search_path) = default_search_path {
         if !search_path.is_empty() {
             search_path.push(':');
         }
-        search_path.push_str(String::from_utf8_lossy(&output.stdout).trim());
+        search_path.push_str(String::from_utf8_lossy(default_search_path).trim());
     }
     let mut paths = std::env::split_paths(&search_path).collect::<Vec<_>>();
     paths.sort_unstable();
@@ -1099,25 +1311,94 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn toolchain_hash_changes_when_cmake_executable_changes() {
+    fn toolchain_hash_tracks_project_cmake_without_executing_it() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let bin = temp.path().join("bin");
+        let project = temp.path().join("project");
+        let bin = project.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cmake = bin.join("cmake");
+        let marker = temp.path().join("executed");
+        std::fs::write(
+            &cmake,
+            format!("#!/bin/sh\n: > '{}'\necho cmake-one\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cmake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let build_environment = HashMap::from([
+            ("PATH".to_string(), bin.display().to_string()),
+            ("HOME".to_string(), temp.path().display().to_string()),
+        ]);
+        let trusted_environment = trusted_toolchain_environment(&build_environment, &project);
+        let first = hash_toolchain(&trusted_environment, &build_environment, &project).unwrap();
+        assert!(!marker.exists());
+
+        std::fs::write(
+            &cmake,
+            format!("#!/bin/sh\n: > '{}'\necho cmake-two\n", marker.display()),
+        )
+        .unwrap();
+        let second = hash_toolchain(&trusted_environment, &build_environment, &project).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn toolchain_probe_timeout_bounds_stalled_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let bin = temp.path().join("host-bin");
         std::fs::create_dir(&bin).unwrap();
         let cmake = bin.join("cmake");
-        std::fs::write(&cmake, "#!/bin/sh\necho cmake-one\n").unwrap();
+        std::fs::write(&cmake, "#!/bin/sh\n/bin/sleep 5\n").unwrap();
         std::fs::set_permissions(&cmake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let environment = HashMap::from([
             ("PATH".to_string(), bin.display().to_string()),
             ("HOME".to_string(), temp.path().display().to_string()),
         ]);
-        let first = hash_toolchain(&environment).unwrap();
 
-        std::fs::write(&cmake, "#!/bin/sh\necho cmake-two\n").unwrap();
-        let second = hash_toolchain(&environment).unwrap();
+        let started = std::time::Instant::now();
+        hash_toolchain(&environment, &environment, &project).unwrap();
 
-        assert_ne!(first, second);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn toolchain_probe_reader_discards_output_beyond_limit() {
+        let input = vec![b'x'; TOOLCHAIN_PROBE_OUTPUT_LIMIT + 1024];
+
+        let output = read_bounded_probe_stream(std::io::Cursor::new(input));
+
+        assert_eq!(output.len(), TOOLCHAIN_PROBE_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn toolchain_probe_environment_excludes_code_injection_variables() {
+        let trusted = HashMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                "NODE_OPTIONS".into(),
+                "--require=/project/payload.js".into(),
+            ),
+            ("LD_PRELOAD".into(), "/project/payload.so".into()),
+            (
+                "DYLD_INSERT_LIBRARIES".into(),
+                "/project/payload.dylib".into(),
+            ),
+        ]);
+
+        let probe = toolchain_probe_environment(&trusted);
+
+        assert_eq!(probe.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+        assert!(!probe.contains_key("NODE_OPTIONS"));
+        assert!(!probe.contains_key("LD_PRELOAD"));
+        assert!(!probe.contains_key("DYLD_INSERT_LIBRARIES"));
     }
 
     #[test]

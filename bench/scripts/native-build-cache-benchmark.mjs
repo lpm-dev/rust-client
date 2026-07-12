@@ -8,10 +8,14 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const options = parseArgs(process.argv.slice(2));
+if (options['self-test']) {
+  runSelfTest();
+  process.exit(0);
+}
 const samples = Number(options.samples ?? 10);
 const fixture = path.resolve(
   repoRoot,
-  options.fixture ?? 'bench/audit-fixtures/native/esbuild-prebuilt',
+  options.fixture ?? 'bench/audit-fixtures/native/sharp-image',
 );
 const lpmBin = path.resolve(options['lpm-bin'] ?? path.join(repoRoot, 'target/release/lpm-rs'));
 const timestamp = new Date().toISOString().replaceAll(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
@@ -102,7 +106,7 @@ function measureRebuild(scenario, sample, cwd) {
       `${scenario} failed (${result.status})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     );
   }
-  const envelope = JSON.parse(result.stdout);
+  const envelope = parseJsonEnvelope(result.stdout);
   const expectedHit = scenario.endsWith('_hit');
   if (
     (expectedHit && (envelope.build_cache.hits !== 1 || envelope.build_cache.misses !== 0)) ||
@@ -121,6 +125,27 @@ function measureRebuild(scenario, sample, cwd) {
     max_rss_bytes: result.maxRssBytes,
     build_cache: envelope.build_cache,
   };
+}
+
+function parseJsonEnvelope(stdout) {
+  const lines = stdout.trimEnd().split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!lines[index].trimStart().startsWith('{')) continue;
+    try {
+      const value = JSON.parse(lines.slice(index).join('\n'));
+      if (value && typeof value === 'object' && value.build_cache) return value;
+    } catch {}
+  }
+  throw new Error(`rebuild output did not contain a JSON cache envelope:\n${stdout}`);
+}
+
+function runSelfTest() {
+  const envelope = parseJsonEnvelope(
+    'native lifecycle output\n{\n  "success": true,\n  "build_cache": {"hits": 1}\n}\n',
+  );
+  if (envelope.build_cache.hits !== 1) {
+    throw new Error('JSON envelope parser did not preserve cache metrics');
+  }
 }
 
 function runChecked(args, cwd) {
@@ -286,7 +311,7 @@ function parseArgs(argv) {
     const token = argv[index];
     if (!token.startsWith('--')) throw new Error(`unexpected argument: ${token}`);
     const key = token.slice(2);
-    if (key === 'keep') parsed.keep = true;
+    if (key === 'keep' || key === 'self-test') parsed[key] = true;
     else parsed[key] = argv[++index];
   }
   return parsed;
