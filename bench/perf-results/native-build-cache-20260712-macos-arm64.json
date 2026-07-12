@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-07-12T05:36:38.673Z",
+  "platform": "darwin-arm64",
+  "node": "v22.22.1",
+  "lpm_bin": "target/release/lpm-rs",
+  "fixture": "bench/audit-fixtures/native/esbuild-prebuilt",
+  "samples": 10,
+  "artifact_bytes": 134444,
+  "scenarios": {
+    "cache_disabled": {
+      "wall_ms_median": 114.99,
+      "wall_ms_p95": 417.43,
+      "max_rss_bytes_median": 52248576,
+      "user_cpu_ms_median": 40,
+      "system_cpu_ms_median": 10,
+      "cache_hits": 0,
+      "cache_misses": 0
+    },
+    "cache_miss": {
+      "wall_ms_median": 134.58,
+      "wall_ms_p95": 148.42,
+      "max_rss_bytes_median": 52264960,
+      "user_cpu_ms_median": 50,
+      "system_cpu_ms_median": 20,
+      "cache_hits": 0,
+      "cache_misses": 10
+    },
+    "local_hit": {
+      "wall_ms_median": 29.45,
+      "wall_ms_p95": 51.91,
+      "max_rss_bytes_median": 41500672,
+      "user_cpu_ms_median": 10,
+      "system_cpu_ms_median": 0,
+      "cache_hits": 10,
+      "cache_misses": 0,
+      "lifecycle_ms_avoided": 1028,
+      "speedup_vs_disabled": 3.9,
+      "wall_reduction_percent": 74.39
+    },
+    "ci_warm_store_hit": {
+      "wall_ms_median": 29.19,
+      "wall_ms_p95": 31.29,
+      "max_rss_bytes_median": 41566208,
+      "user_cpu_ms_median": 10,
+      "system_cpu_ms_median": 0,
+      "cache_hits": 10,
+      "cache_misses": 0,
+      "lifecycle_ms_avoided": 1028,
+      "speedup_vs_disabled": 3.94,
+      "wall_reduction_percent": 74.62
+    }
+  }
+}

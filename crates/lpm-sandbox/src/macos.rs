@@ -49,7 +49,11 @@ impl SeatbeltSandbox {
     ) -> Result<Self, SandboxError> {
         let deny_outbound_network = options.deny_outbound_network;
         let profile = match mode {
-            SandboxMode::Enforce => seatbelt::render_profile(&spec, deny_outbound_network)?,
+            SandboxMode::Enforce => seatbelt::render_profile_with_isolation(
+                &spec,
+                deny_outbound_network,
+                options.build_cache_isolation,
+            )?,
             SandboxMode::LogOnly => seatbelt::render_logonly_profile(&spec, deny_outbound_network)?,
             // Disabled never reaches this backend — the factory in
             // [`crate::new_for_platform`] short-circuits to

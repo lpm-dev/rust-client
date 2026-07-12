@@ -65,8 +65,12 @@ pub(super) struct ScriptablePackage {
     /// Now the lookup is correct for every source kind.
     pub(super) wrapper_id: Option<String>,
     pub(super) store_path: std::path::PathBuf,
+    pub(super) pristine_path: std::path::PathBuf,
+    pub(super) source_integrity: String,
+    pub(super) graph_key_digest: Option<String>,
     pub(super) scripts: HashMap<String, String>,
     pub(super) is_built: bool,
+    pub(super) build_marker_key: Option<String>,
     pub(super) is_trusted: bool,
     /// the specific basis on which
     /// `is_trusted` was decided. Preserved so the dry-run output and
@@ -77,6 +81,47 @@ pub(super) struct ScriptablePackage {
     /// most call sites only care about the boolean and splitting the
     /// read avoids threading [`TrustReason`] through downstream code.
     pub(super) trust_reason: TrustReason,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct BuildCacheMetrics {
+    pub(super) eligible: usize,
+    pub(super) hits: usize,
+    pub(super) misses: usize,
+    pub(super) bypassed: usize,
+    pub(super) local_state_hits: usize,
+    pub(super) scripts_avoided: usize,
+    pub(super) restored_bytes: u64,
+    pub(super) lifecycle_ms_avoided: u64,
+    pub(super) preparation_ms: u64,
+    pub(super) key_ms: u64,
+    pub(super) lookup_ms: u64,
+    pub(super) restore_ms: u64,
+    pub(super) rematerialize_ms: u64,
+    pub(super) publish_ms: u64,
+}
+
+impl BuildCacheMetrics {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "eligible": self.eligible,
+            "hits": self.hits,
+            "misses": self.misses,
+            "bypassed": self.bypassed,
+            "local_state_hits": self.local_state_hits,
+            "scripts_avoided": self.scripts_avoided,
+            "restored_bytes": self.restored_bytes,
+            "lifecycle_ms_avoided": self.lifecycle_ms_avoided,
+            "timings_ms": {
+                "preparation": self.preparation_ms,
+                "key": self.key_ms,
+                "lookup": self.lookup_ms,
+                "restore": self.restore_ms,
+                "rematerialize": self.rematerialize_ms,
+                "publish": self.publish_ms,
+            }
+        })
+    }
 }
 
 pub(crate) type RebuildPackageIdentity = (String, String, Option<String>);
@@ -120,11 +165,13 @@ pub(super) fn rebuild_summary_envelope(
     successes: usize,
     failures: usize,
     force_security_floor: bool,
+    build_cache: &BuildCacheMetrics,
 ) -> serde_json::Value {
     let mut json = serde_json::json!({
         "success": failures == 0,
         "built": successes,
         "failed": failures,
+        "build_cache": build_cache.to_json(),
     });
     crate::security_floor::attach_security_posture(&mut json, force_security_floor);
     json

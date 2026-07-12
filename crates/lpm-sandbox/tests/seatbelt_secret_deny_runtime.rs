@@ -53,6 +53,7 @@ fn cat_through_sandbox(project_dir: &Path, path_to_cat: &Path) -> (i32, Vec<u8>,
     let options = SandboxOptions {
         allow_degraded: false,
         deny_outbound_network: false,
+        build_cache_isolation: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");
@@ -227,6 +228,7 @@ fn seatbelt_secret_read_allow_restores_dotenv_at_runtime() {
     let options = SandboxOptions {
         allow_degraded: false,
         deny_outbound_network: false,
+        build_cache_isolation: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");

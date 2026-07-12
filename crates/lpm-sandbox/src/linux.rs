@@ -237,6 +237,7 @@ pub(crate) struct LandlockSandbox {
     spec: SandboxSpec,
     mode: SandboxMode,
     posture: BackendPosture,
+    build_cache_isolation: bool,
 }
 
 impl LandlockSandbox {
@@ -245,6 +246,7 @@ impl LandlockSandbox {
         mode: SandboxMode,
         options: SandboxOptions,
     ) -> Result<Self, SandboxError> {
+        let build_cache_isolation = options.build_cache_isolation;
         match mode {
             SandboxMode::Enforce => {
                 let posture = if options.deny_outbound_network {
@@ -315,6 +317,7 @@ impl LandlockSandbox {
                     spec,
                     mode,
                     posture,
+                    build_cache_isolation,
                 })
             }
             // Landlock has no native observe-only primitive
@@ -425,11 +428,11 @@ impl Sandbox for LandlockSandbox {
         // `landlock_add_rule` via Ruleset::add_rule) happens here in
         // normal multi-threaded context. The child's pre_exec body
         // only touches direct syscalls.
-        let ruleset = build_parent_side_ruleset(&self.spec, &self.posture).map_err(|e| {
-            SandboxError::ProfileRenderFailed {
-                reason: format!("landlock ruleset build failed: {e}"),
-            }
-        })?;
+        let ruleset =
+            build_parent_side_ruleset(&self.spec, &self.posture, self.build_cache_isolation)
+                .map_err(|e| SandboxError::ProfileRenderFailed {
+                    reason: format!("landlock ruleset build failed: {e}"),
+                })?;
 
         // compile the seccomp socket(2) deny filter
         // parent-side. Like the landlock ruleset, all the
@@ -752,6 +755,7 @@ fn probe_landlock_at(abi: ABI, with_network: bool) -> Result<(), RulesetError> {
 fn build_parent_side_ruleset(
     spec: &SandboxSpec,
     posture: &BackendPosture,
+    build_cache_isolation: bool,
 ) -> Result<RulesetCreated, RulesetError> {
     let abi = posture.abi();
     let rw = AccessFs::from_all(abi);
@@ -767,7 +771,9 @@ fn build_parent_side_ruleset(
         builder = builder.handle_access(AccessNet::from_all(abi))?;
     }
     let mut ruleset = builder.create()?;
-    for (path, access) in describe_rules(spec) {
+    for (path, access) in
+        crate::landlock_rules::describe_rules_with_isolation(spec, build_cache_isolation)
+    {
         let fd = match PathFd::new(&path) {
             Ok(fd) => fd,
             Err(e) => {
@@ -976,6 +982,7 @@ mod tests {
         let options = SandboxOptions {
             deny_outbound_network: true,
             allow_degraded: true,
+            build_cache_isolation: false,
         };
         match LandlockSandbox::new(realistic_spec(), SandboxMode::Enforce, options) {
             Ok(sb) => {
@@ -1035,7 +1042,7 @@ mod tests {
                 detected_kernel: "5.15.0-test".to_string(),
             },
         ] {
-            match build_parent_side_ruleset(&spec, &posture) {
+            match build_parent_side_ruleset(&spec, &posture, false) {
                 Ok(_) => {} // ruleset built, missing extra was skipped
                 Err(e) => {
                     // Only acceptable error: the kernel doesn't support

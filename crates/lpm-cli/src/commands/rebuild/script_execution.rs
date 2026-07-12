@@ -55,11 +55,21 @@ pub(super) fn execute_script(
     let path_value = build_lifecycle_path(project_dir, parent_path);
     let mut envs: Vec<(String, String)> = env
         .iter()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("PATH") && !k.eq_ignore_ascii_case("INIT_CWD"))
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("PATH")
+                && !k.eq_ignore_ascii_case("INIT_CWD")
+                && !k.eq_ignore_ascii_case("TMPDIR")
+                && !k.eq_ignore_ascii_case("TMP")
+                && !k.eq_ignore_ascii_case("TEMP")
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
     envs.push(("PATH".to_string(), path_value));
+    let tmp = tmpdir.display().to_string();
+    envs.push(("TMPDIR".to_string(), tmp.clone()));
+    envs.push(("TMP".to_string(), tmp.clone()));
+    envs.push(("TEMP".to_string(), tmp));
 
     let start = std::time::Instant::now();
 

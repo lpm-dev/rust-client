@@ -92,6 +92,10 @@ pub struct PruneSummary {
     /// cutoff. Without reachability we evict islands by LRU, never by the
     /// project walk, so a complete recently-used island is always kept.
     pub compat_islands_orphaned: Vec<PathBuf>,
+    /// Content-addressed lifecycle-build artifacts on disk.
+    pub build_artifacts_total: usize,
+    /// Incomplete or age-expired lifecycle-build artifacts.
+    pub build_artifacts_orphaned: Vec<PathBuf>,
     /// Total bytes that would be / were freed by deleting orphans.
     /// Sum of `link_entries_orphaned` + `object_entries_orphaned` +
     /// `compat_islands_orphaned` directory sizes.
@@ -246,6 +250,15 @@ fn run_locked(
                 ))
             })?;
         }
+        for artifact in &summary.build_artifacts_orphaned {
+            std::fs::remove_dir_all(artifact).map_err(|e| {
+                LpmError::Store(format!(
+                    "cache prune: failed to remove build artifact {}: {e}",
+                    artifact.display()
+                ))
+            })?;
+        }
+        remove_orphaned_build_locks(v2_store)?;
 
         // Sweep deferred global-uninstall tombstones. Errors are
         // surfaced via `summary.tombstone_sweep_error` (and a
@@ -274,6 +287,33 @@ fn run_locked(
     }
 
     Ok(summary)
+}
+
+fn remove_orphaned_build_locks(store: &V2Store) -> Result<(), LpmError> {
+    let entries = match std::fs::read_dir(store.paths().build_locks_root()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if key.len() == 64
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            && !store.paths().builds_root().join(key).is_dir()
+        {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Compute (but don't apply) the prune plan. Pulled out so unit tests
@@ -357,8 +397,11 @@ pub fn compute_prune_plan(
             // independent), so it is safe even with no usable registry.
             let (compat_islands_total, compat_islands_orphaned) =
                 compute_compat_island_orphans(v2_store.paths().compat_root(), max_age);
+            let (build_artifacts_total, build_artifacts_orphaned) =
+                compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age);
             let bytes_freed_or_eligible = compat_islands_orphaned
                 .iter()
+                .chain(&build_artifacts_orphaned)
                 .map(|dir| dir_size(dir).unwrap_or(0))
                 .fold(0u64, u64::saturating_add);
             return Ok(PruneSummary {
@@ -373,6 +416,8 @@ pub fn compute_prune_plan(
                 object_entries_orphaned: Vec::new(),
                 compat_islands_total,
                 compat_islands_orphaned,
+                build_artifacts_total,
+                build_artifacts_orphaned,
                 bytes_freed_or_eligible,
                 tombstones_pending,
                 tombstones_swept: 0,
@@ -514,6 +559,8 @@ pub fn compute_prune_plan(
     //         are a macOS clonefile feature) → the dir is missing → no-op.
     let (compat_islands_total, compat_islands_orphaned) =
         compute_compat_island_orphans(v2_store.paths().compat_root(), max_age);
+    let (build_artifacts_total, build_artifacts_orphaned) =
+        compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age);
 
     let mut bytes_freed_or_eligible = 0u64;
     for dir in &link_entries_orphaned {
@@ -525,6 +572,10 @@ pub fn compute_prune_plan(
             bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
     }
     for dir in &compat_islands_orphaned {
+        bytes_freed_or_eligible =
+            bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+    }
+    for dir in &build_artifacts_orphaned {
         bytes_freed_or_eligible =
             bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
     }
@@ -543,6 +594,8 @@ pub fn compute_prune_plan(
         object_entries_orphaned,
         compat_islands_total,
         compat_islands_orphaned,
+        build_artifacts_total,
+        build_artifacts_orphaned,
         bytes_freed_or_eligible,
         tombstones_pending,
         tombstones_swept: 0,
@@ -683,7 +736,30 @@ fn compute_compat_island_orphans(
     compat_root: &Path,
     max_age: Option<ChronoDuration>,
 ) -> (usize, Vec<PathBuf>) {
-    let read = match std::fs::read_dir(compat_root) {
+    compute_lru_artifact_orphans(
+        compat_root,
+        lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME,
+        max_age,
+    )
+}
+
+fn compute_build_artifact_orphans(
+    builds_root: &Path,
+    max_age: Option<ChronoDuration>,
+) -> (usize, Vec<PathBuf>) {
+    compute_lru_artifact_orphans(
+        builds_root,
+        lpm_store::v2::BUILD_ARTIFACT_COMPLETE_FILENAME,
+        max_age,
+    )
+}
+
+fn compute_lru_artifact_orphans(
+    root: &Path,
+    completion_sentinel: &str,
+    max_age: Option<ChronoDuration>,
+) -> (usize, Vec<PathBuf>) {
+    let read = match std::fs::read_dir(root) {
         Ok(read) => read,
         Err(_) => return (0, Vec::new()),
     };
@@ -696,7 +772,7 @@ fn compute_compat_island_orphans(
         }
         let island = entry.path();
         total += 1;
-        let sentinel = island.join(lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME);
+        let sentinel = island.join(completion_sentinel);
         let Ok(meta) = std::fs::metadata(&sentinel) else {
             orphaned.push(island);
             continue;
@@ -833,6 +909,18 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
             },
         ));
     }
+    if !summary.build_artifacts_orphaned.is_empty() {
+        install_ui::phase(&format!(
+            "{} stale build artifact(s) {} {}",
+            summary.build_artifacts_orphaned.len(),
+            if applied { "evicted" } else { "eligible —" },
+            if applied {
+                String::new()
+            } else {
+                "`lpm cache prune --apply`".to_string()
+            },
+        ));
+    }
     if !applied && summary.link_entries_orphaned.len() <= 20 {
         for dir in &summary.link_entries_orphaned {
             println!(
@@ -849,6 +937,12 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         for dir in &summary.compat_islands_orphaned {
             println!(
                 "  compat island orphan: {}",
+                sanitize_for_terminal(&dir.display().to_string())
+            );
+        }
+        for dir in &summary.build_artifacts_orphaned {
+            println!(
+                "  build artifact orphan: {}",
                 sanitize_for_terminal(&dir.display().to_string())
             );
         }
@@ -881,6 +975,12 @@ fn emit_json(summary: &PruneSummary) {
         "compat_islands_total": summary.compat_islands_total,
         "compat_islands_orphaned": summary
             .compat_islands_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "build_artifacts_total": summary.build_artifacts_total,
+        "build_artifacts_orphaned": summary
+            .build_artifacts_orphaned
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
@@ -1097,6 +1197,91 @@ mod tests {
             compute_compat_island_orphans(&tmp.path().join("nope"), None),
             (0, Vec::new())
         );
+    }
+
+    #[test]
+    fn build_artifact_prune_evicts_incomplete_and_stale_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let builds_root = tmp.path().join("builds");
+        std::fs::create_dir_all(&builds_root).unwrap();
+        let sentinel = lpm_store::v2::BUILD_ARTIFACT_COMPLETE_FILENAME;
+
+        let fresh = builds_root.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join(sentinel), b"").unwrap();
+
+        let incomplete = builds_root.join("incomplete");
+        std::fs::create_dir_all(&incomplete).unwrap();
+
+        let stale = builds_root.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        let stale_sentinel = stale.join(sentinel);
+        std::fs::write(&stale_sentinel, b"").unwrap();
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_sentinel)
+            .unwrap()
+            .set_modified(ten_days_ago)
+            .unwrap();
+
+        let (total, orphans) = compute_build_artifact_orphans(&builds_root, None);
+        assert_eq!(total, 3);
+        assert_eq!(orphans, vec![incomplete.clone()]);
+
+        let (total, mut orphans) =
+            compute_build_artifact_orphans(&builds_root, Some(ChronoDuration::days(7)));
+        assert_eq!(total, 3);
+        orphans.sort();
+        let mut expected = vec![incomplete, stale];
+        expected.sort();
+        assert_eq!(orphans, expected);
+    }
+
+    #[test]
+    fn build_artifact_crash_recovery_applies_without_project_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let store = V2Store::from_lpm_root(&root);
+        let incomplete = store.paths().builds_root().join("incomplete");
+        std::fs::create_dir_all(&incomplete).unwrap();
+        std::fs::write(incomplete.join("partial"), b"partial").unwrap();
+
+        let summary = run_locked(
+            &root,
+            &store,
+            &PruneFlags {
+                apply: true,
+                ..PruneFlags::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(summary.registry_missing);
+        assert_eq!(summary.build_artifacts_orphaned, vec![incomplete.clone()]);
+        assert!(!incomplete.exists());
+    }
+
+    #[test]
+    fn build_lock_cleanup_removes_only_locks_without_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let store = V2Store::from_lpm_root(&root);
+        let orphan_key = "a".repeat(64);
+        let live_key = "b".repeat(64);
+        std::fs::create_dir_all(store.paths().build_locks_root()).unwrap();
+        std::fs::create_dir_all(store.paths().builds_root().join(&live_key)).unwrap();
+        let orphan_lock = store.paths().build_lock_path_for_key(&orphan_key);
+        let live_lock = store.paths().build_lock_path_for_key(&live_key);
+        std::fs::write(&orphan_lock, b"").unwrap();
+        std::fs::write(&live_lock, b"").unwrap();
+
+        remove_orphaned_build_locks(&store).unwrap();
+
+        assert!(!orphan_lock.exists());
+        assert!(live_lock.exists());
     }
 
     #[test]

@@ -712,6 +712,17 @@ where
     body()
 }
 
+/// Acquire and return an exclusive advisory lock handle.
+///
+/// The caller controls the critical-section lifetime by retaining the returned
+/// handle. This is useful when existing control flow contains early returns or
+/// loop `continue` paths that would make a closure-scoped lock cumbersome.
+pub fn acquire_exclusive_lock(
+    lock_path: impl AsRef<Path>,
+) -> Result<ExclusiveLockHandle, LpmError> {
+    acquire_exclusive_with_hint(lock_path.as_ref(), default_wait_hint)
+}
+
 /// Async variant of [`with_exclusive_lock`]. The lock acquisition runs on
 /// a `tokio::task::spawn_blocking` worker so a contended lock doesn't
 /// block the tokio reactor. The acquired handle is held across `body`'s

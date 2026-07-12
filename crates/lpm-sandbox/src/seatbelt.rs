@@ -30,6 +30,14 @@ pub(crate) fn render_profile(
     spec: &SandboxSpec,
     deny_outbound_network: bool,
 ) -> Result<String, SandboxError> {
+    render_profile_with_isolation(spec, deny_outbound_network, false)
+}
+
+pub(crate) fn render_profile_with_isolation(
+    spec: &SandboxSpec,
+    deny_outbound_network: bool,
+    build_cache_isolation: bool,
+) -> Result<String, SandboxError> {
     // Canonicalize base paths so Seatbelt rules match against the
     // same form the kernel uses at enforcement time. macOS symlinks
     // `/var` -> `/private/var`, `/tmp` -> `/private/tmp`, and
@@ -124,7 +132,16 @@ pub(crate) fn render_profile(
     // deny-default profile.
     out.push_str("  (literal \"/\")\n");
     out.push_str(&format!("  (subpath {package_dir})\n"));
-    out.push_str(&format!("  (subpath {project_dir})\n"));
+    if build_cache_isolation {
+        let dependency_root = quoted_path(
+            &package_dependency_root(spec, &canon_package_dir),
+            "package dependency root",
+        )?;
+        out.push_str(&format!("  (subpath {dependency_root})\n"));
+        out.push_str(&format!("  (subpath {home_node_gyp})\n"));
+    } else {
+        out.push_str(&format!("  (subpath {project_dir})\n"));
+    }
     out.push_str("  (subpath \"/usr\")\n");
     out.push_str("  (subpath \"/bin\")\n");
     out.push_str("  (subpath \"/sbin\")\n");
@@ -172,18 +189,22 @@ pub(crate) fn render_profile(
     // form. `/dev/null` is writable so `>/dev/null` redirects work.
     out.push_str("(allow file-write*\n");
     out.push_str(&format!("  (subpath {package_dir})\n"));
-    out.push_str(&format!("  (subpath {project_node_modules})\n"));
-    out.push_str(&format!("  (subpath {project_husky})\n"));
-    out.push_str(&format!("  (subpath {project_lpm})\n"));
-    out.push_str(&format!("  (subpath {home_cache})\n"));
-    out.push_str(&format!("  (subpath {home_node_gyp})\n"));
-    out.push_str(&format!("  (subpath {home_npm})\n"));
-    out.push_str("  (subpath \"/tmp\")\n");
+    if !build_cache_isolation {
+        out.push_str(&format!("  (subpath {project_node_modules})\n"));
+        out.push_str(&format!("  (subpath {project_husky})\n"));
+        out.push_str(&format!("  (subpath {project_lpm})\n"));
+        out.push_str(&format!("  (subpath {home_cache})\n"));
+        out.push_str(&format!("  (subpath {home_node_gyp})\n"));
+        out.push_str(&format!("  (subpath {home_npm})\n"));
+        out.push_str("  (subpath \"/tmp\")\n");
+    }
     out.push_str(&format!("  (subpath {tmpdir})\n"));
     out.push_str("  (literal \"/dev/null\")\n");
     out.push_str("  (literal \"/dev/tty\")\n");
-    for e in &extras {
-        out.push_str(&format!("  (subpath {e})\n"));
+    if !build_cache_isolation {
+        for e in &extras {
+            out.push_str(&format!("  (subpath {e})\n"));
+        }
     }
     out.push_str(")\n");
     out.push('\n');
@@ -245,6 +266,19 @@ pub(crate) fn render_profile(
     out.push_str("(allow iokit-open)\n");
 
     Ok(out)
+}
+
+fn package_dependency_root(spec: &SandboxSpec, canonical_package_dir: &Path) -> PathBuf {
+    let name_depth = spec
+        .package_name
+        .bytes()
+        .filter(|byte| *byte == b'/')
+        .count();
+    canonical_package_dir
+        .ancestors()
+        .nth(name_depth + 1)
+        .unwrap_or(canonical_package_dir)
+        .to_path_buf()
 }
 
 /// Emit the `(deny file-read* ...)` block for well-known secret
@@ -641,6 +675,25 @@ mod tests {
              contain any `(allow network*)` or narrower \
              `(allow network ...)` form: {p}"
         );
+    }
+
+    #[test]
+    fn build_cache_profile_omits_project_and_home_cache_writes() {
+        let s = spec();
+        let profile = render_profile_with_isolation(&s, true, true).unwrap();
+        let write_section = profile
+            .split("(allow file-write*\n")
+            .nth(1)
+            .unwrap()
+            .split("\n)\n")
+            .next()
+            .unwrap();
+
+        assert!(write_section.contains("/lpm-store/prisma@5.22.0"));
+        assert!(write_section.contains("/var/folders/xx/T"));
+        assert!(!write_section.contains(".husky"));
+        assert!(!write_section.contains(".node-gyp"));
+        assert!(!write_section.contains("node_modules"));
     }
 
     #[test]

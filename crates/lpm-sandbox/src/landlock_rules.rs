@@ -95,6 +95,13 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
 /// 2. Free of unsafe `PathFd` opens at rule-description time (those
 ///    happen in the child's pre_exec hook in [`crate::linux`]).
 pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
+    describe_rules_with_isolation(spec, false)
+}
+
+pub(crate) fn describe_rules_with_isolation(
+    spec: &SandboxSpec,
+    build_cache_isolation: bool,
+) -> Vec<(PathBuf, RuleAccess)> {
     let mut rules = Vec::with_capacity(32 + spec.extra_write_dirs.len());
 
     // Read-only system baseline.
@@ -115,7 +122,11 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
     // widening to `store_root` would expose every other package
     // the user has installed. Two remediations exist for that corner:
     // switch to hardlink, or widen reads with an explicit store rule.
-    rules.push((spec.project_dir.clone(), RuleAccess::Read));
+    if build_cache_isolation {
+        rules.push((package_dependency_root(spec), RuleAccess::Read));
+    } else {
+        rules.push((spec.project_dir.clone(), RuleAccess::Read));
+    }
     // NVM-installed toolchain. Only added if the host has a matching
     // dir — [`crate::linux::spawn`] filters missing paths at FD-open
     // time; the description layer stays complete.
@@ -143,13 +154,17 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
     //   would require either a per-tool allowlist or migrating those
     //   tools to LPM-controlled cache directories.
     rules.push((spec.package_dir.clone(), RuleAccess::ReadWrite));
-    rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));
-    rules.push((spec.project_dir.join(".husky"), RuleAccess::ReadWrite));
-    rules.push((spec.project_dir.join(".lpm"), RuleAccess::ReadWrite));
-    rules.push((spec.home_dir.join(".cache"), RuleAccess::ReadWrite));
-    rules.push((spec.home_dir.join(".node-gyp"), RuleAccess::ReadWrite));
-    rules.push((spec.home_dir.join(".npm"), RuleAccess::ReadWrite));
-    rules.push((PathBuf::from("/tmp"), RuleAccess::ReadWrite));
+    if build_cache_isolation {
+        rules.push((spec.home_dir.join(".node-gyp"), RuleAccess::Read));
+    } else {
+        rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));
+        rules.push((spec.project_dir.join(".husky"), RuleAccess::ReadWrite));
+        rules.push((spec.project_dir.join(".lpm"), RuleAccess::ReadWrite));
+        rules.push((spec.home_dir.join(".cache"), RuleAccess::ReadWrite));
+        rules.push((spec.home_dir.join(".node-gyp"), RuleAccess::ReadWrite));
+        rules.push((spec.home_dir.join(".npm"), RuleAccess::ReadWrite));
+        rules.push((PathBuf::from("/tmp"), RuleAccess::ReadWrite));
+    }
     rules.push((spec.tmpdir.clone(), RuleAccess::ReadWrite));
     // `/dev/null` and `/dev/tty` as writable — shells redirect to
     // them constantly. The broader `/dev` Read rule already covers
@@ -161,11 +176,24 @@ pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
 
     // Per-project extras from `package.json > lpm > scripts >
     // sandboxWriteDirs`. Loader guarantees absolute paths.
-    for p in &spec.extra_write_dirs {
-        rules.push((p.clone(), RuleAccess::ReadWrite));
+    if !build_cache_isolation {
+        for p in &spec.extra_write_dirs {
+            rules.push((p.clone(), RuleAccess::ReadWrite));
+        }
     }
 
     rules
+}
+
+fn package_dependency_root(spec: &SandboxSpec) -> PathBuf {
+    let mut root = spec.package_dir.as_path();
+    while let Some(parent) = root.parent() {
+        if root.file_name().is_some_and(|name| name == "node_modules") {
+            return root.to_path_buf();
+        }
+        root = parent;
+    }
+    spec.package_dir.clone()
 }
 
 #[cfg(test)]
@@ -345,6 +373,29 @@ mod tests {
         // trailing-order-dependent layers can rely on the invariant.
         let last = rules.last().unwrap();
         assert_eq!(last.0.as_os_str(), "/home/u/.cache/ms-playwright");
+    }
+
+    #[test]
+    fn build_cache_isolation_keeps_persistent_writes_package_local() {
+        let s = spec();
+        let rules = describe_rules_with_isolation(&s, true);
+
+        assert!(contains_rule(
+            &rules,
+            "/lpm-store/prisma@5.22.0",
+            RuleAccess::ReadWrite
+        ));
+        assert!(contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
+        assert!(!contains_rule(
+            &rules,
+            "/home/u/proj/node_modules",
+            RuleAccess::ReadWrite
+        ));
+        assert!(!contains_rule(
+            &rules,
+            "/home/u/.node-gyp",
+            RuleAccess::ReadWrite
+        ));
     }
 
     #[test]

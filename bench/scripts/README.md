@@ -1,5 +1,19 @@
 # Install benchmark scripts
 
+## Native lifecycle-build cache
+
+Build the release CLI, then compare uncached rebuilds, cache misses, local
+artifact hits, and CI-like fresh-project hits against the native esbuild
+fixture:
+
+```bash
+cargo build --release --locked -p lpm-cli --bin lpm-rs
+node bench/scripts/native-build-cache-benchmark.mjs --samples 10
+```
+
+The harness writes raw rows plus JSON and Markdown summaries under
+`bench/perf-results/native-build-cache-<timestamp>/`.
+
 ## Production-readiness harness
 
 `run-install-readiness.mjs` is the current install-readiness harness. It is

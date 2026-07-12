@@ -1680,6 +1680,7 @@ mod tests {
         let opts = SandboxOptions {
             deny_outbound_network: true,
             allow_degraded: false,
+            build_cache_isolation: false,
         };
         match WindowsSandbox::new(realistic_spec(), SandboxMode::Enforce, opts) {
             Err(SandboxError::UnsupportedPlatform { platform, .. }) => {
@@ -1694,6 +1695,7 @@ mod tests {
         let opts = SandboxOptions {
             deny_outbound_network: true,
             allow_degraded: true,
+            build_cache_isolation: false,
         };
         let sb = WindowsSandbox::new(realistic_spec(), SandboxMode::Enforce, opts)
             .expect("strict + allow_degraded must construct cleanly");
