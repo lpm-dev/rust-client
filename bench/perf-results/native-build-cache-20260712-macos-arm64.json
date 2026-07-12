@@ -1,53 +1,49 @@
 {
-  "generated_at": "2026-07-12T11:27:12.697Z",
+  "generated_at": "2026-07-12T13:19:13.671Z",
   "platform": "darwin-arm64",
   "node": "v22.22.1",
   "lpm_bin": "target/release/lpm-rs",
   "fixture": "bench/audit-fixtures/native/esbuild-prebuilt",
   "samples": 10,
+  "artifact_count": 2,
   "artifact_bytes": 134444,
   "scenarios": {
-    "cache_disabled": {
-      "wall_ms_median": 112.35,
-      "wall_ms_p95": 423.22,
-      "max_rss_bytes_median": 52264960,
-      "user_cpu_ms_median": 40,
-      "system_cpu_ms_median": 10,
-      "cache_hits": 0,
-      "cache_misses": 0
-    },
     "cache_miss": {
-      "wall_ms_median": 137.53,
-      "wall_ms_p95": 147.84,
-      "max_rss_bytes_median": 52264960,
+      "samples": 10,
+      "wall_ms_median": 138.03,
+      "wall_ms_p95": 449.94,
+      "max_rss_bytes_median": 52248576,
       "user_cpu_ms_median": 50,
       "system_cpu_ms_median": 20,
       "cache_hits": 0,
-      "cache_misses": 10
+      "cache_misses": 10,
+      "lifecycle_ms_avoided": 0
     },
     "local_hit": {
-      "wall_ms_median": 29.66,
-      "wall_ms_p95": 31.39,
-      "max_rss_bytes_median": 41517056,
+      "samples": 10,
+      "wall_ms_median": 32.33,
+      "wall_ms_p95": 37.27,
+      "max_rss_bytes_median": 41467904,
       "user_cpu_ms_median": 10,
-      "system_cpu_ms_median": 0,
+      "system_cpu_ms_median": 10,
       "cache_hits": 10,
       "cache_misses": 0,
-      "lifecycle_ms_avoided": 1046,
-      "speedup_vs_disabled": 3.79,
-      "wall_reduction_percent": 73.6
+      "lifecycle_ms_avoided": 1356,
+      "speedup_vs_miss": 4.27,
+      "wall_reduction_percent": 76.58
     },
     "ci_warm_store_hit": {
-      "wall_ms_median": 29.19,
-      "wall_ms_p95": 30.51,
-      "max_rss_bytes_median": 41533440,
+      "samples": 10,
+      "wall_ms_median": 29.5,
+      "wall_ms_p95": 30.12,
+      "max_rss_bytes_median": 41418752,
       "user_cpu_ms_median": 10,
-      "system_cpu_ms_median": 0,
+      "system_cpu_ms_median": 10,
       "cache_hits": 10,
       "cache_misses": 0,
-      "lifecycle_ms_avoided": 1046,
-      "speedup_vs_disabled": 3.85,
-      "wall_reduction_percent": 74.02
+      "lifecycle_ms_avoided": 1053,
+      "speedup_vs_miss": 4.68,
+      "wall_reduction_percent": 78.63
     }
   }
 }

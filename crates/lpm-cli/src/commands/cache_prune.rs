@@ -1345,8 +1345,8 @@ mod tests {
         let orphan_key = "a".repeat(64);
         let live_key = "b".repeat(64);
         std::fs::create_dir_all(store.paths().build_entry_locks_root()).unwrap();
-        let orphan_lock = store.paths().build_entry_lock_path(&orphan_key);
-        let live_lock = store.paths().build_entry_lock_path(&live_key);
+        let orphan_lock = store.paths().build_entry_lock_path(&orphan_key).unwrap();
+        let live_lock = store.paths().build_entry_lock_path(&live_key).unwrap();
         std::fs::write(&orphan_lock, b"").unwrap();
         std::fs::write(format!("{}.writer-intent", orphan_lock.display()), b"").unwrap();
         std::fs::write(format!("{}.writer-queue", orphan_lock.display()), b"").unwrap();

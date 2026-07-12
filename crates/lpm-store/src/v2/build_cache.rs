@@ -92,7 +92,7 @@ pub struct BuildKeyInputs {
     pub runtime: BuildRuntimeFingerprint,
     /// Effective sandbox fingerprint.
     pub sandbox: BuildSandboxFingerprint,
-    /// Digest of explicitly permitted build-environment values.
+    /// Digest of the complete environment exposed to the lifecycle script.
     pub environment_hash: String,
     /// Digest of discoverable compiler, SDK, and build-tool identities.
     pub toolchain_hash: String,
@@ -645,10 +645,23 @@ mod tests {
         let graph_key = "a".repeat(64);
 
         assert_eq!(
-            store.paths().build_entry_lock_path(&graph_key),
+            store.paths().build_entry_lock_path(&graph_key).unwrap(),
             temp.path()
                 .join("store/build-entry-locks")
                 .join(format!("{graph_key}.lock"))
+        );
+    }
+
+    #[test]
+    fn build_entry_lock_path_rejects_traversal_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("store"));
+
+        assert!(
+            store
+                .paths()
+                .build_entry_lock_path("../../outside")
+                .is_err()
         );
     }
 

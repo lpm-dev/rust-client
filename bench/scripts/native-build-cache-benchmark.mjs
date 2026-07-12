@@ -47,24 +47,29 @@ const rows = [];
 try {
   runChecked(['install'], primary);
   for (let sample = 1; sample <= samples; sample += 1) {
-    rematerialize(primary);
-    rows.push(measureRebuild('cache_disabled', sample, primary, false));
-
     fs.rmSync(path.join(lpmHome, 'store/v2/builds'), { recursive: true, force: true });
     rematerialize(primary);
-    rows.push(measureRebuild('cache_miss', sample, primary, true));
+    rows.push(measureRebuild('cache_miss', sample, primary));
 
     rematerialize(primary);
-    rows.push(measureRebuild('local_hit', sample, primary, true));
+    rows.push(measureRebuild('local_hit', sample, primary));
 
-    const ciProject = path.join(tempRoot, `ci-project-${sample}`);
+    const ciProject = path.join(tempRoot, 'ci-project');
+    fs.rmSync(ciProject, { recursive: true, force: true });
     materializeProject(ciProject);
     runChecked(['install'], ciProject);
-    rows.push(measureRebuild('ci_warm_store_hit', sample, ciProject, true));
+    runChecked(['rebuild', '--all', '--strict-sandbox'], ciProject);
+    fs.rmSync(ciProject, { recursive: true, force: true });
+    materializeProject(ciProject);
+    runChecked(['install'], ciProject);
+    rows.push(measureRebuild('ci_warm_store_hit', sample, ciProject));
   }
 
-  const artifactBytes = directorySize(path.join(lpmHome, 'store/v2/builds'));
-  const summary = summarize(rows, artifactBytes);
+  const artifactSizes = childDirectorySizes(path.join(lpmHome, 'store/v2/builds'));
+  if (artifactSizes.length === 0) {
+    throw new Error('benchmark completed without publishing a build artifact');
+  }
+  const summary = summarize(rows, artifactSizes);
   fs.mkdirSync(outputDir, { recursive: true });
   fs.writeFileSync(path.join(outputDir, 'rows.json'), `${JSON.stringify(rows, null, 2)}\n`);
   fs.writeFileSync(path.join(outputDir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
@@ -87,9 +92,8 @@ function rematerialize(projectDir) {
   runChecked(['install', '--force', '--no-frozen-lockfile'], projectDir);
 }
 
-function measureRebuild(scenario, sample, cwd, strict) {
-  const args = ['--json', 'rebuild', '--all'];
-  if (strict) args.push('--strict-sandbox');
+function measureRebuild(scenario, sample, cwd) {
+  const args = ['--json', 'rebuild', '--all', '--strict-sandbox'];
   const started = process.hrtime.bigint();
   const result = runTimed(args, cwd);
   const wallMs = Number(process.hrtime.bigint() - started) / 1e6;
@@ -99,6 +103,15 @@ function measureRebuild(scenario, sample, cwd, strict) {
     );
   }
   const envelope = JSON.parse(result.stdout);
+  const expectedHit = scenario.endsWith('_hit');
+  if (
+    (expectedHit && (envelope.build_cache.hits !== 1 || envelope.build_cache.misses !== 0)) ||
+    (!expectedHit && (envelope.build_cache.hits !== 0 || envelope.build_cache.misses !== 1))
+  ) {
+    throw new Error(
+      `${scenario} produced unexpected cache metrics: ${JSON.stringify(envelope.build_cache)}`,
+    );
+  }
   return {
     scenario,
     sample,
@@ -167,7 +180,7 @@ function runTimed(args, cwd) {
   return { ...result, userCpuMs: null, systemCpuMs: null, maxRssBytes: null };
 }
 
-function summarize(allRows, artifactBytes) {
+function summarize(allRows, artifactSizes) {
   const scenarios = {};
   for (const scenario of [...new Set(allRows.map((row) => row.scenario))]) {
     const selected = allRows.filter((row) => row.scenario === scenario);
@@ -191,9 +204,9 @@ function summarize(allRows, artifactBytes) {
       ),
     };
   }
-  const baseline = scenarios.cache_disabled.wall_ms_median;
+  const baseline = scenarios.cache_miss.wall_ms_median;
   for (const scenario of ['local_hit', 'ci_warm_store_hit']) {
-    scenarios[scenario].speedup_vs_disabled = round(baseline / scenarios[scenario].wall_ms_median);
+    scenarios[scenario].speedup_vs_miss = round(baseline / scenarios[scenario].wall_ms_median);
     scenarios[scenario].wall_reduction_percent = round(
       100 * (1 - scenarios[scenario].wall_ms_median / baseline),
     );
@@ -205,7 +218,8 @@ function summarize(allRows, artifactBytes) {
     lpm_bin: lpmBin,
     fixture: path.relative(repoRoot, fixture),
     samples,
-    artifact_bytes: artifactBytes,
+    artifact_count: artifactSizes.length,
+    artifact_bytes: percentile(artifactSizes.sort((a, b) => a - b), 0.5),
     scenarios,
   };
 }
@@ -217,19 +231,19 @@ function renderMarkdown(summary) {
     `- Platform: ${summary.platform}`,
     `- Fixture: \`${summary.fixture}\``,
     `- Samples per scenario: ${summary.samples}`,
-    `- Build artifact bytes: ${summary.artifact_bytes}`,
+    `- Median build artifact bytes: ${summary.artifact_bytes} (${summary.artifact_count} keys retained)`,
     '',
     '| Scenario | Median wall | p95 wall | Median RSS | Hits | Misses | Speedup |',
     '|---|---:|---:|---:|---:|---:|---:|',
   ];
   for (const [name, value] of Object.entries(summary.scenarios)) {
     lines.push(
-      `| ${name} | ${value.wall_ms_median} ms | ${value.wall_ms_p95} ms | ${value.max_rss_bytes_median ?? 'n/a'} B | ${value.cache_hits} | ${value.cache_misses} | ${value.speedup_vs_disabled ? `${value.speedup_vs_disabled}×` : '—'} |`,
+      `| ${name} | ${value.wall_ms_median} ms | ${value.wall_ms_p95} ms | ${value.max_rss_bytes_median ?? 'n/a'} B | ${value.cache_hits} | ${value.cache_misses} | ${value.speedup_vs_miss ? `${value.speedup_vs_miss}×` : '—'} |`,
     );
   }
   lines.push(
     '',
-    'The disabled and miss scenarios rematerialize pristine dependencies before each sample. Local-hit samples rematerialize the same project; CI-hit samples create a fresh project while retaining the warm LPM store.',
+    'Every measured scenario uses the same strict sandbox. Miss and local-hit samples rematerialize the same project; CI-hit samples recreate a checkout at the same stable path while retaining the warm LPM store.',
   );
   return lines.join('\n');
 }
@@ -252,6 +266,14 @@ function directorySize(root) {
     else if (entry.isFile()) total += fs.statSync(candidate).size;
   }
   return total;
+}
+
+function childDirectorySizes(root) {
+  if (!fs.existsSync(root)) return [];
+  return fs
+    .readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => directorySize(path.join(root, entry.name)));
 }
 
 function round(value) {

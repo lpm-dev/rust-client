@@ -256,9 +256,15 @@ impl StoreV2Paths {
 
     /// Advisory lock path serializing mutation of one v2 graph entry.
     #[inline]
-    pub fn build_entry_lock_path(&self, graph_key_digest: &str) -> PathBuf {
-        self.build_entry_locks_root
-            .join(format!("{graph_key_digest}.lock"))
+    pub fn build_entry_lock_path(&self, graph_key_digest: &str) -> Result<PathBuf, LpmError> {
+        if !crate::v2::link_meta::is_lower_hex_digest(graph_key_digest) {
+            return Err(LpmError::Store(
+                "invalid graph-key digest for build-entry lock".into(),
+            ));
+        }
+        Ok(self
+            .build_entry_locks_root
+            .join(format!("{graph_key_digest}.lock")))
     }
 
     /// `~/.lpm/store/v2/build-entry-locks/` — per-graph-entry advisory locks.

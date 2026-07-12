@@ -1009,6 +1009,7 @@ async fn run_under_store_lock(
     let build_cache_invocation = BuildCacheInvocation::prepare(
         &lockfile,
         &sanitized_env,
+        project_dir,
         sandbox_mode,
         &effective_sandbox_posture,
         &sandbox_options,
@@ -1086,7 +1087,7 @@ async fn run_under_store_lock(
         let key_start = std::time::Instant::now();
         let mut build_key = build_cache_invocation
             .as_ref()
-            .and_then(|invocation| build_key_for_package(invocation, pkg));
+            .and_then(|invocation| build_key_for_package(invocation, pkg, project_dir));
         build_cache_metrics.key_ms += elapsed_millis(key_start.elapsed());
         if build_key.is_some() {
             build_cache_metrics.eligible += 1;
@@ -1095,9 +1096,11 @@ async fn run_under_store_lock(
         }
         let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
         let _build_entry_lock = if let Some(graph_key_digest) = pkg.graph_key_digest.as_deref() {
-            match lpm_common::acquire_exclusive_lock(
-                v2_store.paths().build_entry_lock_path(graph_key_digest),
-            ) {
+            match v2_store
+                .paths()
+                .build_entry_lock_path(graph_key_digest)
+                .and_then(lpm_common::acquire_exclusive_lock)
+            {
                 Ok(lock) => Some(lock),
                 Err(error) => {
                     if !json_output {
@@ -1299,7 +1302,12 @@ async fn run_under_store_lock(
         }
 
         let build_cache_scratch = if build_key.is_some() {
-            match BuildCacheScratch::create(&pkg.store_path) {
+            let scratch = pkg
+                .graph_key_digest
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("package has no v2 graph identity"))
+                .and_then(|digest| BuildCacheScratch::create(&pkg.store_path, digest));
+            match scratch {
                 Ok(scratch) => Some(scratch),
                 Err(error) => {
                     tracing::warn!(

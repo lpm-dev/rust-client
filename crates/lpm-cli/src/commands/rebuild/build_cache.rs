@@ -1,3 +1,4 @@
+use super::script_execution::{build_lifecycle_environment, build_lifecycle_path};
 use super::scripts::ScriptablePackage;
 use crate::capability::CapabilitySet;
 use lpm_sandbox::{SandboxMode, SandboxOptions, SandboxPosture};
@@ -18,12 +19,35 @@ pub(super) struct BuildCacheScratch {
 }
 
 impl BuildCacheScratch {
-    pub(super) fn create(package_dir: &Path) -> std::io::Result<Self> {
-        let link_dir = package_dir
+    fn path_for(package_dir: &Path, graph_key_digest: &str) -> std::io::Result<PathBuf> {
+        let node_modules_dir = package_dir
             .ancestors()
-            .find(|ancestor| ancestor.join(lpm_store::v2::LINK_META_FILENAME).is_file())
-            .ok_or_else(|| std::io::Error::other("package is not inside a v2 link entry"))?;
-        let path = link_dir.join(".lpm-build-tmp");
+            .find(|ancestor| {
+                ancestor
+                    .file_name()
+                    .is_some_and(|name| name == "node_modules")
+            })
+            .ok_or_else(|| std::io::Error::other("package is not inside a node_modules tree"))?;
+        let link_dir = node_modules_dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("package has no v2 link-entry parent"))?;
+        let metadata = lpm_store::v2::LinkMeta::read_from(link_dir)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if metadata.graph_key_digest_hex != graph_key_digest {
+            return Err(std::io::Error::other(
+                "package graph identity does not match its v2 link sidecar",
+            ));
+        }
+        if node_modules_dir.join(&metadata.name) != package_dir {
+            return Err(std::io::Error::other(
+                "package path does not match its v2 link sidecar",
+            ));
+        }
+        Ok(link_dir.join(".lpm-build-tmp"))
+    }
+
+    pub(super) fn create(package_dir: &Path, graph_key_digest: &str) -> std::io::Result<Self> {
+        let path = Self::path_for(package_dir, graph_key_digest)?;
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                 std::fs::remove_dir_all(&path)?;
@@ -58,8 +82,8 @@ pub(super) struct BuildCacheInvocation {
     platform: BuildPlatformFingerprint,
     runtime: BuildRuntimeFingerprint,
     sandbox: BuildSandboxFingerprint,
-    environment_hash: String,
     environment: HashMap<String, String>,
+    toolchain_environment: HashMap<String, String>,
     native_toolchain_hash: OnceLock<Option<String>>,
 }
 
@@ -68,6 +92,7 @@ impl BuildCacheInvocation {
     pub(super) fn prepare(
         lockfile: &lpm_lockfile::Lockfile,
         environment: &HashMap<String, String>,
+        project_dir: &Path,
         sandbox_mode: SandboxMode,
         posture: &SandboxPosture,
         sandbox_options: &SandboxOptions,
@@ -96,6 +121,16 @@ impl BuildCacheInvocation {
             return None;
         };
         let platform = PlatformTuple::current();
+        let mut toolchain_environment = environment.clone();
+        let parent_path = environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.as_str());
+        toolchain_environment.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+        toolchain_environment.insert(
+            "PATH".into(),
+            build_lifecycle_path(project_dir, parent_path),
+        );
         Some(Self {
             dependency_closure_hash: hash_lockfile_graph(lockfile),
             platform: BuildPlatformFingerprint {
@@ -112,8 +147,8 @@ impl BuildCacheInvocation {
                 environment_scrubbed: true,
                 allowed_inputs_hash: hash_allowed_inputs(capabilities),
             },
-            environment_hash: hash_build_environment(environment),
             environment: environment.clone(),
+            toolchain_environment,
             native_toolchain_hash: OnceLock::new(),
         })
     }
@@ -294,6 +329,7 @@ pub(super) fn read_build_marker_key(marker_path: &Path) -> Option<String> {
 pub(super) fn build_key_for_package(
     invocation: &BuildCacheInvocation,
     package: &ScriptablePackage,
+    project_dir: &Path,
 ) -> Option<BuildCacheKey> {
     let Some(graph_key_digest) = package.graph_key_digest.as_ref() else {
         debug_bypass(&format!("{} has no v2 graph identity", package.name));
@@ -306,6 +342,18 @@ pub(super) fn build_key_for_package(
         ));
         return None;
     };
+    let scratch_path = match BuildCacheScratch::path_for(&package.store_path, graph_key_digest) {
+        Ok(path) => path,
+        Err(error) => {
+            debug_bypass(&format!(
+                "{} has invalid v2 build-cache context: {error}",
+                package.name
+            ));
+            return None;
+        }
+    };
+    let lifecycle_environment =
+        build_lifecycle_environment(&invocation.environment, project_dir, &scratch_path);
     let mut scripts = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
     for phase in EXECUTED_INSTALL_PHASES {
         if let Some(command) = package.scripts.get(*phase) {
@@ -318,17 +366,20 @@ pub(super) fn build_key_for_package(
     let toolchain_hash = if native_kind == NativeBuildKind::NativeToolchain {
         let Some(hash) = invocation
             .native_toolchain_hash
-            .get_or_init(|| hash_toolchain(&invocation.environment).ok())
+            .get_or_init(|| hash_toolchain(&invocation.toolchain_environment).ok())
             .clone()
         else {
             debug_bypass("native toolchain fingerprint unavailable");
             return None;
         };
-        hash
+        let invoked_executables =
+            hash_invoked_build_executables(package, &invocation.toolchain_environment);
+        hash_records([hash.as_bytes(), invoked_executables.as_bytes()])
     } else {
         "runtime-and-dependency-graph-v1".to_string()
     };
-    Some(BuildCacheKey::derive(&BuildKeyInputs {
+    let environment_hash = hash_environment_pairs(&lifecycle_environment);
+    let key = BuildCacheKey::derive(&BuildKeyInputs {
         source_integrity: package.source_integrity.clone(),
         graph_key_digest: graph_key_digest.clone(),
         dependency_closure_hash: invocation.dependency_closure_hash.clone(),
@@ -336,9 +387,17 @@ pub(super) fn build_key_for_package(
         platform: invocation.platform.clone(),
         runtime: invocation.runtime.clone(),
         sandbox: invocation.sandbox.clone(),
-        environment_hash: invocation.environment_hash.clone(),
+        environment_hash: environment_hash.clone(),
         toolchain_hash,
-    }))
+    });
+    tracing::debug!(
+        target: "lpm_cli::build_cache",
+        package = %package.name,
+        %environment_hash,
+        build_key = %key.as_str(),
+        "derived native build-cache key"
+    );
+    Some(key)
 }
 
 pub(super) fn read_v2_graph_key_digest(package_dir: &Path) -> Option<String> {
@@ -413,36 +472,29 @@ fn hash_lockfile_graph(lockfile: &lpm_lockfile::Lockfile) -> String {
     hash_records(rows.iter().map(String::as_bytes))
 }
 
+#[cfg(test)]
 fn hash_build_environment(environment: &HashMap<String, String>) -> String {
-    const BUILD_ENVIRONMENT: &[&str] = &[
-        "AR",
-        "CC",
-        "CFLAGS",
-        "CPPFLAGS",
-        "CXX",
-        "CXXFLAGS",
-        "LDFLAGS",
-        "MACOSX_DEPLOYMENT_TARGET",
-        "MAKEFLAGS",
-        "npm_config_arch",
-        "npm_config_build_from_source",
-        "npm_config_devdir",
-        "npm_config_libc",
-        "npm_config_nodedir",
-        "npm_config_node_gyp",
-        "npm_config_runtime",
-        "npm_config_target",
-        "npm_config_target_arch",
-    ];
-    let mut records = Vec::with_capacity(BUILD_ENVIRONMENT.len());
-    for name in BUILD_ENVIRONMENT {
-        let value = environment
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map_or("", |(_, value)| value.as_str());
-        records.push(format!("{name}\0{value}"));
-    }
-    hash_records(records.iter().map(String::as_bytes))
+    let mut records = environment.iter().collect::<Vec<_>>();
+    records.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    hash_records(records.into_iter().map(|(name, value)| {
+        let mut record = String::with_capacity(name.len() + value.len() + 1);
+        record.push_str(name);
+        record.push('\0');
+        record.push_str(value);
+        record
+    }))
+}
+
+fn hash_environment_pairs(environment: &[(String, String)]) -> String {
+    let mut records = environment.iter().collect::<Vec<_>>();
+    records.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    hash_records(records.into_iter().map(|(name, value)| {
+        let mut record = String::with_capacity(name.len() + value.len() + 1);
+        record.push_str(name);
+        record.push('\0');
+        record.push_str(value);
+        record
+    }))
 }
 
 fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<String> {
@@ -457,9 +509,14 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         ("xcrun", &["--show-sdk-version"]),
         ("rustc", &["-vV"]),
         ("cargo", &["-V"]),
+        ("cmake", &["--version"]),
+        ("ninja", &["--version"]),
+        ("uname", &["-a"]),
+        ("sw_vers", &[]),
+        ("ldd", &["--version"]),
     ];
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-toolchain-v1\0");
+    hasher.update(b"lpm-toolchain-v2\0");
     for (program, args) in PROBES {
         hasher.update(program.as_bytes());
         hasher.update(b"\0");
@@ -472,7 +529,19 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
             hasher.update(&output.stdout[..output.stdout.len().min(16 * 1024)]);
             hasher.update(&output.stderr[..output.stderr.len().min(16 * 1024)]);
         }
+        if let Some(executable) = resolve_executable(program, environment)
+            && let Ok(identity) = runtime_executable_identity(&executable)
+        {
+            hasher.update(identity.as_bytes());
+        }
         hasher.update(b"\x1e");
+    }
+    for path in [
+        Path::new("/etc/os-release"),
+        Path::new("/etc/ld.so.cache"),
+        Path::new("/System/Library/CoreServices/SystemVersion.plist"),
+    ] {
+        hash_optional_file(path, &mut hasher)?;
     }
     if let Some(home) = environment
         .iter()
@@ -483,6 +552,71 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         hash_directory_tree(&home.join(".node-gyp"), &mut hasher)?;
     }
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+}
+
+fn hash_optional_file(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    hash_os_path(hasher, path);
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => hasher.update(b"absent"),
+        Err(error) => return Err(error),
+    }
+    hasher.update(b"\x1e");
+    Ok(())
+}
+
+fn hash_invoked_build_executables(
+    package: &ScriptablePackage,
+    environment: &HashMap<String, String>,
+) -> String {
+    let mut identities = Vec::new();
+    for command in package.scripts.values() {
+        let Some(segments) = shell_command_segments(command) else {
+            continue;
+        };
+        for words in segments {
+            let Some(command_index) = words
+                .iter()
+                .position(|word| !is_environment_assignment(word))
+            else {
+                continue;
+            };
+            let executable = &words[command_index];
+            let Some(path) = resolve_executable(executable, environment) else {
+                continue;
+            };
+            if let Ok(identity) = runtime_executable_identity(&path) {
+                identities.push(format!("{executable}\0{identity}"));
+            }
+        }
+    }
+    identities.sort_unstable();
+    hash_records(identities.iter().map(String::as_bytes))
+}
+
+fn resolve_executable(executable: &str, environment: &HashMap<String, String>) -> Option<PathBuf> {
+    let executable_path = Path::new(executable);
+    if executable_path.components().count() > 1 {
+        return executable_path
+            .is_file()
+            .then(|| executable_path.to_path_buf());
+    }
+    let path = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value)?;
+    std::env::split_paths(path)
+        .map(|directory| directory.join(executable))
+        .find(|candidate| candidate.is_file())
 }
 
 fn hash_directory_tree(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
@@ -569,15 +703,20 @@ fn hash_allowed_inputs(capabilities: &CapabilitySet) -> String {
     let records = [
         capabilities.canonical_hash(),
         "package-local-writes".into(),
-        "graph-local-reads".into(),
+        "graph-and-fingerprinted-system-reads".into(),
         "network-denied".into(),
     ];
     hash_records(records.iter().map(String::as_bytes))
 }
 
-fn hash_records<'a>(records: impl IntoIterator<Item = &'a [u8]>) -> String {
+fn hash_records<T, B>(records: T) -> String
+where
+    T: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
     let mut hasher = Sha256::new();
     for record in records {
+        let record = record.as_ref();
         hasher.update((record.len() as u64).to_le_bytes());
         hasher.update(record);
     }
@@ -656,13 +795,36 @@ mod tests {
         lockfile
     }
 
+    fn write_link_meta(link_dir: &Path, package_name: &str) -> String {
+        let inputs = lpm_store::v2::GraphKeyInputs::new(
+            package_name,
+            "1.0.0",
+            lpm_store::v2::PlatformTuple::current(),
+            lpm_store::v2::LinkerModeTag::Isolated,
+        );
+        let key = lpm_store::v2::GraphKey::derive(&inputs);
+        let metadata = lpm_store::v2::LinkMeta::new(
+            &key,
+            "sha512-source",
+            "objects/sha512-source",
+            Vec::new(),
+            std::sync::Arc::new(lpm_store::v2::LinkMetaPlatform {
+                os: std::env::consts::OS.into(),
+                cpu: std::env::consts::ARCH.into(),
+                libc: None,
+            }),
+        );
+        metadata.write_to(link_dir).unwrap();
+        metadata.graph_key_digest_hex
+    }
+
     #[test]
-    fn build_environment_hash_ignores_unrelated_values() {
+    fn build_environment_hash_changes_with_custom_values() {
         let mut first = HashMap::new();
         first.insert("UNRELATED".into(), "one".into());
         let mut second = HashMap::new();
         second.insert("UNRELATED".into(), "two".into());
-        assert_eq!(
+        assert_ne!(
             hash_build_environment(&first),
             hash_build_environment(&second)
         );
@@ -718,6 +880,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn toolchain_hash_changes_when_cmake_executable_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let cmake = bin.join("cmake");
+        std::fs::write(&cmake, "#!/bin/sh\necho cmake-one\n").unwrap();
+        std::fs::set_permissions(&cmake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = HashMap::from([
+            ("PATH".to_string(), bin.display().to_string()),
+            ("HOME".to_string(), temp.path().display().to_string()),
+        ]);
+        let first = hash_toolchain(&environment).unwrap();
+
+        std::fs::write(&cmake, "#!/bin/sh\necho cmake-two\n").unwrap();
+        let second = hash_toolchain(&environment).unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invoked_tool_hash_changes_when_cmake_js_executable_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let cmake_js = bin.join("cmake-js");
+        std::fs::write(&cmake_js, "#!/bin/sh\necho cmake-js-one\n").unwrap();
+        std::fs::set_permissions(&cmake_js, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = HashMap::from([("PATH".to_string(), bin.display().to_string())]);
+        let package = scriptable_package("fixture", "cmake-js compile");
+        let first = hash_invoked_build_executables(&package, &environment);
+
+        std::fs::write(&cmake_js, "#!/bin/sh\necho cmake-js-two\n").unwrap();
+        let second = hash_invoked_build_executables(&package, &environment);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn lockfile_graph_hash_changes_when_dependency_edge_is_rewired() {
         let first = graph_lockfile(&["leaf@1.0.0"], &[]);
         let second = graph_lockfile(&[], &["leaf@1.0.0"]);
@@ -748,18 +954,42 @@ mod tests {
         let link_dir = temp.path().join("links/example");
         let package_dir = link_dir.join("node_modules/example");
         std::fs::create_dir_all(&package_dir).unwrap();
-        std::fs::write(link_dir.join(lpm_store::v2::LINK_META_FILENAME), b"{}").unwrap();
+        let digest = write_link_meta(&link_dir, "example");
 
         let first_path = {
-            let scratch = BuildCacheScratch::create(&package_dir).unwrap();
+            let scratch = BuildCacheScratch::create(&package_dir, &digest).unwrap();
             scratch.path().to_path_buf()
         };
         let second_path = {
-            let scratch = BuildCacheScratch::create(&package_dir).unwrap();
+            let scratch = BuildCacheScratch::create(&package_dir, &digest).unwrap();
             scratch.path().to_path_buf()
         };
 
         assert_eq!(first_path, second_path);
+    }
+
+    #[test]
+    fn build_cache_scratch_supports_scoped_package_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let link_dir = temp.path().join("links/scoped");
+        let package_dir = link_dir.join("node_modules/@scope/example");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        let digest = write_link_meta(&link_dir, "@scope/example");
+
+        let scratch = BuildCacheScratch::create(&package_dir, &digest).unwrap();
+
+        assert_eq!(scratch.path(), link_dir.join(".lpm-build-tmp"));
+    }
+
+    #[test]
+    fn build_cache_scratch_rejects_package_controlled_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_dir = temp.path().join("links/example/node_modules/example");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join(lpm_store::v2::LINK_META_FILENAME), b"{}").unwrap();
+
+        assert!(BuildCacheScratch::create(&package_dir, &"a".repeat(64)).is_err());
+        assert!(!package_dir.join(".lpm-build-tmp").exists());
     }
 
     #[test]
@@ -774,10 +1004,10 @@ mod tests {
         std::fs::create_dir_all(&package_dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("sentinel"), b"keep").unwrap();
-        std::fs::write(link_dir.join(lpm_store::v2::LINK_META_FILENAME), b"{}").unwrap();
+        let digest = write_link_meta(&link_dir, "example");
         symlink(&outside, link_dir.join(".lpm-build-tmp")).unwrap();
 
-        let scratch = BuildCacheScratch::create(&package_dir).unwrap();
+        let scratch = BuildCacheScratch::create(&package_dir, &digest).unwrap();
 
         assert!(outside.join("sentinel").is_file());
         assert_ne!(std::fs::canonicalize(scratch.path()).unwrap(), outside);

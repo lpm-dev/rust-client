@@ -2,9 +2,9 @@
 
 ## Native lifecycle-build cache
 
-Build the release CLI, then compare uncached rebuilds, cache misses, local
-artifact hits, and CI-like fresh-project hits against the native esbuild
-fixture:
+Build the release CLI, then compare strict cache misses, local artifact hits,
+and CI-like stable-path checkout recreation against the native esbuild fixture.
+Every measured scenario uses the same strict sandbox:
 
 ```bash
 cargo build --release --locked -p lpm-cli --bin lpm-rs

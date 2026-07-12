@@ -1,6 +1,6 @@
 //! Workflow coverage for dependency lifecycle-build artifact reuse.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 mod support;
 
@@ -179,6 +179,74 @@ async fn native_lifecycle_output_is_restored_after_pristine_rematerialization() 
             .expect("invalidated rebuild must produce native-output.txt"),
         first_output,
         "a changed build-environment key must invalidate keyed local build state and rerun the lifecycle command"
+    );
+}
+
+#[tokio::test]
+async fn custom_lifecycle_environment_change_invalidates_cached_output() {
+    if !node_available() {
+        eprintln!("skipping: node is required for the native build-cache workflow");
+        return;
+    }
+
+    let registry = MockRegistry::start().await;
+    let script = br#"
+const fs = require('fs');
+fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
+"#;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": PACKAGE_NAME,
+                "version": PACKAGE_VERSION,
+                "scripts": {
+                    "postinstall": "node install.js"
+                }
+            }),
+            &[("install.js", script)],
+        )
+        .await;
+    let project = TempProject::empty(&project_manifest());
+    let install = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("initial install");
+    assert!(install.status.success());
+
+    for value in ["first", "second"] {
+        let rebuild = lpm_with_registry(&project, &registry.url())
+            .args(["--json", "rebuild", "--all", "--strict-sandbox"])
+            .env("LPM_STORE_VERSION", "v2")
+            .env("LPM_NATIVE_TEST_INPUT", value)
+            .output()
+            .expect("native rebuild");
+        assert!(
+            rebuild.status.success(),
+            "rebuild failed for {value}: {}",
+            String::from_utf8_lossy(&rebuild.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&rebuild.stdout).expect("native rebuild stdout must be JSON");
+        assert_eq!(
+            envelope["build_cache"]["misses"],
+            1,
+            "{value} must execute under its own cache key; envelope: {envelope}; stderr: {}",
+            String::from_utf8_lossy(&rebuild.stderr)
+        );
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(installed_package_dir(&project).join("native-output.txt"))
+            .expect("second build output"),
+        "second"
+    );
+    assert_eq!(
+        std::fs::read_dir(project.store_dir().join("v2/builds"))
+            .expect("build artifacts")
+            .count(),
+        2,
+        "each visible custom environment must have a distinct cache key"
     );
 }
 
