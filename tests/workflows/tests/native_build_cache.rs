@@ -251,6 +251,93 @@ fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
 }
 
 #[tokio::test]
+async fn native_toolchain_snapshot_is_reused_across_rebuild_processes() {
+    use std::os::unix::fs::MetadataExt;
+
+    if !node_available() {
+        eprintln!("skipping: node is required for the native build-cache workflow");
+        return;
+    }
+
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "sharp",
+                "version": PACKAGE_VERSION,
+                "scripts": {
+                    "postinstall": "node install/check"
+                }
+            }),
+            &[(
+                "install/check",
+                b"require('fs').writeFileSync('native-output.txt', 'built');",
+            )],
+        )
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "native-toolchain-snapshot-workflow",
+  "version": "1.0.0",
+  "dependencies": {{
+    "sharp": "{PACKAGE_VERSION}"
+  }}
+}}"#
+    ));
+    let install = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("initial install");
+    assert!(
+        install.status.success(),
+        "initial install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let first_rebuild = lpm_with_registry(&project, &registry.url())
+        .args(["rebuild", "--all", "--strict-sandbox"])
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("first native rebuild");
+    assert!(
+        first_rebuild.status.success(),
+        "first rebuild failed: {}",
+        String::from_utf8_lossy(&first_rebuild.stderr)
+    );
+
+    let snapshot_dir = project.cache_dir().join("metadata/native-toolchains/v1");
+    let snapshots = std::fs::read_dir(&snapshot_dir)
+        .expect("native toolchain snapshot directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 1);
+    let inode_after_first_rebuild = std::fs::metadata(&snapshots[0]).unwrap().ino();
+
+    let second_rebuild = lpm_with_registry(&project, &registry.url())
+        .args(["rebuild", "--all", "--strict-sandbox"])
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("second native rebuild");
+    assert!(
+        second_rebuild.status.success(),
+        "second rebuild failed: {}",
+        String::from_utf8_lossy(&second_rebuild.stderr)
+    );
+
+    assert_eq!(
+        std::fs::metadata(&snapshots[0]).unwrap().ino(),
+        inode_after_first_rebuild,
+        "an unchanged host snapshot must be read without being replaced"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_native_rebuilds_execute_one_lifecycle_build_per_key() {
     if !node_available() {
         eprintln!("skipping: node is required for the native build-cache workflow");

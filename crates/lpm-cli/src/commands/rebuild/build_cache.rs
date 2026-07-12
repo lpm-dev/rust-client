@@ -1,3 +1,6 @@
+use self::toolchain_snapshot::{
+    ComputedToolchainFingerprint, ToolchainFingerprintCache, cached_toolchain_fingerprint,
+};
 use super::script_execution::{build_lifecycle_environment, build_lifecycle_path};
 use super::scripts::ScriptablePackage;
 use crate::capability::CapabilitySet;
@@ -15,9 +18,48 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+mod toolchain_snapshot;
+
 const TOOLCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const TOOLCHAIN_PROBE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const RUNTIME_ONLY_TOOLCHAIN_FINGERPRINT: &str = "runtime-and-dependency-graph-v2";
+
+const TOOLCHAIN_PROBES: &[(&str, &[&str])] = &[
+    ("python3", &["--version"]),
+    ("make", &["--version"]),
+    ("cc", &["--version"]),
+    ("cc", &["-print-sysroot"]),
+    ("cc", &["-print-search-dirs"]),
+    ("c++", &["--version"]),
+    ("c++", &["-print-sysroot"]),
+    ("c++", &["-print-search-dirs"]),
+    ("clang", &["--version"]),
+    ("ld", &["-v"]),
+    ("xcrun", &["--show-sdk-path"]),
+    ("xcrun", &["--show-sdk-version"]),
+    ("rustc", &["-vV"]),
+    ("cargo", &["-V"]),
+    ("cmake", &["--version"]),
+    ("ninja", &["--version"]),
+    ("pkg-config", &["--version"]),
+    ("pkg-config", &["--variable=pc_path", "pkg-config"]),
+    ("pkg-config", &["--list-all"]),
+    (
+        "dpkg-query",
+        &["-W", "-f=${Package}\t${Version}\t${Architecture}\\n"],
+    ),
+    (
+        "rpm",
+        &["-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\\n"],
+    ),
+    ("pacman", &["-Q"]),
+    ("apk", &["info", "-vv"]),
+    ("pkgutil", &["--pkgs"]),
+    ("xcodebuild", &["-version"]),
+    ("uname", &["-a"]),
+    ("sw_vers", &[]),
+    ("ldd", &["--version"]),
+];
 
 pub(super) struct BuildCacheScratch {
     path: PathBuf,
@@ -91,6 +133,7 @@ pub(super) struct BuildCacheInvocation {
     trusted_toolchain_environment: HashMap<String, String>,
     build_executable_environment: HashMap<String, String>,
     project_dir: PathBuf,
+    toolchain_cache: Option<ToolchainFingerprintCache>,
     native_toolchain_hash: OnceLock<Option<String>>,
 }
 
@@ -159,6 +202,9 @@ impl BuildCacheInvocation {
             trusted_toolchain_environment,
             build_executable_environment,
             project_dir: project_dir.to_path_buf(),
+            toolchain_cache: lpm_common::LpmRoot::from_env()
+                .ok()
+                .map(ToolchainFingerprintCache::from_lpm_root),
             native_toolchain_hash: OnceLock::new(),
         })
     }
@@ -381,10 +427,11 @@ pub(super) fn build_key_for_package(
         let Some(hash) = invocation
             .native_toolchain_hash
             .get_or_init(|| {
-                hash_toolchain(
+                hash_toolchain_cached(
                     &invocation.trusted_toolchain_environment,
                     &invocation.build_executable_environment,
                     &invocation.project_dir,
+                    invocation.toolchain_cache.as_ref(),
                 )
                 .ok()
             })
@@ -590,9 +637,10 @@ fn is_project_controlled_path(path: &Path, project_dir: &Path) -> bool {
             .any(|component| component.as_os_str() == "node_modules")
 }
 
+#[derive(Clone)]
 struct TrustedExecutable {
     invocation_path: PathBuf,
-    canonical_target: PathBuf,
+    identity: String,
 }
 
 fn resolve_trusted_executable(
@@ -602,11 +650,14 @@ fn resolve_trusted_executable(
 ) -> Option<TrustedExecutable> {
     let invocation_path = resolve_executable(executable, environment)?;
     let canonical_target = std::fs::canonicalize(&invocation_path).ok()?;
-    (!is_project_controlled_path(&invocation_path, project_dir)
-        && !is_project_controlled_path(&canonical_target, project_dir))
-    .then_some(TrustedExecutable {
+    if is_project_controlled_path(&invocation_path, project_dir)
+        || is_project_controlled_path(&canonical_target, project_dir)
+    {
+        return None;
+    }
+    Some(TrustedExecutable {
         invocation_path,
-        canonical_target,
+        identity: runtime_executable_identity(&canonical_target).ok()?,
     })
 }
 
@@ -726,62 +777,141 @@ fn run_bounded_toolchain_probe(
     })
 }
 
+#[cfg(test)]
 fn hash_toolchain(
     trusted_environment: &HashMap<String, String>,
     build_environment: &HashMap<String, String>,
     project_dir: &Path,
 ) -> std::io::Result<String> {
-    const PROBES: &[(&str, &[&str])] = &[
-        ("python3", &["--version"]),
-        ("make", &["--version"]),
-        ("cc", &["--version"]),
-        ("cc", &["-print-sysroot"]),
-        ("cc", &["-print-search-dirs"]),
-        ("c++", &["--version"]),
-        ("c++", &["-print-sysroot"]),
-        ("c++", &["-print-search-dirs"]),
-        ("clang", &["--version"]),
-        ("ld", &["-v"]),
-        ("xcrun", &["--show-sdk-path"]),
-        ("xcrun", &["--show-sdk-version"]),
-        ("rustc", &["-vV"]),
-        ("cargo", &["-V"]),
-        ("cmake", &["--version"]),
-        ("ninja", &["--version"]),
-        ("pkg-config", &["--version"]),
-        ("pkg-config", &["--variable=pc_path", "pkg-config"]),
-        ("pkg-config", &["--list-all"]),
-        (
-            "dpkg-query",
-            &["-W", "-f=${Package}\t${Version}\t${Architecture}\\n"],
-        ),
-        (
-            "rpm",
-            &["-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\\n"],
-        ),
-        ("pacman", &["-Q"]),
-        ("apk", &["info", "-vv"]),
-        ("pkgutil", &["--pkgs"]),
-        ("xcodebuild", &["-version"]),
-        ("uname", &["-a"]),
-        ("sw_vers", &[]),
-        ("ldd", &["--version"]),
-    ];
+    hash_toolchain_cached(trusted_environment, build_environment, project_dir, None)
+}
+
+fn hash_toolchain_cached(
+    trusted_environment: &HashMap<String, String>,
+    build_environment: &HashMap<String, String>,
+    project_dir: &Path,
+    cache: Option<&ToolchainFingerprintCache>,
+) -> std::io::Result<String> {
+    let mut resolved = HashMap::with_capacity(TOOLCHAIN_PROBES.len());
+    let trusted_executables = TOOLCHAIN_PROBES
+        .iter()
+        .map(|(program, _)| {
+            resolved
+                .entry(*program)
+                .or_insert_with(|| {
+                    resolve_trusted_executable(program, trusted_environment, project_dir)
+                })
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let base_key =
+        toolchain_snapshot_base_key(trusted_environment, &trusted_executables, project_dir);
+    let mut compute = || compute_toolchain_fingerprint(trusted_environment, &trusted_executables);
+    let host_fingerprint = match cache {
+        Some(cache) => cached_toolchain_fingerprint(
+            cache,
+            &base_key,
+            trusted_environment,
+            project_dir,
+            &mut compute,
+        )?,
+        None => compute()?.fingerprint,
+    };
+    let build_visible_fingerprint = hash_build_visible_toolchain_executables(build_environment);
+    Ok(hash_records([
+        host_fingerprint.as_bytes(),
+        build_visible_fingerprint.as_bytes(),
+    ]))
+}
+
+fn toolchain_snapshot_base_key(
+    trusted_environment: &HashMap<String, String>,
+    trusted_executables: &[Option<TrustedExecutable>],
+    project_dir: &Path,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-toolchain-v5\0");
+    hasher.update(b"lpm-toolchain-snapshot-base-v1\0");
+    hasher.update(std::env::consts::OS.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"\0");
+    let probe_environment = toolchain_probe_environment(trusted_environment);
+    hasher.update(hash_string_map(&probe_environment).as_bytes());
+    if let Some(home) = trusted_environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("HOME"))
+        .map(|(_, value)| value)
+    {
+        hash_os_path(&mut hasher, Path::new(home));
+    }
+    for (index, ((program, args), executable)) in
+        TOOLCHAIN_PROBES.iter().zip(trusted_executables).enumerate()
+    {
+        hasher.update(index.to_le_bytes());
+        hasher.update(program.as_bytes());
+        for argument in *args {
+            hasher.update(b"\0");
+            hasher.update(argument.as_bytes());
+        }
+        if let Some(executable) = executable
+            && !is_project_controlled_path(&executable.invocation_path, project_dir)
+        {
+            hash_os_path(&mut hasher, &executable.invocation_path);
+            hasher.update(executable.identity.as_bytes());
+        }
+        hasher.update(b"\x1e");
+    }
+    format!("sha256-{}", hex::encode(hasher.finalize()))
+}
+
+fn hash_build_visible_toolchain_executables(build_environment: &HashMap<String, String>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-build-visible-toolchain-v1\0");
+    let mut identities = HashMap::with_capacity(TOOLCHAIN_PROBES.len());
+    for (program, args) in TOOLCHAIN_PROBES {
+        hasher.update(program.as_bytes());
+        for argument in *args {
+            hasher.update(b"\0");
+            hasher.update(argument.as_bytes());
+        }
+        if let Some((executable, identity)) = identities
+            .entry(*program)
+            .or_insert_with(|| {
+                let executable = resolve_executable(program, build_environment)?;
+                let identity = runtime_executable_identity(&executable).ok()?;
+                Some((executable, identity))
+            })
+            .as_ref()
+        {
+            hash_os_path(&mut hasher, executable);
+            hasher.update(identity.as_bytes());
+        }
+        hasher.update(b"\x1e");
+    }
+    format!("sha256-{}", hex::encode(hasher.finalize()))
+}
+
+fn compute_toolchain_fingerprint(
+    trusted_environment: &HashMap<String, String>,
+    trusted_executables: &[Option<TrustedExecutable>],
+) -> std::io::Result<ComputedToolchainFingerprint> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-toolchain-host-v6\0");
     let probe_environment = toolchain_probe_environment(trusted_environment);
     let probe_outputs = std::thread::scope(|scope| {
         #[expect(
             clippy::needless_collect,
             reason = "all probes must start before any join blocks"
         )]
-        let handles = PROBES
+        let handles = TOOLCHAIN_PROBES
             .iter()
-            .map(|(program, args)| {
+            .zip(trusted_executables)
+            .map(|((_, args), executable)| {
                 let probe_environment = &probe_environment;
                 scope.spawn(move || {
-                    let executable =
-                        resolve_trusted_executable(program, trusted_environment, project_dir)?;
+                    let executable = executable.as_ref()?;
                     run_bounded_toolchain_probe(
                         &executable.invocation_path,
                         args,
@@ -795,7 +925,11 @@ fn hash_toolchain(
             .map(|handle| handle.join().ok().flatten())
             .collect::<Vec<_>>()
     });
-    for ((program, args), output) in PROBES.iter().zip(&probe_outputs) {
+    for (((program, args), executable), output) in TOOLCHAIN_PROBES
+        .iter()
+        .zip(trusted_executables)
+        .zip(&probe_outputs)
+    {
         hasher.update(program.as_bytes());
         hasher.update(b"\0");
         for argument in *args {
@@ -806,19 +940,10 @@ fn hash_toolchain(
             hasher.update(&output.stdout);
             hasher.update(&output.stderr);
         }
-        if let Some(executable) =
-            resolve_trusted_executable(program, trusted_environment, project_dir)
-            && let Ok(identity) = runtime_executable_identity(&executable.canonical_target)
-        {
+        if let Some(executable) = executable {
             hasher.update(b"trusted\0");
             hash_os_path(&mut hasher, &executable.invocation_path);
-            hasher.update(identity.as_bytes());
-        }
-        if let Some(executable) = resolve_executable(program, build_environment)
-            && let Ok(identity) = runtime_executable_identity(&executable)
-        {
-            hasher.update(b"build-visible\0");
-            hasher.update(identity.as_bytes());
+            hasher.update(executable.identity.as_bytes());
         }
         hasher.update(b"\x1e");
     }
@@ -835,7 +960,7 @@ fn hash_toolchain(
         .collect::<Vec<_>>();
     hash_host_package_state(&host_state_paths, &mut hasher)?;
     let pkg_config_pc_path =
-        PROBES
+        TOOLCHAIN_PROBES
             .iter()
             .zip(&probe_outputs)
             .find_map(|((program, args), output)| {
@@ -845,7 +970,8 @@ fn hash_toolchain(
                 .then(|| output.as_ref().map(|value| value.stdout.as_slice()))
                 .flatten()
             });
-    hash_pkg_config_directories(trusted_environment, pkg_config_pc_path, &mut hasher)?;
+    let pkg_config_paths = pkg_config_search_paths(trusted_environment, pkg_config_pc_path);
+    hash_pkg_config_directories(&pkg_config_paths, &mut hasher)?;
     for cellar in [
         Path::new("/opt/homebrew/Cellar"),
         Path::new("/usr/local/Cellar"),
@@ -868,7 +994,22 @@ fn hash_toolchain(
     {
         hash_directory_tree(&home.join(".node-gyp"), &mut hasher)?;
     }
-    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+    Ok(ComputedToolchainFingerprint {
+        fingerprint: format!("sha256-{}", hex::encode(hasher.finalize())),
+        pkg_config_paths,
+    })
+}
+
+fn hash_string_map(values: &HashMap<String, String>) -> String {
+    let mut values = values.iter().collect::<Vec<_>>();
+    values.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    hash_records(values.into_iter().map(|(key, value)| {
+        let mut record = String::with_capacity(key.len() + value.len() + 1);
+        record.push_str(key);
+        record.push('\0');
+        record.push_str(value);
+        record
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -902,11 +1043,10 @@ fn hash_host_package_state(paths: &[&Path], hasher: &mut Sha256) -> std::io::Res
     Ok(())
 }
 
-fn hash_pkg_config_directories(
+fn pkg_config_search_paths(
     environment: &HashMap<String, String>,
     default_search_path: Option<&[u8]>,
-    hasher: &mut Sha256,
-) -> std::io::Result<()> {
+) -> Vec<PathBuf> {
     let mut search_path = environment
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("PKG_CONFIG_PATH"))
@@ -918,11 +1058,17 @@ fn hash_pkg_config_directories(
         }
         search_path.push_str(String::from_utf8_lossy(default_search_path).trim());
     }
-    let mut paths = std::env::split_paths(&search_path).collect::<Vec<_>>();
+    let mut paths = std::env::split_paths(&search_path)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
     paths.sort_unstable();
     paths.dedup();
+    paths
+}
+
+fn hash_pkg_config_directories(paths: &[PathBuf], hasher: &mut Sha256) -> std::io::Result<()> {
     for path in paths {
-        hash_directory_tree(&path, hasher)?;
+        hash_directory_tree(path, hasher)?;
     }
     Ok(())
 }
@@ -1368,6 +1514,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn persisted_toolchain_snapshot_skips_unchanged_trusted_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let host_bin = temp.path().join("host-bin");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&host_bin).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let marker = temp.path().join("cmake-probes");
+        let cmake = host_bin.join("cmake");
+        std::fs::write(
+            &cmake,
+            format!(
+                "#!/bin/sh\nprintf 'probe\\n' >> '{}'\necho cmake-one\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cmake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = HashMap::from([
+            ("PATH".to_string(), host_bin.display().to_string()),
+            ("HOME".to_string(), home.display().to_string()),
+        ]);
+        let cache = ToolchainFingerprintCache::for_test(temp.path().join("cache"));
+
+        let first =
+            hash_toolchain_cached(&environment, &environment, &project, Some(&cache)).unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
+        let second =
+            hash_toolchain_cached(&environment, &environment, &project, Some(&cache)).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "probe\n");
+    }
+
+    #[test]
     fn homebrew_state_hash_changes_when_install_receipt_changes() {
         let temp = tempfile::tempdir().unwrap();
         let version = temp.path().join("example/1.0.0");
@@ -1567,6 +1752,7 @@ mod tests {
             trusted_toolchain_environment: trusted_environment,
             build_executable_environment,
             project_dir: project.clone(),
+            toolchain_cache: None,
             native_toolchain_hash: OnceLock::new(),
         };
         let mut package = scriptable_package("esbuild", "node install.js");
