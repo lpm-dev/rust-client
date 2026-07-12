@@ -424,7 +424,8 @@ mod tests {
         std::fs::create_dir(&tracked).unwrap();
         std::fs::write(tracked.join("native.pc"), b"Version: 1\n").unwrap();
         let environment = environment(&temp);
-        let cache = ToolchainFingerprintCache::for_test(temp.path().join("cache"));
+        let cache_dir = temp.path().join("cache");
+        let first_cache = ToolchainFingerprintCache::for_test(cache_dir.clone());
         let base_key = format!("sha256-{}", "b".repeat(64));
         let computations = Cell::new(0_u32);
         let mut compute = || {
@@ -435,12 +436,23 @@ mod tests {
             })
         };
 
-        let first =
-            cached_toolchain_fingerprint(&cache, &base_key, &environment, &project, &mut compute)
-                .unwrap();
-        let second =
-            cached_toolchain_fingerprint(&cache, &base_key, &environment, &project, &mut compute)
-                .unwrap();
+        let first = cached_toolchain_fingerprint(
+            &first_cache,
+            &base_key,
+            &environment,
+            &project,
+            &mut compute,
+        )
+        .unwrap();
+        let second_cache = ToolchainFingerprintCache::for_test(cache_dir);
+        let second = cached_toolchain_fingerprint(
+            &second_cache,
+            &base_key,
+            &environment,
+            &project,
+            &mut compute,
+        )
+        .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(computations.get(), 1);
