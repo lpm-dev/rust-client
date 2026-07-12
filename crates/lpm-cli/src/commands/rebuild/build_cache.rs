@@ -372,6 +372,10 @@ pub(super) fn build_key_for_package(
             });
         }
     }
+    if !build_visible_node_matches_trusted(invocation) {
+        debug_bypass("build-visible Node does not match the trusted runtime");
+        return None;
+    }
     let toolchain_hash = if native_kind == NativeBuildKind::NativeToolchain {
         let Some(hash) = invocation
             .native_toolchain_hash
@@ -416,6 +420,12 @@ pub(super) fn build_key_for_package(
     Some(key)
 }
 
+fn build_visible_node_matches_trusted(invocation: &BuildCacheInvocation) -> bool {
+    let trusted = resolve_executable("node", &invocation.trusted_toolchain_environment);
+    let build_visible = resolve_executable("node", &invocation.build_executable_environment);
+    trusted.is_some() && trusted == build_visible
+}
+
 pub(super) fn read_v2_graph_key_digest(package_dir: &Path) -> Option<String> {
     let node_modules_dir = package_dir.ancestors().find(|ancestor| {
         ancestor
@@ -434,7 +444,7 @@ fn detect_node_runtime(
     let executable = resolve_trusted_executable("node", environment, project_dir)?;
     let probe_environment = toolchain_probe_environment(environment);
     let output = run_bounded_toolchain_probe(
-        &executable,
+        &executable.invocation_path,
         &[
             "-p",
             "JSON.stringify({version:process.version,modules:process.versions.modules||'',napi:process.versions.napi||'',engine:process.versions.v8||'',execPath:process.execPath})",
@@ -579,14 +589,24 @@ fn is_project_controlled_path(path: &Path, project_dir: &Path) -> bool {
             .any(|component| component.as_os_str() == "node_modules")
 }
 
+struct TrustedExecutable {
+    invocation_path: PathBuf,
+    canonical_target: PathBuf,
+}
+
 fn resolve_trusted_executable(
     executable: &str,
     environment: &HashMap<String, String>,
     project_dir: &Path,
-) -> Option<PathBuf> {
-    let path = resolve_executable(executable, environment)?;
-    let canonical = std::fs::canonicalize(path).ok()?;
-    (!is_project_controlled_path(&canonical, project_dir)).then_some(canonical)
+) -> Option<TrustedExecutable> {
+    let invocation_path = resolve_executable(executable, environment)?;
+    let canonical_target = std::fs::canonicalize(&invocation_path).ok()?;
+    (!is_project_controlled_path(&invocation_path, project_dir)
+        && !is_project_controlled_path(&canonical_target, project_dir))
+    .then_some(TrustedExecutable {
+        invocation_path,
+        canonical_target,
+    })
 }
 
 fn toolchain_probe_environment(
@@ -657,6 +677,7 @@ fn run_bounded_toolchain_probe(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        command.current_dir("/");
         command.process_group(0);
     }
     let mut child = command.spawn().ok()?;
@@ -668,25 +689,37 @@ fn run_bounded_toolchain_probe(
     let stdout_reader = std::thread::spawn(move || read_bounded_probe_stream(stdout));
     let stderr_reader = std::thread::spawn(move || read_bounded_probe_stream(stderr));
     let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < TOOLCHAIN_PROBE_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) | Err(_) => {
-                terminate_toolchain_probe(&mut child);
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return None;
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => status = Some(exit_status),
+                Ok(None) => {}
+                Err(_) => {
+                    terminate_toolchain_probe(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return None;
+                }
             }
         }
-    };
+        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+            break;
+        }
+        if started.elapsed() >= TOOLCHAIN_PROBE_TIMEOUT {
+            terminate_toolchain_probe(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let stdout = stdout_reader.join().ok()?;
     let stderr = stderr_reader.join().ok()?;
     Some(std::process::Output {
-        status,
+        status: status?,
         stdout,
         stderr,
     })
@@ -734,7 +767,7 @@ fn hash_toolchain(
         ("ldd", &["--version"]),
     ];
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-toolchain-v4\0");
+    hasher.update(b"lpm-toolchain-v5\0");
     let probe_environment = toolchain_probe_environment(trusted_environment);
     let probe_outputs = std::thread::scope(|scope| {
         #[expect(
@@ -748,7 +781,11 @@ fn hash_toolchain(
                 scope.spawn(move || {
                     let executable =
                         resolve_trusted_executable(program, trusted_environment, project_dir)?;
-                    run_bounded_toolchain_probe(&executable, args, probe_environment)
+                    run_bounded_toolchain_probe(
+                        &executable.invocation_path,
+                        args,
+                        probe_environment,
+                    )
                 })
             })
             .collect::<Vec<_>>();
@@ -770,9 +807,10 @@ fn hash_toolchain(
         }
         if let Some(executable) =
             resolve_trusted_executable(program, trusted_environment, project_dir)
-            && let Ok(identity) = runtime_executable_identity(&executable)
+            && let Ok(identity) = runtime_executable_identity(&executable.canonical_target)
         {
             hasher.update(b"trusted\0");
+            hash_os_path(&mut hasher, &executable.invocation_path);
             hasher.update(identity.as_bytes());
         }
         if let Some(executable) = resolve_executable(program, build_environment)
@@ -1367,6 +1405,131 @@ mod tests {
         hash_toolchain(&environment, &environment, &project).unwrap();
 
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn toolchain_probe_timeout_kills_descendant_holding_output_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\n(/bin/sleep 5) &\necho ready\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let output = run_bounded_toolchain_probe(&probe, &[], &HashMap::new());
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn trusted_proxy_executes_with_symlink_invocation_name() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let bin = temp.path().join("host-bin");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let manager = bin.join("multicall");
+        std::fs::write(&manager, "#!/bin/sh\necho \"${0##*/}\"\n").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&manager, bin.join("rustc")).unwrap();
+        let environment = HashMap::from([("PATH".to_string(), bin.display().to_string())]);
+        let executable = resolve_trusted_executable("rustc", &environment, &project).unwrap();
+
+        let output =
+            run_bounded_toolchain_probe(&executable.invocation_path, &[], &environment).unwrap();
+
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "rustc");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn toolchain_probe_runs_from_neutral_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\npwd\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = run_bounded_toolchain_probe(&probe, &[], &HashMap::new()).unwrap();
+
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "/");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn runtime_only_key_is_rejected_when_project_node_shadows_trusted_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let project_bin = project.join("node_modules/.bin");
+        let trusted_bin = temp.path().join("trusted-bin");
+        let link_dir = temp.path().join("links/esbuild");
+        let package_dir = link_dir.join("node_modules/esbuild");
+        std::fs::create_dir_all(&project_bin).unwrap();
+        std::fs::create_dir(&trusted_bin).unwrap();
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(project_bin.join("node"), b"project node").unwrap();
+        std::fs::write(trusted_bin.join("node"), b"trusted node").unwrap();
+        std::fs::set_permissions(
+            project_bin.join("node"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            trusted_bin.join("node"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let graph_key_digest = write_link_meta(&link_dir, "esbuild");
+        let platform = PlatformTuple::current();
+        let trusted_path = trusted_bin.display().to_string();
+        let trusted_environment = HashMap::from([("PATH".to_string(), trusted_path.clone())]);
+        let build_executable_environment = HashMap::from([(
+            "PATH".to_string(),
+            build_lifecycle_path(&project, Some(&trusted_path)),
+        )]);
+        let invocation = BuildCacheInvocation {
+            dependency_closure_hash: "graph".into(),
+            platform: BuildPlatformFingerprint {
+                os: platform.os,
+                architecture: platform.cpu,
+                libc: platform.libc.unwrap_or_default(),
+                cpu_features_hash: "cpu".into(),
+            },
+            runtime: BuildRuntimeFingerprint {
+                runtime: "node".into(),
+                version: "22.0.0".into(),
+                modules_abi: "127".into(),
+                napi: "10".into(),
+                engine: "v8".into(),
+                executable_hash: "trusted-node".into(),
+            },
+            sandbox: BuildSandboxFingerprint {
+                mode: "enforce".into(),
+                posture: "strict".into(),
+                network_denied: true,
+                environment_scrubbed: true,
+                allowed_inputs_hash: "inputs".into(),
+            },
+            environment: trusted_environment.clone(),
+            trusted_toolchain_environment: trusted_environment,
+            build_executable_environment,
+            project_dir: project.clone(),
+            native_toolchain_hash: OnceLock::new(),
+        };
+        let mut package = scriptable_package("esbuild", "node install.js");
+        package.store_path = package_dir;
+        package.graph_key_digest = Some(graph_key_digest);
+
+        assert!(build_key_for_package(&invocation, &package, &project).is_none());
     }
 
     #[test]

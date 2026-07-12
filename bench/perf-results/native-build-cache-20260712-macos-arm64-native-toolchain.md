@@ -8,9 +8,9 @@
 
 | Scenario | Median wall | p95 wall | Median RSS | User CPU | System CPU | Result |
 |---|---:|---:|---:|---:|---:|---:|
-| Strict cache miss | 245.04 ms | 319.67 ms | 47,136,768 B | 70 ms | 60 ms | 10 misses |
-| Local artifact hit | 132.80 ms | 156.10 ms | 41,566,208 B | 50 ms | 50 ms | 1.85×; 45.8% lower wall time |
-| Stable-path CI warm-store hit | 134.28 ms | 140.65 ms | 41,549,824 B | 50 ms | 50 ms | 1.82×; 45.2% lower wall time |
+| Strict cache miss | 229.99 ms | 444.35 ms | 47,104,000 B | 120 ms | 170 ms | 10 misses |
+| Local artifact hit | 122.88 ms | 131.98 ms | 41,631,744 B | 100 ms | 160 ms | 1.87×; 46.57% lower wall time |
+| Stable-path CI warm-store hit | 125.39 ms | 135.02 ms | 41,615,360 B | 100 ms | 160 ms | 1.83×; 45.48% lower wall time |
 
 Every measured scenario used the same strict sandbox. Sharp follows the
 `NativeToolchain` cache path, so every hit includes trusted compiler, SDK,
@@ -19,7 +19,7 @@ Miss and local-hit samples rematerialized the same project. CI-like samples
 deleted and recreated a checkout at one stable path while retaining the warm
 LPM store.
 
-Across ten local hits, artifact metadata recorded 1,048 ms of lifecycle
-execution avoided. Across ten stable-path CI hits, it recorded 1,053 ms
+Across ten local hits, artifact metadata recorded 1,072 ms of lifecycle
+execution avoided. Across ten stable-path CI hits, it recorded 1,073 ms
 avoided. The measured hit remains beneficial after paying the complete native
 toolchain key cost.
