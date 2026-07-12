@@ -124,8 +124,8 @@ use crate::{
     SandboxedCommand,
 };
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
-    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
+    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
 };
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -759,7 +759,6 @@ fn build_parent_side_ruleset(
 ) -> Result<RulesetCreated, RulesetError> {
     let abi = posture.abi();
     let rw = AccessFs::from_all(abi);
-    let read = AccessFs::from_read(abi);
     let mut builder = Ruleset::default().handle_access(rw)?;
     if posture.enforces_network() {
         // Strict V4 only: declare the network access classes so
@@ -781,13 +780,23 @@ fn build_parent_side_ruleset(
                 continue;
             }
         };
-        let access_bits = match access {
-            RuleAccess::Read => read,
-            RuleAccess::ReadWrite => rw,
-        };
+        let is_file = std::fs::metadata(&path).is_ok_and(|metadata| !metadata.is_dir());
+        let access_bits = rule_access_bits(access, abi, is_file);
         ruleset = ruleset.add_rule(PathBeneath::new(fd, access_bits))?;
     }
     Ok(ruleset)
+}
+
+fn rule_access_bits(access: RuleAccess, abi: ABI, is_file: bool) -> BitFlags<AccessFs> {
+    let valid = if is_file {
+        AccessFs::from_file(abi)
+    } else {
+        AccessFs::from_all(abi)
+    };
+    match access {
+        RuleAccess::Read => valid & AccessFs::from_read(abi),
+        RuleAccess::ReadWrite => valid,
+    }
 }
 
 /// Async-signal-safe stderr write. Bypasses [`std::io::Stderr::lock`]
@@ -1072,6 +1081,31 @@ mod tests {
         let mut child = sb.spawn(cmd).expect("spawn under enforce");
         let status = child.wait().expect("wait");
         assert!(status.success(), "/usr/bin/true under landlock must exit 0");
+    }
+
+    #[test]
+    fn regular_file_rules_exclude_directory_only_access_rights() {
+        let read = rule_access_bits(RuleAccess::Read, ABI::V4, true);
+        let read_write = rule_access_bits(RuleAccess::ReadWrite, ABI::V4, true);
+
+        assert_eq!(read, AccessFs::Execute | AccessFs::ReadFile);
+        assert_eq!(read_write, AccessFs::from_file(ABI::V4));
+        assert!(!read_write.contains(AccessFs::ReadDir));
+        assert!(!read_write.contains(AccessFs::RemoveDir));
+        assert!(!read_write.contains(AccessFs::MakeDir));
+        assert!(!read_write.contains(AccessFs::Refer));
+    }
+
+    #[test]
+    fn directory_rules_keep_full_requested_access_rights() {
+        assert_eq!(
+            rule_access_bits(RuleAccess::Read, ABI::V4, false),
+            AccessFs::from_read(ABI::V4)
+        );
+        assert_eq!(
+            rule_access_bits(RuleAccess::ReadWrite, ABI::V4, false),
+            AccessFs::from_all(ABI::V4)
+        );
     }
 
     #[test]
