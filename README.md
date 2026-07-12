@@ -32,7 +32,7 @@ LPM has three connected parts:
 
 ## Install
 
-LPM supports macOS, Linux, and Windows x64 through npm. Homebrew and the standalone installer support macOS and Linux.
+LPM supports macOS, Linux glibc, Linux x64 musl (including Alpine), and Windows x64 through npm. Homebrew and the standalone installer support macOS and Linux; the standalone installer selects the matching glibc or musl binary automatically on Linux x64.
 
 ```bash
 # npm

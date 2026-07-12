@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   LpmWrapperError,
   PLATFORMS,
+  detectLinuxLibc,
   platformKey,
   resolveNativeBinary,
 } from "../bin/native.js";
@@ -21,6 +22,7 @@ export function installNativeBinaries(options = {}) {
   const wrapperRoot = options.wrapperRoot ?? defaultWrapperRoot;
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? os.arch();
+  const libc = options.libc ?? detectLinuxLibc();
   const env = options.env ?? process.env;
   const requireFn = options.requireFn ?? require;
   const fsModule = options.fsModule ?? fs;
@@ -29,7 +31,7 @@ export function installNativeBinaries(options = {}) {
   const validateTimeoutMs =
     options.validateTimeoutMs ?? defaultValidateTimeoutMs;
 
-  const key = platformKey(platform, arch);
+  const key = platformKey(platform, arch, libc);
   const spec = PLATFORMS[key];
   if (!spec) {
     logFn(
@@ -43,6 +45,7 @@ export function installNativeBinaries(options = {}) {
     command: "lpm",
     platform,
     arch,
+    libc,
     env,
     requireFn,
   });
@@ -63,6 +66,7 @@ export function installNativeBinaries(options = {}) {
             command,
             platform,
             arch,
+            libc,
             env,
             requireFn,
           });

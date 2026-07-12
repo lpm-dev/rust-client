@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   LpmWrapperError,
+  detectLinuxLibc,
   platformKey,
   resolveNativeBinary,
 } from "../bin/native.js";
@@ -17,8 +18,27 @@ const wrapperRoot = path.resolve(repoPackageDir, "..");
 
 test("platformKey joins node platform and architecture", () => {
   assert.equal(platformKey("darwin", "arm64"), "darwin-arm64");
-  assert.equal(platformKey("linux", "x64"), "linux-x64");
+  assert.equal(platformKey("linux", "x64", "glibc"), "linux-x64");
   assert.equal(platformKey("win32", "x64"), "win32-x64");
+});
+
+test("platformKey distinguishes musl from glibc on Linux x64", () => {
+  assert.equal(platformKey("linux", "x64", "musl"), "linux-x64-musl");
+});
+
+test("platformKey preserves the unsupported musl ARM64 distinction", () => {
+  assert.equal(platformKey("linux", "arm64", "musl"), "linux-arm64-musl");
+});
+
+test("detectLinuxLibc identifies glibc from the Node report", () => {
+  assert.equal(
+    detectLinuxLibc({ header: { glibcVersionRuntime: "2.39" } }),
+    "glibc",
+  );
+});
+
+test("detectLinuxLibc identifies musl when the glibc runtime is absent", () => {
+  assert.equal(detectLinuxLibc({ header: {} }), "musl");
 });
 
 test("published wrapper manifest stays dependency-free", () => {
@@ -40,8 +60,25 @@ test("published wrapper manifest stays dependency-free", () => {
     "@lpm-registry/cli-darwin-x64",
     "@lpm-registry/cli-linux-arm64",
     "@lpm-registry/cli-linux-x64",
+    "@lpm-registry/cli-linux-x64-musl",
     "@lpm-registry/cli-win32-x64",
   ]);
+});
+
+test("resolveNativeBinary selects the musl package on Linux x64 musl", () => {
+  const root = makePackageTree("linux-x64-musl");
+  const requireFn = createFakeRequire(root);
+
+  const resolved = resolveNativeBinary({
+    command: "lpm",
+    platform: "linux",
+    arch: "x64",
+    libc: "musl",
+    requireFn,
+    env: {},
+  });
+
+  assert.equal(resolved.source, "@lpm-registry/cli-linux-x64-musl");
 });
 
 test("resolveNativeBinary finds lpm in the matching optional dependency", () => {
@@ -264,6 +301,25 @@ test("postinstall validates and hard-links unix binaries into bin targets", () =
     fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8"),
     tree.lpxShim,
   );
+});
+
+test("postinstall stages the musl package on Linux x64 musl", () => {
+  const tree = makeInstallTree("linux-x64-musl", {
+    version: "1.2.3",
+    packageBinaryNames: ["lpm", "lpx"],
+  });
+
+  const result = installNativeBinaries({
+    wrapperRoot: tree.wrapperRoot,
+    platform: "linux",
+    arch: "x64",
+    libc: "musl",
+    requireFn: createFakeRequire(tree.root),
+    spawnSyncFn: createVersionSpawn("lpm 1.2.3"),
+    logFn() {},
+  });
+
+  assert.equal(result.package, "@lpm-registry/cli-linux-x64-musl");
 });
 
 test("postinstall copies unix binaries when hard-linking is unavailable", () => {

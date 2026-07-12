@@ -113,6 +113,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: lpm-linux-x64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            binary: lpm-linux-x64-musl
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             binary: lpm-linux-arm64
@@ -130,10 +133,18 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux keyring build deps
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libdbus-1-dev
+
+      - name: Install musl build tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
+          echo 'CC_x86_64_unknown_linux_musl=musl-gcc' >> "$GITHUB_ENV"
 
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -143,7 +154,12 @@ jobs:
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
       - name: Build
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
+
+      - name: Build static musl binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo rustc --locked --release --target ${{ matrix.target }} -p lpm-cli --bin lpm-rs -- -C link-arg=-static
 
       # The Windows runtime ships an additional helper binary for
       # AppContainer strict-mode. Build it with the CLI so the release
@@ -157,6 +173,26 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
           chmod +x ${{ matrix.binary }}
+
+      - name: Verify musl binary on Alpine
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          file "${{ matrix.binary }}"
+          if readelf -l "${{ matrix.binary }}" | grep -q INTERP; then
+            echo "::error::${{ matrix.binary }} requires a runtime ELF interpreter"
+            readelf -l "${{ matrix.binary }}"
+            exit 1
+          fi
+          if readelf -d "${{ matrix.binary }}" | grep -q '(NEEDED)'; then
+            echo "::error::${{ matrix.binary }} has dynamic library dependencies"
+            readelf -d "${{ matrix.binary }}"
+            exit 1
+          fi
+          docker run --rm \
+            -v "$PWD:/work:ro" \
+            alpine@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 \
+            /work/${{ matrix.binary }} --version
 
       - name: Import Developer ID certificate (macOS)
         if: runner.os == 'macOS'
@@ -399,7 +435,7 @@ jobs:
         working-directory: binaries
         run: |
           sha256sum lpm-darwin-arm64 lpm-darwin-x64 \
-                    lpm-linux-x64 lpm-linux-arm64 \
+                    lpm-linux-x64 lpm-linux-x64-musl lpm-linux-arm64 \
                     lpm-win32-x64.exe lpm-sandbox-helper-win32-x64.exe \
                     > SHA256SUMS.txt
           echo "Manifest contents:"
@@ -510,7 +546,7 @@ jobs:
             fi
           }
 
-          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-x64-musl linux-arm64; do
             echo "Publishing @lpm-registry/cli-${platform}@${VERSION}..."
             cd npm/cli-${platform}
             cp ../../binaries/lpm-${platform} ./lpm
@@ -582,6 +618,7 @@ jobs:
               '@lpm-registry/cli-darwin-x64',
               '@lpm-registry/cli-linux-arm64',
               '@lpm-registry/cli-linux-x64',
+              '@lpm-registry/cli-linux-x64-musl',
               '@lpm-registry/cli-win32-x64'
             ];
             pkg.optionalDependencies = Object.fromEntries(platforms.map(p => [p, '$VERSION']));

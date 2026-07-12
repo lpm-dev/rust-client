@@ -50,6 +50,23 @@ version_lt() {
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
+linux_libc() {
+  if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+    echo musl
+    return
+  fi
+  case "$1" in
+    x86_64) loader_="/lib/ld-musl-x86_64.so.1" ;;
+    aarch64|arm64) loader_="/lib/ld-musl-aarch64.so.1" ;;
+    *) loader_="" ;;
+  esac
+  if [ -n "$loader_" ] && [ -e "$loader_" ]; then
+    echo musl
+  else
+    echo glibc
+  fi
+}
+
 case "$OS" in
   Darwin)
     case "$ARCH" in
@@ -60,8 +77,21 @@ case "$OS" in
     ;;
   Linux)
     case "$ARCH" in
-      aarch64|arm64) PLATFORM="lpm-linux-arm64" ;;
-      x86_64)        PLATFORM="lpm-linux-x64" ;;
+      aarch64|arm64)
+        if [ "$(linux_libc "$ARCH")" = "musl" ]; then
+          echo "Unsupported platform: Linux musl ARM64"
+          echo "Official musl releases currently support x86_64. Build from source on ARM64."
+          exit 1
+        fi
+        PLATFORM="lpm-linux-arm64"
+        ;;
+      x86_64)
+        if [ "$(linux_libc "$ARCH")" = "musl" ]; then
+          PLATFORM="lpm-linux-x64-musl"
+        else
+          PLATFORM="lpm-linux-x64"
+        fi
+        ;;
       *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
     ;;

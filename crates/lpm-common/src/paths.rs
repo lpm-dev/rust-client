@@ -911,6 +911,21 @@ pub enum FsKind {
     Unknown,
 }
 
+#[cfg(target_os = "linux")]
+fn classify_linux_filesystem(fs_type: u64) -> FsKind {
+    const NFS_SUPER_MAGIC: u64 = 0x6969;
+    const SMB_SUPER_MAGIC: u64 = 0x517B;
+    const SMB2_MAGIC_NUMBER: u64 = 0xFE53_4D42;
+    const CIFS_MAGIC_NUMBER: u64 = 0xFF53_4D42;
+    const CODA_SUPER_MAGIC: u64 = 0x7375_7245;
+
+    match fs_type {
+        NFS_SUPER_MAGIC | SMB_SUPER_MAGIC | SMB2_MAGIC_NUMBER | CIFS_MAGIC_NUMBER
+        | CODA_SUPER_MAGIC => FsKind::Network,
+        _ => FsKind::Local,
+    }
+}
+
 /// Best-effort detection of whether `path` lives on a local filesystem.
 ///
 /// The detection is used only to emit a one-time diagnostic warning when
@@ -934,19 +949,7 @@ pub fn is_local_fs(path: &Path) -> FsKind {
         if rc != 0 {
             return FsKind::Unknown;
         }
-        // Magic numbers from linux/magic.h — spelled out here to avoid
-        // pulling in a filesystem-types crate for five constants.
-        const NFS_SUPER_MAGIC: libc::__fsword_t = 0x6969;
-        const SMB_SUPER_MAGIC: libc::__fsword_t = 0x517B;
-        const SMB2_MAGIC_NUMBER: libc::__fsword_t = 0xFE534D42u32 as libc::__fsword_t;
-        const CIFS_MAGIC_NUMBER: libc::__fsword_t = 0xFF534D42u32 as libc::__fsword_t;
-        const CODA_SUPER_MAGIC: libc::__fsword_t = 0x73757245;
-
-        match buf.f_type {
-            NFS_SUPER_MAGIC | SMB_SUPER_MAGIC | SMB2_MAGIC_NUMBER | CIFS_MAGIC_NUMBER
-            | CODA_SUPER_MAGIC => FsKind::Network,
-            _ => FsKind::Local,
-        }
+        classify_linux_filesystem(buf.f_type as u64)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1018,6 +1021,18 @@ pub fn is_local_fs(path: &Path) -> FsKind {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_filesystem_magic_classifies_nfs_as_network() {
+        assert_eq!(classify_linux_filesystem(0x6969), FsKind::Network);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_filesystem_magic_classifies_unknown_type_as_local() {
+        assert_eq!(classify_linux_filesystem(0x0102_1994), FsKind::Local);
+    }
 
     #[test]
     fn from_env_respects_lpm_home_override() {
