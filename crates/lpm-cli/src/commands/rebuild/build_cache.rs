@@ -401,10 +401,14 @@ pub(super) fn build_key_for_package(
 }
 
 pub(super) fn read_v2_graph_key_digest(package_dir: &Path) -> Option<String> {
-    let link_dir = package_dir.parent()?.parent()?;
-    lpm_store::v2::LinkMeta::read_from(link_dir)
-        .ok()
-        .map(|metadata| metadata.graph_key_digest_hex)
+    let node_modules_dir = package_dir.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .is_some_and(|name| name == "node_modules")
+    })?;
+    let link_dir = node_modules_dir.parent()?;
+    let metadata = lpm_store::v2::LinkMeta::read_from(link_dir).ok()?;
+    (node_modules_dir.join(&metadata.name) == package_dir).then_some(metadata.graph_key_digest_hex)
 }
 
 fn detect_node_runtime(environment: &HashMap<String, String>) -> Option<BuildRuntimeFingerprint> {
@@ -502,7 +506,11 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         ("python3", &["--version"]),
         ("make", &["--version"]),
         ("cc", &["--version"]),
+        ("cc", &["-print-sysroot"]),
+        ("cc", &["-print-search-dirs"]),
         ("c++", &["--version"]),
+        ("c++", &["-print-sysroot"]),
+        ("c++", &["-print-search-dirs"]),
         ("clang", &["--version"]),
         ("ld", &["-v"]),
         ("xcrun", &["--show-sdk-path"]),
@@ -511,23 +519,56 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         ("cargo", &["-V"]),
         ("cmake", &["--version"]),
         ("ninja", &["--version"]),
+        ("pkg-config", &["--version"]),
+        ("pkg-config", &["--variable=pc_path", "pkg-config"]),
+        ("pkg-config", &["--list-all"]),
+        (
+            "dpkg-query",
+            &["-W", "-f=${Package}\t${Version}\t${Architecture}\\n"],
+        ),
+        (
+            "rpm",
+            &["-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\\n"],
+        ),
+        ("pacman", &["-Q"]),
+        ("apk", &["info", "-vv"]),
+        ("pkgutil", &["--pkgs"]),
+        ("xcodebuild", &["-version"]),
         ("uname", &["-a"]),
         ("sw_vers", &[]),
         ("ldd", &["--version"]),
     ];
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-toolchain-v2\0");
-    for (program, args) in PROBES {
+    hasher.update(b"lpm-toolchain-v3\0");
+    let probe_outputs = std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "all probes must start before any join blocks"
+        )]
+        let handles = PROBES
+            .iter()
+            .map(|(program, args)| {
+                scope.spawn(move || {
+                    Command::new(program)
+                        .args(*args)
+                        .env_clear()
+                        .envs(environment)
+                        .output()
+                        .ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect::<Vec<_>>()
+    });
+    for ((program, _), output) in PROBES.iter().zip(probe_outputs) {
         hasher.update(program.as_bytes());
         hasher.update(b"\0");
-        if let Ok(output) = Command::new(program)
-            .args(*args)
-            .env_clear()
-            .envs(environment)
-            .output()
-        {
-            hasher.update(&output.stdout[..output.stdout.len().min(16 * 1024)]);
-            hasher.update(&output.stderr[..output.stderr.len().min(16 * 1024)]);
+        if let Some(output) = output {
+            hasher.update(&output.stdout[..output.stdout.len().min(4 * 1024 * 1024)]);
+            hasher.update(&output.stderr[..output.stderr.len().min(4 * 1024 * 1024)]);
         }
         if let Some(executable) = resolve_executable(program, environment)
             && let Ok(identity) = runtime_executable_identity(&executable)
@@ -543,6 +584,26 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
     ] {
         hash_optional_file(path, &mut hasher)?;
     }
+    let host_state_paths = host_package_state_paths()
+        .iter()
+        .map(Path::new)
+        .collect::<Vec<_>>();
+    hash_host_package_state(&host_state_paths, &mut hasher)?;
+    hash_pkg_config_directories(environment, &mut hasher)?;
+    for cellar in [
+        Path::new("/opt/homebrew/Cellar"),
+        Path::new("/usr/local/Cellar"),
+        Path::new("/home/linuxbrew/.linuxbrew/Cellar"),
+    ] {
+        hash_homebrew_state(cellar, &mut hasher)?;
+    }
+    #[cfg(target_os = "macos")]
+    for receipts in [
+        Path::new("/var/db/receipts"),
+        Path::new("/Library/Apple/System/Library/Receipts"),
+    ] {
+        hash_directory_files_with_extension(receipts, "plist", &mut hasher)?;
+    }
     if let Some(home) = environment
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("HOME"))
@@ -552,6 +613,124 @@ fn hash_toolchain(environment: &HashMap<String, String>) -> std::io::Result<Stri
         hash_directory_tree(&home.join(".node-gyp"), &mut hasher)?;
     }
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+}
+
+#[cfg(target_os = "linux")]
+fn host_package_state_paths() -> &'static [&'static str] {
+    &[
+        "/var/lib/dpkg/status",
+        "/var/lib/apt/extended_states",
+        "/var/lib/rpm/Packages",
+        "/var/lib/rpm/rpmdb.sqlite",
+        "/usr/lib/sysimage/rpm/Packages",
+        "/usr/lib/sysimage/rpm/rpmdb.sqlite",
+        "/lib/apk/db/installed",
+        "/var/lib/pacman/local",
+    ]
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_package_state_paths() -> &'static [&'static str] {
+    &[]
+}
+
+fn hash_host_package_state(paths: &[&Path], hasher: &mut Sha256) -> std::io::Result<()> {
+    hasher.update(b"host-package-state-v1\0");
+    for path in paths {
+        if path.is_dir() {
+            hash_directory_tree(path, hasher)?;
+        } else {
+            hash_optional_file(path, hasher)?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_pkg_config_directories(
+    environment: &HashMap<String, String>,
+    hasher: &mut Sha256,
+) -> std::io::Result<()> {
+    let mut search_path = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PKG_CONFIG_PATH"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    if let Ok(output) = Command::new("pkg-config")
+        .args(["--variable=pc_path", "pkg-config"])
+        .env_clear()
+        .envs(environment)
+        .output()
+        && output.status.success()
+    {
+        if !search_path.is_empty() {
+            search_path.push(':');
+        }
+        search_path.push_str(String::from_utf8_lossy(&output.stdout).trim());
+    }
+    let mut paths = std::env::split_paths(&search_path).collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    for path in paths {
+        hash_directory_tree(&path, hasher)?;
+    }
+    Ok(())
+}
+
+fn hash_homebrew_state(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    hash_os_path(hasher, root);
+    let mut formulae = match std::fs::read_dir(root) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"absent\x1e");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    formulae.sort_unstable_by_key(std::fs::DirEntry::file_name);
+    for formula in formulae {
+        if !formula.file_type()?.is_dir() {
+            continue;
+        }
+        let formula_name = formula.file_name();
+        hash_os_path(hasher, Path::new(&formula_name));
+        let mut versions = std::fs::read_dir(formula.path())?.collect::<Result<Vec<_>, _>>()?;
+        versions.sort_unstable_by_key(std::fs::DirEntry::file_name);
+        for version in versions {
+            if !version.file_type()?.is_dir() {
+                continue;
+            }
+            let version_name = version.file_name();
+            hash_os_path(hasher, Path::new(&version_name));
+            hash_optional_file(&version.path().join("INSTALL_RECEIPT.json"), hasher)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hash_directory_files_with_extension(
+    root: &Path,
+    extension: &str,
+    hasher: &mut Sha256,
+) -> std::io::Result<()> {
+    hash_os_path(hasher, root);
+    let mut paths = match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|value| value == extension))
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"absent\x1e");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    paths.sort_unstable();
+    for path in paths {
+        hash_optional_file(&path, hasher)?;
+    }
+    Ok(())
 }
 
 fn hash_optional_file(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
@@ -880,6 +1059,45 @@ mod tests {
     }
 
     #[test]
+    fn host_package_state_hash_changes_when_installed_state_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("status");
+        std::fs::write(&state, b"Version: 1\n").unwrap();
+        let mut first = Sha256::new();
+        hash_host_package_state(&[state.as_path()], &mut first).unwrap();
+
+        std::fs::write(&state, b"Version: 2\n").unwrap();
+        let mut second = Sha256::new();
+        hash_host_package_state(&[state.as_path()], &mut second).unwrap();
+
+        assert_ne!(first.finalize(), second.finalize());
+    }
+
+    #[test]
+    fn homebrew_state_hash_changes_when_install_receipt_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let version = temp.path().join("example/1.0.0");
+        std::fs::create_dir_all(&version).unwrap();
+        std::fs::write(
+            version.join("INSTALL_RECEIPT.json"),
+            b"{\"source\":\"first\"}",
+        )
+        .unwrap();
+        let mut first = Sha256::new();
+        hash_homebrew_state(temp.path(), &mut first).unwrap();
+
+        std::fs::write(
+            version.join("INSTALL_RECEIPT.json"),
+            b"{\"source\":\"second\"}",
+        )
+        .unwrap();
+        let mut second = Sha256::new();
+        hash_homebrew_state(temp.path(), &mut second).unwrap();
+
+        assert_ne!(first.finalize(), second.finalize());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn toolchain_hash_changes_when_cmake_executable_changes() {
         use std::os::unix::fs::PermissionsExt;
@@ -979,6 +1197,17 @@ mod tests {
         let scratch = BuildCacheScratch::create(&package_dir, &digest).unwrap();
 
         assert_eq!(scratch.path(), link_dir.join(".lpm-build-tmp"));
+    }
+
+    #[test]
+    fn graph_identity_discovery_supports_scoped_package_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let link_dir = temp.path().join("links/scoped");
+        let package_dir = link_dir.join("node_modules/@scope/example");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        let digest = write_link_meta(&link_dir, "@scope/example");
+
+        assert_eq!(read_v2_graph_key_digest(&package_dir), Some(digest));
     }
 
     #[test]
