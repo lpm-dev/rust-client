@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 const TOOLCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const TOOLCHAIN_PROBE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const RUNTIME_ONLY_TOOLCHAIN_FINGERPRINT: &str = "runtime-and-dependency-graph-v2";
 
 pub(super) struct BuildCacheScratch {
     path: PathBuf,
@@ -396,7 +397,7 @@ pub(super) fn build_key_for_package(
             hash_invoked_build_executables(package, &invocation.build_executable_environment);
         hash_records([hash.as_bytes(), invoked_executables.as_bytes()])
     } else {
-        "runtime-and-dependency-graph-v1".to_string()
+        RUNTIME_ONLY_TOOLCHAIN_FINGERPRINT.to_string()
     };
     let environment_hash = hash_environment_pairs(&lifecycle_environment);
     let key = BuildCacheKey::derive(&BuildKeyInputs {
@@ -1269,6 +1270,49 @@ mod tests {
             hash_build_environment(&first),
             hash_build_environment(&second)
         );
+    }
+
+    #[test]
+    fn runtime_only_key_namespace_invalidates_pre_hardening_artifacts() {
+        fn derive(toolchain_hash: &str) -> BuildCacheKey {
+            BuildCacheKey::derive(&BuildKeyInputs {
+                source_integrity: "sha512-source".into(),
+                graph_key_digest: "graph".into(),
+                dependency_closure_hash: "closure".into(),
+                scripts: vec![BuildScriptFingerprint {
+                    phase: "postinstall".into(),
+                    command: "node install.js".into(),
+                }],
+                platform: BuildPlatformFingerprint {
+                    os: "linux".into(),
+                    architecture: "x86_64".into(),
+                    libc: "glibc".into(),
+                    cpu_features_hash: "cpu".into(),
+                },
+                runtime: BuildRuntimeFingerprint {
+                    runtime: "node".into(),
+                    version: "22.0.0".into(),
+                    modules_abi: "127".into(),
+                    napi: "10".into(),
+                    engine: "v8".into(),
+                    executable_hash: "node".into(),
+                },
+                sandbox: BuildSandboxFingerprint {
+                    mode: "enforce".into(),
+                    posture: "strict".into(),
+                    network_denied: true,
+                    environment_scrubbed: true,
+                    allowed_inputs_hash: "inputs".into(),
+                },
+                environment_hash: "environment".into(),
+                toolchain_hash: toolchain_hash.into(),
+            })
+        }
+
+        let pre_hardening = derive("runtime-and-dependency-graph-v1");
+        let current = derive(RUNTIME_ONLY_TOOLCHAIN_FINGERPRINT);
+
+        assert_ne!(current, pre_hardening);
     }
 
     #[test]
