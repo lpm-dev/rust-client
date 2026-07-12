@@ -1083,6 +1083,58 @@ async fn run_under_store_lock(
     for pkg in &to_build {
         let mut pkg_success = true;
 
+        let key_start = std::time::Instant::now();
+        let mut build_key = build_cache_invocation
+            .as_ref()
+            .and_then(|invocation| build_key_for_package(invocation, pkg));
+        build_cache_metrics.key_ms += elapsed_millis(key_start.elapsed());
+        if build_key.is_some() {
+            build_cache_metrics.eligible += 1;
+        } else if is_cacheable_native_build(pkg) {
+            build_cache_metrics.bypassed += 1;
+        }
+        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+        let _build_entry_lock = if let Some(graph_key_digest) = pkg.graph_key_digest.as_deref() {
+            match lpm_common::acquire_exclusive_lock(
+                v2_store.paths().build_entry_lock_path(graph_key_digest),
+            ) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    if !json_output {
+                        let label = rebuild_package_label(pkg);
+                        install_ui::detail(&format!(
+                            "  {} {label:<package_label_width$}  failed to lock package build state: {error}",
+                            install_ui::red("✗"),
+                        ));
+                    }
+                    if json_output {
+                        install_ui::failed(&rebuild_package_failure_message(pkg, &error));
+                    }
+                    failures += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let _build_key_lock = if let Some(key) = build_key.as_ref() {
+            match lpm_common::acquire_exclusive_lock(v2_store.paths().build_lock_path(key)) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    tracing::warn!(
+                        "build cache bypassed for {}@{} because the per-key lock failed: {error}",
+                        pkg.name,
+                        pkg.version
+                    );
+                    build_cache_metrics.bypassed += 1;
+                    build_key = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // fix: lifecycle scripts must run from the LIVE
         // per-package directory (where the symlinked sibling
         // node_modules/ exists), not the global content-addressable
@@ -1124,36 +1176,12 @@ async fn run_under_store_lock(
             }
         };
 
-        let key_start = std::time::Instant::now();
-        let mut build_key = build_cache_invocation
-            .as_ref()
-            .and_then(|invocation| build_key_for_package(invocation, pkg));
-        build_cache_metrics.key_ms += elapsed_millis(key_start.elapsed());
-        if build_key.is_some() {
-            build_cache_metrics.eligible += 1;
-        } else if is_cacheable_native_build(pkg) {
-            build_cache_metrics.bypassed += 1;
-        }
-        let _build_key_lock = if let Some(key) = build_key.as_ref() {
-            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
-            match lpm_common::acquire_exclusive_lock(store.paths().build_lock_path(key)) {
-                Ok(lock) => Some(lock),
-                Err(error) => {
-                    tracing::warn!(
-                        "build cache bypassed for {}@{} because the per-key lock failed: {error}",
-                        pkg.name,
-                        pkg.version
-                    );
-                    build_cache_metrics.bypassed += 1;
-                    build_key = None;
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let marker_path = pkg.store_path.join(BUILD_MARKER);
+        let current_marker_exists = marker_path.is_file();
+        let current_marker_key = current_marker_exists
+            .then(|| read_build_marker_key(&marker_path))
+            .flatten();
         if force {
-            let marker_path = pkg.store_path.join(BUILD_MARKER);
             if let Err(error) = std::fs::remove_file(&marker_path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -1162,15 +1190,15 @@ async fn run_under_store_lock(
                     pkg.name
                 );
             }
-        } else if let Some(marker_key) = pkg.build_marker_key.as_deref() {
-            match build_key.as_ref() {
-                Some(key) if marker_key == key.as_str() => {
+        } else if current_marker_exists {
+            match (current_marker_key.as_deref(), build_key.as_ref()) {
+                (Some(marker_key), Some(key)) if marker_key == key.as_str() => {
                     build_cache_metrics.local_state_hits += 1;
                     continue;
                 }
-                None => continue,
-                Some(_) => {
-                    if let Err(error) = std::fs::remove_file(pkg.store_path.join(BUILD_MARKER))
+                (_, None) => continue,
+                _ => {
+                    if let Err(error) = std::fs::remove_file(&marker_path)
                         && error.kind() != std::io::ErrorKind::NotFound
                     {
                         tracing::warn!(

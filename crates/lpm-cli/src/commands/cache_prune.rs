@@ -259,6 +259,7 @@ fn run_locked(
             })?;
         }
         remove_orphaned_build_locks(v2_store)?;
+        remove_orphaned_build_entry_locks(v2_store)?;
 
         // Sweep deferred global-uninstall tombstones. Errors are
         // surfaced via `summary.tombstone_sweep_error` (and a
@@ -301,19 +302,63 @@ fn remove_orphaned_build_locks(store: &V2Store) -> Result<(), LpmError> {
             continue;
         }
         let path = entry.path();
-        let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let Some(key) = advisory_lock_key(&path) else {
             continue;
         };
-        if key.len() == 64
-            && key
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            && !store.paths().builds_root().join(key).is_dir()
-        {
+        if !store.paths().builds_root().join(key).is_dir() {
             std::fs::remove_file(path)?;
         }
     }
     Ok(())
+}
+
+fn remove_orphaned_build_entry_locks(store: &V2Store) -> Result<(), LpmError> {
+    let mut live_graph_keys = HashSet::new();
+    match std::fs::read_dir(store.paths().links_root()) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    continue;
+                }
+                if let Ok(metadata) = lpm_store::v2::LinkMeta::read_from(&entry.path()) {
+                    live_graph_keys.insert(metadata.graph_key_digest_hex);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let entries = match std::fs::read_dir(store.paths().build_entry_locks_root()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(key) = advisory_lock_key(&path) else {
+            continue;
+        };
+        if !live_graph_keys.contains(key) {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn advisory_lock_key(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let key = [".lock.writer-intent", ".lock.writer-queue", ".lock"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))?;
+    (key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(key)
 }
 
 /// Compute (but don't apply) the prune plan. Pulled out so unit tests
@@ -1276,12 +1321,59 @@ mod tests {
         let orphan_lock = store.paths().build_lock_path_for_key(&orphan_key);
         let live_lock = store.paths().build_lock_path_for_key(&live_key);
         std::fs::write(&orphan_lock, b"").unwrap();
+        std::fs::write(format!("{}.writer-intent", orphan_lock.display()), b"").unwrap();
+        std::fs::write(format!("{}.writer-queue", orphan_lock.display()), b"").unwrap();
         std::fs::write(&live_lock, b"").unwrap();
+        std::fs::write(format!("{}.writer-intent", live_lock.display()), b"").unwrap();
+        std::fs::write(format!("{}.writer-queue", live_lock.display()), b"").unwrap();
 
         remove_orphaned_build_locks(&store).unwrap();
 
         assert!(!orphan_lock.exists());
+        assert!(!std::fs::exists(format!("{}.writer-intent", orphan_lock.display())).unwrap());
+        assert!(!std::fs::exists(format!("{}.writer-queue", orphan_lock.display())).unwrap());
         assert!(live_lock.exists());
+        assert!(std::fs::exists(format!("{}.writer-intent", live_lock.display())).unwrap());
+        assert!(std::fs::exists(format!("{}.writer-queue", live_lock.display())).unwrap());
+    }
+
+    #[test]
+    fn build_entry_lock_cleanup_removes_only_locks_without_link_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let store = V2Store::from_lpm_root(&root);
+        let orphan_key = "a".repeat(64);
+        let live_key = "b".repeat(64);
+        std::fs::create_dir_all(store.paths().build_entry_locks_root()).unwrap();
+        let orphan_lock = store.paths().build_entry_lock_path(&orphan_key);
+        let live_lock = store.paths().build_entry_lock_path(&live_key);
+        std::fs::write(&orphan_lock, b"").unwrap();
+        std::fs::write(format!("{}.writer-intent", orphan_lock.display()), b"").unwrap();
+        std::fs::write(format!("{}.writer-queue", orphan_lock.display()), b"").unwrap();
+        std::fs::write(&live_lock, b"").unwrap();
+        std::fs::write(format!("{}.writer-intent", live_lock.display()), b"").unwrap();
+        std::fs::write(format!("{}.writer-queue", live_lock.display()), b"").unwrap();
+        let link_dir = store
+            .paths()
+            .links_root()
+            .join("example@1.0.0+bbbbbbbbbbbbbbbb");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::write(
+            link_dir.join(lpm_store::v2::LINK_META_FILENAME),
+            format!(
+                r#"{{"schema":1,"graph_key":"example@1.0.0+bbbbbbbbbbbbbbbb","graph_key_digest_hex":"{live_key}","name":"example","version":"1.0.0","source_sri":"sha512-example","object_path":"objects/sha512-example","deps":[],"platform":{{"os":"darwin","cpu":"arm64","libc":null}},"created_at":"2026-01-01T00:00:00Z","last_referenced_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+
+        remove_orphaned_build_entry_locks(&store).unwrap();
+
+        assert!(!orphan_lock.exists());
+        assert!(!std::fs::exists(format!("{}.writer-intent", orphan_lock.display())).unwrap());
+        assert!(!std::fs::exists(format!("{}.writer-queue", orphan_lock.display())).unwrap());
+        assert!(live_lock.exists());
+        assert!(std::fs::exists(format!("{}.writer-intent", live_lock.display())).unwrap());
+        assert!(std::fs::exists(format!("{}.writer-queue", live_lock.display())).unwrap());
     }
 
     #[test]

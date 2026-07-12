@@ -7,7 +7,7 @@ mod support;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_spawnable_with_registry, lpm_with_registry};
 
-const PACKAGE_NAME: &str = "synthetic-native-cache";
+const PACKAGE_NAME: &str = "esbuild";
 const PACKAGE_VERSION: &str = "1.0.0";
 const BUILD_SCRIPT: &str = r#"
 const fs = require('fs');
@@ -52,10 +52,10 @@ async fn native_lifecycle_output_is_restored_after_pristine_rematerialization() 
                 "name": PACKAGE_NAME,
                 "version": PACKAGE_VERSION,
                 "scripts": {
-                    "postinstall": "node build.js # node-gyp rebuild"
+                    "postinstall": "node install.js"
                 }
             }),
-            &[("build.js", BUILD_SCRIPT.as_bytes())],
+            &[("install.js", BUILD_SCRIPT.as_bytes())],
         )
         .await;
     let project = TempProject::empty(&project_manifest());
@@ -201,10 +201,10 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
                 "name": PACKAGE_NAME,
                 "version": PACKAGE_VERSION,
                 "scripts": {
-                    "postinstall": "node build.js # node-gyp rebuild"
+                    "postinstall": "node install.js"
                 }
             }),
-            &[("build.js", script)],
+            &[("install.js", script)],
         )
         .await;
     let project = TempProject::empty(&project_manifest());
@@ -258,4 +258,92 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
         1,
         "one contender must build and the other must reuse its keyed result"
     );
+}
+
+#[tokio::test]
+async fn concurrent_native_rebuilds_with_different_keys_serialize_shared_package_mutation() {
+    if !node_available() {
+        eprintln!("skipping: node is required for the native build-cache workflow");
+        return;
+    }
+
+    let registry = MockRegistry::start().await;
+    let script = br#"
+const fs = require('fs');
+const label = process.env.CFLAGS;
+fs.writeFileSync('active-build.txt', label);
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6000);
+const active = fs.existsSync('active-build.txt')
+  ? fs.readFileSync('active-build.txt', 'utf8')
+  : '<missing>';
+if (active !== label) {
+  throw new Error(`shared package tree was mutated by ${active} while ${label} was building`);
+}
+fs.rmSync('active-build.txt');
+fs.writeFileSync('native-output.txt', label);
+"#;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": PACKAGE_NAME,
+                "version": PACKAGE_VERSION,
+                "scripts": {
+                    "postinstall": "node install.js"
+                }
+            }),
+            &[("install.js", script)],
+        )
+        .await;
+    let project = TempProject::empty(&project_manifest());
+    let install = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("initial install");
+    assert!(install.status.success());
+
+    let mut first_command = lpm_spawnable_with_registry(&project, &registry.url());
+    first_command
+        .args(["--json", "rebuild", "--all", "--strict-sandbox"])
+        .env("LPM_STORE_VERSION", "v2")
+        .env("CFLAGS", "build-a");
+    let first = first_command.spawn().expect("spawn first rebuild");
+    let active_path = installed_package_dir(&project).join("active-build.txt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !active_path.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        active_path.is_file(),
+        "first build did not enter its lifecycle script"
+    );
+    let mut second_command = lpm_spawnable_with_registry(&project, &registry.url());
+    second_command
+        .args(["--json", "rebuild", "--all", "--strict-sandbox"])
+        .env("LPM_STORE_VERSION", "v2")
+        .env("CFLAGS", "build-b");
+    let second = second_command.spawn().expect("spawn second rebuild");
+    let first_output = first.wait_with_output().expect("wait for first rebuild");
+    let second_output = second.wait_with_output().expect("wait for second rebuild");
+
+    assert!(
+        first_output.status.success() && second_output.status.success(),
+        "different-key rebuilds raced on one package tree:\nfirst stderr:\n{}\nsecond stderr:\n{}",
+        String::from_utf8_lossy(&first_output.stderr),
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let mut artifact_outputs = std::fs::read_dir(project.store_dir().join("v2/builds"))
+        .expect("build artifacts")
+        .map(|entry| {
+            std::fs::read_to_string(
+                entry
+                    .expect("build artifact entry")
+                    .path()
+                    .join("package/native-output.txt"),
+            )
+            .expect("each key must preserve its own native output")
+        })
+        .collect::<Vec<_>>();
+    artifact_outputs.sort_unstable();
+    assert_eq!(artifact_outputs, ["build-a", "build-b"]);
 }

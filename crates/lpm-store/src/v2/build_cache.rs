@@ -639,6 +639,20 @@ mod tests {
     }
 
     #[test]
+    fn build_entry_lock_path_is_keyed_by_graph_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let graph_key = "a".repeat(64);
+
+        assert_eq!(
+            store.paths().build_entry_lock_path(&graph_key),
+            temp.path()
+                .join("store/build-entry-locks")
+                .join(format!("{graph_key}.lock"))
+        );
+    }
+
+    #[test]
     fn build_artifact_corruption_is_a_cache_miss() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::at(temp.path().join("store"));

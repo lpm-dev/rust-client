@@ -23,11 +23,15 @@ impl BuildCacheScratch {
             .ancestors()
             .find(|ancestor| ancestor.join(lpm_store::v2::LINK_META_FILENAME).is_file())
             .ok_or_else(|| std::io::Error::other("package is not inside a v2 link entry"))?;
-        let path = link_dir.join(format!(
-            ".lpm-build-tmp.{}.{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
+        let path = link_dir.join(".lpm-build-tmp");
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                std::fs::remove_dir_all(&path)?;
+            }
+            Ok(_) => std::fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         std::fs::create_dir(&path)?;
         Ok(Self { path })
     }
@@ -120,16 +124,155 @@ fn debug_bypass(reason: &str) {
 }
 
 pub(super) fn is_cacheable_native_build(package: &ScriptablePackage) -> bool {
+    native_build_kind(package).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeBuildKind {
+    RuntimeOnly,
+    NativeToolchain,
+}
+
+fn native_build_kind(package: &ScriptablePackage) -> Option<NativeBuildKind> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return false;
+        return None;
     }
-    package.scripts.values().any(|command| {
-        command.contains("node-gyp")
-            || command.contains("node-gyp-build")
-            || command.contains("prebuild-install")
-            || (package.name == "esbuild" && command.contains("install.js"))
-            || (package.name == "sharp" && command.contains("install/"))
-    })
+    let mut kind = None;
+    for command in package.scripts.values() {
+        for segment in shell_command_segments(command)? {
+            let Some(segment_kind) = native_segment_kind(&package.name, &segment) else {
+                continue;
+            };
+            if segment_kind == NativeBuildKind::NativeToolchain {
+                return Some(segment_kind);
+            }
+            kind = Some(segment_kind);
+        }
+    }
+    kind
+}
+
+fn native_segment_kind(package_name: &str, words: &[String]) -> Option<NativeBuildKind> {
+    let command_index = words
+        .iter()
+        .position(|word| !is_environment_assignment(word))?;
+    let executable = Path::new(&words[command_index])
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    let arguments = &words[command_index + 1..];
+    match executable {
+        "node-gyp"
+        | "node-gyp-build"
+        | "node-gyp-build-optional-packages"
+        | "prebuild-install"
+        | "electron-rebuild"
+        | "cmake-js" => Some(NativeBuildKind::NativeToolchain),
+        "node" if package_name == "esbuild" => arguments
+            .first()
+            .and_then(|argument| Path::new(argument).file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| *name == "install.js")
+            .map(|_| NativeBuildKind::RuntimeOnly),
+        "node" if package_name == "sharp" => arguments
+            .first()
+            .filter(|argument| {
+                let normalized = argument.replace('\\', "/");
+                normalized == "install/check" || normalized.starts_with("install/")
+            })
+            .map(|_| NativeBuildKind::NativeToolchain),
+        _ => None,
+    }
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+        })
+}
+
+fn shell_command_segments(command: &str) -> Option<Vec<Vec<String>>> {
+    let normalized = normalize_shell_structure(command);
+    let words = shlex::split(&normalized)?;
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for word in words {
+        if matches!(word.as_str(), "&&" | "||" | ";" | "|" | "&" | "(" | ")") {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(word);
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    Some(segments)
+}
+
+fn normalize_shell_structure(command: &str) -> String {
+    let mut normalized = String::with_capacity(command.len() * 2);
+    let mut chars = command.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut word_boundary = true;
+    while let Some(character) = chars.next() {
+        if character == '\\' && !single_quoted {
+            normalized.push(character);
+            if let Some(escaped) = chars.next() {
+                normalized.push(escaped);
+            }
+            word_boundary = false;
+            continue;
+        }
+        if character == '\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            normalized.push(character);
+            word_boundary = false;
+            continue;
+        }
+        if character == '"' && !single_quoted {
+            double_quoted = !double_quoted;
+            normalized.push(character);
+            word_boundary = false;
+            continue;
+        }
+        if !single_quoted && !double_quoted && character == '#' && word_boundary {
+            while chars.next().is_some_and(|next| next != '\n') {}
+            normalized.push_str(" ; ");
+            word_boundary = true;
+            continue;
+        }
+        if !single_quoted && !double_quoted {
+            match character {
+                '\n' | ';' | '(' | ')' => {
+                    normalized.push(' ');
+                    normalized.push(if character == '\n' { ';' } else { character });
+                    normalized.push(' ');
+                    word_boundary = true;
+                    continue;
+                }
+                '|' | '&' => {
+                    normalized.push(' ');
+                    normalized.push(character);
+                    if chars.peek().copied() == Some(character) {
+                        normalized.push(chars.next().expect("peeked shell operator"));
+                    }
+                    normalized.push(' ');
+                    word_boundary = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        normalized.push(character);
+        word_boundary = character.is_whitespace();
+    }
+    normalized
 }
 
 pub(super) fn marker_requires_key_validation(package: &ScriptablePackage) -> bool {
@@ -156,13 +299,13 @@ pub(super) fn build_key_for_package(
         debug_bypass(&format!("{} has no v2 graph identity", package.name));
         return None;
     };
-    if !is_cacheable_native_build(package) {
+    let Some(native_kind) = native_build_kind(package) else {
         debug_bypass(&format!(
             "{} lifecycle command is not a recognized native build",
             package.name
         ));
         return None;
-    }
+    };
     let mut scripts = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
     for phase in EXECUTED_INSTALL_PHASES {
         if let Some(command) = package.scripts.get(*phase) {
@@ -172,11 +315,7 @@ pub(super) fn build_key_for_package(
             });
         }
     }
-    let toolchain_hash = if package
-        .scripts
-        .values()
-        .any(|command| command.contains("node-gyp"))
-    {
+    let toolchain_hash = if native_kind == NativeBuildKind::NativeToolchain {
         let Some(hash) = invocation
             .native_toolchain_hash
             .get_or_init(|| hash_toolchain(&invocation.environment).ok())
@@ -237,19 +376,39 @@ fn detect_node_runtime(environment: &HashMap<String, String>) -> Option<BuildRun
 }
 
 fn hash_lockfile_graph(lockfile: &lpm_lockfile::Lockfile) -> String {
-    let mut rows = lockfile
-        .packages
-        .iter()
-        .map(|package| {
-            format!(
-                "{}\0{}\0{}\0{}",
-                package.name,
-                package.version,
-                package.integrity.as_deref().unwrap_or(""),
-                package.source.as_deref().unwrap_or("")
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(lockfile.packages.len() + lockfile.patches.len() + 1);
+    rows.push("graph-schema\0v2".to_string());
+    for package in &lockfile.packages {
+        let mut dependencies = package.dependencies.clone();
+        dependencies.sort_unstable();
+        let mut aliases = package.alias_dependencies.clone();
+        aliases.sort_unstable();
+        let mut peers = package.peers.clone();
+        peers.sort_unstable();
+        rows.push(format!(
+            "package\0{}\0{}\0{}\0{}\0deps\0{}\0aliases\0{}\0peers\0{}",
+            package.name,
+            package.version,
+            package.integrity.as_deref().unwrap_or(""),
+            package.source.as_deref().unwrap_or(""),
+            dependencies.join("\0"),
+            aliases
+                .iter()
+                .map(|[local, target]| format!("{local}\0{target}"))
+                .collect::<Vec<_>>()
+                .join("\0"),
+            peers.join("\0")
+        ));
+    }
+    for (package, patch) in &lockfile.patches {
+        rows.push(format!(
+            "patch\0{package}\0{}\0{}\0{}",
+            patch.path, patch.sha256, patch.original_integrity
+        ));
+    }
+    for (local, target) in &lockfile.root_aliases {
+        rows.push(format!("root-alias\0{local}\0{target}"));
+    }
     rows.sort_unstable();
     hash_records(rows.iter().map(String::as_bytes))
 }
@@ -454,6 +613,49 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn scriptable_package(name: &str, command: &str) -> ScriptablePackage {
+        ScriptablePackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            wrapper_id: None,
+            store_path: PathBuf::new(),
+            pristine_path: PathBuf::new(),
+            source_integrity: "sha512-source".into(),
+            graph_key_digest: Some("a".repeat(64)),
+            scripts: [("postinstall".into(), command.into())]
+                .into_iter()
+                .collect(),
+            is_built: false,
+            build_marker_key: None,
+            is_trusted: true,
+            trust_reason: super::super::trust::TrustReason::StrictBinding,
+        }
+    }
+
+    fn graph_lockfile(
+        left_dependencies: &[&str],
+        right_dependencies: &[&str],
+    ) -> lpm_lockfile::Lockfile {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        for (name, dependencies) in [
+            ("root", vec!["left@1.0.0", "right@1.0.0"]),
+            ("left", left_dependencies.to_vec()),
+            ("right", right_dependencies.to_vec()),
+            ("leaf", Vec::new()),
+        ] {
+            lockfile.add_package(lpm_lockfile::LockedPackage {
+                name: name.into(),
+                version: "1.0.0".into(),
+                source: Some("registry+https://registry.npmjs.org".into()),
+                integrity: Some(format!("sha512-{name}")),
+                dependencies: dependencies.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            });
+        }
+        lockfile
+    }
+
     #[test]
     fn build_environment_hash_ignores_unrelated_values() {
         let mut first = HashMap::new();
@@ -513,5 +715,103 @@ mod tests {
         hash_directory_tree(temp.path(), &mut second).unwrap();
 
         assert_ne!(first.finalize(), second.finalize());
+    }
+
+    #[test]
+    fn lockfile_graph_hash_changes_when_dependency_edge_is_rewired() {
+        let first = graph_lockfile(&["leaf@1.0.0"], &[]);
+        let second = graph_lockfile(&[], &["leaf@1.0.0"]);
+
+        assert_ne!(hash_lockfile_graph(&first), hash_lockfile_graph(&second));
+    }
+
+    #[test]
+    fn lockfile_graph_hash_changes_when_patch_identity_changes() {
+        let mut first = graph_lockfile(&["leaf@1.0.0"], &[]);
+        first.patches.insert(
+            "leaf@1.0.0".into(),
+            lpm_lockfile::LockfilePatch {
+                path: "patches/leaf.patch".into(),
+                sha256: "sha256-first".into(),
+                original_integrity: "sha512-leaf".into(),
+            },
+        );
+        let mut second = first.clone();
+        second.patches.get_mut("leaf@1.0.0").unwrap().sha256 = "sha256-second".into();
+
+        assert_ne!(hash_lockfile_graph(&first), hash_lockfile_graph(&second));
+    }
+
+    #[test]
+    fn build_cache_scratch_path_is_stable_for_one_link_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let link_dir = temp.path().join("links/example");
+        let package_dir = link_dir.join("node_modules/example");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(link_dir.join(lpm_store::v2::LINK_META_FILENAME), b"{}").unwrap();
+
+        let first_path = {
+            let scratch = BuildCacheScratch::create(&package_dir).unwrap();
+            scratch.path().to_path_buf()
+        };
+        let second_path = {
+            let scratch = BuildCacheScratch::create(&package_dir).unwrap();
+            scratch.path().to_path_buf()
+        };
+
+        assert_eq!(first_path, second_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_cache_scratch_replaces_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let link_dir = temp.path().join("links/example");
+        let package_dir = link_dir.join("node_modules/example");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"keep").unwrap();
+        std::fs::write(link_dir.join(lpm_store::v2::LINK_META_FILENAME), b"{}").unwrap();
+        symlink(&outside, link_dir.join(".lpm-build-tmp")).unwrap();
+
+        let scratch = BuildCacheScratch::create(&package_dir).unwrap();
+
+        assert!(outside.join("sentinel").is_file());
+        assert_ne!(std::fs::canonicalize(scratch.path()).unwrap(), outside);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_build_detection_ignores_shell_comments() {
+        let package = scriptable_package("fixture", "node build.js # node-gyp rebuild");
+
+        assert!(!is_cacheable_native_build(&package));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_build_detection_ignores_argument_text() {
+        let package = scriptable_package("fixture", "node build.js node-gyp");
+
+        assert!(!is_cacheable_native_build(&package));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_build_detection_recognizes_package_specific_esbuild_installer() {
+        let package = scriptable_package("esbuild", "node install.js");
+
+        assert!(is_cacheable_native_build(&package));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn native_build_detection_recognizes_compound_fallback_command_position() {
+        let package = scriptable_package("fixture", "prebuild-install || node-gyp rebuild");
+
+        assert!(is_cacheable_native_build(&package));
     }
 }

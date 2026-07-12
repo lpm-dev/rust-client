@@ -69,6 +69,9 @@ const BUILDS_DIR: &str = "builds";
 /// Subdirectory holding per-build-key advisory lock files.
 const BUILD_LOCKS_DIR: &str = "build-locks";
 
+/// Subdirectory holding per-graph-entry advisory lock files.
+const BUILD_ENTRY_LOCKS_DIR: &str = "build-entry-locks";
+
 /// Schema tag folded into [`compat_island_key`] so a change to the island's
 /// on-disk layout invalidates every cached island instead of silently
 /// reusing a stale shape.
@@ -148,6 +151,8 @@ pub struct StoreV2Paths {
     builds_root: PathBuf,
     /// `~/.lpm/store/v2/build-locks/` — precomputed for per-key serialization.
     build_locks_root: PathBuf,
+    /// `~/.lpm/store/v2/build-entry-locks/` — precomputed for link-tree mutation.
+    build_entry_locks_root: PathBuf,
 }
 
 impl StoreV2Paths {
@@ -159,6 +164,7 @@ impl StoreV2Paths {
         let compat_root = root.join(COMPAT_DIR);
         let builds_root = root.join(BUILDS_DIR);
         let build_locks_root = root.join(BUILD_LOCKS_DIR);
+        let build_entry_locks_root = root.join(BUILD_ENTRY_LOCKS_DIR);
         Self {
             root,
             objects_root,
@@ -166,6 +172,7 @@ impl StoreV2Paths {
             compat_root,
             builds_root,
             build_locks_root,
+            build_entry_locks_root,
         }
     }
 
@@ -177,6 +184,7 @@ impl StoreV2Paths {
         let compat_root = root.join(COMPAT_DIR);
         let builds_root = root.join(BUILDS_DIR);
         let build_locks_root = root.join(BUILD_LOCKS_DIR);
+        let build_entry_locks_root = root.join(BUILD_ENTRY_LOCKS_DIR);
         Self {
             root,
             objects_root,
@@ -184,6 +192,7 @@ impl StoreV2Paths {
             compat_root,
             builds_root,
             build_locks_root,
+            build_entry_locks_root,
         }
     }
 
@@ -243,6 +252,19 @@ impl StoreV2Paths {
     #[inline]
     pub fn build_locks_root(&self) -> &Path {
         &self.build_locks_root
+    }
+
+    /// Advisory lock path serializing mutation of one v2 graph entry.
+    #[inline]
+    pub fn build_entry_lock_path(&self, graph_key_digest: &str) -> PathBuf {
+        self.build_entry_locks_root
+            .join(format!("{graph_key_digest}.lock"))
+    }
+
+    /// `~/.lpm/store/v2/build-entry-locks/` — per-graph-entry advisory locks.
+    #[inline]
+    pub fn build_entry_locks_root(&self) -> &Path {
+        &self.build_entry_locks_root
     }
 
     /// `~/.lpm/store/v2/compat/<island-key>/` — the cached island for a
