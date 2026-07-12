@@ -155,7 +155,25 @@ jobs:
         run: cargo nextest run --locked -p lpm-cli -E 'not binary_id(/bin\/lpm-rs/)' --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Native build cache workflow (Linux sandbox)
-        run: cargo nextest run --locked -p lpm-workflows --test native_build_cache --no-fail-fast --status-level slow --final-status-level fail
+        run: |
+          test_bin="$(
+            cargo test --locked -p lpm-workflows --test native_build_cache --no-run --message-format=json |
+              jq -r 'select(.reason == "compiler-artifact" and .target.name == "native_build_cache" and .profile.test) | .executable' |
+              tail -n 1
+          )"
+          test -n "$test_bin"
+          test_bin="$(realpath "$test_bin")"
+          docker run --rm --privileged \
+            --security-opt apparmor=unconfined \
+            --security-opt seccomp=unconfined \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --workdir "$GITHUB_WORKSPACE" \
+            ubuntu:24.04 \
+            bash -euxo pipefail -c '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install --yes nodejs libdbus-1-3
+              "$1" --test-threads=1
+            ' bash "$test_bin"
 
   macos-workspace:
     name: macOS workspace checks
