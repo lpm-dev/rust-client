@@ -117,7 +117,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::landlock_rules::{RuleAccess, describe_rules};
+use crate::landlock_rules::RuleAccess;
 use crate::posture_decision::{PostureDecision, REQUIRED_KERNEL_FOR_STRICT, decide_posture};
 use crate::{
     Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec,

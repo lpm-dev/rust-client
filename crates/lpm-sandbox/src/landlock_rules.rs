@@ -94,6 +94,7 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
 /// 1. Testable without a Linux kernel (runs on macOS host).
 /// 2. Free of unsafe `PathFd` opens at rule-description time (those
 ///    happen in the child's pre_exec hook in [`crate::linux`]).
+#[cfg(test)]
 pub(crate) fn describe_rules(spec: &SandboxSpec) -> Vec<(PathBuf, RuleAccess)> {
     describe_rules_with_isolation(spec, false)
 }
