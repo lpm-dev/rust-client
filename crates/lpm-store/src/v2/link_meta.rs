@@ -265,6 +265,12 @@ impl LinkMeta {
                 parsed.name
             )));
         }
+        if !is_lower_hex_digest(&parsed.graph_key_digest_hex) {
+            return Err(LpmError::Store(format!(
+                "v2 link sidecar at {} has invalid graph-key digest",
+                path.display()
+            )));
+        }
         Ok(parsed)
     }
 
@@ -397,6 +403,13 @@ fn validate_path_segment(s: &str) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -683,5 +696,21 @@ mod tests {
         digest_bytes.copy_from_slice(&raw);
         let reconstructed = GraphKey::from_recorded(&meta.name, &meta.version, digest_bytes);
         assert_eq!(reconstructed, key);
+    }
+
+    #[test]
+    fn read_from_rejects_graph_key_digest_outside_exact_lower_hex_shape() {
+        for invalid in ["../../outside".into(), "A".repeat(64), "a".repeat(63)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut meta = sample_meta();
+            meta.graph_key_digest_hex = invalid;
+            std::fs::write(
+                dir.path().join(LINK_META_FILENAME),
+                serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+
+            assert!(LinkMeta::read_from(dir.path()).is_err());
+        }
     }
 }

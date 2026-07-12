@@ -188,6 +188,7 @@ fn default_mode_bind_mounts_dotenv_to_empty() {
     let options = SandboxOptions {
         allow_degraded: false,
         deny_outbound_network: false,
+        build_cache_isolation: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");
@@ -230,6 +231,7 @@ fn default_mode_does_not_overlay_source_files() {
     let options = SandboxOptions {
         allow_degraded: false,
         deny_outbound_network: false,
+        build_cache_isolation: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");

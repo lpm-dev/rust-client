@@ -15,6 +15,8 @@ expression: json
   "object_entries_orphaned": [],
   "compat_islands_total": 0,
   "compat_islands_orphaned": [],
+  "build_artifacts_total": 0,
+  "build_artifacts_orphaned": [],
   "bytes_freed_or_eligible": 0,
   "registry_missing": true,
   "registry_corrupt": false,

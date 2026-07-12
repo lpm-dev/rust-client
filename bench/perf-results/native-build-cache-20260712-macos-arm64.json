@@ -1,0 +1,49 @@
+{
+  "generated_at": "2026-07-12T13:19:13.671Z",
+  "platform": "darwin-arm64",
+  "node": "v22.22.1",
+  "lpm_bin": "target/release/lpm-rs",
+  "fixture": "bench/audit-fixtures/native/esbuild-prebuilt",
+  "samples": 10,
+  "artifact_count": 2,
+  "artifact_bytes": 134444,
+  "scenarios": {
+    "cache_miss": {
+      "samples": 10,
+      "wall_ms_median": 138.03,
+      "wall_ms_p95": 449.94,
+      "max_rss_bytes_median": 52248576,
+      "user_cpu_ms_median": 50,
+      "system_cpu_ms_median": 20,
+      "cache_hits": 0,
+      "cache_misses": 10,
+      "lifecycle_ms_avoided": 0
+    },
+    "local_hit": {
+      "samples": 10,
+      "wall_ms_median": 32.33,
+      "wall_ms_p95": 37.27,
+      "max_rss_bytes_median": 41467904,
+      "user_cpu_ms_median": 10,
+      "system_cpu_ms_median": 10,
+      "cache_hits": 10,
+      "cache_misses": 0,
+      "lifecycle_ms_avoided": 1356,
+      "speedup_vs_miss": 4.27,
+      "wall_reduction_percent": 76.58
+    },
+    "ci_warm_store_hit": {
+      "samples": 10,
+      "wall_ms_median": 29.5,
+      "wall_ms_p95": 30.12,
+      "max_rss_bytes_median": 41418752,
+      "user_cpu_ms_median": 10,
+      "system_cpu_ms_median": 10,
+      "cache_hits": 10,
+      "cache_misses": 0,
+      "lifecycle_ms_avoided": 1053,
+      "speedup_vs_miss": 4.68,
+      "wall_reduction_percent": 78.63
+    }
+  }
+}

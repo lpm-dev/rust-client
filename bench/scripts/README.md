@@ -1,5 +1,22 @@
 # Install benchmark scripts
 
+## Native lifecycle-build cache
+
+Build the release CLI, then compare strict cache misses, local artifact hits,
+and CI-like stable-path checkout recreation against sharp's NativeToolchain
+cache path. Every measured scenario uses the same strict sandbox, so cache-hit
+timings include host compiler, SDK, package database, and pkg-config
+fingerprinting:
+
+```bash
+cargo build --release --locked -p lpm-cli --bin lpm-rs
+node bench/scripts/native-build-cache-benchmark.mjs --self-test
+node bench/scripts/native-build-cache-benchmark.mjs --samples 10
+```
+
+The harness writes raw rows plus JSON and Markdown summaries under
+`bench/perf-results/native-build-cache-<timestamp>/`.
+
 ## Production-readiness harness
 
 `run-install-readiness.mjs` is the current install-readiness harness. It is

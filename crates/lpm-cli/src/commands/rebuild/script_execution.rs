@@ -51,15 +51,7 @@ pub(super) fn execute_script(
     // worked accidentally because `std::process::Command::env` on
     // Windows does case-insensitive deduplication and our explicit
     // `"PATH"` overrides won, but the LOOKUP path was still broken.
-    let parent_path = find_env_case_insensitive(env, "PATH");
-    let path_value = build_lifecycle_path(project_dir, parent_path);
-    let mut envs: Vec<(String, String)> = env
-        .iter()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("PATH") && !k.eq_ignore_ascii_case("INIT_CWD"))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
-    envs.push(("PATH".to_string(), path_value));
+    let envs = build_lifecycle_environment(env, project_dir, tmpdir);
 
     let start = std::time::Instant::now();
 
@@ -95,6 +87,33 @@ pub(super) fn execute_script(
         }
         Err(e) => Err(e),
     }
+}
+
+pub(super) fn build_lifecycle_environment(
+    env: &HashMap<String, String>,
+    project_dir: &Path,
+    tmpdir: &Path,
+) -> Vec<(String, String)> {
+    let parent_path = find_env_case_insensitive(env, "PATH");
+    let path_value = build_lifecycle_path(project_dir, parent_path);
+    let mut envs: Vec<(String, String)> = env
+        .iter()
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("PATH")
+                && !k.eq_ignore_ascii_case("INIT_CWD")
+                && !k.eq_ignore_ascii_case("TMPDIR")
+                && !k.eq_ignore_ascii_case("TMP")
+                && !k.eq_ignore_ascii_case("TEMP")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
+    envs.push(("PATH".to_string(), path_value));
+    let tmp = tmpdir.display().to_string();
+    envs.push(("TMPDIR".to_string(), tmp.clone()));
+    envs.push(("TMP".to_string(), tmp.clone()));
+    envs.push(("TEMP".to_string(), tmp));
+    envs
 }
 
 /// — resolve the live per-package directory where lifecycle

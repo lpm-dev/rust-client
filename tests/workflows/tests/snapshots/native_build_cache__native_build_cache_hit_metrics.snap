@@ -1,0 +1,27 @@
+---
+source: tests/workflows/tests/native_build_cache.rs
+expression: envelope
+---
+{
+  "success": true,
+  "built": 1,
+  "failed": 0,
+  "build_cache": {
+    "eligible": 1,
+    "hits": 1,
+    "misses": 0,
+    "bypassed": 0,
+    "local_state_hits": 0,
+    "scripts_avoided": 1,
+    "restored_bytes": "<bytes>",
+    "lifecycle_ms_avoided": "<ms>",
+    "timings_ms": {
+      "preparation": "<ms>",
+      "key": "<ms>",
+      "lookup": "<ms>",
+      "restore": "<ms>",
+      "rematerialize": "<ms>",
+      "publish": "<ms>"
+    }
+  }
+}

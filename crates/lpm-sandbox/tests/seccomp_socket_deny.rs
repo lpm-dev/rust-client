@@ -125,6 +125,7 @@ fn denies_udp_socket_under_strict() {
     let options = SandboxOptions {
         deny_outbound_network: true,
         allow_degraded: false,
+        build_cache_isolation: false,
     };
     let sb = match new_for_platform_with_options(realistic_spec(), SandboxMode::Enforce, options) {
         Ok(sb) => sb,

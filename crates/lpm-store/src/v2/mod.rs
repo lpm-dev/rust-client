@@ -37,6 +37,7 @@
 //!
 //! See [`GraphKey::derive`] for the exact byte layout fed into BLAKE3.
 
+pub mod build_cache;
 pub(crate) mod finalize_permits;
 pub(crate) mod fs_util;
 pub mod graph_key;
@@ -47,6 +48,11 @@ pub mod platform;
 pub mod store;
 pub(crate) mod tree_hash;
 
+pub use build_cache::{
+    BUILD_ARTIFACT_COMPLETE_FILENAME, BuildArtifact, BuildArtifactManifest, BuildArtifactPublish,
+    BuildCacheKey, BuildKeyInputs, BuildPlatformFingerprint, BuildRuntimeFingerprint,
+    BuildSandboxFingerprint, BuildScriptFingerprint,
+};
 pub use graph_key::{DepEdge, GraphKey, GraphKeyInputs, LinkerModeTag, PeerEntry};
 pub use link_meta::{
     LINK_META_FILENAME, LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaDep, LinkMetaPlatform,

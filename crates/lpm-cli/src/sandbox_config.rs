@@ -469,6 +469,7 @@ fn merge(project: RawSandboxKeys, global: RawSandboxKeys) -> (SandboxOptions, Re
             .or(global.allow_degraded)
             .unwrap_or(false),
         deny_outbound_network,
+        build_cache_isolation: false,
     };
     (options, resolved)
 }

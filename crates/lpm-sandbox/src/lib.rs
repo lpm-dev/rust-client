@@ -286,6 +286,12 @@ pub struct SandboxOptions {
     ///
     /// Participates in the sandbox CLI / config / env precedence chain.
     pub deny_outbound_network: bool,
+
+    /// Restrict persistent writes to the package directory and the supplied
+    /// temporary directory. This is used only while producing a reusable
+    /// lifecycle-build artifact; normal lifecycle execution keeps the broader
+    /// compatibility write set.
+    pub build_cache_isolation: bool,
 }
 
 impl SandboxOptions {

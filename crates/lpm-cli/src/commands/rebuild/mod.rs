@@ -29,6 +29,7 @@
 //!   entire group (not just the direct child), preventing orphaned subprocesses
 //! - On Windows: `Child::kill()` terminates the process tree via `TerminateProcess`
 
+mod build_cache;
 mod hints;
 mod package_dir;
 mod process_tree;
@@ -40,6 +41,10 @@ mod trust;
 #[cfg(test)]
 mod tests;
 
+use self::build_cache::{
+    BuildCacheInvocation, BuildCacheScratch, build_key_for_package, is_cacheable_native_build,
+    marker_requires_key_validation, read_build_marker_key, read_v2_graph_key_digest,
+};
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
 pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
@@ -47,7 +52,7 @@ use self::package_dir::prepare_live_package_dir;
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
 use self::scripts::{
-    BUILD_MARKER, ScriptablePackage, count_untrusted_unbuilt, package_baseline_dir_indexed,
+    BUILD_MARKER, BuildCacheMetrics, ScriptablePackage, count_untrusted_unbuilt,
     read_lifecycle_scripts, rebuild_dry_run_envelope, rebuild_package_failure_message,
     rebuild_package_label, rebuild_summary_envelope, scripts_word, toposort_packages,
     warn_stale_trusted_deps, widen_to_build_by_policy,
@@ -61,12 +66,16 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_sandbox::SandboxMode;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
-use lpm_store::V2BaselineIndex;
+use lpm_store::{PackageBaselineLayout, V2BaselineIndex};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 300;
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -287,11 +296,22 @@ async fn run_under_store_lock(
         // installs); silent skip preserves the previously
         // `pkg_json_path.exists()` semantic for non-store sources
         // while fixing the v2-installed-and-skipped data-loss bug.
-        let pkg_dir =
-            match package_baseline_dir_indexed(&baseline_index, &lpm_root, &lp.name, &lp.version) {
-                Some(p) => p,
-                None => continue,
-            };
+        let baseline = match lpm_store::find_installed_package_baseline_indexed(
+            &baseline_index,
+            &lpm_root,
+            &lp.name,
+            &lp.version,
+        ) {
+            Some(baseline) => baseline,
+            None => continue,
+        };
+        let graph_key_digest = if baseline.layout == PackageBaselineLayout::V2 {
+            read_v2_graph_key_digest(&baseline.package_dir)
+        } else {
+            None
+        };
+        let pkg_dir = baseline.package_dir;
+        let pristine_path = baseline.pristine_dir;
         let pkg_json_path = pkg_dir.join("package.json");
 
         if !pkg_json_path.exists() {
@@ -303,7 +323,11 @@ async fn run_under_store_lock(
             _ => continue,
         };
 
-        let is_built = pkg_dir.join(BUILD_MARKER).exists();
+        let marker_path = pkg_dir.join(BUILD_MARKER);
+        let is_built = marker_path.exists();
+        let build_marker_key = is_built
+            .then(|| read_build_marker_key(&marker_path))
+            .flatten();
 
         // trust decision
         // now flows through the shared [`evaluate_trust`] helper so
@@ -373,8 +397,12 @@ async fn run_under_store_lock(
             integrity: lp.integrity.clone(),
             wrapper_id,
             store_path: pkg_dir,
+            pristine_path,
+            source_integrity: baseline.integrity,
+            graph_key_digest,
             scripts,
             is_built,
+            build_marker_key,
             is_trusted,
             trust_reason,
         });
@@ -407,7 +435,7 @@ async fn run_under_store_lock(
             let result = if dry_run {
                 rebuild_dry_run_envelope(&[], force_security_floor)
             } else {
-                rebuild_summary_envelope(0, 0, force_security_floor)
+                rebuild_summary_envelope(0, 0, force_security_floor, &BuildCacheMetrics::default())
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         } else {
@@ -470,7 +498,7 @@ async fn run_under_store_lock(
     } else {
         selected_for_policy
             .into_iter()
-            .filter(|p| !p.is_built)
+            .filter(|p| !p.is_built || (!dry_run && marker_requires_key_validation(p)))
             .collect()
     };
 
@@ -482,7 +510,7 @@ async fn run_under_store_lock(
             let result = if dry_run {
                 rebuild_dry_run_envelope(&to_build, force_security_floor)
             } else {
-                rebuild_summary_envelope(0, 0, force_security_floor)
+                rebuild_summary_envelope(0, 0, force_security_floor, &BuildCacheMetrics::default())
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         } else {
@@ -706,6 +734,7 @@ async fn run_under_store_lock(
     let mut successes = 0usize;
     let mut failures = 0usize;
     let mut completed_scripts = 0usize;
+    let mut build_cache_metrics = BuildCacheMetrics::default();
     let mut built_packages = Vec::with_capacity(to_build.len());
     let package_label_width = to_build
         .iter()
@@ -902,6 +931,8 @@ async fn run_under_store_lock(
     lpm_sandbox::prepare_writable_dirs(&prepare_spec)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
 
+    let mut effective_sandbox_posture = lpm_sandbox::SandboxPosture::Disabled;
+
     // `sandbox_options` already carries `allow-degraded` and
     // `deny_outbound_network` from the resolver call above. Reusing
     // it here preserves the resolved mode for both the pre-probe and
@@ -941,6 +972,7 @@ async fn run_under_store_lock(
             sandbox_options.clone(),
         )
         .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+        effective_sandbox_posture = probe_sandbox.posture();
         // per-install warning: emitted once when the
         // probe's effective posture is `Degraded`. The structured
         // line names kernel + active ABI + missing dimension so log
@@ -972,6 +1004,20 @@ async fn run_under_store_lock(
         }
         drop(probe_sandbox);
     }
+
+    let cache_preparation_start = std::time::Instant::now();
+    let build_cache_invocation = BuildCacheInvocation::prepare(
+        &lockfile,
+        &sanitized_env,
+        project_dir,
+        sandbox_mode,
+        &effective_sandbox_posture,
+        &sandbox_options,
+        &extra_write_dirs,
+        &extra_secret_read_allow,
+        &requested_capabilities,
+    );
+    build_cache_metrics.preparation_ms = elapsed_millis(cache_preparation_start.elapsed());
 
     // Banners fire AFTER the probe succeeds. On Linux + LogOnly the
     // probe above bailed with ModeNotSupportedOnPlatform, so this
@@ -1038,6 +1084,60 @@ async fn run_under_store_lock(
     for pkg in &to_build {
         let mut pkg_success = true;
 
+        let key_start = std::time::Instant::now();
+        let mut build_key = build_cache_invocation
+            .as_ref()
+            .and_then(|invocation| build_key_for_package(invocation, pkg, project_dir));
+        build_cache_metrics.key_ms += elapsed_millis(key_start.elapsed());
+        if build_key.is_some() {
+            build_cache_metrics.eligible += 1;
+        } else if is_cacheable_native_build(pkg) {
+            build_cache_metrics.bypassed += 1;
+        }
+        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+        let _build_entry_lock = if let Some(graph_key_digest) = pkg.graph_key_digest.as_deref() {
+            match v2_store
+                .paths()
+                .build_entry_lock_path(graph_key_digest)
+                .and_then(lpm_common::acquire_exclusive_lock)
+            {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    if !json_output {
+                        let label = rebuild_package_label(pkg);
+                        install_ui::detail(&format!(
+                            "  {} {label:<package_label_width$}  failed to lock package build state: {error}",
+                            install_ui::red("✗"),
+                        ));
+                    }
+                    if json_output {
+                        install_ui::failed(&rebuild_package_failure_message(pkg, &error));
+                    }
+                    failures += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let _build_key_lock = if let Some(key) = build_key.as_ref() {
+            match lpm_common::acquire_exclusive_lock(v2_store.paths().build_lock_path(key)) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    tracing::warn!(
+                        "build cache bypassed for {}@{} because the per-key lock failed: {error}",
+                        pkg.name,
+                        pkg.version
+                    );
+                    build_cache_metrics.bypassed += 1;
+                    build_key = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // fix: lifecycle scripts must run from the LIVE
         // per-package directory (where the symlinked sibling
         // node_modules/ exists), not the global content-addressable
@@ -1079,6 +1179,156 @@ async fn run_under_store_lock(
             }
         };
 
+        let marker_path = pkg.store_path.join(BUILD_MARKER);
+        let current_marker_exists = marker_path.is_file();
+        let current_marker_key = current_marker_exists
+            .then(|| read_build_marker_key(&marker_path))
+            .flatten();
+        if force {
+            if let Err(error) = std::fs::remove_file(&marker_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    "failed to clear build marker for forced rebuild of {}: {error}",
+                    pkg.name
+                );
+            }
+        } else if current_marker_exists {
+            match (current_marker_key.as_deref(), build_key.as_ref()) {
+                (Some(marker_key), Some(key)) if marker_key == key.as_str() => {
+                    build_cache_metrics.local_state_hits += 1;
+                    continue;
+                }
+                (_, None) => continue,
+                _ => {
+                    if let Err(error) = std::fs::remove_file(&marker_path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            "failed to clear stale build marker for {}: {error}",
+                            pkg.name
+                        );
+                    }
+                }
+            }
+        }
+        if !force && let Some(key) = build_key.as_ref() {
+            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+            let lookup_start = std::time::Instant::now();
+            match store.reusable_build_artifact(key) {
+                Ok(Some(artifact)) => {
+                    build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
+                    let restore_start = std::time::Instant::now();
+                    match store.restore_build_artifact(&artifact, &pkg.store_path) {
+                        Ok(()) => {
+                            build_cache_metrics.restore_ms +=
+                                elapsed_millis(restore_start.elapsed());
+                            build_cache_metrics.hits += 1;
+                            build_cache_metrics.scripts_avoided += pkg.scripts.len();
+                            build_cache_metrics.restored_bytes += artifact.manifest.unpacked_bytes;
+                            build_cache_metrics.lifecycle_ms_avoided +=
+                                artifact.manifest.lifecycle_duration_ms;
+                            if let Err(error) = std::fs::write(
+                                pkg.store_path.join(BUILD_MARKER),
+                                key.as_str().as_bytes(),
+                            ) {
+                                tracing::warn!(
+                                    "failed to write restored build marker for {}: {error}",
+                                    pkg.name
+                                );
+                            }
+                            if !json_output {
+                                let label = rebuild_package_label(pkg);
+                                install_ui::detail(&format!(
+                                    "  {} {label:<package_label_width$}  {}",
+                                    install_ui::green("✓"),
+                                    install_ui::dim("build cache hit"),
+                                ));
+                            }
+                            successes += 1;
+                            built_packages.push((
+                                pkg.name.clone(),
+                                pkg.version.clone(),
+                                pkg.integrity.clone(),
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            build_cache_metrics.restore_ms +=
+                                elapsed_millis(restore_start.elapsed());
+                            build_cache_metrics.misses += 1;
+                            tracing::warn!(
+                                "failed to restore build cache entry for {}@{}: {error}",
+                                pkg.name,
+                                pkg.version
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
+                    build_cache_metrics.misses += 1;
+                }
+                Err(error) => {
+                    build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
+                    build_cache_metrics.misses += 1;
+                    tracing::warn!(
+                        "failed to inspect build cache entry for {}@{}: {error}",
+                        pkg.name,
+                        pkg.version
+                    );
+                }
+            }
+        }
+
+        if build_key.is_some() {
+            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+            let rematerialize_start = std::time::Instant::now();
+            if let Err(error) = store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
+            {
+                build_cache_metrics.rematerialize_ms +=
+                    elapsed_millis(rematerialize_start.elapsed());
+                if !json_output {
+                    let label = rebuild_package_label(pkg);
+                    install_ui::detail(&format!(
+                        "  {} {label:<package_label_width$}  failed to restore pristine source: {error}",
+                        install_ui::red("✗"),
+                    ));
+                }
+                failures += 1;
+                continue;
+            }
+            build_cache_metrics.rematerialize_ms += elapsed_millis(rematerialize_start.elapsed());
+        }
+
+        let build_cache_scratch = if build_key.is_some() {
+            let scratch = pkg
+                .graph_key_digest
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("package has no v2 graph identity"))
+                .and_then(|digest| BuildCacheScratch::create(&pkg.store_path, digest));
+            match scratch {
+                Ok(scratch) => Some(scratch),
+                Err(error) => {
+                    tracing::warn!(
+                        "build cache bypassed for {}@{} because isolated scratch setup failed: {error}",
+                        pkg.name,
+                        pkg.version
+                    );
+                    build_key = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let script_tmpdir = build_cache_scratch
+            .as_ref()
+            .map_or(tmpdir.as_path(), BuildCacheScratch::path);
+        let mut package_sandbox_options = sandbox_options.clone();
+        package_sandbox_options.build_cache_isolation = build_key.is_some();
+
+        let lifecycle_start = std::time::Instant::now();
         for phase in EXECUTED_INSTALL_PHASES {
             let cmd = match pkg.scripts.get(*phase) {
                 Some(c) => c,
@@ -1094,12 +1344,12 @@ async fn run_under_store_lock(
                 &sanitized_env,
                 &timeout,
                 sandbox_mode,
-                &sandbox_options,
+                &package_sandbox_options,
                 &extra_write_dirs,
                 &extra_secret_read_allow,
                 &store_root,
                 &home_dir,
-                &tmpdir,
+                script_tmpdir,
             ) {
                 Ok(()) => {
                     if !json_output {
@@ -1128,9 +1378,29 @@ async fn run_under_store_lock(
         }
 
         if pkg_success {
-            // Write .lpm-built marker
+            if let Some(key) = build_key.as_ref() {
+                let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+                let publish_start = std::time::Instant::now();
+                if let Err(error) = store.publish_build_artifact(
+                    key,
+                    &pkg.source_integrity,
+                    &pkg.store_path,
+                    elapsed_millis(lifecycle_start.elapsed()),
+                    force,
+                ) {
+                    tracing::warn!(
+                        "failed to publish build cache entry for {}@{}: {error}",
+                        pkg.name,
+                        pkg.version
+                    );
+                }
+                build_cache_metrics.publish_ms += elapsed_millis(publish_start.elapsed());
+            }
             let marker_path = pkg.store_path.join(BUILD_MARKER);
-            if let Err(e) = std::fs::write(&marker_path, "") {
+            let marker = build_key
+                .as_ref()
+                .map_or(&[][..], |key| key.as_str().as_bytes());
+            if let Err(e) = std::fs::write(&marker_path, marker) {
                 tracing::warn!("failed to write build marker for {}: {e}", pkg.name);
             }
             successes += 1;
@@ -1142,7 +1412,12 @@ async fn run_under_store_lock(
 
     // Summary
     if json_output {
-        let json = rebuild_summary_envelope(successes, failures, force_security_floor);
+        let json = rebuild_summary_envelope(
+            successes,
+            failures,
+            force_security_floor,
+            &build_cache_metrics,
+        );
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if failures == 0 {
         eprintln!();

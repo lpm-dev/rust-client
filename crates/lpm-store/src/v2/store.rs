@@ -62,6 +62,16 @@ const LINKS_DIR: &str = "links";
 /// re-copying every package.
 const COMPAT_DIR: &str = "compat";
 
+/// Subdirectory holding lifecycle-build artifacts keyed by their complete
+/// execution inputs.
+const BUILDS_DIR: &str = "builds";
+
+/// Subdirectory holding per-build-key advisory lock files.
+const BUILD_LOCKS_DIR: &str = "build-locks";
+
+/// Subdirectory holding per-graph-entry advisory lock files.
+const BUILD_ENTRY_LOCKS_DIR: &str = "build-entry-locks";
+
 /// Schema tag folded into [`compat_island_key`] so a change to the island's
 /// on-disk layout invalidates every cached island instead of silently
 /// reusing a stale shape.
@@ -137,6 +147,12 @@ pub struct StoreV2Paths {
     links_root: PathBuf,
     /// `~/.lpm/store/v2/compat/` — precomputed for the same reason.
     compat_root: PathBuf,
+    /// `~/.lpm/store/v2/builds/` — precomputed for build-cache operations.
+    builds_root: PathBuf,
+    /// `~/.lpm/store/v2/build-locks/` — precomputed for per-key serialization.
+    build_locks_root: PathBuf,
+    /// `~/.lpm/store/v2/build-entry-locks/` — precomputed for link-tree mutation.
+    build_entry_locks_root: PathBuf,
 }
 
 impl StoreV2Paths {
@@ -146,11 +162,17 @@ impl StoreV2Paths {
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
         let compat_root = root.join(COMPAT_DIR);
+        let builds_root = root.join(BUILDS_DIR);
+        let build_locks_root = root.join(BUILD_LOCKS_DIR);
+        let build_entry_locks_root = root.join(BUILD_ENTRY_LOCKS_DIR);
         Self {
             root,
             objects_root,
             links_root,
             compat_root,
+            builds_root,
+            build_locks_root,
+            build_entry_locks_root,
         }
     }
 
@@ -160,11 +182,17 @@ impl StoreV2Paths {
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
         let compat_root = root.join(COMPAT_DIR);
+        let builds_root = root.join(BUILDS_DIR);
+        let build_locks_root = root.join(BUILD_LOCKS_DIR);
+        let build_entry_locks_root = root.join(BUILD_ENTRY_LOCKS_DIR);
         Self {
             root,
             objects_root,
             links_root,
             compat_root,
+            builds_root,
+            build_locks_root,
+            build_entry_locks_root,
         }
     }
 
@@ -194,6 +222,55 @@ impl StoreV2Paths {
     #[inline]
     pub fn compat_root(&self) -> &Path {
         &self.compat_root
+    }
+
+    /// `~/.lpm/store/v2/builds/` — root of lifecycle-build artifacts.
+    #[inline]
+    pub fn builds_root(&self) -> &Path {
+        &self.builds_root
+    }
+
+    /// Return the content-addressed directory for a lifecycle-build key.
+    #[inline]
+    pub fn build_artifact_dir(&self, key: &crate::v2::BuildCacheKey) -> PathBuf {
+        self.builds_root.join(key.as_str())
+    }
+
+    /// Advisory lock path serializing work for one lifecycle-build key.
+    #[inline]
+    pub fn build_lock_path(&self, key: &crate::v2::BuildCacheKey) -> PathBuf {
+        self.build_lock_path_for_key(key.as_str())
+    }
+
+    /// Advisory lock path for a validated hexadecimal build-key string.
+    #[inline]
+    pub fn build_lock_path_for_key(&self, key: &str) -> PathBuf {
+        self.build_locks_root.join(format!("{key}.lock"))
+    }
+
+    /// `~/.lpm/store/v2/build-locks/` — per-key advisory locks.
+    #[inline]
+    pub fn build_locks_root(&self) -> &Path {
+        &self.build_locks_root
+    }
+
+    /// Advisory lock path serializing mutation of one v2 graph entry.
+    #[inline]
+    pub fn build_entry_lock_path(&self, graph_key_digest: &str) -> Result<PathBuf, LpmError> {
+        if !crate::v2::link_meta::is_lower_hex_digest(graph_key_digest) {
+            return Err(LpmError::Store(
+                "invalid graph-key digest for build-entry lock".into(),
+            ));
+        }
+        Ok(self
+            .build_entry_locks_root
+            .join(format!("{graph_key_digest}.lock")))
+    }
+
+    /// `~/.lpm/store/v2/build-entry-locks/` — per-graph-entry advisory locks.
+    #[inline]
+    pub fn build_entry_locks_root(&self) -> &Path {
+        &self.build_entry_locks_root
     }
 
     /// `~/.lpm/store/v2/compat/<island-key>/` — the cached island for a
