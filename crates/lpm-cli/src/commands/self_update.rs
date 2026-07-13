@@ -1023,27 +1023,21 @@ fn detect_platform() -> Result<(&'static str, &'static str), LpmError> {
     detect_platform_for(
         std::env::consts::OS,
         std::env::consts::ARCH,
-        resolve_linux_libc(executable_linux_libc(), lpm_common::platform::detect_libc()),
+        resolve_linux_libc(EXECUTABLE_LINUX_LIBC, lpm_common::platform::detect_libc()),
     )
 }
 
 #[cfg(all(target_os = "linux", target_env = "musl"))]
-const fn executable_linux_libc() -> Option<&'static str> {
-    Some("musl")
-}
+const EXECUTABLE_LINUX_LIBC: Option<&str> = Some("musl");
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-const fn executable_linux_libc() -> Option<&'static str> {
-    Some("gnu")
-}
+const EXECUTABLE_LINUX_LIBC: Option<&str> = Some("gnu");
 
 #[cfg(not(any(
     all(target_os = "linux", target_env = "musl"),
     all(target_os = "linux", target_env = "gnu")
 )))]
-const fn executable_linux_libc() -> Option<&'static str> {
-    None
-}
+const EXECUTABLE_LINUX_LIBC: Option<&str> = None;
 
 const fn resolve_linux_libc<'a>(
     executable_libc: Option<&'a str>,
