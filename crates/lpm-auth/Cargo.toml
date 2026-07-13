@@ -39,7 +39,7 @@ tokio = { workspace = true, features = ["sync"] }
 # Diagnostics
 tracing = { workspace = true }
 
-[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dependencies]
 keyring = { workspace = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

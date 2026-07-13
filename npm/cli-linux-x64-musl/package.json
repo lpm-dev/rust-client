@@ -1,7 +1,7 @@
 {
-  "name": "@lpm-registry/cli-linux-x64",
+  "name": "@lpm-registry/cli-linux-x64-musl",
   "version": "0.67.0",
-  "description": "LPM CLI native binary for Linux x64",
+  "description": "LPM CLI native binary for Linux x64 (musl)",
   "repository": {
     "type": "git",
     "url": "https://github.com/lpm-dev/rust-client"
@@ -14,7 +14,7 @@
     "x64"
   ],
   "libc": [
-    "glibc"
+    "musl"
   ],
   "files": [
     "lpm",

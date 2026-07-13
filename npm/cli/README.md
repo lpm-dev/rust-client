@@ -8,7 +8,8 @@ npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
 
 This package is the npm gateway for the native LPM CLI. It installs a small
 JavaScript launcher plus the matching platform package, such as
-`@lpm-registry/cli-darwin-arm64` or `@lpm-registry/cli-linux-x64`. A tiny
+`@lpm-registry/cli-darwin-arm64`, `@lpm-registry/cli-linux-x64`, or
+`@lpm-registry/cli-linux-x64-musl`. A tiny
 `postinstall` verifier checks the native binary and wires the global command to
 it where the platform allows that.
 

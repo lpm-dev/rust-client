@@ -1020,13 +1020,49 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
 
 /// Detect the current platform for GitHub Release binary names.
 fn detect_platform() -> Result<(&'static str, &'static str), LpmError> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+    detect_platform_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        resolve_linux_libc(EXECUTABLE_LINUX_LIBC, lpm_common::platform::detect_libc()),
+    )
+}
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const EXECUTABLE_LINUX_LIBC: Option<&str> = Some("musl");
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const EXECUTABLE_LINUX_LIBC: Option<&str> = Some("gnu");
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "musl"),
+    all(target_os = "linux", target_env = "gnu")
+)))]
+const EXECUTABLE_LINUX_LIBC: Option<&str> = None;
+
+const fn resolve_linux_libc<'a>(
+    executable_libc: Option<&'a str>,
+    detected_host_libc: Option<&'a str>,
+) -> Option<&'a str> {
+    match executable_libc {
+        Some(libc) => Some(libc),
+        None => detected_host_libc,
+    }
+}
+
+fn detect_platform_for(
+    os: &str,
+    arch: &str,
+    libc: Option<&str>,
+) -> Result<(&'static str, &'static str), LpmError> {
     match (os, arch) {
         ("macos", "aarch64") => Ok(("darwin-arm64", "")),
         ("macos", "x86_64") => Ok(("darwin-x64", "")),
+        ("linux", "x86_64") if libc == Some("musl") => Ok(("linux-x64-musl", "")),
         ("linux", "x86_64") => Ok(("linux-x64", "")),
+        ("linux", "aarch64") if libc == Some("musl") => Err(LpmError::Script(
+            "unsupported platform: linux-aarch64-musl. Official musl releases currently support x86_64; build from source on ARM64"
+                .to_string(),
+        )),
         ("linux", "aarch64") => Ok(("linux-arm64", "")),
         ("windows", "x86_64") => Ok(("win32-x64", ".exe")),
         _ => Err(LpmError::Script(format!(
@@ -1069,6 +1105,32 @@ mod tests {
     fn install_method_name_not_empty() {
         let method = detect_install_method();
         assert!(!method.name().is_empty());
+    }
+
+    #[test]
+    fn detect_platform_selects_musl_asset_on_linux_x64_musl() {
+        assert_eq!(
+            detect_platform_for("linux", "x86_64", Some("musl")).unwrap(),
+            ("linux-x64-musl", "")
+        );
+    }
+
+    #[test]
+    fn detect_platform_preserves_gnu_asset_on_linux_x64_glibc() {
+        assert_eq!(
+            detect_platform_for("linux", "x86_64", Some("glibc")).unwrap(),
+            ("linux-x64", "")
+        );
+    }
+
+    #[test]
+    fn detect_platform_rejects_linux_arm64_musl_without_release_asset() {
+        assert!(detect_platform_for("linux", "aarch64", Some("musl")).is_err());
+    }
+
+    #[test]
+    fn executable_abi_wins_when_host_has_both_glibc_and_musl_loaders() {
+        assert_eq!(resolve_linux_libc(Some("gnu"), Some("musl")), Some("gnu"));
     }
 
     #[test]
@@ -1871,6 +1933,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             ("darwin-arm64", ""),
             ("darwin-x64", ""),
             ("linux-x64", ""),
+            ("linux-x64-musl", ""),
             ("linux-arm64", ""),
         ] {
             let cmd = standalone_command_for("0.25.0", platform, ext, Some("/usr/local/bin/lpm"));

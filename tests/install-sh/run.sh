@@ -51,7 +51,13 @@ case "$(uname -s)" in
   Linux)
     case "$(uname -m)" in
       aarch64|arm64) PLATFORM="lpm-linux-arm64" ;;
-      x86_64) PLATFORM="lpm-linux-x64" ;;
+      x86_64)
+        if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+          PLATFORM="lpm-linux-x64-musl"
+        else
+          PLATFORM="lpm-linux-x64"
+        fi
+        ;;
       *) fail "unsupported Linux arch $(uname -m) — extend the harness" ;;
     esac ;;
   *) fail "unsupported OS $(uname -s) — install.sh tests run on macOS/Linux only" ;;
@@ -168,7 +174,47 @@ build_clean_path
 sh -n "$INSTALL_SH" || fail "install.sh has shell syntax errors"
 pass "install.sh shell syntax"
 
-# ── Case 2: fail-closed when sha256sum/shasum missing ──────────
+# ── Case 2: Linux x64 musl selects the musl artifact ──────────
+rm -f "$CLEAN_PATH_DIR/uname"
+printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n' > "$CLEAN_PATH_DIR/uname"
+chmod +x "$CLEAN_PATH_DIR/uname"
+printf '#!/bin/sh\necho "musl libc (x86_64)" >&2\nexit 1\n' > "$CLEAN_PATH_DIR/ldd"
+chmod +x "$CLEAN_PATH_DIR/ldd"
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+printf 'musl-binary-bytes' > "$fdir/lpm-linux-x64-musl"
+sha="$($SHA_TOOL "$fdir/lpm-linux-x64-musl" | awk '{print $1}')"
+printf '%s  %s\n' "$sha" "lpm-linux-x64-musl" > "$fdir/SHA256SUMS.txt"
+printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "musl platform install failed with exit $RUN_RC; out: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
+  && fail "musl platform selected the wrong manifest entry: $RUN_OUT"
+[ -x "$RUN_INSTALL_DIR/lpm" ] || fail "musl platform did not install an executable"
+rm -rf "$fdir" "$CLEAN_PATH_DIR"
+build_clean_path
+pass "Linux x64 musl selects the musl artifact"
+
+# ── Case 3: Linux ARM64 musl fails instead of selecting GNU ────
+rm -f "$CLEAN_PATH_DIR/uname"
+printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo aarch64 ;; esac\n' > "$CLEAN_PATH_DIR/uname"
+chmod +x "$CLEAN_PATH_DIR/uname"
+printf '#!/bin/sh\necho "musl libc (aarch64)" >&2\nexit 1\n' > "$CLEAN_PATH_DIR/ldd"
+chmod +x "$CLEAN_PATH_DIR/ldd"
+actual_exit=0
+out="$(PATH="$CLEAN_PATH_DIR" HOME="$(mktemp -d)" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+[ "$actual_exit" -ne 0 ] || fail "Linux ARM64 musl should fail without an official artifact"
+echo "$out" | grep -q "Linux musl ARM64" \
+  || fail "Linux ARM64 musl failure did not explain the unsupported target: $out"
+rm -rf "$CLEAN_PATH_DIR"
+build_clean_path
+pass "Linux ARM64 musl does not select the GNU artifact"
+
+# ── Case 4: fail-closed when sha256sum/shasum missing ──────────
 empty_bin="$(mktemp -d)"
 for tool in sh uname mktemp rm basename grep awk curl sed cat tr; do
   src="$(command -v "$tool" 2>/dev/null || true)"
@@ -186,7 +232,7 @@ echo "$out" | grep -q "LPM_INSTALL_INSECURE=1" \
 rm -rf "$empty_bin"
 pass "fail-closed when SHA tools missing"
 
-# ── Case 3: loopback enforcement on test override env vars ────
+# ── Case 4: loopback enforcement on test override env vars ────
 actual_exit=0
 out="$(LPM_INSTALL_TEST_API_URL="http://attacker.example/x" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
 [ "$actual_exit" -ne 0 ] || fail "non-loopback API URL should fail-closed; got exit 0"
@@ -197,7 +243,7 @@ out="$(LPM_INSTALL_TEST_DOWNLOAD_BASE="http://attacker.example/x" sh "$INSTALL_S
 echo "$out" | grep -q "127.0.0.1" || fail "expected loopback-only error: $out"
 pass "test-override env vars are loopback-gated"
 
-# ── Case 4: happy path ─────────────────────────────────────────
+# ── Case 5: happy path ─────────────────────────────────────────
 make_happy_fixture
 trap 'stop_server' EXIT
 start_server "$FIXTURE_DIR"
@@ -219,7 +265,7 @@ fixture_sha="$($SHA_TOOL "$FIXTURE_DIR/$PLATFORM" | awk '{print $1}')"
 rm -rf "$FIXTURE_DIR"
 pass "happy path installs the verified binary"
 
-# ── Case 5: explicit version skips the latest-release API ──────
+# ── Case 6: explicit version skips the latest-release API ──────
 fdir="$(mktemp -d)"
 printf 'explicit-version-binary-bytes' > "$fdir/$PLATFORM"
 sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
@@ -241,7 +287,7 @@ echo "$RUN_OUT" | grep -q "Using requested version $FIXTURE_VERSION" \
 rm -rf "$fdir"
 pass "explicit version installs without latest-release API"
 
-# ── Case 6: manifest 404 fails closed ─────────────────────────
+# ── Case 7: manifest 404 fails closed ─────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'placeholder' > "$fdir/$PLATFORM"
@@ -259,7 +305,7 @@ echo "$RUN_OUT" | grep -q "does not ship a signed checksums manifest" \
 rm -rf "$fdir"
 pass "manifest 404 fails closed"
 
-# ── Case 7: bundle 404 fails closed ───────────────────────────
+# ── Case 8: bundle 404 fails closed ───────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'placeholder' > "$fdir/$PLATFORM"
@@ -283,7 +329,7 @@ echo "$RUN_OUT" | grep -q "Verified Sigstore" \
 rm -rf "$fdir"
 pass "bundle 404 falls back to SHA-only floor"
 
-# ── Case 8: SHA mismatch fails closed ─────────────────────────
+# ── Case 9: SHA mismatch fails closed ─────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'real-bytes' > "$fdir/$PLATFORM"
@@ -303,7 +349,7 @@ echo "$RUN_OUT" | grep -q "SHA-256 mismatch" \
 rm -rf "$fdir"
 pass "SHA mismatch fails closed"
 
-# ── Case 9: missing platform entry in manifest ───────────────
+# ── Case 10: missing platform entry in manifest ──────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'real-bytes' > "$fdir/$PLATFORM"
@@ -323,7 +369,7 @@ echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
 rm -rf "$fdir"
 pass "missing platform entry fails closed"
 
-# ── Case 10: LPM_INSTALL_INSECURE=1 bypasses missing manifest ─
+# ── Case 11: LPM_INSTALL_INSECURE=1 bypasses missing manifest ─
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'unsigned-bytes' > "$fdir/$PLATFORM"

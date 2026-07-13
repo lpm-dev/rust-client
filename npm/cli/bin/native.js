@@ -27,6 +27,11 @@ export const PLATFORMS = Object.freeze({
     lpm: "lpm",
     lpx: "lpx",
   },
+  "linux-x64-musl": {
+    pkg: "@lpm-registry/cli-linux-x64-musl",
+    lpm: "lpm",
+    lpx: "lpx",
+  },
   "win32-x64": {
     pkg: "@lpm-registry/cli-win32-x64",
     lpm: "lpm.exe",
@@ -34,8 +39,24 @@ export const PLATFORMS = Object.freeze({
   },
 });
 
-export function platformKey(platform = process.platform, arch = os.arch()) {
+export function platformKey(
+  platform = process.platform,
+  arch = os.arch(),
+  libc,
+) {
+  if (platform === "linux" && libc === "musl") {
+    return `linux-${arch}-musl`;
+  }
   return `${platform}-${arch}`;
+}
+
+export function detectLinuxLibc(
+  report = process.platform === "linux" ? process.report?.getReport?.() : undefined,
+) {
+  if (!report) {
+    return undefined;
+  }
+  return report.header?.glibcVersionRuntime ? "glibc" : "musl";
 }
 
 export function resolveNativeBinary(options = {}) {
@@ -43,6 +64,7 @@ export function resolveNativeBinary(options = {}) {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? os.arch();
+  const libc = options.libc ?? detectLinuxLibc();
   const requireFn = options.requireFn ?? require;
 
   const override = env.LPM_BINARY_PATH;
@@ -54,7 +76,7 @@ export function resolveNativeBinary(options = {}) {
     };
   }
 
-  const key = platformKey(platform, arch);
+  const key = platformKey(platform, arch, libc);
   const spec = PLATFORMS[key];
   if (!spec) {
     throw new LpmWrapperError(
