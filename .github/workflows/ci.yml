@@ -117,7 +117,7 @@ jobs:
 
   musl:
     name: Linux musl x64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -134,12 +134,14 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/x86_64-unknown-linux-musl
-          key: ${{ runner.os }}-cargo-musl-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-musl-${{ env.RUST_TOOLCHAIN }}-
+          key: ${{ runner.os }}-24.04-cargo-musl-registry-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-24.04-cargo-musl-registry-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install musl build tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools=1.2.4-2
+          test "$(dpkg-query -W -f='${Version}' musl-tools)" = "1.2.4-2"
 
       - name: Build musl CLI
         env:
@@ -166,6 +168,14 @@ jobs:
             -v "$PWD:/work:ro" \
             alpine@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 \
             /work/$binary --version
+
+      - name: Verify packed npm distribution on Alpine
+        run: |
+          binary=target/x86_64-unknown-linux-musl/debug/lpm-rs
+          docker run --rm \
+            -v "$PWD:/work:ro" \
+            node:22-alpine@sha256:b74031e546d7f4faf561d797ac1b76beccac856a042815ca77db4fd047581605 \
+            sh /work/tests/npm-musl/run.sh /work/$binary
 
   test:
     name: Fast tests

@@ -1023,8 +1023,36 @@ fn detect_platform() -> Result<(&'static str, &'static str), LpmError> {
     detect_platform_for(
         std::env::consts::OS,
         std::env::consts::ARCH,
-        lpm_common::platform::detect_libc(),
+        resolve_linux_libc(executable_linux_libc(), lpm_common::platform::detect_libc()),
     )
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+const fn executable_linux_libc() -> Option<&'static str> {
+    Some("musl")
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const fn executable_linux_libc() -> Option<&'static str> {
+    Some("gnu")
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "musl"),
+    all(target_os = "linux", target_env = "gnu")
+)))]
+const fn executable_linux_libc() -> Option<&'static str> {
+    None
+}
+
+const fn resolve_linux_libc<'a>(
+    executable_libc: Option<&'a str>,
+    detected_host_libc: Option<&'a str>,
+) -> Option<&'a str> {
+    match executable_libc {
+        Some(libc) => Some(libc),
+        None => detected_host_libc,
+    }
 }
 
 fn detect_platform_for(
@@ -1104,6 +1132,11 @@ mod tests {
     #[test]
     fn detect_platform_rejects_linux_arm64_musl_without_release_asset() {
         assert!(detect_platform_for("linux", "aarch64", Some("musl")).is_err());
+    }
+
+    #[test]
+    fn executable_abi_wins_when_host_has_both_glibc_and_musl_loaders() {
+        assert_eq!(resolve_linux_libc(Some("gnu"), Some("musl")), Some("gnu"));
     }
 
     #[test]
