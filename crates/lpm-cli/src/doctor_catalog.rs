@@ -324,7 +324,7 @@ pub static AUTH_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     tier: Tier::Fast,
     description: "Stored auth material for the configured registry is using encrypted file fallback instead of the OS keychain.",
     when_fires: "A locally stored auth token or refresh token exists for the configured registry and at least one stored credential is file-backed.",
-    remediation: "Unlock or repair the OS keychain and run `lpm login` again so LPM can store auth material in keychain-backed storage.",
+    remediation: "Unlock or repair the OS keychain and run `lpm login` again so LPM CLI can store auth material in keychain-backed storage.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -373,7 +373,7 @@ pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     remediation: "Treat the host as the trust boundary: assume any same-UID code-execution \
          primitive on this machine can read vault secrets. Do not run untrusted lifecycle \
          scripts in unsandboxed mode. Keep lifecycle scripts sandboxed and unlock or repair the \
-         OS secure store so LPM can promote the data key.",
+         OS secure store so LPM CLI can promote the data key.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -383,7 +383,7 @@ pub static VAULT_STORAGE_UNAVAILABLE: CheckEntry = CheckEntry {
     name: "Vault storage backend",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "Encrypted vault files exist locally, but LPM cannot access either the OS-protected \
+    description: "Encrypted vault files exist locally, but LPM CLI cannot access either the OS-protected \
          vault data key or the legacy encrypted-file fallback key.",
     when_fires: "Running on Linux or Windows with local vault blobs present and no usable local \
          data-key source.",
@@ -562,9 +562,9 @@ pub static NODE_MODULES_NO_STORE: CheckEntry = CheckEntry {
     name: "node_modules",
     category: Category::ProjectState,
     tier: Tier::Fast,
-    description: "`node_modules/` exists but no LPM-owned store is present.",
-    when_fires: "A non-LPM tool wrote `node_modules/` (npm / pnpm / yarn / bun).",
-    remediation: "Run `lpm install` to rebuild the layout under LPM ownership.",
+    description: "`node_modules/` exists but no LPM CLI-owned store is present.",
+    when_fires: "A non-LPM CLI tool wrote `node_modules/` (npm / pnpm / yarn / bun).",
+    remediation: "Run `lpm install` to rebuild the layout under LPM CLI ownership.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some("lpm install"),
 };
@@ -574,7 +574,7 @@ pub static NODE_MODULES_LEGACY_LAYOUT: CheckEntry = CheckEntry {
     name: "node_modules",
     category: Category::ProjectState,
     tier: Tier::Fast,
-    description: "An older LPM layout is on disk and a one-time migration is pending.",
+    description: "An older LPM CLI layout is on disk and a one-time migration is pending.",
     when_fires: "Legacy `node_modules/.lpm/` or `node_modules/.lpm-metadata.json` populated; the new `.lpm/wrappers/` is empty.",
     remediation: "Run `lpm install` to migrate to the current layout.",
     possible_severities: &[Severity::Warn],
@@ -683,7 +683,7 @@ pub static GITATTRIBUTES_LOCKB_UNMARKED: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Extended,
     description: "`.gitattributes` exists but does not mark `lpm.lockb` as binary.",
-    when_fires: "Repo has `.gitattributes` without the LPM lockb rule.",
+    when_fires: "Repo has `.gitattributes` without the LPM CLI lockb rule.",
     remediation: "Add `lpm.lockb binary` to `.gitattributes` so git diffs treat the file correctly.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
@@ -755,7 +755,7 @@ pub static LOCAL_SOURCE_DIR_NO_PKG: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Fast,
     description: "A `file:` / `link:` dependency points at a directory with no `package.json`.",
-    when_fires: "Resolved local source path lacks the manifest LPM needs to install it.",
+    when_fires: "Resolved local source path lacks the manifest LPM CLI needs to install it.",
     remediation: "Add `package.json` to the local path or update the dep target.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
@@ -1054,9 +1054,9 @@ pub static TUNNEL_UNKNOWN_BASE: CheckEntry = CheckEntry {
     name: "Tunnel",
     category: Category::Tunnel,
     tier: Tier::Extended,
-    description: "Configured tunnel domain uses a base domain LPM does not recognize.",
+    description: "Configured tunnel domain uses a base domain the LPM.dev Registry does not recognize.",
     when_fires: "`lpm.json > tunnel.domain` ends in a base other than `lpm.fyi` / `lpm.llc`.",
-    remediation: "Use one of the supported base domains, or contact the LPM team to add a new one.",
+    remediation: "Use one of the supported base domains, or contact the LPM.dev Registry team to add a new one.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -1115,7 +1115,7 @@ pub static TUNNEL_SUBDOMAIN_LENGTH: CheckEntry = CheckEntry {
     category: Category::Tunnel,
     tier: Tier::Extended,
     description: "Tunnel subdomain length is outside the allowed range.",
-    when_fires: "Subdomain too short or too long for the LPM regex.",
+    when_fires: "Subdomain too short or too long for the LPM.dev Registry regex.",
     remediation: "Pick a subdomain between the documented bounds.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
@@ -1482,7 +1482,7 @@ pub static GLOBAL_SHIM_TARGETS_STALE: CheckEntry = CheckEntry {
     name: "Shim targets",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "One or more manifest-owned shims in `~/.lpm/bin` have wrong targets — they point at a different install root, a deleted root, or a non-LPM path entirely (potential same-user PATH hijack or stale rollback artifact).",
+    description: "One or more manifest-owned shims in `~/.lpm/bin` have wrong targets — they point at a different install root, a deleted root, or a non-LPM CLI path entirely (potential same-user PATH hijack or stale rollback artifact).",
     when_fires: "Symlink target mismatch, regular-file shim where a symlink was expected, or unreadable shim metadata.",
     remediation: "Re-run `lpm install -g <pkg>` to reclaim the shim, or inspect `~/.lpm/bin/<name>` if the mismatch is unexpected.",
     possible_severities: &[Severity::Warn],
@@ -1745,7 +1745,7 @@ pub static SIGSTORE_VERIFY_DISABLED: CheckEntry = CheckEntry {
          malicious or compromised registry can lie about who built a package and the \
          install will accept it.",
     when_fires: "Resolved enforce-mode is `off` (set via `LPM_PROVENANCE_ENFORCE=off` or \
-         `[sigstore] verify = \"off\"`). LPM does not recommend disabled verification \
+         `[sigstore] verify = \"off\"`). LPM CLI does not recommend disabled verification \
          as a persistent setting.",
     remediation: "Re-enable verification: unset `LPM_PROVENANCE_ENFORCE` (or set it to `deny`), \
          or run `lpm config sigstore --set deny`.",

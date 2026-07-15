@@ -5,7 +5,7 @@ use std::io::{self, Write};
 
 pub(in crate::commands::config) const FIREWALL_GUIDED_MENU_LABEL: &str = "Firewall for npm";
 pub(in crate::commands::config) const FIREWALL_WIZARD_PROMPT: &str =
-    "How should LPM handle firewall verdicts for npm packages?";
+    "How should LPM CLI handle LPM Firewall verdicts for npm packages?";
 pub(in crate::commands::config) const FIREWALL_OFF_HINT: &str =
     "default; use direct npm metadata and tarballs only";
 pub(in crate::commands::config) const FIREWALL_MONITOR_HINT: &str =
@@ -354,12 +354,12 @@ const FIREWALL_POLICY_GROUPS: [FirewallPolicyGroup; 5] = [
     },
     FirewallPolicyGroup {
         field: FirewallPolicyField::LpmAiConfirmedMalware,
-        title: "LPM AI-confirmed malware",
+        title: "LPM Firewall AI-confirmed malware",
         detail: "Credential/data exfiltration, RCE, remote payload execution, persistence, dependency confusion",
     },
     FirewallPolicyGroup {
         field: FirewallPolicyField::LpmAiAgentControlSurface,
-        title: "LPM AI-agent control-surface policy",
+        title: "LPM Firewall AI-agent control-surface policy",
         detail: "Silent install-lifecycle writes into foreign or broad AI-agent control surfaces",
     },
     FirewallPolicyGroup {
@@ -637,8 +637,8 @@ mod tests {
         let plain = console::strip_ansi_codes(&frame);
 
         assert!(plain.contains("Trusted public malicious advisories"));
-        assert!(plain.contains("LPM AI-confirmed malware"));
-        assert!(plain.contains("LPM AI-agent control-surface policy"));
+        assert!(plain.contains("LPM Firewall AI-confirmed malware"));
+        assert!(plain.contains("LPM Firewall AI-agent control-surface policy"));
         assert!(plain.contains("Critical vulnerabilities"));
         assert!(plain.contains("Static-only suspicious signals"));
     }
