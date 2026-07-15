@@ -532,7 +532,7 @@ jobs:
       - name: Preflight npm platform package existence
         run: |
           set -euo pipefail
-          for platform in darwin-arm64 darwin-x64 linux-x64 linux-x64-musl linux-arm64 win32-x64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
             package="@lpm-registry/cli-${platform}"
             if ! npm view "$package" name --json >/dev/null; then
               echo "::error::$package does not exist on npm. Bootstrap it and configure this release workflow as its trusted publisher before retrying. No npm packages have been published."
