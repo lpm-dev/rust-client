@@ -836,12 +836,29 @@ impl RegistryClient {
         &self,
         name: &PackageName,
     ) -> Result<PackageMetadata, LpmError> {
+        self.get_package_metadata_inner(name, true).await
+    }
+
+    /// Fetch full metadata for an LPM package without reading or validating
+    /// the existing packument cache.
+    pub async fn refetch_package_metadata(
+        &self,
+        name: &PackageName,
+    ) -> Result<PackageMetadata, LpmError> {
+        self.get_package_metadata_inner(name, false).await
+    }
+
+    async fn get_package_metadata_inner(
+        &self,
+        name: &PackageName,
+        use_cache: bool,
+    ) -> Result<PackageMetadata, LpmError> {
         let scoped = name.scoped();
         crate::timing::record_metadata_request(&scoped);
         let cache_key = format!("lpm:{scoped}");
 
-        // Tier 1: TTL-based cache hit (fast path, no HTTP)
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: {scoped}");
             return Ok(cached);
@@ -862,7 +879,9 @@ impl RegistryClient {
         // attempt so the rotated token is used on retry.
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
-                let cache_validator = self.read_cache_validator(&cache_key);
+                let cache_validator = use_cache
+                    .then(|| self.read_cache_validator(&cache_key))
+                    .flatten();
                 let mut req = self.build_worker_metadata_get(&url).await?;
                 if let Some(etag) = cache_validator.as_ref().and_then(|c| c.etag.as_deref()) {
                     req = req.header("If-None-Match", etag);
@@ -870,7 +889,7 @@ impl RegistryClient {
 
                 let mut response = self.send_package_metadata_request(req).await?;
 
-                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
                     if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
                         tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
                         return Ok(meta);

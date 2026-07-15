@@ -888,6 +888,41 @@ pub(super) async fn pin_staged_dist_tags_for_resolution(
     Ok(())
 }
 
+fn resolve_lpm_install_metadata_version(
+    metadata: &lpm_registry::PackageMetadata,
+    package_name: &lpm_common::PackageName,
+    range: &str,
+) -> Result<String, LpmError> {
+    let scoped_name = package_name.scoped();
+    let latest_version = metadata
+        .latest_version_tag()
+        .ok_or_else(|| LpmError::NotFound(format!("no versions for {scoped_name}")))?;
+    let resolved_version = resolve_version_from_spec(range, metadata, latest_version)?;
+    metadata.version(resolved_version).ok_or_else(|| {
+        LpmError::NotFound(format!(
+            "version {resolved_version} not found for {scoped_name}"
+        ))
+    })?;
+    Ok(resolved_version.to_string())
+}
+
+pub(super) async fn resolve_lpm_install_preflight(
+    client: &RegistryClient,
+    package_name: &lpm_common::PackageName,
+    range: &str,
+) -> Result<(lpm_registry::PackageMetadata, String), LpmError> {
+    let metadata = client.get_package_metadata(package_name).await?;
+    match resolve_lpm_install_metadata_version(&metadata, package_name, range) {
+        Ok(version) => Ok((metadata, version)),
+        Err(LpmError::NotFound(_) | LpmError::InvalidVersionRange(_)) => {
+            let metadata = client.refetch_package_metadata(package_name).await?;
+            let version = resolve_lpm_install_metadata_version(&metadata, package_name, range)?;
+            Ok((metadata, version))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Install specific packages: add them to package.json then run full install.
 /// For Swift packages (ecosystem=swift), uses SE-0292 registry mode instead.
 ///
@@ -963,17 +998,10 @@ pub async fn run_add_packages(
         let range = intent_to_range_string(&intent);
 
         if name.starts_with("@lpm.dev/") {
-            // Fetch metadata to check ecosystem
             let pkg_name = lpm_common::PackageName::parse(&name)?;
-            let metadata = client.get_package_metadata(&pkg_name).await?;
-            let latest_ver = metadata
-                .latest_version_tag()
-                .ok_or_else(|| LpmError::NotFound(format!("no versions for {name}")))?;
-
-            // Resolve the user-specified version range against available versions.
-            // Falls back to latest when no version is specified.
-            let resolved_ver = resolve_version_from_spec(&range, &metadata, latest_ver)?;
-            let ver_meta = metadata.version(resolved_ver).ok_or_else(|| {
+            let (metadata, resolved_ver) =
+                resolve_lpm_install_preflight(client, &pkg_name, &range).await?;
+            let ver_meta = metadata.version(&resolved_ver).ok_or_else(|| {
                 LpmError::NotFound(format!("version {resolved_ver} not found for {name}"))
             })?;
 
@@ -982,7 +1010,7 @@ pub async fn run_add_packages(
                 run_swift_install(
                     project_dir,
                     &pkg_name,
-                    resolved_ver,
+                    &resolved_ver,
                     ver_meta,
                     json_output,
                     client.base_url(),
