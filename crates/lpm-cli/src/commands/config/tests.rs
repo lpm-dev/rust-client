@@ -52,7 +52,7 @@ fn firewall_wizard_copy_uses_npm_package_language() {
         ),
         (
             "Firewall for npm",
-            "How should LPM handle firewall verdicts for npm packages?",
+            "How should LPM CLI handle LPM Firewall verdicts for npm packages?",
             "default; use direct npm metadata and tarballs only",
             "show what would be blocked without stopping install",
             "review recommended policy profile before saving",

@@ -184,7 +184,9 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
             }
         } else if !json_output {
             // User-facing binary name is `lpm`, not `lpm-rs`
-            install_ui::warn("No LPM token found — run `lpm login` first for authenticated access");
+            install_ui::warn(
+                "No LPM.dev Registry token found — run `lpm login` first for authenticated access",
+            );
         }
     } else if !json_output {
         install_ui::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
