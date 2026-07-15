@@ -1,5 +1,44 @@
 use super::*;
 
+#[tokio::test]
+async fn lpm_install_preflight_refetches_when_requested_version_is_missing_from_fresh_cache() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let package_name = lpm_common::PackageName::parse("@lpm.dev/acme.swift-logger").unwrap();
+    let client = lpm_registry::RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_cache_dir(Some(cache_dir.path().to_path_buf()));
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/acme.swift-logger"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(make_metadata(&["1.0.0"], "1.0.0")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    client.get_package_metadata(&package_name).await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/acme.swift-logger"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(make_metadata(&["1.0.0", "1.0.1"], "1.0.1")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (metadata, resolved_version) =
+        resolve_lpm_install_preflight(&client, &package_name, "1.0.1")
+            .await
+            .unwrap();
+
+    assert_eq!(resolved_version, "1.0.1");
+    assert!(metadata.versions.contains_key(&resolved_version));
+}
+
 // ── stage_packages_to_manifest behavior ─────────────────────
 //
 // These tests cover the stage step in isolation (no install pipeline,

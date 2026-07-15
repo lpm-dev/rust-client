@@ -276,6 +276,43 @@ async fn etag_304_revalidation_lpm_metadata() {
 }
 
 #[tokio::test]
+async fn explicit_lpm_refetch_bypasses_a_fresh_packument_cache() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let pkg_name = "@lpm.dev/test.newly-approved";
+    let name = PackageName::parse(pkg_name).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.newly-approved"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(pkg_name, "1.0.0")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    client.get_package_metadata(&name).await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.newly-approved"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(pkg_name, "1.0.1")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let refreshed = client.refetch_package_metadata(&name).await.unwrap();
+
+    assert!(refreshed.versions.contains_key("1.0.1"));
+}
+
+#[tokio::test]
 async fn etag_updated_on_new_response() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
