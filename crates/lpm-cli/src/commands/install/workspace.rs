@@ -413,6 +413,7 @@ pub(super) fn workspace_member_cache_info(
         trust_metadata_complete: true,
         versions_complete: true,
         covered_ranges: std::collections::HashSet::new(),
+        latest_version: None,
         versions: vec![version],
         deps: deps_by_version,
         peer_deps,

@@ -410,12 +410,14 @@ fn cached_info_satisfies_peer_requirements(
     reqs: &[&PeerRequirement],
 ) -> bool {
     info.versions.iter().any(|version| {
-        reqs.iter().all(|req| req.range.satisfies(version))
-            && (info.platform.is_empty()
-                || info
-                    .platform
-                    .get(&version.to_string())
-                    .is_none_or(crate::provider::is_platform_compatible))
+        reqs.iter().all(|req| {
+            req.range
+                .satisfies_with_latest_bound(version, info.latest_version.as_ref())
+        }) && (info.platform.is_empty()
+            || info
+                .platform
+                .get(&version.to_string())
+                .is_none_or(crate::provider::is_platform_compatible))
     })
 }
 
@@ -430,10 +432,10 @@ pub(super) fn partial_worker_cache_needs_full_metadata(
         return !info.versions.contains(&exact);
     }
     !info.covered_ranges.contains(edge.range.raw())
-        || !info
-            .versions
-            .iter()
-            .any(|version| edge.range.satisfies(version))
+        || !info.versions.iter().any(|version| {
+            edge.range
+                .satisfies_with_latest_bound(version, info.latest_version.as_ref())
+        })
 }
 
 /// Fused dispatcher: greedy resolver IS the fetch dispatcher. Replaces the

@@ -53,11 +53,13 @@ pub(crate) fn latest_allowed_version(
     policy: &ResolverPolicy,
 ) -> Option<String> {
     let canonical = CanonicalKey::from_dep_name(&metadata.name);
-    if let Some(latest) = metadata.latest_version_tag()
-        && version_allowed_by_policy(&canonical, metadata, latest, policy)
-        && Version::parse(latest).is_ok()
+    let latest_tag = metadata.latest_version_tag();
+    let latest = latest_tag.and_then(|version| Version::parse(version).ok());
+    if let Some(latest_tag) = latest_tag
+        && latest.is_some()
+        && version_allowed_by_policy(&canonical, metadata, latest_tag, policy)
     {
-        return Some(latest.to_string());
+        return Some(latest_tag.to_string());
     }
 
     let mut versions = parse_versions(metadata);
@@ -65,6 +67,7 @@ pub(crate) fn latest_allowed_version(
     versions
         .into_iter()
         .rev()
+        .filter(|version| latest.as_ref().is_none_or(|latest| version <= latest))
         .map(|version| version.to_string())
         .find(|version| version_allowed_by_policy(&canonical, metadata, version, policy))
 }
@@ -78,7 +81,11 @@ pub(crate) fn latest_allowed_version_or_policy_error(
         return Ok(version);
     }
 
-    let Some(candidate) = parse_versions(metadata).into_iter().max() else {
+    let candidate = metadata
+        .latest_version_tag()
+        .and_then(|version| Version::parse(version).ok())
+        .or_else(|| parse_versions(metadata).into_iter().max());
+    let Some(candidate) = candidate else {
         return Err(LpmError::Script(format!(
             "registry returned no parseable versions for '{}'",
             metadata.name
@@ -201,4 +208,34 @@ fn policy_blocked_error(
         ),
     };
     LpmError::Script(format!("{}@{version} is blocked: {detail}", metadata.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_allowed_version_fallback_never_exceeds_dist_tag_target() {
+        let metadata: PackageMetadata = serde_json::from_value(serde_json::json!({
+            "name": "rolled-back-latest",
+            "dist-tags": { "latest": "3.1.0" },
+            "versions": {
+                "3.0.0": { "name": "rolled-back-latest", "version": "3.0.0" },
+                "3.1.0": { "name": "rolled-back-latest", "version": "3.1.0" },
+                "4.0.0": { "name": "rolled-back-latest", "version": "4.0.0" }
+            },
+            "time": {
+                "3.0.0": "2025-01-01T00:00:00.000Z",
+                "3.1.0": "9999-01-01T00:00:00.000Z",
+                "4.0.0": "2025-01-01T00:00:00.000Z"
+            }
+        }))
+        .unwrap();
+        let policy = ResolverPolicy::new(86_400, TrustPolicyMode::Off);
+
+        assert_eq!(
+            latest_allowed_version(&metadata, &policy),
+            Some("3.0.0".to_string())
+        );
+    }
 }

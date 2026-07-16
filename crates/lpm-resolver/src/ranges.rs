@@ -25,15 +25,24 @@ use version_ranges::Ranges;
 pub struct NpmRange {
     raw: String,
     parsed: node_semver::Range,
+    latest_tag: bool,
 }
 
 impl NpmRange {
     pub fn parse(input: &str) -> Result<Self, String> {
         let trimmed = input.trim();
-        if trimmed.is_empty() || trimmed == "*" || trimmed == "latest" {
+        if trimmed.is_empty() || trimmed == "*" {
             return Ok(NpmRange {
                 raw: "*".to_string(),
                 parsed: node_semver::Range::any(),
+                latest_tag: false,
+            });
+        }
+        if trimmed == "latest" {
+            return Ok(NpmRange {
+                raw: "latest".to_string(),
+                parsed: node_semver::Range::any(),
+                latest_tag: true,
             });
         }
         let parsed = lpm_semver::parse_node_semver_range(trimmed)
@@ -41,6 +50,7 @@ impl NpmRange {
         Ok(NpmRange {
             raw: trimmed.to_string(),
             parsed,
+            latest_tag: false,
         })
     }
 
@@ -49,12 +59,29 @@ impl NpmRange {
         self.parsed.satisfies(version.as_inner())
     }
 
+    pub fn satisfies_with_latest_bound(
+        &self,
+        version: &NpmVersion,
+        latest_version: Option<&NpmVersion>,
+    ) -> bool {
+        self.satisfies(version)
+            && (!self.latest_tag || latest_version.is_none_or(|latest| version <= latest))
+    }
+
     /// Given a list of all available versions, return a `Ranges<NpmVersion>`
     /// that contains exactly the versions satisfying this npm range.
     ///
     /// This converts the predicate-based npm range into PubGrub's interval-based
     /// `Ranges` by building intervals around matching versions.
     pub fn to_pubgrub_ranges(&self, available_versions: &[NpmVersion]) -> Ranges<NpmVersion> {
+        self.to_pubgrub_ranges_with_latest_bound(available_versions, None)
+    }
+
+    pub fn to_pubgrub_ranges_with_latest_bound(
+        &self,
+        available_versions: &[NpmVersion],
+        latest_version: Option<&NpmVersion>,
+    ) -> Ranges<NpmVersion> {
         if self.raw == "*" {
             return Ranges::full();
         }
@@ -78,7 +105,7 @@ impl NpmRange {
         available_versions
             .iter()
             .rev()
-            .filter(|v| self.satisfies(v))
+            .filter(|version| self.satisfies_with_latest_bound(version, latest_version))
             .map(|v| (Included(v.clone()), Included(v.clone())))
             .collect()
     }
@@ -107,6 +134,10 @@ impl NpmRange {
 
     pub fn raw(&self) -> &str {
         &self.raw
+    }
+
+    pub fn is_latest_tag(&self) -> bool {
+        self.latest_tag
     }
 
     pub fn exact_version(&self) -> Option<NpmVersion> {
@@ -278,9 +309,22 @@ mod tests {
     }
 
     #[test]
-    fn latest_is_wildcard() {
+    fn latest_matches_any_version_without_a_tag_target() {
         let r = NpmRange::parse("latest").unwrap();
         assert!(r.satisfies(&v("1.0.0")));
+        assert_eq!(r.raw(), "latest");
+    }
+
+    #[test]
+    fn latest_bound_excludes_semver_greater_versions() {
+        let r = NpmRange::parse("latest").unwrap();
+        let avail = versions(&["3.0.0", "3.1.0", "4.0.0"]);
+        let latest = v("3.1.0");
+        let ranges = r.to_pubgrub_ranges_with_latest_bound(&avail, Some(&latest));
+
+        assert!(ranges.contains(&v("3.0.0")));
+        assert!(ranges.contains(&v("3.1.0")));
+        assert!(!ranges.contains(&v("4.0.0")));
     }
 
     #[test]

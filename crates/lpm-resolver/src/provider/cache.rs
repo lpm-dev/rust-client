@@ -268,7 +268,16 @@ impl LpmDependencyProvider {
         if let Some(cached) = self.range_cache.borrow().get(&key) {
             return cached.clone();
         }
-        let computed = npm_range.to_pubgrub_ranges(available);
+        let latest_version = if npm_range.is_latest_tag() {
+            let canonical = CanonicalKey::from(pkg);
+            self.cache
+                .get(&canonical)
+                .and_then(|info| info.latest_version.clone())
+        } else {
+            None
+        };
+        let computed =
+            npm_range.to_pubgrub_ranges_with_latest_bound(available, latest_version.as_ref());
         self.range_cache.borrow_mut().insert(key, computed.clone());
         computed
     }

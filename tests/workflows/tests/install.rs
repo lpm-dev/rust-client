@@ -8691,6 +8691,7 @@ fn install_no_strict_ssl_setting_emits_no_warning() {
 const RELEASE_AGE_PKG: &str = "@lpm.dev/acme.widget";
 const RELEASE_AGE_VERSION: &str = "1.0.0";
 const RELEASE_AGE_RANGE_PKG: &str = "release-age-range-pkg";
+const RELEASE_AGE_ROLLED_BACK_LATEST_PKG: &str = "release-age-rolled-back-latest-pkg";
 const RELEASE_AGE_PARENT_PKG: &str = "release-age-parent-pkg";
 const RELEASE_AGE_CHILD_PKG: &str = "release-age-child-pkg";
 const RELEASE_AGE_ALIAS_LOCAL_PKG: &str = "release-age-alias-local";
@@ -8996,6 +8997,57 @@ async fn mount_release_age_range_pkg(mock: &MockRegistry) {
         RELEASE_AGE_RANGE_PKG,
         metadata,
         &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0)],
+    )
+    .await;
+}
+
+async fn mount_release_age_rolled_back_latest_pkg(mock: &MockRegistry) {
+    let v3_0_0 = make_tarball(RELEASE_AGE_ROLLED_BACK_LATEST_PKG, "3.0.0");
+    let v3_1_0 = make_tarball(RELEASE_AGE_ROLLED_BACK_LATEST_PKG, "3.1.0");
+    let v4_0_0 = make_tarball(RELEASE_AGE_ROLLED_BACK_LATEST_PKG, "4.0.0");
+    let metadata = serde_json::json!({
+        "name": RELEASE_AGE_ROLLED_BACK_LATEST_PKG,
+        "dist-tags": { "latest": "3.1.0" },
+        "modified": iso8601_n_secs_ago(60),
+        "versions": {
+            "3.0.0": {
+                "name": RELEASE_AGE_ROLLED_BACK_LATEST_PKG,
+                "version": "3.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_ROLLED_BACK_LATEST_PKG, "3.0.0"),
+                    "integrity": compute_integrity(&v3_0_0),
+                },
+                "dependencies": {}
+            },
+            "3.1.0": {
+                "name": RELEASE_AGE_ROLLED_BACK_LATEST_PKG,
+                "version": "3.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_ROLLED_BACK_LATEST_PKG, "3.1.0"),
+                    "integrity": compute_integrity(&v3_1_0),
+                },
+                "dependencies": {}
+            },
+            "4.0.0": {
+                "name": RELEASE_AGE_ROLLED_BACK_LATEST_PKG,
+                "version": "4.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_ROLLED_BACK_LATEST_PKG, "4.0.0"),
+                    "integrity": compute_integrity(&v4_0_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "3.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "3.1.0": iso8601_n_secs_ago(3_600),
+            "4.0.0": iso8601_n_secs_ago(270 * 86_400)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        RELEASE_AGE_ROLLED_BACK_LATEST_PKG,
+        metadata,
+        &[("3.0.0", v3_0_0), ("3.1.0", v3_1_0), ("4.0.0", v4_0_0)],
     )
     .await;
 }
@@ -9456,6 +9508,55 @@ async fn install_range_selects_older_version_when_latest_is_inside_release_age_w
     let manifest: serde_json::Value =
         serde_json::from_str(&installed).expect("installed package.json must parse");
     assert_eq!(manifest["version"], serde_json::json!("1.0.0"));
+}
+
+async fn assert_install_latest_fallback_never_exceeds_rolled_back_dist_tag(resolver: Option<&str>) {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"release-age-rolled-back-latest",
+            "version":"1.0.0",
+            "dependencies":{{"{RELEASE_AGE_ROLLED_BACK_LATEST_PKG}":"latest"}},
+            "lpm":{{"minimumReleaseAge":86400}}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_rolled_back_latest_pkg(&mock).await;
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.args([
+        "install",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]);
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+    let out = command.output().expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "latest install must fall back to a mature version at or below the dist-tag target; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let installed = project.read_file(&format!(
+        "node_modules/{RELEASE_AGE_ROLLED_BACK_LATEST_PKG}/package.json"
+    ));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&installed).expect("installed package.json must parse");
+    assert_eq!(manifest["version"], serde_json::json!("3.0.0"));
+}
+
+#[tokio::test]
+async fn install_latest_fallback_never_exceeds_rolled_back_dist_tag() {
+    assert_install_latest_fallback_never_exceeds_rolled_back_dist_tag(None).await;
+}
+
+#[tokio::test]
+async fn install_pubgrub_latest_fallback_never_exceeds_rolled_back_dist_tag() {
+    assert_install_latest_fallback_never_exceeds_rolled_back_dist_tag(Some("pubgrub")).await;
 }
 
 #[tokio::test]

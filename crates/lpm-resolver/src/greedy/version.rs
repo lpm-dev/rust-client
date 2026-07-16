@@ -64,7 +64,7 @@ fn find_best_version_with_policy_impl(
 ) -> VersionPick {
     let mut first_policy_block: Option<VersionPick> = None;
     for v in &info.versions {
-        if !range.satisfies(v) {
+        if !range.satisfies_with_latest_bound(v, info.latest_version.as_ref()) {
             continue;
         }
         let release_age_status = if record_policy_profile {

@@ -35,6 +35,7 @@ pub(super) fn empty_info_value() -> lpm_resolver::CachedPackageInfo {
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        latest_version: None,
         versions: Vec::new(),
         deps: HashMap::new(),
         peer_deps: HashMap::new(),

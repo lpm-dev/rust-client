@@ -117,6 +117,8 @@ pub struct CachedPackageInfo {
     /// Range strings for which an incomplete `versions` set is known to be
     /// Worker-selected. Empty for normal complete packuments.
     pub covered_ranges: HashSet<String>,
+    /// Parsed target of the registry's authoritative `latest` dist-tag.
+    pub latest_version: Option<NpmVersion>,
     /// Available versions, sorted descending (newest first).
     pub versions: Vec<NpmVersion>,
     /// Regular dependencies for each version: version_string → { dep_name → range_string }.

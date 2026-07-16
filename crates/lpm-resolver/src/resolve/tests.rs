@@ -335,6 +335,7 @@ fn make_cached_info(
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        latest_version: None,
         versions: versions
             .iter()
             .map(|v| NpmVersion::parse(v).unwrap())

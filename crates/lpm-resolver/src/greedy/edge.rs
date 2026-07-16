@@ -167,10 +167,11 @@ fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
 fn newest_existing_satisfying_node(
     nodes: &[(NpmVersion, NodeId)],
     range: &NpmRange,
+    latest_version: Option<&NpmVersion>,
 ) -> Option<NodeId> {
     nodes
         .iter()
-        .filter(|(version, _)| range.satisfies(version))
+        .filter(|(version, _)| range.satisfies_with_latest_bound(version, latest_version))
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, id)| *id)
 }
@@ -206,10 +207,14 @@ fn process_edge_inner(
             // applies only below the root; root deps define the visible
             // install contract and must choose their own target version.
             if !is_root_edge {
-                let existing_id: Option<NodeId> = state
-                    .resolved
-                    .get(&edge.canonical)
-                    .and_then(|nodes| newest_existing_satisfying_node(nodes, &edge.range));
+                let existing_id: Option<NodeId> =
+                    state.resolved.get(&edge.canonical).and_then(|nodes| {
+                        newest_existing_satisfying_node(
+                            nodes,
+                            &edge.range,
+                            info.latest_version.as_ref(),
+                        )
+                    });
                 if let Some(id) = existing_id {
                     if !edge_is_optional_in_context(edge, state) {
                         mark_node_required_closure(state, id);
@@ -333,7 +338,7 @@ fn process_edge_inner(
                 .find(|(v, _)| v == &target_version)
                 .map(|(_, id)| *id)
         } else {
-            newest_existing_satisfying_node(nodes, &edge.range)
+            newest_existing_satisfying_node(nodes, &edge.range, info.latest_version.as_ref())
         }
     });
 

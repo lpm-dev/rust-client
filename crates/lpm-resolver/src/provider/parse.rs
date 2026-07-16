@@ -245,6 +245,9 @@ fn parse_metadata_to_cache_info_inner(
         trust_metadata_complete,
         versions_complete,
         covered_ranges: HashSet::new(),
+        latest_version: metadata
+            .latest_version_tag()
+            .and_then(|version| NpmVersion::parse(version).ok()),
         versions,
         deps,
         peer_deps,

@@ -116,7 +116,7 @@ where
     Box::pin(async move {
         let mut saw_candidate = false;
         for version in &info.versions {
-            if !range.satisfies(version) {
+            if !range.satisfies_with_latest_bound(version, info.latest_version.as_ref()) {
                 continue;
             }
             saw_candidate = true;

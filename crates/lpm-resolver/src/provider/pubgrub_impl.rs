@@ -593,8 +593,14 @@ impl DependencyProvider for LpmDependencyProvider {
                 }
             };
 
+            let range = if available.is_empty() {
+                npm_range.to_pubgrub_ranges_heuristic()
+            } else {
+                self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
+            };
+
             if is_optional {
-                let any_satisfies = available.iter().any(|v| npm_range.satisfies(v));
+                let any_satisfies = available.iter().any(|version| range.contains(version));
                 if !any_satisfies {
                     let host = Platform::current();
                     tracing::debug!(
@@ -610,12 +616,6 @@ impl DependencyProvider for LpmDependencyProvider {
                     continue;
                 }
             }
-
-            let range = if available.is_empty() {
-                npm_range.to_pubgrub_ranges_heuristic()
-            } else {
-                self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
-            };
             constraints.insert(pkg, range);
         }
 
