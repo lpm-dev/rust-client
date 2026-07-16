@@ -95,8 +95,21 @@ fn whoami_response(username: &str, email: &str) -> serde_json::Value {
 
 impl MockRegistry {
     /// Start a new mock registry on a random port.
+    ///
+    /// Unconfigured package-skill reads return an empty published set. More
+    /// specific skill fixtures override this lowest-priority fallback.
     pub async fn start() -> Self {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "fixture.package",
+                "available": false,
+                "skills": [],
+            })))
+            .with_priority(u8::MAX)
+            .mount(&server)
+            .await;
         MockRegistry {
             server,
             tarball_integrities: Arc::default(),
@@ -120,6 +133,79 @@ impl MockRegistry {
     /// The base URL of the mock server (e.g., `http://127.0.0.1:PORT`).
     pub fn url(&self) -> String {
         self.server.uri()
+    }
+
+    /// Mount the package-published skills endpoint for one LPM.dev package.
+    pub async fn with_package_skills(&self, name: &str, skills: Vec<serde_json::Value>) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "available": true,
+                "skills": skills,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount the package-published skills endpoint and require an exact installed version.
+    pub async fn with_package_skills_for_version(
+        &self,
+        name: &str,
+        version: &str,
+        skills: Vec<serde_json::Value>,
+    ) -> &Self {
+        self.with_package_skills_for_version_expected(name, version, skills, 1)
+            .await
+    }
+
+    pub async fn with_package_skills_for_version_expected(
+        &self,
+        name: &str,
+        version: &str,
+        skills: Vec<serde_json::Value>,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .and(query_param("version", version))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "version": version,
+                "available": true,
+                "skills": skills,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a failed package-skill lookup for one exact package version.
+    pub async fn with_package_skills_error_for_version(
+        &self,
+        name: &str,
+        version: &str,
+        status: u16,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .and(query_param("version", version))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "error": "package skills unavailable",
+                })),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
     }
 
     /// Mount `GET /api/search/packages` for a specific query + limit.

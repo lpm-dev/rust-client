@@ -935,43 +935,19 @@ pub async fn run(
     // declaration (deferred per the non-goals).
     if !no_skills && let AddTarget::Lpm(pkg) = &target {
         let short_name = pkg.short();
-        match client.get_skills(&short_name, None).await {
-            Ok(response) if !response.skills.is_empty() => {
-                let skills_dir = project_dir.join(".lpm").join("skills").join(&short_name);
-                let _ = std::fs::create_dir_all(&skills_dir);
-
-                let mut installed = 0;
-                for skill in &response.skills {
-                    let content = skill
-                        .raw_content
-                        .as_deref()
-                        .or(skill.content.as_deref())
-                        .unwrap_or("");
-                    if !content.is_empty() {
-                        let path = skills_dir.join(format!("{}.md", skill.name));
-                        let _ = std::fs::write(&path, content);
-                        installed += 1;
-                    }
-                }
-
-                if installed > 0 && !json_output {
-                    output::info(&format!(
-                        "Installed {installed} agent skill(s) for {short_name}"
-                    ));
-
-                    // Ensure .gitignore includes .lpm/skills/
-                    crate::commands::install::ensure_skills_gitignore(project_dir);
-
-                    // Auto-integrate with editors (respects --no-editor-setup)
-                    if !no_editor_setup {
-                        let integrations = crate::editor_skills::auto_integrate_skills(project_dir);
-                        for msg in &integrations {
-                            output::info(msg);
-                        }
-                    }
-                }
-            }
-            _ => {} // No skills or API error -- skip silently
+        let response = client.get_skills(&short_name, Some(&version)).await?;
+        let result = crate::commands::skills::package::materialize(
+            project_dir,
+            &short_name,
+            Some(&version),
+            &response.skills,
+        )?;
+        crate::commands::install::ensure_skills_gitignore(project_dir);
+        if !json_output {
+            output::info(&format!(
+                "Materialized {} package-published skill(s) for {short_name}",
+                result.installed
+            ));
         }
     }
 

@@ -723,10 +723,8 @@ pub(crate) struct GlobalArgs {
 
 #[derive(Args)]
 pub(crate) struct SkillsArgs {
-    /// Action: list, install, validate, clean.
-    pub(crate) action: String,
-    /// Package name (for install).
-    pub(crate) package: Option<String>,
+    #[command(subcommand)]
+    pub(crate) action: crate::commands::skills::SkillsCmd,
 }
 
 #[derive(Args)]

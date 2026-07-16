@@ -1,0 +1,14 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: disable
+---
+{
+  "success": true,
+  "dry_run": false,
+  "changes": [
+    {
+      "action": "disable managed target",
+      "path": "[project]/.agents/skills/release-notes"
+    }
+  ]
+}

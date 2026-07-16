@@ -1,0 +1,374 @@
+use lpm_common::{LpmError, PackageName};
+use lpm_registry::Skill;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+const MANIFEST_FILE: &str = ".lpm-package-skills.json";
+const MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageSkillsManifest {
+    schema_version: u32,
+    package: String,
+    version: Option<String>,
+    skills: BTreeMap<String, String>,
+}
+
+pub(crate) struct PackageSkillsResult {
+    pub installed: usize,
+    pub directory: PathBuf,
+}
+
+pub(crate) fn materialize(
+    project_dir: &Path,
+    package: &str,
+    version: Option<&str>,
+    skills: &[Skill],
+) -> Result<PackageSkillsResult, LpmError> {
+    let _lock = acquire_mutation_lock(project_dir)?;
+    let parsed = PackageName::parse(package)?;
+    let package = parsed.short();
+    let entries = validated_entries(skills)?;
+    let root = project_dir.join(".lpm").join("skills");
+    super::path_security::ensure_contained_directory(project_dir, &root, "package skill storage")?;
+    let target = root.join(&package);
+    let had_previous = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(LpmError::Registry(format!(
+                "refusing to replace package skill path that is not a regular directory: {}",
+                target.display()
+            )));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+
+    let staging = tempfile::Builder::new()
+        .prefix(".package-skills-stage-")
+        .tempdir_in(&root)
+        .map_err(LpmError::Io)?;
+    let mut manifest_skills = BTreeMap::new();
+    for (name, content) in &entries {
+        std::fs::write(staging.path().join(format!("{name}.md")), content)?;
+        manifest_skills.insert((*name).to_string(), digest(content.as_bytes()));
+    }
+    let manifest = PackageSkillsManifest {
+        schema_version: MANIFEST_VERSION,
+        package,
+        version: version.map(str::to_string),
+        skills: manifest_skills,
+    };
+    let mut manifest_content = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to serialize package skill manifest: {error}"
+        ))
+    })?;
+    manifest_content.push(b'\n');
+    std::fs::write(staging.path().join(MANIFEST_FILE), manifest_content)?;
+
+    let backup_root = tempfile::Builder::new()
+        .prefix(".package-skills-backup-")
+        .tempdir_in(&root)
+        .map_err(LpmError::Io)?;
+    let backup = backup_root.path().join("previous");
+    if had_previous {
+        std::fs::rename(&target, &backup)?;
+    }
+    let staging_path = staging.keep();
+    if let Err(error) = std::fs::rename(&staging_path, &target) {
+        if had_previous {
+            let _ = std::fs::rename(&backup, &target);
+        }
+        let _ = std::fs::remove_dir_all(&staging_path);
+        return Err(LpmError::Io(error));
+    }
+
+    Ok(PackageSkillsResult {
+        installed: entries.len(),
+        directory: target,
+    })
+}
+
+pub(crate) fn validate(skills: &[Skill]) -> Result<(), LpmError> {
+    validated_entries(skills).map(|_| ())
+}
+
+pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError> {
+    let _lock = acquire_mutation_lock(project_dir)?;
+    let package = PackageName::parse(package)?.short();
+    let root = project_dir.join(".lpm").join("skills");
+    super::path_security::ensure_contained_directory(project_dir, &root, "package skill storage")?;
+    let directory = root.join(package);
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LpmError::Registry(format!(
+            "refusing to remove package skill path that is not a regular directory: {}",
+            directory.display()
+        )));
+    }
+    let bytes = crate::commands::cache::dir_size(&directory).unwrap_or(0);
+    std::fs::remove_dir_all(directory)?;
+    Ok(bytes)
+}
+
+pub(crate) fn acquire_mutation_lock(
+    project_dir: &Path,
+) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
+    super::path_security::ensure_contained_directory(
+        project_dir,
+        &project_dir.join(".lpm"),
+        "package skill state",
+    )?;
+    lpm_common::acquire_exclusive_lock(project_dir.join(".lpm/.package-skills.lock"))
+}
+
+pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(package_json) else {
+        return false;
+    };
+    let mut packages = BTreeSet::new();
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let Some(dependencies) = value.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for name in dependencies
+            .keys()
+            .filter(|name| name.starts_with("@lpm.dev/"))
+        {
+            let Ok(name) = PackageName::parse(name) else {
+                return false;
+            };
+            packages.insert(name.short());
+        }
+    }
+    packages
+        .iter()
+        .all(|package| package_materialization_complete(project_dir, package))
+}
+
+fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
+    let directory = project_dir.join(".lpm").join("skills").join(package);
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(directory.join(MANIFEST_FILE)) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
+        return false;
+    };
+    if manifest.schema_version != MANIFEST_VERSION || manifest.package != package {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return false;
+    };
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        if name == MANIFEST_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return false;
+        }
+        if path.extension().is_none_or(|extension| extension != "md") {
+            return false;
+        }
+        let Some(skill_name) = path.file_stem().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(expected_digest) = manifest.skills.get(skill_name) else {
+            return false;
+        };
+        let Ok(content) = std::fs::read(&path) else {
+            return false;
+        };
+        if digest(&content) != *expected_digest {
+            return false;
+        }
+        seen.insert(skill_name.to_string());
+    }
+    seen.len() == manifest.skills.len()
+}
+
+fn validated_entries(skills: &[Skill]) -> Result<Vec<(&str, &str)>, LpmError> {
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::with_capacity(skills.len());
+    for skill in skills {
+        if !lpm_common::is_safe_skill_name(&skill.name) {
+            return Err(LpmError::Registry(format!(
+                "registry returned an unsafe package skill name: {}",
+                skill.name
+            )));
+        }
+        if !seen.insert(skill.name.as_str()) {
+            return Err(LpmError::Registry(format!(
+                "registry returned duplicate package skill name: {}",
+                skill.name
+            )));
+        }
+        let content = skill
+            .raw_content
+            .as_deref()
+            .or(skill.content.as_deref())
+            .filter(|content| !content.is_empty())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "registry returned package skill `{}` without content",
+                    skill.name
+                ))
+            })?;
+        entries.push((skill.name.as_str(), content));
+    }
+    Ok(entries)
+}
+
+fn digest(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(name: &str, content: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: None,
+            globs: Vec::new(),
+            content: Some(content.to_string()),
+            raw_content: None,
+            size_bytes: None,
+        }
+    }
+
+    #[test]
+    fn materialize_rejects_registry_path_traversal_before_writing() {
+        let project = tempfile::tempdir().unwrap();
+        let skills = vec![skill("../../escape", "bad")];
+
+        let error = materialize(project.path(), "owner.package", Some("1.0.0"), &skills)
+            .err()
+            .expect("unsafe registry skill name must fail");
+
+        assert!(error.to_string().contains("unsafe package skill name"));
+        assert!(!project.path().join("escape.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_symlinked_skills_parent_without_external_write() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join(".lpm/skills")).unwrap();
+
+        let error = materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill("guide", "content")],
+        )
+        .err()
+        .expect("symlinked parent must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+        assert!(!outside.path().join("owner.package").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_rejects_symlinked_skills_parent_without_external_deletion() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let package = outside.path().join("owner.package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("guide.md"), "content").unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join(".lpm/skills")).unwrap();
+
+        let error =
+            remove(project.path(), "owner.package").expect_err("symlinked parent must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+        assert!(package.join("guide.md").is_file());
+    }
+
+    #[test]
+    fn materialize_reconciles_removed_package_skills() {
+        let project = tempfile::tempdir().unwrap();
+        materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill("old", "old"), skill("kept", "before")],
+        )
+        .unwrap();
+
+        materialize(
+            project.path(),
+            "owner.package",
+            Some("2.0.0"),
+            &[skill("kept", "after")],
+        )
+        .unwrap();
+
+        let directory = project.path().join(".lpm/skills/owner.package");
+        assert!(!directory.join("old.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("kept.md")).unwrap(),
+            "after"
+        );
+    }
+
+    #[test]
+    fn materialization_complete_detects_missing_skill_content() {
+        let project = tempfile::tempdir().unwrap();
+        materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill("guide", "content")],
+        )
+        .unwrap();
+        std::fs::remove_file(project.path().join(".lpm/skills/owner.package/guide.md")).unwrap();
+        let package_json = r#"{"dependencies":{"@lpm.dev/owner.package":"1.0.0"}}"#;
+
+        assert!(!materialization_complete(project.path(), package_json));
+    }
+
+    #[test]
+    fn remove_deletes_package_owned_skill_directory() {
+        let project = tempfile::tempdir().unwrap();
+        materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill("guide", "content")],
+        )
+        .unwrap();
+
+        let removed = remove(project.path(), "@lpm.dev/owner.package").unwrap();
+
+        assert!(removed > 0);
+        assert!(!project.path().join(".lpm/skills/owner.package").exists());
+    }
+}

@@ -41,6 +41,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) force: bool,
     pub(super) offline: bool,
+    pub(super) no_skills: bool,
     pub(super) omit_policy: InstallOmitPolicy,
     pub(super) strict_peer_dependencies: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
@@ -83,6 +84,11 @@ pub(super) async fn run_install_freshness_phase(
     let cleanup_catalogs_in_pipeline = input.requested_add_count.is_none();
     let fast_path_base_eligible = !input.force
         && !input.offline
+        && (input.no_skills
+            || crate::commands::skills::package::materialization_complete(
+                input.project_dir,
+                &pkg_content_for_state,
+            ))
         && input.omit_policy.is_default()
         && !input.strict_peer_dependencies
         && install_state.up_to_date

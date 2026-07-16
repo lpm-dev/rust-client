@@ -1,0 +1,14 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: enable
+---
+{
+  "success": true,
+  "dry_run": false,
+  "changes": [
+    {
+      "action": "enable managed target",
+      "path": "[project]/.agents/skills/release-notes"
+    }
+  ]
+}

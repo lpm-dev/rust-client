@@ -1,0 +1,9 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: prune
+---
+{
+  "success": true,
+  "dry_run": false,
+  "changes": []
+}
