@@ -67,14 +67,17 @@ impl Store {
             .join(&skill.name)
     }
 
-    fn prepare_root(&self) -> Result<(), LpmError> {
-        let anchor = if self.scope == Scope::Project {
+    fn storage_anchor(&self) -> &Path {
+        if self.scope == Scope::Project {
             &self.project_dir
         } else {
             &self.root
-        };
+        }
+    }
+
+    fn prepare_root(&self) -> Result<(), LpmError> {
         super::path_security::ensure_contained_directory(
-            anchor,
+            self.storage_anchor(),
             &self.root,
             "managed skill storage",
         )?;
@@ -82,16 +85,26 @@ impl Store {
     }
 
     fn prepare_storage_directory(&self, directory: &Path) -> Result<(), LpmError> {
-        let anchor = if self.scope == Scope::Project {
-            &self.project_dir
-        } else {
-            &self.root
-        };
         super::path_security::ensure_contained_directory(
-            anchor,
+            self.storage_anchor(),
             directory,
             "managed skill storage",
         )?;
+        Ok(())
+    }
+
+    fn canonical_removal_path(&self, directory: &Path) -> Result<Option<PathBuf>, LpmError> {
+        super::path_security::canonicalize_contained_directory(
+            self.storage_anchor(),
+            directory,
+            "managed canonical cleanup",
+        )
+    }
+
+    fn remove_canonical_directory(&self, directory: &Path) -> Result<(), LpmError> {
+        if let Some(canonical) = self.canonical_removal_path(directory)? {
+            std::fs::remove_dir_all(canonical)?;
+        }
         Ok(())
     }
 
@@ -502,7 +515,7 @@ fn apply_install_batch(
         records,
     );
     if let Err(error) = commit_result {
-        rollback_staged_install(&mut canonical_stages, &mut target_stages);
+        rollback_staged_install(store, &mut canonical_stages, &mut target_stages);
         return Err(error);
     }
     Ok(())
@@ -633,6 +646,32 @@ fn commit_staged_install(
     target_stages: &mut [StagedTarget],
     records: Vec<ManagedSkillRecord>,
 ) -> Result<(), LpmError> {
+    let replaced_names: BTreeSet<_> = records.iter().map(|record| record.name.as_str()).collect();
+    let mut referenced: BTreeSet<_> = state
+        .skills
+        .iter()
+        .filter(|(name, _)| !replaced_names.contains(name.as_str()))
+        .map(|(_, record)| store.root.join(&record.canonical_dir))
+        .collect();
+    referenced.extend(
+        records
+            .iter()
+            .map(|record| store.root.join(&record.canonical_dir)),
+    );
+    let obsolete_canonicals: Vec<_> = records
+        .iter()
+        .filter_map(|record| {
+            state
+                .skills
+                .get(&record.name)
+                .map(|previous| store.root.join(&previous.canonical_dir))
+        })
+        .filter(|canonical| !referenced.contains(canonical))
+        .collect();
+    for canonical in &obsolete_canonicals {
+        store.canonical_removal_path(canonical)?;
+    }
+
     for stage in canonical_stages.iter_mut() {
         let previous = stage.transaction.path().join("previous");
         if stage.had_previous {
@@ -662,30 +701,13 @@ fn commit_staged_install(
         stage.installed = true;
     }
 
-    let previous_canonicals: Vec<_> = records
-        .iter()
-        .filter_map(|record| {
-            state
-                .skills
-                .get(&record.name)
-                .map(|previous| store.root.join(&previous.canonical_dir))
-        })
-        .collect();
     for record in records {
         state.skills.insert(record.name.clone(), record);
     }
     write_state(store, state)?;
 
-    let referenced: BTreeSet<_> = state
-        .skills
-        .values()
-        .map(|record| store.root.join(&record.canonical_dir))
-        .collect();
-    for canonical in previous_canonicals {
-        if !referenced.contains(&canonical)
-            && is_regular_directory(&canonical)
-            && let Err(error) = std::fs::remove_dir_all(&canonical)
-        {
+    for canonical in obsolete_canonicals {
+        if let Err(error) = store.remove_canonical_directory(&canonical) {
             tracing::warn!(
                 "managed skill update committed but could not remove superseded content at {}: {error}",
                 canonical.display()
@@ -696,6 +718,7 @@ fn commit_staged_install(
 }
 
 fn rollback_staged_install(
+    store: &Store,
     canonical_stages: &mut [StagedCanonical],
     target_stages: &mut [StagedTarget],
 ) {
@@ -711,8 +734,16 @@ fn rollback_staged_install(
     }
     for stage in canonical_stages.iter_mut().rev() {
         if stage.installed {
-            remove_path_if_present(&stage.final_path);
-            if stage.had_previous {
+            let removed = store
+                .remove_canonical_directory(&stage.final_path)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        "could not roll back managed canonical content at {}: {error}",
+                        stage.final_path.display()
+                    );
+                })
+                .is_ok();
+            if removed && stage.had_previous {
                 let _ =
                     std::fs::rename(stage.transaction.path().join("previous"), &stage.final_path);
             }
@@ -1457,6 +1488,20 @@ pub fn mutate(
         ));
     }
     preflight_mutation(&store, &state, &names, &args.agent, mutation)?;
+    if matches!(mutation, Mutation::Remove) {
+        for name in &names {
+            let Some(record) = state.skills.get(name) else {
+                continue;
+            };
+            let removes_every_target = record
+                .targets
+                .keys()
+                .all(|agent| args.agent.is_empty() || args.agent.contains(agent));
+            if removes_every_target {
+                store.canonical_removal_path(&store.root.join(&record.canonical_dir))?;
+            }
+        }
+    }
     let mut enabled_stages = Vec::new();
     let mut removed_stages = Vec::new();
     let mut records_to_remove = Vec::new();
@@ -1612,9 +1657,7 @@ pub fn mutate(
         return Err(error);
     }
     for canonical in removed_canonicals {
-        if is_regular_directory(&canonical)
-            && let Err(error) = std::fs::remove_dir_all(&canonical)
-        {
+        if let Err(error) = store.remove_canonical_directory(&canonical) {
             tracing::warn!(
                 "managed skill removal committed but could not remove content at {}: {error}",
                 canonical.display()
@@ -1663,6 +1706,11 @@ pub fn prune(project_dir: &Path, args: PruneArgs, json_output: bool) -> Result<(
         ));
     }
     let locked_plan = prune_plan(&store, &state);
+    for name in &locked_plan.records_to_remove {
+        if let Some(record) = state.skills.get(name) {
+            store.canonical_removal_path(&store.root.join(&record.canonical_dir))?;
+        }
+    }
     let mut removed_stages = Vec::new();
     for (name, agent) in &locked_plan.orphaned_targets {
         let Some(record) = state.skills.get(name) else {
@@ -1699,9 +1747,7 @@ pub fn prune(project_dir: &Path, args: PruneArgs, json_output: bool) -> Result<(
         return Err(error);
     }
     for canonical in removed_canonicals {
-        if is_regular_directory(&canonical)
-            && let Err(error) = std::fs::remove_dir_all(&canonical)
-        {
+        if let Err(error) = store.remove_canonical_directory(&canonical) {
             tracing::warn!(
                 "managed skill prune committed but could not remove content at {}: {error}",
                 canonical.display()

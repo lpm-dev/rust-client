@@ -1530,6 +1530,183 @@ fn skills_remove_all_deletes_every_managed_record_and_target() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn skills_remove_rejects_symlinked_canonical_parent_without_external_deletion() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed managed skill");
+    assert!(add.status.success());
+
+    let managed_root = project.path().join(".lpm/managed-skills");
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    let canonical_dir = state["skills"]["release-notes"]["canonical_dir"]
+        .as_str()
+        .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_sources = outside.path().join("sources");
+    std::fs::rename(managed_root.join("sources"), &outside_sources).unwrap();
+    std::os::unix::fs::symlink(&outside_sources, managed_root.join("sources")).unwrap();
+    let external_skill = outside.path().join(canonical_dir).join("SKILL.md");
+
+    let remove = lpm(&project)
+        .args(["skills", "remove", "release-notes", "--yes"])
+        .output()
+        .expect("failed to invoke managed skill removal");
+
+    assert!(
+        !remove.status.success(),
+        "removal through a symlinked canonical parent must fail closed"
+    );
+    assert!(external_skill.is_file(), "external content must survive");
+    assert!(project.file_exists(".agents/skills/release-notes/SKILL.md"));
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    assert!(state["skills"].get("release-notes").is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_update_rejects_symlinked_superseded_parent_without_external_deletion() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed managed skill");
+    assert!(add.status.success());
+
+    let managed_root = project.path().join(".lpm/managed-skills");
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    let canonical_dir = state["skills"]["release-notes"]["canonical_dir"]
+        .as_str()
+        .unwrap();
+    let canonical = managed_root.join(canonical_dir);
+    let old_revision = canonical.parent().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let external_revision = outside.path().join("revision");
+    std::fs::rename(old_revision, &external_revision).unwrap();
+    std::os::unix::fs::symlink(&external_revision, old_revision).unwrap();
+    let external_skill = external_revision.join("release-notes/SKILL.md");
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize commits and include migration guidance.",
+    );
+
+    let update = lpm(&project)
+        .args(["skills", "update", "release-notes", "--yes"])
+        .output()
+        .expect("failed to invoke managed skill update");
+
+    assert!(
+        !update.status.success(),
+        "update through a symlinked superseded parent must fail closed"
+    );
+    assert!(external_skill.is_file(), "external content must survive");
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    assert_eq!(
+        state["skills"]["release-notes"]["canonical_dir"],
+        serde_json::json!(canonical_dir)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_prune_rejects_symlinked_canonical_parent_without_external_deletion() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed managed skill");
+    assert!(add.status.success());
+
+    let managed_root = project.path().join(".lpm/managed-skills");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    let canonical_dir = state["skills"]["release-notes"]["canonical_dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    state["skills"]["release-notes"]["targets"] = serde_json::json!({});
+    project.write_file(
+        ".lpm/managed-skills/skills.lock.json",
+        &serde_json::to_string_pretty(&state).unwrap(),
+    );
+    let outside = tempfile::tempdir().unwrap();
+    let outside_sources = outside.path().join("sources");
+    std::fs::rename(managed_root.join("sources"), &outside_sources).unwrap();
+    std::os::unix::fs::symlink(&outside_sources, managed_root.join("sources")).unwrap();
+    let external_skill = outside.path().join(&canonical_dir).join("SKILL.md");
+
+    let prune = lpm(&project)
+        .args(["skills", "prune", "--yes"])
+        .output()
+        .expect("failed to invoke managed skill prune");
+
+    assert!(
+        !prune.status.success(),
+        "prune through a symlinked canonical parent must fail closed"
+    );
+    assert!(external_skill.is_file(), "external content must survive");
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    assert!(state["skills"].get("release-notes").is_some());
+}
+
 #[test]
 fn skills_update_reports_replacement_warning_as_a_new_finding() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
