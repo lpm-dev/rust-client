@@ -1414,7 +1414,7 @@ async fn run_with_options_under_store_lock(
     }
 
     // Step 8: Auto-install skills for direct LPM packages
-    if !no_skills {
+    if !offline && !no_skills {
         let lpm_packages: Vec<_> = packages
             .iter()
             .filter(|p| p.is_lpm && p.is_direct)

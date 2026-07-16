@@ -291,6 +291,39 @@ fn skills_add_local_source_links_selected_skill_into_codex_project_directory() {
 }
 
 #[test]
+fn skills_install_alias_routes_to_the_add_flow() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "install",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to invoke the skills install compatibility alias");
+
+    assert!(
+        output.status.success(),
+        "skills install must remain an alias for add: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.file_exists(".agents/skills/release-notes/SKILL.md"));
+}
+
+#[test]
 fn skills_add_local_source_rejects_security_findings_before_any_write() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     seed_standard_skill(
@@ -701,6 +734,52 @@ async fn install_propagates_package_skill_fetch_errors() {
     assert!(!project.path().join(".lpm/skills/owner.package").exists());
 }
 
+#[tokio::test]
+async fn offline_install_does_not_refetch_package_published_skills() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "skills",
+            "version": "1.0.0",
+            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
+        }"#,
+    );
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
+    registry
+        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
+        .await;
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "guide",
+                "Use package-specific conventions",
+                "Follow the package guide.",
+            )],
+            1,
+        )
+        .await;
+    let online = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .expect("failed to seed the offline package store");
+    assert!(online.status.success());
+    std::fs::remove_dir_all(project.path().join(".lpm/skills")).unwrap();
+
+    let offline = lpm_with_registry(&project, &registry.url())
+        .args(["install", "--offline"])
+        .output()
+        .expect("failed to run offline install");
+
+    assert!(
+        offline.status.success(),
+        "offline install must not require the skills endpoint: {}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert!(!project.path().join(".lpm/skills").exists());
+}
+
 #[test]
 fn skills_list_json_combines_package_and_managed_inventory_categories() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
@@ -740,6 +819,11 @@ fn skills_list_json_combines_package_and_managed_inventory_categories() {
     assert!(output.status.success(), "unified skill list must succeed");
     let mut envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("unified inventory must emit a JSON envelope");
+    assert_eq!(envelope["count"], serde_json::json!(2));
+    assert_eq!(
+        envelope["counts"],
+        serde_json::json!({"package": 1, "managed": 1, "external": 0})
+    );
     envelope["skills"]["managed"][0]["source"] = serde_json::json!("[local source]");
     insta::assert_json_snapshot!(envelope, @r###"
     {
@@ -750,6 +834,12 @@ fn skills_list_json_combines_package_and_managed_inventory_categories() {
           "size": 16
         }
       ],
+      "count": 2,
+      "counts": {
+        "package": 1,
+        "managed": 1,
+        "external": 0
+      },
       "skills": {
         "package": [
           {

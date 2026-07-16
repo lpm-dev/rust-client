@@ -6,6 +6,7 @@
 
 mod managed;
 pub(crate) mod package;
+mod path_security;
 mod source;
 
 use crate::install_ui;
@@ -21,6 +22,7 @@ use std::path::Path;
 #[derive(Debug, Subcommand)]
 pub enum SkillsCmd {
     /// Add a package-published LPM.dev skill set or a standalone agent skill.
+    #[command(visible_alias = "install")]
     Add(AddArgs),
     /// List package-published, LPM-managed, and externally discovered skills.
     #[command(visible_alias = "ls")]
@@ -672,6 +674,8 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
     } else {
         Vec::new()
     };
+    let package_total: usize = packages.iter().map(|(_, skills)| skills.len()).sum();
+    let total = package_total + managed.len() + external.len();
 
     if json_output {
         let mut map = serde_json::Map::new();
@@ -687,6 +691,15 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
                 ),
             );
         }
+        map.insert("count".into(), serde_json::json!(total));
+        map.insert(
+            "counts".into(),
+            serde_json::json!({
+                "package": package_total,
+                "managed": managed.len(),
+                "external": external.len(),
+            }),
+        );
         map.insert(
             "skills".into(),
             serde_json::json!({
@@ -716,8 +729,6 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
         }
         println!();
     }
-    let package_total: usize = packages.iter().map(|(_, skills)| skills.len()).sum();
-    let total = package_total + managed.len() + external.len();
     if total == 0 {
         install_ui::warn("No skills installed or discovered");
     } else if managed.is_empty() && external.is_empty() {

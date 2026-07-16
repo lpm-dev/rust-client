@@ -32,7 +32,7 @@ pub(crate) fn materialize(
     let package = parsed.short();
     let entries = validated_entries(skills)?;
     let root = project_dir.join(".lpm").join("skills");
-    std::fs::create_dir_all(&root)?;
+    super::path_security::ensure_contained_directory(project_dir, &root, "package skill storage")?;
     let target = root.join(&package);
     let had_previous = match std::fs::symlink_metadata(&target) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -99,7 +99,9 @@ pub(crate) fn validate(skills: &[Skill]) -> Result<(), LpmError> {
 pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError> {
     let _lock = acquire_mutation_lock(project_dir)?;
     let package = PackageName::parse(package)?.short();
-    let directory = project_dir.join(".lpm").join("skills").join(package);
+    let root = project_dir.join(".lpm").join("skills");
+    super::path_security::ensure_contained_directory(project_dir, &root, "package skill storage")?;
+    let directory = root.join(package);
     let metadata = match std::fs::symlink_metadata(&directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -119,6 +121,11 @@ pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError>
 pub(crate) fn acquire_mutation_lock(
     project_dir: &Path,
 ) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
+    super::path_security::ensure_contained_directory(
+        project_dir,
+        &project_dir.join(".lpm"),
+        "package skill state",
+    )?;
     lpm_common::acquire_exclusive_lock(project_dir.join(".lpm/.package-skills.lock"))
 }
 
@@ -264,6 +271,45 @@ mod tests {
 
         assert!(error.to_string().contains("unsafe package skill name"));
         assert!(!project.path().join("escape.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_symlinked_skills_parent_without_external_write() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join(".lpm/skills")).unwrap();
+
+        let error = materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill("guide", "content")],
+        )
+        .err()
+        .expect("symlinked parent must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+        assert!(!outside.path().join("owner.package").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_rejects_symlinked_skills_parent_without_external_deletion() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let package = outside.path().join("owner.package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("guide.md"), "content").unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join(".lpm/skills")).unwrap();
+
+        let error =
+            remove(project.path(), "owner.package").expect_err("symlinked parent must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+        assert!(package.join("guide.md").is_file());
     }
 
     #[test]

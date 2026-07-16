@@ -405,34 +405,29 @@ fn is_github_component(value: &str) -> bool {
 }
 
 async fn load_github(location: GithubLocation) -> Result<SourceTree, LpmError> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = std::env::var_os("GH_TOKEN").or_else(|| std::env::var_os("GITHUB_TOKEN")) {
-        let token = token.into_string().map_err(|_| {
-            LpmError::Registry("GitHub authentication token is not valid UTF-8".into())
-        })?;
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| LpmError::Registry("GitHub authentication token is invalid".into()))?;
-        value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-    }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .default_headers(headers)
-        .user_agent("lpm-skills")
-        .build()
-        .map_err(|error| LpmError::Registry(format!("failed to create GitHub client: {error}")))?;
+    let authentication = github_authentication_header()?;
+    let api_client = build_github_client()?;
+    let archive_client = build_github_client()?;
     let repository = location.repository();
-    let (reference, subpath, commit) =
-        resolve_github_location(&client, &repository, &location.path).await?;
+    let (reference, subpath, commit) = resolve_github_location(
+        &api_client,
+        authentication.as_ref(),
+        &repository,
+        &location.path,
+    )
+    .await?;
     if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(LpmError::Registry(
             "GitHub returned a non-immutable commit identifier".into(),
         ));
     }
     let archive_url = format!("https://api.github.com/repos/{repository}/tarball/{commit}");
-    let archive_response = client.get(archive_url).send().await.map_err(|error| {
-        LpmError::Registry(format!("failed to request GitHub archive: {error}"))
-    })?;
+    let archive_response = github_api_get(&api_client, &archive_url, authentication.as_ref())
+        .send()
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to request GitHub archive: {error}"))
+        })?;
     let location_header = archive_response
         .headers()
         .get(reqwest::header::LOCATION)
@@ -445,9 +440,13 @@ async fn load_github(location: GithubLocation) -> Result<SourceTree, LpmError> {
             "refusing GitHub archive redirect outside https://codeload.github.com/".into(),
         ));
     }
-    let archive_response = client.get(location_header).send().await.map_err(|error| {
-        LpmError::Registry(format!("failed to download pinned GitHub archive: {error}"))
-    })?;
+    let archive_response = archive_client
+        .get(location_header)
+        .send()
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to download pinned GitHub archive: {error}"))
+        })?;
     if !archive_response.status().is_success() {
         return Err(LpmError::Registry(format!(
             "GitHub archive download failed: HTTP {}",
@@ -473,8 +472,44 @@ async fn load_github(location: GithubLocation) -> Result<SourceTree, LpmError> {
     })
 }
 
+fn github_authentication_header() -> Result<Option<reqwest::header::HeaderValue>, LpmError> {
+    if let Some(token) = std::env::var_os("GH_TOKEN").or_else(|| std::env::var_os("GITHUB_TOKEN")) {
+        let token = token.into_string().map_err(|_| {
+            LpmError::Registry("GitHub authentication token is not valid UTF-8".into())
+        })?;
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| LpmError::Registry("GitHub authentication token is invalid".into()))?;
+        value.set_sensitive(true);
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
+}
+
+fn build_github_client() -> Result<reqwest::Client, LpmError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("lpm-skills")
+        .build()
+        .map_err(|error| LpmError::Registry(format!("failed to create GitHub client: {error}")))
+}
+
+fn github_api_get(
+    client: &reqwest::Client,
+    url: &str,
+    authentication: Option<&reqwest::header::HeaderValue>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    if let Some(value) = authentication {
+        request.header(reqwest::header::AUTHORIZATION, value.clone())
+    } else {
+        request
+    }
+}
+
 async fn resolve_github_location(
     client: &reqwest::Client,
+    authentication: Option<&reqwest::header::HeaderValue>,
     repository: &str,
     path: &GithubPath,
 ) -> Result<(String, PathBuf, String), LpmError> {
@@ -498,11 +533,14 @@ async fn resolve_github_location(
             "https://api.github.com/repos/{repository}/commits/{}",
             urlencoding::encode(&reference)
         );
-        let response = client.get(resolve_url).send().await.map_err(|error| {
-            LpmError::Registry(format!(
-                "failed to resolve immutable GitHub commit: {error}"
-            ))
-        })?;
+        let response = github_api_get(client, &resolve_url, authentication)
+            .send()
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to resolve immutable GitHub commit: {error}"
+                ))
+            })?;
         if !response.status().is_success() {
             if response.status() == reqwest::StatusCode::NOT_FOUND
                 || response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY
@@ -880,6 +918,46 @@ mod tests {
             GithubLocation::parse("git@github.com:vercel-labs/agent-skills.git").unwrap_err();
 
         assert!(error.to_string().contains("HTTPS GitHub"));
+    }
+
+    #[tokio::test]
+    async fn codeload_request_does_not_include_github_api_credentials() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = build_github_client().unwrap();
+
+        client.get(server.uri()).send().await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+
+        assert!(!requests[0].headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn github_api_request_includes_configured_credentials() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let authentication = reqwest::header::HeaderValue::from_static("Bearer secret");
+        let client = build_github_client().unwrap();
+
+        github_api_get(&client, &server.uri(), Some(&authentication))
+            .send()
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret")
+        );
     }
 
     #[test]
