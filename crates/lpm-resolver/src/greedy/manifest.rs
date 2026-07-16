@@ -796,6 +796,10 @@ fn merge_cached_package_info(
             && (existing.trust_metadata_complete || incoming.trust_metadata_complete),
         versions_complete,
         covered_ranges,
+        latest_version: incoming
+            .latest_version
+            .clone()
+            .or_else(|| existing.latest_version.clone()),
         versions,
         deps,
         peer_deps,

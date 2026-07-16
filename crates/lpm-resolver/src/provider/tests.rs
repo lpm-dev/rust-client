@@ -64,6 +64,7 @@ fn peer_deps_stored_per_version() {
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        latest_version: None,
         versions: vec![
             NpmVersion::parse("2.0.0").unwrap(),
             NpmVersion::parse("1.0.0").unwrap(),
@@ -475,6 +476,7 @@ fn make_info(
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        latest_version: None,
         versions: versions
             .iter()
             .filter_map(|v| NpmVersion::parse(v).ok())
@@ -1485,6 +1487,49 @@ fn release_age_package_scope_allows_unlisted_transitive_version() {
 // instead of recomputing. `available_versions` is fixed for a
 // given `ResolverPackage` once `ensure_cached` has run, so there's
 // no staleness concern within a resolve pass.
+
+#[test]
+fn latest_range_fallback_never_exceeds_dist_tag_target() {
+    let pkg = ResolverPackage::npm("rolled-back-latest");
+    let mut info = make_info(&["4.0.0", "3.1.0", "3.0.0"], vec![], vec![], vec![]);
+    info.latest_version = Some(NpmVersion::parse("3.1.0").unwrap());
+    for (version, published_at) in [
+        ("4.0.0", "2025-01-01T00:00:00.000Z"),
+        ("3.1.0", "2025-01-03T00:00:00.000Z"),
+        ("3.0.0", "2025-01-01T00:00:00.000Z"),
+    ] {
+        info.dist.insert(
+            version.to_string(),
+            CachedDistInfo {
+                published_at: Some(published_at.to_string()),
+                published_at_unix: parse_npm_time_unix(published_at),
+                ..CachedDistInfo::default()
+            },
+        );
+    }
+
+    let client = Arc::new(RegistryClient::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+        .with_policy(ResolverPolicy::with_cutoff_unix(
+            86_400,
+            parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
+            TrustPolicyMode::Off,
+        ));
+    provider
+        .cache
+        .insert(CanonicalKey::from(&pkg), Arc::new(info));
+
+    let available = provider.available_versions(&pkg);
+    let latest = NpmRange::parse("latest").unwrap();
+    let range = provider.to_pubgrub_ranges_cached(&pkg, &latest, &available);
+    let chosen = provider.choose_version(&pkg, &range).unwrap();
+
+    assert_eq!(
+        chosen.map(|version| version.to_string()),
+        Some("3.0.0".into())
+    );
+}
 
 #[test]
 fn to_pubgrub_ranges_cached_hits_on_repeated_query() {

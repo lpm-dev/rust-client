@@ -180,7 +180,7 @@ enum MetadataEdgeMissRangeShape {
 
 fn metadata_edge_miss_range_shape(range: &NpmRange) -> MetadataEdgeMissRangeShape {
     let raw = range.raw().trim();
-    if raw == "*" {
+    if raw == "*" || raw == "latest" {
         return MetadataEdgeMissRangeShape::Star;
     }
     if NpmVersion::parse(raw).is_ok() {
@@ -670,6 +670,7 @@ mod tests {
             trust_metadata_complete: false,
             versions_complete: true,
             covered_ranges: HashSet::new(),
+            latest_version: None,
             versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
             deps: HashMap::new(),
             peer_deps: HashMap::new(),

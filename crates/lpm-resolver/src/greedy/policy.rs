@@ -24,7 +24,7 @@ pub(super) fn apply_override_target_greedy(
 ) -> Option<NpmVersion> {
     match target {
         OverrideTarget::PinnedVersion { version, .. } => {
-            if range.satisfies(version)
+            if range.satisfies_with_latest_bound(version, info.latest_version.as_ref())
                 && matches!(
                     release_age_status_for_version(canonical, info, version, policy),
                     ReleaseTimeStatus::Allowed
@@ -45,7 +45,7 @@ pub(super) fn apply_override_target_greedy(
             // `parse_metadata_to_cache_info`, so the first match is
             // the newest match — same contract as `find_best_version`.
             for v in &info.versions {
-                if !range.satisfies(v) {
+                if !range.satisfies_with_latest_bound(v, info.latest_version.as_ref()) {
                     continue;
                 }
                 if !target_range.satisfies(v) {

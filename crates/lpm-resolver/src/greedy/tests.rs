@@ -119,6 +119,7 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        latest_version: None,
         versions: parsed,
         deps: deps_map,
         peer_deps: HashMap::new(),
@@ -313,6 +314,28 @@ fn find_best_version_skips_too_fresh_latest_when_release_age_is_active() {
         ))
         .to_string(),
         "1.0.0"
+    );
+}
+
+#[test]
+fn find_best_version_latest_fallback_never_exceeds_dist_tag_target() {
+    let mut info = mk_info(&["4.0.0", "3.1.0", "3.0.0"], &[]);
+    info.latest_version = Some(NpmVersion::parse("3.1.0").unwrap());
+    set_published_at(&mut info, "4.0.0", "2025-01-01T00:00:00.000Z");
+    set_published_at(&mut info, "3.1.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut info, "3.0.0", "2025-01-01T00:00:00.000Z");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let range = NpmRange::parse("latest").unwrap();
+
+    assert_eq!(
+        picked(find_best_version_with_policy(
+            &CanonicalKey::npm("release-age-target"),
+            &info,
+            &range,
+            &policy,
+        ))
+        .to_string(),
+        "3.0.0"
     );
 }
 
