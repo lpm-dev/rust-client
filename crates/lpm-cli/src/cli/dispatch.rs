@@ -1651,12 +1651,8 @@ async fn async_main() -> Result<()> {
         }
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills(args) => {
-            let lifecycle_args::SkillsArgs {
-                action,
-                package,
-            } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::skills::run(&client, &action, package.as_deref(), &cwd, cli.json).await
+            commands::skills::run(&client, args, &cwd, cli.json).await
         }
         Commands::Remove(args) => {
             let lifecycle_args::RemoveArgs {

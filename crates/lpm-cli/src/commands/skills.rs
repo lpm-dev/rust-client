@@ -1,369 +1,1366 @@
+use crate::cli::{
+    SkillsAddArgs, SkillsArgs, SkillsCommand, SkillsListArgs, SkillsRemoveArgs, SkillsScopeArgs,
+    SkillsToggleArgs, SkillsUpdateArgs, SkillsValidateArgs, SkillsViewArgs,
+};
 use crate::install_ui;
+use crate::prompt::prompt_err;
+use crate::skills_model::{
+    AgentTarget, ManagedSkill, SkillBinding, SkillManifest, SkillScope, managed_root,
+};
+use crate::skills_source::{
+    DiscoveredSkill, SkillAudit, audit_skill, copy_skill_tree, discover_skills, resolve_source,
+};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use std::path::Path;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-/// Skills management: list, install from a package, validate, clean.
+/// Manage agent skills from GitHub, local directories, and the LPM Registry.
 pub async fn run(
     client: &RegistryClient,
-    action: &str,
-    package: Option<&str>,
+    args: SkillsArgs,
     project_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    match action {
-        "list" | "ls" => list_skills(project_dir, json_output),
-        "install" => {
-            let pkg = package.ok_or_else(|| {
-                LpmError::Registry("specify a package: lpm skills install <package>".into())
-            })?;
-            install_skills(client, pkg, project_dir, json_output).await
-        }
-        "validate" => validate_skills(project_dir, json_output),
-        "clean" => clean_skills(project_dir, json_output),
-        _ => Err(LpmError::Registry(format!(
-            "unknown skills action: {action}. Use: list, install, validate, clean"
-        ))),
+    match args.action {
+        SkillsCommand::Add(args) => run_add(client, args, project_dir, json_output).await,
+        SkillsCommand::List(args) => run_list(args, project_dir, json_output),
+        SkillsCommand::View(args) => run_view(args, project_dir, json_output),
+        SkillsCommand::Remove(args) => run_remove(args, project_dir, json_output),
+        SkillsCommand::Enable(args) => run_toggle(args, true, project_dir, json_output),
+        SkillsCommand::Disable(args) => run_toggle(args, false, project_dir, json_output),
+        SkillsCommand::Update(args) => run_update(client, args, project_dir, json_output).await,
+        SkillsCommand::Doctor(args) => run_doctor(args, project_dir, json_output),
+        SkillsCommand::Validate(args) => run_validate(args, project_dir, json_output),
     }
 }
 
-fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let skills_dir = project_dir.join(".lpm").join("skills");
-    if !skills_dir.exists() {
-        if !json_output {
-            install_ui::warn("No skills installed");
-        }
-        return Ok(());
-    }
-
-    // Walk subdirectories: .lpm/skills/{owner.package}/*.md
-    let mut packages: Vec<(String, Vec<(String, u64)>)> = Vec::new();
-
-    for pkg_entry in std::fs::read_dir(&skills_dir)?.flatten() {
-        if !pkg_entry.path().is_dir() {
-            continue;
-        }
-
-        let pkg_name = pkg_entry.file_name().to_string_lossy().to_string();
-        let mut skills = Vec::new();
-
-        for skill_entry in std::fs::read_dir(pkg_entry.path())?.flatten() {
-            let path = skill_entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                let name = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let size = skill_entry.metadata().map_or(0, |m| m.len());
-                skills.push((name, size));
-            }
-        }
-
-        if !skills.is_empty() {
-            skills.sort_by(|a, b| a.0.cmp(&b.0));
-            packages.push((pkg_name, skills));
-        }
-    }
-
-    packages.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if json_output {
-        // JSON output grouped by package
-        let mut map = serde_json::Map::new();
-        map.insert("success".to_string(), serde_json::Value::Bool(true));
-        for (pkg, skills) in &packages {
-            let arr: Vec<serde_json::Value> = skills
-                .iter()
-                .map(|(name, size)| serde_json::json!({"name": name, "size": size}))
-                .collect();
-            map.insert(pkg.clone(), serde_json::Value::Array(arr));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
-        );
-    } else if packages.is_empty() {
-        install_ui::warn("No skills installed");
-    } else {
-        let total: usize = packages.iter().map(|(_, s)| s.len()).sum();
-        let width = packages
-            .iter()
-            .flat_map(|(_, skills)| skills.iter().map(|(name, _)| name.len() + ".md".len()))
-            .max()
-            .unwrap_or(0);
-        for (pkg_name, skills) in &packages {
-            println!("{}", install_ui::cyan(&format!("@lpm.dev/{pkg_name}")));
-            for (name, size) in skills {
-                let file_name = format!("{name}.md");
-                println!(
-                    "  {file_name:<width$}  {}",
-                    lpm_common::format_bytes(*size).dimmed()
-                );
-            }
-            println!();
-        }
-        install_ui::done(&format!(
-            "{total} {} installed across {} {}",
-            plural(total, "skill", "skills"),
-            packages.len(),
-            plural(packages.len(), "package", "packages"),
-        ));
-    }
-
-    Ok(())
-}
-
-async fn install_skills(
+async fn run_add(
     client: &RegistryClient,
-    package: &str,
+    mut args: SkillsAddArgs,
     project_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let name = lpm_common::PackageName::parse(package)?;
-
-    if !json_output {
-        install_ui::phase(&format!("Fetching skills for {}", name.scoped().bold()));
-    }
-
-    let skills = client.get_skills(&name.short(), None).await?;
-
-    if skills.skills.is_empty() {
-        if !json_output {
-            install_ui::warn("Package has no skills");
-        }
-        return Ok(());
-    }
-
-    // Create skills directory
-    let skills_dir = project_dir.join(".lpm").join("skills").join(name.short());
-    std::fs::create_dir_all(&skills_dir)?;
-
-    let mut installed = 0;
-    for skill in &skills.skills {
-        let content = skill
-            .raw_content
-            .as_deref()
-            .or(skill.content.as_deref())
-            .unwrap_or("");
-
-        if content.is_empty() {
-            continue;
-        }
-
-        if !lpm_common::is_safe_skill_name(&skill.name) {
-            tracing::warn!("skipping skill with unsafe name: {}", skill.name);
-            continue;
-        }
-
-        let path = skills_dir.join(format!("{}.md", skill.name));
-        std::fs::write(&path, content)?;
-        installed += 1;
-    }
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "installed": installed,
-                "directory": skills_dir.display().to_string(),
-            }))
-            .unwrap()
-        );
-    } else {
-        install_ui::done(&format!(
-            "Installed {installed} {}",
-            plural(installed, "skill", "skills"),
-        ));
-        eprintln!("  {}", skills_dir.display().to_string().dimmed());
-    }
-
-    Ok(())
-}
-
-fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let skills_dir = project_dir.join(".lpm").join("skills");
-    if !skills_dir.exists() {
-        if !json_output {
-            install_ui::warn("No .lpm/skills/ directory found");
-        }
-        return Ok(());
-    }
-
-    let mut errors = Vec::new();
-    let mut valid = 0;
-    let mut total_size: u64 = 0;
-
-    // Walk subdirectories: .lpm/skills/{owner.package}/*.md
-    for pkg_entry in std::fs::read_dir(&skills_dir)?.flatten() {
-        let pkg_path = pkg_entry.path();
-        if !pkg_path.is_dir() {
-            continue;
-        }
-
-        for skill_entry in std::fs::read_dir(&pkg_path).into_iter().flatten().flatten() {
-            let path = skill_entry.path();
-            if path.extension().is_none_or(|e| e != "md") {
-                continue;
-            }
-
-            let pkg_name = pkg_path.file_name().unwrap_or_default().to_string_lossy();
-            let name = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let display_name = format!("{pkg_name}/{name}");
-            let size = skill_entry.metadata().map_or(0, |m| m.len());
-            total_size += size;
-
-            if size > 15 * 1024 {
-                errors.push(format!("{display_name}: exceeds 15KB limit ({size} bytes)"));
-                continue;
-            }
-
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            if content.len() < 100 {
-                errors.push(format!(
-                    "{display_name}: content too short (need 100+ chars)"
-                ));
-                continue;
-            }
-
-            // Check for frontmatter
-            if !content.starts_with("---") {
-                errors.push(format!("{display_name}: missing YAML frontmatter"));
-                continue;
-            }
-
-            valid += 1;
-        }
-    }
-
-    if total_size > 100 * 1024 {
-        errors.push(format!(
-            "total skills size {total_size} bytes exceeds 100KB limit"
-        ));
-    }
-
-    if json_output {
-        let quality_impact = if valid >= 3 {
-            10
-        } else if valid > 0 {
-            7
-        } else {
-            0
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": errors.is_empty(),
-                "valid": valid,
-                "errors": errors,
-                "quality_impact": quality_impact,
-            }))
-            .unwrap()
-        );
-        // a non-empty `errors` list must surface as a
-        // non-zero exit code so CI gates fail closed. The structured
-        // envelope above carries the per-skill error list; returning
-        // `LpmError::ExitCode(1)` exits non-zero while routing past
-        // the top-level `--json` envelope handler so we don't emit a
-        // second, less-informative envelope on top of the rich one.
-        if !errors.is_empty() {
-            return Err(LpmError::ExitCode(1));
-        }
-        return Ok(());
-    } else if errors.is_empty() {
-        install_ui::done(&format!(
-            "{valid} {} valid",
-            plural(valid, "skill", "skills"),
-        ));
-        if valid > 0 {
-            let impact = if valid >= 3 {
-                "+7 pts (has-skills) +3 pts (comprehensive)"
-            } else {
-                "+7 pts (has-skills)"
-            };
-            install_ui::phase(&format!("Quality impact: {}", impact.green()));
-        }
-    } else {
-        for err in &errors {
-            install_ui::warn(err);
-        }
-        if valid > 0 {
-            install_ui::phase(&format!(
-                "{valid} {} valid, {} {}",
-                plural(valid, "skill", "skills"),
-                errors.len(),
-                plural(errors.len(), "error", "errors"),
+    let started = Instant::now();
+    let interactive = is_interactive(args.yes, json_output);
+    let source = match args.source.take() {
+        Some(source) => source,
+        None if interactive => cliclack::input("Skill source")
+            .placeholder("vercel-labs/agent-skills, https://github.com/org/repo, or ./skills")
+            .interact::<String>()
+            .map_err(prompt_err)?,
+        None => {
+            return Err(LpmError::Registry(
+                "specify a source or run `lpm skills add` in an interactive terminal".into(),
             ));
         }
+    };
+
+    if !json_output {
+        install_ui::phase(&format!("Resolving {}", install_ui::cyan(&source)));
+    }
+    let resolved = resolve_source(&source, client).await?;
+    let discovered = discover_skills(&resolved.root)?;
+    if discovered.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "no SKILL.md files found in `{source}`"
+        )));
+    }
+    if args.list {
+        print_discovered(&source, &discovered, json_output);
+        return Ok(());
     }
 
-    // human-mode path. Per-skill warnings have already
-    // been emitted above; return a concise summary error so the
-    // top-level error handler renders a slim failure AND the process
-    // exits non-zero. Without this, CI gates that run
-    // `lpm skills validate` silently passed on broken skill files.
-    // Mirrors the contract of every other audit/lint-style command.
-    if !errors.is_empty() {
-        return Err(LpmError::Script(format!(
-            "{} skill validation error(s)",
-            errors.len()
+    let selected = select_skills(&discovered, &args, interactive)?;
+    let scope = select_scope(&args, interactive)?;
+    let agents = select_agents(&args, scope, project_dir, interactive)?;
+    let audited: Vec<_> = selected
+        .iter()
+        .map(|skill| audit_skill(skill).map(|audit| (skill, audit)))
+        .collect::<Result<_, _>>()?;
+    let blocked: Vec<_> = audited
+        .iter()
+        .filter(|(_, audit)| !audit.findings.is_empty())
+        .collect();
+    if !blocked.is_empty() {
+        let details = blocked
+            .iter()
+            .map(|(skill, audit)| format!("{}: {}", skill.name, audit.findings.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(LpmError::Registry(format!(
+            "refusing to install skills with blocked security findings: {details}"
         )));
     }
 
-    Ok(())
-}
-
-fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let skills_dir = project_dir.join(".lpm").join("skills");
-    if !skills_dir.exists() {
-        if !json_output {
-            install_ui::warn("No skills to clean");
+    if interactive {
+        print_install_plan(&source, &selected, scope, &agents, args.copy);
+        let confirmed = cliclack::confirm("Install selected skills?")
+            .initial_value(true)
+            .interact()
+            .map_err(prompt_err)?;
+        if !confirmed {
+            return Err(LpmError::Registry("skills installation cancelled".into()));
         }
-        return Ok(());
     }
 
-    // Count files before removing
-    let file_count = count_files_recursive(&skills_dir);
-
-    std::fs::remove_dir_all(&skills_dir)?;
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"success": true, "cleaned": true, "files_removed": file_count})
-        );
-    } else {
-        install_ui::done(&format!(
-            "Skills cleaned · removed {file_count} {}",
-            plural(file_count, "file", "files"),
-        ));
-    }
-
-    Ok(())
-}
-
-fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
-}
-
-fn count_files_recursive(dir: &Path) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                count += count_files_recursive(&entry.path());
-            } else {
-                count += 1;
+    let mut manifest = SkillManifest::load(scope, project_dir)?;
+    let requested_bindings: Vec<_> = agents
+        .into_iter()
+        .map(|agent| SkillBinding {
+            agent,
+            enabled: true,
+            copied: args.copy,
+        })
+        .collect();
+    preflight_install(&manifest, &audited, &requested_bindings, scope, project_dir)?;
+    let mut installed = Vec::with_capacity(audited.len());
+    for (skill, audit) in audited {
+        match install_skill(
+            &mut manifest,
+            skill,
+            &audit,
+            InstallOptions {
+                source: &resolved.source,
+                source_kind: resolved.source_kind,
+                resolved_revision: resolved.resolved_revision.as_deref(),
+                scope,
+                bindings: &requested_bindings,
+                project_dir,
+            },
+        ) {
+            Ok(managed) => installed.push(managed),
+            Err(error) => {
+                for managed in installed.iter().rev() {
+                    let _ = remove_managed_skill(managed, project_dir);
+                }
+                return Err(error);
             }
         }
     }
-    count
+    if let Err(error) = manifest.save(scope, project_dir) {
+        for managed in installed.iter().rev() {
+            let _ = remove_managed_skill(managed, project_dir);
+        }
+        return Err(error);
+    }
+
+    if json_output {
+        let skills: Vec<_> = installed.iter().map(skill_json).collect();
+        print_json(serde_json::json!({
+            "success": true,
+            "action": "add",
+            "source": source,
+            "scope": scope.as_str(),
+            "skills": skills,
+            "count": installed.len(),
+            "duration_ms": started.elapsed().as_millis() as u64,
+        }));
+    } else {
+        for skill in &installed {
+            install_ui::done(&format!(
+                "Enabled {} for {}",
+                install_ui::yellow(&skill.name),
+                skill
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.agent.display_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        install_ui::done(&format!(
+            "Added {} {} in {}",
+            installed.len(),
+            if installed.len() == 1 {
+                "skill"
+            } else {
+                "skills"
+            },
+            install_ui::status_ok(&install_ui::format_duration(started.elapsed()))
+        ));
+    }
+    Ok(())
+}
+
+fn print_discovered(source: &str, skills: &[DiscoveredSkill], json_output: bool) {
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "source": source,
+            "skills": skills.iter().map(|skill| serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+            })).collect::<Vec<_>>(),
+            "count": skills.len(),
+        }));
+        return;
+    }
+    install_ui::phase(&format!("Skills from {}", install_ui::cyan(source)));
+    for skill in skills {
+        eprintln!("  {:<24} {}", skill.name, skill.description.dimmed());
+    }
+    install_ui::done(&format!(
+        "Found {} {}",
+        skills.len(),
+        plural(skills.len(), "skill")
+    ));
+}
+
+fn select_skills(
+    discovered: &[DiscoveredSkill],
+    args: &SkillsAddArgs,
+    interactive: bool,
+) -> Result<Vec<DiscoveredSkill>, LpmError> {
+    if args.all && !args.skills.is_empty() {
+        return Err(LpmError::Registry(
+            "`--all` cannot be combined with `--skill`".into(),
+        ));
+    }
+    if args.all {
+        return Ok(discovered.to_vec());
+    }
+    if !args.skills.is_empty() {
+        let mut selected = Vec::with_capacity(args.skills.len());
+        for requested in &args.skills {
+            let skill = discovered
+                .iter()
+                .find(|skill| skill.name == *requested)
+                .ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "source does not contain skill `{requested}`; available: {}",
+                        discovered
+                            .iter()
+                            .map(|skill| skill.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+            selected.push(skill.clone());
+        }
+        return Ok(selected);
+    }
+    if discovered.len() == 1 {
+        return Ok(vec![discovered[0].clone()]);
+    }
+    if !interactive {
+        return Err(LpmError::Registry(format!(
+            "source contains multiple skills; pass `--skill <name>` or `--all`: {}",
+            discovered
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    let mut select = cliclack::multiselect("Select skills  (space=toggle  a=all  enter=confirm)");
+    for (index, skill) in discovered.iter().enumerate() {
+        select = select.item(index, &skill.name, &skill.description);
+    }
+    let indices: Vec<usize> = select.interact().map_err(prompt_err)?;
+    if indices.is_empty() {
+        return Err(LpmError::Registry("select at least one skill".into()));
+    }
+    Ok(indices
+        .into_iter()
+        .filter_map(|index| discovered.get(index).cloned())
+        .collect())
+}
+
+fn select_scope(args: &SkillsAddArgs, interactive: bool) -> Result<SkillScope, LpmError> {
+    if args.global {
+        return Ok(SkillScope::Global);
+    }
+    if args.project || !interactive {
+        return Ok(SkillScope::Project);
+    }
+    let choice: &str = cliclack::select("Install scope")
+        .item("project", "Project", "available to this repository")
+        .item("global", "Global", "available in every repository")
+        .initial_value("project")
+        .interact()
+        .map_err(prompt_err)?;
+    Ok(match choice {
+        "global" => SkillScope::Global,
+        _ => SkillScope::Project,
+    })
+}
+
+fn select_agents(
+    args: &SkillsAddArgs,
+    scope: SkillScope,
+    project_dir: &Path,
+    interactive: bool,
+) -> Result<Vec<AgentTarget>, LpmError> {
+    if args.all_agents && !args.agents.is_empty() {
+        return Err(LpmError::Registry(
+            "`--all-agents` cannot be combined with `--agent`".into(),
+        ));
+    }
+    if args.all_agents {
+        return Ok(AgentTarget::ALL.to_vec());
+    }
+    if !args.agents.is_empty() {
+        return parse_agents(&args.agents);
+    }
+    if !interactive {
+        return Err(LpmError::Registry(
+            "non-interactive installs require `--agent <name>` or `--all-agents`".into(),
+        ));
+    }
+
+    let detected: Vec<_> = AgentTarget::ALL
+        .into_iter()
+        .filter(|agent| agent.is_detected(scope, project_dir))
+        .collect();
+    let mut select =
+        cliclack::multiselect("Enable for agents  (space=toggle  a=all  enter=confirm)");
+    for (index, agent) in AgentTarget::ALL.iter().enumerate() {
+        let hint = if detected.contains(agent) {
+            "detected"
+        } else {
+            "creates its skill directory"
+        };
+        select = select.item(index, agent.display_name(), hint);
+    }
+    let initial: Vec<usize> = AgentTarget::ALL
+        .iter()
+        .enumerate()
+        .filter_map(|(index, agent)| detected.contains(agent).then_some(index))
+        .collect();
+    let indices: Vec<usize> = select
+        .initial_values(initial)
+        .interact()
+        .map_err(prompt_err)?;
+    if indices.is_empty() {
+        return Err(LpmError::Registry("select at least one agent".into()));
+    }
+    Ok(indices
+        .into_iter()
+        .map(|index| AgentTarget::ALL[index])
+        .collect())
+}
+
+fn print_install_plan(
+    source: &str,
+    skills: &[DiscoveredSkill],
+    scope: SkillScope,
+    agents: &[AgentTarget],
+    copy: bool,
+) {
+    eprintln!();
+    eprintln!("  {}", install_ui::section("Installation plan"));
+    eprintln!("  {}  {}", "source".dimmed(), install_ui::cyan(source));
+    eprintln!(
+        "  {}  {}",
+        "skills".dimmed(),
+        skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!(
+        "  {}  {}",
+        "scope".dimmed(),
+        install_ui::cyan(scope.as_str())
+    );
+    eprintln!(
+        "  {}  {} ({})",
+        "agents".dimmed(),
+        agents
+            .iter()
+            .map(|agent| agent.display_name())
+            .collect::<Vec<_>>()
+            .join(", "),
+        if copy { "copy" } else { "link" }
+    );
+    eprintln!();
+}
+
+struct InstallOptions<'a> {
+    source: &'a str,
+    source_kind: &'a str,
+    resolved_revision: Option<&'a str>,
+    scope: SkillScope,
+    bindings: &'a [SkillBinding],
+    project_dir: &'a Path,
+}
+
+fn install_skill(
+    manifest: &mut SkillManifest,
+    skill: &DiscoveredSkill,
+    audit: &SkillAudit,
+    options: InstallOptions<'_>,
+) -> Result<ManagedSkill, LpmError> {
+    let id = managed_id(&skill.name, &audit.digest);
+    if manifest
+        .skills
+        .iter()
+        .any(|installed| installed.name == skill.name && installed.source == options.source)
+    {
+        return Err(LpmError::Registry(format!(
+            "skill `{}` from `{}` is already managed; run `lpm skills update {}`",
+            options.source, skill.name, skill.name
+        )));
+    }
+
+    let root = managed_root(options.scope, options.project_dir)?;
+    std::fs::create_dir_all(&root).map_err(LpmError::Io)?;
+    let canonical = root.join(&id);
+    if let Err(error) = copy_skill_tree(&skill.root, &canonical) {
+        let _ = std::fs::remove_dir_all(&canonical);
+        return Err(error);
+    }
+    let mut bindings: Vec<SkillBinding> = Vec::with_capacity(options.bindings.len());
+    for requested in options.bindings {
+        let copied = if requested.enabled {
+            match install_agent_binding(
+                requested.agent,
+                options.scope,
+                options.project_dir,
+                &id,
+                &canonical,
+                requested.copied,
+            ) {
+                Ok(copied) => copied,
+                Err(error) => {
+                    for binding in &bindings {
+                        let target = binding
+                            .agent
+                            .skill_root(options.scope, options.project_dir)?
+                            .join(&id);
+                        remove_owned_target(&target, &canonical, binding.copied, &id)?;
+                    }
+                    std::fs::remove_dir_all(&canonical).map_err(LpmError::Io)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            requested.copied
+        };
+        bindings.push(SkillBinding {
+            agent: requested.agent,
+            enabled: requested.enabled,
+            copied,
+        });
+    }
+    let managed = ManagedSkill {
+        id,
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        source: options.source.to_string(),
+        source_kind: options.source_kind.to_string(),
+        resolved_revision: options.resolved_revision.map(str::to_string),
+        digest: audit.digest.clone(),
+        scope: options.scope,
+        bindings,
+        estimated_tokens: audit.estimated_tokens,
+        size_bytes: audit.size_bytes,
+    };
+    manifest.skills.push(managed.clone());
+    manifest
+        .skills
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(managed)
+}
+
+fn preflight_install(
+    manifest: &SkillManifest,
+    audited: &[(&DiscoveredSkill, SkillAudit)],
+    bindings: &[SkillBinding],
+    scope: SkillScope,
+    project_dir: &Path,
+) -> Result<(), LpmError> {
+    let root = managed_root(scope, project_dir)?;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut targets = std::collections::BTreeSet::new();
+    for (skill, audit) in audited {
+        let id = managed_id(&skill.name, &audit.digest);
+        if !ids.insert(id.clone()) || root.join(&id).symlink_metadata().is_ok() {
+            return Err(LpmError::Registry(format!(
+                "refusing to replace existing managed skill path {}",
+                root.join(&id).display()
+            )));
+        }
+        if manifest.skills.iter().any(|managed| managed.id == id) {
+            return Err(LpmError::Registry(format!(
+                "skill `{}` is already managed; run `lpm skills update {}`",
+                skill.name, skill.name
+            )));
+        }
+        for binding in bindings.iter().filter(|binding| binding.enabled) {
+            let target = binding.agent.skill_root(scope, project_dir)?.join(&id);
+            if !targets.insert(target.clone()) || target.symlink_metadata().is_ok() {
+                return Err(LpmError::Registry(format!(
+                    "refusing to replace existing agent skill path {}",
+                    target.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn install_agent_binding(
+    agent: AgentTarget,
+    scope: SkillScope,
+    project_dir: &Path,
+    id: &str,
+    canonical: &Path,
+    copy: bool,
+) -> Result<bool, LpmError> {
+    let root = agent.skill_root(scope, project_dir)?;
+    std::fs::create_dir_all(&root).map_err(LpmError::Io)?;
+    let target = root.join(id);
+    if target.symlink_metadata().is_ok() {
+        return Err(LpmError::Registry(format!(
+            "refusing to replace existing agent skill path {}",
+            target.display()
+        )));
+    }
+    if copy {
+        copy_binding_tree(canonical, &target, id)?;
+        return Ok(true);
+    }
+    create_skill_link(canonical, &target)?;
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn create_skill_link(canonical: &Path, target: &Path) -> Result<(), LpmError> {
+    std::os::unix::fs::symlink(canonical, target).map_err(LpmError::Io)
+}
+
+#[cfg(windows)]
+fn create_skill_link(canonical: &Path, target: &Path) -> Result<(), LpmError> {
+    std::os::windows::fs::symlink_dir(canonical, target).map_err(LpmError::Io)
+}
+
+fn copy_binding_tree(canonical: &Path, target: &Path, id: &str) -> Result<(), LpmError> {
+    let result = copy_skill_tree(canonical, target).and_then(|_| {
+        std::fs::write(target.join(".lpm-skill-owner"), format!("{id}\n")).map_err(LpmError::Io)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(target);
+    }
+    result
+}
+
+fn run_list(args: SkillsListArgs, project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    let skills = load_scoped_skills(args.scope, project_dir)?;
+    let skills: Vec<_> = skills
+        .into_iter()
+        .filter(|skill| {
+            args.agent.as_ref().is_none_or(|agent| {
+                skill
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.agent.as_str() == agent)
+            })
+        })
+        .collect();
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "skills": skills.iter().map(skill_json).collect::<Vec<_>>(),
+            "count": skills.len(),
+        }));
+        return Ok(());
+    }
+    if skills.is_empty() {
+        install_ui::warn("No managed skills installed");
+        return Ok(());
+    }
+    print_skill_rows(&skills);
+    install_ui::done(&format!(
+        "{} {} installed",
+        skills.len(),
+        plural(skills.len(), "skill")
+    ));
+    Ok(())
+}
+
+fn run_view(args: SkillsViewArgs, project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    let skills = load_scoped_skills(args.scope, project_dir)?;
+    let skills: Vec<_> = skills
+        .into_iter()
+        .filter(|managed| {
+            args.skill
+                .as_ref()
+                .is_none_or(|skill| managed.name == *skill || managed.id == *skill)
+        })
+        .filter(|managed| {
+            args.agent.as_ref().is_none_or(|agent| {
+                managed
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.agent.as_str() == agent)
+            })
+        })
+        .collect();
+    if skills.is_empty() {
+        return Err(LpmError::Registry(
+            "no matching managed skills found".into(),
+        ));
+    }
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "skills": skills.iter().map(|skill| skill_view_json(skill, project_dir)).collect::<Vec<_>>(),
+            "count": skills.len(),
+        }));
+        return Ok(());
+    }
+    for (index, skill) in skills.iter().enumerate() {
+        if index > 0 {
+            eprintln!();
+        }
+        print_skill_view(skill, project_dir)?;
+    }
+    Ok(())
+}
+
+fn run_remove(
+    args: SkillsRemoveArgs,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if args.all && !args.skills.is_empty() {
+        return Err(LpmError::Registry(
+            "`--all` cannot be combined with skill names".into(),
+        ));
+    }
+    let scope = mutation_scope(args.scope, project_dir);
+    let mut manifest = SkillManifest::load(scope, project_dir)?;
+    let requested_agents = parse_agents(&args.agents)?;
+    let selected_count = manifest
+        .skills
+        .iter()
+        .filter(|skill| skill_is_selected(skill, &args.skills, args.all))
+        .count();
+    if selected_count == 0 {
+        return Err(LpmError::Registry(
+            "no matching managed skills found".into(),
+        ));
+    }
+    if !args.yes && is_interactive(false, json_output) {
+        let confirmed = cliclack::confirm(format!(
+            "Remove {} {}?",
+            selected_count,
+            plural(selected_count, "skill")
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+        if !confirmed {
+            return Err(LpmError::Registry("skills removal cancelled".into()));
+        }
+    } else if !args.yes && !json_output {
+        return Err(LpmError::Registry(
+            "pass `--yes` when removing skills without an interactive terminal".into(),
+        ));
+    }
+
+    for skill in manifest
+        .skills
+        .iter()
+        .filter(|skill| skill_is_selected(skill, &args.skills, args.all))
+    {
+        if requested_agents.is_empty() {
+            preflight_remove_skill(skill, project_dir)?;
+            continue;
+        }
+        if !requested_agents
+            .iter()
+            .all(|agent| skill.bindings.iter().any(|binding| binding.agent == *agent))
+        {
+            return Err(LpmError::Registry(format!(
+                "skill `{}` is not managed for every requested agent",
+                skill.name
+            )));
+        }
+        let canonical = managed_root(scope, project_dir)?.join(&skill.id);
+        for binding in skill
+            .bindings
+            .iter()
+            .filter(|binding| requested_agents.contains(&binding.agent))
+        {
+            let target = binding
+                .agent
+                .skill_root(scope, project_dir)?
+                .join(&skill.id);
+            validate_owned_target(&target, &canonical, binding.copied, &skill.id)?;
+        }
+    }
+
+    let mut removed = Vec::with_capacity(selected_count);
+    let mut next = Vec::with_capacity(manifest.skills.len());
+    for mut skill in manifest.skills {
+        if !skill_is_selected(&skill, &args.skills, args.all) {
+            next.push(skill);
+            continue;
+        }
+        if requested_agents.is_empty() {
+            remove_managed_skill(&skill, project_dir)?;
+            removed.push(skill.name);
+            continue;
+        }
+        let canonical = managed_root(scope, project_dir)?.join(&skill.id);
+        for binding in skill
+            .bindings
+            .iter()
+            .filter(|binding| requested_agents.contains(&binding.agent))
+        {
+            let target = binding
+                .agent
+                .skill_root(scope, project_dir)
+                .map(|root| root.join(&skill.id))?;
+            remove_owned_target(&target, &canonical, binding.copied, &skill.id)?;
+        }
+        skill
+            .bindings
+            .retain(|binding| !requested_agents.contains(&binding.agent));
+        if skill.bindings.is_empty() {
+            if canonical.exists() {
+                std::fs::remove_dir_all(&canonical).map_err(LpmError::Io)?;
+            }
+            removed.push(skill.name);
+        } else {
+            next.push(skill);
+        }
+    }
+    manifest.skills = next;
+    manifest.save(scope, project_dir)?;
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "action": "remove",
+            "removed": removed,
+            "count": selected_count,
+        }));
+    } else {
+        install_ui::done(&format!(
+            "Removed {} {}",
+            selected_count,
+            plural(selected_count, "skill")
+        ));
+    }
+    Ok(())
+}
+
+fn run_toggle(
+    args: SkillsToggleArgs,
+    enabled: bool,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if args.skills.is_empty() {
+        return Err(LpmError::Registry("specify at least one skill".into()));
+    }
+    let scope = mutation_scope(args.scope, project_dir);
+    let mut manifest = SkillManifest::load(scope, project_dir)?;
+    let requested_agents = parse_agents(&args.agents)?;
+    for skill in manifest.skills.iter().filter(|skill| {
+        args.skills
+            .iter()
+            .any(|requested| requested == &skill.name || requested == &skill.id)
+    }) {
+        let canonical = managed_root(scope, project_dir)?.join(&skill.id);
+        if !canonical.is_dir() {
+            return Err(LpmError::Registry(format!(
+                "managed skill content is missing for `{}`; run `lpm skills doctor`",
+                skill.name
+            )));
+        }
+        for binding in &skill.bindings {
+            if !requested_agents.is_empty() && !requested_agents.contains(&binding.agent) {
+                continue;
+            }
+            let target = binding
+                .agent
+                .skill_root(scope, project_dir)?
+                .join(&skill.id);
+            if enabled && !binding.enabled && target.symlink_metadata().is_ok() {
+                return Err(LpmError::Registry(format!(
+                    "refusing to replace existing agent skill path {}",
+                    target.display()
+                )));
+            }
+            if !enabled && binding.enabled {
+                validate_owned_target(&target, &canonical, binding.copied, &skill.id)?;
+            }
+        }
+    }
+    let mut changed = 0usize;
+    for skill in manifest.skills.iter_mut().filter(|skill| {
+        args.skills
+            .iter()
+            .any(|requested| requested == &skill.name || requested == &skill.id)
+    }) {
+        let canonical = managed_root(scope, project_dir)?.join(&skill.id);
+        for binding in &mut skill.bindings {
+            if !requested_agents.is_empty() && !requested_agents.contains(&binding.agent) {
+                continue;
+            }
+            let target = binding
+                .agent
+                .skill_root(scope, project_dir)?
+                .join(&skill.id);
+            if enabled && !binding.enabled {
+                binding.copied = install_agent_binding(
+                    binding.agent,
+                    scope,
+                    project_dir,
+                    &skill.id,
+                    &canonical,
+                    binding.copied,
+                )?;
+                binding.enabled = true;
+                changed += 1;
+            } else if !enabled && binding.enabled {
+                remove_owned_target(&target, &canonical, binding.copied, &skill.id)?;
+                binding.enabled = false;
+                changed += 1;
+            }
+        }
+    }
+    if changed == 0 {
+        return Err(LpmError::Registry(
+            "no matching enabled-state changes found".into(),
+        ));
+    }
+    manifest.save(scope, project_dir)?;
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "action": if enabled { "enable" } else { "disable" },
+            "count": changed,
+        }));
+    } else {
+        install_ui::done(&format!(
+            "{} {} agent {}",
+            if enabled { "Enabled" } else { "Disabled" },
+            changed,
+            plural(changed, "binding")
+        ));
+    }
+    Ok(())
+}
+
+async fn run_update(
+    client: &RegistryClient,
+    args: SkillsUpdateArgs,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let scope = mutation_scope(args.scope, project_dir);
+    let mut manifest = SkillManifest::load(scope, project_dir)?;
+    let mut updated = Vec::new();
+    let candidates = manifest.skills.clone();
+    for existing in candidates {
+        if !args.skills.is_empty()
+            && !args
+                .skills
+                .iter()
+                .any(|requested| requested == &existing.name || requested == &existing.id)
+        {
+            continue;
+        }
+        let source = resolve_source(&existing.source, client).await?;
+        let discovered = discover_skills(&source.root)?;
+        let skill = discovered
+            .iter()
+            .find(|candidate| candidate.name == existing.name)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "source `{}` no longer contains skill `{}`",
+                    existing.source, existing.name
+                ))
+            })?;
+        let audit = audit_skill(skill)?;
+        if !audit.findings.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "refusing update of `{}` due to blocked findings: {}",
+                existing.name,
+                audit.findings.join(", ")
+            )));
+        }
+        if audit.digest == existing.digest {
+            continue;
+        }
+        if !args.yes && !is_interactive(false, json_output) {
+            return Err(LpmError::Registry(
+                "pass `--yes` when updating skills without an interactive terminal".into(),
+            ));
+        }
+        if !args.yes && is_interactive(false, json_output) {
+            let confirmed = cliclack::confirm(format!("Update {}?", existing.name))
+                .initial_value(true)
+                .interact()
+                .map_err(prompt_err)?;
+            if !confirmed {
+                continue;
+            }
+        }
+        let mut next_manifest = manifest.clone();
+        next_manifest
+            .skills
+            .retain(|managed| managed.id != existing.id);
+        let audit_ref = [(skill, audit.clone())];
+        preflight_install(
+            &next_manifest,
+            &audit_ref,
+            &existing.bindings,
+            scope,
+            project_dir,
+        )?;
+        let updated_skill = install_skill(
+            &mut next_manifest,
+            skill,
+            &audit,
+            InstallOptions {
+                source: &source.source,
+                source_kind: source.source_kind,
+                resolved_revision: source.resolved_revision.as_deref(),
+                scope,
+                bindings: &existing.bindings,
+                project_dir,
+            },
+        )?;
+        if let Err(error) = next_manifest.save(scope, project_dir) {
+            let _ = remove_managed_skill(&updated_skill, project_dir);
+            return Err(error);
+        }
+        // The replacement is fully materialized and persisted before the prior
+        // generation is retired, so a failed refresh never destroys a usable skill.
+        remove_managed_skill(&existing, project_dir)?;
+        manifest = next_manifest;
+        updated.push(updated_skill.name);
+    }
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "action": "update",
+            "updated": updated,
+            "count": updated.len(),
+        }));
+    } else if updated.is_empty() {
+        install_ui::done("All managed skills are current");
+    } else {
+        install_ui::done(&format!(
+            "Updated {} {}",
+            updated.len(),
+            plural(updated.len(), "skill")
+        ));
+    }
+    Ok(())
+}
+
+fn run_doctor(
+    args: SkillsScopeArgs,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let skills = load_scoped_skills(args, project_dir)?;
+    let mut checks = Vec::new();
+    for skill in skills {
+        let canonical = managed_root(skill.scope, project_dir)?.join(&skill.id);
+        checks.push(serde_json::json!({
+            "code": "managed_content",
+            "skill": skill.name,
+            "passed": canonical.join("SKILL.md").is_file(),
+            "path": canonical,
+        }));
+        for binding in &skill.bindings {
+            let target = binding
+                .agent
+                .skill_root(skill.scope, project_dir)?
+                .join(&skill.id);
+            checks.push(serde_json::json!({
+                "code": "agent_visibility",
+                "skill": skill.name,
+                "agent": binding.agent.as_str(),
+                "enabled": binding.enabled,
+                "passed": !binding.enabled || target.symlink_metadata().is_ok(),
+                "path": target,
+            }));
+        }
+    }
+    let failures = checks
+        .iter()
+        .filter(|check| check["passed"] == false)
+        .count();
+    if json_output {
+        print_json(serde_json::json!({
+            "success": failures == 0,
+            "checks": checks,
+            "count": checks.len(),
+            "failures": failures,
+        }));
+    } else if checks.is_empty() {
+        install_ui::warn("No managed skills installed");
+    } else {
+        for check in &checks {
+            let passed = check["passed"].as_bool().unwrap_or(false);
+            let status = if passed { "healthy" } else { "broken" };
+            eprintln!(
+                "  {} {}  {}",
+                install_ui::bullet(passed),
+                check["skill"].as_str().unwrap_or_default(),
+                if passed {
+                    install_ui::status_ok(status)
+                } else {
+                    status.red()
+                }
+            );
+        }
+        if failures == 0 {
+            install_ui::done("All managed skill checks passed");
+        } else {
+            install_ui::warn(&format!("{failures} skill checks need attention"));
+        }
+    }
+    if json_output || failures == 0 {
+        Ok(())
+    } else {
+        Err(LpmError::Registry(
+            "managed skill health checks failed".into(),
+        ))
+    }
+}
+
+fn run_validate(
+    args: SkillsValidateArgs,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let path = args
+        .path
+        .map_or_else(|| project_dir.to_path_buf(), PathBuf::from);
+    let root = std::fs::canonicalize(&path).map_err(LpmError::Io)?;
+    let skills = discover_skills(&root)?;
+    let audits: Vec<_> = skills
+        .iter()
+        .map(|skill| audit_skill(skill).map(|audit| (skill, audit)))
+        .collect::<Result<_, _>>()?;
+    let findings = audits
+        .iter()
+        .map(|(_, audit)| audit.findings.len())
+        .sum::<usize>();
+    if json_output {
+        print_json(serde_json::json!({
+            "success": findings == 0,
+            "skills": audits.iter().map(|(skill, audit)| serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "size_bytes": audit.size_bytes,
+                "estimated_tokens": audit.estimated_tokens,
+                "findings": audit.findings,
+            })).collect::<Vec<_>>(),
+            "count": audits.len(),
+            "findings_count": findings,
+        }));
+    } else if findings == 0 {
+        install_ui::done(&format!(
+            "Validated {} {}",
+            audits.len(),
+            plural(audits.len(), "skill")
+        ));
+    } else {
+        return Err(LpmError::Registry(format!(
+            "{findings} blocked skill validation findings"
+        )));
+    }
+    Ok(())
+}
+
+fn mutation_scope(args: SkillsScopeArgs, _project_dir: &Path) -> SkillScope {
+    if args.global {
+        SkillScope::Global
+    } else {
+        SkillScope::Project
+    }
+}
+
+fn load_scoped_skills(
+    args: SkillsScopeArgs,
+    project_dir: &Path,
+) -> Result<Vec<ManagedSkill>, LpmError> {
+    let scopes: &[SkillScope] = if args.project {
+        &[SkillScope::Project]
+    } else if args.global {
+        &[SkillScope::Global]
+    } else {
+        &[SkillScope::Project, SkillScope::Global]
+    };
+    let mut skills = Vec::new();
+    for scope in scopes {
+        skills.extend(SkillManifest::load(*scope, project_dir)?.skills);
+    }
+    skills.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(skills)
+}
+
+fn parse_agents(agents: &[String]) -> Result<Vec<AgentTarget>, LpmError> {
+    let parsed: Vec<_> = agents
+        .iter()
+        .map(|agent| AgentTarget::parse(agent))
+        .collect::<Result<_, _>>()?;
+    if parsed
+        .iter()
+        .enumerate()
+        .any(|(index, agent)| parsed[..index].contains(agent))
+    {
+        return Err(LpmError::Registry(
+            "each agent may be specified only once".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn skill_is_selected(skill: &ManagedSkill, requested: &[String], all: bool) -> bool {
+    all || requested
+        .iter()
+        .any(|name| name == &skill.name || name == &skill.id)
+}
+
+fn preflight_remove_skill(skill: &ManagedSkill, project_dir: &Path) -> Result<(), LpmError> {
+    let canonical = managed_root(skill.scope, project_dir)?.join(&skill.id);
+    for binding in &skill.bindings {
+        let target = binding
+            .agent
+            .skill_root(skill.scope, project_dir)?
+            .join(&skill.id);
+        validate_owned_target(&target, &canonical, binding.copied, &skill.id)?;
+    }
+    Ok(())
+}
+
+fn remove_managed_skill(skill: &ManagedSkill, project_dir: &Path) -> Result<(), LpmError> {
+    let canonical = managed_root(skill.scope, project_dir)?.join(&skill.id);
+    for binding in &skill.bindings {
+        let target = binding
+            .agent
+            .skill_root(skill.scope, project_dir)?
+            .join(&skill.id);
+        remove_owned_target(&target, &canonical, binding.copied, &skill.id)?;
+    }
+    if canonical.exists() {
+        std::fs::remove_dir_all(canonical).map_err(LpmError::Io)?;
+    }
+    Ok(())
+}
+
+fn remove_owned_target(
+    path: &Path,
+    canonical: &Path,
+    copied: bool,
+    id: &str,
+) -> Result<(), LpmError> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    validate_owned_target(path, canonical, copied, id)?;
+    if metadata.file_type().is_symlink() {
+        std::fs::remove_file(path).map_err(LpmError::Io)
+    } else if metadata.is_dir() && copied {
+        std::fs::remove_dir_all(path).map_err(LpmError::Io)
+    } else {
+        Err(LpmError::Registry(format!(
+            "refusing to remove unsupported managed skill path {}",
+            path.display()
+        )))
+    }
+}
+
+fn validate_owned_target(
+    path: &Path,
+    canonical: &Path,
+    copied: bool,
+    id: &str,
+) -> Result<(), LpmError> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(LpmError::Io)?;
+        let target = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        };
+        if target != canonical {
+            return Err(LpmError::Registry(format!(
+                "refusing to remove agent skill path {} because it no longer points to LPM-managed content",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    if metadata.is_dir() && copied {
+        let marker = path.join(".lpm-skill-owner");
+        let owner = std::fs::read_to_string(&marker).map_err(|_| {
+            LpmError::Registry(format!(
+                "refusing to remove agent skill path {} because it is not an LPM-managed copy",
+                path.display()
+            ))
+        })?;
+        if owner.trim() == id {
+            return Ok(());
+        }
+        return Err(LpmError::Registry(format!(
+            "refusing to remove agent skill path {} because its ownership marker does not match",
+            path.display()
+        )));
+    }
+    Err(LpmError::Registry(format!(
+        "refusing to remove unsupported managed skill path {}",
+        path.display()
+    )))
+}
+
+fn print_skill_rows(skills: &[ManagedSkill]) {
+    let width = skills
+        .iter()
+        .map(|skill| skill.name.len())
+        .max()
+        .unwrap_or(0);
+    for skill in skills {
+        let bindings = skill
+            .bindings
+            .iter()
+            .map(|binding| {
+                format!(
+                    "{} {}",
+                    install_ui::bullet(binding.enabled),
+                    binding.agent.display_name()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "  {:<width$}  {}  {}",
+            skill.name,
+            install_ui::cyan(skill.scope.as_str()),
+            bindings.dimmed()
+        );
+    }
+}
+
+fn print_skill_view(skill: &ManagedSkill, project_dir: &Path) -> Result<(), LpmError> {
+    eprintln!("{}", install_ui::section(&skill.name));
+    eprintln!("  {}  {}", "description".dimmed(), skill.description);
+    eprintln!(
+        "  {}       {}",
+        "source".dimmed(),
+        install_ui::cyan(&skill.source)
+    );
+    if let Some(revision) = &skill.resolved_revision {
+        eprintln!("  {}     {}", "revision".dimmed(), revision.dimmed());
+    }
+    eprintln!(
+        "  {}        {}",
+        "scope".dimmed(),
+        install_ui::cyan(skill.scope.as_str())
+    );
+    eprintln!(
+        "  {}       ~{} tokens · {}",
+        "context".dimmed(),
+        skill.estimated_tokens,
+        lpm_common::format_bytes(skill.size_bytes).dimmed()
+    );
+    for binding in &skill.bindings {
+        let target = binding
+            .agent
+            .skill_root(skill.scope, project_dir)?
+            .join(&skill.id);
+        let visible = binding.enabled && target.symlink_metadata().is_ok();
+        eprintln!(
+            "  {}       {} {}  {}",
+            "agent".dimmed(),
+            install_ui::bullet(visible),
+            binding.agent.display_name(),
+            if visible {
+                install_ui::status_ok("visible")
+            } else {
+                "not visible".red()
+            }
+        );
+    }
+    Ok(())
+}
+
+fn skill_json(skill: &ManagedSkill) -> serde_json::Value {
+    serde_json::json!({
+        "id": skill.id,
+        "name": skill.name,
+        "description": skill.description,
+        "source": skill.source,
+        "source_kind": skill.source_kind,
+        "resolved_revision": skill.resolved_revision,
+        "scope": skill.scope.as_str(),
+        "enabled": skill.bindings.iter().any(|binding| binding.enabled),
+        "agents": skill.bindings.iter().map(|binding| serde_json::json!({
+            "name": binding.agent.as_str(),
+            "enabled": binding.enabled,
+            "copied": binding.copied,
+        })).collect::<Vec<_>>(),
+        "estimated_tokens": skill.estimated_tokens,
+        "size_bytes": skill.size_bytes,
+    })
+}
+
+fn skill_view_json(skill: &ManagedSkill, project_dir: &Path) -> serde_json::Value {
+    let mut value = skill_json(skill);
+    let bindings = skill
+        .bindings
+        .iter()
+        .map(|binding| {
+            let path = binding.agent.skill_root(skill.scope, project_dir).map(|root| root.join(&skill.id));
+            serde_json::json!({
+                "name": binding.agent.as_str(),
+                "enabled": binding.enabled,
+                "visible": path.as_ref().is_ok_and(|path| !binding.enabled || path.symlink_metadata().is_ok()),
+                "path": path.map(|path| path.display().to_string()).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    value["agents"] = serde_json::Value::Array(bindings);
+    value["digest"] = serde_json::Value::String(skill.digest.clone());
+    value
+}
+
+fn managed_id(name: &str, digest: &str) -> String {
+    let suffix = digest.strip_prefix("sha256:").unwrap_or(digest);
+    format!("{name}--{}", &suffix[..12.min(suffix.len())])
+}
+
+fn print_json(value: serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(&value).unwrap());
+}
+
+fn is_interactive(yes: bool, json_output: bool) -> bool {
+    !yes && !json_output && std::io::stdin().is_terminal()
+}
+
+fn plural(count: usize, singular: &str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        format!("{singular}s")
+    }
 }
 
 #[cfg(test)]
@@ -371,29 +1368,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_skills_walks_subdirectories() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_dir = dir.path().join(".lpm").join("skills");
-        let pkg_dir = skills_dir.join("owner.pkg");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-
-        // Valid skill with frontmatter and 100+ chars
-        let content = format!(
-            "---\nname: guide\ndescription: A helpful guide\n---\n{}",
-            "x".repeat(100)
+    fn managed_id_uses_skill_name_and_digest_prefix() {
+        assert_eq!(
+            managed_id("find-skills", "sha256:0123456789abcdef"),
+            "find-skills--0123456789ab"
         );
-        std::fs::write(pkg_dir.join("guide.md"), &content).unwrap();
-
-        // Call validate_skills; it should find the skill in the subdirectory
-        let result = validate_skills(dir.path(), true);
-        assert!(result.is_ok());
-        // The JSON output goes to stdout — we just verify no error
     }
 
     #[test]
-    fn validate_skills_empty_dir_no_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = validate_skills(dir.path(), true);
-        assert!(result.is_ok());
+    fn mutation_scope_defaults_to_project() {
+        let project = tempfile::tempdir().unwrap();
+        let scope = mutation_scope(
+            SkillsScopeArgs {
+                global: false,
+                project: false,
+            },
+            project.path(),
+        );
+        assert_eq!(scope, SkillScope::Project);
     }
 }

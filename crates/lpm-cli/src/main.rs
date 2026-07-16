@@ -52,6 +52,8 @@ pub mod security_check;
 mod security_floor;
 mod sigstore;
 mod sigstore_verify;
+mod skills_model;
+mod skills_source;
 mod step_up;
 mod swift_manifest;
 #[cfg(test)]
