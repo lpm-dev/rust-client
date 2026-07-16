@@ -935,7 +935,7 @@ pub async fn run(
     // declaration (deferred per the non-goals).
     if !no_skills && let AddTarget::Lpm(pkg) = &target {
         let short_name = pkg.short();
-        match client.get_skills(&short_name, None).await {
+        match client.get_skills(&short_name, Some(&version)).await {
             Ok(response) if !response.skills.is_empty() => {
                 let skills_dir = project_dir.join(".lpm").join("skills").join(&short_name);
                 let _ = std::fs::create_dir_all(&skills_dir);
@@ -962,11 +962,10 @@ pub async fn run(
                     // Ensure .gitignore includes .lpm/skills/
                     crate::commands::install::ensure_skills_gitignore(project_dir);
 
-                    // Auto-integrate with editors (respects --no-editor-setup)
                     if !no_editor_setup {
                         let integrations = crate::editor_skills::auto_integrate_skills(project_dir);
-                        for msg in &integrations {
-                            output::info(msg);
+                        for message in integrations {
+                            output::info(&message);
                         }
                     }
                 }

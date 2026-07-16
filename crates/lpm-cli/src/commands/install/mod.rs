@@ -1413,16 +1413,22 @@ async fn run_with_options_under_store_lock(
     }
 
     // Step 8: Auto-install skills for direct LPM packages
-    if !json_output && !no_skills {
-        let lpm_packages: Vec<String> = packages
+    if !no_skills {
+        let lpm_packages: Vec<_> = packages
             .iter()
             .filter(|p| p.is_lpm && p.is_direct)
-            .map(|p| p.name.clone())
+            .map(|p| (p.name.clone(), p.version.clone()))
             .collect();
 
         if !lpm_packages.is_empty() {
-            install_skills_for_packages(&arc_client, &lpm_packages, project_dir, no_editor_setup)
-                .await;
+            install_skills_for_packages(
+                &arc_client,
+                &lpm_packages,
+                project_dir,
+                !json_output,
+                !no_editor_setup,
+            )
+            .await;
         }
     }
 

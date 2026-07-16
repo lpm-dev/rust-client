@@ -3,23 +3,25 @@ use super::*;
 /// Auto-install agent skills for direct LPM packages.
 ///
 /// For each direct LPM dependency, fetches its skills from the registry and
-/// writes them to `.lpm/skills/{owner.package}/`. Also ensures `.gitignore`
-/// includes the skills directory and triggers editor auto-integration.
+/// writes them to `.lpm/skills/{owner.package}/`. Package-published skills
+/// remain package-owned and are never linked into agent target directories.
 pub(super) async fn install_skills_for_packages(
     client: &Arc<RegistryClient>,
-    packages: &[String],
+    packages: &[(String, String)],
     project_dir: &Path,
-    no_editor_setup: bool,
+    show_progress: bool,
+    setup_editor_references: bool,
 ) {
     // Fetch all package skills in parallel
     let futures: Vec<_> = packages
         .iter()
-        .map(|pkg_name| {
+        .map(|(pkg_name, version)| {
             let client = client.clone();
             let pkg = pkg_name.clone();
+            let version = version.clone();
             async move {
                 let short_name = pkg.strip_prefix("@lpm.dev/").unwrap_or(&pkg).to_string();
-                let result = client.get_skills(&short_name, None).await;
+                let result = client.get_skills(&short_name, Some(&version)).await;
                 (short_name, result)
             }
         })
@@ -58,16 +60,21 @@ pub(super) async fn install_skills_for_packages(
     }
 
     if total_installed > 0 {
-        output::info(&format!("Installed {total_installed} agent skill(s)"));
+        if show_progress {
+            output::info(&format!(
+                "Installed {total_installed} package-published skill(s)"
+            ));
+        }
 
         // Ensure .gitignore includes .lpm/skills/
         ensure_skills_gitignore(project_dir);
 
-        // Auto-integrate with editors (respects --no-editor-setup)
-        if !no_editor_setup {
+        if setup_editor_references {
             let integrations = crate::editor_skills::auto_integrate_skills(project_dir);
-            for msg in &integrations {
-                output::info(msg);
+            if show_progress {
+                for message in integrations {
+                    output::info(&message);
+                }
             }
         }
     }
