@@ -78,14 +78,18 @@ impl PackageKey {
 ///   path can run. Patch records bind `lpm.patchedDependencies` to
 ///   patch file SHA-256 digests so replayed installs can verify the
 ///   bytes they apply.
+/// - **v6**: per-package `engines.node` constraints. Warm and frozen installs
+///   can revalidate dependency compatibility when the effective Node.js
+///   version or `engine-strict` setting changes.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
 /// is meaningful. On v1 + `auto_install_peers = true`, the absence
 /// could be a buggy-writer artifact, so the fast path is invalidated
-/// and a fresh resolve runs (which writes a v2 lockfile, restoring
+/// and a fresh resolve runs (which writes a current lockfile, restoring
 /// fast-path eligibility on subsequent installs).
-pub const LOCKFILE_VERSION: u32 = 5;
+pub const LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES: u32 = 6;
+pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -318,6 +322,13 @@ pub struct LockedPackage {
     /// libc restrictions from the package version's manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub libc: Vec<String>,
+    /// Node.js compatibility range from the package version's manifest.
+    #[serde(
+        default,
+        rename = "node-engine",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub node_engine: Option<String>,
     /// True when the package is only reachable through optional
     /// dependency edges.
     #[serde(default, skip_serializing_if = "is_false")]

@@ -4,26 +4,32 @@ pub(super) fn write_post_install_hash(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
     let pkg = std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
     let lock = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
-    let hash = crate::install_state::compute_install_hash_v8(
+    let dependency_engine_key = dependency_engine_policy.freshness_key(&lock);
+    let hash = crate::install_state::compute_install_hash_v9(
         &pkg,
         &lock,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
         &platform,
+        &dependency_engine_key,
     );
-    if let Err(e) = crate::install_state::write_install_hash_with_integrity_and_platform(
-        project_dir,
-        &hash,
-        linker_mode,
-        object_integrity_policy,
-        &platform,
-    ) {
+    if let Err(e) =
+        crate::install_state::write_install_hash_with_integrity_platform_and_dependency_engine(
+            project_dir,
+            &hash,
+            linker_mode,
+            object_integrity_policy,
+            &platform,
+            &dependency_engine_key,
+        )
+    {
         tracing::warn!(
             "failed to write `.lpm/install-hash` after install ({e}) — \
              the next freshness check will fall through to the slow path"
@@ -46,6 +52,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) strict_peer_dependencies: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) requested_v2_mode: bool,
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) requested_add_count: Option<usize>,
@@ -68,12 +75,19 @@ pub(super) async fn run_install_freshness_phase(
 ) -> Result<InstallFreshnessResult, LpmError> {
     let pkg_content_for_state = std::fs::read_to_string(input.pkg_json_path).unwrap_or_default();
     let setup_state_t = Instant::now();
-    let install_state = crate::install_state::check_install_state_with_linker_and_integrity(
+    let dependency_engine_key = dependency_engine_freshness_key_for_state(
         input.project_dir,
-        &pkg_content_for_state,
-        input.linker_mode,
-        input.object_integrity_policy,
+        input.lockfile_path,
+        input.dependency_engine_policy,
     );
+    let install_state =
+        crate::install_state::check_install_state_with_linker_integrity_and_dependency_engine(
+            input.project_dir,
+            &pkg_content_for_state,
+            input.linker_mode,
+            input.object_integrity_policy,
+            &dependency_engine_key,
+        );
     let setup_install_state_ms = setup_state_t.elapsed().as_millis();
     let compatibility_bins_ready = !input.requested_v2_mode
         || input.compatibility_bin_names.is_empty()
@@ -110,6 +124,10 @@ pub(super) async fn run_install_freshness_phase(
                 if input.omit_policy.dev {
                     filter_dev_packages(&mut policy_packages, input.production_dependency_names);
                 }
+                filter_dependency_engine_packages(
+                    &mut policy_packages,
+                    input.dependency_engine_policy,
+                )?;
                 filter_platform_packages(&mut policy_packages)?;
                 Some(
                     run_policy_extensions(
@@ -148,6 +166,7 @@ pub(super) async fn run_install_freshness_phase(
                 input.project_dir,
                 input.linker_mode,
                 input.object_integrity_policy,
+                input.dependency_engine_policy,
             );
         }
         let elapsed = input.start.elapsed();
@@ -218,6 +237,26 @@ pub(super) async fn run_install_freshness_phase(
         cleanup_catalogs_in_pipeline,
         completed: false,
     })
+}
+
+fn dependency_engine_freshness_key_for_state(
+    project_dir: &Path,
+    lockfile_path: &Path,
+    policy: &crate::engine_check::DependencyEnginePolicy,
+) -> String {
+    let state_path = project_dir.join(".lpm").join("install-hash");
+    if let Ok(state) = std::fs::read_to_string(state_path)
+        && let Some(stored) = state.lines().find_map(|line| line.strip_prefix("e:"))
+    {
+        return if stored == "none" {
+            "none".to_string()
+        } else {
+            policy.constrained_freshness_key()
+        };
+    }
+
+    let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
+    policy.freshness_key(&lockfile)
 }
 
 /// Empty installs still need the same durable on-disk markers the

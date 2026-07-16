@@ -44,6 +44,8 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) linker_mode: lpm_linker::LinkerMode,
     pub(in crate::commands::install) strict_integrity: bool,
     pub(in crate::commands::install) streaming_fetch: bool,
+    pub(in crate::commands::install) dependency_engine_policy:
+        &'a crate::engine_check::DependencyEnginePolicy,
 }
 
 pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
@@ -119,6 +121,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         linker_mode,
         strict_integrity,
         streaming_fetch,
+        dependency_engine_policy,
     } = input;
 
     let NonRegistryPreResolveResult {
@@ -572,6 +575,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     if omit_policy.dev {
         filter_dev_packages(&mut packages, production_dependency_names);
     }
+    filter_dependency_engine_packages(&mut packages, dependency_engine_policy)?;
     platform_skipped += filter_platform_packages(&mut packages)?;
 
     Ok(OnlineResolutionPhaseResult {

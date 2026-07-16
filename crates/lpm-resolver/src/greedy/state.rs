@@ -381,6 +381,7 @@ impl ResolveState {
                 .get(&version)
                 .and_then(|dist| dist.integrity.clone()),
             platform: info.platform.get(&version).cloned(),
+            node_engine: info.node_engines.get(&version).cloned(),
             optional,
         };
         let _ = tx.send(event);
@@ -539,6 +540,10 @@ impl ResolveState {
                     .get(&n.canonical)
                     .and_then(|info| info.platform.get(&ver_str))
                     .cloned();
+                let node_engine = cache
+                    .get(&n.canonical)
+                    .and_then(|info| info.node_engines.get(&ver_str))
+                    .cloned();
 
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
@@ -574,6 +579,7 @@ impl ResolveState {
                     tarball_url,
                     integrity,
                     platform,
+                    node_engine,
                     optional: n.optional,
                 }
             })
@@ -676,6 +682,7 @@ mod tests {
             peer_deps: HashMap::new(),
             optional_dep_names: HashMap::new(),
             optional_peer_names: HashMap::new(),
+            node_engines: HashMap::new(),
             bundled_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist: HashMap::new(),

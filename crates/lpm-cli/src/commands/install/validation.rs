@@ -168,7 +168,7 @@ fn validate_frozen_importer_snapshot(
     }
     let locked = lockfile.importers.get(".").ok_or_else(|| {
         LpmError::Registry(format!(
-            "Frozen lockfile mismatch\n  lockfile    {}\n  importer    .\n  hint        run `lpm install` locally and commit the v5 lpm.lock",
+            "Frozen lockfile mismatch\n  lockfile    {}\n  importer    .\n  hint        run `lpm install` locally and commit lpm.lock",
             lockfile_path.display()
         ))
     })?;

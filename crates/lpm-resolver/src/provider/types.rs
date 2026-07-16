@@ -137,6 +137,9 @@ pub struct CachedPackageInfo {
     /// wrong version still produce a warning — the user opted into
     /// having a peer, just at an incompatible version.
     pub optional_peer_names: HashMap<String, HashSet<String>>,
+    /// `engines.node` constraints keyed by version string. Versions without
+    /// a Node.js constraint are absent from the map.
+    pub node_engines: HashMap<String, String>,
     /// `bundleDependencies` /
     /// `bundledDependencies` names per version. Per-version because
     /// the same package's bundling intent can change across releases
@@ -269,6 +272,11 @@ pub struct LpmDependencyProvider {
     /// Surfaced via `into_parts()` so `ResolveResult.root_aliases` carries
     /// the map into the install pipeline, which feeds it to the linker.
     pub(super) root_aliases: RefCell<HashMap<String, String>>,
+    /// Effective optional reachability discovered while PubGrub walks package
+    /// constraints. `false` is sticky: if any required path reaches a package,
+    /// failures below that package remain fatal even when another path is
+    /// optional.
+    pub(super) optional_reachability: RefCell<HashMap<ResolverPackage, bool>>,
     /// Memoize `(ResolverPackage, raw_range) → Ranges<NpmVersion>` so
     /// repeated PubGrub `get_dependencies` queries for the same edge skip
     /// the O(N-versions) conversion inside `NpmRange::to_pubgrub_ranges`.

@@ -12,6 +12,7 @@ use lpm_registry::RegistryClient;
 pub struct InstallGlobalOverrides {
     pub allow_new: bool,
     pub strict_peer_dependencies_override: Option<bool>,
+    pub no_engine_strict: bool,
     pub min_release_age_override: Option<u64>,
     pub min_release_age_exclude: Vec<String>,
     pub drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
@@ -44,6 +45,7 @@ pub(super) async fn do_install(
             suppress_nested_output,
             allow_new: overrides.allow_new,
             strict_peer_dependencies_override: overrides.strict_peer_dependencies_override,
+            no_engine_strict: overrides.no_engine_strict,
             auto_build: overrides.auto_build,
             script_policy_override: overrides.script_policy_override,
             min_release_age_override: overrides.min_release_age_override,

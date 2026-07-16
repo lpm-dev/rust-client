@@ -364,6 +364,7 @@ fn install_package_from_selected_event(
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: event.platform,
+        node_engine: event.node_engine,
         optional: event.optional,
         tarball_url: event.tarball_url,
         metadata_checked_for_tarball: true,

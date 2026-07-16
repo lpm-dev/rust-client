@@ -67,6 +67,7 @@ fn parse_metadata_to_cache_info_inner(
     let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut optional_peer_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut node_engines: HashMap<String, String> = HashMap::new();
     let mut bundled_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
     let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::with_capacity(version_count);
@@ -202,6 +203,10 @@ fn parse_metadata_to_cache_info_inner(
                 }
             }
 
+            if let Some(required) = ver_meta.engines.get("node") {
+                node_engines.insert(ver_str.clone(), required.clone());
+            }
+
             if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() || !ver_meta.libc.is_empty() {
                 platform.insert(
                     ver_str.clone(),
@@ -253,6 +258,7 @@ fn parse_metadata_to_cache_info_inner(
         peer_deps,
         optional_dep_names,
         optional_peer_names,
+        node_engines,
         bundled_dep_names,
         platform,
         dist: dist_info,

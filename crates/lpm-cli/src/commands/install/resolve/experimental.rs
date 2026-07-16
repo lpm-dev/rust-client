@@ -225,6 +225,7 @@ pub(in crate::commands::install) async fn run(
     current_patches: &HashMap<String, PatchedDependencyEntry>,
     prior_patch_state: &Option<patch_state::PatchState>,
     current_patch_fingerprint: &str,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::info("using experimental resolver path");
@@ -461,6 +462,7 @@ pub(in crate::commands::install) async fn run(
             ));
         }
     };
+    filter_dependency_engine_packages(&mut install_packages, dependency_engine_policy)?;
     let mut platform_skipped = filter_platform_packages(&mut install_packages)?;
     if graph_source == ExperimentalResolverGraphSource::Lockfile {
         let fetch_packages = lockfile_fetch_schedule(&install_packages);
@@ -499,6 +501,7 @@ pub(in crate::commands::install) async fn run(
         project_dir,
         &install_packages,
         json_output,
+        dependency_engine_policy,
     )
     .await?;
     stage_timings.parity_ms = parity_start.elapsed().as_millis();
@@ -859,6 +862,7 @@ async fn compute_parity_if_requested(
     project_dir: &Path,
     candidate_packages: &[InstallPackage],
     json_output: bool,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> Result<ExperimentalResolverParity, LpmError> {
     let mode = ExperimentalResolverParityMode::from_env();
     if !mode.enabled() {
@@ -933,6 +937,7 @@ async fn compute_parity_if_requested(
         }
     };
     dedupe_install_packages_by_identity(&mut baseline_packages);
+    filter_dependency_engine_packages(&mut baseline_packages, dependency_engine_policy)?;
     let _ = filter_platform_packages(&mut baseline_packages)?;
 
     let parity = compare_package_parity_with_baseline(

@@ -345,6 +345,7 @@ pub(super) fn build_install_global_overrides_with_excludes(
     Ok(commands::install_global::InstallGlobalOverrides {
         allow_new,
         strict_peer_dependencies_override: None,
+        no_engine_strict: false,
         min_release_age_override,
         min_release_age_exclude,
         drift_ignore_policy,

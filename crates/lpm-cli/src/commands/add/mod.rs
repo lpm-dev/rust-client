@@ -56,6 +56,7 @@ pub async fn run(
     no_install_deps: bool,
     no_skills: bool,
     no_editor_setup: bool,
+    no_engine_strict: bool,
     pm: &str,
     alias_override: Option<&str>,
     swift_target: Option<&str>,
@@ -771,6 +772,7 @@ pub async fn run(
             ecosystem,
             yes,
             json_output,
+            no_engine_strict,
             &effective_pm,
         )
         .await?
@@ -876,6 +878,7 @@ pub async fn run(
             no_install_deps,
             no_skills,
             no_editor_setup,
+            no_engine_strict,
             pm,
         )
         .await?;

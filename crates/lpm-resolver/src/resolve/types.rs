@@ -47,6 +47,8 @@ pub struct ResolvedPackage {
     pub integrity: Option<String>,
     /// Platform restrictions declared by the selected package version.
     pub platform: Option<PlatformMeta>,
+    /// `engines.node` constraint declared by the selected package version.
+    pub node_engine: Option<String>,
     /// True when this package is reachable only through optional dependency
     /// edges. Install-time platform filtering skips incompatible optional
     /// packages while failing required ones.
@@ -63,6 +65,7 @@ pub struct SelectedPackageEvent {
     pub tarball_url: Option<String>,
     pub integrity: Option<String>,
     pub platform: Option<PlatformMeta>,
+    pub node_engine: Option<String>,
     pub optional: bool,
 }
 

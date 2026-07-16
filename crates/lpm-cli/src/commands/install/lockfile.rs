@@ -37,6 +37,10 @@ pub(super) struct LockfileFastPath {
 
 pub(super) const MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE: u32 = 2;
 
+pub(super) fn lockfile_needs_dependency_engine_repair(lockfile: &lpm_lockfile::Lockfile) -> bool {
+    lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
+}
+
 pub(super) fn lockfile_needs_peer_state_repair(
     lockfile: &lpm_lockfile::Lockfile,
     auto_install_peers: bool,
@@ -85,6 +89,13 @@ pub(super) fn select_lockfile_install_plan(
                 lpm_lockfile::LOCKFILE_VERSION,
             )));
         }
+        if lockfile_needs_dependency_engine_repair(&candidate.lockfile) {
+            return Err(LpmError::Registry(format!(
+                "Frozen lockfile mismatch\n  lockfile    v{}\n  required    v{}\n  hint        run `lpm install` locally and commit the upgraded lpm.lock",
+                candidate.lockfile.metadata.lockfile_version,
+                lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
+            )));
+        }
         return Ok(Some(candidate));
     }
 
@@ -108,6 +119,14 @@ pub(super) fn select_lockfile_install_plan(
                 output::info(
                     "Lockfile is in an older format; rebuilding to capture \
                      peer auto-install state. Subsequent installs will be fast.",
+                );
+            }
+            Ok(None)
+        }
+        Some(fast) if lockfile_needs_dependency_engine_repair(&fast.lockfile) => {
+            if !input.json_output {
+                output::info(
+                    "Lockfile is in an older format; rebuilding to capture dependency engine constraints. Subsequent installs will be fast.",
                 );
             }
             Ok(None)
@@ -270,6 +289,7 @@ fn locked_package_from_install_package(package: &InstallPackage) -> lpm_lockfile
             .platform
             .as_ref()
             .map_or_else(Vec::new, |platform| platform.libc.clone()),
+        node_engine: package.node_engine.clone(),
         optional: package.optional,
         dependencies,
         alias_dependencies,
@@ -398,6 +418,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) override_set: &'a OverrideSet,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
 }
 
 pub(super) async fn run_empty_dependency_install_phase(
@@ -418,6 +439,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         override_set,
         linker_mode,
         object_integrity_policy,
+        dependency_engine_policy,
     } = input;
 
     if cleanup_catalogs_in_pipeline {
@@ -486,7 +508,12 @@ pub(super) async fn run_empty_dependency_install_phase(
         tracing::warn!("failed to delete stale overrides-state.json: {e}");
     }
     materialize_empty_install_artifacts(project_dir)?;
-    write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
+    write_post_install_hash(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        dependency_engine_policy,
+    );
     Ok(())
 }
 
@@ -606,6 +633,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) emit_timing: bool,
     pub(super) strict_integrity: bool,
     pub(super) compatibility_bin_names: &'a [String],
+    pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
 }
 
 pub(super) async fn run_offline_install_phase(
@@ -655,6 +683,7 @@ pub(super) async fn run_offline_install_phase(
         emit_timing,
         strict_integrity,
         compatibility_bin_names,
+        dependency_engine_policy,
     } = input;
 
     if overrides_changed {
@@ -729,11 +758,19 @@ pub(super) async fn run_offline_install_phase(
                 .into(),
         ));
     }
+    if lockfile_needs_dependency_engine_repair(&fast.lockfile) {
+        return Err(LpmError::Registry(format!(
+            "--offline cannot use lockfile v{} because it predates dependency engine metadata. Run `lpm install` online once to upgrade to v{}, then retry --offline.",
+            fast.lockfile.metadata.lockfile_version,
+            lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
+        )));
+    }
 
     let mut locked = fast.packages;
     if omit_policy.dev {
         filter_dev_packages(&mut locked, production_dependency_names);
     }
+    filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     let _platform_skipped = filter_platform_packages(&mut locked)?;
     if !json_output {
         output::info(&format!(
@@ -1457,6 +1494,44 @@ pub(super) fn filter_platform_packages(
     Ok(skipped.len())
 }
 
+pub(super) fn filter_dependency_engine_packages(
+    packages: &mut Vec<InstallPackage>,
+    policy: &crate::engine_check::DependencyEnginePolicy,
+) -> Result<usize, LpmError> {
+    let mut skipped: HashSet<(String, String)> = HashSet::new();
+    let mut kept = Vec::with_capacity(packages.len());
+
+    for package in packages.drain(..) {
+        let Some(required) = package.node_engine.as_deref() else {
+            kept.push(package);
+            continue;
+        };
+        if policy.enforce_dependency(&package.name, &package.version, required, package.optional)? {
+            kept.push(package);
+        } else {
+            skipped.insert((package.name.clone(), package.version.clone()));
+        }
+    }
+
+    if !skipped.is_empty() {
+        for package in &mut kept {
+            package.dependencies.retain(|(local, version)| {
+                let target = package
+                    .aliases
+                    .get(local)
+                    .map_or(local.as_str(), String::as_str);
+                !skipped.contains(&(target.to_string(), version.clone()))
+            });
+            package
+                .peers
+                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
+        }
+    }
+
+    *packages = kept;
+    Ok(skipped.len())
+}
+
 pub(super) fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -1720,6 +1795,7 @@ pub(super) fn try_lockfile_fast_path(
                 registry_signatures: install_registry_signatures(&lp.registry_signatures),
                 registry_published_at: lp.registry_published_at.clone(),
                 platform: platform_meta_from_lockfile(lp),
+                node_engine: lp.node_engine.clone(),
                 optional: lp.optional,
                 // — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
@@ -2004,6 +2080,7 @@ pub(super) fn resolved_to_install_packages(
                 registry_signatures,
                 registry_published_at,
                 platform: r.platform.clone(),
+                node_engine: r.node_engine.clone(),
                 optional: r.optional,
                 tarball_url: r.tarball_url.clone(),
                 metadata_checked_for_tarball: true,

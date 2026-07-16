@@ -37,7 +37,9 @@ mod support;
 use support::assertions;
 use support::build_state::seed_global_install_blocked_state_with_tier;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_with_registry, write_npm_firewall_global_config};
+use support::{
+    TempProject, configure_fake_node, lpm, lpm_with_registry, write_npm_firewall_global_config,
+};
 
 const GLOBAL_E2E_PKG: &str = "@lpm.dev/acme.global-tool";
 const GLOBAL_E2E_COMMAND: &str = "acme-global-tool";
@@ -524,6 +526,43 @@ console.log('global-firewall-tool');
     assert!(
         combined.contains("LPM Firewall active"),
         "firewall-active global install must show the badge; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_global_no_engine_strict_accepts_incompatible_dependency_with_warning_policy() {
+    const PACKAGE: &str = "@lpm.dev/acme.global-engine-tool";
+
+    let project = TempProject::empty(r#"{ "name": "global-engine-test", "version": "0.0.0" }"#);
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": PACKAGE,
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" },
+            "bin": { "global-engine-tool": "bin/global-engine-tool.js" }
+        }),
+        &[(
+            "bin/global-engine-tool.js",
+            br#"#!/usr/bin/env node
+console.log('global-engine-tool');
+"#,
+        )],
+    )
+    .await;
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args(["install", "-g", PACKAGE, "--no-engine-strict"])
+        .output()
+        .expect("run warning-only global dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "--no-engine-strict must reach the synthesized global install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

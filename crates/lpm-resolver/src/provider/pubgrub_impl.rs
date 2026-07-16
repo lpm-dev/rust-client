@@ -1,6 +1,28 @@
 use super::prelude::*;
 
 impl LpmDependencyProvider {
+    fn child_is_optional(
+        &self,
+        parent: &ResolverPackage,
+        child: &ResolverPackage,
+        edge_is_optional: bool,
+    ) -> bool {
+        let parent_is_optional = !parent.is_root()
+            && self
+                .optional_reachability
+                .borrow()
+                .get(parent)
+                .copied()
+                .unwrap_or(false);
+        let path_is_optional = parent_is_optional || edge_is_optional;
+        let mut reachability = self.optional_reachability.borrow_mut();
+        let effective = reachability
+            .entry(child.clone())
+            .and_modify(|is_optional| *is_optional &= path_is_optional)
+            .or_insert(path_is_optional);
+        *effective
+    }
+
     /// Pick the version the resolver would choose without any override applied.
     /// Returns the newest version in the consumer's declared range.
     ///
@@ -328,6 +350,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 };
 
                 let pkg = ResolverPackage::from_dep_name(&target_name);
+                self.child_is_optional(package, &pkg, false);
 
                 // Ensure dep is cached so we know its versions
                 self.ensure_cached(&pkg)?;
@@ -544,7 +567,8 @@ impl DependencyProvider for LpmDependencyProvider {
                 base_pkg
             };
 
-            let is_optional = optional_names.contains(dep_name);
+            let is_optional =
+                self.child_is_optional(package, &pkg, optional_names.contains(dep_name));
 
             // Ensure dep is cached — skip optional deps that fail to fetch.
             //

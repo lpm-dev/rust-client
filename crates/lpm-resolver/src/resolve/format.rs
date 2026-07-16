@@ -89,6 +89,10 @@ pub(super) fn format_solution(
                 .get(&key)
                 .and_then(|info| info.platform.get(&ver_str))
                 .cloned();
+            let node_engine = cache
+                .get(&key)
+                .and_then(|info| info.node_engines.get(&ver_str))
+                .cloned();
 
             // Surface resolved peers per package. The resolver already
             // proved each peer's range was satisfied (or surfaced a
@@ -108,6 +112,7 @@ pub(super) fn format_solution(
                 tarball_url,
                 integrity,
                 platform,
+                node_engine,
                 optional: false,
             }
         })
@@ -254,6 +259,7 @@ pub(super) fn resolved_package_can_replace(
 ) -> bool {
     candidate.tarball_url == package.tarball_url
         && candidate.integrity == package.integrity
+        && candidate.node_engine == package.node_engine
         && entries_are_superset(&candidate.dependencies, &package.dependencies)
         && aliases_are_superset(&candidate.aliases, &package.aliases)
         && entries_are_superset(&candidate.peers, &package.peers)

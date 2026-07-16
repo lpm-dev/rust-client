@@ -22,6 +22,7 @@ fn package_with_source(name: &str, source: &str) -> InstallPackage {
         registry_signatures: Vec::new(),
         registry_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string()),
         metadata_checked_for_tarball: true,
@@ -374,6 +375,7 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
                 tarball_url: None,
                 integrity: None,
                 platform: None,
+                node_engine: None,
                 optional: false,
             })
             .expect("selected package receiver should be open");
@@ -692,6 +694,7 @@ fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
         tarball_url: None,
         integrity: Some("sha512-test".to_string()),
         platform: None,
+        node_engine: None,
         optional: false,
     };
 
@@ -731,6 +734,7 @@ fn npm_firewall_package_from_selected_event_includes_public_npm_registry_from_np
             tarball_url: None,
             integrity: Some("sha512-test".to_string()),
             platform: None,
+            node_engine: None,
             optional: false,
         };
 
@@ -762,6 +766,7 @@ fn npm_firewall_package_from_selected_event_skips_incompatible_platform_package(
             cpu: Vec::new(),
             libc: Vec::new(),
         }),
+        node_engine: None,
         optional: true,
     };
 

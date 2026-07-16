@@ -407,7 +407,7 @@ pub(crate) struct CiArgs {
     #[arg(long)]
     pub(crate) auto_build: bool,
 
-    /// Skip `engines.lpm` / `engines.node` enforcement for this invocation.
+    /// Use warning-only root and dependency engine checks for this invocation.
     #[arg(long)]
     pub(crate) no_engine_strict: bool,
 

@@ -342,6 +342,10 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
 
     let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
     for member in direct_workspace_member_deps {
+        let (_, _, node_engine) = read_pkg_json_name_version(
+            &member.source_dir,
+            &format!("workspace member at {}", member.source_dir.display()),
+        )?;
         install_pkgs.push(InstallPackage {
             name: member.name.clone(),
             version: member.version.clone(),
@@ -356,6 +360,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -761,7 +766,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             .await?;
         let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
 
-        let (real_name, real_version) =
+        let (real_name, real_version, node_engine) =
             read_pkg_json_name_version(&cas_path, &format!("tarball at {url}"))?;
 
         // Dep-key vs fetched-name policy: warn rather than reject. The manifest dep key
@@ -789,6 +794,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: Some(url),
             metadata_checked_for_tarball: false,
@@ -845,7 +851,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
 
         let cas_path = store.store_local_tarball_at_cas_path(&content_sha256_hex, &data)?;
 
-        let (real_name, real_version) = read_pkg_json_name_version(
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &cas_path,
             &format!("local tarball at {}", abs_path.display()),
         )?;
@@ -890,6 +896,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             // tarball_url is fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
@@ -939,7 +946,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             ))
         })?;
 
-        let (real_name, real_version) = read_pkg_json_name_version(
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &realpath,
             &format!("file: directory at {}", realpath.display()),
         )?;
@@ -1028,6 +1035,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -1054,7 +1062,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             ))
         })?;
 
-        let (real_name, real_version) =
+        let (real_name, real_version, node_engine) =
             read_pkg_json_name_version(&realpath, &format!("link: dep at {}", realpath.display()))?;
 
         // : workspace overlap detection — same logic as the
@@ -1129,6 +1137,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -1243,7 +1252,7 @@ pub(super) async fn read_local_tarball_bounded(
 }
 
 /// Read `package.json` from an extracted package directory and
-/// return `(name, version)` as owned strings.
+/// return `(name, version, engines.node)` as owned values.
 ///
 /// Shared between the remote-tarball-URL arm and the local-file-
 /// tarball arm of [`pre_resolve_non_registry_deps`]; the two used to
@@ -1253,7 +1262,7 @@ pub(super) async fn read_local_tarball_bounded(
 pub(super) fn read_pkg_json_name_version(
     cas_path: &Path,
     source_label: &str,
-) -> Result<(String, String), LpmError> {
+) -> Result<(String, String, Option<String>), LpmError> {
     let pkg_json_path = cas_path.join("package.json");
     let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
         LpmError::Registry(format!(
@@ -1280,7 +1289,12 @@ pub(super) fn read_pkg_json_name_version(
             ))
         })?
         .to_string();
-    Ok((name, version))
+    let node_engine = pkg_json
+        .get("engines")
+        .and_then(|engines| engines.get("node"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    Ok((name, version, node_engine))
 }
 
 /// read a local source's
@@ -1642,6 +1656,13 @@ fn promote_workspace_member_source_graph(
     }
     visited.insert(realpath.clone(), source_string.clone());
     spec.target_source = Some(source_string.clone());
+    let (_, _, node_engine) = read_pkg_json_name_version(
+        &matched_member.source_dir,
+        &format!(
+            "workspace member at {}",
+            matched_member.source_dir.display()
+        ),
+    )?;
     install_pkgs_out.push(InstallPackage {
         name: matched_member.name.clone(),
         version: matched_member.version.clone(),
@@ -1656,6 +1677,7 @@ fn promote_workspace_member_source_graph(
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -1815,7 +1837,7 @@ pub(super) fn recurse_local_source_deps(
                     spec.target_source = Some(existing_source.clone());
                     continue;
                 }
-                let (real_name, real_version) = read_pkg_json_name_version(
+                let (real_name, real_version, node_engine) = read_pkg_json_name_version(
                     &realpath,
                     &format!("transitive local source at {}", realpath.display()),
                 )?;
@@ -1908,6 +1930,7 @@ pub(super) fn recurse_local_source_deps(
                     registry_signatures: Vec::new(),
                     registry_published_at: None,
                     platform: None,
+                    node_engine,
                     optional: false,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,

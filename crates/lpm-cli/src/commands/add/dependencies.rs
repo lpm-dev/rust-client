@@ -282,6 +282,7 @@ pub(super) async fn handle_dependencies(
     ecosystem: &str,
     _yes: bool,
     json_output: bool,
+    no_engine_strict: bool,
     effective_pm: &str,
 ) -> Result<Vec<(String, String)>, LpmError> {
     let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?;
@@ -425,6 +426,7 @@ pub(super) async fn handle_dependencies(
                 false,                                                 // force
                 false,                                                 // allow_new
                 false, // strict_integrity
+                no_engine_strict,
                 None,  // strict_peer_dependencies_override
                 None,  // linker_override
                 false, // no_skills

@@ -969,6 +969,7 @@ pub async fn run_add_packages(
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded strict peer-dependency override — see [`run_with_options`].
     strict_peer_dependencies_override: Option<bool>,
+    no_engine_strict: bool,
     omit_policy: InstallOmitPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
@@ -1107,6 +1108,7 @@ pub async fn run_add_packages(
             force,
             allow_new,
             false, // strict_integrity — internal call, no flag
+            no_engine_strict,
             strict_peer_dependencies_override,
             None,  // linker_override
             false, // no_skills
@@ -1206,6 +1208,7 @@ pub async fn run_install_filtered_add(
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded strict peer-dependency override — see [`run_with_options`].
     strict_peer_dependencies_override: Option<bool>,
+    no_engine_strict: bool,
     omit_policy: InstallOmitPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
@@ -1477,6 +1480,7 @@ pub async fn run_install_filtered_add(
                 force,
                 allow_new,
                 false, // strict_integrity — workspace-add path, no flag
+                no_engine_strict,
                 strict_peer_dependencies_override,
                 None,  // linker_override
                 false, // no_skills

@@ -214,6 +214,73 @@ async fn transitive_peer_host_satisfies_peer_and_survives_warm_reinstall() {
 }
 
 #[tokio::test]
+async fn repeated_writable_peer_resolution_keeps_lockfile_bytes_and_transitive_nodes_stable() {
+    let mock = MockRegistry::start().await;
+    mount_transitive_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/using-ajv": "1.0.0"
+            }
+        }"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .output()
+        .expect("failed to run initial writable install");
+    assert!(
+        first.status.success(),
+        "initial peer resolution must succeed\n{}",
+        output_text(&first)
+    );
+    let first_lockfile = project.read_file("lpm.lock");
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .arg("--force")
+        .output()
+        .expect("failed to rerun writable peer resolution");
+    assert!(
+        second.status.success(),
+        "repeated writable peer resolution must succeed\n{}",
+        output_text(&second)
+    );
+    let second_lockfile = project.read_file("lpm.lock");
+    assert_eq!(
+        second_lockfile, first_lockfile,
+        "re-resolving an unchanged peer graph must keep lpm.lock byte-stable"
+    );
+
+    assert_lockfile_has_peer_binding(&project, "ajv-keywords", "1.5.0", "ajv@4.10.4");
+    let node_modules = project.path().join("node_modules");
+    assert!(
+        node_modules
+            .join("@pnpm.e2e")
+            .join("using-ajv")
+            .join("package.json")
+            .exists()
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("stable lockfile must remain readable");
+    let host = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "@pnpm.e2e/using-ajv")
+        .expect("transitive host must remain in the lockfile");
+    assert!(
+        host.dependencies.contains(&"ajv@4.10.4".to_string())
+            && host
+                .dependencies
+                .contains(&"ajv-keywords@1.5.0".to_string()),
+        "the repeated resolve must keep both transitive peer graph edges reachable"
+    );
+}
+
+#[tokio::test]
 async fn uninstalling_direct_peer_copy_keeps_transitive_peer_bound_package() {
     let mock = MockRegistry::start().await;
     mount_transitive_peer_graph(&mock).await;

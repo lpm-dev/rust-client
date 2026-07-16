@@ -190,6 +190,7 @@ fn resolved_pkg_with_graph(
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }
 }
@@ -364,6 +365,7 @@ fn make_cached_info(
             .collect(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
+        node_engines: HashMap::new(),
         bundled_dep_names: HashMap::new(),
         platform: HashMap::new(),
         dist: HashMap::new(),
@@ -382,6 +384,7 @@ fn make_version_metadata(
     VersionMetadata {
         name: name.to_string(),
         version: version.to_string(),
+        engines: HashMap::new(),
         dependencies: dependencies
             .into_iter()
             .map(|(dep_name, dep_range)| (dep_name.to_string(), dep_range.to_string()))
@@ -1231,6 +1234,7 @@ fn peer_check_satisfied_peer_no_warning() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1242,6 +1246,7 @@ fn peer_check_satisfied_peer_no_warning() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1284,6 +1289,7 @@ fn peer_check_wrong_version_produces_warning() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1295,6 +1301,7 @@ fn peer_check_wrong_version_produces_warning() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1336,6 +1343,7 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1347,6 +1355,7 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1358,6 +1367,7 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1400,6 +1410,7 @@ fn peer_check_optional_peer_missing_no_warning() {
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }];
 
@@ -1444,6 +1455,7 @@ fn peer_check_optional_peer_wrong_version_still_warns() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1455,6 +1467,7 @@ fn peer_check_optional_peer_wrong_version_still_warns() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1501,6 +1514,7 @@ fn peer_check_missing_peer_produces_warning() {
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }];
 
@@ -1549,6 +1563,7 @@ fn peer_check_version_specific_no_cross_contamination() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1560,6 +1575,7 @@ fn peer_check_version_specific_no_cross_contamination() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1605,6 +1621,7 @@ fn peer_check_prefers_same_split_context_peer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1616,6 +1633,7 @@ fn peer_check_prefers_same_split_context_peer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1627,6 +1645,7 @@ fn peer_check_prefers_same_split_context_peer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1671,6 +1690,7 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1682,6 +1702,7 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1693,6 +1714,7 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1750,6 +1772,7 @@ fn peer_check_multiple_packages_multiple_peers() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1761,6 +1784,7 @@ fn peer_check_multiple_packages_multiple_peers() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1772,6 +1796,7 @@ fn peer_check_multiple_packages_multiple_peers() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -1828,6 +1853,7 @@ fn peer_check_no_peers_no_warnings() {
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }];
 
@@ -1943,6 +1969,7 @@ fn peer_rules_ignore_missing_suppresses_missing_warning() {
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }];
 
@@ -1994,6 +2021,7 @@ fn peer_rules_allowed_versions_widens_match() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -2005,6 +2033,7 @@ fn peer_rules_allowed_versions_widens_match() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -2073,6 +2102,7 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -2084,6 +2114,7 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -2098,6 +2129,7 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }];
 
@@ -2275,6 +2307,7 @@ fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -2286,6 +2319,7 @@ fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -2297,6 +2331,7 @@ fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -2360,6 +2395,7 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -2371,6 +2407,7 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];
@@ -2385,6 +2422,7 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -2396,6 +2434,7 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];

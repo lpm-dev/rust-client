@@ -307,6 +307,7 @@ mod tests {
         lpm_registry::VersionMetadata {
             name: name.to_string(),
             version: version.to_string(),
+            engines: Default::default(),
             dependencies: dependencies
                 .iter()
                 .map(|(dep_name, dep_range)| (dep_name.to_string(), dep_range.to_string()))

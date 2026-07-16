@@ -1907,6 +1907,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["body-parser@1.20.0".into(), "debug@4.3.4".into()],
@@ -1924,6 +1925,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["debug@4.3.4".into()],
@@ -1941,6 +1943,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -1958,6 +1961,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -2513,6 +2517,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["qs@1.0.0".to_string()],
@@ -2530,6 +2535,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],

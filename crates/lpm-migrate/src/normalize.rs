@@ -99,6 +99,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
             dependencies,
             // The migrate path consumes lockfiles produced by other

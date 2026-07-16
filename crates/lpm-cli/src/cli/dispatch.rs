@@ -616,6 +616,7 @@ async fn async_main() -> Result<()> {
                     unverified_provenance_all,
                 )?;
                 overrides.strict_peer_dependencies_override = cli_strict_peer_dependencies;
+                overrides.no_engine_strict = no_engine_strict;
 
                 return commands::install_global::run(
                     &client,
@@ -704,13 +705,6 @@ async fn async_main() -> Result<()> {
             } else {
                 cfg.get_bool("audit-after-install").unwrap_or(false)
             };
-
-            // engines.lpm / engines.node enforcement (workspace root).
-            // Runs before any install work so a constraint violation
-            // exits cheaply with a structured error code. The gate
-            // discovers the workspace root internally so a member-dir
-            // invocation honors the root's `lpm.engineStrict` opt-out.
-            engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
 
             //: parse `--min-release-age=<dur>` once, at the
             // clap layer, so invalid input surfaces before any install
@@ -905,6 +899,7 @@ async fn async_main() -> Result<()> {
                         force,
                         eff_allow_new,
                         strict_integrity,
+                        no_engine_strict,
                         cli_strict_peer_dependencies,
                         cli_linker,
                         eff_no_skills,
@@ -964,6 +959,7 @@ async fn async_main() -> Result<()> {
                     drift_ignore_policy,
                     verify_policy,
                     cli_strict_peer_dependencies,
+                    no_engine_strict,
                     omit_policy,
                     strict_sandbox || paranoid,
                     no_sandbox,
@@ -1006,6 +1002,7 @@ async fn async_main() -> Result<()> {
                         drift_ignore_policy,
                         verify_policy,
                         cli_strict_peer_dependencies,
+                        no_engine_strict,
                         omit_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
@@ -1033,6 +1030,7 @@ async fn async_main() -> Result<()> {
                         drift_ignore_policy,
                         verify_policy,
                         cli_strict_peer_dependencies,
+                        no_engine_strict,
                         omit_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
@@ -1149,6 +1147,7 @@ async fn async_main() -> Result<()> {
                 no_install_deps,
                 no_skills,
                 no_editor_setup,
+                no_engine_strict,
                 &pm,
                 alias.as_deref(),
                 target.as_deref(),
@@ -2516,8 +2515,6 @@ async fn async_main() -> Result<()> {
                 cfg.get_bool("audit-after-install").unwrap_or(false)
             };
 
-            engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
-
             let min_release_age_override: Option<u64> = match min_release_age.as_deref() {
                 Some(s) => Some(release_age_config::parse_duration(s)?),
                 None => None,
@@ -2607,6 +2604,7 @@ async fn async_main() -> Result<()> {
                 false,
                 eff_allow_new,
                 strict_integrity,
+                no_engine_strict,
                 cli_strict_peer_dependencies,
                 cli_linker,
                 eff_no_skills,

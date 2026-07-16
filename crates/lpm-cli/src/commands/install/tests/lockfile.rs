@@ -36,6 +36,7 @@ fn fake_resolved(name: &str, version: &str, context: Option<&str>) -> ResolvedPa
         tarball_url: None,
         integrity: None,
         platform: None,
+        node_engine: None,
         optional: false,
     }
 }
@@ -207,7 +208,10 @@ fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
 
 #[test]
 fn fresh_lockfiles_use_current_schema_version() {
-    assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 5);
+    assert_eq!(
+        lpm_lockfile::LOCKFILE_VERSION,
+        lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
+    );
     let lf = lpm_lockfile::Lockfile::new();
     assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
 }
@@ -445,6 +449,7 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
             peer_deps: HashMap::new(),
             optional_dep_names: HashMap::new(),
             optional_peer_names: HashMap::new(),
+            node_engines: HashMap::new(),
             bundled_dep_names: HashMap::new(),
             platform: HashMap::new(),
             dist,
@@ -604,6 +609,7 @@ fn lockfile_fast_path_flags_v1_binary_for_upgrade() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -671,6 +677,7 @@ fn lockfile_fast_path_flags_missing_binary_for_upgrade() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -708,6 +715,7 @@ fn try_lockfile_fast_path_flags_stale_binary_for_writeback() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -748,6 +756,7 @@ fn try_lockfile_fast_path_flags_corrupt_binary_for_writeback() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -789,6 +798,7 @@ fn lockfile_fast_path_skips_upgrade_when_binary_current() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -833,6 +843,7 @@ fn accepted_gate_url_populates_tarball_url() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -881,6 +892,7 @@ fn try_lockfile_fast_path_restores_registry_signature_metadata() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -930,6 +942,7 @@ fn rejected_gate_urls_downgrade_to_none_with_telemetry() {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
@@ -994,6 +1007,7 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],

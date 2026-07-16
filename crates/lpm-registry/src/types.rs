@@ -113,6 +113,10 @@ pub struct VersionMetadata {
     #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
 
+    /// Runtime compatibility constraints declared by this version.
+    #[serde(default)]
+    pub engines: HashMap<String, String>,
+
     /// Platform restrictions: `"darwin"` or `["darwin", "linux", "win32"]`.
     #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
     pub os: Vec<String>,

@@ -76,6 +76,13 @@ pub(super) fn load_lockfile_graph_packages(
             fast.lockfile.metadata.lockfile_version
         )));
     }
+    if lockfile_needs_dependency_engine_repair(&fast.lockfile) {
+        return Err(LpmError::Registry(format!(
+            "experimental resolver lockfile graph mode requires an upgraded v{} lockfile; found v{}",
+            lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
+            fast.lockfile.metadata.lockfile_version
+        )));
+    }
     Ok(fast.packages)
 }
 
@@ -347,6 +354,7 @@ pub(super) fn merge_node_into_packages(
                 registry_signatures: dist.map(|dist| dist.signatures.clone()).unwrap_or_default(),
                 registry_published_at: dist.and_then(|dist| dist.published_at.clone()),
                 platform: node.platform.clone(),
+                node_engine: node.info.node_engines.get(&version).cloned(),
                 optional: node.request.optional,
                 tarball_url: dist.and_then(|dist| dist.tarball_url.clone()),
                 metadata_checked_for_tarball: true,

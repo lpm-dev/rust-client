@@ -1,22 +1,21 @@
 //! `engines.lpm` and `engines.node` enforcement, plus the manifest-side
 //! compatibility warning loop.
 //!
-//! Reads `engines` from the workspace root `package.json`, compares
-//! constraints against the running CLI version (`engines.lpm`) and the
-//! effective Node version (`engines.node`), and aborts the install /
-//! rebuild / add pipeline when a constraint isn't satisfied. While we
-//! have the parsed root manifest in hand, this is also the right place
-//! to emit the structured manifest-compat warnings driven by
+//! Reads `engines` from the workspace root and installed dependency
+//! metadata, compares constraints against the running CLI version
+//! (`engines.lpm`) and the effective Node version (`engines.node`), and
+//! aborts the install / rebuild / add pipeline when a required constraint
+//! isn't satisfied. While we have the parsed root manifest in hand, this
+//! is also the right place to emit the structured manifest-compat warnings driven by
 //! [`lpm_workspace::PackageJson::manifest_compat_issues`] — a single
 //! emission shared across install / rebuild / add.
 //!
 //! ## Defaults
 //!
 //! - `engine-strict = true` by default. Mismatches abort.
-//! - Workspace **root** package's `engines` block is the gate. Member
-//!   packages don't gate the workspace install. The same root manifest
-//!   owns the `lpm.engineStrict` opt-out — running `lpm install` from
-//!   `packages/foo/` honors the root's `engineStrict = false`.
+//! - The workspace root owns `engines.lpm`, its own `engines.node`, and the
+//!   `lpm.engineStrict` policy. Installed dependency `engines.node`
+//!   constraints are then checked under that same policy.
 //! - Unknown `engines.<other-pm>` keys (`npm`, `pnpm`, `yarn`, `bun`),
 //!   `pnpm.overrides` / `pnpm.patchedDependencies` drift, and other
 //!   manifest-side silent drops produce one-line stderr warnings via
@@ -35,10 +34,150 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
-use lpm_runtime::effective::resolve_effective_node_version_with_engines;
+use lpm_runtime::effective::{Effective, resolve_effective_node_version_with_engines};
 use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+const LOCKFILE_NODE_ENGINE_NEEDLE: &str = "node-engine = ";
+
+pub(crate) struct DependencyEnginePolicy {
+    engine_strict: bool,
+    json_output: bool,
+    root_dir: PathBuf,
+    root_engines: HashMap<String, String>,
+    effective_node: OnceLock<Effective>,
+}
+
+impl DependencyEnginePolicy {
+    fn new(
+        root_dir: PathBuf,
+        root_engines: HashMap<String, String>,
+        engine_strict: bool,
+        json_output: bool,
+    ) -> Self {
+        Self {
+            engine_strict,
+            json_output,
+            root_dir,
+            root_engines,
+            effective_node: OnceLock::new(),
+        }
+    }
+
+    fn effective_node(&self) -> &Effective {
+        self.effective_node.get_or_init(|| {
+            resolve_effective_node_version_with_engines(&self.root_dir, &self.root_engines)
+        })
+    }
+
+    fn check_node_requirement(&self, required: &str, source: String) -> Result<(), Mismatch> {
+        let effective = self.effective_node();
+        let Some(actual) = effective.version() else {
+            return Ok(());
+        };
+        let source = format!("{source} (compared against {})", effective.source_label());
+        match version_satisfies(required, actual) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Mismatch {
+                required: required.to_string(),
+                actual: actual.to_string(),
+                source,
+            }),
+            Err(parse_err) => Err(Mismatch {
+                required: format!("{required} (parse error: {parse_err})"),
+                actual: actual.to_string(),
+                source,
+            }),
+        }
+    }
+
+    pub(crate) fn enforce_dependency(
+        &self,
+        package_name: &str,
+        package_version: &str,
+        required: &str,
+        optional: bool,
+    ) -> Result<bool, LpmError> {
+        let source = format!("{package_name}@{package_version} > engines.node");
+        let Err(mismatch) = self.check_node_requirement(required, source) else {
+            return Ok(true);
+        };
+
+        if !self.engine_strict {
+            if !self.json_output {
+                output::warn(&format!(
+                    "{package_name}@{package_version}: {mismatch} (engine-strict disabled, ignoring)"
+                ));
+            }
+            return Ok(true);
+        }
+        if optional {
+            if !self.json_output {
+                output::warn(&format!(
+                    "skipping optional {package_name}@{package_version}: {mismatch}"
+                ));
+            }
+            return Ok(false);
+        }
+        Err(mismatch.into_error("node"))
+    }
+
+    pub(crate) fn freshness_key(&self, lockfile_content: &str) -> String {
+        if lockfile_version(lockfile_content)
+            .is_some_and(|version| version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES)
+        {
+            return "legacy".to_string();
+        }
+        if !lockfile_has_dependency_node_engines(lockfile_content) {
+            return "none".to_string();
+        }
+        self.constrained_freshness_key()
+    }
+
+    pub(crate) fn constrained_freshness_key(&self) -> String {
+        let version = self.effective_node().version().unwrap_or("unknown");
+        format!("{}:{version}", u8::from(self.engine_strict))
+    }
+}
+
+pub(crate) fn lockfile_has_dependency_node_engines(content: &str) -> bool {
+    content.contains(LOCKFILE_NODE_ENGINE_NEEDLE)
+}
+
+fn lockfile_version(content: &str) -> Option<u32> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("lockfile-version = ")?
+            .parse()
+            .ok()
+    })
+}
+
+pub(crate) fn prepare_dependency_policy(
+    start_dir: &Path,
+    cli_no_engine_strict: bool,
+    json_output: bool,
+) -> Result<DependencyEnginePolicy, LpmError> {
+    let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
+        return Ok(DependencyEnginePolicy::new(
+            start_dir.to_path_buf(),
+            HashMap::new(),
+            false,
+            json_output,
+        ));
+    };
+    let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
+    let policy = DependencyEnginePolicy::new(
+        root_dir,
+        root_pkg.engines.clone(),
+        engine_strict,
+        json_output,
+    );
+    enforce_root_with_policy(&root_pkg, &policy)?;
+    Ok(policy)
+}
 
 /// Run the engine gate for `start_dir`.
 ///
@@ -65,15 +204,7 @@ pub fn enforce(
     cli_no_engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
-        // No `package.json` anywhere above `start_dir`. Plain source
-        // copy (`lpm add`) lives here; `lpm install` / `lpm rebuild`
-        // would already error downstream with their own NotFound. The
-        // gate has nothing to validate against.
-        return Ok(());
-    };
-    let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
-    enforce_with_root(&root_dir, &root_pkg, engine_strict, json_output)
+    prepare_dependency_policy(start_dir, cli_no_engine_strict, json_output).map(|_| ())
 }
 
 /// Variant that takes the already-resolved root + manifest. Use this
@@ -85,30 +216,45 @@ pub fn enforce_with_root(
     engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let policy = DependencyEnginePolicy::new(
+        root_dir.to_path_buf(),
+        root_pkg.engines.clone(),
+        engine_strict,
+        json_output,
+    );
+    enforce_root_with_policy(root_pkg, &policy)
+}
+
+fn enforce_root_with_policy(
+    root_pkg: &PackageJson,
+    policy: &DependencyEnginePolicy,
+) -> Result<(), LpmError> {
     // Manifest-compat warnings always run — regardless of whether
     // `engines` is set, because the detector also surfaces
     // `pnpm.overrides` / `pnpm.patchedDependencies` drift that has
     // nothing to do with the engines block. Silenced under `--json`
     // so the stdout JSON contract stays clean; automation pulls the
     // same signals from `lpm doctor --json`.
-    emit_manifest_compat_warnings(root_pkg, json_output);
+    emit_manifest_compat_warnings(root_pkg, policy.json_output);
 
     if root_pkg.engines.is_empty() {
         return Ok(());
     }
 
     let lpm_result = check_lpm_engine(&root_pkg.engines);
-    let node_result = check_node_engine(&root_pkg.engines, root_dir);
+    let node_result = root_pkg.engines.get("node").map_or(Ok(()), |required| {
+        policy.check_node_requirement(required, "package.json > engines.node".to_string())
+    });
 
-    if !engine_strict {
+    if !policy.engine_strict {
         // Soft mode: surface mismatches as warnings, never abort.
         if let Err(msg) = &lpm_result
-            && !json_output
+            && !policy.json_output
         {
             output::warn(&format!("{msg} (engine-strict disabled, ignoring)"));
         }
         if let Err(msg) = &node_result
-            && !json_output
+            && !policy.json_output
         {
             output::warn(&format!("{msg} (engine-strict disabled, ignoring)"));
         }
@@ -194,41 +340,6 @@ fn check_lpm_engine(engines: &HashMap<String, String>) -> Result<(), Mismatch> {
             required: format!("{required} (parse error: {parse_err})"),
             actual: actual.to_string(),
             source: "package.json > engines.lpm".to_string(),
-        }),
-    }
-}
-
-/// Compare `engines.node` against the effective Node version LPM will
-/// use for this project (managed runtime if installed, else system
-/// Node, else skip).
-fn check_node_engine(
-    engines: &HashMap<String, String>,
-    project_dir: &Path,
-) -> Result<(), Mismatch> {
-    let Some(required) = engines.get("node") else {
-        return Ok(());
-    };
-    let effective = resolve_effective_node_version_with_engines(project_dir, engines);
-    let Some(actual) = effective.version() else {
-        // No Node available at all (no managed runtime, no system
-        // Node). Don't fail — there's nothing to validate against. If
-        // the user actually runs scripts later, the runtime layer will
-        // surface the missing-Node error.
-        return Ok(());
-    };
-    let source_label = effective.source_label();
-    let source = format!("package.json > engines.node (compared against {source_label})");
-    match version_satisfies(required, actual) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(Mismatch {
-            required: required.clone(),
-            actual: actual.to_string(),
-            source,
-        }),
-        Err(parse_err) => Err(Mismatch {
-            required: format!("{required} (parse error: {parse_err})"),
-            actual: actual.to_string(),
-            source,
         }),
     }
 }
@@ -474,5 +585,26 @@ mod tests {
     #[test]
     fn version_satisfies_unparseable_version_errors() {
         assert!(version_satisfies(">=1.0.0", "not a version").is_err());
+    }
+
+    #[test]
+    fn legacy_lockfile_uses_migration_freshness_without_resolving_node() {
+        let dir = tempdir().unwrap();
+        let policy =
+            DependencyEnginePolicy::new(dir.path().to_path_buf(), HashMap::new(), true, true);
+
+        assert_eq!(policy.freshness_key("lockfile-version = 5\n"), "legacy");
+        assert!(policy.effective_node.get().is_none());
+    }
+
+    #[test]
+    fn current_unconstrained_lockfile_preserves_existing_freshness() {
+        let dir = tempdir().unwrap();
+        let policy =
+            DependencyEnginePolicy::new(dir.path().to_path_buf(), HashMap::new(), true, true);
+        let lockfile = format!("lockfile-version = {}\n", lpm_lockfile::LOCKFILE_VERSION);
+
+        assert_eq!(policy.freshness_key(&lockfile), "none");
+        assert!(policy.effective_node.get().is_none());
     }
 }

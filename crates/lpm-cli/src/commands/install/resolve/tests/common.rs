@@ -20,6 +20,7 @@ pub(super) fn fake_package(name: &str, version: &str, deps: &[(&str, &str)]) -> 
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: Some(format!(
             "https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"
@@ -41,6 +42,7 @@ pub(super) fn empty_info_value() -> lpm_resolver::CachedPackageInfo {
         peer_deps: HashMap::new(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
+        node_engines: HashMap::new(),
         bundled_dep_names: HashMap::new(),
         platform: HashMap::new(),
         dist: HashMap::new(),
