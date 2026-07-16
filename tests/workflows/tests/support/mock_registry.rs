@@ -95,8 +95,21 @@ fn whoami_response(username: &str, email: &str) -> serde_json::Value {
 
 impl MockRegistry {
     /// Start a new mock registry on a random port.
+    ///
+    /// Unconfigured package-skill reads return an empty published set. More
+    /// specific skill fixtures override this lowest-priority fallback.
     pub async fn start() -> Self {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "fixture.package",
+                "available": false,
+                "skills": [],
+            })))
+            .with_priority(u8::MAX)
+            .mount(&server)
+            .await;
         MockRegistry {
             server,
             tarball_integrities: Arc::default(),
@@ -167,6 +180,29 @@ impl MockRegistry {
                 "skills": skills,
             })))
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a failed package-skill lookup for one exact package version.
+    pub async fn with_package_skills_error_for_version(
+        &self,
+        name: &str,
+        version: &str,
+        status: u16,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .and(query_param("version", version))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "error": "package skills unavailable",
+                })),
+            )
+            .with_priority(1)
+            .expect(1)
             .mount(&self.server)
             .await;
         self

@@ -724,11 +724,14 @@ async fn install_propagates_package_skill_fetch_errors() {
     registry
         .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
         .await;
+    registry
+        .with_package_skills_error_for_version("owner.package", "1.0.0", 404)
+        .await;
 
     let output = lpm_with_registry(&project, &registry.url())
         .arg("install")
         .output()
-        .expect("failed to run package install without a skills endpoint");
+        .expect("failed to run package install with a skills endpoint error");
 
     assert!(!output.status.success());
     assert!(!project.path().join(".lpm/skills/owner.package").exists());
