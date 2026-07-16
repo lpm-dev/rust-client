@@ -1,7 +1,7 @@
 use super::parsers::parse_advisor_slug;
 use super::{InstallOmitCli, LinkerCli, OutdatedRegistryScope};
 use crate::commands;
-use clap::Args;
+use clap::{ArgAction, Args, Subcommand};
 
 #[derive(Args)]
 pub(crate) struct FetchArgs {
@@ -723,10 +723,161 @@ pub(crate) struct GlobalArgs {
 
 #[derive(Args)]
 pub(crate) struct SkillsArgs {
-    /// Action: list, install, validate, clean.
-    pub(crate) action: String,
-    /// Package name (for install).
-    pub(crate) package: Option<String>,
+    #[command(subcommand)]
+    pub(crate) action: SkillsCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SkillsCommand {
+    /// Discover, scan, and install skills from a source.
+    Add(SkillsAddArgs),
+    /// List installed skills.
+    #[command(visible_alias = "ls")]
+    List(SkillsListArgs),
+    /// Show a detailed skill inventory or one skill.
+    View(SkillsViewArgs),
+    /// Remove managed skills.
+    #[command(visible_alias = "rm")]
+    Remove(SkillsRemoveArgs),
+    /// Enable one or more managed skills for agent targets.
+    Enable(SkillsToggleArgs),
+    /// Disable one or more managed skills for agent targets.
+    Disable(SkillsToggleArgs),
+    /// Refresh managed skills from their sources.
+    Update(SkillsUpdateArgs),
+    /// Diagnose managed skill storage and agent links.
+    Doctor(SkillsScopeArgs),
+    /// Validate SKILL.md files without installing them.
+    Validate(SkillsValidateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsAddArgs {
+    /// GitHub repository, local directory, or @lpm.dev package.
+    pub(crate) source: Option<String>,
+
+    /// Install only this skill. Repeat for multiple skills.
+    #[arg(long = "skill", short = 's')]
+    pub(crate) skills: Vec<String>,
+
+    /// Install every discovered skill.
+    #[arg(long)]
+    pub(crate) all: bool,
+
+    /// Install into the user-wide skill store.
+    #[arg(long, conflicts_with = "project")]
+    pub(crate) global: bool,
+
+    /// Install into the current project (the default).
+    #[arg(long, conflicts_with = "global")]
+    pub(crate) project: bool,
+
+    /// Enable the skill for an agent. Repeat for multiple agents.
+    #[arg(long = "agent", short = 'a', value_delimiter = ',', action = ArgAction::Append)]
+    pub(crate) agents: Vec<String>,
+
+    /// Enable the skill for every supported agent.
+    #[arg(long)]
+    pub(crate) all_agents: bool,
+
+    /// Copy skill files instead of creating links to the managed store.
+    #[arg(long)]
+    pub(crate) copy: bool,
+
+    /// Only list skills discoverable from the source.
+    #[arg(long)]
+    pub(crate) list: bool,
+
+    /// Skip the interactive wizard and confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsListArgs {
+    #[command(flatten)]
+    pub(crate) scope: SkillsScopeArgs,
+
+    /// Limit results to an agent target.
+    #[arg(long = "agent", short = 'a')]
+    pub(crate) agent: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsViewArgs {
+    /// Skill name or managed identifier.
+    pub(crate) skill: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) scope: SkillsScopeArgs,
+
+    /// Limit results to an agent target.
+    #[arg(long = "agent", short = 'a')]
+    pub(crate) agent: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsRemoveArgs {
+    /// Skill names or managed identifiers to remove.
+    pub(crate) skills: Vec<String>,
+
+    /// Remove every managed skill in the selected scope.
+    #[arg(long)]
+    pub(crate) all: bool,
+
+    #[command(flatten)]
+    pub(crate) scope: SkillsScopeArgs,
+
+    /// Limit removal to these agent targets.
+    #[arg(long = "agent", short = 'a', value_delimiter = ',', action = ArgAction::Append)]
+    pub(crate) agents: Vec<String>,
+
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsToggleArgs {
+    /// Skill names or managed identifiers to change.
+    pub(crate) skills: Vec<String>,
+
+    #[command(flatten)]
+    pub(crate) scope: SkillsScopeArgs,
+
+    /// Limit the change to these agent targets.
+    #[arg(long = "agent", short = 'a', value_delimiter = ',', action = ArgAction::Append)]
+    pub(crate) agents: Vec<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsUpdateArgs {
+    /// Skill names or managed identifiers to refresh. Omit to refresh all.
+    pub(crate) skills: Vec<String>,
+
+    #[command(flatten)]
+    pub(crate) scope: SkillsScopeArgs,
+
+    /// Apply every available update without prompting.
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct SkillsValidateArgs {
+    /// Directory containing one or more SKILL.md files.
+    pub(crate) path: Option<String>,
+}
+
+#[derive(Args, Clone, Copy)]
+pub(crate) struct SkillsScopeArgs {
+    /// Operate on user-wide managed skills.
+    #[arg(long, conflicts_with = "project")]
+    pub(crate) global: bool,
+
+    /// Operate on current-project managed skills.
+    #[arg(long, conflicts_with = "global")]
+    pub(crate) project: bool,
 }
 
 #[derive(Args)]

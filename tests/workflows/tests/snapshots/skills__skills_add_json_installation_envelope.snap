@@ -1,0 +1,33 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: json
+---
+{
+  "success": true,
+  "action": "add",
+  "source": "[local skill source]",
+  "scope": "project",
+  "skills": [
+    {
+      "id": "find-skills--6c99b3685e21",
+      "name": "find-skills",
+      "description": "Finds and installs useful agent skills",
+      "source": "[local skill source]",
+      "source_kind": "local",
+      "resolved_revision": null,
+      "scope": "project",
+      "enabled": true,
+      "agents": [
+        {
+          "name": "codex",
+          "enabled": true,
+          "copied": false
+        }
+      ],
+      "estimated_tokens": 40,
+      "size_bytes": 158
+    }
+  ],
+  "count": 1,
+  "duration_ms": "[duration]"
+}
