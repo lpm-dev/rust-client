@@ -410,7 +410,7 @@ async fn run_with_options_under_store_lock(
     strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
-    no_editor_setup: bool,
+    _no_editor_setup: bool,
     no_security_summary: bool,
     auto_build: bool,
     target_set: Option<&[String]>,
@@ -500,6 +500,7 @@ async fn run_with_options_under_store_lock(
         policy_extension_configs: &policy_extension_configs,
         force,
         offline,
+        no_skills,
         omit_policy,
         strict_peer_dependencies,
         linker_mode,
@@ -1421,14 +1422,8 @@ async fn run_with_options_under_store_lock(
             .collect();
 
         if !lpm_packages.is_empty() {
-            install_skills_for_packages(
-                &arc_client,
-                &lpm_packages,
-                project_dir,
-                !json_output,
-                !no_editor_setup,
-            )
-            .await;
+            install_skills_for_packages(&arc_client, &lpm_packages, project_dir, !json_output)
+                .await?;
         }
     }
 

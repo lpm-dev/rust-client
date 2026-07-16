@@ -1,0 +1,18 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: update
+---
+{
+  "success": true,
+  "dry_run": false,
+  "changes": [
+    {
+      "action": "write managed content",
+      "path": "[project]/.lpm/managed-skills/sources/[source-id]/d83fc78bdc406324369aa654a27e2a8ef152e84ce2f9a6d0fcb756826ebfc202/release-notes"
+    },
+    {
+      "action": "link agent skill",
+      "path": "[project]/.agents/skills/release-notes"
+    }
+  ]
+}

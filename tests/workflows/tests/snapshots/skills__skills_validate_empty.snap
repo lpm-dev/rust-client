@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: envelope
+---
+{
+  "success": true,
+  "valid": 0,
+  "errors": [],
+  "quality_impact": 0
+}

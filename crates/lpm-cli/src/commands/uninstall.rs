@@ -73,6 +73,13 @@ pub(crate) fn cleanup_removed_packages(
     let node_modules = project_dir.join("node_modules");
     let mut freed_bytes = 0u64;
     for name in removed {
+        if name.starts_with("@lpm.dev/") {
+            freed_bytes = freed_bytes
+                .saturating_add(crate::commands::skills::package::remove(project_dir, name)?);
+            if let Ok(package) = lpm_common::PackageName::parse(name) {
+                crate::editor_skills::remove_editor_skills(project_dir, &package.short());
+            }
+        }
         freed_bytes =
             freed_bytes.saturating_add(cleanup_bin_shims_for_package(&node_modules, name)?);
         freed_bytes = freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, name)?);

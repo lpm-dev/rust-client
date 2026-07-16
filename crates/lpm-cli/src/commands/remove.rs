@@ -15,7 +15,7 @@ fn manifest_lookup_keys(package: &str) -> Vec<String> {
     keys
 }
 
-fn legacy_skill_short(package: &str) -> Option<String> {
+fn package_skill_short(package: &str) -> Option<String> {
     lpm_common::PackageName::parse(package)
         .ok()
         .map(|name| name.short())
@@ -93,8 +93,8 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
 
         if let Some(short) = record.skill_package_short.as_deref() {
             let skills_dir = project_dir.join(".lpm").join("skills").join(short);
-            if skills_dir.exists() {
-                std::fs::remove_dir_all(&skills_dir)?;
+            if std::fs::symlink_metadata(&skills_dir).is_ok() {
+                crate::commands::skills::package::remove(project_dir, short)?;
                 removed_paths.push(format!(".lpm/skills/{short}/"));
             }
             crate::editor_skills::remove_editor_skills(project_dir, short);
@@ -121,10 +121,10 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
 
         crate::added_sources_state::write_state(project_dir, &added_sources_state)?;
     } else {
-        if let Some(short) = legacy_skill_short(package) {
+        if let Some(short) = package_skill_short(package) {
             let skills_dir = project_dir.join(".lpm").join("skills").join(&short);
-            if skills_dir.exists() {
-                std::fs::remove_dir_all(&skills_dir)?;
+            if std::fs::symlink_metadata(&skills_dir).is_ok() {
+                crate::commands::skills::package::remove(project_dir, &short)?;
                 removed_paths.push(format!(".lpm/skills/{short}/"));
             }
             crate::editor_skills::remove_editor_skills(project_dir, &short);

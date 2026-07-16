@@ -138,6 +138,40 @@ impl MockRegistry {
         self
     }
 
+    /// Mount the package-published skills endpoint and require an exact installed version.
+    pub async fn with_package_skills_for_version(
+        &self,
+        name: &str,
+        version: &str,
+        skills: Vec<serde_json::Value>,
+    ) -> &Self {
+        self.with_package_skills_for_version_expected(name, version, skills, 1)
+            .await
+    }
+
+    pub async fn with_package_skills_for_version_expected(
+        &self,
+        name: &str,
+        version: &str,
+        skills: Vec<serde_json::Value>,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .and(query_param("version", version))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "version": version,
+                "available": true,
+                "skills": skills,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount `GET /api/search/packages` for a specific query + limit.
     pub async fn with_search_results(
         &self,

@@ -1,0 +1,9 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: envelope
+---
+{
+  "success": true,
+  "cleaned": false,
+  "files_removed": 0
+}

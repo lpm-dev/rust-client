@@ -54,6 +54,17 @@ pub fn is_stale() -> bool {
     base_is_stale(cache.as_ref(), now, SUCCESS_TTL, FAILURE_BACKOFF)
 }
 
+pub fn should_spawn_background_check() -> bool {
+    should_spawn_background_check_for(
+        is_stale(),
+        std::env::var_os("LPM_NO_UPDATE_CHECK").is_some(),
+    )
+}
+
+fn should_spawn_background_check_for(stale: bool, disabled: bool) -> bool {
+    stale && !disabled
+}
+
 /// Unconditionally refresh the update cache. Called by the hidden
 /// `internal-update-check` subcommand spawned as a detached child.
 /// The parent already checked staleness — this just does the network
@@ -91,6 +102,11 @@ mod tests {
     use super::*;
     use crate::release_lookup;
     use crate::release_lookup::UpdateCache;
+
+    #[test]
+    fn disabled_update_checks_never_spawn_a_background_child() {
+        assert!(!should_spawn_background_check_for(true, true));
+    }
 
     #[test]
     fn hidden_subcommand_parses() {

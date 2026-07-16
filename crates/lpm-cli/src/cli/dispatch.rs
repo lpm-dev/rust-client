@@ -66,7 +66,7 @@ pub(crate) fn run() -> Result<()> {
         if !workspace_json_output && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
             if state.up_to_date {
-                match check_fast_lane_admission(&cwd, fast_lane.json) {
+                match check_fast_lane_admission(&cwd, pkg_content, fast_lane.json) {
                     Ok(FastLaneAdmission::ExitAllowed) => {
                         let elapsed_ms = start.elapsed().as_millis();
                         if fast_lane.json {
@@ -139,13 +139,16 @@ enum FastLaneAdmission {
 
 fn check_fast_lane_admission(
     project_dir: &std::path::Path,
+    package_json: &str,
     json_output: bool,
 ) -> Result<FastLaneAdmission, lpm_common::LpmError> {
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
     let policy_extension_configs =
         crate::commands::install::policy_extensions::load_policy_extension_configs(&global_config)?;
-    if policy_extension_configs.is_empty() {
+    let package_skills_ready = global_config.get_bool("noSkills").unwrap_or(false)
+        || crate::commands::skills::package::materialization_complete(project_dir, package_json);
+    if policy_extension_configs.is_empty() && package_skills_ready {
         Ok(FastLaneAdmission::ExitAllowed)
     } else {
         Ok(FastLaneAdmission::NeedsInstallPipeline)
@@ -2976,7 +2979,7 @@ async fn async_main() -> Result<()> {
     // spawn a detached child process to refresh the update cache
     // if stale. The parent never waits for it — command exit is immediate.
     // The staleness check is sync (file stat + timestamp comparison).
-    if update_check::is_stale() {
+    if update_check::should_spawn_background_check() {
         spawn_background_update_check();
     }
 

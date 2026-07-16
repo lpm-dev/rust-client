@@ -1,0 +1,21 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: doctor
+---
+{
+  "success": true,
+  "healthy": true,
+  "targets": [
+    {
+      "name": "release-notes",
+      "agent": "codex",
+      "path": "[project]/.agents/skills/release-notes",
+      "enabled": true,
+      "canonical_exists": true,
+      "target_exists": true,
+      "healthy": true,
+      "status": "healthy"
+    }
+  ],
+  "external_broken_links": []
+}

@@ -5,6 +5,7 @@
 //! into supported agent directories.
 
 mod managed;
+pub(crate) mod package;
 mod source;
 
 use crate::install_ui;
@@ -228,7 +229,7 @@ async fn run_add(
 
     let selected = select_skills(&args.skill, &discovered, json_output)?;
     let scope = choose_scope(args.project, args.global, json_output)?;
-    let agents = choose_agents(&args.agent, json_output)?;
+    let agents = choose_agents(&selected, &args.agent, json_output)?;
     source::ensure_agents_are_compatible(&selected, &agents)?;
 
     let store = managed::Store::for_scope(scope, project_dir)?;
@@ -240,11 +241,22 @@ async fn run_add(
         return Ok(());
     }
     source::ensure_skills_are_safe(&selected)?;
-    require_confirmation(
-        args.yes,
-        json_output,
-        "Install the planned standalone skills?",
-    )?;
+    let warning_count = selected
+        .iter()
+        .flat_map(|skill| &skill.findings)
+        .filter(|finding| {
+            finding.severity == lpm_security::skill_security::SkillSecuritySeverity::Warning
+        })
+        .count();
+    let confirmation = if warning_count == 0 {
+        "Install the planned standalone skills?".to_string()
+    } else {
+        format!(
+            "Install after reviewing {warning_count} security {}?",
+            plural(warning_count, "warning", "warnings")
+        )
+    };
+    require_confirmation(args.yes, json_output, &confirmation)?;
     let changes = plan.changes.clone();
     managed::apply_install(&store, &tree, &selected, plan)?;
 
@@ -325,27 +337,21 @@ async fn add_package_skills(
     project_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    if !args.skill.is_empty() || !args.agent.is_empty() || args.project || args.global || args.copy
+    if !args.skill.is_empty()
+        || !args.agent.is_empty()
+        || args.project
+        || args.global
+        || args.copy
+        || args.full_depth
     {
         return Err(LpmError::Registry(
-            "`--skill`, `--agent`, scope, and `--copy` apply only to standalone skills; package-published skills are materialized as one package-owned set".into(),
+            "`--skill`, `--agent`, scope, `--copy`, and `--full-depth` apply only to standalone skills; package-published skills are materialized as one package-owned set".into(),
         ));
     }
     let name = lpm_common::PackageName::parse(package)?;
     let response = client.get_skills(&name.short(), None).await?;
     let target = project_dir.join(".lpm").join("skills").join(name.short());
-    let skills: Vec<_> = response
-        .skills
-        .iter()
-        .filter(|skill| {
-            lpm_common::is_safe_skill_name(&skill.name)
-                && skill
-                    .raw_content
-                    .as_deref()
-                    .or(skill.content.as_deref())
-                    .is_some_and(|content| !content.is_empty())
-        })
-        .collect();
+    package::validate(&response.skills)?;
 
     if args.list || args.dry_run {
         if json_output {
@@ -356,7 +362,7 @@ async fn add_package_skills(
                     "kind": "package",
                     "package": name.scoped(),
                     "directory": target,
-                    "skills": skills.iter().map(|skill| serde_json::json!({
+                    "skills": response.skills.iter().map(|skill| serde_json::json!({
                         "name": skill.name,
                         "description": skill.description,
                         "size": skill.size_bytes,
@@ -367,7 +373,7 @@ async fn add_package_skills(
             );
         } else {
             println!("{}", name.scoped().cyan());
-            for skill in &skills {
+            for skill in &response.skills {
                 println!("  {}", skill.name);
             }
             install_ui::phase(&format!("would materialize {}", target.display()));
@@ -379,15 +385,12 @@ async fn add_package_skills(
         json_output,
         "Materialize these package-published skills?",
     )?;
-    std::fs::create_dir_all(&target)?;
-    let mut installed = 0usize;
-    for skill in skills {
-        let Some(content) = skill.raw_content.as_deref().or(skill.content.as_deref()) else {
-            continue;
-        };
-        std::fs::write(target.join(format!("{}.md", skill.name)), content)?;
-        installed += 1;
-    }
+    let result = package::materialize(
+        project_dir,
+        &name.short(),
+        response.version.as_deref(),
+        &response.skills,
+    )?;
     if json_output {
         println!(
             "{}",
@@ -395,17 +398,18 @@ async fn add_package_skills(
                 "success": true,
                 "kind": "package",
                 "package": name.scoped(),
-                "installed": installed,
-                "directory": target,
+                "installed": result.installed,
+                "directory": result.directory,
             }))
             .unwrap()
         );
     } else {
         install_ui::done(&format!(
-            "Materialized {installed} package-published {}",
-            plural(installed, "skill", "skills")
+            "Materialized {} package-published {}",
+            result.installed,
+            plural(result.installed, "skill", "skills")
         ));
-        eprintln!("  {}", target.display().to_string().dimmed());
+        eprintln!("  {}", result.directory.display().to_string().dimmed());
     }
     Ok(())
 }
@@ -498,6 +502,7 @@ fn choose_scope(
 }
 
 fn choose_agents(
+    skills: &[&source::DiscoveredSkill],
     requested: &[AgentTarget],
     json_output: bool,
 ) -> Result<Vec<AgentTarget>, LpmError> {
@@ -509,12 +514,26 @@ fn choose_agents(
             "standalone installs outside a TTY require at least one `--agent`".into(),
         ));
     }
+    let compatible: Vec<_> = AgentTarget::ALL
+        .into_iter()
+        .filter(|agent| skills.iter().all(|skill| skill.supports(*agent)))
+        .collect();
+    if compatible.is_empty() {
+        return Err(LpmError::Registry(
+            "the selected skills have no common compatible agent target".into(),
+        ));
+    }
     let mut prompt = cliclack::multiselect("Install for agents  (space=toggle  enter=confirm)");
-    for agent in AgentTarget::ALL {
+    for agent in compatible.iter().copied() {
         prompt = prompt.item(agent, agent.label(), "standard Agent Skills location");
     }
+    let initial = if compatible.contains(&AgentTarget::Codex) {
+        AgentTarget::Codex
+    } else {
+        compatible[0]
+    };
     let agents: Vec<AgentTarget> = prompt
-        .initial_values(vec![AgentTarget::Codex])
+        .initial_values(vec![initial])
         .interact()
         .map_err(crate::prompt::prompt_err)?;
     if agents.is_empty() {
@@ -572,11 +591,14 @@ fn print_discovery(
                 skill.description.dimmed(),
                 skill.context_tokens
             );
-            if !skill.findings.is_empty() {
+            for finding in &skill.findings {
                 println!(
-                    "  {} {} security finding(s)",
-                    "!".yellow(),
-                    skill.findings.len()
+                    "  {} {} · {} · {}:{}",
+                    security_severity_label(finding.severity),
+                    install_ui::cyan(&finding.rule_id),
+                    finding.category,
+                    finding.path,
+                    finding.line
                 );
             }
         }
@@ -612,8 +634,9 @@ fn print_standalone_plan(
         );
         for finding in &skill.findings {
             println!(
-                "    {} {} at {}:{}",
-                "!".yellow(),
+                "    {} {} · {} · {}:{}",
+                security_severity_label(finding.severity),
+                install_ui::cyan(&finding.rule_id),
                 finding.category,
                 finding.path,
                 finding.line
@@ -680,14 +703,14 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
         print_package_inventory(&packages);
     }
     if !managed.is_empty() {
-        println!("{}", "managed".yellow().bold());
+        println!("{}", install_ui::section("managed"));
         for skill in &managed {
             println!("  {:<24} {}", skill.name, skill.summary().dimmed());
         }
         println!();
     }
     if !external.is_empty() {
-        println!("{}", "external".yellow().bold());
+        println!("{}", install_ui::section("external"));
         for skill in &external {
             println!("  {:<24} {}", skill.name, skill.summary().dimmed());
         }
@@ -760,20 +783,27 @@ fn package_inventory(project_dir: &Path) -> Result<PackageInventory, LpmError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(packages),
         Err(error) => return Err(LpmError::Io(error)),
     };
-    for package in entries.flatten() {
-        if !package.file_type().is_ok_and(|kind| kind.is_dir()) {
+    for package in entries {
+        let package = package?;
+        let package_metadata = std::fs::symlink_metadata(package.path())?;
+        if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
             continue;
         }
         let mut skills = Vec::new();
-        for skill in std::fs::read_dir(package.path())?.flatten() {
+        for skill in std::fs::read_dir(package.path())? {
+            let skill = skill?;
             let path = skill.path();
-            if path.extension().is_some_and(|extension| extension == "md") {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && path.extension().is_some_and(|extension| extension == "md")
+            {
                 skills.push((
                     path.file_stem()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string(),
-                    skill.metadata().map_or(0, |metadata| metadata.len()),
+                    metadata.len(),
                 ));
             }
         }
@@ -793,7 +823,7 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
         .max()
         .unwrap_or(0);
     for (package, skills) in packages {
-        println!("{}", format!("@lpm.dev/{package}").cyan());
+        println!("{}", install_ui::cyan(&format!("@lpm.dev/{package}")));
         for (name, size) in skills {
             let file_name = format!("{name}.md");
             println!(
@@ -807,20 +837,47 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
 
 fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let skills_dir = project_dir.join(".lpm").join("skills");
-    if !skills_dir.exists() {
-        if !json_output {
-            install_ui::warn("No .lpm/skills/ directory found");
+    let root_metadata = match std::fs::symlink_metadata(&skills_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "valid": 0,
+                        "errors": [],
+                        "quality_impact": 0,
+                    })
+                );
+            } else {
+                install_ui::warn("No .lpm/skills/ directory found");
+            }
+            return Ok(());
         }
-        return Ok(());
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(LpmError::Registry(format!(
+            "package skill path is not a regular directory: {}",
+            skills_dir.display()
+        )));
     }
     let mut errors = Vec::new();
     let mut valid = 0usize;
     let mut total_size = 0u64;
-    for package in std::fs::read_dir(&skills_dir)?.flatten() {
-        if !package.file_type().is_ok_and(|kind| kind.is_dir()) {
+    for package in std::fs::read_dir(&skills_dir)? {
+        let package = package?;
+        let package_metadata = std::fs::symlink_metadata(package.path())?;
+        if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
+            errors.push(format!(
+                "{}: package skill entry is not a regular directory",
+                package.file_name().to_string_lossy()
+            ));
             continue;
         }
-        for skill in std::fs::read_dir(package.path())?.flatten() {
+        for skill in std::fs::read_dir(package.path())? {
+            let skill = skill?;
             let path = skill.path();
             if path.extension().is_none_or(|extension| extension != "md") {
                 continue;
@@ -830,7 +887,12 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                 package.file_name().to_string_lossy(),
                 path.file_stem().unwrap_or_default().to_string_lossy()
             );
-            let size = skill.metadata().map_or(0, |metadata| metadata.len());
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                errors.push(format!("{display}: skill is not a regular file"));
+                continue;
+            }
+            let size = metadata.len();
             total_size += size;
             if size > 15 * 1024 {
                 errors.push(format!("{display}: exceeds 15KB limit ({size} bytes)"));
@@ -901,12 +963,32 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
 }
 
 fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    let _lock = package::acquire_mutation_lock(project_dir)?;
     let skills_dir = project_dir.join(".lpm").join("skills");
-    if !skills_dir.exists() {
-        if !json_output {
-            install_ui::warn("No skills to clean");
+    let metadata = match std::fs::symlink_metadata(&skills_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "cleaned": false,
+                        "files_removed": 0,
+                    })
+                );
+            } else {
+                install_ui::warn("No skills to clean");
+            }
+            return Ok(());
         }
-        return Ok(());
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LpmError::Registry(format!(
+            "refusing to clean package skill path that is not a regular directory: {}",
+            skills_dir.display()
+        )));
     }
     let removed = count_files_recursive(&skills_dir);
     std::fs::remove_dir_all(skills_dir)?;
@@ -929,8 +1011,12 @@ fn count_files_recursive(dir: &Path) -> usize {
         entries
             .flatten()
             .map(|entry| {
-                if entry.path().is_dir() {
-                    count_files_recursive(&entry.path())
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path);
+                if metadata
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+                {
+                    count_files_recursive(&path)
                 } else {
                     1
                 }
@@ -941,6 +1027,17 @@ fn count_files_recursive(dir: &Path) -> usize {
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
+}
+
+fn security_severity_label(
+    severity: lpm_security::skill_security::SkillSecuritySeverity,
+) -> String {
+    match severity {
+        lpm_security::skill_security::SkillSecuritySeverity::Warning => {
+            install_ui::section("warning")
+        }
+        lpm_security::skill_security::SkillSecuritySeverity::Block => install_ui::red("block"),
+    }
 }
 
 #[cfg(test)]
@@ -968,5 +1065,38 @@ mod tests {
             inventory,
             vec![("example.package".into(), vec![("guide".into(), 5)])]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_inventory_ignores_symlinked_skill_files() {
+        let project = tempfile::tempdir().unwrap();
+        let package = project.path().join(".lpm/skills/example.package");
+        std::fs::create_dir_all(&package).unwrap();
+        let external = project.path().join("external.md");
+        std::fs::write(&external, "external").unwrap();
+        std::os::unix::fs::symlink(&external, package.join("linked.md")).unwrap();
+
+        let inventory = package_inventory(project.path()).unwrap();
+
+        assert!(inventory.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_skill_file_counter_does_not_follow_symlinked_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let skills = project.path().join(".lpm/skills");
+        let package = skills.join("example.package");
+        let external = project.path().join("external");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("one.md"), "one").unwrap();
+        std::fs::write(external.join("two.md"), "two").unwrap();
+        std::os::unix::fs::symlink(&external, package.join("linked")).unwrap();
+
+        let count = count_files_recursive(&skills);
+
+        assert_eq!(count, 1);
     }
 }

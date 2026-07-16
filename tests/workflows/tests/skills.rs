@@ -1,10 +1,4 @@
-//! Workflow tests for `lpm skills list / validate / clean`.
-//!
-//! Skills live under `<project>/.lpm/skills/<owner.pkg>/<name>.md`.
-//! These tests cover the local-only management surfaces (list /
-//! validate / clean); `install` requires a registry call that's
-//! already exercised by integration tests at `tests/integration/`
-//! and isn't repeated here.
+//! Workflow coverage for package-published, managed, and external skills.
 
 mod support;
 
@@ -44,7 +38,65 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-// ─── list ─────────────────────────────────────────────────────────────
+fn package_skill(name: &str, description: &str, body: &str) -> serde_json::Value {
+    let content = format!("---\nname: {name}\ndescription: {description}\n---\n{body}");
+    serde_json::json!({
+        "name": name,
+        "description": description,
+        "sizeBytes": content.len(),
+        "rawContent": content,
+    })
+}
+
+fn json_command(project: &TempProject, args: &[&str]) -> serde_json::Value {
+    let output = lpm(project)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run lpm --json {}: {error}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "lpm --json {} failed:\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "lpm --json {} did not emit one JSON envelope: {error}\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+fn redact_project_paths(value: &mut serde_json::Value, project: &TempProject) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Ok(canonical) = project.path().canonicalize() {
+                *text = text.replace(&canonical.display().to_string(), "[project]");
+            }
+            *text = text.replace(&project.path().display().to_string(), "[project]");
+            let marker = ".lpm/managed-skills/sources/";
+            if let Some(start) = text.find(marker).map(|index| index + marker.len())
+                && let Some(length) = text[start..].find('/')
+            {
+                text.replace_range(start..start + length, "[source-id]");
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_project_paths(value, project);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_project_paths(value, project);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
 
 #[test]
 fn skills_list_on_fresh_project_reports_no_skills_installed() {
@@ -98,8 +150,6 @@ fn skills_list_groups_by_package_and_counts_files() {
             && stdout.contains("deploy.md"),
         "list must show each skill name, got:\n{stdout}"
     );
-    // The package/skill report is stdout; the total summary is slim
-    // status on stderr so callers can pipe the report without chatter.
     assert!(
         !stdout.contains("3 skills installed"),
         "summary belongs on stderr so stdout stays report-only, got:\n{stdout}"
@@ -322,6 +372,7 @@ fn skills_add_noninteractive_standalone_source_requires_yes_after_planning() {
 async fn skills_add_lpm_package_materializes_registry_content_without_agent_targets() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     let registry = MockRegistry::start().await;
+    std::fs::create_dir_all(project.path().join(".cursor/rules")).unwrap();
     registry
         .with_package_skills(
             "owner.package",
@@ -355,6 +406,90 @@ async fn skills_add_lpm_package_materializes_registry_content_without_agent_targ
 }
 
 #[tokio::test]
+async fn skills_add_lpm_package_rejects_standalone_full_depth_flag() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "skills",
+            "add",
+            "@lpm.dev/owner.package",
+            "--full-depth",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to add package-published skills with --full-depth");
+
+    assert!(
+        !output.status.success(),
+        "package-published skill add must reject standalone-only --full-depth"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`--full-depth`") && stderr.contains("only to standalone skills"),
+        "package flag error must identify --full-depth as standalone-only, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn skills_add_package_refresh_removes_skills_no_longer_published() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let first_registry = MockRegistry::start().await;
+    first_registry
+        .with_package_skills(
+            "owner.package",
+            vec![
+                package_skill(
+                    "kept",
+                    "Use the current package recommendation",
+                    "Follow the first recommendation.",
+                ),
+                package_skill(
+                    "removed",
+                    "Use the temporary package recommendation",
+                    "Follow the temporary recommendation.",
+                ),
+            ],
+        )
+        .await;
+    let first = lpm_with_registry(&project, &first_registry.url())
+        .args(["skills", "add", "@lpm.dev/owner.package", "--yes"])
+        .output()
+        .expect("failed to materialize the first package skill set");
+    assert!(first.status.success());
+
+    let second_registry = MockRegistry::start().await;
+    second_registry
+        .with_package_skills(
+            "owner.package",
+            vec![package_skill(
+                "kept",
+                "Use the current package recommendation",
+                "Follow the updated recommendation.",
+            )],
+        )
+        .await;
+    let second = lpm_with_registry(&project, &second_registry.url())
+        .args(["skills", "add", "@lpm.dev/owner.package", "--yes"])
+        .output()
+        .expect("failed to refresh the package skill set");
+
+    assert!(second.status.success());
+    assert!(
+        !project
+            .path()
+            .join(".lpm/skills/owner.package/removed.md")
+            .exists()
+    );
+    assert!(
+        project
+            .read_file(".lpm/skills/owner.package/kept.md")
+            .contains("updated recommendation")
+    );
+}
+
+#[tokio::test]
 async fn install_json_materializes_direct_package_published_skills_without_agent_links() {
     let project = TempProject::empty(
         r#"{
@@ -364,13 +499,15 @@ async fn install_json_materializes_direct_package_published_skills_without_agent
         }"#,
     );
     let registry = MockRegistry::start().await;
+    std::fs::create_dir_all(project.path().join(".cursor/rules")).unwrap();
     let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
     registry
         .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
         .await;
     registry
-        .with_package_skills(
+        .with_package_skills_for_version(
             "owner.package",
+            "1.0.0",
             vec![serde_json::json!({
                 "name": "guide",
                 "description": "Use package-specific conventions",
@@ -398,8 +535,170 @@ async fn install_json_materializes_direct_package_published_skills_without_agent
         !project.path().join(".agents/skills/guide").exists(),
         "package-published skills must not create standalone agent links"
     );
+    assert!(
+        !project
+            .path()
+            .join(".cursor/rules/owner.package--guide.md")
+            .exists(),
+        "package installs must not create Cursor rule links"
+    );
     let _: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("JSON install must retain one valid stdout envelope");
+}
+
+#[tokio::test]
+async fn uninstall_removes_the_package_owned_skill_directory() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "skills",
+            "version": "1.0.0",
+            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
+        }"#,
+    );
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
+    registry
+        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
+        .await;
+    registry
+        .with_package_skills_for_version(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "guide",
+                "Use package-specific conventions",
+                "Follow the package guide.",
+            )],
+        )
+        .await;
+    let install = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .expect("failed to install package skills");
+    assert!(install.status.success());
+
+    let uninstall = lpm_with_registry(&project, &registry.url())
+        .args(["uninstall", "@lpm.dev/owner.package"])
+        .output()
+        .expect("failed to uninstall package");
+
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    assert!(!project.path().join(".lpm/skills/owner.package").exists());
+}
+
+#[tokio::test]
+async fn clean_followed_by_a_warm_install_restores_package_skills() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "skills",
+            "version": "1.0.0",
+            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
+        }"#,
+    );
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
+    registry
+        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
+        .await;
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "guide",
+                "Use package-specific conventions",
+                "Follow the package guide.",
+            )],
+            2,
+        )
+        .await;
+    let first = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .expect("failed to install package skills");
+    assert!(first.status.success());
+    let clean = lpm(&project)
+        .args(["skills", "clean"])
+        .output()
+        .expect("failed to clean package skills");
+    assert!(clean.status.success());
+
+    let warm = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .expect("failed to restore package skills");
+
+    assert!(
+        warm.status.success(),
+        "warm install failed: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert!(project.file_exists(".lpm/skills/owner.package/guide.md"));
+}
+
+#[tokio::test]
+async fn install_rejects_an_unsafe_registry_skill_name_before_skill_materialization() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "skills",
+            "version": "1.0.0",
+            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
+        }"#,
+    );
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
+    registry
+        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
+        .await;
+    registry
+        .with_package_skills_for_version(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "../../escape",
+                "An unsafe package skill name",
+                "This content must never be written.",
+            )],
+        )
+        .await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .expect("failed to run unsafe package skill install");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe package skill name"));
+    assert!(!project.path().join(".lpm/skills/owner.package").exists());
+    assert!(!project.path().join("escape.md").exists());
+}
+
+#[tokio::test]
+async fn install_propagates_package_skill_fetch_errors() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "skills",
+            "version": "1.0.0",
+            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
+        }"#,
+    );
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
+    registry
+        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
+        .await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .expect("failed to run package install without a skills endpoint");
+
+    assert!(!output.status.success());
+    assert!(!project.path().join(".lpm/skills/owner.package").exists());
 }
 
 #[test]
@@ -558,12 +857,81 @@ fn skills_add_json_mutation_emits_one_success_envelope_with_applied_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+    let mut envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
         panic!("JSON add must emit exactly one JSON envelope: {error}\n---\n{stdout}")
     });
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["kind"], serde_json::json!("managed"));
     assert_eq!(envelope["changes"].as_array().map(Vec::len), Some(2));
+    redact_project_paths(&mut envelope, &project);
+    insta::assert_json_snapshot!("skills_add_managed", envelope);
+}
+
+#[test]
+fn managed_skills_json_command_surfaces_have_stable_envelopes() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let add = json_command(
+        &project,
+        &[
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ],
+    );
+    assert_eq!(add["success"], serde_json::json!(true));
+
+    let mut view = json_command(&project, &["skills", "view", "release-notes"]);
+    redact_project_paths(&mut view, &project);
+    insta::assert_json_snapshot!("skills_view_managed", view);
+
+    let mut doctor = json_command(&project, &["skills", "doctor"]);
+    redact_project_paths(&mut doctor, &project);
+    insta::assert_json_snapshot!("skills_doctor_healthy", doctor);
+
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize commits and include migration guidance.",
+    );
+    let mut update_preview = json_command(
+        &project,
+        &["skills", "update", "release-notes", "--dry-run"],
+    );
+    redact_project_paths(&mut update_preview, &project);
+    insta::assert_json_snapshot!("skills_update_preview", update_preview);
+
+    let mut update = json_command(&project, &["skills", "update", "release-notes", "--yes"]);
+    redact_project_paths(&mut update, &project);
+    insta::assert_json_snapshot!("skills_update_applied", update);
+
+    let mut disable = json_command(&project, &["skills", "disable", "release-notes", "--yes"]);
+    redact_project_paths(&mut disable, &project);
+    insta::assert_json_snapshot!("skills_disable_applied", disable);
+
+    let mut enable = json_command(&project, &["skills", "enable", "release-notes", "--yes"]);
+    redact_project_paths(&mut enable, &project);
+    insta::assert_json_snapshot!("skills_enable_applied", enable);
+
+    let mut prune = json_command(&project, &["skills", "prune", "--yes"]);
+    redact_project_paths(&mut prune, &project);
+    insta::assert_json_snapshot!("skills_prune_no_op", prune);
+
+    let mut remove = json_command(&project, &["skills", "remove", "release-notes", "--yes"]);
+    redact_project_paths(&mut remove, &project);
+    insta::assert_json_snapshot!("skills_remove_applied", remove);
 }
 
 #[test]
@@ -671,9 +1039,30 @@ fn skills_prune_removes_orphaned_links_and_stale_state_records() {
         .output()
         .expect("failed to preview stale skill prune");
     assert!(preview.status.success(), "prune preview must succeed");
+    let preview_stdout = String::from_utf8_lossy(&preview.stdout);
     assert!(
-        String::from_utf8_lossy(&preview.stdout).contains("orphaned managed target"),
+        preview_stdout.contains("orphaned managed target"),
         "prune preview must identify the broken managed link"
+    );
+    assert!(
+        preview_stdout.contains(
+            &project
+                .path()
+                .join(".agents/skills/release-notes")
+                .display()
+                .to_string()
+        ),
+        "prune preview must show the exact target path: {preview_stdout}"
+    );
+    assert!(
+        preview_stdout.contains(
+            &project
+                .path()
+                .join(".lpm/managed-skills/skills.lock.json")
+                .display()
+                .to_string()
+        ),
+        "prune preview must show the real state file path: {preview_stdout}"
     );
 
     let output = lpm(&project)
@@ -816,18 +1205,286 @@ fn skills_update_restores_missing_managed_content_and_broken_agent_link() {
     );
 }
 
-// ─── validate ─────────────────────────────────────────────────────────
+#[test]
+fn skills_add_copy_materializes_a_new_skill_before_canonical_commit() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "cursor",
+            "--project",
+            "--copy",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to copy a new standalone skill");
+
+    assert!(
+        output.status.success(),
+        "first copy install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.file_exists(".cursor/skills/release-notes/SKILL.md"));
+    assert!(project.file_exists(".cursor/skills/release-notes/.lpm-managed-skill.json"));
+}
+
+#[test]
+fn skills_add_allows_warning_findings_after_explicit_confirmation() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "token-helper",
+        "Read process.env.GITHUB_TOKEN only when the requested workflow needs authentication.",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "token-helper",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to add a warning-level skill");
+
+    assert!(
+        output.status.success(),
+        "warning findings must remain confirmable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.file_exists(".agents/skills/token-helper/SKILL.md"));
+}
+
+#[test]
+fn skills_add_rejects_duplicate_names_before_creating_managed_storage() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    for directory in ["first", "second"] {
+        project.write_file(
+            &format!("team-skills/{directory}/SKILL.md"),
+            "---\nname: duplicate\ndescription: A duplicated standalone skill name\n---\nBody\n",
+        );
+    }
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "duplicate",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run duplicate-name add");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate skill name `duplicate`"));
+    assert!(!project.path().join(".lpm/managed-skills").exists());
+}
+
+#[test]
+fn skills_doctor_reports_missing_canonical_content_as_unhealthy() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed managed skill");
+    assert!(add.status.success());
+    std::fs::remove_dir_all(project.path().join(".lpm/managed-skills/sources")).unwrap();
+
+    let envelope = json_command(&project, &["skills", "doctor"]);
+
+    assert_eq!(envelope["healthy"], serde_json::json!(false));
+    assert_eq!(
+        envelope["targets"][0]["status"],
+        serde_json::json!("canonical-missing")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_doctor_includes_broken_external_symlinks() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let root = project.path().join(".agents/skills");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink("missing-skill", root.join("broken")).unwrap();
+
+    let envelope = json_command(&project, &["skills", "doctor"]);
+
+    assert_eq!(envelope["healthy"], serde_json::json!(false));
+    assert_eq!(
+        envelope["external_broken_links"][0]["name"],
+        serde_json::json!("broken")
+    );
+}
+
+#[test]
+fn skills_disable_and_enable_all_apply_to_every_managed_skill() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    for name in ["dependency-review", "release-notes"] {
+        seed_standard_skill(
+            &project,
+            "team-skills",
+            name,
+            "Follow the project-specific checklist for this task.",
+        );
+    }
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "*",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed managed skills");
+    assert!(add.status.success());
+
+    let disabled = json_command(&project, &["skills", "disable", "--all", "--yes"]);
+    assert_eq!(disabled["changes"].as_array().map(Vec::len), Some(2));
+    assert!(!project.path().join(".agents/skills/release-notes").exists());
+    assert!(
+        !project
+            .path()
+            .join(".agents/skills/dependency-review")
+            .exists()
+    );
+
+    let enabled = json_command(&project, &["skills", "enable", "--all", "--yes"]);
+    assert_eq!(enabled["changes"].as_array().map(Vec::len), Some(2));
+    assert!(project.file_exists(".agents/skills/release-notes/SKILL.md"));
+    assert!(project.file_exists(".agents/skills/dependency-review/SKILL.md"));
+}
+
+#[test]
+fn skills_remove_all_deletes_every_managed_record_and_target() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    for name in ["dependency-review", "release-notes"] {
+        seed_standard_skill(
+            &project,
+            "team-skills",
+            name,
+            "Follow the project-specific checklist for this task.",
+        );
+    }
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "*",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed managed skills");
+    assert!(add.status.success());
+
+    let envelope = json_command(&project, &["skills", "remove", "--all", "--yes"]);
+
+    assert_eq!(envelope["changes"].as_array().map(Vec::len), Some(4));
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+    assert_eq!(state["skills"], serde_json::json!({}));
+    assert!(!project.path().join(".agents/skills/release-notes").exists());
+    assert!(
+        !project
+            .path()
+            .join(".agents/skills/dependency-review")
+            .exists()
+    );
+}
+
+#[test]
+fn skills_update_reports_replacement_warning_as_a_new_finding() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Use eval(input) only in the documented test harness.",
+    );
+    let add = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to seed warning-level managed skill");
+    assert!(add.status.success());
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Read process.env.GITHUB_TOKEN only for an authenticated release.",
+    );
+
+    let envelope = json_command(
+        &project,
+        &["skills", "update", "release-notes", "--dry-run"],
+    );
+
+    assert_eq!(
+        envelope["updates"][0]["new_security_findings"][0]["rule_id"],
+        serde_json::json!("sensitive-environment-access")
+    );
+}
 
 #[test]
 fn skills_validate_accepts_a_well_formed_skill() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
-    // Validator gates: (a) YAML frontmatter required (content must
-    // start with `---`), (b) total content length >= 100 chars,
-    // (c) file size <= 15 KB. An earlier test seeded a 40-char body
-    // with no frontmatter and still passed because the validator
-    // unconditionally returned Ok — the fix to fail-closed exposed
-    // the fixture gap. Rebuild the skill with all three constraints
-    // satisfied so we exercise the canonical happy path.
     seed_skill(
         &project,
         "alice.tools",
@@ -865,8 +1522,6 @@ fn skills_validate_accepts_a_well_formed_skill() {
 fn skills_validate_rejects_skill_exceeding_size_limit() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
 
-    // Source enforces a 15KB max per skill file. Write 20KB so the limit
-    // fires deterministically.
     let oversized = "x".repeat(20 * 1024);
     seed_skill(&project, "alice.tools", "too-big", &oversized);
 
@@ -875,12 +1530,6 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
         .output()
         .expect("failed to run lpm skills validate");
 
-    // Contract: a non-empty error set must exit non-zero,
-    // so CI gates that run `lpm skills validate` fail closed. The
-    // exit code AND the surfaced message are both load-bearing —
-    // exit-only would let a future regression scrub the per-skill
-    // warning without notice, message-only is what the pre-fix test
-    // settled for and let the 0-exit regression sit for a tranche.
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -911,11 +1560,6 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
 fn skills_validate_json_reports_success_false_and_exits_non_zero_on_error() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
 
-    // 20KB skill file triggers the 15KB size-limit branch in
-    // `validate_skills`. The JSON envelope must (a) carry
-    // `success: false` so agents that parse stdout can branch on
-    // failure, (b) keep the per-skill `errors` list intact, and
-    // (c) exit non-zero so `$?`-style CI gates pick up the failure.
     let oversized = "x".repeat(20 * 1024);
     seed_skill(&project, "alice.tools", "too-big", &oversized);
 
@@ -981,7 +1625,14 @@ fn skills_validate_with_no_skills_dir_succeeds_quietly() {
     );
 }
 
-// ─── clean ────────────────────────────────────────────────────────────
+#[test]
+fn skills_validate_json_without_a_skills_directory_emits_a_success_envelope() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+
+    let envelope = json_command(&project, &["skills", "validate"]);
+
+    insta::assert_json_snapshot!("skills_validate_empty", envelope);
+}
 
 #[test]
 fn skills_clean_removes_skills_directory_and_reports_count() {
@@ -1041,6 +1692,15 @@ fn skills_clean_on_empty_project_is_idempotent() {
 }
 
 #[test]
+fn skills_clean_json_on_an_empty_project_emits_a_no_op_envelope() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+
+    let envelope = json_command(&project, &["skills", "clean"]);
+
+    insta::assert_json_snapshot!("skills_clean_empty", envelope);
+}
+
+#[test]
 fn skills_clean_human_removes_skills_directory_with_slim_completion() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     seed_skill(&project, "alice.tools", "a", "# a\n");
@@ -1067,8 +1727,6 @@ fn skills_clean_human_removes_skills_directory_with_slim_completion() {
         "skills clean must not use cliclack gutter output, got:\n{stderr}",
     );
 }
-
-// ─── unknown action ───────────────────────────────────────────────────
 
 #[test]
 fn skills_unknown_action_fails_with_helpful_message() {
