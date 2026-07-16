@@ -115,6 +115,9 @@ jobs:
       - name: npm wrapper pack check
         run: npm --prefix npm/cli run pack:check
 
+      - name: npm release artifact tests
+        run: node --test npm/release/tests/*.test.mjs
+
   musl:
     name: Linux musl x64
     runs-on: ubuntu-24.04
