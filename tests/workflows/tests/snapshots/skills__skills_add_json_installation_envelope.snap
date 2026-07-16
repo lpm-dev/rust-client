@@ -14,6 +14,7 @@ expression: json
       "description": "Finds and installs useful agent skills",
       "source": "[local skill source]",
       "source_kind": "local",
+      "ownership": "managed",
       "resolved_revision": null,
       "scope": "project",
       "enabled": true,

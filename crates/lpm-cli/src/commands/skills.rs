@@ -4,6 +4,7 @@ use crate::cli::{
 };
 use crate::install_ui;
 use crate::prompt::prompt_err;
+use crate::skills_inventory;
 use crate::skills_model::{
     AgentTarget, ManagedSkill, SkillBinding, SkillManifest, SkillScope, managed_root,
 };
@@ -551,7 +552,7 @@ fn copy_binding_tree(canonical: &Path, target: &Path, id: &str) -> Result<(), Lp
 }
 
 fn run_list(args: SkillsListArgs, project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let skills = load_scoped_skills(args.scope, project_dir)?;
+    let skills = load_skill_inventory(args.scope, project_dir)?;
     let skills: Vec<_> = skills
         .into_iter()
         .filter(|skill| {
@@ -572,12 +573,12 @@ fn run_list(args: SkillsListArgs, project_dir: &Path, json_output: bool) -> Resu
         return Ok(());
     }
     if skills.is_empty() {
-        install_ui::warn("No managed skills installed");
+        install_ui::warn("No skills discovered");
         return Ok(());
     }
     print_skill_rows(&skills);
     install_ui::done(&format!(
-        "{} {} installed",
+        "{} {} discovered",
         skills.len(),
         plural(skills.len(), "skill")
     ));
@@ -585,7 +586,7 @@ fn run_list(args: SkillsListArgs, project_dir: &Path, json_output: bool) -> Resu
 }
 
 fn run_view(args: SkillsViewArgs, project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let skills = load_scoped_skills(args.scope, project_dir)?;
+    let skills = load_skill_inventory(args.scope, project_dir)?;
     let skills: Vec<_> = skills
         .into_iter()
         .filter(|managed| {
@@ -602,10 +603,8 @@ fn run_view(args: SkillsViewArgs, project_dir: &Path, json_output: bool) -> Resu
             })
         })
         .collect();
-    if skills.is_empty() {
-        return Err(LpmError::Registry(
-            "no matching managed skills found".into(),
-        ));
+    if skills.is_empty() && args.skill.is_some() {
+        return Err(LpmError::Registry("no matching skills found".into()));
     }
     if json_output {
         print_json(serde_json::json!({
@@ -613,6 +612,10 @@ fn run_view(args: SkillsViewArgs, project_dir: &Path, json_output: bool) -> Resu
             "skills": skills.iter().map(|skill| skill_view_json(skill, project_dir)).collect::<Vec<_>>(),
             "count": skills.len(),
         }));
+        return Ok(());
+    }
+    if skills.is_empty() {
+        install_ui::warn("No skills discovered");
         return Ok(());
     }
     for (index, skill) in skills.iter().enumerate() {
@@ -1109,6 +1112,20 @@ fn load_scoped_skills(
     Ok(skills)
 }
 
+fn load_skill_inventory(
+    args: SkillsScopeArgs,
+    project_dir: &Path,
+) -> Result<Vec<ManagedSkill>, LpmError> {
+    let scopes: &[SkillScope] = if args.project {
+        &[SkillScope::Project]
+    } else if args.global {
+        &[SkillScope::Global]
+    } else {
+        &[SkillScope::Project, SkillScope::Global]
+    };
+    skills_inventory::load(scopes, project_dir)
+}
+
 fn parse_agents(agents: &[String]) -> Result<Vec<AgentTarget>, LpmError> {
     let parsed: Vec<_> = agents
         .iter()
@@ -1251,9 +1268,10 @@ fn print_skill_rows(skills: &[ManagedSkill]) {
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!(
-            "  {:<width$}  {}  {}",
+            "  {:<width$}  {}  {}  {}",
             skill.name,
             install_ui::cyan(skill.scope.as_str()),
+            skill_ownership(skill).dimmed(),
             bindings.dimmed()
         );
     }
@@ -1276,17 +1294,19 @@ fn print_skill_view(skill: &ManagedSkill, project_dir: &Path) -> Result<(), LpmE
         install_ui::cyan(skill.scope.as_str())
     );
     eprintln!(
+        "  {}    {}",
+        "ownership".dimmed(),
+        skill_ownership(skill).dimmed()
+    );
+    eprintln!(
         "  {}       ~{} tokens · {}",
         "context".dimmed(),
         skill.estimated_tokens,
         lpm_common::format_bytes(skill.size_bytes).dimmed()
     );
     for binding in &skill.bindings {
-        let target = binding
-            .agent
-            .skill_root(skill.scope, project_dir)?
-            .join(&skill.id);
-        let visible = binding.enabled && target.symlink_metadata().is_ok();
+        let visible = binding.enabled
+            && agent_visible_path(binding.agent, skill.scope, project_dir, &skill.id)?.is_some();
         eprintln!(
             "  {}       {} {}  {}",
             "agent".dimmed(),
@@ -1309,6 +1329,7 @@ fn skill_json(skill: &ManagedSkill) -> serde_json::Value {
         "description": skill.description,
         "source": skill.source,
         "source_kind": skill.source_kind,
+        "ownership": skill_ownership(skill),
         "resolved_revision": skill.resolved_revision,
         "scope": skill.scope.as_str(),
         "enabled": skill.bindings.iter().any(|binding| binding.enabled),
@@ -1328,18 +1349,41 @@ fn skill_view_json(skill: &ManagedSkill, project_dir: &Path) -> serde_json::Valu
         .bindings
         .iter()
         .map(|binding| {
-            let path = binding.agent.skill_root(skill.scope, project_dir).map(|root| root.join(&skill.id));
+            let path = agent_visible_path(binding.agent, skill.scope, project_dir, &skill.id);
             serde_json::json!({
                 "name": binding.agent.as_str(),
                 "enabled": binding.enabled,
-                "visible": path.as_ref().is_ok_and(|path| !binding.enabled || path.symlink_metadata().is_ok()),
-                "path": path.map(|path| path.display().to_string()).unwrap_or_default(),
+                "visible": binding.enabled && path.as_ref().is_ok_and(Option::is_some),
+                "path": path.ok().flatten().map(|path| path.display().to_string()).unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();
     value["agents"] = serde_json::Value::Array(bindings);
     value["digest"] = serde_json::Value::String(skill.digest.clone());
     value
+}
+
+fn skill_ownership(skill: &ManagedSkill) -> &'static str {
+    match skill.source_kind.as_str() {
+        "external" => "external",
+        "package" => "package",
+        _ => "managed",
+    }
+}
+
+fn agent_visible_path(
+    agent: AgentTarget,
+    scope: SkillScope,
+    project_dir: &Path,
+    id: &str,
+) -> Result<Option<PathBuf>, LpmError> {
+    for root in agent.inventory_roots(scope, project_dir)? {
+        let path = root.join(id);
+        if path.symlink_metadata().is_ok() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 fn managed_id(name: &str, digest: &str) -> String {

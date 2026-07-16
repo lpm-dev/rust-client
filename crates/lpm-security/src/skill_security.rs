@@ -166,7 +166,8 @@ pub fn parse_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>
 
     // Simple YAML parsing (key: value, with list support for globs)
     let mut in_globs = false;
-    for line in yaml_section.lines() {
+    let mut lines = yaml_section.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -188,6 +189,26 @@ pub fn parse_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>
 
             match (key, value) {
                 ("name", value) => meta.name = Some(value.to_string()),
+                ("description", ">" | "|") => {
+                    let separator = if value == ">" { " " } else { "\n" };
+                    let mut description = String::new();
+                    while let Some(next) = lines.peek() {
+                        if !next.chars().next().is_some_and(char::is_whitespace) {
+                            break;
+                        }
+                        let Some(line) = lines.next() else {
+                            break;
+                        };
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            if !description.is_empty() {
+                                description.push_str(separator);
+                            }
+                            description.push_str(line);
+                        }
+                    }
+                    meta.description = Some(description);
+                }
                 ("description", value) => meta.description = Some(value.to_string()),
                 ("version", value) => meta.version = Some(value.to_string()),
                 ("globs", "") => in_globs = true,
@@ -467,6 +488,18 @@ console.log(x);
         assert_eq!(meta.version.as_deref(), Some("1.0.0"));
         assert_eq!(meta.globs, vec!["**/*.ts", "**/*.js"]);
         assert!(body.starts_with("# Body content"));
+    }
+
+    #[test]
+    fn folded_description_frontmatter_is_preserved() {
+        let content = "---\nname: rust-best-practices\ndescription: >\n  Guide for writing idiomatic Rust code\n  with practical error-handling patterns.\n---\n# Body";
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert!(errors.is_empty(), "frontmatter errors: {errors:?}");
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Guide for writing idiomatic Rust code with practical error-handling patterns.")
+        );
     }
 
     #[test]
