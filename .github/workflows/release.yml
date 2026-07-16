@@ -85,6 +85,9 @@ jobs:
           echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
           npx --yes "verdaccio@$VERDACCIO_VERSION" --version
 
+      - name: npm release artifact tests
+        run: node --test npm/release/tests/*.test.mjs
+
       - name: Build workspace
         run: cargo build --workspace --locked
 
@@ -94,9 +97,58 @@ jobs:
       - name: Audit-scale workflow fixtures
         run: cargo nextest run --locked -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
+  verify-windows-filesystem:
+    name: Windows filesystem release gate
+    if: github.event_name == 'push' || inputs.mode == 'full'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-filesystem-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-filesystem-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install nextest
+        uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
+
+      - name: Install Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
+      - name: Build Windows CLI
+        run: cargo build --locked -p lpm-cli
+
+      - name: Windows filesystem crate tests
+        run: cargo nextest run --locked -p lpm-common -p lpm-extractor -p lpm-linker -p lpm-store -p lpm-global -p lpm-sandbox --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Windows install and bin-shim workflows
+        run: >-
+          cargo nextest run --locked -p lpm-workflows
+          -E 'test(install_single_package_via_mock_registry) |
+          test(install_creates_bin_symlink_for_binary_package) |
+          test(install_v2_bin_shim_resolves_project_context_from_transitive_runtime) |
+          test(uninstall_then_reinstall_same_packages_reports_only_readded_direct_deps) |
+          test(uninstall_scoped_package_removes_owned_bin_shim)'
+          --no-fail-fast --status-level slow --final-status-level fail
+
   build:
     name: Build ${{ matrix.target }}
-    needs: verify
+    needs:
+      - verify
+      - verify-windows-filesystem
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     environment: windows-signing
@@ -105,10 +157,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             binary: lpm-darwin-x64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             binary: lpm-darwin-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -117,7 +169,7 @@ jobs:
             os: ubuntu-24.04
             binary: lpm-linux-x64-musl
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             binary: lpm-linux-arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -148,7 +200,7 @@ jobs:
           echo 'CC_x86_64_unknown_linux_musl=musl-gcc' >> "$GITHUB_ENV"
 
       - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.arch != 'ARM64'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -177,6 +229,8 @@ jobs:
 
       - name: Verify musl binary on Alpine
         if: matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           file "${{ matrix.binary }}"
@@ -190,10 +244,12 @@ jobs:
             readelf -d "${{ matrix.binary }}"
             exit 1
           fi
-          docker run --rm \
+          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          actual=$(docker run --rm \
             -v "$PWD:/work:ro" \
             alpine@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 \
-            /work/${{ matrix.binary }} --version
+            /work/${{ matrix.binary }} --version)
+          test "$actual" = "lpm $VERSION"
 
       - name: Import Developer ID certificate (macOS)
         if: runner.os == 'macOS'
@@ -289,14 +345,8 @@ jobs:
           cp target/${{ matrix.target }}/release/lpm-rs.exe ${{ matrix.binary }}
           cp target/${{ matrix.target }}/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
 
-      - name: Report Windows signing disabled
-        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED != 'true'
-        shell: pwsh
-        run: |
-          Write-Warning "Windows signing is disabled because WINDOWS_SIGNING_ENABLED is not true. This release will publish unsigned Windows binaries. Enable it only after the Windows signing smoke workflow passes."
-
       - name: Validate Windows signing configuration
-        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_SIGNING_AZURE_CLIENT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
@@ -326,7 +376,7 @@ jobs:
           }
 
       - name: Azure login (Windows signing)
-        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        if: runner.os == 'Windows'
         uses: azure/login@2dd0bbf4064d5a1812889dc200bb8eed2597f82a # v3
         with:
           client-id: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
@@ -334,7 +384,7 @@ jobs:
           subscription-id: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign binaries (Windows)
-        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        if: runner.os == 'Windows'
         uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30 # v2
         with:
           endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
@@ -350,7 +400,7 @@ jobs:
           description-url: https://github.com/lpm-dev/rust-client
 
       - name: Verify signatures (Windows)
-        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           foreach ($file in @(".\${{ matrix.binary }}", ".\lpm-sandbox-helper-win32-x64.exe")) {
@@ -366,6 +416,56 @@ jobs:
               Write-Error "Authenticode signature for $file does not include a timestamp."
               exit 1
             }
+          }
+
+      - name: Execute release binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              actual=$(arch -arm64 "./${{ matrix.binary }}" --version)
+              ;;
+            x86_64-apple-darwin)
+              actual=$(arch -x86_64 "./${{ matrix.binary }}" --version)
+              ;;
+            *)
+              echo "::error::Unexpected macOS target ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+          test "$actual" = "lpm $VERSION"
+          arch_name=$(file "./${{ matrix.binary }}")
+          echo "$arch_name"
+
+      - name: Execute release binary (Linux glibc)
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          actual=$("./${{ matrix.binary }}" --version)
+          test "$actual" = "lpm $VERSION"
+
+      - name: Execute release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ([string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
+            $env:GITHUB_REF_NAME.TrimStart("v")
+          } else {
+            $env:INPUT_VERSION
+          }
+          $actual = (& ".\${{ matrix.binary }}" --version | Out-String).Trim()
+          if ($actual -ne "lpm $version") {
+            Write-Error "Release binary reported '$actual', expected 'lpm $version'."
+            exit 1
           }
 
       - name: Upload artifact
@@ -388,9 +488,127 @@ jobs:
             security delete-keychain "$APPLE_SIGNING_KEYCHAIN" || true
           fi
 
+  pack-npm-packages:
+    name: Pack exact npm release artifacts
+    needs: build
+    if: github.event_name == 'push' || inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
+      - name: Download signed release binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: lpm-*
+          merge-multiple: true
+          path: binaries
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pack and hash release packages
+        run: |
+          node npm/release/prepare-packages.mjs \
+            --repo "$PWD" \
+            --binaries "$PWD/binaries" \
+            --output "$PWD/npm-release-packages" \
+            --version "${{ steps.version.outputs.version }}"
+
+      - name: Upload exact npm tarballs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: npm-release-packages
+          path: npm-release-packages/
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke-npm-packages:
+    name: Smoke npm artifacts (${{ matrix.platform }})
+    needs: pack-npm-packages
+    if: github.event_name == 'push' || inputs.mode == 'full'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-15
+            node_arch: arm64
+          - platform: darwin-x64
+            os: macos-15-intel
+            node_arch: x64
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            node_arch: arm64
+          - platform: linux-x64
+            os: ubuntu-latest
+            node_arch: x64
+          - platform: linux-x64-musl
+            os: ubuntu-latest
+            alpine: true
+          - platform: win32-x64
+            os: windows-latest
+            node_arch: x64
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download exact npm tarballs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-release-packages
+          path: npm-release-packages
+
+      - name: Install Node 22
+        if: matrix.alpine != true
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          architecture: ${{ matrix.node_arch }}
+
+      - name: Pin npm used by release consumers
+        if: matrix.alpine != true
+        run: npm install --global npm@11.12.1 --no-audit --no-fund
+
+      - name: Install and execute exact npm tarballs
+        if: matrix.alpine != true
+        run: >-
+          node npm/release/smoke-install.mjs
+          --tarballs npm-release-packages
+          --platform ${{ matrix.platform }}
+          --version ${{ needs.pack-npm-packages.outputs.version }}
+
+      - name: Install and execute exact npm tarballs on Alpine
+        if: matrix.alpine == true
+        run: |
+          docker run --rm --network none \
+            -v "$PWD:/work:ro" \
+            -w /work \
+            node:22-alpine@sha256:b74031e546d7f4faf561d797ac1b76beccac856a042815ca77dbb060bf5eb2e6 \
+            node npm/release/smoke-install.mjs \
+              --tarballs npm-release-packages \
+              --platform ${{ matrix.platform }} \
+              --version ${{ needs.pack-npm-packages.outputs.version }}
+
   release:
     name: Create Release
-    needs: build
+    needs:
+      - build
+      - smoke-npm-packages
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -400,36 +618,16 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Download all artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Download signed release binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: lpm-*
+          merge-multiple: true
+          path: binaries
+
+      - name: List release binaries
         run: |
           set -euo pipefail
-          rm -rf artifact-downloads binaries
-          mkdir -p artifact-downloads binaries
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifact-downloads
-
-          count=0
-          for artifact_file in artifact-downloads/*/*; do
-            if [ ! -f "$artifact_file" ]; then
-              continue
-            fi
-
-            filename="$(basename "$artifact_file")"
-            if [ -e "binaries/$filename" ]; then
-              echo "::error::Duplicate release artifact filename: $filename"
-              exit 1
-            fi
-
-            cp "$artifact_file" "binaries/$filename"
-            count=$((count + 1))
-          done
-
-          if [ "$count" -eq 0 ]; then
-            echo "::error::No release artifacts were downloaded."
-            exit 1
-          fi
-
           find binaries -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Generate SHA256SUMS.txt
@@ -491,37 +689,11 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Download all artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          rm -rf artifact-downloads binaries
-          mkdir -p artifact-downloads binaries
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifact-downloads
-
-          count=0
-          for artifact_file in artifact-downloads/*/*; do
-            if [ ! -f "$artifact_file" ]; then
-              continue
-            fi
-
-            filename="$(basename "$artifact_file")"
-            if [ -e "binaries/$filename" ]; then
-              echo "::error::Duplicate release artifact filename: $filename"
-              exit 1
-            fi
-
-            cp "$artifact_file" "binaries/$filename"
-            count=$((count + 1))
-          done
-
-          if [ "$count" -eq 0 ]; then
-            echo "::error::No release artifacts were downloaded."
-            exit 1
-          fi
-
-          find binaries -maxdepth 1 -type f -printf '%f\n' | sort
+      - name: Download verified npm tarballs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-release-packages
+          path: npm-release-packages
 
       - name: Bootstrap npm 11 (required for trusted publishers OIDC)
         run: |
@@ -541,14 +713,27 @@ jobs:
           done
 
       - name: Publish platform packages via trusted publishers (OIDC, tokenless)
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          set -euo pipefail
+          MANIFEST=npm-release-packages/release-packages.json
+          VERSION=$(jq -r '.version' "$MANIFEST")
 
           publish_pkg() {
-            npx npm@11.12.1 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
+            local package="$1"
+            local tarball
+            tarball=$(jq -r --arg package "$package" \
+              '.packages[] | select(.name == $package) | .tarball' "$MANIFEST")
+            if [ -z "$tarball" ] || [ "$tarball" = "null" ]; then
+              echo "::error::Verified release manifest does not contain $package"
+              exit 1
+            fi
+
+            echo "Publishing ${package}@${VERSION} from verified tarball ${tarball}..."
+            set +e
+            npx npm@11.12.1 publish "npm-release-packages/$tarball" \
+              --provenance --access public 2>&1 | tee /tmp/npm-publish.log
             local exit_code=${PIPESTATUS[0]}
+            set -e
             if [ "$exit_code" -ne 0 ]; then
               if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
                 echo "Already published — skipping"
@@ -558,46 +743,31 @@ jobs:
             fi
           }
 
-          publish_unix_platform() {
-            local platform="$1"
-            echo "Publishing @lpm-registry/cli-${platform}@${VERSION}..."
-            (
-              cd "npm/cli-${platform}"
-              cp "../../binaries/lpm-${platform}" ./lpm
-              cp ./lpm ./lpx
-              chmod +x ./lpm ./lpx
-              npm version "$VERSION" --no-git-tag-version --allow-same-version
-              publish_pkg
-            )
-          }
-
           # The musl package is new and its trusted-publisher binding cannot be
           # queried through npm's public API. Publish it first so an absent or
           # incorrect OIDC binding fails before any established package changes.
-          publish_unix_platform linux-x64-musl
+          publish_pkg @lpm-registry/cli-linux-x64-musl
 
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            publish_unix_platform "$platform"
+            publish_pkg "@lpm-registry/cli-${platform}"
           done
-
-          # Windows uses different binary names and ships the AppContainer helper.
-          echo "Publishing @lpm-registry/cli-win32-x64@${VERSION}..."
-          cd npm/cli-win32-x64
-          cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
-          cp ./lpm.exe ./lpx.exe
-          cp ../../binaries/lpm-sandbox-helper-win32-x64.exe ./lpm-sandbox-helper.exe
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          publish_pkg
+          publish_pkg @lpm-registry/cli-win32-x64
 
   publish-npm-wrapper:
     name: Publish @lpm-registry/cli wrapper
-    needs: publish-npm-platform
-    if: always() && (needs.publish-npm-platform.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'))
+    needs:
+      - pack-npm-packages
+      - publish-npm-platform
+    if: >-
+      always() &&
+      ((needs.pack-npm-packages.result == 'success' && needs.publish-npm-platform.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
+      actions: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -612,66 +782,56 @@ jobs:
           echo "Runner npm: $(npm --version)"
           echo "npx npm@11: $(npx npm@11.12.1 --version)"
 
-      - name: Bump version and optionalDependencies, then publish
-        working-directory: npm/cli
+      - name: Download verified full-release tarballs
+        if: inputs.mode != 'wrapper-only'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-release-packages
+          path: npm-release-packages
+
+      - name: Pack wrapper-only recovery artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
-          case "$VERSION" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *)
-              echo "::error::release version must look like 0.59.0, got '${VERSION}'"
-              exit 1
-              ;;
-          esac
+          node npm/release/prepare-packages.mjs \
+            --repo "$PWD" \
+            --output "$PWD/npm-release-packages" \
+            --version "$INPUT_VERSION" \
+            --wrapper-only
 
-          # Update wrapper version
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+      - name: Smoke wrapper-only recovery artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'
+        run: |
+          set -euo pipefail
+          MANIFEST=npm-release-packages/release-packages.json
+          VERSION=$(jq -r '.version' "$MANIFEST")
+          TARBALL=$(jq -r '.packages[] | select(.name == "@lpm-registry/cli") | .tarball' "$MANIFEST")
+          PREFIX=$(mktemp -d)
+          trap 'rm -rf "$PREFIX"' EXIT
+          cd "$PREFIX"
+          npm install --prefix "$PREFIX" --ignore-scripts=false --no-audit --no-fund \
+            --no-package-lock --no-save "$GITHUB_WORKSPACE/npm-release-packages/$TARBALL"
+          actual=$("$PREFIX/node_modules/.bin/lpm" --version)
+          test "$actual" = "lpm $VERSION"
+          "$PREFIX/node_modules/.bin/lpx" --help >/dev/null
 
-          # Update platform optionalDependencies to the same tag. The
-          # wrapper intentionally carries no runtime dependencies; npm's
-          # optional platform packages plus the tiny postinstall verifier
-          # are the distribution mechanism.
-          node --input-type=module -e "
-            import fs from 'node:fs';
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            const platforms = [
-              '@lpm-registry/cli-darwin-arm64',
-              '@lpm-registry/cli-darwin-x64',
-              '@lpm-registry/cli-linux-arm64',
-              '@lpm-registry/cli-linux-x64',
-              '@lpm-registry/cli-linux-x64-musl',
-              '@lpm-registry/cli-win32-x64'
-            ];
-            pkg.optionalDependencies = Object.fromEntries(platforms.map(p => [p, '$VERSION']));
-            if (pkg.dependencies) {
-              throw new Error('@lpm-registry/cli wrapper must not publish runtime dependencies');
-            }
-            if (pkg.scripts?.preinstall || pkg.scripts?.install) {
-              throw new Error('@lpm-registry/cli wrapper must not publish preinstall/install lifecycle scripts');
-            }
-            if (pkg.scripts?.postinstall !== 'node scripts/install-binary.js') {
-              throw new Error('@lpm-registry/cli wrapper must publish the native binary postinstall verifier');
-            }
-            for (const p of platforms) {
-              if (pkg.optionalDependencies[p] !== '$VERSION') {
-                throw new Error('optional dependency version mismatch for ' + p);
-              }
-            }
-            pkg.repository = {
-              type: 'git',
-              url: 'https://github.com/lpm-dev/rust-client'
-            };
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-
-          npm test
-          npm run pack:check
-
-          echo "Publishing @lpm-registry/cli@${VERSION}..."
-          npx npm@11.12.1 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
+      - name: Publish exact verified wrapper tarball
+        run: |
+          set -euo pipefail
+          MANIFEST=npm-release-packages/release-packages.json
+          VERSION=$(jq -r '.version' "$MANIFEST")
+          TARBALL=$(jq -r '.packages[] | select(.name == "@lpm-registry/cli") | .tarball' "$MANIFEST")
+          if [ -z "$TARBALL" ] || [ "$TARBALL" = "null" ]; then
+            echo "::error::Verified release manifest does not contain @lpm-registry/cli"
+            exit 1
+          fi
+          echo "Publishing @lpm-registry/cli@${VERSION} from verified tarball ${TARBALL}..."
+          set +e
+          npx npm@11.12.1 publish "npm-release-packages/$TARBALL" \
+            --provenance --access public 2>&1 | tee /tmp/npm-publish.log
           exit_code=${PIPESTATUS[0]}
+          set -e
           if [ "$exit_code" -ne 0 ]; then
             if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
               echo "Already published — skipping"
@@ -680,12 +840,17 @@ jobs:
             fi
           fi
 
+      - name: Verify published wrapper from npm
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
           install_verified=0
           for attempt in 1 2 3 4 5; do
             PREFIX=$(mktemp -d)
-            if npm install -g --prefix "$PREFIX" "@lpm-registry/cli@${VERSION}" &&
+            if npx npm@11.12.1 install -g --prefix "$PREFIX" --no-audit --no-fund \
+                 "@lpm-registry/cli@${VERSION}" &&
                INSTALLED_VERSION=$("$PREFIX/bin/lpm" --version 2>/tmp/lpm-wrapper-smoke.log) &&
-               echo "$INSTALLED_VERSION" | grep -q "$VERSION" &&
+               test "$INSTALLED_VERSION" = "lpm $VERSION" &&
                "$PREFIX/bin/lpx" --help >/dev/null 2>>/tmp/lpm-wrapper-smoke.log; then
               install_verified=1
               break
