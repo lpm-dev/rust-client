@@ -153,6 +153,28 @@ impl MockRegistry {
         self
     }
 
+    /// Mount `GET /api/registry/skills` for package-published skill content.
+    pub async fn with_package_skills(
+        &self,
+        name: &str,
+        version: &str,
+        skills: Vec<serde_json::Value>,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "version": version,
+                "skillsCount": skills.len(),
+                "skills": skills,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount `POST /api/registry/-/token/create` for `lpm setup local`.
     pub async fn with_npmrc_token_create(
         &self,

@@ -729,7 +729,7 @@ pub(crate) struct SkillsArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum SkillsCommand {
-    /// Discover, scan, and install skills from a source.
+    /// Discover, scan, and add skills from a source.
     Add(SkillsAddArgs),
     /// List installed skills.
     #[command(visible_alias = "ls")]
@@ -739,6 +739,8 @@ pub(crate) enum SkillsCommand {
     /// Remove managed skills.
     #[command(visible_alias = "rm")]
     Remove(SkillsRemoveArgs),
+    /// Remove package-published skills from .lpm/skills.
+    Clean,
     /// Enable one or more managed skills for agent targets.
     Enable(SkillsToggleArgs),
     /// Disable one or more managed skills for agent targets.

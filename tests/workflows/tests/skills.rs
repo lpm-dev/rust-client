@@ -2,7 +2,8 @@ mod support;
 
 use sha2::{Digest, Sha256};
 use support::assertions::parse_json_output;
-use support::{TempProject, lpm};
+use support::mock_registry::MockRegistry;
+use support::{TempProject, lpm, lpm_with_registry};
 
 const VALID_SKILL: &str = "---\nname: find-skills\ndescription: Finds and installs useful agent skills\n---\n\nUse the approved skill catalogue to locate a capability that matches the task.\n";
 
@@ -86,7 +87,7 @@ fn skills_add_global_writes_only_the_isolated_home_skill_store() {
 }
 
 #[test]
-fn skills_list_combines_external_agent_and_legacy_package_skills() {
+fn skills_list_combines_external_agent_and_package_published_skills() {
     let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
     project.write_file(
         ".agents/skills/rust-best-practices/SKILL.md",
@@ -115,6 +116,139 @@ fn skills_list_combines_external_agent_and_legacy_package_skills() {
             && skill["ownership"] == "package"
             && skill["source"] == "@lpm.dev/owner.widget"
     }));
+}
+
+#[tokio::test]
+async fn skills_add_materializes_package_published_skills_in_package_directory() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package_skills(
+            "owner.widget",
+            "1.2.3",
+            vec![serde_json::json!({
+                "name": "build",
+                "rawContent": "---\nname: build\ndescription: Build the widget\n---\n\nUse this package to build a widget."
+            })],
+        )
+        .await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["--json", "skills", "add", "@lpm.dev/owner.widget"])
+        .output()
+        .expect("add package-published skills");
+
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["action"], "add");
+    assert_eq!(json["package"], "@lpm.dev/owner.widget");
+    assert_eq!(json["installed"], 1);
+    assert!(project.file_exists(".lpm/skills/owner.widget/build.md"));
+}
+
+#[tokio::test]
+async fn skills_add_rejects_unsafe_package_skill_name_before_writing() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package_skills(
+            "owner.widget",
+            "1.2.3",
+            vec![serde_json::json!({
+                "name": "../escape",
+                "rawContent": "unsafe"
+            })],
+        )
+        .await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["skills", "add", "@lpm.dev/owner.widget"])
+        .output()
+        .expect("reject unsafe package skill name during add");
+
+    assert!(!output.status.success());
+    assert!(!project.path().join(".lpm/skills").exists());
+}
+
+#[test]
+fn skills_validate_without_path_checks_package_published_skills() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    project.write_file(
+        ".lpm/skills/owner.widget/build.md",
+        &format!(
+            "---\nname: build\ndescription: Build the widget\n---\n\n{}",
+            "Use the package-published build workflow. ".repeat(3)
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "skills", "validate"])
+        .output()
+        .expect("validate package-published skills");
+
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["valid"], 1);
+}
+
+#[test]
+fn skills_clean_removes_package_published_skills_without_touching_managed_agent_content() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    project.write_file(".lpm/skills/owner.widget/build.md", "package skill");
+    project.write_file(".lpm/agent-skills/find-skills/SKILL.md", VALID_SKILL);
+
+    let output = lpm(&project)
+        .args(["skills", "clean"])
+        .output()
+        .expect("clean package-published skills");
+
+    assert!(output.status.success());
+    assert!(!project.path().join(".lpm/skills").exists());
+    assert!(project.file_exists(".lpm/agent-skills/find-skills/SKILL.md"));
+}
+
+#[test]
+fn skills_remove_refuses_package_published_skill_and_points_to_package_lifecycle() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    project.write_file(".lpm/skills/owner.widget/build.md", "package skill");
+
+    let output = lpm(&project)
+        .args(["skills", "remove", "build", "--yes"])
+        .output()
+        .expect("remove package-published skill");
+
+    assert!(!output.status.success());
+    assert!(project.file_exists(".lpm/skills/owner.widget/build.md"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("package-published"));
+    assert!(stderr.contains("lpm remove @lpm.dev/owner.widget"));
+}
+
+#[test]
+fn skills_add_package_source_rejects_agent_target_flags() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "@lpm.dev/owner.widget",
+            "--skill",
+            "build",
+            "--agent",
+            "codex",
+            "--yes",
+        ])
+        .output()
+        .expect("reject agent target for package-published skill add");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("package-published skills always belong to the installed package"),
+        "unexpected package source error:\n{stderr}"
+    );
 }
 
 #[test]

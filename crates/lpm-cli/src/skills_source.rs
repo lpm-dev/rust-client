@@ -1,5 +1,4 @@
-use lpm_common::{LpmError, PackageName, is_safe_skill_name};
-use lpm_registry::RegistryClient;
+use lpm_common::LpmError;
 use lpm_security::skill_security::{parse_skill_frontmatter, scan_skill_content};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -36,13 +35,7 @@ pub(crate) struct SkillAudit {
     pub(crate) findings: Vec<String>,
 }
 
-pub(crate) async fn resolve_source(
-    source: &str,
-    client: &RegistryClient,
-) -> Result<ResolvedSource, LpmError> {
-    if source.starts_with("@lpm.dev/") {
-        return resolve_registry_source(source, client).await;
-    }
+pub(crate) async fn resolve_source(source: &str) -> Result<ResolvedSource, LpmError> {
     if let Some(spec) = GithubSpec::parse(source) {
         return resolve_github_source(source, spec).await;
     }
@@ -64,60 +57,6 @@ pub(crate) async fn resolve_source(
         root,
         _temporary: None,
     })
-}
-
-async fn resolve_registry_source(
-    source: &str,
-    client: &RegistryClient,
-) -> Result<ResolvedSource, LpmError> {
-    let package = PackageName::parse(source)?;
-    let response = client.get_skills(&package.short(), None).await?;
-    if response.skills.is_empty() {
-        return Err(LpmError::Registry(format!(
-            "package `{source}` has no skills"
-        )));
-    }
-
-    let temporary = tempfile::tempdir().map_err(LpmError::Io)?;
-    for skill in response.skills {
-        if !is_safe_skill_name(&skill.name) {
-            return Err(LpmError::Registry(format!(
-                "package `{source}` returned an unsafe skill name `{}`",
-                skill.name
-            )));
-        }
-        let content = skill
-            .raw_content
-            .as_deref()
-            .or(skill.content.as_deref())
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "package `{source}` returned empty content for skill `{}`",
-                    skill.name
-                ))
-            })?;
-        let destination = temporary.path().join(&skill.name);
-        std::fs::create_dir_all(&destination).map_err(LpmError::Io)?;
-        let normalized =
-            normalize_registry_skill(&skill.name, skill.description.as_deref(), content);
-        std::fs::write(destination.join("SKILL.md"), normalized).map_err(LpmError::Io)?;
-    }
-
-    Ok(ResolvedSource {
-        source: source.to_string(),
-        source_kind: "lpm_registry",
-        resolved_revision: response.version,
-        root: temporary.path().to_path_buf(),
-        _temporary: Some(temporary),
-    })
-}
-
-fn normalize_registry_skill(name: &str, description: Option<&str>, content: &str) -> String {
-    if content.starts_with("---") {
-        return content.to_string();
-    }
-    let description = description.unwrap_or("LPM Registry skill");
-    format!("---\nname: {name}\ndescription: {description}\n---\n\n{content}")
 }
 
 #[derive(Debug, Clone)]

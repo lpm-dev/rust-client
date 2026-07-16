@@ -11,8 +11,8 @@ use crate::skills_model::{
 use crate::skills_source::{
     DiscoveredSkill, SkillAudit, audit_skill, copy_skill_tree, discover_skills, resolve_source,
 };
-use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_common::{LpmError, PackageName, is_safe_skill_name};
 use lpm_registry::RegistryClient;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -30,9 +30,10 @@ pub async fn run(
         SkillsCommand::List(args) => run_list(args, project_dir, json_output),
         SkillsCommand::View(args) => run_view(args, project_dir, json_output),
         SkillsCommand::Remove(args) => run_remove(args, project_dir, json_output),
+        SkillsCommand::Clean => run_package_clean(project_dir, json_output),
         SkillsCommand::Enable(args) => run_toggle(args, true, project_dir, json_output),
         SkillsCommand::Disable(args) => run_toggle(args, false, project_dir, json_output),
-        SkillsCommand::Update(args) => run_update(client, args, project_dir, json_output).await,
+        SkillsCommand::Update(args) => run_update(args, project_dir, json_output).await,
         SkillsCommand::Doctor(args) => run_doctor(args, project_dir, json_output),
         SkillsCommand::Validate(args) => run_validate(args, project_dir, json_output),
     }
@@ -59,10 +60,13 @@ async fn run_add(
         }
     };
 
+    if source.starts_with("@lpm.dev/") {
+        return run_package_add(client, &source, &args, project_dir, json_output).await;
+    }
     if !json_output {
         install_ui::phase(&format!("Resolving {}", install_ui::cyan(&source)));
     }
-    let resolved = resolve_source(&source, client).await?;
+    let resolved = resolve_source(&source).await?;
     let discovered = discover_skills(&resolved.root)?;
     if discovered.is_empty() {
         return Err(LpmError::Registry(format!(
@@ -181,6 +185,225 @@ async fn run_add(
                 "skills"
             },
             install_ui::status_ok(&install_ui::format_duration(started.elapsed()))
+        ));
+    }
+    Ok(())
+}
+
+async fn run_package_add(
+    client: &RegistryClient,
+    source: &str,
+    args: &SkillsAddArgs,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if args.global || args.project || !args.agents.is_empty() || args.all_agents || args.copy {
+        return Err(LpmError::Registry(
+            "package-published skills always belong to the installed package in `.lpm/skills`; agent targets and skill scope apply only to standalone sources".into(),
+        ));
+    }
+    if args.all && !args.skills.is_empty() {
+        return Err(LpmError::Registry(
+            "`--all` cannot be combined with `--skill`".into(),
+        ));
+    }
+    let package = PackageName::parse(source)?;
+    if !json_output {
+        install_ui::phase(&format!(
+            "Fetching package skills for {}",
+            install_ui::cyan(&package.scoped())
+        ));
+    }
+    let response = client.get_skills(&package.short(), None).await?;
+    if response.skills.is_empty() {
+        if json_output {
+            print_json(serde_json::json!({
+                "success": true,
+                "action": "add",
+                "package": package.scoped(),
+                "installed": 0,
+            }));
+        } else {
+            install_ui::warn("Package has no published skills");
+        }
+        return Ok(());
+    }
+
+    let selected = select_package_skills(&response.skills, &args.skills)?;
+    if args.list {
+        print_package_discovered(source, &selected, json_output);
+        return Ok(());
+    }
+
+    let mut files = Vec::with_capacity(selected.len());
+    for skill in selected {
+        if !is_safe_skill_name(&skill.name) {
+            return Err(LpmError::Registry(format!(
+                "package `{}` returned an unsafe skill name `{}`",
+                package.scoped(),
+                skill.name
+            )));
+        }
+        let content = skill
+            .raw_content
+            .as_deref()
+            .or(skill.content.as_deref())
+            .filter(|content| !content.is_empty())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "package `{}` returned empty content for skill `{}`",
+                    package.scoped(),
+                    skill.name
+                ))
+            })?;
+        files.push((skill.name.as_str(), content));
+    }
+
+    let root = project_dir.join(".lpm").join("skills");
+    std::fs::create_dir_all(&root).map_err(LpmError::Io)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".lpm-skills-stage-")
+        .tempdir_in(&root)
+        .map_err(LpmError::Io)?;
+    for (name, content) in &files {
+        std::fs::write(staged.path().join(format!("{name}.md")), content).map_err(LpmError::Io)?;
+    }
+
+    let destination = root.join(package.short());
+    let backup = tempfile::Builder::new()
+        .prefix(".lpm-skills-backup-")
+        .tempdir_in(&root)
+        .map_err(LpmError::Io)?;
+    let backup_path = backup.path().to_path_buf();
+    drop(backup);
+
+    let had_destination = destination.exists();
+    if had_destination {
+        std::fs::rename(&destination, &backup_path).map_err(LpmError::Io)?;
+    }
+    if let Err(error) = std::fs::rename(staged.path(), &destination) {
+        if had_destination {
+            let _ = std::fs::rename(&backup_path, &destination);
+        }
+        return Err(LpmError::Io(error));
+    }
+    if had_destination {
+        std::fs::remove_dir_all(&backup_path).map_err(LpmError::Io)?;
+    }
+    crate::commands::install::ensure_skills_gitignore(project_dir);
+
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "action": "add",
+            "package": package.scoped(),
+            "installed": files.len(),
+            "directory": destination,
+        }));
+    } else {
+        install_ui::done(&format!(
+            "Added {} package-published {}",
+            files.len(),
+            plural(files.len(), "skill")
+        ));
+        eprintln!("  {}", install_ui::cyan(&destination.display().to_string()));
+    }
+    Ok(())
+}
+
+fn select_package_skills<'a>(
+    skills: &'a [lpm_registry::Skill],
+    requested: &[String],
+) -> Result<Vec<&'a lpm_registry::Skill>, LpmError> {
+    if requested.is_empty() {
+        return Ok(skills.iter().collect());
+    }
+    let mut selected: Vec<&lpm_registry::Skill> = Vec::with_capacity(requested.len());
+    for name in requested {
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == *name)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "package does not publish skill `{name}`; available: {}",
+                    skills
+                        .iter()
+                        .map(|skill| skill.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+        if selected.iter().any(|selected| selected.name == skill.name) {
+            return Err(LpmError::Registry(format!(
+                "package skill `{name}` was selected more than once"
+            )));
+        }
+        selected.push(skill);
+    }
+    Ok(selected)
+}
+
+fn print_package_discovered(source: &str, skills: &[&lpm_registry::Skill], json_output: bool) {
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "source": source,
+            "skills": skills.iter().map(|skill| serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+            })).collect::<Vec<_>>(),
+            "count": skills.len(),
+        }));
+        return;
+    }
+    install_ui::phase(&format!("Package skills from {}", install_ui::cyan(source)));
+    for skill in skills {
+        eprintln!(
+            "  {:<24} {}",
+            skill.name,
+            skill
+                .description
+                .as_deref()
+                .unwrap_or("Package-published skill")
+                .dimmed()
+        );
+    }
+    install_ui::done(&format!(
+        "Found {} package-published {}",
+        skills.len(),
+        plural(skills.len(), "skill")
+    ));
+}
+
+fn run_package_clean(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    let root = project_dir.join(".lpm").join("skills");
+    let file_count = match count_files_recursive(&root) {
+        Ok(file_count) => file_count,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if json_output {
+                print_json(serde_json::json!({
+                    "success": true,
+                    "action": "clean",
+                    "files_removed": 0,
+                }));
+            } else {
+                install_ui::warn("No package-published skills to clean");
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    std::fs::remove_dir_all(&root).map_err(LpmError::Io)?;
+    if json_output {
+        print_json(serde_json::json!({
+            "success": true,
+            "action": "clean",
+            "files_removed": file_count,
+        }));
+    } else {
+        install_ui::done(&format!(
+            "Removed {file_count} package-published {}",
+            plural(file_count, "skill file")
         ));
     }
     Ok(())
@@ -646,6 +869,27 @@ fn run_remove(
         .filter(|skill| skill_is_selected(skill, &args.skills, args.all))
         .count();
     if selected_count == 0 {
+        if !args.all {
+            let inventory = load_skill_inventory(args.scope, project_dir)?;
+            if let Some(skill) = inventory
+                .iter()
+                .find(|skill| skill_is_selected(skill, &args.skills, false))
+            {
+                return match skill.source_kind.as_str() {
+                    "package" => Err(LpmError::Registry(format!(
+                        "`{}` is package-published; manage it through `lpm install` or `lpm remove {}`",
+                        skill.name, skill.source
+                    ))),
+                    "external" => Err(LpmError::Registry(format!(
+                        "`{}` is an externally installed agent skill; LPM will not remove it",
+                        skill.name
+                    ))),
+                    _ => Err(LpmError::Registry(
+                        "no matching managed skills found".into(),
+                    )),
+                };
+            }
+        }
         return Err(LpmError::Registry(
             "no matching managed skills found".into(),
         ));
@@ -855,7 +1099,6 @@ fn run_toggle(
 }
 
 async fn run_update(
-    client: &RegistryClient,
     args: SkillsUpdateArgs,
     project_dir: &Path,
     json_output: bool,
@@ -873,7 +1116,7 @@ async fn run_update(
         {
             continue;
         }
-        let source = resolve_source(&existing.source, client).await?;
+        let source = resolve_source(&existing.source).await?;
         let discovered = discover_skills(&source.root)?;
         let skill = discovered
             .iter()
@@ -1041,10 +1284,14 @@ fn run_validate(
     project_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let path = args
-        .path
-        .map_or_else(|| project_dir.to_path_buf(), PathBuf::from);
-    let root = std::fs::canonicalize(&path).map_err(LpmError::Io)?;
+    match args.path {
+        Some(path) => run_standard_validate(Path::new(&path), json_output),
+        None => run_package_validate(project_dir, json_output),
+    }
+}
+
+fn run_standard_validate(path: &Path, json_output: bool) -> Result<(), LpmError> {
+    let root = std::fs::canonicalize(path).map_err(LpmError::Io)?;
     let skills = discover_skills(&root)?;
     let audits: Vec<_> = skills
         .iter()
@@ -1079,6 +1326,109 @@ fn run_validate(
         )));
     }
     Ok(())
+}
+
+fn run_package_validate(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    let root = project_dir.join(".lpm").join("skills");
+    let packages = match std::fs::read_dir(&root) {
+        Ok(packages) => packages,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if json_output {
+                print_json(serde_json::json!({
+                    "success": true,
+                    "valid": 0,
+                    "errors": [],
+                    "quality_impact": 0,
+                }));
+            } else {
+                install_ui::warn("No package-published skills installed");
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+
+    let mut errors = Vec::new();
+    let mut valid = 0usize;
+    let mut total_size = 0u64;
+    for package in packages {
+        let package = package.map_err(LpmError::Io)?;
+        let package_path = package.path();
+        if !package_path.is_dir() {
+            continue;
+        }
+        let package_name = package.file_name().to_string_lossy().to_string();
+        for skill in std::fs::read_dir(&package_path).map_err(LpmError::Io)? {
+            let skill = skill.map_err(LpmError::Io)?;
+            let path = skill.path();
+            if path.extension().is_none_or(|extension| extension != "md") {
+                continue;
+            }
+            let skill_name = path
+                .file_stem()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            let display_name = format!("{package_name}/{skill_name}");
+            let size = skill.metadata().map_err(LpmError::Io)?.len();
+            total_size = total_size.saturating_add(size);
+            if size > 15 * 1024 {
+                errors.push(format!("{display_name}: exceeds 15KB limit ({size} bytes)"));
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).map_err(LpmError::Io)?;
+            if content.len() < 100 {
+                errors.push(format!(
+                    "{display_name}: content too short (need 100+ chars)"
+                ));
+                continue;
+            }
+            if !content.starts_with("---") {
+                errors.push(format!("{display_name}: missing YAML frontmatter"));
+                continue;
+            }
+            valid += 1;
+        }
+    }
+    if total_size > 100 * 1024 {
+        errors.push(format!(
+            "total skills size {total_size} bytes exceeds 100KB limit"
+        ));
+    }
+
+    let quality_impact = if valid >= 3 {
+        10
+    } else if valid > 0 {
+        7
+    } else {
+        0
+    };
+    if json_output {
+        print_json(serde_json::json!({
+            "success": errors.is_empty(),
+            "valid": valid,
+            "errors": errors,
+            "quality_impact": quality_impact,
+        }));
+        return if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(LpmError::ExitCode(1))
+        };
+    }
+    if errors.is_empty() {
+        install_ui::done(&format!(
+            "Validated {valid} package-published {}",
+            plural(valid, "skill")
+        ));
+        return Ok(());
+    }
+    for error in &errors {
+        install_ui::warn(error);
+    }
+    Err(LpmError::Script(format!(
+        "{} package skill validation error(s)",
+        errors.len()
+    )))
 }
 
 fn mutation_scope(args: SkillsScopeArgs, _project_dir: &Path) -> SkillScope {
@@ -1405,6 +1755,19 @@ fn plural(count: usize, singular: &str) -> String {
     } else {
         format!("{singular}s")
     }
+}
+
+fn count_files_recursive(directory: &Path) -> Result<usize, std::io::Error> {
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            count += count_files_recursive(&entry.path())?;
+        } else {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
