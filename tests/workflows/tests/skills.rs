@@ -86,6 +86,68 @@ fn skills_add_global_writes_only_the_isolated_home_skill_store() {
 }
 
 #[test]
+fn skills_list_combines_external_agent_and_legacy_package_skills() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    project.write_file(
+        ".agents/skills/rust-best-practices/SKILL.md",
+        "---\nname: rust-best-practices\ndescription: Writes idiomatic Rust\n---\n\nUse idiomatic Rust patterns.\n",
+    );
+    project.write_file(
+        ".lpm/skills/owner.widget/build.md",
+        "# Build the widget\n\nUse the widget build process.\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "skills", "list"])
+        .output()
+        .expect("list combined skill inventory");
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["count"], 2);
+    let skills = json["skills"].as_array().expect("skills array");
+    assert!(skills.iter().any(|skill| {
+        skill["name"] == "rust-best-practices"
+            && skill["ownership"] == "external"
+            && skill["agents"][0]["name"] == "codex"
+    }));
+    assert!(skills.iter().any(|skill| {
+        skill["name"] == "build"
+            && skill["ownership"] == "package"
+            && skill["source"] == "@lpm.dev/owner.widget"
+    }));
+}
+
+#[test]
+fn skills_view_includes_global_codex_skills_from_agents_directory() {
+    let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
+    let skill_file = project.home().join(".agents/skills/find-skills/SKILL.md");
+    std::fs::create_dir_all(skill_file.parent().expect("skill parent")).expect("create skill root");
+    std::fs::write(
+        &skill_file,
+        "---\nname: find-skills\ndescription: Finds useful skills\n---\n\nFind a skill for the task.\n",
+    )
+    .expect("write global external skill");
+
+    let output = lpm(&project)
+        .args(["--json", "skills", "view", "find-skills", "--global"])
+        .output()
+        .expect("view global external skill");
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["skills"][0]["ownership"], "external");
+    assert_eq!(json["skills"][0]["agents"][0]["name"], "codex");
+    assert_eq!(json["skills"][0]["agents"][0]["visible"], true);
+    assert_eq!(
+        json["skills"][0]["agents"][0]["path"],
+        skill_file
+            .display()
+            .to_string()
+            .trim_end_matches("/SKILL.md")
+    );
+}
+
+#[test]
 fn skills_disable_and_enable_change_codex_visibility_without_deleting_content() {
     let project = TempProject::empty(r#"{"name":"skills-test","version":"1.0.0"}"#);
     let source = local_skill_source(&project);

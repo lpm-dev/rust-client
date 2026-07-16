@@ -77,9 +77,21 @@ impl AgentTarget {
         }
     }
 
+    pub(crate) fn inventory_roots(
+        self,
+        scope: SkillScope,
+        project_dir: &Path,
+    ) -> Result<Vec<PathBuf>, LpmError> {
+        let primary = self.skill_root(scope, project_dir)?;
+        if self == Self::Codex && scope == SkillScope::Global {
+            return Ok(vec![home_dir()?.join(".agents").join("skills"), primary]);
+        }
+        Ok(vec![primary])
+    }
+
     pub(crate) fn is_detected(self, scope: SkillScope, project_dir: &Path) -> bool {
-        self.skill_root(scope, project_dir)
-            .is_ok_and(|path| path.exists())
+        self.inventory_roots(scope, project_dir)
+            .is_ok_and(|paths| paths.iter().any(|path| path.exists()))
     }
 }
 

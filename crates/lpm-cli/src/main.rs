@@ -52,6 +52,7 @@ pub mod security_check;
 mod security_floor;
 mod sigstore;
 mod sigstore_verify;
+mod skills_inventory;
 mod skills_model;
 mod skills_source;
 mod step_up;
