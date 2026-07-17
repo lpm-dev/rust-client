@@ -94,7 +94,10 @@ pub(super) async fn drain_ambient_peer_installs(
         }
 
         while let Some(result) = pending.next().await {
-            let NodeResolution::Metadata { request, info } = result?;
+            let NodeResolution::Metadata { request, info } = result? else {
+                stats.skipped_optional += 1;
+                continue;
+            };
             let Some(node) = select_or_reuse_node(
                 request,
                 Arc::clone(&info),

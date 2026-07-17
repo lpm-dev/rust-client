@@ -272,6 +272,9 @@ pub(in crate::commands::install) async fn run(
 
             while let Some(result) = pending.next().await {
                 match result? {
+                    NodeResolution::SkippedOptionalMetadata => {
+                        stats.skipped_optional += 1;
+                    }
                     NodeResolution::Metadata { request, info } => {
                         let Some(node) = select_or_reuse_node(
                             request,

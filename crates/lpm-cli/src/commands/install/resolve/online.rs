@@ -45,7 +45,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) strict_integrity: bool,
     pub(in crate::commands::install) streaming_fetch: bool,
     pub(in crate::commands::install) dependency_engine_policy:
-        &'a crate::engine_check::DependencyEnginePolicy,
+        Arc<crate::engine_check::DependencyEnginePolicy>,
 }
 
 pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
@@ -153,6 +153,12 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         ),
     );
     expand_workspace_member_deps_with_transitives(workspace_member_deps, all_workspace_members)?;
+    if !requested_v2_mode {
+        enforce_required_workspace_member_engines(
+            workspace_member_deps,
+            dependency_engine_policy.as_ref(),
+        )?;
+    }
 
     let spec_tracker = SpeculativeKeyTracker::default();
     let fetch_coord: Arc<FetchCoordinator> = fetch_coord;
@@ -277,6 +283,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 project_dir.to_path_buf(),
                                 gate_stats.clone(),
                                 fetch_extract_limiter.clone(),
+                                dependency_engine_policy.clone(),
                                 streaming_fetch,
                                 1,
                             ));
@@ -308,6 +315,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 project_dir.to_path_buf(),
                                 gate_stats.clone(),
                                 fetch_extract_limiter.clone(),
+                                dependency_engine_policy.clone(),
                                 streaming_fetch,
                                 fetch_overlap_min_selected(),
                             ));
@@ -580,7 +588,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     if omit_policy.dev {
         filter_dev_packages(&mut packages, production_dependency_names);
     }
-    filter_dependency_engine_packages(&mut packages, dependency_engine_policy)?;
+    filter_dependency_engine_packages(&mut packages, dependency_engine_policy.as_ref())?;
     platform_skipped += filter_platform_packages(&mut packages)?;
 
     Ok(OnlineResolutionPhaseResult {

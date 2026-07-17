@@ -1839,6 +1839,8 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         "failed_count",
         "skipped_platform_count",
         "skipped_auth_count",
+        "skipped_optional_count",
+        "skipped_engine_count",
         "task_sum_ms",
         "task_max_ms",
         "drain_ms",
@@ -7430,6 +7432,52 @@ async fn pubgrub_skips_missing_optional_registry_dependency_from_local_source() 
     run_missing_optional_registry_dependency_from_local_source_case(Some("pubgrub")).await;
 }
 
+#[tokio::test]
+async fn experimental_resolver_skips_missing_optional_registry_dependency_from_local_source() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"missing-optional-registry-experimental",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"missing-optional-registry":"1.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_GRAPH", "resolve-worklist")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run experimental optional metadata failure install");
+
+    assert!(
+        output.status.success(),
+        "the experimental resolver must skip unavailable optional metadata\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn strict_install_skips_incompatible_optional_workspace_dependency_from_local_source() {
     let project = TempProject::empty(
@@ -7483,6 +7531,109 @@ fn strict_install_skips_incompatible_optional_workspace_dependency_from_local_so
             .join("node_modules/workspace-native")
             .exists(),
         "a skipped optional workspace child must not leave a root symlink",
+    );
+}
+
+#[test]
+fn optional_local_parent_engine_skip_prunes_required_workspace_descendant_link() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-local-workspace-descendant",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "dependencies":{"local-host":"file:./vendor/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "vendor/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"optional-parent":"file:../optional-parent"}
+        }"#,
+    );
+    project.write_file(
+        "vendor/optional-parent/package.json",
+        r#"{
+            "name":"optional-parent",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"},
+            "dependencies":{"workspace-child":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-child/package.json",
+        r#"{"name":"workspace-child","version":"1.0.0"}"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run inherited optional workspace descendant install");
+
+    assert!(
+        output.status.success(),
+        "an incompatible optional local parent must be skippable\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let node_modules = project.path().join("node_modules");
+    assert!(!node_modules.join("optional-parent").exists());
+    assert!(
+        !node_modules.join("workspace-child").exists(),
+        "a required workspace edge below a skipped optional parent must not leave a root link",
+    );
+}
+
+#[test]
+fn v1_store_rejects_required_workspace_member_with_incompatible_node_engine() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"v1-workspace-engine-strict",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "dependencies":{"workspace-native":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-native/package.json",
+        r#"{
+            "name":"workspace-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run v1 workspace dependency-engine install");
+
+    assert!(
+        !output.status.success(),
+        "v1 must reject the same required workspace engine mismatch as v2"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace-native@1.0.0") && stderr.contains(">=999.0.0"),
+        "v1 workspace mismatch must identify the member and range; got:\n{stderr}",
     );
 }
 
@@ -7593,6 +7744,72 @@ async fn strict_install_does_not_fetch_descendant_orphaned_by_optional_engine_sk
     assert!(node_modules.join("orphan-host").exists());
     assert!(!node_modules.join("incompatible-optional-parent").exists());
     assert!(!node_modules.join("orphan-leaf").exists());
+}
+
+#[tokio::test]
+async fn greedy_fusion_does_not_prefetch_optional_graph_before_engine_pruning() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "overlap-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "overlap-incompatible-parent": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "overlap-incompatible-parent",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" },
+            "dependencies": { "overlap-orphan-leaf": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "overlap-orphan-leaf",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"engine-overlap-pruning",
+            "version":"1.0.0",
+            "dependencies":{"overlap-host":"1.0.0"}
+        }"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .output()
+        .expect("run greedy-fusion overlap dependency-engine install");
+    assert!(
+        output.status.success(),
+        "engine-pruned optional graph must not fail install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let orphan_tarball = MockRegistry::tarball_path("overlap-orphan-leaf", "1.0.0");
+    let orphan_tarball_hits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == orphan_tarball)
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        orphan_tarball_hits.is_empty(),
+        "greedy-fusion must not materialize descendants that engine pruning will orphan; hits={orphan_tarball_hits:?}",
+    );
 }
 
 #[tokio::test]

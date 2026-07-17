@@ -330,6 +330,7 @@ pub(super) fn expand_local_source_install_packages(
             &mut node_modules_warned,
             &mut additional_workspace_links,
             workspace_transitives,
+            false,
         )?;
     }
 
@@ -1336,7 +1337,7 @@ pub(super) fn read_pkg_json_name_version(
     Ok((name, version, node_engine))
 }
 
-fn read_pkg_json_node_engine(
+pub(super) fn read_pkg_json_node_engine(
     package_dir: &Path,
     source_label: &str,
 ) -> Result<Option<String>, LpmError> {
@@ -1720,6 +1721,7 @@ fn promote_workspace_member_source_graph(
     node_modules_warned: &mut std::collections::HashSet<PathBuf>,
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
     workspace_transitives: WorkspaceTransitiveMode,
+    inherited_optional: bool,
 ) -> Result<(), LpmError> {
     let realpath = match matched_member.source_dir.canonicalize() {
         Ok(path) => path,
@@ -1764,7 +1766,7 @@ fn promote_workspace_member_source_graph(
         registry_published_at: None,
         platform: None,
         node_engine,
-        optional: spec.optional,
+        optional: inherited_optional || spec.optional,
         tarball_url: None,
         metadata_checked_for_tarball: false,
     });
@@ -1783,6 +1785,7 @@ fn promote_workspace_member_source_graph(
         node_modules_warned,
         additional_workspace_links,
         workspace_transitives,
+        inherited_optional || spec.optional,
     )
 }
 
@@ -1835,6 +1838,7 @@ pub(super) fn recurse_local_source_deps(
     // silently dropped the member from the root-symlink set.
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
     workspace_transitives: WorkspaceTransitiveMode,
+    inherited_optional: bool,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
         return Ok(());
@@ -1876,11 +1880,12 @@ pub(super) fn recurse_local_source_deps(
                         available_str,
                     )));
                 };
-                let optional_root_link = matches!(
+                let optional_path = inherited_optional || spec.optional;
+                let graph_backed_root_link = matches!(
                     workspace_transitives,
                     WorkspaceTransitiveMode::RootSymlinkOnly
-                ) && spec.optional;
-                if !optional_root_link {
+                ) && optional_path;
+                if !graph_backed_root_link {
                     additional_workspace_links.push(WorkspaceMemberLink {
                         name: spec.local_name.clone(),
                         version: matched_member.version.clone(),
@@ -1890,11 +1895,11 @@ pub(super) fn recurse_local_source_deps(
                 if matches!(
                     workspace_transitives,
                     WorkspaceTransitiveMode::RootSymlinkOnly
-                ) && !spec.optional
+                ) && !optional_path
                 {
                     continue;
                 }
-                let root_link_name = optional_root_link.then(|| spec.local_name.clone());
+                let root_link_name = graph_backed_root_link.then(|| spec.local_name.clone());
 
                 promote_workspace_member_source_graph(
                     project_dir,
@@ -1912,6 +1917,7 @@ pub(super) fn recurse_local_source_deps(
                     node_modules_warned,
                     additional_workspace_links,
                     workspace_transitives,
+                    optional_path,
                 )?;
             }
             DepKind::FileDir | DepKind::Link => {
@@ -1956,11 +1962,12 @@ pub(super) fn recurse_local_source_deps(
                                 member.name,
                             ));
                         }
-                        let optional_root_link = matches!(
+                        let optional_path = inherited_optional || spec.optional;
+                        let graph_backed_root_link = matches!(
                             workspace_transitives,
                             WorkspaceTransitiveMode::RootSymlinkOnly
-                        ) && spec.optional;
-                        if !optional_root_link {
+                        ) && optional_path;
+                        if !graph_backed_root_link {
                             additional_workspace_links.push(WorkspaceMemberLink {
                                 name: spec.local_name.clone(),
                                 version: member.version.clone(),
@@ -1968,10 +1975,10 @@ pub(super) fn recurse_local_source_deps(
                             });
                         }
                         if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph)
-                            || optional_root_link
+                            || graph_backed_root_link
                         {
                             let root_link_name =
-                                optional_root_link.then(|| spec.local_name.clone());
+                                graph_backed_root_link.then(|| spec.local_name.clone());
                             promote_workspace_member_source_graph(
                                 project_dir,
                                 spec,
@@ -1988,6 +1995,7 @@ pub(super) fn recurse_local_source_deps(
                                 node_modules_warned,
                                 additional_workspace_links,
                                 workspace_transitives,
+                                optional_path,
                             )?;
                         }
                         continue;
@@ -2032,7 +2040,7 @@ pub(super) fn recurse_local_source_deps(
                     registry_published_at: None,
                     platform: None,
                     node_engine,
-                    optional: spec.optional,
+                    optional: inherited_optional || spec.optional,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,
                 });
@@ -2052,6 +2060,7 @@ pub(super) fn recurse_local_source_deps(
                     node_modules_warned,
                     additional_workspace_links,
                     workspace_transitives,
+                    inherited_optional || spec.optional,
                 )?;
             }
         }

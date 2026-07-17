@@ -131,6 +131,17 @@ impl DependencyEnginePolicy {
         Err(mismatch.into_error("node"))
     }
 
+    pub(crate) fn allows_dependency_materialization(&self, required: Option<&str>) -> bool {
+        if !self.engine_strict {
+            return true;
+        }
+        let Some(required) = required else {
+            return true;
+        };
+        self.check_node_requirement(required, "dependency prefetch > engines.node".to_string())
+            .is_ok()
+    }
+
     pub(crate) fn freshness_key(&self, lockfile_content: &str) -> String {
         if lockfile_version(lockfile_content)
             .is_some_and(|version| version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES)

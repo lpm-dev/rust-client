@@ -806,6 +806,27 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
     Ok(())
 }
 
+pub(super) fn enforce_required_workspace_member_engines(
+    workspace_member_deps: &[WorkspaceMemberLink],
+    policy: &crate::engine_check::DependencyEnginePolicy,
+) -> Result<(), LpmError> {
+    let mut checked_sources = HashSet::with_capacity(workspace_member_deps.len());
+    for member in workspace_member_deps {
+        if !checked_sources.insert(member.source_dir.as_path()) {
+            continue;
+        }
+        let Some(required) = read_pkg_json_node_engine(
+            &member.source_dir,
+            &format!("workspace member at {}", member.source_dir.display()),
+        )?
+        else {
+            continue;
+        };
+        policy.enforce_dependency(&member.name, &member.version, &required, false)?;
+    }
+    Ok(())
+}
+
 /// Symlink workspace member dependencies into `<project_dir>/node_modules/<name>`.
 ///
 /// Called AFTER `link_packages` (or `link_packages_hoisted`) so that the

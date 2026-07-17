@@ -98,6 +98,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
     project_dir: PathBuf,
     gate_stats: Arc<GateStats>,
     fetch_extract_limiter: FetchExtractLimiter,
+    dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     streaming_fetch: bool,
     min_selected: usize,
 ) -> FetchOverlapJoin {
@@ -139,6 +140,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                                     &project_dir,
                                     &gate_stats,
                                     &fetch_extract_limiter,
+                                    dependency_engine_policy.as_ref(),
                                     streaming_fetch,
                                     &mut seen,
                                     &mut tasks,
@@ -159,6 +161,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                         &project_dir,
                         &gate_stats,
                         &fetch_extract_limiter,
+                        dependency_engine_policy.as_ref(),
                         streaming_fetch,
                         &mut seen,
                         &mut tasks,
@@ -247,12 +250,21 @@ fn dispatch_selected_event(
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
     fetch_extract_limiter: &FetchExtractLimiter,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
     streaming_fetch: bool,
     seen: &mut HashSet<String>,
     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
     stats: &mut FetchOverlapStats,
 ) {
     let package = install_package_from_selected_event(event, route_table);
+    if package.optional {
+        stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
+        return;
+    }
+    if !dependency_engine_policy.allows_dependency_materialization(package.node_engine.as_deref()) {
+        stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
+        return;
+    }
     dispatch_install_package(
         package,
         route_table,

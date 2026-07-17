@@ -32,6 +32,7 @@ pub(super) enum NodeResolution {
         request: ResolveRequest,
         info: Arc<lpm_resolver::CachedPackageInfo>,
     },
+    SkippedOptionalMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -127,7 +128,7 @@ pub(super) async fn resolve_node(
     resolver_policy: lpm_resolver::ResolverPolicy,
 ) -> Result<NodeResolution, LpmError> {
     let context = MetadataRequestContext::from_request(&request);
-    let info = metadata_for_package(
+    let result = metadata_for_package(
         context,
         client,
         route_table,
@@ -136,7 +137,19 @@ pub(super) async fn resolve_node(
         metadata_stats,
         resolver_policy,
     )
-    .await?;
+    .await;
+    let info = match result {
+        Ok(info) => info,
+        Err(err) if request.optional => {
+            tracing::debug!(
+                "skipping optional metadata failure for {}@{}: {err}",
+                request.target_name,
+                request.range,
+            );
+            return Ok(NodeResolution::SkippedOptionalMetadata);
+        }
+        Err(err) => return Err(err),
+    };
     Ok(NodeResolution::Metadata { request, info })
 }
 

@@ -809,6 +809,9 @@ pub(super) async fn run_offline_install_phase(
             .cloned(),
     );
     expand_workspace_member_deps_with_transitives(workspace_member_deps, all_workspace_members)?;
+    if !requested_v2_mode {
+        enforce_required_workspace_member_engines(workspace_member_deps, dependency_engine_policy)?;
+    }
     enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
     if verify_registry_signatures {
         enforce_registry_signature_policy(
@@ -1384,7 +1387,7 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
             .root_link_names
             .as_ref()
             .is_some_and(|names| !names.is_empty());
-        if (package.is_direct || has_root_link) && retained.insert(idx) {
+        if (package.is_direct || (has_root_link && !package.optional)) && retained.insert(idx) {
             queue.push_back(idx);
         }
     }

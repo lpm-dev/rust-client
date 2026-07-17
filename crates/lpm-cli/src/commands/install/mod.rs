@@ -972,6 +972,12 @@ async fn run_with_options_under_store_lock(
             &mut workspace_member_deps,
             &all_workspace_members,
         )?;
+        if !requested_v2_mode {
+            enforce_required_workspace_member_engines(
+                &workspace_member_deps,
+                dependency_engine_policy.as_ref(),
+            )?;
+        }
         spike_pre_resolved_install_pkgs
             .extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
         for (source, deps) in &v2_workspace_root_pre_resolve.source_deps {
@@ -1078,7 +1084,7 @@ async fn run_with_options_under_store_lock(
         linker_mode,
         strict_integrity,
         streaming_fetch,
-        dependency_engine_policy: dependency_engine_policy.as_ref(),
+        dependency_engine_policy: dependency_engine_policy.clone(),
         resolver_min_age_secs,
         override_set: override_set.clone(),
     })
