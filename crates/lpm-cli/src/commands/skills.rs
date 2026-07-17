@@ -1388,6 +1388,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "guide".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some(valid_package_skill("guide")),
                 raw_content: None,
@@ -1423,6 +1424,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "guide".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some(valid_package_skill("guide")),
                 raw_content: None,
@@ -1454,6 +1456,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "guide".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some(valid_package_skill("guide")),
                 raw_content: None,

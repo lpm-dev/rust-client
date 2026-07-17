@@ -897,6 +897,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "usage".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some("dependency guidance".into()),
                 raw_content: None,
@@ -936,6 +937,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "dependency-usage".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some("dependency guidance".into()),
                 raw_content: None,

@@ -1059,6 +1059,9 @@ pub struct Skill {
     pub description: Option<String>,
 
     #[serde(default)]
+    pub version: Option<String>,
+
+    #[serde(default)]
     pub globs: Vec<String>,
 
     #[serde(default)]

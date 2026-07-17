@@ -557,6 +557,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "guide".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some(
                     "---\nname: guide\ndescription: A useful package guide\n---\nUse the guide."
@@ -604,6 +605,7 @@ mod tests {
                 lpm_registry::Skill {
                     name: "available".into(),
                     description: None,
+                    version: None,
                     globs: Vec::new(),
                     content: Some(
                         "---\nname: available\ndescription: Available guide\n---\nUse it.".into(),
@@ -614,6 +616,7 @@ mod tests {
                 lpm_registry::Skill {
                     name: "missing".into(),
                     description: None,
+                    version: None,
                     globs: Vec::new(),
                     content: Some(
                         "---\nname: missing\ndescription: Missing guide\n---\nUse it.".into(),

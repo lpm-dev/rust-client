@@ -259,6 +259,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "consumer".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some(valid_skill("consumer")),
                 raw_content: None,

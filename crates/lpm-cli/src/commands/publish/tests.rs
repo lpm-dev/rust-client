@@ -233,6 +233,7 @@ fn local_and_published_skill_digests_use_frontmatter_names() {
     let published = vec![lpm_registry::Skill {
         name: "usage".into(),
         description: Some("Complete package usage guidance".into()),
+        version: None,
         globs: Vec::new(),
         content: Some("package guidance".into()),
         raw_content: Some(raw_content.into()),
