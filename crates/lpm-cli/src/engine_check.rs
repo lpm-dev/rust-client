@@ -34,7 +34,10 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
-use lpm_runtime::effective::{Effective, resolve_effective_node_version_with_engines};
+use lpm_runtime::effective::{
+    Effective, EffectiveNodeResolution, probe_effective_node_fingerprint_with_engines,
+    resolve_effective_node_with_fingerprint_with_engines,
+};
 use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -47,7 +50,7 @@ pub(crate) struct DependencyEnginePolicy {
     json_output: bool,
     root_dir: PathBuf,
     root_engines: HashMap<String, String>,
-    effective_node: OnceLock<Effective>,
+    effective_node: OnceLock<EffectiveNodeResolution>,
 }
 
 impl DependencyEnginePolicy {
@@ -67,8 +70,12 @@ impl DependencyEnginePolicy {
     }
 
     fn effective_node(&self) -> &Effective {
+        self.effective_node_resolution().effective()
+    }
+
+    fn effective_node_resolution(&self) -> &EffectiveNodeResolution {
         self.effective_node.get_or_init(|| {
-            resolve_effective_node_version_with_engines(&self.root_dir, &self.root_engines)
+            resolve_effective_node_with_fingerprint_with_engines(&self.root_dir, &self.root_engines)
         })
     }
 
@@ -139,6 +146,22 @@ impl DependencyEnginePolicy {
     pub(crate) fn constrained_freshness_key(&self) -> String {
         let version = self.effective_node().version().unwrap_or("unknown");
         format!("{}:{version}", u8::from(self.engine_strict))
+    }
+
+    pub(crate) fn probe_node_runtime_fingerprint(&self) -> Option<String> {
+        probe_effective_node_fingerprint_with_engines(&self.root_dir, &self.root_engines)
+    }
+
+    pub(crate) fn resolved_node_runtime_fingerprint(&self) -> Option<&str> {
+        self.effective_node_resolution().runtime_fingerprint()
+    }
+
+    pub(crate) fn can_reuse_constrained_freshness_key(&self, key: &str) -> bool {
+        let prefix = if self.engine_strict { "1:" } else { "0:" };
+        let Some(version) = key.strip_prefix(prefix) else {
+            return false;
+        };
+        lpm_semver::Version::parse(version).is_ok()
     }
 }
 
@@ -606,5 +629,14 @@ mod tests {
 
         assert_eq!(policy.freshness_key(&lockfile), "none");
         assert!(policy.effective_node.get().is_none());
+    }
+
+    #[test]
+    fn unknown_node_version_is_never_reused_from_fingerprint_cache() {
+        let dir = tempdir().unwrap();
+        let policy =
+            DependencyEnginePolicy::new(dir.path().to_path_buf(), HashMap::new(), true, true);
+
+        assert!(!policy.can_reuse_constrained_freshness_key("1:unknown"));
     }
 }

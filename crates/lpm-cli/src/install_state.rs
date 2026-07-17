@@ -58,6 +58,87 @@ fn write_state_file_owner_only(path: &Path, content: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
+pub(crate) fn is_node_runtime_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn refresh_install_hash_node_runtime_fingerprint(
+    project_dir: &Path,
+    expected_dependency_engine_key: &str,
+    runtime_fingerprint: Option<&str>,
+) -> std::io::Result<bool> {
+    if runtime_fingerprint.is_some_and(|value| !is_node_runtime_fingerprint(value)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Node runtime fingerprint",
+        ));
+    }
+
+    let path = project_dir.join(".lpm").join("install-hash");
+    let original = std::fs::read_to_string(&path)?;
+    let Some(updated) = replace_node_runtime_fingerprint(
+        &original,
+        expected_dependency_engine_key,
+        runtime_fingerprint,
+    ) else {
+        return Ok(false);
+    };
+    if updated == original {
+        return Ok(false);
+    }
+
+    if std::fs::read_to_string(&path)? != original {
+        return Ok(false);
+    }
+    write_state_file_owner_only(&path, updated.as_bytes())?;
+    Ok(true)
+}
+
+fn replace_node_runtime_fingerprint(
+    content: &str,
+    expected_dependency_engine_key: &str,
+    runtime_fingerprint: Option<&str>,
+) -> Option<String> {
+    let mut updated = String::with_capacity(content.len() + 72);
+    let mut saw_engine_key = false;
+    let mut saw_runtime_fingerprint = false;
+    let fingerprint = runtime_fingerprint.unwrap_or("none");
+
+    for line in content.lines() {
+        if let Some(key) = line.strip_prefix("e:") {
+            if saw_engine_key || key != expected_dependency_engine_key {
+                return None;
+            }
+            saw_engine_key = true;
+        }
+
+        if line.starts_with("n:") {
+            if saw_runtime_fingerprint {
+                return None;
+            }
+            saw_runtime_fingerprint = true;
+            updated.push_str("n:");
+            updated.push_str(fingerprint);
+        } else {
+            updated.push_str(line);
+        }
+        updated.push('\n');
+    }
+
+    if !saw_engine_key {
+        return None;
+    }
+    if !saw_runtime_fingerprint {
+        updated.push_str("n:");
+        updated.push_str(fingerprint);
+        updated.push('\n');
+    }
+    Some(updated)
+}
+
 /// Result of checking install state.
 pub struct InstallState {
     /// Whether the project's install is up to date.
@@ -1079,6 +1160,7 @@ pub(crate) fn write_install_hash_with_integrity_and_platform(
         object_integrity_policy,
         platform,
         "none",
+        None,
     )
 }
 
@@ -1089,7 +1171,14 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     object_integrity_policy: ObjectIntegrityPolicy,
     platform: &PlatformTuple,
     dependency_engine_key: &str,
+    node_runtime_fingerprint: Option<&str>,
 ) -> std::io::Result<()> {
+    if node_runtime_fingerprint.is_some_and(|value| !is_node_runtime_fingerprint(value)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Node runtime fingerprint",
+        ));
+    }
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
     let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
 
@@ -1098,8 +1187,9 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     let linker_str = linker_mode.as_str();
     let integrity_policy_str = object_integrity_policy.as_str();
     let platform_str = platform_tuple_key(platform);
+    let node_runtime_fingerprint = node_runtime_fingerprint.unwrap_or("none");
     let content = format!(
-        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\ne:{dependency_engine_key}\n"
+        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\n"
     );
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
@@ -1754,7 +1844,75 @@ mod tests {
             "expected platform line, got {platform_line:?}"
         );
         assert_eq!(lines.next(), Some("e:none"));
+        assert_eq!(lines.next(), Some("n:none"));
         assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn install_hash_reserves_node_runtime_fingerprint_metadata() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+
+        write_install_hash(p, "abc123", lpm_linker::LinkerMode::Hoisted).unwrap();
+
+        let content = fs::read_to_string(p.join(".lpm").join("install-hash")).unwrap();
+        assert!(
+            content.lines().any(|line| line == "n:none"),
+            "install-hash must reserve a stable node runtime fingerprint line: {content:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_fingerprint_refresh_preserves_other_install_state_metadata() {
+        const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEW: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+        let platform = PlatformTuple::current();
+        write_install_hash_with_integrity_platform_and_dependency_engine(
+            p,
+            "abc123",
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            "1:22.0.0",
+            Some(OLD),
+        )
+        .unwrap();
+        let path = p.join(".lpm").join("install-hash");
+        let before = fs::read_to_string(&path).unwrap();
+        let expected = before.replace(&format!("n:{OLD}"), &format!("n:{NEW}"));
+
+        let refreshed =
+            refresh_install_hash_node_runtime_fingerprint(p, "1:22.0.0", Some(NEW)).unwrap();
+
+        assert!(refreshed);
+        assert_eq!(fs::read_to_string(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn runtime_fingerprint_refresh_appends_missing_metadata() {
+        const FINGERPRINT: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let legacy = "hash\nm:1:2\nl:hoisted\ni:source\np:linux/x64/glibc\ne:1:22.0.0\n";
+
+        let updated =
+            replace_node_runtime_fingerprint(legacy, "1:22.0.0", Some(FINGERPRINT)).unwrap();
+
+        assert_eq!(updated, format!("{legacy}n:{FINGERPRINT}\n"));
+    }
+
+    #[test]
+    fn runtime_fingerprint_refresh_rejects_changed_engine_key() {
+        const FINGERPRINT: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let state = "hash\nm:1:2\nl:hoisted\ni:source\np:linux/x64/glibc\ne:1:23.0.0\nn:none\n";
+
+        assert!(replace_node_runtime_fingerprint(state, "1:22.0.0", Some(FINGERPRINT)).is_none());
     }
 
     #[test]
@@ -2031,6 +2189,7 @@ mod tests {
             ObjectIntegrityPolicy::Source,
             &platform,
             "1:22.0.0",
+            None,
         )
         .unwrap();
 
