@@ -4,6 +4,7 @@
 //! skills have a separate LPM-managed store and are explicitly materialized
 //! into supported agent directories.
 
+pub(crate) mod author;
 mod dashboard;
 mod inventory;
 mod managed;
@@ -34,10 +35,10 @@ pub enum SkillsCmd {
     /// Open a local browser dashboard for inspecting and managing skills.
     #[command(visible_alias = "ui")]
     Dashboard(DashboardArgs),
-    /// Validate package-published `.lpm/skills/` files against publishing rules.
+    /// Validate flat `.lpm/skills/*.md` files against LPM.dev publishing rules.
     Validate,
-    /// Remove package-published `.lpm/skills/` content.
-    Clean,
+    /// Remove installed LPM.dev package skill sets while preserving authored files.
+    Clean(CleanArgs),
     /// Diagnose managed agent targets and externally discovered broken links.
     Doctor(DoctorArgs),
     /// Resolve managed standalone sources again and preview their changes.
@@ -168,6 +169,16 @@ pub struct PruneArgs {
     pub yes: bool,
 }
 
+#[derive(Debug, Args, Default)]
+pub struct CleanArgs {
+    /// Print installed package skill sets that would be removed without changing files.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Confirm cleanup outside an interactive terminal.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
 #[derive(
     Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, ValueEnum,
 )]
@@ -217,7 +228,7 @@ pub async fn run(
         SkillsCmd::View(args) => view_skill(project_dir, &args, json_output),
         SkillsCmd::Dashboard(args) => dashboard::run(project_dir, args, json_output).await,
         SkillsCmd::Validate => validate_skills(project_dir, json_output),
-        SkillsCmd::Clean => clean_skills(project_dir, json_output),
+        SkillsCmd::Clean(args) => clean_skills(project_dir, args, json_output),
         SkillsCmd::Doctor(args) => managed::doctor(project_dir, args.global, json_output),
         SkillsCmd::Update(args) => managed::update(project_dir, args, json_output).await,
         SkillsCmd::Remove(args) => {
@@ -884,150 +895,198 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
 
 fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let skills_dir = project_dir.join(".lpm").join("skills");
-    let root_metadata = match std::fs::symlink_metadata(&skills_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "valid": 0,
-                        "errors": [],
-                        "quality_impact": 0,
-                    })
-                );
-            } else {
-                install_ui::warn("No .lpm/skills/ directory found");
-            }
-            return Ok(());
-        }
-        Err(error) => return Err(LpmError::Io(error)),
-    };
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(LpmError::Registry(format!(
-            "package skill path is not a regular directory: {}",
-            skills_dir.display()
-        )));
-    }
-    let mut errors = Vec::new();
-    let mut valid = 0usize;
-    let mut total_size = 0u64;
-    for package in std::fs::read_dir(&skills_dir)? {
-        let package = package?;
-        let package_metadata = std::fs::symlink_metadata(package.path())?;
-        if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
-            errors.push(format!(
-                "{}: package skill entry is not a regular directory",
-                package.file_name().to_string_lossy()
-            ));
-            continue;
-        }
-        for skill in std::fs::read_dir(package.path())? {
-            let skill = skill?;
-            let path = skill.path();
-            if path.extension().is_none_or(|extension| extension != "md") {
-                continue;
-            }
-            let display = format!(
-                "{}/{}",
-                package.file_name().to_string_lossy(),
-                path.file_stem().unwrap_or_default().to_string_lossy()
-            );
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                errors.push(format!("{display}: skill is not a regular file"));
-                continue;
-            }
-            let size = metadata.len();
-            total_size += size;
-            if size > 15 * 1024 {
-                errors.push(format!("{display}: exceeds 15KB limit ({size} bytes)"));
-                continue;
-            }
-            let content = std::fs::read_to_string(&path)?;
-            if content.len() < 100 {
-                errors.push(format!("{display}: content too short (need 100+ chars)"));
-                continue;
-            }
-            let findings = lpm_security::skill_security::scan_skill_content(&content);
-            if !findings.is_empty() {
-                errors.push(format!(
-                    "{display}: security scan found {} issue(s)",
-                    findings.len()
-                ));
-                continue;
-            }
-            let (_, _, frontmatter_errors) =
-                lpm_security::skill_security::parse_skill_frontmatter(&content);
-            if frontmatter_errors.is_empty() {
-                valid += 1;
-            } else {
-                errors.extend(
-                    frontmatter_errors
-                        .into_iter()
-                        .map(|error| format!("{display}: {error}")),
-                );
-            }
-        }
-    }
-    if total_size > 100 * 1024 {
-        errors.push(format!(
-            "total skills size {total_size} bytes exceeds 100KB limit"
-        ));
-    }
+    let report = author::validate_directory(&skills_dir)?;
     if json_output {
+        let security = report
+            .security_issues
+            .iter()
+            .map(|located| {
+                serde_json::json!({
+                    "path": located.path,
+                    "rule_id": located.issue.rule_id,
+                    "category": located.issue.category,
+                    "severity": located.issue.severity,
+                    "line": located.issue.line_number,
+                })
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "success": errors.is_empty(),
-                "valid": valid,
-                "errors": errors,
-                "quality_impact": if valid >= 3 { 10 } else if valid > 0 { 7 } else { 0 },
+                "success": report.is_valid(),
+                "directory_found": report.directory_found,
+                "valid": report.valid_files.len(),
+                "files": report.valid_files,
+                "errors": report.errors,
+                "security_findings": security,
+                "total_size_bytes": report.total_size_bytes,
+                "ignored_package_sets": report.ignored_package_sets,
+                "quality_impact": if report.valid_files.len() >= 3 { 10 } else if !report.valid_files.is_empty() { 7 } else { 0 },
             }))
-            .unwrap()
+            .map_err(|error| LpmError::Registry(format!("failed to serialize validation result: {error}")))?
         );
-    } else if errors.is_empty() {
-        install_ui::done(&format!(
-            "{valid} {} valid",
-            plural(valid, "skill", "skills")
-        ));
     } else {
-        for error in &errors {
+        if !report.directory_found {
+            install_ui::warn("No .lpm/skills/ directory found");
+        } else {
+            install_ui::phase("Validating package skills in .lpm/skills/");
+            for file in &report.valid_files {
+                eprintln!("  {} {file}", install_ui::status_ok("valid"));
+            }
+        }
+        if report.ignored_package_sets > 0 {
+            install_ui::warn(&format!(
+                "Ignored {} installed LPM.dev package skill {}",
+                report.ignored_package_sets,
+                plural(report.ignored_package_sets, "set", "sets")
+            ));
+        }
+        for error in &report.errors {
             install_ui::warn(error);
         }
+        for located in &report.security_issues {
+            install_ui::warn(&format!(
+                "{}: {} security finding at line {} ({})",
+                located.path,
+                located.issue.category,
+                located.issue.line_number,
+                located.issue.rule_id
+            ));
+        }
+        if report.is_valid() {
+            if report.valid_files.is_empty() {
+                install_ui::warn("No publisher-authored .lpm/skills/*.md files found");
+            } else {
+                install_ui::done(&format!(
+                    "{} package {} valid · {}",
+                    report.valid_files.len(),
+                    plural(report.valid_files.len(), "skill", "skills"),
+                    lpm_common::format_bytes(report.total_size_bytes)
+                ));
+            }
+        }
     }
-    if errors.is_empty() {
+    if report.is_valid() {
         Ok(())
     } else if json_output {
         Err(LpmError::ExitCode(1))
     } else {
         Err(LpmError::Script(format!(
             "{} skill validation error(s)",
-            errors.len()
+            report.error_count()
         )))
     }
 }
 
-fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+#[derive(Debug, Serialize)]
+struct PackageCleanTarget {
+    package: String,
+    version: Option<String>,
+    directory: String,
+    files: usize,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PreservedCleanPath {
+    path: String,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct PackageCleanPlan {
+    directory_found: bool,
+    targets: Vec<PackageCleanTarget>,
+    publisher_files: Vec<String>,
+    skipped: Vec<PreservedCleanPath>,
+}
+
+fn clean_skills(project_dir: &Path, args: CleanArgs, json_output: bool) -> Result<(), LpmError> {
     let _lock = package::acquire_mutation_lock(project_dir)?;
     let skills_dir = project_dir.join(".lpm").join("skills");
-    let metadata = match std::fs::symlink_metadata(&skills_dir) {
+    let plan = plan_package_clean(&skills_dir)?;
+    if !json_output {
+        print_package_clean_plan(&plan);
+    }
+
+    if args.dry_run || plan.targets.is_empty() {
+        if json_output {
+            print_clean_json(&plan, args.dry_run, &[], 0, 0)?;
+        } else if args.dry_run {
+            install_ui::done("Dry run complete · no files changed");
+        } else if !plan.directory_found {
+            install_ui::warn("No .lpm/skills/ directory found");
+        } else {
+            install_ui::warn("No installed LPM.dev package skill sets to clean");
+        }
+        return Ok(());
+    }
+
+    require_confirmation(
+        args.yes,
+        json_output,
+        &format!(
+            "Remove {} installed LPM.dev package skill {}?",
+            plan.targets.len(),
+            plural(plan.targets.len(), "set", "sets")
+        ),
+    )?;
+
+    let mut removed = Vec::with_capacity(plan.targets.len());
+    let mut files_removed = 0usize;
+    let mut bytes_removed = 0u64;
+    for target in &plan.targets {
+        let directory = std::path::PathBuf::from(&target.directory);
+        let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+            LpmError::Registry(format!(
+                "refusing to clean package skill directory whose type changed after preview: {} ({error})",
+                directory.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(LpmError::Registry(format!(
+                "refusing to clean package skill directory whose type changed after preview: {}",
+                directory.display()
+            )));
+        }
+        let expected_package = target
+            .package
+            .strip_prefix("@lpm.dev/")
+            .unwrap_or(&target.package);
+        if directory.file_name().and_then(|name| name.to_str()) != Some(expected_package)
+            || !package::is_materialized_directory(&directory)
+        {
+            return Err(LpmError::Registry(format!(
+                "refusing to clean package skill directory whose ownership changed after preview: {}",
+                directory.display()
+            )));
+        }
+        std::fs::remove_dir_all(&directory)?;
+        removed.push(target.package.clone());
+        files_removed += target.files;
+        bytes_removed = bytes_removed.saturating_add(target.size_bytes);
+    }
+
+    if json_output {
+        print_clean_json(&plan, false, &removed, files_removed, bytes_removed)?;
+    } else {
+        install_ui::done(&format!(
+            "Removed {} package skill {} · {files_removed} {} · {}",
+            removed.len(),
+            plural(removed.len(), "set", "sets"),
+            plural(files_removed, "file", "files"),
+            lpm_common::format_bytes(bytes_removed)
+        ));
+        eprintln!("  Run lpm install to restore them.");
+    }
+    Ok(())
+}
+
+fn plan_package_clean(skills_dir: &Path) -> Result<PackageCleanPlan, LpmError> {
+    let metadata = match std::fs::symlink_metadata(skills_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "cleaned": false,
-                        "files_removed": 0,
-                    })
-                );
-            } else {
-                install_ui::warn("No skills to clean");
-            }
-            return Ok(());
+            return Ok(PackageCleanPlan::default());
         }
         Err(error) => return Err(LpmError::Io(error)),
     };
@@ -1037,39 +1096,145 @@ fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             skills_dir.display()
         )));
     }
-    let removed = count_files_recursive(&skills_dir);
-    std::fs::remove_dir_all(skills_dir)?;
-    if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"success": true, "cleaned": true, "files_removed": removed})
-        );
-    } else {
-        install_ui::done(&format!(
-            "Skills cleaned · removed {removed} {}",
-            plural(removed, "file", "files")
-        ));
+
+    let mut plan = PackageCleanPlan {
+        directory_found: true,
+        ..PackageCleanPlan::default()
+    };
+    let mut entries = std::fs::read_dir(skills_dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let display = path.display().to_string();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            plan.skipped.push(PreservedCleanPath {
+                path: display,
+                reason: "symlinked entries are never cleaned".into(),
+            });
+        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "md")
+        {
+            plan.publisher_files.push(display);
+        } else if metadata.is_dir() {
+            let package_name = entry.file_name().to_string_lossy().to_string();
+            match package::read_manifest(&path, &package_name) {
+                package::PackageManifestStatus::Valid(manifest)
+                    if package::is_materialized_directory(&path) =>
+                {
+                    let (files, size_bytes) = directory_stats(&path)?;
+                    plan.targets.push(PackageCleanTarget {
+                        package: format!("@lpm.dev/{}", manifest.package),
+                        version: manifest.version,
+                        directory: display,
+                        files,
+                        size_bytes,
+                    });
+                }
+                package::PackageManifestStatus::Valid(_) => {
+                    plan.skipped.push(PreservedCleanPath {
+                        path: display,
+                        reason:
+                            "directory content no longer matches its LPM CLI ownership manifest"
+                                .into(),
+                    });
+                }
+                package::PackageManifestStatus::Missing => {
+                    plan.skipped.push(PreservedCleanPath {
+                        path: display,
+                        reason: "directory has no LPM CLI ownership manifest".into(),
+                    });
+                }
+                package::PackageManifestStatus::Invalid => {
+                    plan.skipped.push(PreservedCleanPath {
+                        path: display,
+                        reason: "directory has an invalid LPM CLI ownership manifest".into(),
+                    });
+                }
+            }
+        } else {
+            plan.skipped.push(PreservedCleanPath {
+                path: display,
+                reason: "unrecognized content is preserved".into(),
+            });
+        }
     }
-    Ok(())
+    Ok(plan)
 }
 
-fn count_files_recursive(dir: &Path) -> usize {
-    std::fs::read_dir(dir).map_or(0, |entries| {
-        entries
-            .flatten()
-            .map(|entry| {
-                let path = entry.path();
-                let metadata = std::fs::symlink_metadata(&path);
-                if metadata
-                    .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
-                {
-                    count_files_recursive(&path)
-                } else {
-                    1
-                }
-            })
-            .sum()
-    })
+fn directory_stats(directory: &Path) -> Result<(usize, u64), LpmError> {
+    let mut files = 0usize;
+    let mut size_bytes = 0u64;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            files += 1;
+            size_bytes = size_bytes.saturating_add(metadata.len());
+        } else if metadata.is_dir() {
+            let (nested_files, nested_size) = directory_stats(&path)?;
+            files += nested_files;
+            size_bytes = size_bytes.saturating_add(nested_size);
+        }
+    }
+    Ok((files, size_bytes))
+}
+
+fn print_package_clean_plan(plan: &PackageCleanPlan) {
+    if !plan.targets.is_empty() {
+        install_ui::phase("Installed LPM.dev package skill sets");
+        for target in &plan.targets {
+            let version = target
+                .version
+                .as_deref()
+                .map_or_else(String::new, |version| format!("@{version}"));
+            eprintln!(
+                "  {}{version} · {} {} · {}",
+                target.package,
+                target.files,
+                plural(target.files, "file", "files"),
+                lpm_common::format_bytes(target.size_bytes)
+            );
+        }
+    }
+    if !plan.publisher_files.is_empty() {
+        install_ui::phase("Preserved");
+        eprintln!(
+            "  {} publisher-authored skill {}",
+            plan.publisher_files.len(),
+            plural(plan.publisher_files.len(), "file", "files")
+        );
+    }
+    for skipped in &plan.skipped {
+        install_ui::warn(&format!("Preserving {} — {}", skipped.path, skipped.reason));
+    }
+}
+
+fn print_clean_json(
+    plan: &PackageCleanPlan,
+    dry_run: bool,
+    removed: &[String],
+    files_removed: usize,
+    bytes_removed: u64,
+) -> Result<(), LpmError> {
+    let output = serde_json::json!({
+        "success": true,
+        "dry_run": dry_run,
+        "cleaned": !removed.is_empty(),
+        "removed": removed,
+        "files_removed": files_removed,
+        "bytes_removed": bytes_removed,
+        "would_remove": plan.targets,
+        "preserved_publisher_files": plan.publisher_files,
+        "skipped": plan.skipped,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).map_err(|error| LpmError::Registry(format!(
+            "failed to serialize cleanup result: {error}"
+        )))?
+    );
+    Ok(())
 }
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -1090,6 +1255,13 @@ fn security_severity_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_package_skill(name: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: A complete package skill for validation\n---\n# Guide\n\n{}",
+            "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
+        )
+    }
 
     #[test]
     fn select_skills_rejects_a_missing_requested_name() {
@@ -1142,9 +1314,171 @@ mod tests {
         std::fs::write(external.join("two.md"), "two").unwrap();
         std::os::unix::fs::symlink(&external, package.join("linked")).unwrap();
 
-        let count = count_files_recursive(&skills);
+        let (count, _) = directory_stats(&package).unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn validate_skills_accepts_flat_publisher_files() {
+        let project = tempfile::tempdir().unwrap();
+        let skills = project.path().join(".lpm/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("getting-started.md"),
+            valid_package_skill("getting-started"),
+        )
+        .unwrap();
+
+        let result = validate_skills(project.path(), false);
+
+        assert!(
+            result.is_ok(),
+            "flat publisher skills must validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_skills_rejects_nested_publisher_files() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join(".lpm/skills/guides");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("getting-started.md"),
+            valid_package_skill("getting-started"),
+        )
+        .unwrap();
+
+        let result = validate_skills(project.path(), false);
+
+        assert!(result.is_err(), "nested publisher skills must be rejected");
+    }
+
+    #[test]
+    fn clean_skills_preserves_publisher_files() {
+        let project = tempfile::tempdir().unwrap();
+        let skill = project.path().join(".lpm/skills/getting-started.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, valid_package_skill("getting-started")).unwrap();
+
+        clean_skills(
+            project.path(),
+            CleanArgs {
+                dry_run: false,
+                yes: true,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            skill.exists(),
+            "cleanup must preserve publisher-authored files"
+        );
+    }
+
+    #[test]
+    fn clean_skills_removes_only_manifest_owned_package_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let skills = project.path().join(".lpm/skills");
+        package::materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[lpm_registry::Skill {
+                name: "guide".into(),
+                description: None,
+                version: None,
+                globs: Vec::new(),
+                content: Some(valid_package_skill("guide")),
+                raw_content: None,
+                size_bytes: None,
+            }],
+        )
+        .unwrap();
+        let untracked = skills.join("team-notes");
+        std::fs::create_dir_all(&untracked).unwrap();
+        std::fs::write(untracked.join("notes.md"), "keep").unwrap();
+
+        clean_skills(
+            project.path(),
+            CleanArgs {
+                dry_run: false,
+                yes: true,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(!skills.join("owner.package").exists());
+        assert!(untracked.exists());
+    }
+
+    #[test]
+    fn clean_skills_dry_run_does_not_remove_manifest_owned_directories() {
+        let project = tempfile::tempdir().unwrap();
+        package::materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[lpm_registry::Skill {
+                name: "guide".into(),
+                description: None,
+                version: None,
+                globs: Vec::new(),
+                content: Some(valid_package_skill("guide")),
+                raw_content: None,
+                size_bytes: None,
+            }],
+        )
+        .unwrap();
+
+        clean_skills(
+            project.path(),
+            CleanArgs {
+                dry_run: true,
+                yes: false,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(project.path().join(".lpm/skills/owner.package").exists());
+    }
+
+    #[test]
+    fn clean_skills_preserves_a_package_directory_with_untracked_content() {
+        let project = tempfile::tempdir().unwrap();
+        package::materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[lpm_registry::Skill {
+                name: "guide".into(),
+                description: None,
+                version: None,
+                globs: Vec::new(),
+                content: Some(valid_package_skill("guide")),
+                raw_content: None,
+                size_bytes: None,
+            }],
+        )
+        .unwrap();
+        let directory = project.path().join(".lpm/skills/owner.package");
+        std::fs::write(directory.join("notes.txt"), "preserve me").unwrap();
+
+        clean_skills(
+            project.path(),
+            CleanArgs {
+                dry_run: false,
+                yes: true,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(directory.join("notes.txt").exists());
+        assert!(directory.join("guide.md").exists());
     }
 
     #[test]

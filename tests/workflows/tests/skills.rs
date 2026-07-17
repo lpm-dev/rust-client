@@ -100,6 +100,31 @@ fn seed_skill(project: &TempProject, pkg: &str, name: &str, body: &str) {
     project.write_file(&format!(".lpm/skills/{pkg}/{name}.md"), body);
 }
 
+fn seed_publisher_skill(project: &TempProject, name: &str, body: &str) {
+    project.write_file(&format!(".lpm/skills/{name}.md"), body);
+}
+
+fn seed_materialized_package_skills(project: &TempProject, package: &str, skills: &[(&str, &str)]) {
+    let mut digests = serde_json::Map::new();
+    for (name, content) in skills {
+        project.write_file(&format!(".lpm/skills/{package}/{name}.md"), content);
+        digests.insert(
+            (*name).to_string(),
+            serde_json::Value::String(hex::encode(Sha256::digest(content.as_bytes()))),
+        );
+    }
+    project.write_file(
+        &format!(".lpm/skills/{package}/.lpm-package-skills.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "package": package,
+            "version": "1.0.0",
+            "skills": digests,
+        })
+        .to_string(),
+    );
+}
+
 fn seed_standard_skill(project: &TempProject, directory: &str, name: &str, body: &str) {
     project.write_file(
         &format!("{directory}/{name}/SKILL.md"),
@@ -1254,7 +1279,7 @@ async fn clean_followed_by_a_warm_install_restores_package_skills() {
         .expect("failed to install package skills");
     assert!(first.status.success());
     let clean = lpm(&project)
-        .args(["skills", "clean"])
+        .args(["skills", "clean", "--yes"])
         .output()
         .expect("failed to clean package skills");
     assert!(clean.status.success());
@@ -2354,9 +2379,8 @@ fn skills_update_reports_replacement_warning_as_a_new_finding() {
 #[test]
 fn skills_validate_accepts_a_well_formed_skill() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
-    seed_skill(
+    seed_publisher_skill(
         &project,
-        "alice.tools",
         "ok",
         &format!(
             "---\nname: ok\ndescription: A small but well-formed skill for the validate-happy-path test\n---\n\n{}",
@@ -2378,7 +2402,7 @@ fn skills_validate_accepts_a_well_formed_skill() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ 1 skill valid"),
+        stderr.contains("✓ 1 package skill valid"),
         "validate must report a slim success line, got:\n{stderr}",
     );
     assert!(
@@ -2392,7 +2416,7 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
 
     let oversized = "x".repeat(20 * 1024);
-    seed_skill(&project, "alice.tools", "too-big", &oversized);
+    seed_publisher_skill(&project, "too-big", &oversized);
 
     let output = lpm(&project)
         .args(["skills", "validate"])
@@ -2430,7 +2454,7 @@ fn skills_validate_json_reports_success_false_and_exits_non_zero_on_error() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
 
     let oversized = "x".repeat(20 * 1024);
-    seed_skill(&project, "alice.tools", "too-big", &oversized);
+    seed_publisher_skill(&project, "too-big", &oversized);
 
     let output = lpm(&project)
         .args(["--json", "skills", "validate"])
@@ -2504,11 +2528,13 @@ fn skills_validate_json_without_a_skills_directory_emits_a_success_envelope() {
 }
 
 #[test]
-fn skills_clean_removes_skills_directory_and_reports_count() {
+fn skills_clean_removes_manifest_owned_package_set_and_reports_count() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
-    seed_skill(&project, "alice.tools", "a", "# a\n");
-    seed_skill(&project, "alice.tools", "b", "# b\n");
-    seed_skill(&project, "bob.helpers", "c", "# c\n");
+    seed_materialized_package_skills(
+        &project,
+        "alice.tools",
+        &[("a", "# a\n"), ("b", "# b\n"), ("c", "# c\n")],
+    );
 
     assert!(
         project.file_exists(".lpm/skills/alice.tools/a.md"),
@@ -2516,15 +2542,15 @@ fn skills_clean_removes_skills_directory_and_reports_count() {
     );
 
     let output = lpm(&project)
-        .args(["--json", "skills", "clean"])
+        .args(["--json", "skills", "clean", "--yes"])
         .output()
         .expect("failed to run lpm skills clean");
 
     assert!(output.status.success(), "skills clean must succeed");
 
     assert!(
-        !project.path().join(".lpm/skills").exists(),
-        ".lpm/skills/ must be removed after clean"
+        !project.path().join(".lpm/skills/alice.tools").exists(),
+        "the manifest-owned package directory must be removed after clean"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -2535,8 +2561,8 @@ fn skills_clean_removes_skills_directory_and_reports_count() {
     assert_eq!(envelope["cleaned"], serde_json::json!(true));
     assert_eq!(
         envelope["files_removed"],
-        serde_json::json!(3),
-        "envelope must count removed files (3 skills): {envelope}",
+        serde_json::json!(4),
+        "envelope must count three skills and their ownership manifest: {envelope}",
     );
 }
 
@@ -2555,7 +2581,7 @@ fn skills_clean_on_empty_project_is_idempotent() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("! No skills to clean"),
+        stderr.contains("! No .lpm/skills/ directory found"),
         "clean with no skills dir must use a slim warning, got:\n{stderr}",
     );
 }
@@ -2570,25 +2596,24 @@ fn skills_clean_json_on_an_empty_project_emits_a_no_op_envelope() {
 }
 
 #[test]
-fn skills_clean_human_removes_skills_directory_with_slim_completion() {
+fn skills_clean_human_removes_manifest_owned_set_with_slim_completion() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
-    seed_skill(&project, "alice.tools", "a", "# a\n");
-    seed_skill(&project, "alice.tools", "b", "# b\n");
+    seed_materialized_package_skills(&project, "alice.tools", &[("a", "# a\n"), ("b", "# b\n")]);
 
     let output = lpm(&project)
-        .args(["skills", "clean"])
+        .args(["skills", "clean", "--yes"])
         .output()
         .expect("failed to run lpm skills clean");
 
     assert!(output.status.success(), "skills clean must succeed");
     assert!(
-        !project.path().join(".lpm/skills").exists(),
-        ".lpm/skills/ must be removed after clean"
+        !project.path().join(".lpm/skills/alice.tools").exists(),
+        "the manifest-owned package directory must be removed after clean"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Skills cleaned · removed 2 files"),
+        stderr.contains("✓ Removed 1 package skill set · 3 files"),
         "clean must report a slim completion line, got:\n{stderr}",
     );
     assert!(

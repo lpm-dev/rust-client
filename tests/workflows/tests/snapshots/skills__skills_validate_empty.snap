@@ -4,7 +4,12 @@ expression: envelope
 ---
 {
   "success": true,
+  "directory_found": false,
   "valid": 0,
+  "files": [],
   "errors": [],
+  "security_findings": [],
+  "total_size_bytes": 0,
+  "ignored_package_sets": 0,
   "quality_impact": 0
 }

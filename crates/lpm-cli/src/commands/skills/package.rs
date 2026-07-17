@@ -2,11 +2,13 @@ use lpm_common::{LpmError, PackageName};
 use lpm_registry::Skill;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub(super) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
 const MANIFEST_VERSION: u32 = 1;
+const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PackageSkillsManifest {
@@ -14,6 +16,12 @@ pub(super) struct PackageSkillsManifest {
     pub(super) package: String,
     pub(super) version: Option<String>,
     pub(super) skills: BTreeMap<String, String>,
+}
+
+pub(super) enum PackageManifestStatus {
+    Missing,
+    Invalid,
+    Valid(PackageSkillsManifest),
 }
 
 pub(crate) struct PackageSkillsResult {
@@ -51,9 +59,12 @@ pub(crate) fn materialize(
         .tempdir_in(&root)
         .map_err(LpmError::Io)?;
     let mut manifest_skills = BTreeMap::new();
-    for (name, content) in &entries {
-        std::fs::write(staging.path().join(format!("{name}.md")), content)?;
-        manifest_skills.insert((*name).to_string(), digest(content.as_bytes()));
+    for entry in &entries {
+        std::fs::write(
+            staging.path().join(format!("{}.md", entry.name)),
+            entry.content.as_bytes(),
+        )?;
+        manifest_skills.insert(entry.name.to_string(), digest(entry.content.as_bytes()));
     }
     let manifest = PackageSkillsManifest {
         schema_version: MANIFEST_VERSION,
@@ -118,6 +129,48 @@ pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError>
     Ok(bytes)
 }
 
+pub(super) fn read_manifest(directory: &Path, expected_package: &str) -> PackageManifestStatus {
+    let path = directory.join(MANIFEST_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PackageManifestStatus::Missing;
+        }
+        Err(_) => return PackageManifestStatus::Invalid,
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_MANIFEST_SIZE
+    {
+        return PackageManifestStatus::Invalid;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return PackageManifestStatus::Invalid,
+    };
+    let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
+        return PackageManifestStatus::Invalid;
+    };
+    if manifest.schema_version == MANIFEST_VERSION
+        && manifest.package == expected_package
+        && manifest
+            .skills
+            .keys()
+            .all(|name| lpm_common::is_safe_skill_name(name))
+    {
+        PackageManifestStatus::Valid(manifest)
+    } else {
+        PackageManifestStatus::Invalid
+    }
+}
+
+pub(crate) fn is_materialized_directory(directory: &Path) -> bool {
+    let Some(package) = directory.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    materialized_directory_complete(directory, package)
+}
+
 pub(crate) fn acquire_mutation_lock(
     project_dir: &Path,
 ) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
@@ -155,22 +208,20 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
 
 fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
     let directory = project_dir.join(".lpm").join("skills").join(package);
-    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+    materialized_directory_complete(&directory, package)
+}
+
+fn materialized_directory_complete(directory: &Path, package: &str) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(directory) else {
         return false;
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return false;
     }
-    let Ok(content) = std::fs::read_to_string(directory.join(MANIFEST_FILE)) else {
+    let PackageManifestStatus::Valid(manifest) = read_manifest(directory, package) else {
         return false;
     };
-    let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
-        return false;
-    };
-    if manifest.schema_version != MANIFEST_VERSION || manifest.package != package {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(&directory) else {
+    let Ok(entries) = std::fs::read_dir(directory) else {
         return false;
     };
     let mut seen = BTreeSet::new();
@@ -209,7 +260,12 @@ fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
     seen.len() == manifest.skills.len()
 }
 
-fn validated_entries(skills: &[Skill]) -> Result<Vec<(&str, &str)>, LpmError> {
+struct ValidatedEntry<'a> {
+    name: &'a str,
+    content: Cow<'a, str>,
+}
+
+fn validated_entries(skills: &[Skill]) -> Result<Vec<ValidatedEntry<'_>>, LpmError> {
     let mut seen = BTreeSet::new();
     let mut entries = Vec::with_capacity(skills.len());
     for skill in skills {
@@ -225,20 +281,74 @@ fn validated_entries(skills: &[Skill]) -> Result<Vec<(&str, &str)>, LpmError> {
                 skill.name
             )));
         }
-        let content = skill
-            .raw_content
-            .as_deref()
-            .or(skill.content.as_deref())
-            .filter(|content| !content.is_empty())
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "registry returned package skill `{}` without content",
-                    skill.name
-                ))
-            })?;
-        entries.push((skill.name.as_str(), content));
+        let content = materialized_content(skill)?;
+        entries.push(ValidatedEntry {
+            name: skill.name.as_str(),
+            content,
+        });
     }
     Ok(entries)
+}
+
+fn materialized_content(skill: &Skill) -> Result<Cow<'_, str>, LpmError> {
+    if let Some(raw_content) = skill
+        .raw_content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+    {
+        return Ok(Cow::Borrowed(raw_content));
+    }
+
+    let content = skill
+        .content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "registry returned package skill `{}` without content",
+                skill.name
+            ))
+        })?;
+    if content.starts_with("---\n") || content.starts_with("---\r\n") {
+        return Ok(Cow::Borrowed(content));
+    }
+    let Some(description) = skill.description.as_deref() else {
+        return Ok(Cow::Borrowed(content));
+    };
+
+    let mut document = String::with_capacity(content.len() + description.len() + 128);
+    document.push_str("---\nname: ");
+    push_yaml_string(&mut document, &skill.name)?;
+    document.push_str("\ndescription: ");
+    push_yaml_string(&mut document, description)?;
+    if let Some(version) = skill
+        .version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    {
+        document.push_str("\nversion: ");
+        push_yaml_string(&mut document, version)?;
+    }
+    if !skill.globs.is_empty() {
+        document.push_str("\nglobs:");
+        for glob in &skill.globs {
+            document.push_str("\n  - ");
+            push_yaml_string(&mut document, glob)?;
+        }
+    }
+    document.push_str("\n---\n");
+    document.push_str(content);
+    Ok(Cow::Owned(document))
+}
+
+fn push_yaml_string(output: &mut String, value: &str) -> Result<(), LpmError> {
+    let encoded = serde_json::to_string(value).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to encode package skill frontmatter: {error}"
+        ))
+    })?;
+    output.push_str(&encoded);
+    Ok(())
 }
 
 pub(super) fn digest(content: &[u8]) -> String {
@@ -253,6 +363,7 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: None,
+            version: None,
             globs: Vec::new(),
             content: Some(content.to_string()),
             raw_content: None,
@@ -340,6 +451,31 @@ mod tests {
     }
 
     #[test]
+    fn materialize_reconstructs_redacted_frontmatter_with_the_authored_version() {
+        let project = tempfile::tempdir().unwrap();
+        let skill: Skill = serde_json::from_value(serde_json::json!({
+            "name": "guide",
+            "description": "Guidance written for an earlier package release",
+            "version": "0.8.0",
+            "globs": ["**/*.rs"],
+            "content": "# Guide\n\nUse the supported API."
+        }))
+        .unwrap();
+
+        materialize(project.path(), "owner.package", Some("1.0.0"), &[skill]).unwrap();
+
+        let content =
+            std::fs::read_to_string(project.path().join(".lpm/skills/owner.package/guide.md"))
+                .unwrap();
+        let (meta, body, errors) =
+            lpm_security::skill_security::parse_agent_skill_frontmatter(&content);
+        assert!(errors.is_empty(), "reconstructed frontmatter: {errors:?}");
+        assert_eq!(meta.version.as_deref(), Some("0.8.0"));
+        assert_eq!(meta.globs, ["**/*.rs"]);
+        assert!(body.contains("Use the supported API."));
+    }
+
+    #[test]
     fn materialization_complete_detects_missing_skill_content() {
         let project = tempfile::tempdir().unwrap();
         materialize(
@@ -353,6 +489,43 @@ mod tests {
         let package_json = r#"{"dependencies":{"@lpm.dev/owner.package":"1.0.0"}}"#;
 
         assert!(!materialization_complete(project.path(), package_json));
+    }
+
+    #[test]
+    fn read_manifest_rejects_oversized_ownership_files() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join("owner.package");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join(MANIFEST_FILE),
+            vec![b' '; MAX_MANIFEST_SIZE as usize + 1],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            read_manifest(&directory, "owner.package"),
+            PackageManifestStatus::Invalid
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_manifest_rejects_symlinked_ownership_files() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join("owner.package");
+        let external = project.path().join("manifest.json");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            &external,
+            r#"{"schema_version":1,"package":"owner.package","version":"1.0.0","skills":{}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&external, directory.join(MANIFEST_FILE)).unwrap();
+
+        assert!(matches!(
+            read_manifest(&directory, "owner.package"),
+            PackageManifestStatus::Invalid
+        ));
     }
 
     #[test]

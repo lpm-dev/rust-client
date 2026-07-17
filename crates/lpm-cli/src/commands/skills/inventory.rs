@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::managed;
-use super::package::{self, MANIFEST_FILE, PackageSkillsManifest};
+use super::package::{self, PackageManifestStatus};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_SCANNED_SKILL_BYTES: u64 = 1024 * 1024;
@@ -282,7 +282,7 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
             continue;
         }
         let package_name = entry.file_name().to_string_lossy().to_string();
-        let manifest = read_package_manifest(&directory, &package_name);
+        let manifest = package::read_manifest(&directory, &package_name);
         let mut observed = BTreeSet::new();
         for skill_entry in std::fs::read_dir(&directory)? {
             let skill_entry = skill_entry?;
@@ -366,36 +366,6 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
         }
     }
     Ok(result)
-}
-
-enum PackageManifestStatus {
-    Missing,
-    Invalid,
-    Valid(PackageSkillsManifest),
-}
-
-fn read_package_manifest(directory: &Path, package_name: &str) -> PackageManifestStatus {
-    let content = match std::fs::read_to_string(directory.join(MANIFEST_FILE)) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return PackageManifestStatus::Missing;
-        }
-        Err(_) => return PackageManifestStatus::Invalid,
-    };
-    let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
-        return PackageManifestStatus::Invalid;
-    };
-    if manifest.schema_version == 1
-        && manifest.package == package_name
-        && manifest
-            .skills
-            .keys()
-            .all(|name| lpm_common::is_safe_skill_name(name))
-    {
-        PackageManifestStatus::Valid(manifest)
-    } else {
-        PackageManifestStatus::Invalid
-    }
 }
 
 fn package_version(manifest: &PackageManifestStatus) -> Option<String> {
@@ -587,6 +557,7 @@ mod tests {
             &[lpm_registry::Skill {
                 name: "guide".into(),
                 description: None,
+                version: None,
                 globs: Vec::new(),
                 content: Some(
                     "---\nname: guide\ndescription: A useful package guide\n---\nUse the guide."
@@ -613,7 +584,7 @@ mod tests {
             "---\nname: guide\ndescription: A useful package guide\n---\nUse the guide.",
         )
         .unwrap();
-        std::fs::write(directory.join(MANIFEST_FILE), "not json").unwrap();
+        std::fs::write(directory.join(package::MANIFEST_FILE), "not json").unwrap();
 
         let inventory = collect(project.path(), false, true).unwrap();
 
@@ -634,6 +605,7 @@ mod tests {
                 lpm_registry::Skill {
                     name: "available".into(),
                     description: None,
+                    version: None,
                     globs: Vec::new(),
                     content: Some(
                         "---\nname: available\ndescription: Available guide\n---\nUse it.".into(),
@@ -644,6 +616,7 @@ mod tests {
                 lpm_registry::Skill {
                     name: "missing".into(),
                     description: None,
+                    version: None,
                     globs: Vec::new(),
                     content: Some(
                         "---\nname: missing\ndescription: Missing guide\n---\nUse it.".into(),

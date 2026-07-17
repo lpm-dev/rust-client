@@ -275,41 +275,36 @@ static SKILL_NAME_RE: LazyLock<Regex> =
 /// The parser is intentionally simple (key: value lines) — skills are small
 /// Markdown files, not complex YAML documents.
 pub fn parse_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>) {
-    parse_skill_frontmatter_with_description_limits(content, true)
+    parse_skill_frontmatter_with_description_limits(content, true, false)
 }
 
 /// Parse standard Agent Skills frontmatter without LPM.dev publish-time
 /// description-length limits.
 pub fn parse_agent_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>) {
-    parse_skill_frontmatter_with_description_limits(content, false)
+    parse_skill_frontmatter_with_description_limits(content, false, true)
 }
 
 fn parse_skill_frontmatter_with_description_limits(
     content: &str,
     enforce_description_limits: bool,
+    allow_description_block_scalars: bool,
 ) -> (SkillMeta, String, Vec<String>) {
     let mut meta = SkillMeta::default();
     let mut errors = Vec::new();
 
-    // Must start with ---
-    if !content.starts_with("---") {
+    let Some(rest) = content
+        .strip_prefix("---\r\n")
+        .or_else(|| content.strip_prefix("---\n"))
+    else {
         errors.push("missing YAML frontmatter (must start with ---)".to_string());
         return (meta, content.to_string(), errors);
-    }
-
-    // Find closing ---
-    let rest = &content[3..];
-    let end = match rest.find("\n---") {
-        Some(pos) => pos,
-        None => {
-            errors.push("missing closing --- for frontmatter".to_string());
-            return (meta, content.to_string(), errors);
-        }
     };
 
-    let yaml_section = &rest[..end];
-    // Skip past \n---  (4 chars), then trim leading newline from body
-    let body = rest[end + 4..].trim_start_matches('\n').to_string();
+    let Some((yaml_section, body)) = split_frontmatter(rest) else {
+        errors.push("missing closing --- for frontmatter".to_string());
+        return (meta, content.to_string(), errors);
+    };
+    let body = body.to_string();
 
     // Simple YAML parsing (key: value, with list support for globs)
     let mut in_globs = false;
@@ -334,11 +329,33 @@ fn parse_skill_frontmatter_with_description_limits(
             let key = key.trim();
             let raw_value = value.trim();
 
-            if key == "description"
+            if allow_description_block_scalars
+                && key == "description"
                 && let Some(style) = block_scalar_style(raw_value)
             {
                 let parent_indent = line.len() - line.trim_start().len();
                 meta.description = Some(parse_block_scalar(&mut lines, parent_indent, style));
+                continue;
+            }
+
+            if key == "globs" {
+                if raw_value.is_empty() {
+                    in_globs = true;
+                } else if let Some(inner) = raw_value
+                    .strip_prefix('[')
+                    .and_then(|value| value.strip_suffix(']'))
+                {
+                    meta.globs.extend(
+                        inner
+                            .split(',')
+                            .map(str::trim)
+                            .map(|glob| glob.trim_matches('"').trim_matches('\''))
+                            .filter(|glob| !glob.is_empty())
+                            .map(str::to_string),
+                    );
+                } else {
+                    errors.push("globs field must be an array of strings".to_string());
+                }
                 continue;
             }
 
@@ -347,8 +364,10 @@ fn parse_skill_frontmatter_with_description_limits(
             match (key, value) {
                 ("name", value) => meta.name = Some(value.to_string()),
                 ("description", value) => meta.description = Some(value.to_string()),
+                ("version", "") => {
+                    errors.push("version field must be a string".to_string());
+                }
                 ("version", value) => meta.version = Some(value.to_string()),
-                ("globs", "") => in_globs = true,
                 ("context" | "hooks", _) => meta.requires_claude_code = true,
                 _ => {} // ignore unknown fields
             }
@@ -369,10 +388,11 @@ fn parse_skill_frontmatter_with_description_limits(
 
     // Validate description
     if let Some(ref desc) = meta.description {
-        if enforce_description_limits && desc.len() < 10 {
+        let description_length = desc.encode_utf16().count();
+        if enforce_description_limits && description_length < 10 {
             errors.push("description too short (minimum 10 characters)".to_string());
         }
-        if enforce_description_limits && desc.len() > 500 {
+        if enforce_description_limits && description_length > 500 {
             errors.push("description too long (maximum 500 characters)".to_string());
         }
     } else {
@@ -380,6 +400,23 @@ fn parse_skill_frontmatter_with_description_limits(
     }
 
     (meta, body, errors)
+}
+
+fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        let Some(line_without_lf) = line.strip_suffix('\n') else {
+            break;
+        };
+        let fence = line_without_lf
+            .strip_suffix('\r')
+            .unwrap_or(line_without_lf);
+        if fence == "---" {
+            return Some((&rest[..offset], &rest[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -911,7 +948,7 @@ console.log(x);
     fn folded_description_is_parsed_as_text() {
         let content = "---\nname: my-skill\ndescription: >\n  A useful skill for\n  application developers.\nversion: 1.2.3\n---\nBody";
 
-        let (meta, _, errors) = parse_skill_frontmatter(content);
+        let (meta, _, errors) = parse_agent_skill_frontmatter(content);
 
         assert!(errors.is_empty(), "errors: {errors:?}");
         assert_eq!(
@@ -925,12 +962,40 @@ console.log(x);
     fn literal_description_preserves_internal_line_breaks() {
         let content = "---\nname: my-skill\ndescription: |-\n  First paragraph.\n\n  Second paragraph.\n---\nBody";
 
-        let (meta, _, errors) = parse_skill_frontmatter(content);
+        let (meta, _, errors) = parse_agent_skill_frontmatter(content);
 
         assert!(errors.is_empty(), "errors: {errors:?}");
         assert_eq!(
             meta.description.as_deref(),
             Some("First paragraph.\n\nSecond paragraph.")
+        );
+    }
+
+    #[test]
+    fn package_folded_description_uses_registry_literal_semantics() {
+        let content = "---\nname: my-skill\ndescription: >\n  A useful skill for\n  application developers.\n---\nBody";
+
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert_eq!(meta.description.as_deref(), Some(">"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("description too short"))
+        );
+    }
+
+    #[test]
+    fn package_literal_description_uses_registry_literal_semantics() {
+        let content = "---\nname: my-skill\ndescription: |-\n  First paragraph.\n\n  Second paragraph.\n---\nBody";
+
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert_eq!(meta.description.as_deref(), Some("|-"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("description too short"))
         );
     }
 }
