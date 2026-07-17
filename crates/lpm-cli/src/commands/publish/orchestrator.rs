@@ -4,16 +4,13 @@ use super::output::{
     print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
     publish_result_json, visibility_from_access,
 };
-use super::prepare::prepare_publish_project;
+use super::prepare::{prepare_publish_project_from_manifest, read_publish_manifest};
 use super::provenance::{
     ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
 };
 use super::quality_gate::run_publish_quality_gate;
 use super::secret_scan::run_publish_secret_scan;
-use super::skills::{
-    compute_published_skills_digest, compute_skills_digest, ensure_lpm_in_files,
-    validate_skills_for_publish,
-};
+use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
 use super::target::resolve_targets;
 use super::types::{
     NpmTargetArtifact, NpmTargetArtifactInput, PublishProject, PublishQualityGateInput,
@@ -21,6 +18,7 @@ use super::types::{
 };
 use super::upload_lpm::publish_to_lpm;
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
+use crate::commands::skills::author;
 use crate::commands::{npm_auth, publish_common, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, sigstore};
 use lpm_common::LpmError;
@@ -60,20 +58,7 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let publish_started = std::time::Instant::now();
 
-    let PublishProject {
-        package_json_path: pkg_json_path,
-        pkg_json,
-        name,
-        version,
-        publish_config,
-        readme,
-        tarball_data,
-        tarball_files,
-        tarball_size,
-        detected_ecosystem,
-        swift_manifest,
-    } = prepare_publish_project(project_dir)?;
-    let publish_config = publish_config.as_ref();
+    let mut publish_manifest = read_publish_manifest(project_dir)?;
 
     // Resolve target registries
     let targets = resolve_targets(
@@ -82,7 +67,7 @@ pub async fn run(
         cli_github,
         cli_gitlab,
         cli_registry,
-        publish_config,
+        publish_manifest.publish_config.as_ref(),
     )?;
 
     // Cap registry fan-out so one publish command cannot spray tokens too broadly.
@@ -95,6 +80,87 @@ pub async fn run(
     }
 
     let targets_lpm = targets.contains(&PublishTarget::Lpm);
+    if targets_lpm {
+        let lpm_name = publish_manifest
+            .publish_config
+            .as_ref()
+            .and_then(|config| config.lpm.as_ref())
+            .and_then(|config| config.name.as_deref())
+            .unwrap_or(&publish_manifest.name);
+        if !lpm_name.starts_with("@lpm.dev/") {
+            return Err(LpmError::Registry(format!(
+                "LPM registry requires @lpm.dev/ prefix (got \"{lpm_name}\"). \
+						 Set publish.lpm.name in lpm.json."
+            )));
+        }
+    }
+
+    // Publisher-authored skills must be validated and included in a restrictive
+    // package.json `files` list before the publish tarball is created.
+    let skills_dir = project_dir.join(".lpm").join("skills");
+    let has_skills = if targets_lpm {
+        let validation = author::validate_directory(&skills_dir)?;
+
+        if !validation.security_issues.is_empty() {
+            for located in &validation.security_issues {
+                let issue = &located.issue;
+                install_ui::warn(&format!(
+                    "Skill security: {}: {} — {} at line {} ({})",
+                    located.path,
+                    issue.matched_text,
+                    issue.category,
+                    issue.line_number,
+                    issue.pattern
+                ));
+            }
+            return Err(LpmError::Registry(
+                "skills contain blocked security patterns".into(),
+            ));
+        }
+
+        if !validation.errors.is_empty() {
+            for error in &validation.errors {
+                install_ui::warn(error);
+            }
+            return Err(LpmError::Registry(
+                "skills validation failed — fix errors above".into(),
+            ));
+        }
+
+        let has_authored_skills = !validation.valid_files.is_empty();
+        if has_authored_skills {
+            if !json_output {
+                install_ui::done(&format!(
+                    "{} skill(s) validated",
+                    validation.valid_files.len()
+                ));
+            }
+            if ensure_lpm_in_files(
+                &publish_manifest.package_json_path,
+                &publish_manifest.pkg_json,
+            )? {
+                publish_manifest = read_publish_manifest(project_dir)?;
+            }
+        }
+        has_authored_skills
+    } else {
+        false
+    };
+
+    let PublishProject {
+        pkg_json,
+        name,
+        version,
+        publish_config,
+        readme,
+        tarball_data,
+        tarball_files,
+        tarball_size,
+        detected_ecosystem,
+        swift_manifest,
+    } = prepare_publish_project_from_manifest(project_dir, publish_manifest)?;
+    let publish_config = publish_config.as_ref();
+
     let targets_gitlab = targets.iter().any(|t| matches!(t, PublishTarget::GitLab));
 
     // GitLab Packages requires projectId in lpm.json
@@ -107,7 +173,7 @@ pub async fn run(
         }
     }
 
-    // Resolve per-target names early (before expensive tarball work).
+    // Resolve the package name used by each target.
     // Each registry can have its own name override in lpm.json.
     // package.json `name` is the fallback when no config override exists.
     let lpm_config = publish_config.and_then(|p| p.lpm.as_ref());
@@ -240,45 +306,6 @@ pub async fn run(
         None
     };
 
-    // Skills validation applies only to LPM publishes.
-    let skills_dir = project_dir.join(".lpm").join("skills");
-    let has_skills = skills_dir.exists() && skills_dir.is_dir();
-
-    if has_skills && targets_lpm {
-        if !json_output {
-            install_ui::phase("Validating skills");
-        }
-
-        let (valid, skill_errors, security_issues) = validate_skills_for_publish(&skills_dir);
-
-        if !security_issues.is_empty() {
-            for issue in &security_issues {
-                install_ui::warn(&format!(
-                    "Skill security: {} — {} at line {} ({})",
-                    issue.matched_text, issue.category, issue.line_number, issue.pattern
-                ));
-            }
-            return Err(LpmError::Registry(
-                "skills contain blocked security patterns".into(),
-            ));
-        }
-
-        if !skill_errors.is_empty() {
-            for err in &skill_errors {
-                install_ui::warn(err);
-            }
-            return Err(LpmError::Registry(
-                "skills validation failed — fix errors above".into(),
-            ));
-        }
-
-        if !json_output {
-            install_ui::done(&format!("{valid} skill(s) validated"));
-        }
-
-        ensure_lpm_in_files(&pkg_json_path, &pkg_json)?;
-    }
-
     // OIDC auto-exchange is limited to LPM publishes, real publish, and dry-run.
     //
     // Gated on `targets_lpm && !check_only`:
@@ -336,7 +363,7 @@ pub async fn run(
         let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(&name);
         match client.get_skills(name_short, None).await {
             Ok(prev) if !prev.skills.is_empty() => {
-                let local_digest = compute_skills_digest(&skills_dir);
+                let local_digest = author::compute_digest(&skills_dir)?;
                 let published_digest = compute_published_skills_digest(&prev.skills);
                 if local_digest == published_digest && !json_output {
                     install_ui::warn(

@@ -342,13 +342,36 @@ fn parse_skill_frontmatter_with_description_limits(
                 continue;
             }
 
+            if key == "globs" {
+                if raw_value.is_empty() {
+                    in_globs = true;
+                } else if let Some(inner) = raw_value
+                    .strip_prefix('[')
+                    .and_then(|value| value.strip_suffix(']'))
+                {
+                    meta.globs.extend(
+                        inner
+                            .split(',')
+                            .map(str::trim)
+                            .map(|glob| glob.trim_matches('"').trim_matches('\''))
+                            .filter(|glob| !glob.is_empty())
+                            .map(str::to_string),
+                    );
+                } else {
+                    errors.push("globs field must be an array of strings".to_string());
+                }
+                continue;
+            }
+
             let value = raw_value.trim_matches('"').trim_matches('\'');
 
             match (key, value) {
                 ("name", value) => meta.name = Some(value.to_string()),
                 ("description", value) => meta.description = Some(value.to_string()),
+                ("version", "") => {
+                    errors.push("version field must be a string".to_string());
+                }
                 ("version", value) => meta.version = Some(value.to_string()),
-                ("globs", "") => in_globs = true,
                 ("context" | "hooks", _) => meta.requires_claude_code = true,
                 _ => {} // ignore unknown fields
             }
@@ -369,10 +392,11 @@ fn parse_skill_frontmatter_with_description_limits(
 
     // Validate description
     if let Some(ref desc) = meta.description {
-        if enforce_description_limits && desc.len() < 10 {
+        let description_length = desc.encode_utf16().count();
+        if enforce_description_limits && description_length < 10 {
             errors.push("description too short (minimum 10 characters)".to_string());
         }
-        if enforce_description_limits && desc.len() > 500 {
+        if enforce_description_limits && description_length > 500 {
             errors.push("description too long (maximum 500 characters)".to_string());
         }
     } else {

@@ -60,7 +60,6 @@ pub struct PublishResult {
 
 /// Local package artifact prepared for publish-like uploads.
 pub(crate) struct PublishProject {
-    pub(crate) package_json_path: std::path::PathBuf,
     pub(crate) pkg_json: serde_json::Value,
     pub(crate) name: String,
     pub(crate) version: String,

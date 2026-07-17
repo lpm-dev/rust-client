@@ -4,7 +4,20 @@ use lpm_common::LpmError;
 use lpm_runner::lpm_json;
 use std::path::Path;
 
+pub(super) struct PublishManifest {
+    pub(super) package_json_path: std::path::PathBuf,
+    pub(super) pkg_json: serde_json::Value,
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) publish_config: Option<lpm_json::PublishConfig>,
+}
+
 pub(crate) fn prepare_publish_project(project_dir: &Path) -> Result<PublishProject, LpmError> {
+    let manifest = read_publish_manifest(project_dir)?;
+    prepare_publish_project_from_manifest(project_dir, manifest)
+}
+
+pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifest, LpmError> {
     let package_json_path = project_dir.join("package.json");
     if !package_json_path.exists() {
         return Err(LpmError::NotFound(
@@ -30,6 +43,27 @@ pub(crate) fn prepare_publish_project(project_dir: &Path) -> Result<PublishProje
 
     let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Registry)?;
     let publish_config = lpm_config.and_then(|c| c.publish);
+
+    Ok(PublishManifest {
+        package_json_path,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+    })
+}
+
+pub(super) fn prepare_publish_project_from_manifest(
+    project_dir: &Path,
+    manifest: PublishManifest,
+) -> Result<PublishProject, LpmError> {
+    let PublishManifest {
+        package_json_path: _,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+    } = manifest;
     let readme = publish_common::read_readme(project_dir);
     let (mut tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
 
@@ -51,7 +85,6 @@ pub(crate) fn prepare_publish_project(project_dir: &Path) -> Result<PublishProje
     let (detected_ecosystem, swift_manifest) = detect_publish_ecosystem(project_dir);
 
     Ok(PublishProject {
-        package_json_path,
         pkg_json,
         name,
         version,

@@ -1,11 +1,13 @@
 use super::output::{format_dry_run_files_value, format_publish_retry_detail};
+use super::prepare::{prepare_publish_project_from_manifest, read_publish_manifest};
 use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_json};
-use super::skills::{compute_skills_digest, ensure_lpm_in_files};
+use super::skills::ensure_lpm_in_files;
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets};
 use super::types::PublishTarget;
 use super::version_data::integrity_to_sha512_hex;
 use crate::commands::publish_common;
+use crate::commands::skills::author;
 use lpm_runner::lpm_json;
 use lpm_security::behavioral::secrets::{SecretMatch, SecretScanResult};
 
@@ -112,6 +114,48 @@ fn ensure_lpm_in_files_already_present() {
 }
 
 #[test]
+fn publisher_skills_are_included_when_files_array_was_restrictive() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+    std::fs::create_dir_all(project.join(".lpm/skills")).unwrap();
+    std::fs::write(
+        project.join("package.json"),
+        r#"{
+  "name": "@lpm.dev/owner.package",
+  "version": "1.0.0",
+  "files": ["index.js"]
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+    std::fs::write(
+        project.join(".lpm/skills/usage.md"),
+        format!(
+            "---\nname: usage\ndescription: Complete package usage guidance\n---\n# Usage\n\n{}",
+            "Use this package through its documented public API. This guidance includes enough detail for an agent to follow the supported workflow safely."
+        ),
+    )
+    .unwrap();
+
+    let mut manifest = read_publish_manifest(project).unwrap();
+    assert!(
+        ensure_lpm_in_files(&manifest.package_json_path, &manifest.pkg_json).unwrap(),
+        "the restrictive files array should be updated before tarball creation"
+    );
+    manifest = read_publish_manifest(project).unwrap();
+    let prepared = prepare_publish_project_from_manifest(project, manifest).unwrap();
+
+    assert!(
+        prepared
+            .tarball_files
+            .iter()
+            .any(|file| file.path == ".lpm/skills/usage.md"),
+        "the current publish tarball must include publisher-authored skills"
+    );
+}
+
+#[test]
 fn skills_digest_deterministic() {
     let dir = tempfile::tempdir().unwrap();
     let skills_dir = dir.path().join("skills");
@@ -119,12 +163,12 @@ fn skills_digest_deterministic() {
     std::fs::write(skills_dir.join("a.md"), "alpha").unwrap();
     std::fs::write(skills_dir.join("b.md"), "beta").unwrap();
 
-    let d1 = compute_skills_digest(&skills_dir);
-    let d2 = compute_skills_digest(&skills_dir);
+    let d1 = author::compute_digest(&skills_dir).unwrap();
+    let d2 = author::compute_digest(&skills_dir).unwrap();
     assert_eq!(d1, d2, "same content must produce same digest");
 
     std::fs::write(skills_dir.join("b.md"), "gamma").unwrap();
-    let d3 = compute_skills_digest(&skills_dir);
+    let d3 = author::compute_digest(&skills_dir).unwrap();
     assert_ne!(d1, d3, "different content must produce different digest");
 }
 

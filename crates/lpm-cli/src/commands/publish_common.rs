@@ -353,6 +353,9 @@ fn collect_dir_files(
     canonical_root: &Path,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
+    if is_materialized_package_skills_directory(dir, project_root) {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -441,6 +444,9 @@ fn collect_all_files(
     canonical_root: &Path,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
+    if is_materialized_package_skills_directory(dir, project_root) {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -473,6 +479,14 @@ fn collect_all_files(
         }
     }
     Ok(())
+}
+
+fn is_materialized_package_skills_directory(directory: &Path, project_root: &Path) -> bool {
+    let Ok(relative) = directory.strip_prefix(project_root) else {
+        return false;
+    };
+    relative.parent() == Some(Path::new(".lpm/skills"))
+        && crate::commands::skills::package::is_materialized_directory(directory)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +862,71 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"package.json"));
         assert!(paths.contains(&"index.js"));
+    }
+
+    #[test]
+    fn create_tarball_excludes_materialized_dependency_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+        crate::commands::skills::package::materialize(
+            project,
+            "owner.dependency",
+            Some("2.0.0"),
+            &[lpm_registry::Skill {
+                name: "usage".into(),
+                description: None,
+                globs: Vec::new(),
+                content: Some("dependency guidance".into()),
+                raw_content: None,
+                size_bytes: None,
+            }],
+        )
+        .unwrap();
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.path.starts_with(".lpm/skills/owner.dependency/"))
+        );
+    }
+
+    #[test]
+    fn create_tarball_does_not_exclude_manifest_shaped_directories_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let fixture = project.join("fixtures/owner.package");
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.join(".lpm-package-skills.json"),
+            r#"{"schema_version":1,"package":"owner.package","version":"1.0.0","skills":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(fixture.join("payload.txt"), "fixture").unwrap();
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == "fixtures/owner.package/payload.txt")
+        );
     }
 
     #[test]

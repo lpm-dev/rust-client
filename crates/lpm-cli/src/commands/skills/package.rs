@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub(super) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
 const MANIFEST_VERSION: u32 = 1;
+const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PackageSkillsManifest {
@@ -14,6 +15,12 @@ pub(super) struct PackageSkillsManifest {
     pub(super) package: String,
     pub(super) version: Option<String>,
     pub(super) skills: BTreeMap<String, String>,
+}
+
+pub(super) enum PackageManifestStatus {
+    Missing,
+    Invalid,
+    Valid(PackageSkillsManifest),
 }
 
 pub(crate) struct PackageSkillsResult {
@@ -118,6 +125,48 @@ pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError>
     Ok(bytes)
 }
 
+pub(super) fn read_manifest(directory: &Path, expected_package: &str) -> PackageManifestStatus {
+    let path = directory.join(MANIFEST_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PackageManifestStatus::Missing;
+        }
+        Err(_) => return PackageManifestStatus::Invalid,
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_MANIFEST_SIZE
+    {
+        return PackageManifestStatus::Invalid;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return PackageManifestStatus::Invalid,
+    };
+    let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
+        return PackageManifestStatus::Invalid;
+    };
+    if manifest.schema_version == MANIFEST_VERSION
+        && manifest.package == expected_package
+        && manifest
+            .skills
+            .keys()
+            .all(|name| lpm_common::is_safe_skill_name(name))
+    {
+        PackageManifestStatus::Valid(manifest)
+    } else {
+        PackageManifestStatus::Invalid
+    }
+}
+
+pub(crate) fn is_materialized_directory(directory: &Path) -> bool {
+    let Some(package) = directory.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    materialized_directory_complete(directory, package)
+}
+
 pub(crate) fn acquire_mutation_lock(
     project_dir: &Path,
 ) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
@@ -155,22 +204,20 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
 
 fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
     let directory = project_dir.join(".lpm").join("skills").join(package);
-    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+    materialized_directory_complete(&directory, package)
+}
+
+fn materialized_directory_complete(directory: &Path, package: &str) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(directory) else {
         return false;
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return false;
     }
-    let Ok(content) = std::fs::read_to_string(directory.join(MANIFEST_FILE)) else {
+    let PackageManifestStatus::Valid(manifest) = read_manifest(directory, package) else {
         return false;
     };
-    let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
-        return false;
-    };
-    if manifest.schema_version != MANIFEST_VERSION || manifest.package != package {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(&directory) else {
+    let Ok(entries) = std::fs::read_dir(directory) else {
         return false;
     };
     let mut seen = BTreeSet::new();
@@ -353,6 +400,43 @@ mod tests {
         let package_json = r#"{"dependencies":{"@lpm.dev/owner.package":"1.0.0"}}"#;
 
         assert!(!materialization_complete(project.path(), package_json));
+    }
+
+    #[test]
+    fn read_manifest_rejects_oversized_ownership_files() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join("owner.package");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join(MANIFEST_FILE),
+            vec![b' '; MAX_MANIFEST_SIZE as usize + 1],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            read_manifest(&directory, "owner.package"),
+            PackageManifestStatus::Invalid
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_manifest_rejects_symlinked_ownership_files() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join("owner.package");
+        let external = project.path().join("manifest.json");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            &external,
+            r#"{"schema_version":1,"package":"owner.package","version":"1.0.0","skills":{}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&external, directory.join(MANIFEST_FILE)).unwrap();
+
+        assert!(matches!(
+            read_manifest(&directory, "owner.package"),
+            PackageManifestStatus::Invalid
+        ));
     }
 
     #[test]
