@@ -113,8 +113,9 @@ pub struct VersionMetadata {
     #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
 
-    /// Runtime compatibility constraints declared by this version.
-    #[serde(default)]
+    /// Runtime compatibility constraints declared by this version. Historical
+    /// npm packuments that list runtime names without ranges are ignored.
+    #[serde(default, deserialize_with = "deserialize_engine_constraints")]
     pub engines: HashMap<String, String>,
 
     /// Platform restrictions: `"darwin"` or `["darwin", "linux", "win32"]`.
@@ -1253,6 +1254,77 @@ where
     Ok(out)
 }
 
+fn deserialize_engine_constraints<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct EngineConstraintsVisitor;
+
+    impl<'de> Visitor<'de> for EngineConstraintsVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an engine-to-version-range map or a legacy runtime-name list")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_bool<E: de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_i64<E: de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_u64<E: de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_string<E: de::Error>(self, _value: String) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(HashMap::new())
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut constraints = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
+                if let serde_json::Value::String(range) = value {
+                    constraints.insert(name, range);
+                }
+            }
+            Ok(constraints)
+        }
+    }
+
+    deserializer.deserialize_any(EngineConstraintsVisitor)
+}
+
 fn deserialize_string_or_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1469,6 +1541,45 @@ mod tests {
         assert_eq!(
             version.libc.iter().map(String::as_str).collect::<Vec<_>>(),
             ["glibc"]
+        );
+    }
+
+    #[test]
+    fn package_metadata_ignores_legacy_engine_name_arrays_and_preserves_node_ranges() {
+        let json = r#"{
+            "name": "lodash",
+            "dist-tags": {
+                "latest": "4.17.21"
+            },
+            "versions": {
+                "0.1.0": {
+                    "name": "lodash",
+                    "version": "0.1.0",
+                    "engines": ["node", "rhino"]
+                },
+                "4.17.21": {
+                    "name": "lodash",
+                    "version": "4.17.21",
+                    "engines": {
+                        "node": ">=0.10.0"
+                    }
+                }
+            }
+        }"#;
+
+        let metadata: PackageMetadata =
+            serde_json::from_str(json).expect("historical npm engines arrays should parse");
+        let legacy = metadata
+            .version("0.1.0")
+            .expect("metadata should include the historical version");
+        let current = metadata
+            .version("4.17.21")
+            .expect("metadata should include the current version");
+
+        assert!(legacy.engines.is_empty());
+        assert_eq!(
+            current.engines.get("node").map(String::as_str),
+            Some(">=0.10.0")
         );
     }
 
