@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ impl SecurityAssessment {
         }
     }
 
-    fn unavailable(message: String) -> Self {
+    pub(super) fn unavailable(message: String) -> Self {
         Self {
             status: "unavailable".into(),
             warning_count: 0,
@@ -283,6 +283,7 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
         }
         let package_name = entry.file_name().to_string_lossy().to_string();
         let manifest = read_package_manifest(&directory, &package_name);
+        let mut observed = BTreeSet::new();
         for skill_entry in std::fs::read_dir(&directory)? {
             let skill_entry = skill_entry?;
             let path = skill_entry.path();
@@ -298,6 +299,7 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            observed.insert(name.clone());
             let (content, security) = read_and_scan(&path);
             let description = content.as_deref().and_then(|content| {
                 lpm_security::skill_security::parse_skill_frontmatter(content)
@@ -330,6 +332,38 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
                 command: format!("lpm skills view {package_name}/{name}"),
             });
         }
+        if let PackageManifestStatus::Valid(manifest) = &manifest {
+            for name in manifest
+                .skills
+                .keys()
+                .filter(|name| !observed.contains(*name))
+            {
+                let path = directory.join(format!("{name}.md"));
+                let package = format!("@lpm.dev/{package_name}");
+                let identity = format!("{}:{name}", directory.display());
+                result.push(SkillInventoryItem {
+                    id: stable_id("package", &identity),
+                    kind: SkillInventoryKind::Package,
+                    name: name.clone(),
+                    description: None,
+                    source: package.clone(),
+                    scope: "project".into(),
+                    package: Some(package),
+                    version: manifest.version.clone(),
+                    path: Some(path.display().to_string()),
+                    size_bytes: None,
+                    context_tokens: None,
+                    targets: Vec::new(),
+                    healthy: false,
+                    integrity: Some("missing".into()),
+                    security: SecurityAssessment::unavailable(
+                        "package skill content is missing".into(),
+                    ),
+                    actions: Vec::new(),
+                    command: format!("lpm skills view {package_name}/{name}"),
+                });
+            }
+        }
     }
     Ok(result)
 }
@@ -351,7 +385,13 @@ fn read_package_manifest(directory: &Path, package_name: &str) -> PackageManifes
     let Ok(manifest) = serde_json::from_str::<PackageSkillsManifest>(&content) else {
         return PackageManifestStatus::Invalid;
     };
-    if manifest.schema_version == 1 && manifest.package == package_name {
+    if manifest.schema_version == 1
+        && manifest.package == package_name
+        && manifest
+            .skills
+            .keys()
+            .all(|name| lpm_common::is_safe_skill_name(name))
+    {
         PackageManifestStatus::Valid(manifest)
     } else {
         PackageManifestStatus::Invalid
@@ -445,6 +485,49 @@ pub(super) fn read_and_scan(path: &Path) -> (Option<String>, SecurityAssessment)
     (content.into(), SecurityAssessment::scanned(findings))
 }
 
+pub(super) fn read_and_scan_directory(
+    directory: &Path,
+) -> (Option<String>, Option<usize>, SecurityAssessment) {
+    let files = match super::source::read_bounded_skill_directory(directory) {
+        Ok(files) => files,
+        Err(error) => {
+            return (
+                None,
+                None,
+                SecurityAssessment::unavailable(format!("could not scan skill directory: {error}")),
+            );
+        }
+    };
+    let mut skill_content = None;
+    let mut context_chars = 0usize;
+    let mut findings = Vec::new();
+    for (path, bytes) in files {
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        context_chars = context_chars.saturating_add(content.chars().count());
+        findings.extend(
+            lpm_security::skill_security::scan_skill_content(&content)
+                .into_iter()
+                .map(|finding| SecurityFinding {
+                    rule_id: finding.rule_id,
+                    category: finding.category,
+                    severity: finding.severity,
+                    path: path.display().to_string(),
+                    line: finding.line_number,
+                }),
+        );
+        if path == Path::new("SKILL.md") {
+            skill_content = Some(content);
+        }
+    }
+    (
+        skill_content,
+        Some(context_chars.div_ceil(4)),
+        SecurityAssessment::scanned(findings),
+    )
+}
+
 pub(super) fn stable_id(kind: &str, identity: &str) -> String {
     let digest = Sha256::digest(identity.as_bytes());
     format!("{kind}:{}", hex::encode(digest))
@@ -452,10 +535,6 @@ pub(super) fn stable_id(kind: &str, identity: &str) -> String {
 
 pub(super) fn target_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-pub(super) fn skill_file_path(directory: &Path) -> PathBuf {
-    directory.join("SKILL.md")
 }
 
 #[cfg(test)]
@@ -524,5 +603,50 @@ mod tests {
             inventory.skills[0].integrity.as_deref(),
             Some("invalid-manifest")
         );
+    }
+
+    #[test]
+    fn package_inventory_surfaces_a_missing_manifest_skill_as_needing_attention() {
+        let project = tempfile::tempdir().unwrap();
+        package::materialize(
+            project.path(),
+            "owner.package",
+            Some("1.2.3"),
+            &[
+                lpm_registry::Skill {
+                    name: "available".into(),
+                    description: None,
+                    globs: Vec::new(),
+                    content: Some(
+                        "---\nname: available\ndescription: Available guide\n---\nUse it.".into(),
+                    ),
+                    raw_content: None,
+                    size_bytes: None,
+                },
+                lpm_registry::Skill {
+                    name: "missing".into(),
+                    description: None,
+                    globs: Vec::new(),
+                    content: Some(
+                        "---\nname: missing\ndescription: Missing guide\n---\nUse it.".into(),
+                    ),
+                    raw_content: None,
+                    size_bytes: None,
+                },
+            ],
+        )
+        .unwrap();
+        std::fs::remove_file(project.path().join(".lpm/skills/owner.package/missing.md")).unwrap();
+
+        let inventory = collect(project.path(), false, true).unwrap();
+        let missing = inventory
+            .skills
+            .iter()
+            .find(|skill| skill.name == "missing")
+            .expect("the missing manifest skill must remain visible");
+
+        assert_eq!(missing.integrity.as_deref(), Some("missing"));
+        assert!(!missing.healthy);
+        assert_eq!(inventory.counts.needs_attention, 1);
     }
 }

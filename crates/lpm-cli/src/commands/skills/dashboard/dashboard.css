@@ -201,6 +201,7 @@ select { padding: 0 29px 0 10px; font-size: 12px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th { padding: 11px 13px; color: var(--faint); font-size: 10px; letter-spacing: .07em; text-align: left; text-transform: uppercase; white-space: nowrap; }
+th:last-child { position: relative; }
 td { padding: 14px 13px; border-top: 1px solid var(--border); vertical-align: middle; }
 tbody tr { cursor: pointer; transition: background .12s ease; }
 tbody tr:hover { background: rgba(37, 48, 41, .64); }

@@ -173,19 +173,14 @@ async fn start(
     let display_url = format!("http://127.0.0.1:{bound_port}/");
     let auth_token: Arc<str> = random_token().into();
     let launch_url = format!("{display_url}#token={auth_token}");
+    let (allowed_hosts, allowed_origins) = loopback_authority_allowlists(bound_port);
     let state = DashboardState {
         project_dir: Arc::new(project_dir.to_path_buf()),
         include_global,
         read_only,
         auth_token,
-        allowed_hosts: Arc::new([
-            format!("127.0.0.1:{bound_port}"),
-            format!("localhost:{bound_port}"),
-        ]),
-        allowed_origins: Arc::new([
-            format!("http://127.0.0.1:{bound_port}"),
-            format!("http://localhost:{bound_port}"),
-        ]),
+        allowed_hosts: Arc::new(allowed_hosts),
+        allowed_origins: Arc::new(allowed_origins),
         plans: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
     let api = Router::new()
@@ -221,6 +216,24 @@ async fn start(
         launch_url,
         shutdown_tx,
     })
+}
+
+fn loopback_authority_allowlists(port: u16) -> ([String; 2], [String; 2]) {
+    let port_suffix = if port == 80 {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    (
+        [
+            format!("127.0.0.1{port_suffix}"),
+            format!("localhost{port_suffix}"),
+        ],
+        [
+            format!("http://127.0.0.1{port_suffix}"),
+            format!("http://localhost{port_suffix}"),
+        ],
+    )
 }
 
 fn dashboard_bind_error(port: u16, error: std::io::Error) -> LpmError {
@@ -518,6 +531,30 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_http_port_allowlists_canonical_browser_authorities() {
+        let (hosts, origins) = loopback_authority_allowlists(80);
+
+        assert_eq!(hosts, ["127.0.0.1", "localhost"]);
+        assert_eq!(origins, ["http://127.0.0.1", "http://localhost"]);
+    }
+
+    #[test]
+    fn non_default_http_port_allowlists_explicit_authorities() {
+        let (hosts, origins) = loopback_authority_allowlists(43127);
+
+        assert_eq!(hosts, ["127.0.0.1:43127", "localhost:43127"]);
+        assert_eq!(
+            origins,
+            ["http://127.0.0.1:43127", "http://localhost:43127"]
+        );
+    }
+
+    #[test]
+    fn visually_hidden_actions_label_is_contained_by_its_table_header() {
+        assert!(DASHBOARD_CSS.contains("th:last-child { position: relative; }"));
+    }
 
     #[tokio::test]
     async fn automatic_port_avoids_an_existing_loopback_server() {

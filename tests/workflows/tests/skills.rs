@@ -7,6 +7,7 @@ use std::process::Child;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use support::mock_registry::MockRegistry;
 use support::mock_registry::make_tarball;
 use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry};
@@ -271,6 +272,50 @@ fn skills_dashboard_serves_authenticated_unified_inventory() {
     assert_eq!(inventory["skills"][0]["name"], "format-code");
     assert_eq!(inventory["skills"][0]["security"]["status"], "scanned");
     assert_eq!(inventory["read_only"], true);
+}
+
+#[test]
+fn skills_dashboard_surfaces_a_deleted_package_manifest_skill() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let available =
+        "---\nname: available\ndescription: Use the available package guide\n---\nFollow it.";
+    let missing = "---\nname: missing\ndescription: Use the missing package guide\n---\nFollow it.";
+    project.write_file(".lpm/skills/owner.package/available.md", available);
+    project.write_file(".lpm/skills/owner.package/missing.md", missing);
+    project.write_file(
+        ".lpm/skills/owner.package/.lpm-package-skills.json",
+        &serde_json::json!({
+            "schema_version": 1,
+            "package": "owner.package",
+            "version": "1.0.0",
+            "skills": {
+                "available": hex::encode(Sha256::digest(available.as_bytes())),
+                "missing": hex::encode(Sha256::digest(missing.as_bytes())),
+            }
+        })
+        .to_string(),
+    );
+    std::fs::remove_file(project.path().join(".lpm/skills/owner.package/missing.md")).unwrap();
+    let dashboard = DashboardProcess::start(&project, &["--read-only"]);
+
+    let inventory: serde_json::Value = dashboard
+        .client()
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory")
+        .json()
+        .expect("decode dashboard inventory");
+    let missing = inventory["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "missing")
+        .expect("deleted package skill must remain visible");
+
+    assert_eq!(missing["integrity"], "missing");
+    assert_eq!(missing["healthy"], false);
+    assert_eq!(inventory["counts"]["needs_attention"], 1);
 }
 
 #[test]
