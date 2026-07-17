@@ -3289,6 +3289,59 @@ mod tests {
         assert_eq!(inventory[0].context_tokens, Some(expected));
     }
 
+    #[test]
+    fn dashboard_external_inventory_marks_non_utf8_skill_content_unavailable() {
+        let project = tempfile::tempdir().unwrap();
+        let damaged = project.path().join(".agents/skills/damaged");
+        let healthy = project.path().join(".agents/skills/healthy");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::write(damaged.join("SKILL.md"), b"\xff\xfe\xfd").unwrap();
+        std::fs::write(
+            healthy.join("SKILL.md"),
+            "---\nname: healthy\ndescription: Healthy guide\n---\nUse the guide.",
+        )
+        .unwrap();
+
+        let inventory = dashboard_external_inventory(project.path(), false).unwrap();
+        let damaged = inventory
+            .iter()
+            .find(|skill| skill.name == "damaged")
+            .unwrap();
+        let healthy = inventory
+            .iter()
+            .find(|skill| skill.name == "healthy")
+            .unwrap();
+
+        assert_eq!(damaged.security.status, "unavailable");
+        assert!(damaged.needs_attention());
+        assert_eq!(damaged.context_tokens, None);
+        assert_eq!(healthy.security.status, "scanned");
+        assert_eq!(healthy.description.as_deref(), Some("Healthy guide"));
+
+        let snapshot = super::super::inventory::collect(project.path(), false, true).unwrap();
+        let snapshot = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(snapshot["counts"]["needs_attention"], 1);
+    }
+
+    #[test]
+    fn dashboard_external_inventory_ignores_non_utf8_auxiliary_content() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join(".agents/skills/manual");
+        let skill_content = "---\nname: manual\ndescription: Manual guide\n---\nUse the guide.";
+        std::fs::create_dir_all(directory.join("assets")).unwrap();
+        std::fs::write(directory.join("SKILL.md"), skill_content).unwrap();
+        std::fs::write(directory.join("assets/icon.bin"), b"\xff\xfe\xfd").unwrap();
+
+        let inventory = dashboard_external_inventory(project.path(), false).unwrap();
+
+        assert_eq!(inventory[0].security.status, "scanned");
+        assert_eq!(
+            inventory[0].context_tokens,
+            Some(skill_content.chars().count().div_ceil(4))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn dashboard_external_inventory_does_not_follow_auxiliary_symlinks() {

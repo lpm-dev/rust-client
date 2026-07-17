@@ -502,8 +502,19 @@ pub(super) fn read_and_scan_directory(
     let mut context_chars = 0usize;
     let mut findings = Vec::new();
     for (path, bytes) in files {
-        let Ok(content) = String::from_utf8(bytes) else {
-            continue;
+        let is_primary = path == Path::new("SKILL.md");
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) if is_primary => {
+                return (
+                    None,
+                    None,
+                    SecurityAssessment::unavailable(
+                        "primary SKILL.md is not valid UTF-8 text".into(),
+                    ),
+                );
+            }
+            Err(_) => continue,
         };
         context_chars = context_chars.saturating_add(content.chars().count());
         findings.extend(
@@ -517,12 +528,19 @@ pub(super) fn read_and_scan_directory(
                     line: finding.line_number,
                 }),
         );
-        if path == Path::new("SKILL.md") {
+        if is_primary {
             skill_content = Some(content);
         }
     }
+    let Some(skill_content) = skill_content else {
+        return (
+            None,
+            None,
+            SecurityAssessment::unavailable("primary SKILL.md is missing".into()),
+        );
+    };
     (
-        skill_content,
+        Some(skill_content),
         Some(context_chars.div_ceil(4)),
         SecurityAssessment::scanned(findings),
     )
