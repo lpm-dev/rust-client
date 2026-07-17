@@ -292,25 +292,19 @@ fn parse_skill_frontmatter_with_description_limits(
     let mut meta = SkillMeta::default();
     let mut errors = Vec::new();
 
-    // Must start with ---
-    if !content.starts_with("---") {
+    let Some(rest) = content
+        .strip_prefix("---\r\n")
+        .or_else(|| content.strip_prefix("---\n"))
+    else {
         errors.push("missing YAML frontmatter (must start with ---)".to_string());
         return (meta, content.to_string(), errors);
-    }
-
-    // Find closing ---
-    let rest = &content[3..];
-    let end = match rest.find("\n---") {
-        Some(pos) => pos,
-        None => {
-            errors.push("missing closing --- for frontmatter".to_string());
-            return (meta, content.to_string(), errors);
-        }
     };
 
-    let yaml_section = &rest[..end];
-    // Skip past \n---  (4 chars), then trim leading newline from body
-    let body = rest[end + 4..].trim_start_matches('\n').to_string();
+    let Some((yaml_section, body)) = split_frontmatter(rest) else {
+        errors.push("missing closing --- for frontmatter".to_string());
+        return (meta, content.to_string(), errors);
+    };
+    let body = body.to_string();
 
     // Simple YAML parsing (key: value, with list support for globs)
     let mut in_globs = false;
@@ -406,6 +400,23 @@ fn parse_skill_frontmatter_with_description_limits(
     }
 
     (meta, body, errors)
+}
+
+fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        let Some(line_without_lf) = line.strip_suffix('\n') else {
+            break;
+        };
+        let fence = line_without_lf
+            .strip_suffix('\r')
+            .unwrap_or(line_without_lf);
+        if fence == "---" {
+            return Some((&rest[..offset], &rest[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 #[derive(Clone, Copy)]

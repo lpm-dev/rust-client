@@ -161,6 +161,46 @@ fn skill_frontmatter_no_frontmatter_errors() {
     assert!(!errors.is_empty(), "Should error on missing frontmatter");
 }
 
+#[test]
+fn skill_frontmatter_rejects_registry_invalid_opening_fence() {
+    let content = "---junk\nname: valid-name\ndescription: A complete package skill description\n---\n\nContent body.";
+
+    let (_, _, errors) = lpm_security::skill_security::parse_skill_frontmatter(content);
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("missing YAML frontmatter")),
+        "Registry-invalid opening fence must be rejected: {errors:?}"
+    );
+}
+
+#[test]
+fn skill_frontmatter_rejects_registry_invalid_closing_fence() {
+    let content = "---\nname: valid-name\ndescription: A complete package skill description\n---junk\n\nContent body.";
+
+    let (_, _, errors) = lpm_security::skill_security::parse_skill_frontmatter(content);
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("missing closing ---")),
+        "Registry-invalid closing fence must be rejected: {errors:?}"
+    );
+}
+
+#[test]
+fn skill_frontmatter_accepts_registry_valid_crlf_fences() {
+    let content = "---\r\nname: valid-name\r\ndescription: A complete package skill description\r\n---\r\n\r\nContent body.";
+
+    let (_, _, errors) = lpm_security::skill_security::parse_skill_frontmatter(content);
+
+    assert!(
+        errors.is_empty(),
+        "CRLF fences must remain valid: {errors:?}"
+    );
+}
+
 // ─── Typosquatting Detection ─────────────────────────────────────
 
 #[test]
