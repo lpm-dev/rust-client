@@ -6230,6 +6230,48 @@ fn install_workspace_star_dep_plants_root_symlink_to_member() {
     );
 }
 
+#[test]
+fn install_workspace_star_dep_accepts_member_without_version() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-versionless-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "no-ver": "workspace:*"
+  }
+}"#,
+    );
+
+    project.write_file("packages/no-ver/package.json", r#"{"name":"no-ver"}"#);
+
+    lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .env("LPM_STORE_VERSION", "v2")
+        .assert()
+        .success();
+
+    let link = project.path().join("node_modules/no-ver");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("versionless workspace member must be linked")
+            .file_type()
+            .is_symlink(),
+        "v2 must materialize the versionless workspace member through its link store",
+    );
+    let resolved = std::fs::canonicalize(link).expect("resolve versionless workspace member link");
+    assert!(
+        resolved.to_string_lossy().contains("no-ver@0.0.0"),
+        "versionless workspace members must retain the workspace discovery default"
+    );
+}
+
 /// `workspace:^` is a published-time hint — the member is still installed
 /// locally as a symlink. Pre-fix, install rewrote `workspace:^` into a
 /// registry range and 404'd against the upstream proxy.
@@ -6899,20 +6941,28 @@ async fn pubgrub_propagates_required_failure_below_required_parent() {
 #[tokio::test]
 async fn pubgrub_keeps_shared_descendant_failure_fatal_when_any_path_is_required() {
     let mock = MockRegistry::start().await;
-    mock.with_manifest_package(
-        serde_json::json!({
-            "name": "required-host",
-            "version": "1.0.0",
-            "dependencies": { "shared-failure-parent": "1.0.0" }
-        }),
-        &[],
+    mock.with_full_package_metadata(
+        "required-host",
+        "2.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({ "shared-failure-parent": "1.0.0" }),
+                Some(make_tarball("required-host", "1.0.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({ "shared-failure-parent": "1.0.0" }),
+                Some(make_tarball("required-host", "2.0.0")),
+            ),
+        ],
     )
     .await;
     mock.with_manifest_package(
         serde_json::json!({
             "name": "optional-host",
             "version": "1.0.0",
-            "dependencies": { "shared-failure-parent": "1.0.0" }
+            "optionalDependencies": { "shared-failure-parent": "1.0.0" }
         }),
         &[],
     )
@@ -6931,8 +6981,10 @@ async fn pubgrub_keeps_shared_descendant_failure_fatal_when_any_path_is_required
         r#"{
             "name":"shared-transitive-failure",
             "version":"1.0.0",
-            "dependencies":{"required-host":"1.0.0"},
-            "optionalDependencies":{"optional-host":"1.0.0"}
+            "dependencies":{
+                "optional-host":"1.0.0",
+                "required-host":"1.0.0"
+            }
         }"#,
     );
     let output = lpm_with_registry(&project, &mock.url())

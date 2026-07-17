@@ -342,7 +342,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
 
     let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
     for member in direct_workspace_member_deps {
-        let (_, _, node_engine) = read_pkg_json_name_version(
+        let node_engine = read_pkg_json_node_engine(
             &member.source_dir,
             &format!("workspace member at {}", member.source_dir.display()),
         )?;
@@ -1263,14 +1263,7 @@ pub(super) fn read_pkg_json_name_version(
     cas_path: &Path,
     source_label: &str,
 ) -> Result<(String, String, Option<String>), LpmError> {
-    let pkg_json_path = cas_path.join("package.json");
-    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to read package.json from {source_label}: {e}"
-        ))
-    })?;
-    let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str)
-        .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))?;
+    let pkg_json = read_pkg_json(cas_path, source_label)?;
     let name = pkg_json
         .get("name")
         .and_then(|v| v.as_str())
@@ -1289,12 +1282,35 @@ pub(super) fn read_pkg_json_name_version(
             ))
         })?
         .to_string();
-    let node_engine = pkg_json
+    let node_engine = package_json_node_engine(&pkg_json);
+    Ok((name, version, node_engine))
+}
+
+fn read_pkg_json_node_engine(
+    package_dir: &Path,
+    source_label: &str,
+) -> Result<Option<String>, LpmError> {
+    let pkg_json = read_pkg_json(package_dir, source_label)?;
+    Ok(package_json_node_engine(&pkg_json))
+}
+
+fn read_pkg_json(cas_path: &Path, source_label: &str) -> Result<serde_json::Value, LpmError> {
+    let pkg_json_path = cas_path.join("package.json");
+    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read package.json from {source_label}: {e}"
+        ))
+    })?;
+    serde_json::from_str(&pkg_json_str)
+        .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))
+}
+
+fn package_json_node_engine(pkg_json: &serde_json::Value) -> Option<String> {
+    pkg_json
         .get("engines")
         .and_then(|engines| engines.get("node"))
         .and_then(|value| value.as_str())
-        .map(str::to_string);
-    Ok((name, version, node_engine))
+        .map(str::to_string)
 }
 
 /// read a local source's
@@ -1656,7 +1672,7 @@ fn promote_workspace_member_source_graph(
     }
     visited.insert(realpath.clone(), source_string.clone());
     spec.target_source = Some(source_string.clone());
-    let (_, _, node_engine) = read_pkg_json_name_version(
+    let node_engine = read_pkg_json_node_engine(
         &matched_member.source_dir,
         &format!(
             "workspace member at {}",

@@ -168,6 +168,70 @@ pub struct CachedPackageInfo {
     pub aliases: HashMap<String, HashMap<String, String>>,
 }
 
+#[derive(Debug)]
+pub(crate) enum SkippedDependencyReason {
+    Fetch { detail: String, warn_auth: bool },
+    InvalidRange { detail: String },
+    NoMatchingVersion { detail: String },
+}
+
+impl SkippedDependencyReason {
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::Fetch { detail, .. }
+            | Self::InvalidRange { detail }
+            | Self::NoMatchingVersion { detail } => detail,
+        }
+    }
+
+    pub(crate) fn warns_about_auth(&self) -> bool {
+        matches!(
+            self,
+            Self::Fetch {
+                warn_auth: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn counts_as_platform_skip(&self) -> bool {
+        matches!(self, Self::NoMatchingVersion { .. })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SkippedDependency {
+    pub(crate) parent: ResolverPackage,
+    pub(crate) parent_version: String,
+    pub(crate) child: ResolverPackage,
+    pub(crate) local_name: String,
+    pub(crate) requested: String,
+    pub(crate) edge_is_optional: bool,
+    pub(crate) reason: SkippedDependencyReason,
+}
+
+impl SkippedDependency {
+    pub(super) fn new(
+        parent: &ResolverPackage,
+        parent_version: &NpmVersion,
+        child: &ResolverPackage,
+        local_name: &str,
+        requested: &str,
+        edge_is_optional: bool,
+        reason: SkippedDependencyReason,
+    ) -> Self {
+        Self {
+            parent: parent.clone(),
+            parent_version: parent_version.to_string(),
+            child: child.clone(),
+            local_name: local_name.to_string(),
+            requested: requested.to_string(),
+            edge_is_optional,
+            reason,
+        }
+    }
+}
+
 impl CachedPackageInfo {
     pub fn needs_trust_metadata(&self, policy: &ResolverPolicy) -> bool {
         policy.requires_trust_history() && !self.trust_metadata_complete
@@ -260,23 +324,16 @@ pub struct LpmDependencyProvider {
     /// Prevents repeated guaranteed-failing batch requests during resolution.
     /// Individual ensure_cached calls still work as fallback.
     pub(super) batch_disabled: RefCell<bool>,
-    /// Count of optional deps skipped because no platform-compatible version
-    /// satisfies the declared range on the current OS/CPU. Cumulative across
-    /// all calls to `get_dependencies` within a single provider instance.
-    /// Drained via [`Self::platform_skipped_count`] after `pubgrub::resolve`
-    /// returns so the resolver can expose it in `ResolveResult.platform_skipped`.
-    pub(super) platform_skipped: RefCell<usize>,
     pub(super) policy: ResolverPolicy,
     /// Root-level npm-alias edges accumulated as `get_dependencies(Root)`
     /// walks `self.root_deps`. Shape: `local_name → target_canonical_name`.
     /// Surfaced via `into_parts()` so `ResolveResult.root_aliases` carries
     /// the map into the install pipeline, which feeds it to the linker.
     pub(super) root_aliases: RefCell<HashMap<String, String>>,
-    /// Effective optional reachability discovered while PubGrub walks package
-    /// constraints. `false` is sticky: if any required path reaches a package,
-    /// failures below that package remain fatal even when another path is
-    /// optional.
-    pub(super) optional_reachability: RefCell<HashMap<ResolverPackage, bool>>,
+    /// Dependency edges provisionally omitted while PubGrub explores versions.
+    /// Their effective optionality is decided from the final selected graph.
+    pub(super) skipped_dependencies:
+        RefCell<HashMap<(ResolverPackage, String, ResolverPackage, String), SkippedDependency>>,
     /// Memoize `(ResolverPackage, raw_range) → Ranges<NpmVersion>` so
     /// repeated PubGrub `get_dependencies` queries for the same edge skip
     /// the O(N-versions) conversion inside `NpmRange::to_pubgrub_ranges`.

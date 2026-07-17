@@ -291,9 +291,18 @@ pub async fn resolve_with_shared_cache_options_and_policy(
 
         match result {
             Ok((solution, provider)) => {
-                let (cache, applied_overrides, platform_skipped, root_aliases, root_deps) =
+                let (cache, applied_overrides, skipped_dependencies, root_aliases, root_deps) =
                     provider.into_parts();
-                let packages = format_solution(solution, &cache, &root_deps, &root_aliases);
+                let (packages, platform_skipped) = match format_solution(
+                    solution,
+                    &cache,
+                    &root_deps,
+                    &root_aliases,
+                    skipped_dependencies,
+                ) {
+                    Ok(formatted) => formatted,
+                    Err(error) => break Err(error),
+                };
                 // Snapshot substage counters at the tail of the happy
                 // path. The registry-side atomics were reset at the
                 // top of this call, so they now reflect only follow-up
