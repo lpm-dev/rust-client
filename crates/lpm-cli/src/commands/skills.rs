@@ -4,6 +4,8 @@
 //! skills have a separate LPM-managed store and are explicitly materialized
 //! into supported agent directories.
 
+mod dashboard;
+mod inventory;
 mod managed;
 pub(crate) mod package;
 mod path_security;
@@ -29,6 +31,9 @@ pub enum SkillsCmd {
     List(ListArgs),
     /// Show source, security, context, and agent-target details for a skill.
     View(ViewArgs),
+    /// Open a local browser dashboard for inspecting and managing skills.
+    #[command(visible_alias = "ui")]
+    Dashboard(DashboardArgs),
     /// Validate package-published `.lpm/skills/` files against publishing rules.
     Validate,
     /// Remove package-published `.lpm/skills/` content.
@@ -103,6 +108,22 @@ pub struct ViewArgs {
     /// Include global managed and external skill locations when looking up the selector.
     #[arg(long)]
     pub global: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct DashboardArgs {
+    /// Include global managed and external skill locations.
+    #[arg(long)]
+    pub global: bool,
+    /// Do not open the dashboard in the default browser.
+    #[arg(long)]
+    pub no_open: bool,
+    /// Bind an exact localhost port instead of selecting a free port.
+    #[arg(long, value_name = "PORT", value_parser = parse_dashboard_port)]
+    pub port: Option<u16>,
+    /// Disable dashboard mutations while keeping inspection available.
+    #[arg(long)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -194,6 +215,7 @@ pub async fn run(
         SkillsCmd::Add(args) => run_add(client, args, project_dir, json_output).await,
         SkillsCmd::List(args) => list_skills(project_dir, &args, json_output),
         SkillsCmd::View(args) => view_skill(project_dir, &args, json_output),
+        SkillsCmd::Dashboard(args) => dashboard::run(project_dir, args, json_output).await,
         SkillsCmd::Validate => validate_skills(project_dir, json_output),
         SkillsCmd::Clean => clean_skills(project_dir, json_output),
         SkillsCmd::Doctor(args) => managed::doctor(project_dir, args.global, json_output),
@@ -568,6 +590,20 @@ fn require_confirmation(yes: bool, json_output: bool, prompt: &str) -> Result<()
 
 fn is_interactive(json_output: bool) -> bool {
     !json_output && std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+fn parse_dashboard_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| "dashboard port must be an integer from 1 to 65535".to_string())?;
+    if port == 0 {
+        Err(
+            "dashboard port must be from 1 to 65535; omit `--port` to select one automatically"
+                .into(),
+        )
+    } else {
+        Ok(port)
+    }
 }
 
 fn print_discovery(
@@ -1109,5 +1145,12 @@ mod tests {
         let count = count_files_recursive(&skills);
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dashboard_port_zero_is_rejected_in_favor_of_automatic_selection() {
+        let error = parse_dashboard_port("0").unwrap_err();
+
+        assert!(error.contains("omit `--port`"));
     }
 }

@@ -313,7 +313,8 @@ fn parse_skill_frontmatter_with_description_limits(
 
     // Simple YAML parsing (key: value, with list support for globs)
     let mut in_globs = false;
-    for line in yaml_section.lines() {
+    let mut lines = yaml_section.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -331,7 +332,17 @@ fn parse_skill_frontmatter_with_description_limits(
 
         if let Some((key, value)) = trimmed.split_once(':') {
             let key = key.trim();
-            let value = value.trim().trim_matches('"').trim_matches('\'');
+            let raw_value = value.trim();
+
+            if key == "description"
+                && let Some(style) = block_scalar_style(raw_value)
+            {
+                let parent_indent = line.len() - line.trim_start().len();
+                meta.description = Some(parse_block_scalar(&mut lines, parent_indent, style));
+                continue;
+            }
+
+            let value = raw_value.trim_matches('"').trim_matches('\'');
 
             match (key, value) {
                 ("name", value) => meta.name = Some(value.to_string()),
@@ -369,6 +380,82 @@ fn parse_skill_frontmatter_with_description_limits(
     }
 
     (meta, body, errors)
+}
+
+#[derive(Clone, Copy)]
+enum BlockScalarStyle {
+    Folded,
+    Literal,
+}
+
+fn block_scalar_style(value: &str) -> Option<BlockScalarStyle> {
+    let mut chars = value.chars();
+    let style = match chars.next()? {
+        '>' => BlockScalarStyle::Folded,
+        '|' => BlockScalarStyle::Literal,
+        _ => return None,
+    };
+    chars
+        .all(|character| matches!(character, '+' | '-' | '1'..='9'))
+        .then_some(style)
+}
+
+fn parse_block_scalar(
+    lines: &mut std::iter::Peekable<std::str::Lines<'_>>,
+    parent_indent: usize,
+    style: BlockScalarStyle,
+) -> String {
+    let mut block_lines = Vec::new();
+    let mut content_indent = usize::MAX;
+    while let Some(line) = lines.peek().copied() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let indent = line.len() - line.trim_start().len();
+            if indent <= parent_indent {
+                break;
+            }
+            content_indent = content_indent.min(indent);
+        }
+        block_lines.push(lines.next().expect("peeked frontmatter line must exist"));
+    }
+    if content_indent == usize::MAX {
+        return String::new();
+    }
+
+    let estimated_bytes = block_lines.iter().map(|line| line.len()).sum();
+    let mut output = String::with_capacity(estimated_bytes);
+    match style {
+        BlockScalarStyle::Folded => {
+            let mut has_content = false;
+            let mut blank_lines = 0;
+            for line in block_lines {
+                let content = line.get(content_indent..).unwrap_or_default().trim_end();
+                if content.is_empty() {
+                    blank_lines += 1;
+                    continue;
+                }
+                if has_content {
+                    if blank_lines == 0 {
+                        output.push(' ');
+                    } else {
+                        output.extend(std::iter::repeat_n('\n', blank_lines));
+                    }
+                }
+                output.push_str(content);
+                has_content = true;
+                blank_lines = 0;
+            }
+        }
+        BlockScalarStyle::Literal => {
+            for line in block_lines {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(line.get(content_indent..).unwrap_or_default().trim_end());
+            }
+        }
+    }
+    output.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -818,5 +905,32 @@ console.log(x);
         let (meta, _, errors) = parse_skill_frontmatter(content);
         assert!(errors.is_empty(), "errors: {:?}", errors);
         assert_eq!(meta.name.as_deref(), Some("my-skill"));
+    }
+
+    #[test]
+    fn folded_description_is_parsed_as_text() {
+        let content = "---\nname: my-skill\ndescription: >\n  A useful skill for\n  application developers.\nversion: 1.2.3\n---\nBody";
+
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("A useful skill for application developers.")
+        );
+        assert_eq!(meta.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn literal_description_preserves_internal_line_breaks() {
+        let content = "---\nname: my-skill\ndescription: |-\n  First paragraph.\n\n  Second paragraph.\n---\nBody";
+
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("First paragraph.\n\nSecond paragraph.")
+        );
     }
 }

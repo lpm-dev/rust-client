@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>LPM Skills</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <script src="/assets/dashboard.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="brand"><span class="brand-mark">L</span><span>LPM</span></div>
+        <h1>Skills control center</h1>
+        <p id="project-path" class="subtle">Loading project…</p>
+      </div>
+      <div class="header-actions">
+        <span id="mode-badge" class="badge neutral">Local session</span>
+        <button id="refresh-button" class="button secondary" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <section id="notice" class="notice hidden" role="status"></section>
+
+    <section id="summary" class="summary" aria-label="Skills summary"></section>
+
+    <section class="context-panel">
+      <div>
+        <h2>Estimated context footprint</h2>
+        <p>Enabled skill content by agent. These are estimates, not actual session or billing tokens.</p>
+      </div>
+      <div id="agent-context" class="agent-context"></div>
+    </section>
+
+    <section class="inventory-panel">
+      <div class="inventory-heading">
+        <div>
+          <h2>Installed skills</h2>
+          <p id="inventory-count">Loading inventory…</p>
+        </div>
+        <div class="filters">
+          <label class="search-field">
+            <span class="sr-only">Search skills</span>
+            <input id="search" type="search" placeholder="Search skills, source, package…" autocomplete="off">
+          </label>
+          <label>
+            <span class="sr-only">Kind</span>
+            <select id="kind-filter">
+              <option value="all">All kinds</option>
+              <option value="managed">Managed</option>
+              <option value="external">External</option>
+              <option value="package">Package</option>
+            </select>
+          </label>
+          <label>
+            <span class="sr-only">Scope</span>
+            <select id="scope-filter">
+              <option value="all">All scopes</option>
+              <option value="project">Project</option>
+              <option value="global">Global</option>
+            </select>
+          </label>
+          <label>
+            <span class="sr-only">Agent</span>
+            <select id="agent-filter">
+              <option value="all">All agents</option>
+              <option value="codex">Codex</option>
+              <option value="claude-code">Claude Code</option>
+              <option value="cursor">Cursor</option>
+            </select>
+          </label>
+          <label>
+            <span class="sr-only">Status</span>
+            <select id="status-filter">
+              <option value="all">All statuses</option>
+              <option value="attention">Needs attention</option>
+              <option value="disabled">Disabled</option>
+              <option value="healthy">Healthy</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Skill</th>
+              <th>Ownership</th>
+              <th>Scope</th>
+              <th>Enabled for</th>
+              <th>Context</th>
+              <th>Security</th>
+              <th>Status</th>
+              <th><span class="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="skill-rows"></tbody>
+        </table>
+        <div id="empty-state" class="empty hidden">
+          <strong>No skills match these filters</strong>
+          <span>Try changing the search or filter selection.</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="detail-dialog" class="dialog detail-dialog">
+    <div class="dialog-header">
+      <div>
+        <span id="detail-kind" class="eyebrow"></span>
+        <h2 id="detail-title"></h2>
+      </div>
+      <button class="icon-button" data-close="detail-dialog" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="detail-content" class="detail-content"></div>
+  </dialog>
+
+  <dialog id="plan-dialog" class="dialog plan-dialog">
+    <div class="dialog-header">
+      <div>
+        <span class="eyebrow">Review required</span>
+        <h2 id="plan-title">Review changes</h2>
+      </div>
+      <button class="icon-button" data-close="plan-dialog" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="plan-content" class="plan-content"></div>
+    <div class="dialog-actions">
+      <button class="button secondary" data-close="plan-dialog" type="button">Cancel</button>
+      <button id="apply-button" class="button danger" type="button">Apply changes</button>
+    </div>
+  </dialog>
+</body>
+</html>

@@ -1,3 +1,7 @@
+use super::inventory::{
+    DashboardAction, SecurityAssessment, SecurityFinding, SkillInventoryItem, SkillInventoryKind,
+    SkillTarget, skill_file_path, stable_id, target_path,
+};
 use super::source::{self, DiscoveredSkill, SourceDescriptor, SourceTree};
 use super::{AgentTarget, ManageArgs, PruneArgs};
 use lpm_common::{LpmError, LpmRoot};
@@ -1074,6 +1078,172 @@ pub fn external_inventory(
     Ok(result)
 }
 
+pub(super) fn dashboard_inventory(
+    project_dir: &Path,
+    include_global: bool,
+) -> Result<Vec<SkillInventoryItem>, LpmError> {
+    let mut result = dashboard_managed_scope(&Store::for_scope(Scope::Project, project_dir)?)?;
+    if include_global {
+        result.extend(dashboard_managed_scope(&Store::for_scope(
+            Scope::Global,
+            project_dir,
+        )?)?);
+    }
+    result.extend(dashboard_external_inventory(project_dir, include_global)?);
+    Ok(result)
+}
+
+fn dashboard_managed_scope(store: &Store) -> Result<Vec<SkillInventoryItem>, LpmError> {
+    let state = load_state(store)?;
+    let mut result = Vec::with_capacity(state.skills.len());
+    for record in state.skills.values() {
+        let canonical = store.root.join(&record.canonical_dir);
+        let findings = scan_canonical_findings(&canonical)?
+            .into_iter()
+            .map(|finding| SecurityFinding {
+                rule_id: finding.rule_id,
+                category: finding.category,
+                severity: finding.severity,
+                path: finding.path,
+                line: finding.line,
+            })
+            .collect();
+        let security = SecurityAssessment::scanned(findings);
+        let mut targets = Vec::with_capacity(record.targets.len());
+        for (agent, target) in &record.targets {
+            let diagnosis = diagnose_target(store, target, &canonical);
+            targets.push(SkillTarget {
+                agent: agent_slug(*agent).into(),
+                label: agent.label().into(),
+                path: target_path(&diagnosis.path),
+                enabled: diagnosis.enabled,
+                healthy: diagnosis.healthy,
+                status: diagnosis.status.as_str().replace(' ', "-"),
+                materialization: match target.materialization {
+                    Materialization::Link => "link",
+                    Materialization::Copy => "copy",
+                }
+                .into(),
+            });
+        }
+        let healthy =
+            is_regular_directory(&canonical) && targets.iter().all(|target| target.healthy);
+        let mut actions = Vec::with_capacity(4);
+        if targets.iter().any(|target| !target.enabled) {
+            actions.push(DashboardAction::Enable);
+        }
+        if targets.iter().any(|target| target.enabled) {
+            actions.push(DashboardAction::Disable);
+        }
+        actions.push(DashboardAction::Update);
+        actions.push(DashboardAction::Remove);
+        let global_flag = if store.scope == Scope::Global {
+            " --global"
+        } else {
+            ""
+        };
+        result.push(SkillInventoryItem {
+            id: stable_id(
+                "managed",
+                &format!("{}:{}", store.scope.as_str(), record.name),
+            ),
+            kind: SkillInventoryKind::Managed,
+            name: record.name.clone(),
+            description: Some(record.description.clone()),
+            source: record.source.display(),
+            scope: store.scope.as_str().into(),
+            package: None,
+            version: None,
+            path: Some(canonical.display().to_string()),
+            size_bytes: None,
+            context_tokens: Some(record.context_tokens),
+            targets,
+            healthy,
+            integrity: None,
+            security,
+            actions,
+            command: format!("lpm skills view {}{global_flag}", record.name),
+        });
+    }
+    Ok(result)
+}
+
+fn dashboard_external_inventory(
+    project_dir: &Path,
+    include_global: bool,
+) -> Result<Vec<SkillInventoryItem>, LpmError> {
+    Ok(external_inventory(project_dir, include_global)?
+        .into_iter()
+        .map(|skill| {
+            let directory = PathBuf::from(&skill.path);
+            let path = skill_file_path(&directory);
+            let (content, security) = if skill.healthy {
+                super::inventory::read_and_scan(&path)
+            } else {
+                (
+                    None,
+                    SecurityAssessment {
+                        status: "unavailable".into(),
+                        warning_count: 0,
+                        block_count: 0,
+                        findings: Vec::new(),
+                        message: Some("external skill target is a broken link".into()),
+                    },
+                )
+            };
+            let description = content.as_deref().and_then(|content| {
+                lpm_security::skill_security::parse_agent_skill_frontmatter(content)
+                    .0
+                    .description
+            });
+            let context_tokens = content
+                .as_deref()
+                .map(|content| content.chars().count().div_ceil(4));
+            let agent = agent_slug(skill.agent);
+            let global_flag = if skill.scope == "global" {
+                " --global"
+            } else {
+                ""
+            };
+            SkillInventoryItem {
+                id: stable_id(
+                    "external",
+                    &format!("{}:{agent}:{}", skill.scope, directory.display()),
+                ),
+                kind: SkillInventoryKind::External,
+                name: skill.name,
+                description,
+                source: "external agent directory".into(),
+                scope: skill.scope,
+                package: None,
+                version: None,
+                path: Some(directory.display().to_string()),
+                size_bytes: None,
+                context_tokens,
+                targets: vec![SkillTarget {
+                    agent: agent.into(),
+                    label: skill.agent.label().into(),
+                    path: directory.display().to_string(),
+                    enabled: skill.healthy,
+                    healthy: skill.healthy,
+                    status: if skill.healthy {
+                        "healthy"
+                    } else {
+                        "broken-link"
+                    }
+                    .into(),
+                    materialization: "external".into(),
+                }],
+                healthy: skill.healthy,
+                integrity: None,
+                security,
+                actions: Vec::new(),
+                command: format!("lpm skills list --kind external --agent {agent}{global_flag}"),
+            }
+        })
+        .collect())
+}
+
 fn managed_target_paths(
     project_dir: &Path,
     include_global: bool,
@@ -1446,11 +1616,47 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Mutation {
     Remove,
     Enable,
     Disable,
+}
+
+pub(super) struct ManagedMutationPlan {
+    store: Store,
+    state_snapshot: Vec<u8>,
+    names: Vec<String>,
+    agents: Vec<AgentTarget>,
+    mutation: Mutation,
+    changes: Vec<PlannedChange>,
+}
+
+impl ManagedMutationPlan {
+    pub(super) fn changes(&self) -> &[PlannedChange] {
+        &self.changes
+    }
+}
+
+pub(super) fn plan_dashboard_mutation(
+    project_dir: &Path,
+    name: String,
+    global: bool,
+    agents: Vec<AgentTarget>,
+    mutation: Mutation,
+) -> Result<ManagedMutationPlan, LpmError> {
+    plan_mutation(
+        project_dir,
+        ManageArgs {
+            selectors: vec![name],
+            agent: agents,
+            global,
+            all: false,
+            dry_run: false,
+            yes: false,
+        },
+        mutation,
+    )
 }
 
 pub fn mutate(
@@ -1459,6 +1665,30 @@ pub fn mutate(
     mutation: Mutation,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let dry_run = args.dry_run;
+    let yes = args.yes;
+    let plan = plan_mutation(project_dir, args, mutation)?;
+    if dry_run || !json_output {
+        print_changes(plan.changes(), json_output);
+    }
+    if dry_run {
+        return Ok(());
+    }
+    require_confirmation(yes, json_output, "Apply the managed skill changes?")?;
+    let changes = apply_mutation_plan(plan)?;
+    if json_output {
+        print_applied_changes(&changes);
+    } else {
+        super::install_ui::done("Managed skill changes applied");
+    }
+    Ok(())
+}
+
+fn plan_mutation(
+    project_dir: &Path,
+    args: ManageArgs,
+    mutation: Mutation,
+) -> Result<ManagedMutationPlan, LpmError> {
     let store = Store::for_scope(
         if args.global {
             Scope::Global
@@ -1471,14 +1701,27 @@ pub fn mutate(
     let names = select_record_names(&state, &args)?;
     let changes = mutation_changes(&store, &state, &names, &args.agent, mutation)?;
     preflight_mutation(&store, &state, &names, &args.agent, mutation)?;
-    if args.dry_run || !json_output {
-        print_changes(&changes, json_output);
-    }
-    if args.dry_run {
-        return Ok(());
-    }
-    require_confirmation(args.yes, json_output, "Apply the managed skill changes?")?;
-    let preview_snapshot = state_snapshot(&state)?;
+    Ok(ManagedMutationPlan {
+        store,
+        state_snapshot: state_snapshot(&state)?,
+        names,
+        agents: args.agent,
+        mutation,
+        changes,
+    })
+}
+
+pub(super) fn apply_mutation_plan(
+    plan: ManagedMutationPlan,
+) -> Result<Vec<PlannedChange>, LpmError> {
+    let ManagedMutationPlan {
+        store,
+        state_snapshot: preview_snapshot,
+        names,
+        agents,
+        mutation,
+        changes,
+    } = plan;
     store.prepare_root()?;
     let _lock = lpm_common::acquire_exclusive_lock(store.root.join(".mutation.lock"))?;
     let mut state = load_state(&store)?;
@@ -1487,7 +1730,7 @@ pub fn mutate(
             "managed skill state changed after preview; review the operation again".into(),
         ));
     }
-    preflight_mutation(&store, &state, &names, &args.agent, mutation)?;
+    preflight_mutation(&store, &state, &names, &agents, mutation)?;
     if matches!(mutation, Mutation::Remove) {
         for name in &names {
             let Some(record) = state.skills.get(name) else {
@@ -1496,7 +1739,7 @@ pub fn mutate(
             let removes_every_target = record
                 .targets
                 .keys()
-                .all(|agent| args.agent.is_empty() || args.agent.contains(agent));
+                .all(|agent| agents.is_empty() || agents.contains(agent));
             if removes_every_target {
                 store.canonical_removal_path(&store.root.join(&record.canonical_dir))?;
             }
@@ -1509,10 +1752,10 @@ pub fn mutate(
         let Some(record) = state.skills.get(name).cloned() else {
             continue;
         };
-        let agents: Vec<_> = if args.agent.is_empty() {
+        let selected_agents: Vec<_> = if agents.is_empty() {
             record.targets.keys().copied().collect()
         } else {
-            args.agent.clone()
+            agents.clone()
         };
         match mutation {
             Mutation::Enable => {
@@ -1523,7 +1766,7 @@ pub fn mutate(
                         record.name, record.name
                     )));
                 }
-                for agent in agents {
+                for agent in selected_agents {
                     let Some(target) = state
                         .skills
                         .get(name)
@@ -1545,7 +1788,7 @@ pub fn mutate(
             }
             Mutation::Disable => {
                 let canonical = store.root.join(&record.canonical_dir);
-                for agent in agents {
+                for agent in selected_agents {
                     let Some(target) = state
                         .skills
                         .get(name)
@@ -1566,7 +1809,7 @@ pub fn mutate(
             }
             Mutation::Remove => {
                 let canonical = store.root.join(&record.canonical_dir);
-                for agent in agents {
+                for agent in selected_agents {
                     let Some(target) = record.targets.get(&agent) else {
                         continue;
                     };
@@ -1597,14 +1840,14 @@ pub fn mutate(
         let Some(record) = state.skills.get(name).cloned() else {
             continue;
         };
-        let agents: Vec<_> = if args.agent.is_empty() {
+        let selected_agents: Vec<_> = if agents.is_empty() {
             record.targets.keys().copied().collect()
         } else {
-            args.agent.clone()
+            agents.clone()
         };
         match mutation {
             Mutation::Enable => {
-                for agent in agents {
+                for agent in selected_agents {
                     if let Some(target) = state
                         .skills
                         .get_mut(name)
@@ -1619,7 +1862,7 @@ pub fn mutate(
                 }
             }
             Mutation::Disable => {
-                for agent in agents {
+                for agent in selected_agents {
                     if let Some(target) = state
                         .skills
                         .get_mut(name)
@@ -1630,7 +1873,7 @@ pub fn mutate(
                 }
             }
             Mutation::Remove => {
-                for agent in agents {
+                for agent in selected_agents {
                     if let Some(record) = state.skills.get_mut(name) {
                         record.targets.remove(&agent);
                     }
@@ -1664,12 +1907,7 @@ pub fn mutate(
             );
         }
     }
-    if json_output {
-        print_applied_changes(&changes);
-    } else {
-        super::install_ui::done("Managed skill changes applied");
-    }
-    Ok(())
+    Ok(changes)
 }
 
 pub fn prune(project_dir: &Path, args: PruneArgs, json_output: bool) -> Result<(), LpmError> {
@@ -1828,6 +2066,102 @@ pub async fn update(
     args: ManageArgs,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let dry_run = args.dry_run;
+    let yes = args.yes;
+    let plan = plan_update(project_dir, args).await?;
+    if dry_run || !json_output {
+        print_update_preview(&plan.updates, &plan.changes, json_output);
+    }
+    if dry_run {
+        return Ok(());
+    }
+    let warning_count = plan.warning_count();
+    let confirmation = if warning_count == 0 {
+        "Apply the managed skill updates?".to_string()
+    } else {
+        format!(
+            "Apply after reviewing {warning_count} security {}?",
+            if warning_count == 1 {
+                "warning"
+            } else {
+                "warnings"
+            }
+        )
+    };
+    require_confirmation(yes, json_output, &confirmation)?;
+    let changes = apply_update_plan(plan)?;
+    if json_output {
+        print_applied_changes(&changes);
+    } else {
+        super::install_ui::done("Managed skill updates applied");
+    }
+    Ok(())
+}
+
+pub(super) struct ManagedUpdatePlan {
+    store: Store,
+    updates: Vec<PendingUpdate>,
+    changes: Vec<PlannedChange>,
+}
+
+impl ManagedUpdatePlan {
+    pub(super) fn changes(&self) -> &[PlannedChange] {
+        &self.changes
+    }
+
+    pub(super) fn summaries(&self) -> Vec<ManagedUpdateSummary> {
+        self.updates
+            .iter()
+            .map(|update| ManagedUpdateSummary {
+                name: update.skill.name.clone(),
+                diff: update.diff.clone(),
+                security_findings_before: update.previous_findings.len(),
+                security_findings_after: update.candidate_findings.len(),
+                new_security_findings: update.new_findings.clone(),
+            })
+            .collect()
+    }
+
+    pub(super) fn warning_count(&self) -> usize {
+        self.updates
+            .iter()
+            .flat_map(|update| &update.candidate_findings)
+            .filter(|finding| {
+                finding.severity == lpm_security::skill_security::SkillSecuritySeverity::Warning
+            })
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ManagedUpdateSummary {
+    name: String,
+    diff: String,
+    security_findings_before: usize,
+    security_findings_after: usize,
+    new_security_findings: Vec<FindingIdentity>,
+}
+
+pub(super) async fn plan_dashboard_update(
+    project_dir: &Path,
+    name: String,
+    global: bool,
+) -> Result<ManagedUpdatePlan, LpmError> {
+    plan_update(
+        project_dir,
+        ManageArgs {
+            selectors: vec![name],
+            agent: Vec::new(),
+            global,
+            all: false,
+            dry_run: false,
+            yes: false,
+        },
+    )
+    .await
+}
+
+async fn plan_update(project_dir: &Path, args: ManageArgs) -> Result<ManagedUpdatePlan, LpmError> {
     if !args.agent.is_empty() {
         return Err(LpmError::Registry(
             "`lpm skills update` refreshes shared managed content and all recorded targets; `--agent` cannot safely narrow an update"
@@ -1893,34 +2227,21 @@ pub async fn update(
         .iter()
         .flat_map(|update| update.plan.changes.clone())
         .collect();
-    if args.dry_run || !json_output {
-        print_update_preview(&updates, &changes, json_output);
-    }
-    if args.dry_run {
-        return Ok(());
-    }
+    Ok(ManagedUpdatePlan {
+        store,
+        updates,
+        changes,
+    })
+}
+
+pub(super) fn apply_update_plan(plan: ManagedUpdatePlan) -> Result<Vec<PlannedChange>, LpmError> {
+    let ManagedUpdatePlan {
+        store,
+        updates,
+        changes,
+    } = plan;
     let skills: Vec<_> = updates.iter().map(|update| &update.skill).collect();
     source::ensure_skills_are_safe(&skills)?;
-    let warning_count = updates
-        .iter()
-        .flat_map(|update| &update.candidate_findings)
-        .filter(|finding| {
-            finding.severity == lpm_security::skill_security::SkillSecuritySeverity::Warning
-        })
-        .count();
-    let confirmation = if warning_count == 0 {
-        "Apply the managed skill updates?".to_string()
-    } else {
-        format!(
-            "Apply after reviewing {warning_count} security {}?",
-            if warning_count == 1 {
-                "warning"
-            } else {
-                "warnings"
-            }
-        )
-    };
-    require_confirmation(args.yes, json_output, &confirmation)?;
     let operations = updates
         .iter()
         .map(|update| {
@@ -1935,12 +2256,7 @@ pub async fn update(
         })
         .collect::<Result<Vec<_>, LpmError>>()?;
     apply_install_batch(&store, operations)?;
-    if json_output {
-        print_applied_changes(&changes);
-    } else {
-        super::install_ui::done("Managed skill updates applied");
-    }
-    Ok(())
+    Ok(changes)
 }
 
 struct PendingUpdate {
@@ -1954,7 +2270,7 @@ struct PendingUpdate {
 }
 
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct FindingIdentity {
+pub(super) struct FindingIdentity {
     rule_id: String,
     category: String,
     severity: lpm_security::skill_security::SkillSecuritySeverity,
@@ -2769,6 +3085,30 @@ mod tests {
     #[test]
     fn managed_state_default_uses_current_schema_version() {
         assert_eq!(ManagedState::default().state_version, STATE_VERSION);
+    }
+
+    #[test]
+    fn mutation_plan_rejects_state_changed_after_dashboard_preview() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+        let plan = plan_dashboard_mutation(
+            project.path(),
+            skill.name.clone(),
+            false,
+            Vec::new(),
+            Mutation::Disable,
+        )
+        .unwrap();
+        let mut state = load_state(&store).unwrap();
+        state.skills.get_mut(&skill.name).unwrap().context_tokens += 1;
+        write_state(&store, &state).unwrap();
+
+        let error = apply_mutation_plan(plan).unwrap_err();
+
+        assert!(error.to_string().contains("changed after preview"));
     }
 
     #[test]
