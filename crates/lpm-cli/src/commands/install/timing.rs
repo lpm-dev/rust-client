@@ -401,6 +401,8 @@ pub(super) struct FetchOverlapStats {
     pub(super) failed_count: u64,
     pub(super) skipped_platform_count: u64,
     pub(super) skipped_auth_count: u64,
+    pub(super) skipped_optional_count: u64,
+    pub(super) skipped_engine_count: u64,
     pub(super) buffered_count: u64,
     pub(super) buffered_dispatch_count: u64,
     pub(super) buffer_wait_sum_ms: u128,
@@ -433,6 +435,8 @@ impl FetchOverlapStats {
             "failed_count": self.failed_count,
             "skipped_platform_count": self.skipped_platform_count,
             "skipped_auth_count": self.skipped_auth_count,
+            "skipped_optional_count": self.skipped_optional_count,
+            "skipped_engine_count": self.skipped_engine_count,
             "buffered_count": self.buffered_count,
             "buffered_dispatch_count": self.buffered_dispatch_count,
             "buffered_undispatched_count": self.buffered_count.saturating_sub(self.buffered_dispatch_count),
@@ -1788,6 +1792,8 @@ mod tests {
         stats.record_buffered_event();
         stats.record_buffered_event();
         stats.record_buffered_dispatch(7);
+        stats.skipped_optional_count = 3;
+        stats.skipped_engine_count = 2;
 
         let json = stats.to_json();
 
@@ -1796,6 +1802,8 @@ mod tests {
         assert_eq!(json["buffered_undispatched_count"], 1);
         assert_eq!(json["buffer_wait"]["sum_ms"], 7);
         assert_eq!(json["buffer_wait"]["max_ms"], 7);
+        assert_eq!(json["skipped_optional_count"], 3);
+        assert_eq!(json["skipped_engine_count"], 2);
     }
 
     #[test]

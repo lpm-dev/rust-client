@@ -217,6 +217,7 @@ pub(in crate::commands::install) async fn run(
     resolver_policy: lpm_resolver::ResolverPolicy,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
+    optional_registry_roots: &HashSet<String>,
     pre_resolved_install_pkgs: &[InstallPackage],
     pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
     workspace_member_deps: &[WorkspaceMemberLink],
@@ -225,6 +226,7 @@ pub(in crate::commands::install) async fn run(
     current_patches: &HashMap<String, PatchedDependencyEntry>,
     prior_patch_state: &Option<patch_state::PatchState>,
     current_patch_fingerprint: &str,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::info("using experimental resolver path");
@@ -253,7 +255,7 @@ pub(in crate::commands::install) async fn run(
             let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
             let mut packages: HashMap<PackageIdentity, PackageDraft> =
                 HashMap::with_capacity(deps.len().saturating_mul(4).max(32));
-            let root_requests = root_resolve_requests(deps);
+            let root_requests = root_resolve_requests(deps, optional_registry_roots);
             stats.root_requests = root_requests.len() as u64;
 
             for request in root_requests {
@@ -270,6 +272,9 @@ pub(in crate::commands::install) async fn run(
 
             while let Some(result) = pending.next().await {
                 match result? {
+                    NodeResolution::SkippedOptionalMetadata => {
+                        stats.skipped_optional += 1;
+                    }
                     NodeResolution::Metadata { request, info } => {
                         let Some(node) = select_or_reuse_node(
                             request,
@@ -461,6 +466,7 @@ pub(in crate::commands::install) async fn run(
             ));
         }
     };
+    filter_dependency_engine_packages(&mut install_packages, dependency_engine_policy)?;
     let mut platform_skipped = filter_platform_packages(&mut install_packages)?;
     if graph_source == ExperimentalResolverGraphSource::Lockfile {
         let fetch_packages = lockfile_fetch_schedule(&install_packages);
@@ -492,6 +498,7 @@ pub(in crate::commands::install) async fn run(
         resolver_policy,
         auto_install_peers,
         include_optional_dependencies,
+        optional_registry_roots,
         all_workspace_members,
         catalog_resolutions,
         pre_resolved_install_pkgs,
@@ -499,6 +506,7 @@ pub(in crate::commands::install) async fn run(
         project_dir,
         &install_packages,
         json_output,
+        dependency_engine_policy,
     )
     .await?;
     stage_timings.parity_ms = parity_start.elapsed().as_millis();
@@ -852,6 +860,7 @@ async fn compute_parity_if_requested(
     resolver_policy: lpm_resolver::ResolverPolicy,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
+    optional_registry_roots: &HashSet<String>,
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     pre_resolved_install_pkgs: &[InstallPackage],
@@ -859,6 +868,7 @@ async fn compute_parity_if_requested(
     project_dir: &Path,
     candidate_packages: &[InstallPackage],
     json_output: bool,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> Result<ExperimentalResolverParity, LpmError> {
     let mode = ExperimentalResolverParityMode::from_env();
     if !mode.enabled() {
@@ -874,20 +884,25 @@ async fn compute_parity_if_requested(
                 "LPM_NPM_FANOUT",
                 default_fusion_npm_fanout(false, 0),
             );
-            let resolve_result = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
-                client,
+            let root_dependencies = lpm_resolver::RootDependencies::with_optional_names(
                 deps.clone(),
-                override_set,
-                route_table.clone(),
-                npm_fanout,
-                None,
-                shared_cache,
-                auto_install_peers,
-                include_optional_dependencies,
-                resolver_policy,
-            )
-            .await
-            .map_err(crate::resolver_error::resolver_error_to_lpm)?;
+                optional_registry_roots.clone(),
+            );
+            let resolve_result =
+                lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy_roots(
+                    client,
+                    root_dependencies,
+                    override_set,
+                    route_table.clone(),
+                    npm_fanout,
+                    None,
+                    shared_cache,
+                    auto_install_peers,
+                    include_optional_dependencies,
+                    resolver_policy,
+                )
+                .await
+                .map_err(crate::resolver_error::resolver_error_to_lpm)?;
 
             let mut packages = resolved_to_install_packages_with_workspace_members(
                 &resolve_result.packages,
@@ -933,6 +948,7 @@ async fn compute_parity_if_requested(
         }
     };
     dedupe_install_packages_by_identity(&mut baseline_packages);
+    filter_dependency_engine_packages(&mut baseline_packages, dependency_engine_policy)?;
     let _ = filter_platform_packages(&mut baseline_packages)?;
 
     let parity = compare_package_parity_with_baseline(

@@ -19,6 +19,7 @@ pub use dispatch::{
     resolve_dependencies, resolve_dependencies_routed, resolve_dependencies_with_overrides,
     resolve_with_shared_cache, resolve_with_shared_cache_options,
     resolve_with_shared_cache_options_and_policy,
+    resolve_with_shared_cache_options_and_policy_roots,
 };
 #[allow(unused_imports)]
 pub use error::ResolveError;
@@ -30,7 +31,9 @@ pub use peers::{
     validate_allowed_versions_selector,
 };
 #[allow(unused_imports)]
-pub use types::{ResolveResult, ResolvedPackage, SelectedPackageEvent, StageTiming};
+pub use types::{
+    ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent, StageTiming,
+};
 
 mod prelude {
     #[allow(unused_imports)]
@@ -38,6 +41,7 @@ mod prelude {
         resolve_dependencies, resolve_dependencies_routed, resolve_dependencies_with_overrides,
         resolve_with_shared_cache, resolve_with_shared_cache_options,
         resolve_with_shared_cache_options_and_policy,
+        resolve_with_shared_cache_options_and_policy_roots,
     };
     #[allow(unused_imports)]
     pub(super) use super::error::{
@@ -59,7 +63,8 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::types::{
-        PubGrubResult, ResolveResult, ResolvedPackage, SelectedPackageEvent, StageTiming,
+        PubGrubResult, ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent,
+        StageTiming,
     };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;
@@ -72,7 +77,7 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use crate::provider::{
         CachedPackageInfo, LpmDependencyProvider, NotifyMap, PlatformMeta, SharedCache,
-        StreamingBfsMetrics,
+        SkippedDependency, StreamingBfsMetrics,
     };
     #[allow(unused_imports)]
     pub(super) use crate::ranges::NpmRange;

@@ -13,6 +13,7 @@ fn sample_lockfile() -> Lockfile {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec!["react@999.999.999".to_string()],
@@ -30,6 +31,7 @@ fn sample_lockfile() -> Lockfile {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -46,6 +48,25 @@ fn serialize_roundtrip() {
     let toml_str = lf.to_toml().unwrap();
     let parsed = Lockfile::from_toml(&toml_str).unwrap();
     assert_eq!(lf, parsed);
+}
+
+#[test]
+fn dependency_node_engine_round_trips_through_toml() {
+    let mut lf = sample_lockfile();
+    lf.packages[0].node_engine = Some(">=22 <23".to_string());
+
+    let toml = lf.to_toml().expect("serialize dependency Node engine");
+    let parsed = Lockfile::from_toml(&toml).expect("parse dependency Node engine");
+
+    assert_eq!(parsed.packages[0].node_engine.as_deref(), Some(">=22 <23"));
+}
+
+#[test]
+fn dependency_node_engine_metadata_requires_toml_fallback() {
+    let mut lf = sample_lockfile();
+    lf.packages[0].node_engine = Some(">=22".to_string());
+
+    assert!(!binary::binary_format_supports(&lf));
 }
 
 #[test]
@@ -80,7 +101,7 @@ fn importer_snapshots_round_trip_dependency_sections() {
             && toml.contains("[importers.\".\".dev-dependencies]")
             && toml.contains("[importers.\".\".optional-dependencies]")
             && toml.contains("[importers.\".\".peer-dependencies]"),
-        "v5 lockfile must serialize importer dependency sections, got:\n{toml}"
+        "lockfile must serialize importer dependency sections, got:\n{toml}"
     );
 
     let parsed = Lockfile::from_toml(&toml).expect("parse importer snapshot");
@@ -104,6 +125,7 @@ fn patch_records_round_trip_and_skip_binary() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -130,7 +152,7 @@ fn patch_records_round_trip_and_skip_binary() {
             && toml.contains("path = \"patches/lodash@4.17.21.patch\"")
             && toml.contains("sha256 = \"sha256-0123456789abcdef\"")
             && toml.contains("original-integrity = \"sha512-original\""),
-        "v5 lockfile must serialize patch evidence, got:\n{toml}"
+        "lockfile must serialize patch evidence, got:\n{toml}"
     );
     let parsed = Lockfile::from_toml(&toml).expect("parse patch records");
     assert_eq!(parsed.patches, lf.patches);
@@ -138,7 +160,7 @@ fn patch_records_round_trip_and_skip_binary() {
     lf.write_all(&toml_path).unwrap();
     assert!(
         !binary_path.exists(),
-        "patch-bearing v5 lockfile must remove stale lpm.lockb"
+        "patch-bearing lockfile must remove stale lpm.lockb"
     );
 }
 
@@ -159,6 +181,7 @@ fn write_all_skips_binary_when_importer_snapshots_present() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
         dependencies: vec![],
         alias_dependencies: vec![],
@@ -181,7 +204,7 @@ fn write_all_skips_binary_when_importer_snapshots_present() {
     lf.write_all(&toml_path).unwrap();
     assert!(
         !binary_path.exists(),
-        "importer-bearing v5 lockfile must remove stale lpm.lockb"
+        "importer-bearing lockfile must remove stale lpm.lockb"
     );
 }
 
@@ -326,6 +349,7 @@ fn packages_sorted_by_name() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -343,6 +367,7 @@ fn packages_sorted_by_name() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -376,6 +401,7 @@ fn tarball_roundtrips_when_present() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -435,6 +461,7 @@ fn tarball_mixed_population_roundtrips() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -452,6 +479,7 @@ fn tarball_mixed_population_roundtrips() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -757,6 +785,7 @@ fn toml_roundtrips_npm_alias_metadata() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec!["ansi-regex@5.0.1".to_string()],
@@ -774,6 +803,7 @@ fn toml_roundtrips_npm_alias_metadata() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
@@ -821,6 +851,7 @@ fn write_all_skips_binary_when_root_aliases_present() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -862,6 +893,7 @@ fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -893,6 +925,7 @@ fn empty_deps_not_serialized() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -938,6 +971,7 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -960,6 +994,7 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec!["payload@1.0.0".to_string()],
@@ -996,6 +1031,7 @@ fn read_fast_ignores_stale_binary() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1076,6 +1112,7 @@ fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1171,6 +1208,7 @@ fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> L
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1352,6 +1390,7 @@ fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1400,6 +1439,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1417,6 +1457,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1434,6 +1475,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1451,6 +1493,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1468,6 +1511,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1695,6 +1739,7 @@ fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1846,6 +1891,7 @@ fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1863,6 +1909,7 @@ fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1924,6 +1971,7 @@ fn package_key_distinguishes_cross_source_same_name_version() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1941,6 +1989,7 @@ fn package_key_distinguishes_cross_source_same_name_version() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1971,6 +2020,7 @@ fn package_key_uses_unknown_sentinel_when_source_missing() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -1998,6 +2048,7 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2015,6 +2066,7 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2057,6 +2109,7 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2074,6 +2127,7 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2178,6 +2232,7 @@ fn locked_package_peers_round_trip_through_toml() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec!["use-sync-external-store@1.6.0".to_string()],
@@ -2218,6 +2273,7 @@ fn locked_package_peers_empty_skipped_in_serialization() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2275,6 +2331,7 @@ fn binary_format_falls_back_when_ambient_peers_present() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2308,6 +2365,7 @@ fn binary_format_falls_back_when_per_package_peers_present() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2349,6 +2407,7 @@ fn registry_signature_metadata_triggers_binary_fallback() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2379,6 +2438,7 @@ fn legacy_find_package_returns_some_match_under_collision() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],
@@ -2396,6 +2456,7 @@ fn legacy_find_package_returns_some_match_under_collision() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],

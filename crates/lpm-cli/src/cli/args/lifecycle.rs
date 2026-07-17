@@ -219,13 +219,11 @@ pub(crate) struct InstallArgs {
     #[arg(long)]
     pub(crate) auto_build: bool,
 
-    /// Skip `engines.lpm` / `engines.node` enforcement for this
-    /// invocation.
+    /// Use warning-only root and dependency engine checks for this invocation.
     ///
-    /// LPM enforces `engines` constraints from the workspace root
-    /// `package.json` by default, mismatches abort. Pass this flag
-    /// to bypass — useful when running an older CLI in a project
-    /// pinned to a newer one, or vice versa.
+    /// LPM enforces `engines.lpm` and `engines.node` from the workspace
+    /// root plus `engines.node` from selected dependencies. Required
+    /// mismatches abort by default. Pass this flag to install with warnings.
     ///
     /// Precedence: this flag > `package.json > lpm > engineStrict`
     /// > `~/.lpm/config.toml > engine-strict` > default (true).
@@ -606,7 +604,7 @@ pub(crate) struct AddArgs {
     #[arg(long)]
     pub(crate) target: Option<String>,
 
-    /// Skip `engines.lpm` / `engines.node` enforcement.
+    /// Use warning-only root and dependency engine checks.
     ///
     /// `lpm add` runs the engine gate before mutating
     /// `package.json` so a constraint violation can't leave the
@@ -856,7 +854,7 @@ pub(crate) struct RebuildArgs {
     #[arg(long)]
     pub(crate) sandbox_log: bool,
 
-    /// Skip `engines.lpm` / `engines.node` enforcement. See
+    /// Skip workspace-root engine enforcement. See
     /// `lpm install --no-engine-strict` for the precedence chain.
     #[arg(long)]
     pub(crate) no_engine_strict: bool,

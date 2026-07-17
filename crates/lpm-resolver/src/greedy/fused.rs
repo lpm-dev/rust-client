@@ -586,6 +586,35 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_with_cache_options_and_policy_roots(
+    client: Arc<RegistryClient>,
+    root_dependencies: crate::resolve::RootDependencies,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+        client,
+        root_dependencies,
+        overrides,
+        route_table,
+        npm_fanout,
+        spec_tx,
+        shared_cache,
+        auto_install_peers,
+        include_optional_dependencies,
+        policy,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
@@ -599,9 +628,39 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     policy: ResolverPolicy,
     selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+        client,
+        crate::resolve::RootDependencies::required(dependencies),
+        overrides,
+        route_table,
+        npm_fanout,
+        spec_tx,
+        shared_cache,
+        auto_install_peers,
+        include_optional_dependencies,
+        policy,
+        selected_package_tx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+    client: Arc<RegistryClient>,
+    root_dependencies: crate::resolve::RootDependencies,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+    selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
-        n_deps = dependencies.len(),
+        n_deps = root_dependencies.dependencies.len(),
         npm_fanout
     )
     .entered();
@@ -615,8 +674,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
     let range_aware_worker_batch = worker_range_aware_batch_enabled();
 
-    let mut state = ResolveState::new_with_options_and_policy(
-        dependencies,
+    let mut state = ResolveState::new_with_root_dependencies_and_policy(
+        root_dependencies,
         overrides,
         include_optional_dependencies,
         policy.clone(),

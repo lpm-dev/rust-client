@@ -10,7 +10,7 @@ use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json,
 };
-use support::{TempProject, lpm, lpm_with_registry, write_signed_unlock};
+use support::{TempProject, configure_fake_node, lpm, lpm_with_registry, write_signed_unlock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1839,6 +1839,8 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         "failed_count",
         "skipped_platform_count",
         "skipped_auth_count",
+        "skipped_optional_count",
+        "skipped_engine_count",
         "task_sum_ms",
         "task_max_ms",
         "drain_ms",
@@ -6230,6 +6232,48 @@ fn install_workspace_star_dep_plants_root_symlink_to_member() {
     );
 }
 
+#[test]
+fn install_workspace_star_dep_accepts_member_without_version() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-versionless-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "no-ver": "workspace:*"
+  }
+}"#,
+    );
+
+    project.write_file("packages/no-ver/package.json", r#"{"name":"no-ver"}"#);
+
+    lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .env("LPM_STORE_VERSION", "v2")
+        .assert()
+        .success();
+
+    let link = project.path().join("node_modules/no-ver");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("versionless workspace member must be linked")
+            .file_type()
+            .is_symlink(),
+        "v2 must materialize the versionless workspace member through its link store",
+    );
+    let resolved = std::fs::canonicalize(link).expect("resolve versionless workspace member link");
+    assert!(
+        resolved.to_string_lossy().contains("no-ver@0.0.0"),
+        "versionless workspace members must retain the workspace discovery default"
+    );
+}
+
 /// `workspace:^` is a published-time hint — the member is still installed
 /// locally as a symlink. Pre-fix, install rewrote `workspace:^` into a
 /// registry range and 404'd against the upstream proxy.
@@ -6805,6 +6849,966 @@ async fn install_optional_dep_failure_does_not_abort_install() {
     assert!(
         !nm.join("phantom-optional").exists(),
         "phantom-optional must not appear; the registry never served it"
+    );
+}
+
+async fn run_transitive_dependency_failure_case(resolver: Option<&str>, parent_optional: bool) {
+    let mock = MockRegistry::start().await;
+    let host_manifest = if parent_optional {
+        serde_json::json!({
+            "name": "failure-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "failure-parent": "1.0.0" }
+        })
+    } else {
+        serde_json::json!({
+            "name": "failure-host",
+            "version": "1.0.0",
+            "dependencies": { "failure-parent": "1.0.0" }
+        })
+    };
+    mock.with_manifest_package(host_manifest, &[]).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "failure-parent",
+            "version": "1.0.0",
+            "dependencies": { "missing-required-child": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"transitive-failure","version":"1.0.0","dependencies":{"failure-host":"1.0.0"}}"#,
+    );
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.args([
+        "install",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]);
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+    let output = command.output().expect("run transitive failure install");
+
+    if parent_optional {
+        assert!(
+            output.status.success(),
+            "required child failure below an optional parent must be skipped\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let node_modules = project.path().join("node_modules");
+        assert!(
+            node_modules.join("failure-host").exists()
+                && node_modules.join("failure-parent").exists()
+                && !node_modules.join("missing-required-child").exists(),
+            "the optional parent must remain installed while its unavailable child is omitted",
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "required child failure below a required parent must fail installation"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("missing-required-child"),
+            "failure must identify the unavailable required child; got:\n{stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn greedy_skips_required_failure_below_optional_parent() {
+    run_transitive_dependency_failure_case(None, true).await;
+}
+
+#[tokio::test]
+async fn pubgrub_skips_required_failure_below_optional_parent() {
+    run_transitive_dependency_failure_case(Some("pubgrub"), true).await;
+}
+
+#[tokio::test]
+async fn greedy_propagates_required_failure_below_required_parent() {
+    run_transitive_dependency_failure_case(None, false).await;
+}
+
+#[tokio::test]
+async fn pubgrub_propagates_required_failure_below_required_parent() {
+    run_transitive_dependency_failure_case(Some("pubgrub"), false).await;
+}
+
+#[tokio::test]
+async fn pubgrub_keeps_shared_descendant_failure_fatal_when_any_path_is_required() {
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "required-host",
+        "2.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({ "shared-failure-parent": "1.0.0" }),
+                Some(make_tarball("required-host", "1.0.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({ "shared-failure-parent": "1.0.0" }),
+                Some(make_tarball("required-host", "2.0.0")),
+            ),
+        ],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "shared-failure-parent": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "shared-failure-parent",
+            "version": "1.0.0",
+            "dependencies": { "missing-shared-child": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"shared-transitive-failure",
+            "version":"1.0.0",
+            "dependencies":{
+                "optional-host":"1.0.0",
+                "required-host":"1.0.0"
+            }
+        }"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .env("LPM_RESOLVER", "pubgrub")
+        .output()
+        .expect("run shared-path PubGrub failure install");
+
+    assert!(
+        !output.status.success(),
+        "a required path to the shared parent must keep its child failure fatal"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing-shared-child"),
+        "failure must identify the missing descendant"
+    );
+}
+
+async fn mount_required_incompatible_engine(mock: &MockRegistry) {
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "incompatible-engine",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" }
+        }),
+        &[],
+    )
+    .await;
+}
+
+fn dependency_engine_install_command(
+    project: &TempProject,
+    registry_url: &str,
+) -> assert_cmd::Command {
+    let mut command = lpm_with_registry(project, registry_url);
+    configure_fake_node(&mut command, project, "20.0.0");
+    command.args([
+        "install",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]);
+    command
+}
+
+#[tokio::test]
+async fn fresh_strict_install_rejects_required_dependency_with_incompatible_node_engine() {
+    let mock = MockRegistry::start().await;
+    mount_required_incompatible_engine(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"engine-strict","version":"1.0.0","dependencies":{"incompatible-engine":"1.0.0"}}"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .output()
+        .expect("run strict dependency-engine install");
+
+    assert!(
+        !output.status.success(),
+        "strict install must reject an incompatible required dependency"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("incompatible-engine@1.0.0") && stderr.contains(">=999.0.0"),
+        "engine mismatch must identify the dependency and required range; got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn fresh_non_strict_install_warns_and_accepts_incompatible_dependency_engine() {
+    let mock = MockRegistry::start().await;
+    mount_required_incompatible_engine(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"engine-soft","version":"1.0.0","lpm":{"engineStrict":false},"dependencies":{"incompatible-engine":"1.0.0"}}"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .output()
+        .expect("run non-strict dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "non-strict install must accept an incompatible dependency\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("incompatible-engine@1.0.0") && stderr.contains("engine-strict disabled"),
+        "non-strict install must warn about the ignored mismatch; got:\n{stderr}"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/incompatible-engine")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn frozen_strict_install_revalidates_dependency_engine_from_lockfile() {
+    let mock = MockRegistry::start().await;
+    mount_required_incompatible_engine(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"engine-frozen","version":"1.0.0","lpm":{"engineStrict":false},"dependencies":{"incompatible-engine":"1.0.0"}}"#,
+    );
+
+    dependency_engine_install_command(&project, &mock.url())
+        .assert()
+        .success();
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("node-engine = \">=999.0.0\""),
+        "lockfile must retain dependency engine constraints for replay:\n{lockfile}"
+    );
+
+    project.write_file(
+        "package.json",
+        r#"{"name":"engine-frozen","version":"1.0.0","lpm":{"engineStrict":true},"dependencies":{"incompatible-engine":"1.0.0"}}"#,
+    );
+    let _ = std::fs::remove_dir_all(project.path().join("node_modules"));
+    let _ = std::fs::remove_file(project.path().join(".lpm/install-hash"));
+
+    let mut command = dependency_engine_install_command(&project, &mock.url());
+    command.arg("--frozen-lockfile");
+    let output = command
+        .output()
+        .expect("run frozen strict dependency-engine install");
+    assert!(
+        !output.status.success(),
+        "frozen strict install must reject the locked incompatible dependency"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("incompatible-engine@1.0.0") && stderr.contains(">=999.0.0"),
+        "frozen mismatch must come from persisted engine metadata; got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn warm_install_revalidates_dependency_engine_when_effective_node_changes() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "node-20-only",
+            "version": "1.0.0",
+            "engines": { "node": ">=20 <21" }
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{"name":"engine-warm","version":"1.0.0","dependencies":{"node-20-only":"1.0.0"}}"#,
+    );
+
+    let mut first = dependency_engine_install_command(&project, &mock.url());
+    configure_fake_node(&mut first, &project, "20.0.0");
+    first.assert().success();
+
+    let mut second = dependency_engine_install_command(&project, &mock.url());
+    configure_fake_node(&mut second, &project, "22.0.0");
+    let output = second
+        .output()
+        .expect("run warm install after effective Node change");
+
+    assert!(
+        !output.status.success(),
+        "warm install must not use an install-state hit after the effective Node version changes"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("node-20-only@1.0.0") && stderr.contains(">=20 <21"),
+        "warm mismatch must be revalidated from lockfile engine metadata; got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn strict_install_skips_incompatible_required_descendant_below_optional_parent() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "engine-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "engine-optional-parent": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "engine-optional-parent",
+            "version": "1.0.0",
+            "dependencies": { "incompatible-engine": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mount_required_incompatible_engine(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"engine-optional","version":"1.0.0","dependencies":{"engine-host":"1.0.0"}}"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .output()
+        .expect("run optional dependency-engine install");
+    assert!(
+        output.status.success(),
+        "incompatible dependency below an optional parent must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let node_modules = project.path().join("node_modules");
+    assert!(node_modules.join("engine-host").exists());
+    assert!(node_modules.join("engine-optional-parent").exists());
+    assert!(!node_modules.join("incompatible-engine").exists());
+}
+
+#[test]
+fn strict_install_skips_incompatible_optional_file_dependency_from_local_source() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"local-engine-optional",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"local-native":"file:../local-native"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-native/package.json",
+        r#"{
+            "name":"local-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run local optional dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "incompatible optional file dependency must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+}
+
+#[tokio::test]
+async fn optional_local_engine_skip_preserves_required_registry_package_with_same_identity() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "registry-host",
+            "version": "1.0.0",
+            "main": "index.js",
+            "dependencies": { "foo": "1.0.0" }
+        }),
+        &[("index.js", b"module.exports = require('foo');\n")],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'registry-foo';\n")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"source-aware-engine-skip",
+            "version":"1.0.0",
+            "dependencies":{
+                "local-host":"file:./packages/local-host",
+                "registry-host":"1.0.0"
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"local-foo":"file:../local-foo"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-foo/package.json",
+        r#"{
+            "name":"foo",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .output()
+        .expect("run source-aware dependency-engine install");
+    assert!(
+        output.status.success(),
+        "skipping the optional local foo must preserve required registry foo\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .args(["-e", "process.stdout.write(require('registry-host'))"])
+        .output()
+        .expect("require registry host after source-aware engine skip");
+    assert!(
+        runtime.status.success() && String::from_utf8_lossy(&runtime.stdout) == "registry-foo",
+        "required registry foo must remain installed and linked\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+}
+
+async fn run_optional_registry_dependency_from_local_source_case(resolver: Option<&str>) {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-registry-native",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-registry-from-local-source",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"optional-registry-native":"1.0.0"}
+        }"#,
+    );
+
+    let mut command = dependency_engine_install_command(&project, &mock.url());
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+    let output = command
+        .output()
+        .expect("run optional registry dependency from local source install");
+    assert!(
+        output.status.success(),
+        "an incompatible optional registry child of a local source must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+    assert!(
+        !project
+            .path()
+            .join("node_modules/optional-registry-native")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn greedy_skips_incompatible_optional_registry_dependency_from_local_source() {
+    run_optional_registry_dependency_from_local_source_case(None).await;
+}
+
+#[tokio::test]
+async fn pubgrub_skips_incompatible_optional_registry_dependency_from_local_source() {
+    run_optional_registry_dependency_from_local_source_case(Some("pubgrub")).await;
+}
+
+async fn run_missing_optional_registry_dependency_from_local_source_case(resolver: Option<&str>) {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"missing-optional-registry-from-local-source",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"missing-optional-registry":"1.0.0"}
+        }"#,
+    );
+
+    let mut command = dependency_engine_install_command(&project, &mock.url());
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+    let output = command
+        .output()
+        .expect("run missing optional registry dependency from local source install");
+    assert!(
+        output.status.success(),
+        "an unavailable optional registry child of a local source must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+}
+
+#[tokio::test]
+async fn greedy_skips_missing_optional_registry_dependency_from_local_source() {
+    run_missing_optional_registry_dependency_from_local_source_case(None).await;
+}
+
+#[tokio::test]
+async fn pubgrub_skips_missing_optional_registry_dependency_from_local_source() {
+    run_missing_optional_registry_dependency_from_local_source_case(Some("pubgrub")).await;
+}
+
+#[tokio::test]
+async fn experimental_resolver_skips_missing_optional_registry_dependency_from_local_source() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"missing-optional-registry-experimental",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"missing-optional-registry":"1.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_GRAPH", "resolve-worklist")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run experimental optional metadata failure install");
+
+    assert!(
+        output.status.success(),
+        "the experimental resolver must skip unavailable optional metadata\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn strict_install_skips_incompatible_optional_workspace_dependency_from_local_source() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-workspace-from-local-source",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "dependencies":{"local-host":"file:./vendor/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "vendor/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"workspace-native":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-native/package.json",
+        r#"{
+            "name":"workspace-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run optional workspace dependency from local source install");
+
+    assert!(
+        output.status.success(),
+        "an incompatible optional workspace child of a local source must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+    assert!(
+        !project
+            .path()
+            .join("node_modules/workspace-native")
+            .exists(),
+        "a skipped optional workspace child must not leave a root symlink",
+    );
+}
+
+#[test]
+fn optional_local_parent_engine_skip_prunes_required_workspace_descendant_link() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-local-workspace-descendant",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "dependencies":{"local-host":"file:./vendor/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "vendor/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"optional-parent":"file:../optional-parent"}
+        }"#,
+    );
+    project.write_file(
+        "vendor/optional-parent/package.json",
+        r#"{
+            "name":"optional-parent",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"},
+            "dependencies":{"workspace-child":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-child/package.json",
+        r#"{"name":"workspace-child","version":"1.0.0"}"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run inherited optional workspace descendant install");
+
+    assert!(
+        output.status.success(),
+        "an incompatible optional local parent must be skippable\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let node_modules = project.path().join("node_modules");
+    assert!(!node_modules.join("optional-parent").exists());
+    assert!(
+        !node_modules.join("workspace-child").exists(),
+        "a required workspace edge below a skipped optional parent must not leave a root link",
+    );
+}
+
+#[test]
+fn v1_store_rejects_required_workspace_member_with_incompatible_node_engine() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"v1-workspace-engine-strict",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "dependencies":{"workspace-native":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-native/package.json",
+        r#"{
+            "name":"workspace-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run v1 workspace dependency-engine install");
+
+    assert!(
+        !output.status.success(),
+        "v1 must reject the same required workspace engine mismatch as v2"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace-native@1.0.0") && stderr.contains(">=999.0.0"),
+        "v1 workspace mismatch must identify the member and range; got:\n{stderr}",
+    );
+}
+
+#[test]
+fn optional_dependency_overrides_duplicate_required_local_source_dependency() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-local-override",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "dependencies":{"local-native":"file:../local-native"},
+            "optionalDependencies":{"local-native":"file:../local-native"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-native/package.json",
+        r#"{
+            "name":"local-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run duplicate local dependency override install");
+
+    assert!(
+        output.status.success(),
+        "optionalDependencies must override a duplicate dependencies entry\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+}
+
+#[tokio::test]
+async fn strict_install_does_not_fetch_descendant_orphaned_by_optional_engine_skip() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "orphan-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "incompatible-optional-parent": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "incompatible-optional-parent",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" },
+            "dependencies": { "orphan-leaf": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "orphan-leaf",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path("orphan-leaf", "1.0.0")))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"engine-orphan-pruning",
+            "version":"1.0.0",
+            "dependencies":{"orphan-host":"1.0.0"}
+        }"#,
+    );
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .env("LPM_RESOLVER", "pubgrub")
+        .output()
+        .expect("run orphan-pruning dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "descendant orphaned by an optional engine skip must not be fetched\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let node_modules = project.path().join("node_modules");
+    assert!(node_modules.join("orphan-host").exists());
+    assert!(!node_modules.join("incompatible-optional-parent").exists());
+    assert!(!node_modules.join("orphan-leaf").exists());
+}
+
+#[tokio::test]
+async fn greedy_fusion_does_not_prefetch_optional_graph_before_engine_pruning() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "overlap-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "overlap-incompatible-parent": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "overlap-incompatible-parent",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" },
+            "dependencies": { "overlap-orphan-leaf": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "overlap-orphan-leaf",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"engine-overlap-pruning",
+            "version":"1.0.0",
+            "dependencies":{"overlap-host":"1.0.0"}
+        }"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .output()
+        .expect("run greedy-fusion overlap dependency-engine install");
+    assert!(
+        output.status.success(),
+        "engine-pruned optional graph must not fail install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let orphan_tarball = MockRegistry::tarball_path("overlap-orphan-leaf", "1.0.0");
+    let orphan_tarball_hits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == orphan_tarball)
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        orphan_tarball_hits.is_empty(),
+        "greedy-fusion must not materialize descendants that engine pruning will orphan; hits={orphan_tarball_hits:?}",
     );
 }
 

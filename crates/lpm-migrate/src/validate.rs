@@ -293,6 +293,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["accepts@1.3.8".to_string()],
@@ -310,6 +311,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -341,6 +343,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec!["missing-dep@1.0.0".to_string()],
@@ -373,6 +376,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -400,6 +404,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -427,6 +432,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -467,6 +473,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -498,6 +505,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -515,6 +523,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -532,6 +541,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -568,6 +578,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -615,6 +626,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["b@1.0.0".to_string()],
@@ -632,6 +644,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["a@1.0.0".to_string()],
@@ -664,6 +677,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["b@1.0.0".to_string()],
@@ -681,6 +695,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["c@1.0.0".to_string()],
@@ -698,6 +713,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["a@1.0.0".to_string()],
@@ -730,6 +746,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["b@1.0.0".to_string(), "c@1.0.0".to_string()],
@@ -747,6 +764,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec!["c@1.0.0".to_string()],
@@ -764,6 +782,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],

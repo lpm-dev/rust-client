@@ -17,6 +17,7 @@ pub(super) async fn handle_swift_lpm_deps(
     no_install_deps: bool,
     no_skills: bool,
     no_editor_setup: bool,
+    no_engine_strict: bool,
     pm: &str,
 ) -> Result<(), LpmError> {
     // Check versionMeta for swift manifest dependencies
@@ -60,6 +61,7 @@ pub(super) async fn handle_swift_lpm_deps(
             no_install_deps,
             no_skills,
             no_editor_setup,
+            no_engine_strict,
             pm,
             None,
             None,

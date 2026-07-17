@@ -1553,6 +1553,7 @@ async fn auto_install_if_stale(
             false, // force
             false, // allow_new
             false, // strict_integrity
+            false, // no_engine_strict
             None,  // strict_peer_dependencies_override
             None,  // linker_override
             false, // no_skills
@@ -2450,7 +2451,7 @@ mod tests {
     /// A future regression that reintroduces a parallel bare-hash overwrite
     /// in `auto_install_if_stale` or the dev flow fails here immediately.
     #[tokio::test]
-    async fn auto_install_if_stale_writes_v8_install_hash_for_empty_deps() {
+    async fn auto_install_if_stale_writes_complete_install_state_for_empty_deps() {
         // Isolate every env var the install pipeline reads so a
         // developer's exported state can't pollute the test. `LPM_HOME`
         // redirects the store + cache + global config away from the
@@ -2501,7 +2502,7 @@ mod tests {
             "auto_install_if_stale must succeed on empty-deps project, got: {result:?}"
         );
 
-        // Load-bearing pin: install-hash on disk has v8 shape (5 lines).
+        // Load-bearing pin: install-hash on disk has the complete metadata shape.
         // A regression that reintroduces `fs::write(install_hash, &bare_hash)`
         // anywhere in the dev path — inside auto_install_if_stale or a
         // helper it calls — fails the line-count assertion here.
@@ -2510,8 +2511,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            5,
-            "install-hash MUST be v8 (5 lines: hash + m: + l: + i: + p:), got:\n{on_disk}\n\
+            7,
+            "install-hash MUST contain 7 lines (hash + m: + l: + i: + p: + e: + n:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
@@ -2539,8 +2540,16 @@ mod tests {
             "line 5 must be platform tuple, got {:?}",
             lines[4]
         );
+        assert_eq!(
+            lines[5], "e:none",
+            "line 6 must record unconstrained dependency engines"
+        );
+        assert_eq!(
+            lines[6], "n:none",
+            "line 7 must reserve Node runtime fingerprint metadata"
+        );
 
-        // Round-trip: needs_install reads the v8 shape as up-to-date.
+        // Round-trip: needs_install reads the complete shape as up-to-date.
         let (stale_after, hash) = needs_install(p);
         assert!(
             !stale_after,

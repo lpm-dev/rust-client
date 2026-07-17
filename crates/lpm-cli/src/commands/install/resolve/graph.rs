@@ -32,6 +32,7 @@ pub(super) enum NodeResolution {
         request: ResolveRequest,
         info: Arc<lpm_resolver::CachedPackageInfo>,
     },
+    SkippedOptionalMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -76,10 +77,20 @@ pub(super) fn load_lockfile_graph_packages(
             fast.lockfile.metadata.lockfile_version
         )));
     }
+    if lockfile_needs_dependency_engine_repair(&fast.lockfile) {
+        return Err(LpmError::Registry(format!(
+            "experimental resolver lockfile graph mode requires an upgraded v{} lockfile; found v{}",
+            lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
+            fast.lockfile.metadata.lockfile_version
+        )));
+    }
     Ok(fast.packages)
 }
 
-pub(super) fn root_resolve_requests(deps: &HashMap<String, String>) -> Vec<ResolveRequest> {
+pub(super) fn root_resolve_requests(
+    deps: &HashMap<String, String>,
+    optional_names: &HashSet<String>,
+) -> Vec<ResolveRequest> {
     let mut requests = Vec::with_capacity(deps.len());
     let mut entries: Vec<(&String, &String)> = deps.iter().collect();
     entries.sort_by_key(|(name, _)| *name);
@@ -92,7 +103,7 @@ pub(super) fn root_resolve_requests(deps: &HashMap<String, String>) -> Vec<Resol
             range,
             parent: None,
             depth: 0,
-            optional: false,
+            optional: optional_names.contains(local_name),
             root: true,
             direct: true,
         });
@@ -117,7 +128,7 @@ pub(super) async fn resolve_node(
     resolver_policy: lpm_resolver::ResolverPolicy,
 ) -> Result<NodeResolution, LpmError> {
     let context = MetadataRequestContext::from_request(&request);
-    let info = metadata_for_package(
+    let result = metadata_for_package(
         context,
         client,
         route_table,
@@ -126,7 +137,19 @@ pub(super) async fn resolve_node(
         metadata_stats,
         resolver_policy,
     )
-    .await?;
+    .await;
+    let info = match result {
+        Ok(info) => info,
+        Err(err) if request.optional => {
+            tracing::debug!(
+                "skipping optional metadata failure for {}@{}: {err}",
+                request.target_name,
+                request.range,
+            );
+            return Ok(NodeResolution::SkippedOptionalMetadata);
+        }
+        Err(err) => return Err(err),
+    };
     Ok(NodeResolution::Metadata { request, info })
 }
 
@@ -347,6 +370,7 @@ pub(super) fn merge_node_into_packages(
                 registry_signatures: dist.map(|dist| dist.signatures.clone()).unwrap_or_default(),
                 registry_published_at: dist.and_then(|dist| dist.published_at.clone()),
                 platform: node.platform.clone(),
+                node_engine: node.info.node_engines.get(&version).cloned(),
                 optional: node.request.optional,
                 tarball_url: dist.and_then(|dist| dist.tarball_url.clone()),
                 metadata_checked_for_tarball: true,

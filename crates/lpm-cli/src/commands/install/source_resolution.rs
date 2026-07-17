@@ -54,6 +54,8 @@ pub(super) struct SourceDep {
     /// Classification used to drive both the recursive pre-resolve
     /// and the post-resolve fix-up.
     pub(super) kind: DepKind,
+    /// Whether this edge was declared in `optionalDependencies`.
+    pub(super) optional: bool,
     /// Exact `InstallPackage::source` string for a resolved
     /// directory/link target. Registry-style dependencies leave this
     /// empty and resolve through the registry package index.
@@ -118,6 +120,7 @@ pub(super) struct NonRegistryPreResolveResult {
     /// `node_modules/<canonical>` — matches consumer expectation
     /// when the local name aliases the workspace member.
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+    pub(super) optional_registry_roots: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -125,12 +128,19 @@ pub(super) struct V2WorkspaceRootPreResolveResult {
     pub(super) install_pkgs: Vec<InstallPackage>,
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+    pub(super) optional_registry_roots: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct LocalSourceExpansionResult {
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryRootOptionality {
+    optional: HashSet<String>,
+    required: HashSet<String>,
 }
 
 pub(super) struct InstallRoutingContext {
@@ -320,6 +330,7 @@ pub(super) fn expand_local_source_install_packages(
             &mut node_modules_warned,
             &mut additional_workspace_links,
             workspace_transitives,
+            false,
         )?;
     }
 
@@ -340,8 +351,13 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         return Ok(V2WorkspaceRootPreResolveResult::default());
     }
 
+    let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
     for member in direct_workspace_member_deps {
+        let node_engine = read_pkg_json_node_engine(
+            &member.source_dir,
+            &format!("workspace member at {}", member.source_dir.display()),
+        )?;
         install_pkgs.push(InstallPackage {
             name: member.name.clone(),
             version: member.version.clone(),
@@ -356,6 +372,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -373,11 +390,17 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         json_output,
         WorkspaceTransitiveMode::SourceGraph,
     )?;
+    let optional_registry_roots = merge_optional_registry_roots(
+        &dependency_names_before_expansion,
+        &HashSet::new(),
+        registry_root_optionality(&install_pkgs, &source_deps),
+    );
 
     Ok(V2WorkspaceRootPreResolveResult {
         install_pkgs,
         source_deps,
         additional_workspace_links,
+        optional_registry_roots,
     })
 }
 
@@ -500,6 +523,7 @@ pub(super) fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
 ///   non-Registry source entries — falls back to fresh-resolve.
 ///   Correctness fine; warm-restart perf follow-up.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn pre_resolve_non_registry_deps(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -514,6 +538,30 @@ pub(super) async fn pre_resolve_non_registry_deps(
     // installs (the common case); the detection becomes a
     // no-op.
     workspace_members: &[WorkspaceMemberLink],
+) -> Result<NonRegistryPreResolveResult, LpmError> {
+    pre_resolve_non_registry_deps_with_optional_registry_roots(
+        client,
+        store,
+        project_dir,
+        deps,
+        json_output,
+        strict_integrity,
+        workspace_members,
+        &HashSet::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    project_dir: &Path,
+    deps: &mut HashMap<String, String>,
+    json_output: bool,
+    strict_integrity: bool,
+    workspace_members: &[WorkspaceMemberLink],
+    inherited_optional_registry_roots: &HashSet<String>,
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Gate the manifest boundary for non-registry specifiers.
     //
@@ -693,6 +741,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             install_pkgs: Vec::new(),
             source_deps: HashMap::new(),
             additional_workspace_links: Vec::new(),
+            optional_registry_roots: inherited_optional_registry_roots.clone(),
         });
     }
 
@@ -761,7 +810,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             .await?;
         let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
 
-        let (real_name, real_version) =
+        let (real_name, real_version, node_engine) =
             read_pkg_json_name_version(&cas_path, &format!("tarball at {url}"))?;
 
         // Dep-key vs fetched-name policy: warn rather than reject. The manifest dep key
@@ -789,6 +838,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: Some(url),
             metadata_checked_for_tarball: false,
@@ -845,7 +895,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
 
         let cas_path = store.store_local_tarball_at_cas_path(&content_sha256_hex, &data)?;
 
-        let (real_name, real_version) = read_pkg_json_name_version(
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &cas_path,
             &format!("local tarball at {}", abs_path.display()),
         )?;
@@ -890,6 +940,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             // tarball_url is fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
@@ -939,7 +990,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             ))
         })?;
 
-        let (real_name, real_version) = read_pkg_json_name_version(
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &realpath,
             &format!("file: directory at {}", realpath.display()),
         )?;
@@ -1028,6 +1079,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -1054,7 +1106,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             ))
         })?;
 
-        let (real_name, real_version) =
+        let (real_name, real_version, node_engine) =
             read_pkg_json_name_version(&realpath, &format!("link: dep at {}", realpath.display()))?;
 
         // : workspace overlap detection — same logic as the
@@ -1129,6 +1181,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -1147,6 +1200,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
     // - Stash per-source-string dep specs in `source_deps_out` for
     // the post-resolve fix-up at install.rs:2663+.
     //
+    let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let LocalSourceExpansionResult {
         source_deps: source_deps_out,
         additional_workspace_links,
@@ -1158,11 +1212,17 @@ pub(super) async fn pre_resolve_non_registry_deps(
         json_output,
         WorkspaceTransitiveMode::RootSymlinkOnly,
     )?;
+    let optional_registry_roots = merge_optional_registry_roots(
+        &dependency_names_before_expansion,
+        inherited_optional_registry_roots,
+        registry_root_optionality(&install_pkgs, &source_deps_out),
+    );
 
     Ok(NonRegistryPreResolveResult {
         install_pkgs,
         source_deps: source_deps_out,
         additional_workspace_links,
+        optional_registry_roots,
     })
 }
 
@@ -1243,7 +1303,7 @@ pub(super) async fn read_local_tarball_bounded(
 }
 
 /// Read `package.json` from an extracted package directory and
-/// return `(name, version)` as owned strings.
+/// return `(name, version, engines.node)` as owned values.
 ///
 /// Shared between the remote-tarball-URL arm and the local-file-
 /// tarball arm of [`pre_resolve_non_registry_deps`]; the two used to
@@ -1253,15 +1313,8 @@ pub(super) async fn read_local_tarball_bounded(
 pub(super) fn read_pkg_json_name_version(
     cas_path: &Path,
     source_label: &str,
-) -> Result<(String, String), LpmError> {
-    let pkg_json_path = cas_path.join("package.json");
-    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to read package.json from {source_label}: {e}"
-        ))
-    })?;
-    let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str)
-        .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))?;
+) -> Result<(String, String, Option<String>), LpmError> {
+    let pkg_json = read_pkg_json(cas_path, source_label)?;
     let name = pkg_json
         .get("name")
         .and_then(|v| v.as_str())
@@ -1280,7 +1333,35 @@ pub(super) fn read_pkg_json_name_version(
             ))
         })?
         .to_string();
-    Ok((name, version))
+    let node_engine = package_json_node_engine(&pkg_json);
+    Ok((name, version, node_engine))
+}
+
+pub(super) fn read_pkg_json_node_engine(
+    package_dir: &Path,
+    source_label: &str,
+) -> Result<Option<String>, LpmError> {
+    let pkg_json = read_pkg_json(package_dir, source_label)?;
+    Ok(package_json_node_engine(&pkg_json))
+}
+
+fn read_pkg_json(cas_path: &Path, source_label: &str) -> Result<serde_json::Value, LpmError> {
+    let pkg_json_path = cas_path.join("package.json");
+    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read package.json from {source_label}: {e}"
+        ))
+    })?;
+    serde_json::from_str(&pkg_json_str)
+        .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))
+}
+
+fn package_json_node_engine(pkg_json: &serde_json::Value) -> Option<String> {
+    pkg_json
+        .get("engines")
+        .and_then(|engines| engines.get("node"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// read a local source's
@@ -1331,6 +1412,11 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
         ))
     })?;
 
+    let optional_names = pkg_json
+        .get("optionalDependencies")
+        .and_then(|value| value.as_object())
+        .map(|deps| deps.keys().map(String::as_str).collect::<HashSet<_>>())
+        .unwrap_or_default();
     let mut out = Vec::new();
     for field in [
         "dependencies",
@@ -1342,6 +1428,9 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
             continue;
         };
         for (local_name, raw) in deps {
+            if field == "dependencies" && optional_names.contains(local_name.as_str()) {
+                continue;
+            }
             let Some(raw_str) = raw.as_str() else {
                 continue;
             };
@@ -1365,6 +1454,7 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
                 local_name: local_name.clone(),
                 raw_spec: normalized_spec.unwrap_or_else(|| raw_str.to_string()),
                 kind,
+                optional: field == "optionalDependencies",
                 target_source: None,
             });
         }
@@ -1619,6 +1709,7 @@ fn promote_workspace_member_source_graph(
     project_dir: &Path,
     spec: &mut SourceDep,
     matched_member: &WorkspaceMemberLink,
+    root_link_name: Option<&str>,
     consumer_deps_map: &mut HashMap<String, String>,
     install_pkgs_out: &mut Vec<InstallPackage>,
     source_deps_out: &mut HashMap<String, Vec<SourceDep>>,
@@ -1630,6 +1721,7 @@ fn promote_workspace_member_source_graph(
     node_modules_warned: &mut std::collections::HashSet<PathBuf>,
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
     workspace_transitives: WorkspaceTransitiveMode,
+    inherited_optional: bool,
 ) -> Result<(), LpmError> {
     let realpath = match matched_member.source_dir.canonicalize() {
         Ok(path) => path,
@@ -1638,17 +1730,34 @@ fn promote_workspace_member_source_graph(
     let source_string = workspace_member_source(project_dir, &matched_member.source_dir);
     if let Some(existing_source) = visited.get(&realpath) {
         spec.target_source = Some(existing_source.clone());
+        if let Some(root_link_name) = root_link_name
+            && let Some(package) = install_pkgs_out
+                .iter_mut()
+                .find(|package| package.source == *existing_source)
+        {
+            let root_links = package.root_link_names.get_or_insert_default();
+            if !root_links.iter().any(|name| name == root_link_name) {
+                root_links.push(root_link_name.to_string());
+            }
+        }
         return Ok(());
     }
     visited.insert(realpath.clone(), source_string.clone());
     spec.target_source = Some(source_string.clone());
+    let node_engine = read_pkg_json_node_engine(
+        &matched_member.source_dir,
+        &format!(
+            "workspace member at {}",
+            matched_member.source_dir.display()
+        ),
+    )?;
     install_pkgs_out.push(InstallPackage {
         name: matched_member.name.clone(),
         version: matched_member.version.clone(),
         source: source_string.clone(),
         dependencies: Vec::new(),
         aliases: HashMap::new(),
-        root_link_names: Some(Vec::new()),
+        root_link_names: Some(root_link_name.into_iter().map(str::to_string).collect()),
         is_direct: false,
         is_lpm: false,
         peers: Vec::new(),
@@ -1656,7 +1765,8 @@ fn promote_workspace_member_source_graph(
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
-        optional: false,
+        node_engine,
+        optional: inherited_optional || spec.optional,
         tarball_url: None,
         metadata_checked_for_tarball: false,
     });
@@ -1675,6 +1785,7 @@ fn promote_workspace_member_source_graph(
         node_modules_warned,
         additional_workspace_links,
         workspace_transitives,
+        inherited_optional || spec.optional,
     )
 }
 
@@ -1727,6 +1838,7 @@ pub(super) fn recurse_local_source_deps(
     // silently dropped the member from the root-symlink set.
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
     workspace_transitives: WorkspaceTransitiveMode,
+    inherited_optional: bool,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
         return Ok(());
@@ -1768,22 +1880,32 @@ pub(super) fn recurse_local_source_deps(
                         available_str,
                     )));
                 };
-                additional_workspace_links.push(WorkspaceMemberLink {
-                    name: spec.local_name.clone(),
-                    version: matched_member.version.clone(),
-                    source_dir: matched_member.source_dir.clone(),
-                });
+                let optional_path = inherited_optional || spec.optional;
+                let graph_backed_root_link = matches!(
+                    workspace_transitives,
+                    WorkspaceTransitiveMode::RootSymlinkOnly
+                ) && optional_path;
+                if !graph_backed_root_link {
+                    additional_workspace_links.push(WorkspaceMemberLink {
+                        name: spec.local_name.clone(),
+                        version: matched_member.version.clone(),
+                        source_dir: matched_member.source_dir.clone(),
+                    });
+                }
                 if matches!(
                     workspace_transitives,
                     WorkspaceTransitiveMode::RootSymlinkOnly
-                ) {
+                ) && !optional_path
+                {
                     continue;
                 }
+                let root_link_name = graph_backed_root_link.then(|| spec.local_name.clone());
 
                 promote_workspace_member_source_graph(
                     project_dir,
                     spec,
                     matched_member,
+                    root_link_name.as_deref(),
                     consumer_deps_map,
                     install_pkgs_out,
                     source_deps_out,
@@ -1795,6 +1917,7 @@ pub(super) fn recurse_local_source_deps(
                     node_modules_warned,
                     additional_workspace_links,
                     workspace_transitives,
+                    optional_path,
                 )?;
             }
             DepKind::FileDir | DepKind::Link => {
@@ -1815,7 +1938,7 @@ pub(super) fn recurse_local_source_deps(
                     spec.target_source = Some(existing_source.clone());
                     continue;
                 }
-                let (real_name, real_version) = read_pkg_json_name_version(
+                let (real_name, real_version, node_engine) = read_pkg_json_name_version(
                     &realpath,
                     &format!("transitive local source at {}", realpath.display()),
                 )?;
@@ -1839,21 +1962,28 @@ pub(super) fn recurse_local_source_deps(
                                 member.name,
                             ));
                         }
-                        // Invariant invariant — see immediate
-                        // file:/link: arms for the rationale. Push
-                        // the matched member under the parent's
-                        // local_name so the caller adds it to the
-                        // root-symlink set.
-                        additional_workspace_links.push(WorkspaceMemberLink {
-                            name: spec.local_name.clone(),
-                            version: member.version.clone(),
-                            source_dir: member.source_dir.clone(),
-                        });
-                        if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph) {
+                        let optional_path = inherited_optional || spec.optional;
+                        let graph_backed_root_link = matches!(
+                            workspace_transitives,
+                            WorkspaceTransitiveMode::RootSymlinkOnly
+                        ) && optional_path;
+                        if !graph_backed_root_link {
+                            additional_workspace_links.push(WorkspaceMemberLink {
+                                name: spec.local_name.clone(),
+                                version: member.version.clone(),
+                                source_dir: member.source_dir.clone(),
+                            });
+                        }
+                        if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph)
+                            || graph_backed_root_link
+                        {
+                            let root_link_name =
+                                graph_backed_root_link.then(|| spec.local_name.clone());
                             promote_workspace_member_source_graph(
                                 project_dir,
                                 spec,
                                 member,
+                                root_link_name.as_deref(),
                                 consumer_deps_map,
                                 install_pkgs_out,
                                 source_deps_out,
@@ -1865,6 +1995,7 @@ pub(super) fn recurse_local_source_deps(
                                 node_modules_warned,
                                 additional_workspace_links,
                                 workspace_transitives,
+                                optional_path,
                             )?;
                         }
                         continue;
@@ -1908,7 +2039,8 @@ pub(super) fn recurse_local_source_deps(
                     registry_signatures: Vec::new(),
                     registry_published_at: None,
                     platform: None,
-                    optional: false,
+                    node_engine,
+                    optional: inherited_optional || spec.optional,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,
                 });
@@ -1928,6 +2060,7 @@ pub(super) fn recurse_local_source_deps(
                     node_modules_warned,
                     additional_workspace_links,
                     workspace_transitives,
+                    inherited_optional || spec.optional,
                 )?;
             }
         }
@@ -2038,4 +2171,113 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
         p.dependencies = deps_out;
         p.aliases.extend(aliases_out);
     }
+
+    apply_local_source_optionality(packages, source_deps);
+}
+
+fn apply_local_source_optionality(
+    packages: &mut [InstallPackage],
+    source_deps: &HashMap<String, Vec<SourceDep>>,
+) {
+    let local_sources = all_local_sources(source_deps);
+    let required_sources = required_local_sources(packages, source_deps);
+    for package in packages {
+        if local_sources.contains(package.source.as_str()) {
+            package.optional = !required_sources.contains(package.source.as_str());
+        }
+    }
+}
+
+fn all_local_sources(source_deps: &HashMap<String, Vec<SourceDep>>) -> HashSet<&str> {
+    let mut local_sources: HashSet<&str> = HashSet::with_capacity(source_deps.len() * 2);
+    for (source, specs) in source_deps {
+        local_sources.insert(source);
+        for spec in specs {
+            if let Some(target_source) = spec.target_source.as_deref() {
+                local_sources.insert(target_source);
+            }
+        }
+    }
+    local_sources
+}
+
+fn required_local_sources<'a>(
+    packages: &[InstallPackage],
+    source_deps: &'a HashMap<String, Vec<SourceDep>>,
+) -> HashSet<&'a str> {
+    let local_sources = all_local_sources(source_deps);
+    let mut required_sources: HashSet<&str> = HashSet::with_capacity(local_sources.len());
+    let mut queue = VecDeque::with_capacity(local_sources.len());
+    for package in packages.iter() {
+        if !package.is_direct {
+            continue;
+        }
+        let Some(&source) = local_sources.get(package.source.as_str()) else {
+            continue;
+        };
+        if required_sources.insert(source) {
+            queue.push_back(source);
+        }
+    }
+
+    while let Some(source) = queue.pop_front() {
+        let Some(specs) = source_deps.get(source) else {
+            continue;
+        };
+        for spec in specs {
+            if spec.optional {
+                continue;
+            }
+            let Some(target_source) = spec.target_source.as_deref() else {
+                continue;
+            };
+            let Some(&target_source) = local_sources.get(target_source) else {
+                continue;
+            };
+            if required_sources.insert(target_source) {
+                queue.push_back(target_source);
+            }
+        }
+    }
+    required_sources
+}
+
+fn registry_root_optionality(
+    packages: &[InstallPackage],
+    source_deps: &HashMap<String, Vec<SourceDep>>,
+) -> RegistryRootOptionality {
+    let required_sources = required_local_sources(packages, source_deps);
+    let mut optionality = RegistryRootOptionality::default();
+    for (source, specs) in source_deps {
+        let parent_required = required_sources.contains(source.as_str());
+        for spec in specs {
+            if !matches!(spec.kind, DepKind::Registry) {
+                continue;
+            }
+            if parent_required && !spec.optional {
+                optionality.required.insert(spec.local_name.clone());
+            } else {
+                optionality.optional.insert(spec.local_name.clone());
+            }
+        }
+    }
+    optionality
+}
+
+fn merge_optional_registry_roots(
+    dependency_names_before_expansion: &HashSet<String>,
+    inherited_optional: &HashSet<String>,
+    source_optionality: RegistryRootOptionality,
+) -> HashSet<String> {
+    let mut optional = inherited_optional.clone();
+    optional.extend(source_optionality.optional);
+    for name in source_optionality.required {
+        optional.remove(&name);
+    }
+    for name in dependency_names_before_expansion {
+        if !inherited_optional.contains(name) {
+            optional.remove(name);
+        }
+    }
+    optional
 }

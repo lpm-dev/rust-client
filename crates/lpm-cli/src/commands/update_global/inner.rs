@@ -24,6 +24,7 @@ pub(super) async fn do_install_upgrade(
             suppress_nested_output,
             allow_new: false,
             strict_peer_dependencies_override: None,
+            no_engine_strict: false,
             auto_build: false,
             script_policy_override: None,
             min_release_age_override: None,

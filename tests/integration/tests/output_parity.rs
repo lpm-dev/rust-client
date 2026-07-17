@@ -372,6 +372,7 @@ fn binary_lockfile_roundtrip_100_packages() {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: if i > 0 {

@@ -275,6 +275,7 @@ fn make_version_metadata(
     VersionMetadata {
         name: name.to_string(),
         version: version.to_string(),
+        engines: HashMap::new(),
         dependencies: dependencies
             .iter()
             .map(|(dep_name, dep_range)| (dep_name.to_string(), dep_range.to_string()))

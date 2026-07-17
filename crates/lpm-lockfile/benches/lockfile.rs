@@ -14,6 +14,7 @@ fn make_lockfile(n: usize) -> Lockfile {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: if i > 0 {

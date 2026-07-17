@@ -682,6 +682,7 @@ pub async fn dlx(
             false, // force
             options.allow_new,
             false, // strict_integrity
+            false, // no_engine_strict
             None,  // strict_peer_dependencies_override
             None,  // linker_override
             false, // no_skills

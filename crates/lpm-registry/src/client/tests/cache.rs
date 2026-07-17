@@ -1011,6 +1011,95 @@ async fn custom_metadata_etag_304_revalidation_keeps_auth_partition() {
 }
 
 #[tokio::test]
+async fn custom_metadata_304_with_lost_cached_body_refetches_with_auth_without_validator() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server("https://lpm.dev");
+    let auth = bearer_for(&server.uri(), "TOKEN-A");
+
+    Mock::given(method("GET"))
+        .and(path("/private-pkg"))
+        .and(header("authorization", "Bearer TOKEN-A"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version("private-pkg", "1.0.0"))
+                .append_header("ETag", "\"custom-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+        .await
+        .unwrap();
+
+    let url = format!("{}/private-pkg", server.uri());
+    let cache_key = format!(
+        "npm:{}:{url}",
+        principal_fingerprint(Some(&auth), client.http.identity_fp_for_url(&url))
+    );
+    let cache_path = client
+        .cache_path(&cache_key)
+        .expect("custom metadata cache path should exist");
+    let mut validator_only = Vec::new();
+    validator_only.extend_from_slice(METADATA_CACHE_MAGIC);
+    validator_only.extend_from_slice(b"\"custom-v1\"");
+    validator_only.push(b'\n');
+    validator_only.extend_from_slice(b"lost-cache-body");
+    std::fs::write(cache_path, validator_only).unwrap();
+    expire_cache_entry(&client, &cache_key);
+
+    server.reset().await;
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let responder_count = Arc::clone(&request_count);
+    Mock::given(method("GET"))
+        .and(path("/private-pkg"))
+        .and(header("authorization", "Bearer TOKEN-A"))
+        .respond_with(move |request: &wiremock::Request| {
+            if responder_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"custom-v1\"")
+                );
+                ResponseTemplate::new(304)
+            } else {
+                assert!(request.headers.get("if-none-match").is_none());
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version("private-pkg", "2.0.0"))
+                    .append_header("ETag", "\"custom-v2\"")
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let refreshed = client
+        .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        client
+            .read_cache_content(&cache_key)
+            .unwrap()
+            .etag
+            .as_deref(),
+        Some("\"custom-v2\"")
+    );
+}
+
+#[tokio::test]
 async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
     use std::sync::{
         Arc,

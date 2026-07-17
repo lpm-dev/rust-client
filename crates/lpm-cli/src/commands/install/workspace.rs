@@ -403,6 +403,11 @@ pub(super) fn workspace_member_cache_info(
         aliases_by_version.insert(version_str.clone(), aliases);
     }
 
+    let mut node_engines = HashMap::new();
+    if let Some(required) = pkg.engines.get("node") {
+        node_engines.insert(version_str.clone(), required.clone());
+    }
+
     let mut dist = HashMap::with_capacity(1);
     dist.insert(version_str, lpm_resolver::CachedDistInfo::default());
 
@@ -419,6 +424,7 @@ pub(super) fn workspace_member_cache_info(
         peer_deps,
         optional_dep_names,
         optional_peer_names,
+        node_engines,
         bundled_dep_names: HashMap::new(),
         platform: HashMap::new(),
         dist,
@@ -796,6 +802,27 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
                 queue.push_back(entry);
             }
         }
+    }
+    Ok(())
+}
+
+pub(super) fn enforce_required_workspace_member_engines(
+    workspace_member_deps: &[WorkspaceMemberLink],
+    policy: &crate::engine_check::DependencyEnginePolicy,
+) -> Result<(), LpmError> {
+    let mut checked_sources = HashSet::with_capacity(workspace_member_deps.len());
+    for member in workspace_member_deps {
+        if !checked_sources.insert(member.source_dir.as_path()) {
+            continue;
+        }
+        let Some(required) = read_pkg_json_node_engine(
+            &member.source_dir,
+            &format!("workspace member at {}", member.source_dir.display()),
+        )?
+        else {
+            continue;
+        };
+        policy.enforce_dependency(&member.name, &member.version, &required, false)?;
     }
     Ok(())
 }

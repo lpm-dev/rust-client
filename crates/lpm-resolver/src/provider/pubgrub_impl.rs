@@ -1,6 +1,18 @@
 use super::prelude::*;
 
 impl LpmDependencyProvider {
+    fn record_skipped_dependency(&self, skipped: SkippedDependency) {
+        self.skipped_dependencies.borrow_mut().insert(
+            (
+                skipped.parent.clone(),
+                skipped.parent_version.clone(),
+                skipped.child.clone(),
+                skipped.local_name.clone(),
+            ),
+            skipped,
+        );
+    }
+
     /// Pick the version the resolver would choose without any override applied.
     /// Returns the newest version in the consumer's declared range.
     ///
@@ -260,7 +272,8 @@ impl DependencyProvider for LpmDependencyProvider {
             // path behavior.
             if self.fetch_wait_timeout.is_zero() {
                 let uncached: Vec<String> = self
-                    .root_deps
+                    .root_dependencies
+                    .dependencies
                     .iter()
                     .map(|(local, range)| {
                         crate::ranges::parse_npm_alias(range)
@@ -308,7 +321,11 @@ impl DependencyProvider for LpmDependencyProvider {
             }
 
             let mut constraints = pubgrub::Map::default();
-            for (dep_name, dep_range_str) in &self.root_deps {
+            for (dep_name, dep_range_str) in &self.root_dependencies.dependencies {
+                let edge_is_optional = self.root_dependencies.is_optional(dep_name);
+                if edge_is_optional && !self.include_optional_dependencies {
+                    continue;
+                }
                 // Root-level alias rewrite: if the consumer's package.json
                 // declares `"local": "npm:target@range"`, the resolver
                 // must key the PubGrub constraint on `target` (the real
@@ -328,9 +345,15 @@ impl DependencyProvider for LpmDependencyProvider {
                 };
 
                 let pkg = ResolverPackage::from_dep_name(&target_name);
-
-                // Ensure dep is cached so we know its versions
-                self.ensure_cached(&pkg)?;
+                if let Err(error) = self.ensure_cached(&pkg) {
+                    if edge_is_optional {
+                        tracing::debug!(
+                            "optional root dep {dep_name} fetch failed; skipping: {error}"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
                 let available = self.available_versions(&pkg);
 
                 // **Defense-in-depth.** `workspace:<rest>` must
@@ -358,6 +381,13 @@ impl DependencyProvider for LpmDependencyProvider {
                 } else {
                     self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
                 };
+
+                if edge_is_optional && !available.iter().any(|version| range.contains(version)) {
+                    tracing::debug!(
+                        "optional root dep {dep_name}@{range_str} has no matching version; skipping"
+                    );
+                    continue;
+                }
 
                 constraints.insert(pkg, range);
             }
@@ -544,9 +574,12 @@ impl DependencyProvider for LpmDependencyProvider {
                 base_pkg
             };
 
-            let is_optional = optional_names.contains(dep_name);
+            let edge_is_optional = optional_names.contains(dep_name);
 
-            // Ensure dep is cached — skip optional deps that fail to fetch.
+            // Dependency fetch failures are recorded against this exact
+            // parent version and provisionally omitted. PubGrub can query
+            // versions it later discards, so effective optionality is checked
+            // only after the selected graph is known.
             //
             // An optional `@lpm.dev` dep that hits an auth/entitlement error
             // must surface as a user-visible warning, not a silent debug skip.
@@ -560,35 +593,40 @@ impl DependencyProvider for LpmDependencyProvider {
             match self.ensure_cached(&pkg) {
                 Ok(()) => {}
                 Err(e) => {
-                    if is_optional {
-                        let is_lpm = matches!(pkg, ResolverPackage::Lpm { .. });
-                        let is_auth = matches!(e, ProviderError::AuthRequired(_));
-                        if is_lpm && is_auth {
-                            tracing::warn!(
-                                "optional dep {dep_name} skipped: requires LPM authentication \
-                                 (run `lpm login` to install this package)"
-                            );
-                        } else {
-                            tracing::debug!("skipping optional dep {dep_name}: {e}");
-                        }
-                        continue;
-                    }
-                    return Err(e);
+                    let warn_auth = pkg.is_lpm() && matches!(&e, ProviderError::AuthRequired(_));
+                    let detail = format!("failed to resolve {pkg}@{dep_range_str}: {e}");
+                    tracing::debug!("provisionally skipping dep {dep_name}: {e}");
+                    self.record_skipped_dependency(SkippedDependency::new(
+                        package,
+                        version,
+                        &pkg,
+                        dep_name,
+                        dep_range_str,
+                        edge_is_optional,
+                        SkippedDependencyReason::Fetch { detail, warn_auth },
+                    ));
+                    continue;
                 }
             }
             let available = self.available_versions(&pkg);
 
-            // Optional dependencies with no semver-satisfying candidate are
-            // omitted, while platform metadata on satisfying candidates is
+            // Ranges without a matching candidate follow the same deferred
+            // validation path. Platform metadata on satisfying candidates is
             // preserved for install-time filtering.
             let npm_range = match NpmRange::parse(dep_range_str) {
                 Ok(r) => r,
                 Err(e) => {
-                    if is_optional {
-                        tracing::debug!("skipping optional dep {dep_name}@{dep_range_str}: {e}");
-                    } else {
-                        tracing::warn!("skipping dep {dep_name}@{dep_range_str}: {e}");
-                    }
+                    let detail = format!("invalid range for {pkg}@{dep_range_str}: {e}");
+                    tracing::debug!("provisionally skipping dep {dep_name}@{dep_range_str}: {e}");
+                    self.record_skipped_dependency(SkippedDependency::new(
+                        package,
+                        version,
+                        &pkg,
+                        dep_name,
+                        dep_range_str,
+                        edge_is_optional,
+                        SkippedDependencyReason::InvalidRange { detail },
+                    ));
                     continue;
                 }
             };
@@ -599,22 +637,27 @@ impl DependencyProvider for LpmDependencyProvider {
                 self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
             };
 
-            if is_optional {
-                let any_satisfies = available.iter().any(|version| range.contains(version));
-                if !any_satisfies {
-                    let host = Platform::current();
-                    tracing::debug!(
-                        "skipping optional dep {dep_name}@{dep_range_str}: \
-                         no available version satisfies range \
-                         (available={}, os={}, cpu={}, libc={})",
-                        available.len(),
-                        host.os,
-                        host.cpu,
-                        host.libc.unwrap_or("none"),
-                    );
-                    *self.platform_skipped.borrow_mut() += 1;
-                    continue;
-                }
+            if !available.iter().any(|version| range.contains(version)) {
+                let host = Platform::current();
+                let detail = format!(
+                    "no available version of {pkg} satisfies {dep_range_str} \
+                     (available={}, os={}, cpu={}, libc={})",
+                    available.len(),
+                    host.os,
+                    host.cpu,
+                    host.libc.unwrap_or("none"),
+                );
+                tracing::debug!("provisionally skipping dep {dep_name}: {detail}");
+                self.record_skipped_dependency(SkippedDependency::new(
+                    package,
+                    version,
+                    &pkg,
+                    dep_name,
+                    dep_range_str,
+                    edge_is_optional,
+                    SkippedDependencyReason::NoMatchingVersion { detail },
+                ));
+                continue;
             }
             constraints.insert(pkg, range);
         }

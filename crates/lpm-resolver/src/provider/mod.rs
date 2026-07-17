@@ -31,6 +31,9 @@ pub(crate) use policy::{
     trust_downgrade_violation, trust_downgrade_violation_unprofiled,
 };
 pub(crate) use types::LpmDependencyProvider;
+pub(crate) use types::SkippedDependency;
+#[cfg(test)]
+pub(crate) use types::SkippedDependencyReason;
 pub use types::{
     CachedDistInfo, CachedPackageInfo, NotifyMap, PlatformMeta, SharedCache, StreamingBfsMetrics,
     WalkerDone,
@@ -59,7 +62,7 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::types::{
         CachedDistInfo, CachedPackageInfo, LpmDependencyProvider, NotifyMap, PlatformMeta,
-        SharedCache, StreamingBfsMetrics, WalkerDone,
+        SharedCache, SkippedDependency, SkippedDependencyReason, StreamingBfsMetrics, WalkerDone,
     };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;
@@ -73,6 +76,8 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use crate::ranges::NpmRange;
+    #[allow(unused_imports)]
+    pub(super) use crate::resolve::RootDependencies;
     #[allow(unused_imports)]
     pub(super) use dashmap::DashMap;
     #[allow(unused_imports)]

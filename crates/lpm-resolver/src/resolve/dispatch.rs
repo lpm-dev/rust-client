@@ -175,6 +175,38 @@ pub async fn resolve_with_shared_cache_options_and_policy(
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_with_shared_cache_options_and_policy_roots(
+        client,
+        RootDependencies::required(dependencies),
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        include_optional_dependencies,
+        policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_with_shared_cache_options_and_policy_roots(
+    client: Arc<RegistryClient>,
+    root_dependencies: RootDependencies,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: crate::provider::WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
     // Greedy is the default; users opt out to the legacy
     // PubGrub-with-split-retry resolver via `LPM_RESOLVER=pubgrub`.
     // The flag dispatches at the public entry-point so every caller —
@@ -186,9 +218,9 @@ pub async fn resolve_with_shared_cache_options_and_policy(
     // See install.rs `fusion_enabled_local` for the resolver-dispatch
     // matrix.
     if std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub") {
-        return crate::greedy::resolve_greedy_with_options_and_policy(
+        return crate::greedy::resolve_greedy_with_root_dependencies_options_and_policy(
             client,
-            dependencies,
+            root_dependencies,
             overrides,
             shared_cache,
             notify_map,
@@ -203,7 +235,8 @@ pub async fn resolve_with_shared_cache_options_and_policy(
         .await;
     }
 
-    let _span = tracing::debug_span!("resolve", n_deps = dependencies.len()).entered();
+    let _span =
+        tracing::debug_span!("resolve", n_deps = root_dependencies.dependencies.len()).entered();
     let rt = Handle::current();
 
     // Reset profiling accumulators once before resolution starts.
@@ -231,7 +264,7 @@ pub async fn resolve_with_shared_cache_options_and_policy(
     let mut pubgrub_ms_total: u128 = 0;
 
     let final_result = loop {
-        let deps_for_pass = dependencies.clone();
+        let root_dependencies_for_pass = root_dependencies.clone();
         let client_for_pass = client.clone();
         let rt_for_pass = rt.clone();
         let overrides_for_pass = overrides.clone();
@@ -256,12 +289,16 @@ pub async fn resolve_with_shared_cache_options_and_policy(
         let pass_start = std::time::Instant::now();
         let result: PubGrubResult = tokio::task::spawn_blocking(move || {
             let provider = if split_packages_for_pass.is_empty() {
-                LpmDependencyProvider::new(client_for_pass, rt_for_pass, deps_for_pass)
-            } else {
-                LpmDependencyProvider::new_with_splits(
+                LpmDependencyProvider::new_with_root_dependencies(
                     client_for_pass,
                     rt_for_pass,
-                    deps_for_pass,
+                    root_dependencies_for_pass,
+                )
+            } else {
+                LpmDependencyProvider::new_with_root_dependencies_and_splits(
+                    client_for_pass,
+                    rt_for_pass,
+                    root_dependencies_for_pass,
                     split_packages_for_pass,
                 )
             }
@@ -291,9 +328,23 @@ pub async fn resolve_with_shared_cache_options_and_policy(
 
         match result {
             Ok((solution, provider)) => {
-                let (cache, applied_overrides, platform_skipped, root_aliases, root_deps) =
-                    provider.into_parts();
-                let packages = format_solution(solution, &cache, &root_deps, &root_aliases);
+                let (
+                    cache,
+                    applied_overrides,
+                    skipped_dependencies,
+                    root_aliases,
+                    root_dependencies,
+                ) = provider.into_parts();
+                let (packages, platform_skipped) = match format_solution(
+                    solution,
+                    &cache,
+                    &root_dependencies,
+                    &root_aliases,
+                    skipped_dependencies,
+                ) {
+                    Ok(formatted) => formatted,
+                    Err(error) => break Err(error),
+                };
                 // Snapshot substage counters at the tail of the happy
                 // path. The registry-side atomics were reset at the
                 // top of this call, so they now reflect only follow-up

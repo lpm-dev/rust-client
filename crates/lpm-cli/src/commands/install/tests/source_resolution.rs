@@ -761,6 +761,7 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -809,6 +810,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -827,6 +829,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -988,6 +991,86 @@ fn read_source_dep_specs_propagates_unsupported_transitive_error() {
     assert!(
         msg.contains(&source_dir.display().to_string()),
         "msg should reference the source dir for grep-ability: {msg}",
+    );
+}
+
+#[test]
+fn read_source_dep_specs_optional_dependency_overrides_required_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("local-source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("package.json"),
+        br#"{
+          "name": "local-source",
+          "version": "0.1.0",
+          "dependencies": { "native": "git+https://example.com/overridden.git" },
+          "optionalDependencies": { "native": "file:./native" }
+        }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(source_dir.join("native")).unwrap();
+
+    let specs = read_source_dep_specs(&source_dir)
+        .expect("overridden required declaration must not be classified");
+    assert!(
+        matches!(
+            specs.as_slice(),
+            [SourceDep {
+                local_name,
+                kind: DepKind::FileDir,
+                optional: true,
+                ..
+            }] if local_name == "native"
+        ),
+        "only the optional winning declaration should remain: {specs:?}",
+    );
+}
+
+#[tokio::test]
+async fn pre_resolve_marks_duplicate_local_dependency_optional_after_override() {
+    let store_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let project = tempfile::tempdir().unwrap();
+    let host = project.path().join("packages/local-host");
+    let native = project.path().join("packages/local-native");
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::write(
+        host.join("package.json"),
+        br#"{
+          "name":"local-host",
+          "version":"1.0.0",
+          "dependencies":{"local-native":"file:../local-native"},
+          "optionalDependencies":{"local-native":"file:../local-native"}
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        native.join("package.json"),
+        br#"{"name":"local-native","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mut deps = HashMap::from([(
+        "local-host".to_string(),
+        "file:./packages/local-host".to_string(),
+    )]);
+
+    let mut result =
+        pre_resolve_non_registry_deps(&client, &store, project.path(), &mut deps, true, false, &[])
+            .await
+            .expect("pre-resolve duplicate local dependency");
+    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps);
+
+    let native = result
+        .install_pkgs
+        .iter()
+        .find(|package| package.name == "local-native")
+        .expect("local-native install package");
+    assert!(
+        native.optional,
+        "overridden local dependency must be optional"
     );
 }
 
@@ -1232,6 +1315,7 @@ async fn store_path_or_err_routes_directory_to_canonical_realpath() {
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -1269,6 +1353,7 @@ async fn store_path_or_err_directory_errors_on_missing_source() {
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -1818,6 +1903,7 @@ async fn pre_resolve_link_dep_routes_through_store_path_to_canonical_realpath() 
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -2183,6 +2269,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2201,6 +2288,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2219,6 +2307,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2233,12 +2322,14 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 local_name: "lodash".to_string(),
                 raw_spec: "^4.0.0".to_string(),
                 kind: DepKind::Registry,
+                optional: false,
                 target_source: None,
             },
             SourceDep {
                 local_name: "b".to_string(),
                 raw_spec: "file:../b".to_string(),
                 kind: DepKind::FileDir,
+                optional: false,
                 target_source: Some("directory+./packages/b".to_string()),
             },
         ],
@@ -2284,6 +2375,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2302,6 +2394,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2315,6 +2408,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             local_name: "@std/path".to_string(),
             raw_spec: "npm:@jsr/std__path@^1.1.0".to_string(),
             kind: DepKind::Registry,
+            optional: false,
             target_source: None,
         }],
     );
@@ -2354,6 +2448,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2372,6 +2467,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2390,6 +2486,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
+            node_engine: None,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -2403,6 +2500,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             local_name: "react".to_string(),
             raw_spec: "file:../react-fork".to_string(),
             kind: DepKind::FileDir,
+            optional: false,
             target_source: Some(fork_source),
         }],
     );
@@ -2437,6 +2535,7 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
+        node_engine: None,
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
@@ -2449,6 +2548,7 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
             local_name: "missing-from-resolver".to_string(),
             raw_spec: "^1.0.0".to_string(),
             kind: DepKind::Registry,
+            optional: false,
             target_source: None,
         }],
     );

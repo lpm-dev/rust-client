@@ -772,6 +772,8 @@ fn merge_cached_package_info(
     optional_dep_names.extend(incoming.optional_dep_names.clone());
     let mut optional_peer_names = existing.optional_peer_names.clone();
     optional_peer_names.extend(incoming.optional_peer_names.clone());
+    let mut node_engines = existing.node_engines.clone();
+    node_engines.extend(incoming.node_engines.clone());
     let mut bundled_dep_names = existing.bundled_dep_names.clone();
     bundled_dep_names.extend(incoming.bundled_dep_names.clone());
     let mut platform = existing.platform.clone();
@@ -805,6 +807,7 @@ fn merge_cached_package_info(
         peer_deps,
         optional_dep_names,
         optional_peer_names,
+        node_engines,
         bundled_dep_names,
         platform,
         dist,

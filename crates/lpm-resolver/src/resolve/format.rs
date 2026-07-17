@@ -5,9 +5,10 @@ use super::prelude::*;
 pub(super) fn format_solution(
     solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    root_deps: &HashMap<String, String>,
+    root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
-) -> Vec<ResolvedPackage> {
+    skipped_dependencies: Vec<SkippedDependency>,
+) -> Result<(Vec<ResolvedPackage>, usize), ResolveError> {
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
         .iter()
@@ -89,6 +90,10 @@ pub(super) fn format_solution(
                 .get(&key)
                 .and_then(|info| info.platform.get(&ver_str))
                 .cloned();
+            let node_engine = cache
+                .get(&key)
+                .and_then(|info| info.node_engines.get(&ver_str))
+                .cloned();
 
             // Surface resolved peers per package. The resolver already
             // proved each peer's range was satisfied (or surfaced a
@@ -108,20 +113,87 @@ pub(super) fn format_solution(
                 tarball_url,
                 integrity,
                 platform,
+                node_engine,
                 optional: false,
             }
         })
         .collect();
-    mark_optional_reachability(&mut resolved, cache, root_deps, root_aliases);
+    mark_optional_reachability(&mut resolved, cache, root_dependencies, root_aliases);
+    let platform_skipped =
+        validate_selected_dependency_skips(&resolved, cache, skipped_dependencies)?;
     dedupe_peer_superset_packages(&mut resolved);
     resolved.sort_by_key(|a| a.package.to_string());
-    resolved
+    Ok((resolved, platform_skipped))
+}
+
+fn validate_selected_dependency_skips(
+    packages: &[ResolvedPackage],
+    cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+    skipped_dependencies: Vec<SkippedDependency>,
+) -> Result<usize, ResolveError> {
+    if skipped_dependencies.is_empty() {
+        return Ok(0);
+    }
+
+    let selected: HashMap<ResolverPackage, &ResolvedPackage> = packages
+        .iter()
+        .map(|package| (package.package.clone(), package))
+        .collect();
+    let mut platform_skipped = 0;
+
+    for skipped in skipped_dependencies {
+        let Some(parent) = selected.get(&skipped.parent) else {
+            continue;
+        };
+        if parent.version.to_string() != skipped.parent_version {
+            continue;
+        }
+
+        let recovered = selected.get(&skipped.child).is_some_and(|child| {
+            let Ok(range) = NpmRange::parse(&skipped.requested) else {
+                return false;
+            };
+            let latest = cache
+                .get(&CanonicalKey::from(&skipped.child))
+                .and_then(|info| info.latest_version.as_ref());
+            range.satisfies_with_latest_bound(&child.version, latest)
+        });
+        if recovered {
+            continue;
+        }
+
+        if parent.optional || skipped.edge_is_optional {
+            if skipped.reason.warns_about_auth() {
+                tracing::warn!(
+                    "optional dep {} skipped: requires LPM authentication \
+                     (run `lpm login` to install this package)",
+                    skipped.local_name,
+                );
+            } else {
+                tracing::debug!(
+                    "optional dep {} skipped: {}",
+                    skipped.local_name,
+                    skipped.reason.detail(),
+                );
+            }
+            platform_skipped += usize::from(skipped.reason.counts_as_platform_skip());
+            continue;
+        }
+
+        return Err(ResolveError::DependencyFetch {
+            package: parent.package.to_string(),
+            version: parent.version.to_string(),
+            detail: skipped.reason.detail().to_string(),
+        });
+    }
+
+    Ok(platform_skipped)
 }
 
 pub(super) fn mark_optional_reachability(
     packages: &mut [ResolvedPackage],
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    root_deps: &HashMap<String, String>,
+    root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
 ) {
     if packages.is_empty() {
@@ -143,7 +215,10 @@ pub(super) fn mark_optional_reachability(
 
     let mut required = vec![false; packages.len()];
     let mut queue = VecDeque::new();
-    for local_name in root_deps.keys() {
+    for local_name in root_dependencies.dependencies.keys() {
+        if root_dependencies.is_optional(local_name) {
+            continue;
+        }
         let target = root_aliases
             .get(local_name)
             .map_or(local_name.as_str(), String::as_str);
@@ -254,6 +329,7 @@ pub(super) fn resolved_package_can_replace(
 ) -> bool {
     candidate.tarball_url == package.tarball_url
         && candidate.integrity == package.integrity
+        && candidate.node_engine == package.node_engine
         && entries_are_superset(&candidate.dependencies, &package.dependencies)
         && aliases_are_superset(&candidate.aliases, &package.aliases)
         && entries_are_superset(&candidate.peers, &package.peers)
@@ -286,4 +362,43 @@ pub(super) fn aliases_are_superset(
     package
         .iter()
         .all(|(local, target)| candidate.get(local) == Some(target))
+}
+
+#[cfg(test)]
+mod skipped_dependency_tests {
+    use super::*;
+    use crate::provider::SkippedDependencyReason;
+
+    #[test]
+    fn skipped_dependency_from_discarded_parent_version_does_not_affect_solution() {
+        let parent = ResolverPackage::npm("parent");
+        let packages = vec![ResolvedPackage {
+            package: parent.clone(),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        }];
+        let skipped = SkippedDependency {
+            parent,
+            parent_version: "2.0.0".to_string(),
+            child: ResolverPackage::npm("missing-child"),
+            local_name: "missing-child".to_string(),
+            requested: "1.0.0".to_string(),
+            edge_is_optional: false,
+            reason: SkippedDependencyReason::NoMatchingVersion {
+                detail: "no matching version".to_string(),
+            },
+        };
+
+        assert_eq!(
+            validate_selected_dependency_skips(&packages, &HashMap::new(), vec![skipped]).unwrap(),
+            0,
+        );
+    }
 }

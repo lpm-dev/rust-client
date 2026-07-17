@@ -58,6 +58,7 @@ fn lockfile_toml_binary_roundtrip() {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: if i > 0 {
@@ -103,6 +104,7 @@ fn lockfile_binary_corrupt_falls_back_to_toml() {
         os: Vec::new(),
         cpu: Vec::new(),
         libc: Vec::new(),
+        node_engine: None,
         optional: false,
 
         dependencies: vec![],

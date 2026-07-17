@@ -514,11 +514,12 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
     );
     // Author a toml-only lockfile so doctor --fix has work to do
     // (regenerate lpm.lockb + write .gitattributes).
-    project.write_file(
-        "lpm.lock",
-        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+    let lockfile = format!(
+        "[metadata]\nlockfile-version = {}\nresolved-with = \"greedy-fusion\"\n\n\
          [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n",
+        lpm_lockfile::LOCKFILE_VERSION
     );
+    project.write_file("lpm.lock", &lockfile);
     assert!(
         !project.file_exists(".gitattributes"),
         "precondition: .gitattributes must be absent so doctor --fix has work"

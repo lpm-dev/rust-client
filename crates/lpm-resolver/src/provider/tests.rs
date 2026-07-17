@@ -73,6 +73,7 @@ fn peer_deps_stored_per_version() {
         peer_deps,
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
+        node_engines: HashMap::new(),
         bundled_dep_names: HashMap::new(),
         platform: HashMap::new(),
         dist: HashMap::new(),
@@ -494,6 +495,7 @@ fn make_info(
             .collect(),
         peer_deps: HashMap::new(),
         optional_peer_names: HashMap::new(),
+        node_engines: HashMap::new(),
         bundled_dep_names: HashMap::new(),
         optional_dep_names: optional_names
             .into_iter()

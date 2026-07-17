@@ -24,8 +24,9 @@ pub use error::LockfileError;
 pub use io::ensure_gitattributes;
 pub use model::{
     CatalogSnapshotEntry, CatalogSnapshots, DEFAULT_RESOLVED_WITH, ImporterSnapshot,
-    ImporterSnapshots, LOCKFILE_NAME, LOCKFILE_VERSION, LockedPackage, LockedRegistrySignature,
-    Lockfile, LockfileMetadata, LockfilePatch, LockfilePatches, PackageKey, is_safe_source,
+    ImporterSnapshots, LOCKFILE_NAME, LOCKFILE_VERSION, LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
+    LockedPackage, LockedRegistrySignature, Lockfile, LockfileMetadata, LockfilePatch,
+    LockfilePatches, PackageKey, is_safe_source,
 };
 pub use source::{Source, SourceParseError};
 

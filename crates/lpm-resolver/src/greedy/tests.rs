@@ -125,6 +125,7 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
         peer_deps: HashMap::new(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
+        node_engines: HashMap::new(),
         bundled_dep_names: HashMap::new(),
         platform: HashMap::new(),
         dist: versions
@@ -1238,6 +1239,7 @@ fn selected_package_cardinality_counts_duplicate_canonicals() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1252,6 +1254,7 @@ fn selected_package_cardinality_counts_duplicate_canonicals() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
         ResolvedPackage {
@@ -1266,6 +1269,7 @@ fn selected_package_cardinality_counts_duplicate_canonicals() {
             tarball_url: None,
             integrity: None,
             platform: None,
+            node_engine: None,
             optional: false,
         },
     ];

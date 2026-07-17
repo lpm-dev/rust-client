@@ -139,6 +139,7 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
             && p.os.is_empty()
             && p.cpu.is_empty()
             && p.libc.is_empty()
+            && p.node_engine.is_none()
             && !p.optional
             && p.registry_signatures.is_empty()
             && p.registry_published_at.is_none()
@@ -781,6 +782,7 @@ impl<'a> PackageEntryView<'a> {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
             dependencies: self.dependencies().iter().map(|s| s.to_string()).collect(),
             // The binary format doesn't encode alias metadata;
@@ -887,6 +889,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec!["react@18.2.0".to_string()],
@@ -904,6 +907,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -999,6 +1003,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec!["loose-envify@1.4.0".to_string()],
@@ -1017,6 +1022,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -1385,6 +1391,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: if i > 0 {
@@ -1425,6 +1432,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: deps,
@@ -1443,6 +1451,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -1476,6 +1485,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: if i > 0 {
@@ -1674,6 +1684,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -1778,6 +1789,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -1820,6 +1832,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -1837,6 +1850,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -1874,6 +1888,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -1908,6 +1923,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -1932,6 +1948,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2008,6 +2025,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2054,6 +2072,7 @@ mod tests {
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
+                node_engine: None,
                 optional: false,
 
                 dependencies: vec![],
@@ -2098,6 +2117,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2137,6 +2157,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2171,6 +2192,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2206,6 +2228,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2247,6 +2270,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2264,6 +2288,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2281,6 +2306,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2298,6 +2324,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],
@@ -2315,6 +2342,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
 
             dependencies: vec![],

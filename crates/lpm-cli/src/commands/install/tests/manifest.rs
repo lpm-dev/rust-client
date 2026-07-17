@@ -920,6 +920,7 @@ async fn run_install_filtered_add_no_match_with_fail_flag_includes_d2_hint_for_b
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
         None,                                                  // strict_peer_dependencies_override
+        false,                                                 // no_engine_strict
         InstallOmitPolicy::default(),
         false, // strict_sandbox
         false, // no_sandbox
@@ -972,6 +973,7 @@ async fn run_install_filtered_add_no_match_for_glob_filter_does_not_emit_d2_hint
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
         None,                                                  // strict_peer_dependencies_override
+        false,                                                 // no_engine_strict
         InstallOmitPolicy::default(),
         false, // strict_sandbox
         false, // no_sandbox

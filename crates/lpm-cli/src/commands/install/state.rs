@@ -4,26 +4,37 @@ pub(super) fn write_post_install_hash(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
     let pkg = std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
     let lock = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
-    let hash = crate::install_state::compute_install_hash_v8(
+    let dependency_engine_key = dependency_engine_policy.freshness_key(&lock);
+    let node_runtime_fingerprint = match dependency_engine_key.as_str() {
+        "none" | "legacy" => None,
+        _ => dependency_engine_policy.resolved_node_runtime_fingerprint(),
+    };
+    let hash = crate::install_state::compute_install_hash_v9(
         &pkg,
         &lock,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
         &platform,
+        &dependency_engine_key,
     );
-    if let Err(e) = crate::install_state::write_install_hash_with_integrity_and_platform(
-        project_dir,
-        &hash,
-        linker_mode,
-        object_integrity_policy,
-        &platform,
-    ) {
+    if let Err(e) =
+        crate::install_state::write_install_hash_with_integrity_platform_and_dependency_engine(
+            project_dir,
+            &hash,
+            linker_mode,
+            object_integrity_policy,
+            &platform,
+            &dependency_engine_key,
+            node_runtime_fingerprint,
+        )
+    {
         tracing::warn!(
             "failed to write `.lpm/install-hash` after install ({e}) — \
              the next freshness check will fall through to the slow path"
@@ -46,6 +57,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) strict_peer_dependencies: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) requested_v2_mode: bool,
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) requested_add_count: Option<usize>,
@@ -68,12 +80,19 @@ pub(super) async fn run_install_freshness_phase(
 ) -> Result<InstallFreshnessResult, LpmError> {
     let pkg_content_for_state = std::fs::read_to_string(input.pkg_json_path).unwrap_or_default();
     let setup_state_t = Instant::now();
-    let install_state = crate::install_state::check_install_state_with_linker_and_integrity(
+    let dependency_engine_key = dependency_engine_freshness_key_for_state(
         input.project_dir,
-        &pkg_content_for_state,
-        input.linker_mode,
-        input.object_integrity_policy,
+        input.lockfile_path,
+        input.dependency_engine_policy,
     );
+    let install_state =
+        crate::install_state::check_install_state_with_linker_integrity_and_dependency_engine(
+            input.project_dir,
+            &pkg_content_for_state,
+            input.linker_mode,
+            input.object_integrity_policy,
+            &dependency_engine_key,
+        );
     let setup_install_state_ms = setup_state_t.elapsed().as_millis();
     let compatibility_bins_ready = !input.requested_v2_mode
         || input.compatibility_bin_names.is_empty()
@@ -110,6 +129,10 @@ pub(super) async fn run_install_freshness_phase(
                 if input.omit_policy.dev {
                     filter_dev_packages(&mut policy_packages, input.production_dependency_names);
                 }
+                filter_dependency_engine_packages(
+                    &mut policy_packages,
+                    input.dependency_engine_policy,
+                )?;
                 filter_platform_packages(&mut policy_packages)?;
                 Some(
                     run_policy_extensions(
@@ -148,6 +171,7 @@ pub(super) async fn run_install_freshness_phase(
                 input.project_dir,
                 input.linker_mode,
                 input.object_integrity_policy,
+                input.dependency_engine_policy,
             );
         }
         let elapsed = input.start.elapsed();
@@ -220,6 +244,135 @@ pub(super) async fn run_install_freshness_phase(
     })
 }
 
+fn dependency_engine_freshness_key_for_state(
+    project_dir: &Path,
+    lockfile_path: &Path,
+    policy: &crate::engine_check::DependencyEnginePolicy,
+) -> String {
+    let state_path = project_dir.join(".lpm").join("install-hash");
+    if let Ok(state) = std::fs::read_to_string(&state_path)
+        && let Some(cached) = parse_cached_dependency_engine_state(&state)
+    {
+        if matches!(cached.key, "none" | "legacy") {
+            return cached.key.to_string();
+        }
+
+        let probed_fingerprint = policy.probe_node_runtime_fingerprint();
+        let decision = decide_dependency_engine_freshness(
+            cached.key,
+            cached.runtime_fingerprint,
+            probed_fingerprint.as_deref(),
+            policy.can_reuse_constrained_freshness_key(cached.key),
+            || {
+                let key = policy.constrained_freshness_key();
+                let runtime_fingerprint = policy
+                    .resolved_node_runtime_fingerprint()
+                    .map(str::to_owned);
+                ResolvedDependencyEngineFreshness {
+                    key,
+                    runtime_fingerprint,
+                }
+            },
+        );
+        if let RuntimeFingerprintUpdate::Replace(runtime_fingerprint) =
+            &decision.runtime_fingerprint_update
+            && let Err(error) = crate::install_state::refresh_install_hash_node_runtime_fingerprint(
+                project_dir,
+                cached.key,
+                runtime_fingerprint.as_deref(),
+            )
+        {
+            tracing::debug!(
+                "failed to refresh cached Node runtime fingerprint after revalidation: {error}"
+            );
+        }
+        return decision.key;
+    }
+
+    let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
+    policy.freshness_key(&lockfile)
+}
+
+struct CachedDependencyEngineState<'a> {
+    key: &'a str,
+    runtime_fingerprint: Option<&'a str>,
+}
+
+fn parse_cached_dependency_engine_state(state: &str) -> Option<CachedDependencyEngineState<'_>> {
+    let mut key = None;
+    let mut runtime_fingerprint = None;
+    let mut saw_runtime_fingerprint = false;
+
+    for line in state.lines() {
+        if let Some(value) = line.strip_prefix("e:")
+            && key.replace(value).is_some()
+        {
+            return None;
+        }
+        if let Some(value) = line.strip_prefix("n:") {
+            if saw_runtime_fingerprint {
+                runtime_fingerprint = None;
+                continue;
+            }
+            saw_runtime_fingerprint = true;
+            if crate::install_state::is_node_runtime_fingerprint(value) {
+                runtime_fingerprint = Some(value);
+            }
+        }
+    }
+
+    Some(CachedDependencyEngineState {
+        key: key?,
+        runtime_fingerprint,
+    })
+}
+
+struct ResolvedDependencyEngineFreshness {
+    key: String,
+    runtime_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RuntimeFingerprintUpdate {
+    Keep,
+    Replace(Option<String>),
+}
+
+struct DependencyEngineFreshnessDecision {
+    key: String,
+    runtime_fingerprint_update: RuntimeFingerprintUpdate,
+}
+
+fn decide_dependency_engine_freshness(
+    stored_key: &str,
+    stored_fingerprint: Option<&str>,
+    probed_fingerprint: Option<&str>,
+    stored_key_matches_current_policy: bool,
+    revalidate: impl FnOnce() -> ResolvedDependencyEngineFreshness,
+) -> DependencyEngineFreshnessDecision {
+    if stored_key_matches_current_policy
+        && stored_fingerprint
+            .zip(probed_fingerprint)
+            .is_some_and(|(stored, probed)| stored == probed)
+    {
+        return DependencyEngineFreshnessDecision {
+            key: stored_key.to_string(),
+            runtime_fingerprint_update: RuntimeFingerprintUpdate::Keep,
+        };
+    }
+
+    let resolved = revalidate();
+    let runtime_fingerprint_update = if resolved.key == stored_key {
+        RuntimeFingerprintUpdate::Replace(resolved.runtime_fingerprint)
+    } else {
+        RuntimeFingerprintUpdate::Keep
+    };
+    DependencyEngineFreshnessDecision {
+        key: resolved.key,
+        runtime_fingerprint_update,
+    }
+}
+
 /// Empty installs still need the same durable on-disk markers the
 /// freshness cache keys on: `lpm.lock`, `node_modules/`, and the
 /// standard `lpm.lockb`/`.gitattributes` sidecar written by the main
@@ -238,4 +391,140 @@ pub(super) fn materialize_empty_install_artifacts(project_dir: &Path) -> Result<
 
     std::fs::create_dir_all(project_dir.join("node_modules")).map_err(LpmError::Io)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod dependency_engine_freshness_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const FINGERPRINT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FINGERPRINT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn matching_runtime_fingerprint_reuses_key_without_revalidation() {
+        let revalidation_count = Cell::new(0);
+
+        let decision = decide_dependency_engine_freshness(
+            "1:22.0.0",
+            Some(FINGERPRINT_A),
+            Some(FINGERPRINT_A),
+            true,
+            || {
+                revalidation_count.set(revalidation_count.get() + 1);
+                ResolvedDependencyEngineFreshness {
+                    key: "1:22.0.0".to_string(),
+                    runtime_fingerprint: Some(FINGERPRINT_A.to_string()),
+                }
+            },
+        );
+
+        assert_eq!(decision.key, "1:22.0.0");
+        assert_eq!(revalidation_count.get(), 0);
+    }
+
+    #[test]
+    fn changed_runtime_fingerprint_invokes_revalidation() {
+        let revalidation_count = Cell::new(0);
+
+        decide_dependency_engine_freshness(
+            "1:22.0.0",
+            Some(FINGERPRINT_A),
+            Some(FINGERPRINT_B),
+            true,
+            || {
+                revalidation_count.set(revalidation_count.get() + 1);
+                ResolvedDependencyEngineFreshness {
+                    key: "1:22.0.0".to_string(),
+                    runtime_fingerprint: Some(FINGERPRINT_B.to_string()),
+                }
+            },
+        );
+
+        assert_eq!(revalidation_count.get(), 1);
+    }
+
+    #[test]
+    fn missing_runtime_fingerprint_invokes_revalidation() {
+        let revalidation_count = Cell::new(0);
+
+        decide_dependency_engine_freshness("1:22.0.0", None, Some(FINGERPRINT_A), true, || {
+            revalidation_count.set(revalidation_count.get() + 1);
+            ResolvedDependencyEngineFreshness {
+                key: "1:22.0.0".to_string(),
+                runtime_fingerprint: Some(FINGERPRINT_A.to_string()),
+            }
+        });
+
+        assert_eq!(revalidation_count.get(), 1);
+    }
+
+    #[test]
+    fn same_version_after_runtime_change_refreshes_fingerprint() {
+        let decision = decide_dependency_engine_freshness(
+            "1:22.0.0",
+            Some(FINGERPRINT_A),
+            Some(FINGERPRINT_B),
+            true,
+            || ResolvedDependencyEngineFreshness {
+                key: "1:22.0.0".to_string(),
+                runtime_fingerprint: Some(FINGERPRINT_B.to_string()),
+            },
+        );
+
+        assert_eq!(
+            decision.runtime_fingerprint_update,
+            RuntimeFingerprintUpdate::Replace(Some(FINGERPRINT_B.to_string()))
+        );
+    }
+
+    #[test]
+    fn changed_version_invalidates_without_refreshing_old_state() {
+        let decision = decide_dependency_engine_freshness(
+            "1:22.0.0",
+            Some(FINGERPRINT_A),
+            Some(FINGERPRINT_B),
+            true,
+            || ResolvedDependencyEngineFreshness {
+                key: "1:23.0.0".to_string(),
+                runtime_fingerprint: Some(FINGERPRINT_B.to_string()),
+            },
+        );
+
+        assert_eq!(decision.key, "1:23.0.0");
+        assert_eq!(
+            decision.runtime_fingerprint_update,
+            RuntimeFingerprintUpdate::Keep
+        );
+    }
+
+    #[test]
+    fn malformed_runtime_fingerprint_is_not_reusable() {
+        let cached =
+            parse_cached_dependency_engine_state("hash\ne:1:22.0.0\nn:not-a-valid-fingerprint\n")
+                .unwrap();
+
+        assert_eq!(cached.runtime_fingerprint, None);
+    }
+
+    #[test]
+    fn strictness_change_invokes_revalidation_even_when_fingerprint_matches() {
+        let revalidation_count = Cell::new(0);
+
+        decide_dependency_engine_freshness(
+            "1:22.0.0",
+            Some(FINGERPRINT_A),
+            Some(FINGERPRINT_A),
+            false,
+            || {
+                revalidation_count.set(revalidation_count.get() + 1);
+                ResolvedDependencyEngineFreshness {
+                    key: "0:22.0.0".to_string(),
+                    runtime_fingerprint: Some(FINGERPRINT_A.to_string()),
+                }
+            },
+        );
+
+        assert_eq!(revalidation_count.get(), 1);
+    }
 }

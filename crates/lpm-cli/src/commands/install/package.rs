@@ -72,6 +72,9 @@ fn merge_install_package(dst: &mut InstallPackage, mut src: InstallPackage) {
     if dst.platform.is_none() {
         dst.platform = src.platform;
     }
+    if dst.node_engine.is_none() {
+        dst.node_engine = src.node_engine;
+    }
     if dst.tarball_url.is_none() {
         dst.tarball_url = src.tarball_url;
     }
@@ -139,6 +142,8 @@ pub(super) struct InstallPackage {
     pub(super) registry_published_at: Option<String>,
     /// Platform restrictions declared by the selected package version.
     pub(super) platform: Option<lpm_resolver::PlatformMeta>,
+    /// `engines.node` constraint declared by this package version.
+    pub(super) node_engine: Option<String>,
     /// True when this package is reachable only through optional dependency
     /// edges.
     pub(super) optional: bool,

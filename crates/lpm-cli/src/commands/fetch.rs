@@ -654,6 +654,7 @@ mod tests {
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
+            node_engine: None,
             optional: false,
             dependencies: Vec::new(),
             alias_dependencies: Vec::new(),

@@ -44,6 +44,8 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) linker_mode: lpm_linker::LinkerMode,
     pub(in crate::commands::install) strict_integrity: bool,
     pub(in crate::commands::install) streaming_fetch: bool,
+    pub(in crate::commands::install) dependency_engine_policy:
+        Arc<crate::engine_check::DependencyEnginePolicy>,
 }
 
 pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
@@ -119,13 +121,15 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         linker_mode,
         strict_integrity,
         streaming_fetch,
+        dependency_engine_policy,
     } = input;
 
     let NonRegistryPreResolveResult {
         install_pkgs: tarball_url_install_pkgs,
         source_deps: non_registry_source_deps,
         additional_workspace_links,
-    } = pre_resolve_non_registry_deps(
+        optional_registry_roots,
+    } = pre_resolve_non_registry_deps_with_optional_registry_roots(
         &arc_client,
         &store,
         project_dir,
@@ -133,8 +137,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         json_output,
         strict_integrity,
         all_workspace_members,
+        &v2_workspace_root_pre_resolve.optional_registry_roots,
     )
     .await?;
+    let resolver_root_dependencies =
+        lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots);
 
     merge_workspace_member_links(
         workspace_member_deps,
@@ -146,6 +153,12 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         ),
     );
     expand_workspace_member_deps_with_transitives(workspace_member_deps, all_workspace_members)?;
+    if !requested_v2_mode {
+        enforce_required_workspace_member_engines(
+            workspace_member_deps,
+            dependency_engine_policy.as_ref(),
+        )?;
+    }
 
     let spec_tracker = SpeculativeKeyTracker::default();
     let fetch_coord: Arc<FetchCoordinator> = fetch_coord;
@@ -270,6 +283,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 project_dir.to_path_buf(),
                                 gate_stats.clone(),
                                 fetch_extract_limiter.clone(),
+                                dependency_engine_policy.clone(),
                                 streaming_fetch,
                                 1,
                             ));
@@ -301,6 +315,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 project_dir.to_path_buf(),
                                 gate_stats.clone(),
                                 fetch_extract_limiter.clone(),
+                                dependency_engine_policy.clone(),
                                 streaming_fetch,
                                 fetch_overlap_min_selected(),
                             ));
@@ -309,9 +324,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     } else {
                         None
                     };
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
                         arc_client.clone(),
-                        deps.clone(),
+                        resolver_root_dependencies.clone(),
                         override_set.clone(),
                         route_table.clone(),
                         npm_fanout,
@@ -394,7 +409,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     );
 
                     let resolve_client = arc_client.clone();
-                    let resolve_deps = deps.clone();
+                    let resolve_root_dependencies = resolver_root_dependencies.clone();
                     let resolve_overrides = override_set.clone();
                     let shared_cache_for_resolve = shared_cache.clone();
                     let notify_map_for_resolve = notify_map.clone();
@@ -407,22 +422,23 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         let _ = roots_ready_rx.await;
                         let roots_ready_at = batch_start.elapsed().as_millis();
                         let w2_resolve_start = Instant::now();
-                        let result = lpm_resolver::resolve_with_shared_cache_options_and_policy(
-                            resolve_client,
-                            resolve_deps,
-                            resolve_overrides,
-                            shared_cache_for_resolve,
-                            notify_map_for_resolve,
-                            walker_done_for_resolve,
-                            std::time::Duration::from_secs(5),
-                            route_table.clone(),
-                            streaming_metrics_for_resolve,
-                            auto_install_peers,
-                            !omit_policy.optional,
-                            resolver_policy.clone(),
-                        )
-                        .await
-                        .map_err(crate::resolver_error::resolver_error_to_lpm);
+                        let result =
+                            lpm_resolver::resolve_with_shared_cache_options_and_policy_roots(
+                                resolve_client,
+                                resolve_root_dependencies,
+                                resolve_overrides,
+                                shared_cache_for_resolve,
+                                notify_map_for_resolve,
+                                walker_done_for_resolve,
+                                std::time::Duration::from_secs(5),
+                                route_table.clone(),
+                                streaming_metrics_for_resolve,
+                                auto_install_peers,
+                                !omit_policy.optional,
+                                resolver_policy.clone(),
+                            )
+                            .await
+                            .map_err(crate::resolver_error::resolver_error_to_lpm);
                         tracing::debug!(
                             "perf.w2_resolve_after_roots ms={}",
                             w2_resolve_start.elapsed().as_millis()
@@ -572,6 +588,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     if omit_policy.dev {
         filter_dev_packages(&mut packages, production_dependency_names);
     }
+    filter_dependency_engine_packages(&mut packages, dependency_engine_policy.as_ref())?;
     platform_skipped += filter_platform_packages(&mut packages)?;
 
     Ok(OnlineResolutionPhaseResult {

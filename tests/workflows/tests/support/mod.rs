@@ -468,6 +468,49 @@ pub fn lpm_with_registry(project: &TempProject, registry_url: &str) -> assert_cm
     cmd
 }
 
+/// Put a deterministic fake `node --version` at the front of `PATH`.
+pub fn configure_fake_node(
+    command: &mut assert_cmd::Command,
+    project: &TempProject,
+    version: &str,
+) {
+    let bin_dir = project.home().join("fake-node-bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake Node bin directory");
+    let node_path = if cfg!(windows) {
+        bin_dir.join("node.cmd")
+    } else {
+        bin_dir.join("node")
+    };
+    let script = if cfg!(windows) {
+        format!("@echo off\r\necho v{version}\r\n")
+    } else {
+        format!("#!/bin/sh\necho v{version}\n")
+    };
+    std::fs::write(&node_path, script).expect("write fake Node binary");
+    set_test_binary_executable(&node_path);
+
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).expect("construct PATH with fake Node"),
+    );
+}
+
+#[cfg(unix)]
+fn set_test_binary_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .expect("test binary must exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("mark test binary executable");
+}
+
+#[cfg(not(unix))]
+fn set_test_binary_executable(_path: &Path) {}
+
 /// Spawnable variant of [`lpm_with_registry`] for tests that need
 /// `Child::kill()` or two-process races. Shares env isolation with
 /// [`lpm_with_registry`] via [`apply_lpm_env`].

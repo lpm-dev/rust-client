@@ -58,6 +58,87 @@ fn write_state_file_owner_only(path: &Path, content: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
+pub(crate) fn is_node_runtime_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn refresh_install_hash_node_runtime_fingerprint(
+    project_dir: &Path,
+    expected_dependency_engine_key: &str,
+    runtime_fingerprint: Option<&str>,
+) -> std::io::Result<bool> {
+    if runtime_fingerprint.is_some_and(|value| !is_node_runtime_fingerprint(value)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Node runtime fingerprint",
+        ));
+    }
+
+    let path = project_dir.join(".lpm").join("install-hash");
+    let original = std::fs::read_to_string(&path)?;
+    let Some(updated) = replace_node_runtime_fingerprint(
+        &original,
+        expected_dependency_engine_key,
+        runtime_fingerprint,
+    ) else {
+        return Ok(false);
+    };
+    if updated == original {
+        return Ok(false);
+    }
+
+    if std::fs::read_to_string(&path)? != original {
+        return Ok(false);
+    }
+    write_state_file_owner_only(&path, updated.as_bytes())?;
+    Ok(true)
+}
+
+fn replace_node_runtime_fingerprint(
+    content: &str,
+    expected_dependency_engine_key: &str,
+    runtime_fingerprint: Option<&str>,
+) -> Option<String> {
+    let mut updated = String::with_capacity(content.len() + 72);
+    let mut saw_engine_key = false;
+    let mut saw_runtime_fingerprint = false;
+    let fingerprint = runtime_fingerprint.unwrap_or("none");
+
+    for line in content.lines() {
+        if let Some(key) = line.strip_prefix("e:") {
+            if saw_engine_key || key != expected_dependency_engine_key {
+                return None;
+            }
+            saw_engine_key = true;
+        }
+
+        if line.starts_with("n:") {
+            if saw_runtime_fingerprint {
+                return None;
+            }
+            saw_runtime_fingerprint = true;
+            updated.push_str("n:");
+            updated.push_str(fingerprint);
+        } else {
+            updated.push_str(line);
+        }
+        updated.push('\n');
+    }
+
+    if !saw_engine_key {
+        return None;
+    }
+    if !saw_runtime_fingerprint {
+        updated.push_str("n:");
+        updated.push_str(fingerprint);
+        updated.push('\n');
+    }
+    Some(updated)
+}
+
 /// Result of checking install state.
 pub struct InstallState {
     /// Whether the project's install is up to date.
@@ -86,6 +167,9 @@ pub struct InstallState {
 /// - `v6`: resolved linker mode participates in freshness.
 /// - `v7`: v2 object integrity policy participates in freshness.
 /// - `v8`: host platform tuple participates in freshness.
+/// - `v9`: dependency-engine policy participates when the lockfile contains
+///   dependency `engines.node` constraints. Unconstrained projects retain
+///   their v8 hash so the common path does not churn install state.
 //
 // **v6 — linker mode folds into the hash.** Pre-v6 the install-hash
 // only keyed off manifest/lock content, so a post-install change to
@@ -109,6 +193,14 @@ pub struct InstallState {
 // platform-specific optional dependency filtering ran. v8 also adds a
 // `p:<os>/<cpu>/<libc>` install-hash line so the mtime fast path detects
 // the same host change without recomputing the full hash.
+//
+// **v9 — dependency-engine context folds into constrained hashes.** A
+// lockfile containing dependency `engines.node` constraints is interpreted
+// against both engine strictness and the effective Node version. v9 layers
+// that context over the v8 base hash and records an `e:<key>` line so both
+// the full and mtime freshness paths rerun when either value changes. The
+// `none` key returns the v8 hash to preserve warm state for unconstrained
+// projects.
 const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v8\x00";
 
 /// Compute the install hash from raw file contents — back-compat shim
@@ -233,6 +325,35 @@ pub fn compute_install_hash_v8(
     hasher.update(object_integrity_policy.as_str().as_bytes());
     hasher.update(b"\x00");
     hasher.update(platform_tuple_key(platform).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn compute_install_hash_v9(
+    pkg_content: &str,
+    lock_content: &str,
+    file_link_manifests: &[u8],
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    platform: &PlatformTuple,
+    dependency_engine_key: &str,
+) -> String {
+    let base = compute_install_hash_v8(
+        pkg_content,
+        lock_content,
+        file_link_manifests,
+        linker_mode,
+        object_integrity_policy,
+        platform,
+    );
+    if dependency_engine_key == "none" {
+        return base;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-install-hash-v9-dependency-engines\x00");
+    hasher.update(base.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(dependency_engine_key.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -629,6 +750,22 @@ pub fn check_install_state_with_linker_and_integrity(
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: ObjectIntegrityPolicy,
 ) -> InstallState {
+    check_install_state_with_linker_integrity_and_dependency_engine(
+        project_dir,
+        pkg_content,
+        linker_mode,
+        object_integrity_policy,
+        "none",
+    )
+}
+
+pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
+    project_dir: &Path,
+    pkg_content: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    dependency_engine_key: &str,
+) -> InstallState {
     let platform = PlatformTuple::current();
     // mtime short-circuit also applies here. The caller may have
     // already read pkg.json for an earlier check, but the fast path still
@@ -639,6 +776,7 @@ pub fn check_install_state_with_linker_and_integrity(
         linker_mode,
         object_integrity_policy,
         &platform,
+        dependency_engine_key,
     ) {
         return state;
     }
@@ -653,13 +791,14 @@ pub fn check_install_state_with_linker_and_integrity(
     // bytes for projects without local-source deps preserve the common
     // no-local-source path.
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
-    let current_hash = compute_install_hash_v8(
+    let current_hash = compute_install_hash_v9(
         pkg_content,
         &lock_content,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
         &platform,
+        dependency_engine_key,
     );
 
     // Validate that package.json parses into the typed PackageJson struct —
@@ -794,6 +933,7 @@ fn try_mtime_fast_path(
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: ObjectIntegrityPolicy,
     platform: &PlatformTuple,
+    dependency_engine_key: &str,
 ) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
@@ -871,6 +1011,16 @@ fn try_mtime_fast_path(
     let stored_platform = platform_line.strip_prefix("p:")?;
     if stored_platform != platform_tuple_key(platform) {
         return None;
+    }
+
+    match lines.next() {
+        Some(engine_line) => {
+            if engine_line.strip_prefix("e:")? != dependency_engine_key {
+                return None;
+            }
+        }
+        None if dependency_engine_key == "none" => {}
+        None => return None,
     }
 
     let pkg_ns = mtime_ns(&project_dir.join("package.json"))?;
@@ -965,12 +1115,12 @@ pub fn write_install_hash(
     )
 }
 
-/// Write `.lpm/install-hash` in the v8 format (hash line + mtime line +
-/// linker line + integrity-policy line + platform tuple line). Callers
+/// Write `.lpm/install-hash` with the freshness hash plus mtime, linker,
+/// integrity-policy, platform, and dependency-engine metadata. Callers
 /// provide the pre-computed hash, the linker mode, and the v2 object
 /// integrity policy that were effective for the install. The metadata lets
-/// the mtime fast path detect config and host-platform flips without
-/// recomputing the full SHA-256.
+/// the mtime fast path detect config, host-platform, and dependency-engine
+/// context changes without recomputing the full SHA-256.
 ///
 /// On any failure reading an mtime (typically missing lpm.lock on a
 /// dependency-less project), falls back to a `0` sentinel. A mismatch
@@ -1003,6 +1153,32 @@ pub(crate) fn write_install_hash_with_integrity_and_platform(
     object_integrity_policy: ObjectIntegrityPolicy,
     platform: &PlatformTuple,
 ) -> std::io::Result<()> {
+    write_install_hash_with_integrity_platform_and_dependency_engine(
+        project_dir,
+        hash,
+        linker_mode,
+        object_integrity_policy,
+        platform,
+        "none",
+        None,
+    )
+}
+
+pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
+    project_dir: &Path,
+    hash: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    platform: &PlatformTuple,
+    dependency_engine_key: &str,
+    node_runtime_fingerprint: Option<&str>,
+) -> std::io::Result<()> {
+    if node_runtime_fingerprint.is_some_and(|value| !is_node_runtime_fingerprint(value)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Node runtime fingerprint",
+        ));
+    }
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
     let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
 
@@ -1011,8 +1187,9 @@ pub(crate) fn write_install_hash_with_integrity_and_platform(
     let linker_str = linker_mode.as_str();
     let integrity_policy_str = object_integrity_policy.as_str();
     let platform_str = platform_tuple_key(platform);
+    let node_runtime_fingerprint = node_runtime_fingerprint.unwrap_or("none");
     let content = format!(
-        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\n"
+        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\n"
     );
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
@@ -1626,8 +1803,9 @@ mod tests {
     }
 
     #[test]
-    fn write_install_hash_produces_v8_format() {
-        // Contract: file content is hash + mtime line + linker line + integrity line + platform line.
+    fn write_install_hash_records_all_fast_path_metadata() {
+        // Contract: file content is hash + mtime line + linker line + integrity line +
+        // platform line + dependency-engine line.
         // Pins the on-disk format so a v1 reader still gets the hash on
         // line 1 (legacy compat), AND the mtime fast-path can detect
         // post-install config and platform flips without recomputing the full hash.
@@ -1665,6 +1843,120 @@ mod tests {
             platform_line.starts_with("p:"),
             "expected platform line, got {platform_line:?}"
         );
+        assert_eq!(lines.next(), Some("e:none"));
+        assert_eq!(lines.next(), Some("n:none"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn install_hash_reserves_node_runtime_fingerprint_metadata() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+
+        write_install_hash(p, "abc123", lpm_linker::LinkerMode::Hoisted).unwrap();
+
+        let content = fs::read_to_string(p.join(".lpm").join("install-hash")).unwrap();
+        assert!(
+            content.lines().any(|line| line == "n:none"),
+            "install-hash must reserve a stable node runtime fingerprint line: {content:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_fingerprint_refresh_preserves_other_install_state_metadata() {
+        const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEW: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+        let platform = PlatformTuple::current();
+        write_install_hash_with_integrity_platform_and_dependency_engine(
+            p,
+            "abc123",
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            "1:22.0.0",
+            Some(OLD),
+        )
+        .unwrap();
+        let path = p.join(".lpm").join("install-hash");
+        let before = fs::read_to_string(&path).unwrap();
+        let expected = before.replace(&format!("n:{OLD}"), &format!("n:{NEW}"));
+
+        let refreshed =
+            refresh_install_hash_node_runtime_fingerprint(p, "1:22.0.0", Some(NEW)).unwrap();
+
+        assert!(refreshed);
+        assert_eq!(fs::read_to_string(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn runtime_fingerprint_refresh_appends_missing_metadata() {
+        const FINGERPRINT: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let legacy = "hash\nm:1:2\nl:hoisted\ni:source\np:linux/x64/glibc\ne:1:22.0.0\n";
+
+        let updated =
+            replace_node_runtime_fingerprint(legacy, "1:22.0.0", Some(FINGERPRINT)).unwrap();
+
+        assert_eq!(updated, format!("{legacy}n:{FINGERPRINT}\n"));
+    }
+
+    #[test]
+    fn runtime_fingerprint_refresh_rejects_changed_engine_key() {
+        const FINGERPRINT: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let state = "hash\nm:1:2\nl:hoisted\ni:source\np:linux/x64/glibc\ne:1:23.0.0\nn:none\n";
+
+        assert!(replace_node_runtime_fingerprint(state, "1:22.0.0", Some(FINGERPRINT)).is_none());
+    }
+
+    #[test]
+    fn unconstrained_dependency_engine_context_preserves_v8_hash() {
+        let platform = PlatformTuple::new("linux", "x64", Some("glibc".into()));
+        let v8 = compute_install_hash_v8(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+        );
+        let v9 = compute_install_hash_v9(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            "none",
+        );
+
+        assert_eq!(v9, v8);
+    }
+
+    #[test]
+    fn constrained_dependency_engine_context_changes_with_runtime_or_strictness() {
+        let platform = PlatformTuple::new("linux", "x64", Some("glibc".into()));
+        let hash_for = |dependency_engine_key| {
+            compute_install_hash_v9(
+                "pkg",
+                "lock",
+                &[],
+                lpm_linker::LinkerMode::Isolated,
+                ObjectIntegrityPolicy::Source,
+                &platform,
+                dependency_engine_key,
+            )
+        };
+
+        let strict_node_22 = hash_for("1:22.0.0");
+        assert_ne!(strict_node_22, hash_for("1:20.0.0"));
+        assert_ne!(strict_node_22, hash_for("0:22.0.0"));
     }
 
     #[test]
@@ -1828,6 +2120,7 @@ mod tests {
             lpm_linker::LinkerMode::Isolated,
             ObjectIntegrityPolicy::Source,
             &platform,
+            "none",
         );
         assert!(
             same.is_some_and(|s| s.up_to_date),
@@ -1840,6 +2133,7 @@ mod tests {
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
             &platform,
+            "none",
         );
         assert!(
             flipped.is_none(),
@@ -1872,11 +2166,44 @@ mod tests {
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
             &PlatformTuple::current(),
+            "none",
         );
         assert!(
             fast.is_none(),
             "stored platform tuple must not short-circuit a check running on a different host"
         );
+    }
+
+    #[test]
+    fn mtime_fast_path_bails_when_dependency_engine_context_differs() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        fs::write(p.join("lpm.lock"), "lock").unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let platform = PlatformTuple::current();
+        write_install_hash_with_integrity_platform_and_dependency_engine(
+            p,
+            "deadbeef",
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            "1:22.0.0",
+            None,
+        )
+        .unwrap();
+
+        let pkg_content = fs::read_to_string(p.join("package.json")).unwrap();
+        let fast = try_mtime_fast_path(
+            p,
+            &pkg_content,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            "1:20.0.0",
+        );
+
+        assert!(fast.is_none());
     }
 
     #[test]

@@ -162,7 +162,9 @@ pub async fn run_with_options(
     // trust-on-first-use. Lockfile-resident integrity is still
     // trusted; only the manifest-boundary trust-on-first-use is
     // disabled.
-    strict_integrity: bool, // CLI-level override for strict peer-dependency handling. `None`
+    strict_integrity: bool,
+    cli_no_engine_strict: bool,
+    // CLI-level override for strict peer-dependency handling. `None`
     // falls through to package.json / global config / default.
     strict_peer_dependencies_override: Option<bool>,
     // Already-resolved linker override from CLI / `~/.lpm/config.toml` / env.
@@ -283,6 +285,7 @@ pub async fn run_with_options(
         force,
         allow_new,
         strict_integrity,
+        cli_no_engine_strict,
         strict_peer_dependencies_override,
         linker_override,
         no_skills,
@@ -320,6 +323,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
+    cli_no_engine_strict: bool,
     strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
@@ -344,6 +348,11 @@ pub(crate) async fn run_with_options_with_lpm_root(
     compatibility_bin_names: &[String],
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    let dependency_engine_policy = Arc::new(crate::engine_check::prepare_dependency_policy(
+        project_dir,
+        cli_no_engine_strict,
+        json_output,
+    )?);
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
     // freely; `lpm cache prune --apply` and `lpm store clean` (which take it
@@ -366,6 +375,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             force,
             allow_new,
             strict_integrity,
+            dependency_engine_policy,
             strict_peer_dependencies_override,
             linker_override,
             no_skills,
@@ -407,6 +417,7 @@ async fn run_with_options_under_store_lock(
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
+    dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
@@ -505,6 +516,7 @@ async fn run_with_options_under_store_lock(
         strict_peer_dependencies,
         linker_mode,
         object_integrity_policy,
+        dependency_engine_policy: dependency_engine_policy.as_ref(),
         requested_v2_mode,
         compatibility_bin_names,
         requested_add_count,
@@ -634,8 +646,8 @@ async fn run_with_options_under_store_lock(
 
     // Manifest-side compatibility warnings (pnpm overrides / patches
     // / peer rules drift, ignored other-PM `engines.*` keys) fire from
-    // the engine_check preflight gate (`engine_check::enforce`) which
-    // runs before this point in install / rebuild / add. The shared
+    // dependency-engine policy preflight, which runs before this point
+    // in install / rebuild / add. The shared
     // source of truth is `PackageJson::manifest_compat_issues` in
     // `lpm-workspace`. Automation pipelines pull the same signals
     // from `lpm doctor --json`, where every issue lands as a
@@ -694,6 +706,7 @@ async fn run_with_options_under_store_lock(
             override_set: &override_set,
             linker_mode,
             object_integrity_policy,
+            dependency_engine_policy: dependency_engine_policy.as_ref(),
         })
         .await?;
         return Ok(());
@@ -780,6 +793,7 @@ async fn run_with_options_under_store_lock(
             global_config: &global_config,
             strict_integrity,
             compatibility_bin_names,
+            dependency_engine_policy: dependency_engine_policy.as_ref(),
         })
         .await;
     }
@@ -932,7 +946,8 @@ async fn run_with_options_under_store_lock(
             install_pkgs: mut spike_pre_resolved_install_pkgs,
             source_deps: mut spike_pre_resolved_source_deps,
             additional_workspace_links,
-        } = pre_resolve_non_registry_deps(
+            optional_registry_roots,
+        } = pre_resolve_non_registry_deps_with_optional_registry_roots(
             &arc_client,
             &store,
             project_dir,
@@ -940,6 +955,7 @@ async fn run_with_options_under_store_lock(
             json_output,
             strict_integrity,
             &all_workspace_members,
+            &v2_workspace_root_pre_resolve.optional_registry_roots,
         )
         .await?;
 
@@ -956,6 +972,12 @@ async fn run_with_options_under_store_lock(
             &mut workspace_member_deps,
             &all_workspace_members,
         )?;
+        if !requested_v2_mode {
+            enforce_required_workspace_member_engines(
+                &workspace_member_deps,
+                dependency_engine_policy.as_ref(),
+            )?;
+        }
         spike_pre_resolved_install_pkgs
             .extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
         for (source, deps) in &v2_workspace_root_pre_resolve.source_deps {
@@ -981,6 +1003,7 @@ async fn run_with_options_under_store_lock(
             resolver_policy.clone(),
             auto_install_peers,
             !omit_policy.optional,
+            &optional_registry_roots,
             &spike_pre_resolved_install_pkgs,
             &spike_pre_resolved_source_deps,
             &workspace_member_deps,
@@ -989,6 +1012,7 @@ async fn run_with_options_under_store_lock(
             &current_patches,
             &prior_patch_state,
             &current_patch_fingerprint,
+            dependency_engine_policy.as_ref(),
         )
         .await;
     }
@@ -1060,6 +1084,7 @@ async fn run_with_options_under_store_lock(
         linker_mode,
         strict_integrity,
         streaming_fetch,
+        dependency_engine_policy: dependency_engine_policy.clone(),
         resolver_min_age_secs,
         override_set: override_set.clone(),
     })
@@ -1653,7 +1678,12 @@ async fn run_with_options_under_store_lock(
     // delegated to `write_install_hash`, which also captures
     // manifest mtimes into the v2 file format so the next up-to-date
     // check can take the mtime fast path.
-    write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
+    write_post_install_hash(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        dependency_engine_policy.as_ref(),
+    );
 
     // Register the project in the machine-global known-projects registry.
     // `lpm cache prune` walks this set to

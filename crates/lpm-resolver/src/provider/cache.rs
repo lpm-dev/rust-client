@@ -284,9 +284,9 @@ impl LpmDependencyProvider {
 
     /// Extract the override hits AND the metadata cache in one shot. The
     /// two-stage `take_override_hits()` / `into_cache()` API is also
-    /// available for callers that need only one of the two. Surfaces
-    /// `platform_skipped`, `root_aliases`, and `root_deps` so the resolver can
-    /// accumulate pass-local state without separate borrows.
+    /// available for callers that need only one of the two. Surfaces skipped
+    /// dependency candidates, root aliases, and root deps so the resolver can
+    /// validate the final selected graph without separate borrows.
     // Keep this tuple at the extraction boundary: the single caller
     // destructures it immediately, and a one-use struct would not clarify
     // ownership.
@@ -296,14 +296,25 @@ impl LpmDependencyProvider {
     ) -> (
         HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
         Vec<OverrideHit>,
-        usize,
+        Vec<SkippedDependency>,
         HashMap<String, String>,
-        HashMap<String, String>,
+        RootDependencies,
     ) {
         let hits = self.overrides.take_hits();
-        let platform_skipped = *self.platform_skipped.borrow();
+        let mut skipped_dependencies: Vec<_> = self
+            .skipped_dependencies
+            .into_inner()
+            .into_values()
+            .collect();
+        skipped_dependencies.sort_by_cached_key(|skipped| {
+            (
+                skipped.parent.to_string(),
+                skipped.parent_version.clone(),
+                skipped.local_name.clone(),
+            )
+        });
         let root_aliases = self.root_aliases.into_inner();
-        let root_deps = self.root_deps;
+        let root_dependencies = self.root_dependencies;
         // Surface Arc<CachedPackageInfo> directly — deep-cloning each
         // entry's seven nested HashMaps moved ~7 MB per cold resolve on
         // `bench/fixture-large` (hidden inside `pubgrub_ms`). Arc::clone is
@@ -316,6 +327,12 @@ impl LpmDependencyProvider {
                 .map(|e| (e.key().clone(), Arc::clone(e.value())))
                 .collect(),
         };
-        (cache, hits, platform_skipped, root_aliases, root_deps)
+        (
+            cache,
+            hits,
+            skipped_dependencies,
+            root_aliases,
+            root_dependencies,
+        )
     }
 }
