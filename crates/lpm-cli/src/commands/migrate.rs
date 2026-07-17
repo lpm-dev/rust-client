@@ -374,7 +374,7 @@ pub async fn run(
             false, // no_engine_strict
             None,  // strict_peer_dependencies_override
             None,  // linker_override
-            true,  // no_skills — skip skill setup during migration
+            crate::lpm_skills_config::LpmSkillsPreference::Disabled,
             true,  // no_editor_setup — skip editor setup during migration
             true,  // no_security_summary — migration already showed warnings
             false, // auto_build

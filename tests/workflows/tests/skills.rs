@@ -48,6 +48,33 @@ fn package_skill(name: &str, description: &str, body: &str) -> serde_json::Value
     })
 }
 
+fn seed_global_config(project: &TempProject, contents: &str) {
+    let path = project.home().join(".lpm/config.toml");
+    std::fs::create_dir_all(path.parent().expect("config path must have a parent")).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+async fn registry_with_lpm_package_skill(expected_calls: u64) -> MockRegistry {
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
+    registry
+        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
+        .await;
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "guide",
+                "Use package-specific conventions",
+                "Follow the package guide.",
+            )],
+            expected_calls,
+        )
+        .await;
+    registry
+}
+
 fn json_command(project: &TempProject, args: &[&str]) -> serde_json::Value {
     let output = lpm(project)
         .arg("--json")
@@ -244,8 +271,9 @@ fn skills_list_json_envelope_carries_per_package_arrays() {
 }
 
 #[test]
-fn skills_add_local_source_links_selected_skill_into_codex_project_directory() {
+fn standalone_skills_add_ignores_disabled_lpm_package_skill_config() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_global_config(&project, "auto-install-lpm-skills = false\n");
     seed_standard_skill(
         &project,
         "team-skills",
@@ -519,6 +547,224 @@ async fn skills_add_package_refresh_removes_skills_no_longer_published() {
         project
             .read_file(".lpm/skills/owner.package/kept.md")
             .contains("updated recommendation")
+    );
+}
+
+#[tokio::test]
+async fn direct_install_no_skills_does_not_materialize_package_published_skills() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let registry = registry_with_lpm_package_skill(0).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["install", "@lpm.dev/owner.package@1.0.0", "--no-skills"])
+        .output()
+        .expect("failed to run direct package install with --no-skills");
+
+    assert!(
+        output.status.success(),
+        "direct install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join(".lpm/skills/owner.package").exists(),
+        "--no-skills must prevent package-published skill materialization"
+    );
+}
+
+#[tokio::test]
+async fn disabled_lpm_skills_config_prevents_direct_install_materialization() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_global_config(&project, "auto-install-lpm-skills = false\n");
+    let registry = registry_with_lpm_package_skill(0).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["install", "@lpm.dev/owner.package@1.0.0"])
+        .output()
+        .expect("failed to run direct package install with LPM skills disabled");
+
+    assert!(
+        output.status.success(),
+        "direct install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join(".lpm/skills/owner.package").exists(),
+        "disabled auto-install-lpm-skills must prevent package-published skill materialization"
+    );
+}
+
+#[tokio::test]
+async fn install_skills_flag_overrides_disabled_lpm_skills_config() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_global_config(&project, "auto-install-lpm-skills = false\n");
+    let registry = registry_with_lpm_package_skill(1).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["install", "@lpm.dev/owner.package@1.0.0", "--skills"])
+        .output()
+        .expect("failed to run direct package install with --skills");
+
+    assert!(
+        output.status.success(),
+        "direct install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists(".lpm/skills/owner.package/guide.md"),
+        "--skills must override disabled auto-install-lpm-skills config"
+    );
+}
+
+#[tokio::test]
+async fn legacy_no_skills_config_still_prevents_direct_install_materialization() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_global_config(&project, "noSkills = true\n");
+    let registry = registry_with_lpm_package_skill(0).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["install", "@lpm.dev/owner.package@1.0.0"])
+        .output()
+        .expect("failed to run direct package install with legacy noSkills config");
+
+    assert!(
+        output.status.success(),
+        "direct install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join(".lpm/skills/owner.package").exists(),
+        "legacy noSkills config must remain an opt-out compatibility fallback"
+    );
+}
+
+#[tokio::test]
+async fn workspace_root_direct_install_no_skills_does_not_materialize_package_skills() {
+    let project = TempProject::empty(
+        r#"{"name":"workspace-root","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0"}"#,
+    );
+    let registry = registry_with_lpm_package_skill(0).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "install",
+            "@lpm.dev/owner.package@1.0.0",
+            "--workspace-root",
+            "--no-skills",
+        ])
+        .output()
+        .expect("failed to run workspace-root package install with --no-skills");
+
+    assert!(
+        output.status.success(),
+        "workspace-root install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join(".lpm/skills/owner.package").exists(),
+        "--no-skills must reach the workspace direct-install path"
+    );
+}
+
+#[tokio::test]
+async fn disabled_lpm_skills_config_prevents_source_add_materialization() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_global_config(&project, "auto-install-lpm-skills = false\n");
+    let registry = registry_with_lpm_package_skill(0).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "add",
+            "@lpm.dev/owner.package@1.0.0",
+            "--yes",
+            "--path",
+            "src/vendor",
+        ])
+        .output()
+        .expect("failed to add an LPM.dev source package with skills disabled");
+
+    assert!(
+        output.status.success(),
+        "source add failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join(".lpm/skills/owner.package").exists(),
+        "auto-install-lpm-skills must control lpm add package skill materialization"
+    );
+}
+
+#[tokio::test]
+async fn add_skills_flag_overrides_disabled_lpm_skills_config() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_global_config(&project, "auto-install-lpm-skills = false\n");
+    let registry = registry_with_lpm_package_skill(1).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "add",
+            "@lpm.dev/owner.package@1.0.0",
+            "--yes",
+            "--path",
+            "src/vendor",
+            "--skills",
+        ])
+        .output()
+        .expect("failed to add an LPM.dev source package with --skills");
+
+    assert!(
+        output.status.success(),
+        "source add failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists(".lpm/skills/owner.package/guide.md"),
+        "lpm add --skills must override disabled auto-install-lpm-skills config"
+    );
+}
+
+#[tokio::test]
+async fn ci_skills_flag_overrides_disabled_lpm_skills_config() {
+    let project = TempProject::empty(
+        r#"{"name":"skills","version":"1.0.0","dependencies":{"@lpm.dev/owner.package":"1.0.0"}}"#,
+    );
+    seed_global_config(&project, "auto-install-lpm-skills = false\n");
+    let registry = registry_with_lpm_package_skill(1).await;
+    let install = lpm_with_registry(&project, &registry.url())
+        .args(["install", "--no-skills"])
+        .output()
+        .expect("failed to create the lockfile for lpm ci");
+    assert!(
+        install.status.success(),
+        "setup install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["ci", "--skills"])
+        .output()
+        .expect("failed to run lpm ci --skills");
+
+    assert!(
+        output.status.success(),
+        "lpm ci --skills failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists(".lpm/skills/owner.package/guide.md"),
+        "lpm ci --skills must override disabled auto-install-lpm-skills config"
     );
 }
 

@@ -927,6 +927,7 @@ async fn run_install_filtered_add_no_match_with_fail_flag_includes_d2_hint_for_b
         false, // verbose
         false, // audit_after_install
         false, // timing
+        crate::lpm_skills_config::LpmSkillsPreference::Config,
     )
     .await;
 
@@ -980,6 +981,7 @@ async fn run_install_filtered_add_no_match_for_glob_filter_does_not_emit_d2_hint
         false, // verbose
         false, // audit_after_install
         false, // timing
+        crate::lpm_skills_config::LpmSkillsPreference::Config,
     )
     .await;
 

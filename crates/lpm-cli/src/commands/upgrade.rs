@@ -600,7 +600,7 @@ pub async fn run(
         false, // no_engine_strict
         None,  // strict_peer_dependencies_override
         None,  // linker_override
-        false, // no_skills
+        crate::lpm_skills_config::LpmSkillsPreference::Config,
         false, // no_editor_setup
         false, // no_security_summary
         false, // auto_build

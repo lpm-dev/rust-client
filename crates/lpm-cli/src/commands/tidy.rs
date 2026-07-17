@@ -916,7 +916,7 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
         false,
         None,
         None,
-        true,
+        crate::lpm_skills_config::LpmSkillsPreference::Disabled,
         true,
         true,
         false,

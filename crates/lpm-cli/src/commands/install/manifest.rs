@@ -980,6 +980,7 @@ pub async fn run_add_packages(
     // forwarded resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
     timing: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
 ) -> Result<(), LpmError> {
     let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
         project_dir,
@@ -1110,8 +1111,8 @@ pub async fn run_add_packages(
             false, // strict_integrity — internal call, no flag
             no_engine_strict,
             strict_peer_dependencies_override,
-            None,  // linker_override
-            false, // no_skills
+            None, // linker_override
+            lpm_skills_preference,
             false, // no_editor_setup
             false, // no_security_summary
             false, // auto_build
@@ -1219,6 +1220,7 @@ pub async fn run_install_filtered_add(
     // forwarded resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
     timing: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -1482,8 +1484,8 @@ pub async fn run_install_filtered_add(
                 false, // strict_integrity — workspace-add path, no flag
                 no_engine_strict,
                 strict_peer_dependencies_override,
-                None,  // linker_override
-                false, // no_skills
+                None, // linker_override
+                lpm_skills_preference,
                 false, // no_editor_setup
                 false, // no_security_summary
                 false, // auto_build

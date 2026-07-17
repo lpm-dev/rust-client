@@ -773,6 +773,7 @@ pub async fn run(
             yes,
             json_output,
             no_engine_strict,
+            !no_skills,
             &effective_pm,
         )
         .await?

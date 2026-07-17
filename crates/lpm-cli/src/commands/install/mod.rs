@@ -172,7 +172,7 @@ pub async fn run_with_options(
     // validated against `lpm_linker::LinkerMode::parse_str` inside the
     // install pipeline) and finally the default isolated layout.
     linker_override: Option<lpm_linker::LinkerMode>,
-    no_skills: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
     no_editor_setup: bool,
     no_security_summary: bool,
     auto_build: bool,
@@ -288,7 +288,7 @@ pub async fn run_with_options(
         cli_no_engine_strict,
         strict_peer_dependencies_override,
         linker_override,
-        no_skills,
+        lpm_skills_preference,
         no_editor_setup,
         no_security_summary,
         auto_build,
@@ -326,7 +326,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     cli_no_engine_strict: bool,
     strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
-    no_skills: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
     no_editor_setup: bool,
     no_security_summary: bool,
     auto_build: bool,
@@ -378,7 +378,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             dependency_engine_policy,
             strict_peer_dependencies_override,
             linker_override,
-            no_skills,
+            lpm_skills_preference,
             no_editor_setup,
             no_security_summary,
             auto_build,
@@ -420,7 +420,7 @@ async fn run_with_options_under_store_lock(
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
-    no_skills: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
     _no_editor_setup: bool,
     no_security_summary: bool,
     auto_build: bool,
@@ -494,6 +494,7 @@ async fn run_with_options_under_store_lock(
         min_release_age_exclude,
         timing,
     })?;
+    let no_skills = !lpm_skills_preference.resolve(&global_config)?;
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_audit_after_install_ms = 0u128;
 

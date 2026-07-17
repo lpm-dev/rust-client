@@ -193,8 +193,12 @@ pub(crate) struct InstallArgs {
     #[arg(long, value_enum)]
     pub(crate) linker: Option<LinkerCli>,
 
-    /// Skip skills auto-install.
-    #[arg(long)]
+    /// Install package-published LPM.dev skills for this invocation.
+    #[arg(long, conflicts_with = "no_skills")]
+    pub(crate) skills: bool,
+
+    /// Skip package-published LPM.dev skills auto-install.
+    #[arg(long, conflicts_with = "skills")]
     pub(crate) no_skills: bool,
 
     /// Skip editor auto-integration.
@@ -584,8 +588,12 @@ pub(crate) struct AddArgs {
     #[arg(long)]
     pub(crate) no_install_deps: bool,
 
-    /// Skip skills auto-install.
-    #[arg(long)]
+    /// Install package-published LPM.dev skills for this invocation.
+    #[arg(long, conflicts_with = "no_skills")]
+    pub(crate) skills: bool,
+
+    /// Skip package-published LPM.dev skills auto-install.
+    #[arg(long, conflicts_with = "skills")]
     pub(crate) no_skills: bool,
 
     /// Skip editor auto-integration.

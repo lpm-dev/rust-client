@@ -98,6 +98,7 @@ fn guided_config_summary_uses_product_defaults_when_unset() {
             integrity_mode: "source".to_string(),
             release_age: "default (1d)".to_string(),
             release_age_policy: "direct".to_string(),
+            lpm_skills: "enabled (default)",
         }
     );
 }
@@ -116,6 +117,7 @@ typosquat-guard = "off"
 integrity = "tree"
 minimum-release-age-secs = "259200"
 release-age-policy = "strict"
+auto-install-lpm-skills = false
 
 [sandbox]
 mode = "strict"
@@ -145,6 +147,7 @@ mode = "enforce"
             integrity_mode: "tree".to_string(),
             release_age: "3d".to_string(),
             release_age_policy: "strict".to_string(),
+            lpm_skills: "disabled",
         }
     );
 }

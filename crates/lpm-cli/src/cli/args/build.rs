@@ -391,8 +391,12 @@ pub(crate) struct CiArgs {
     #[arg(long, value_enum)]
     pub(crate) linker: Option<LinkerCli>,
 
-    /// Skip skills auto-install.
-    #[arg(long)]
+    /// Install package-published LPM.dev skills for this invocation.
+    #[arg(long, id = "ci_skills", conflicts_with = "ci_no_skills")]
+    pub(crate) skills: bool,
+
+    /// Skip package-published LPM.dev skills auto-install.
+    #[arg(long, id = "ci_no_skills", conflicts_with = "ci_skills")]
     pub(crate) no_skills: bool,
 
     /// Skip editor auto-integration.
