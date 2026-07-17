@@ -206,12 +206,25 @@ pub(crate) fn compute_digest(skills_dir: &Path) -> Result<String, LpmError> {
         {
             continue;
         }
-        entries.push((
-            entry.file_name().to_string_lossy().to_string(),
-            std::fs::read(&path)?,
-        ));
+        let content = std::fs::read_to_string(&path)?;
+        let (meta, _, errors) = skill_security::parse_skill_frontmatter(&content);
+        if !errors.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "cannot compute package skill digest for {}: {}",
+                relative_display(skills_dir, &path),
+                errors.join(", ")
+            )));
+        }
+        let name = meta.name.ok_or_else(|| {
+            LpmError::Registry(format!(
+                "cannot compute package skill digest for {}: missing skill name",
+                relative_display(skills_dir, &path)
+            ))
+        })?;
+        entries.push((name, content.into_bytes()));
     }
 
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = Sha256::new();
     for (name, content) in entries {
         hasher.update(name.as_bytes());
@@ -301,6 +314,30 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("globs field must be an array"))
+        );
+    }
+
+    #[test]
+    fn validate_directory_matches_registry_block_scalar_description_behavior() {
+        let project = tempfile::tempdir().unwrap();
+        let skills = project.path().join(".lpm/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("invalid.md"),
+            format!(
+                "---\nname: invalid\ndescription: >\n  A complete package skill for validation\n---\n# Guide\n\n{}",
+                "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
+            ),
+        )
+        .unwrap();
+
+        let report = validate_directory(&skills).unwrap();
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("description too short"))
         );
     }
 

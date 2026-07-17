@@ -275,18 +275,19 @@ static SKILL_NAME_RE: LazyLock<Regex> =
 /// The parser is intentionally simple (key: value lines) — skills are small
 /// Markdown files, not complex YAML documents.
 pub fn parse_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>) {
-    parse_skill_frontmatter_with_description_limits(content, true)
+    parse_skill_frontmatter_with_description_limits(content, true, false)
 }
 
 /// Parse standard Agent Skills frontmatter without LPM.dev publish-time
 /// description-length limits.
 pub fn parse_agent_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>) {
-    parse_skill_frontmatter_with_description_limits(content, false)
+    parse_skill_frontmatter_with_description_limits(content, false, true)
 }
 
 fn parse_skill_frontmatter_with_description_limits(
     content: &str,
     enforce_description_limits: bool,
+    allow_description_block_scalars: bool,
 ) -> (SkillMeta, String, Vec<String>) {
     let mut meta = SkillMeta::default();
     let mut errors = Vec::new();
@@ -334,7 +335,8 @@ fn parse_skill_frontmatter_with_description_limits(
             let key = key.trim();
             let raw_value = value.trim();
 
-            if key == "description"
+            if allow_description_block_scalars
+                && key == "description"
                 && let Some(style) = block_scalar_style(raw_value)
             {
                 let parent_indent = line.len() - line.trim_start().len();
@@ -935,7 +937,7 @@ console.log(x);
     fn folded_description_is_parsed_as_text() {
         let content = "---\nname: my-skill\ndescription: >\n  A useful skill for\n  application developers.\nversion: 1.2.3\n---\nBody";
 
-        let (meta, _, errors) = parse_skill_frontmatter(content);
+        let (meta, _, errors) = parse_agent_skill_frontmatter(content);
 
         assert!(errors.is_empty(), "errors: {errors:?}");
         assert_eq!(
@@ -949,12 +951,40 @@ console.log(x);
     fn literal_description_preserves_internal_line_breaks() {
         let content = "---\nname: my-skill\ndescription: |-\n  First paragraph.\n\n  Second paragraph.\n---\nBody";
 
-        let (meta, _, errors) = parse_skill_frontmatter(content);
+        let (meta, _, errors) = parse_agent_skill_frontmatter(content);
 
         assert!(errors.is_empty(), "errors: {errors:?}");
         assert_eq!(
             meta.description.as_deref(),
             Some("First paragraph.\n\nSecond paragraph.")
+        );
+    }
+
+    #[test]
+    fn package_folded_description_uses_registry_literal_semantics() {
+        let content = "---\nname: my-skill\ndescription: >\n  A useful skill for\n  application developers.\n---\nBody";
+
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert_eq!(meta.description.as_deref(), Some(">"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("description too short"))
+        );
+    }
+
+    #[test]
+    fn package_literal_description_uses_registry_literal_semantics() {
+        let content = "---\nname: my-skill\ndescription: |-\n  First paragraph.\n\n  Second paragraph.\n---\nBody";
+
+        let (meta, _, errors) = parse_skill_frontmatter(content);
+
+        assert_eq!(meta.description.as_deref(), Some("|-"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("description too short"))
         );
     }
 }

@@ -277,6 +277,9 @@ fn collect_package_files(
                         if !is_safe_entry(&entry, canonical_root) {
                             continue;
                         }
+                        if is_materialized_package_skill_path(&entry, project_dir) {
+                            continue;
+                        }
                         if entry.is_file() {
                             if let Ok(rel) = entry.strip_prefix(project_dir) {
                                 let rel_str = rel.to_string_lossy().to_string();
@@ -297,6 +300,9 @@ fn collect_package_files(
                     // Treat as literal path
                     let path = project_dir.join(pattern);
                     if !is_safe_entry(&path, canonical_root) {
+                        continue;
+                    }
+                    if is_materialized_package_skill_path(&path, project_dir) {
                         continue;
                     }
                     if path.is_file() {
@@ -353,7 +359,7 @@ fn collect_dir_files(
     canonical_root: &Path,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
-    if is_materialized_package_skills_directory(dir, project_root) {
+    if is_materialized_package_skill_path(dir, project_root) {
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
@@ -444,7 +450,7 @@ fn collect_all_files(
     canonical_root: &Path,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
-    if is_materialized_package_skills_directory(dir, project_root) {
+    if is_materialized_package_skill_path(dir, project_root) {
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
@@ -481,12 +487,22 @@ fn collect_all_files(
     Ok(())
 }
 
-fn is_materialized_package_skills_directory(directory: &Path, project_root: &Path) -> bool {
-    let Ok(relative) = directory.strip_prefix(project_root) else {
+fn is_materialized_package_skill_path(path: &Path, project_root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(project_root) else {
         return false;
     };
-    relative.parent() == Some(Path::new(".lpm/skills"))
-        && crate::commands::skills::package::is_materialized_directory(directory)
+    let mut segments = relative.iter();
+    if segments.next() != Some(std::ffi::OsStr::new(".lpm"))
+        || segments.next() != Some(std::ffi::OsStr::new("skills"))
+    {
+        return false;
+    }
+    let Some(package) = segments.next() else {
+        return false;
+    };
+    crate::commands::skills::package::is_materialized_directory(
+        &project_root.join(".lpm").join("skills").join(package),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +913,63 @@ mod tests {
             files
                 .iter()
                 .all(|file| !file.path.starts_with(".lpm/skills/owner.dependency/"))
+        );
+    }
+
+    #[test]
+    fn create_tarball_excludes_materialized_dependency_skills_from_explicit_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+  "name": "@lpm.dev/test.pkg",
+  "version": "1.0.0",
+  "files": [".lpm/skills/**/*"]
+}"#,
+        )
+        .unwrap();
+        crate::commands::skills::package::materialize(
+            project,
+            "owner.dependency",
+            Some("2.0.0"),
+            &[lpm_registry::Skill {
+                name: "dependency-usage".into(),
+                description: None,
+                globs: Vec::new(),
+                content: Some("dependency guidance".into()),
+                raw_content: None,
+                size_bytes: None,
+            }],
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/package-usage.md"),
+            "publisher guidance",
+        )
+        .unwrap();
+        let pkg_json: serde_json::Value = serde_json::from_str(
+            r#"{
+  "name": "@lpm.dev/test.pkg",
+  "version": "1.0.0",
+  "files": [".lpm/skills/**/*"]
+}"#,
+        )
+        .unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == ".lpm/skills/package-usage.md"),
+            "the explicit glob must retain publisher-authored skills"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.path.starts_with(".lpm/skills/owner.dependency/")),
+            "the explicit glob must not bypass ownership filtering"
         );
     }
 

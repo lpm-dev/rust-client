@@ -1,5 +1,6 @@
 use crate::install_ui;
 use lpm_common::LpmError;
+use serde::Serialize;
 use std::path::Path;
 
 /// Compute a digest from previously published skills for staleness comparison.
@@ -45,33 +46,48 @@ pub(super) fn ensure_lpm_in_files(
         });
         if !has_skills {
             let content = std::fs::read_to_string(pkg_json_path)?;
+            let mut updated = pkg_json.clone();
+            let updated_files = updated
+                .get_mut("files")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or_else(|| {
+                    LpmError::Registry(
+                        "package.json `files` changed while preparing the publish tarball".into(),
+                    )
+                })?;
+            updated_files.push(serde_json::Value::String(".lpm/skills".into()));
 
-            if let Some(files_pos) = content.find("\"files\"")
-                && let Some(bracket_offset) = content[files_pos..].find('[')
-            {
-                let insert_pos = files_pos + bracket_offset + 1;
-                let mut new_content = String::with_capacity(content.len() + 32);
-                new_content.push_str(&content[..insert_pos]);
-                let after_bracket = &content[insert_pos..];
-                let indent = after_bracket.find('"').map_or("    ", |i| {
-                    let segment = &after_bracket[..i];
-                    segment.rfind('\n').map_or(segment, |nl| &segment[nl + 1..])
-                });
-                new_content.push('\n');
-                new_content.push_str(indent);
-                new_content.push_str("\".lpm/skills\",");
-                new_content.push_str(&content[insert_pos..]);
+            let indent = package_json_indent(&content);
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent);
+            let mut serialized = Vec::with_capacity(content.len() + 32);
+            let mut serializer = serde_json::Serializer::with_formatter(&mut serialized, formatter);
+            updated.serialize(&mut serializer).map_err(|error| {
+                LpmError::Registry(format!("failed to serialize package.json: {error}"))
+            })?;
+            serialized.push(b'\n');
+            lpm_common::write_file_atomic(pkg_json_path, serialized)?;
 
-                let tmp = pkg_json_path.with_extension("json.tmp");
-                std::fs::write(&tmp, &new_content)?;
-                std::fs::rename(&tmp, pkg_json_path)?;
-
-                install_ui::warn(
-                    "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
-                );
-                return Ok(true);
-            }
+            install_ui::warn(
+                "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
+            );
+            return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn package_json_indent(content: &str) -> Vec<u8> {
+    content
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let indent = line
+                .as_bytes()
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .copied()
+                .collect::<Vec<_>>();
+            (!indent.is_empty() && !line.trim().is_empty()).then_some(indent)
+        })
+        .unwrap_or_else(|| b"  ".to_vec())
 }

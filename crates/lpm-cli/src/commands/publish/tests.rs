@@ -1,7 +1,7 @@
 use super::output::{format_dry_run_files_value, format_publish_retry_detail};
 use super::prepare::{prepare_publish_project_from_manifest, read_publish_manifest};
 use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_json};
-use super::skills::ensure_lpm_in_files;
+use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets};
 use super::types::PublishTarget;
@@ -114,6 +114,44 @@ fn ensure_lpm_in_files_already_present() {
 }
 
 #[test]
+fn ensure_lpm_in_files_updates_an_empty_array_with_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg_json_path = dir.path().join("package.json");
+    let original = "{\n  \"name\": \"test\",\n  \"files\": []\n}\n";
+    std::fs::write(&pkg_json_path, original).unwrap();
+
+    let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
+    assert!(ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap());
+
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pkg_json_path).unwrap()).unwrap();
+    assert_eq!(updated["files"], serde_json::json!([".lpm/skills"]));
+}
+
+#[test]
+fn ensure_lpm_in_files_only_updates_the_top_level_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg_json_path = dir.path().join("package.json");
+    let original = r#"{
+  "metadata": {"files": ["leave-me-alone"]},
+  "files": ["src/"]
+}
+"#;
+    std::fs::write(&pkg_json_path, original).unwrap();
+
+    let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
+    assert!(ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap());
+
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pkg_json_path).unwrap()).unwrap();
+    assert_eq!(
+        updated["metadata"]["files"],
+        serde_json::json!(["leave-me-alone"])
+    );
+    assert_eq!(updated["files"], serde_json::json!(["src/", ".lpm/skills"]));
+}
+
+#[test]
 fn publisher_skills_are_included_when_files_array_was_restrictive() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path();
@@ -160,16 +198,51 @@ fn skills_digest_deterministic() {
     let dir = tempfile::tempdir().unwrap();
     let skills_dir = dir.path().join("skills");
     std::fs::create_dir_all(&skills_dir).unwrap();
-    std::fs::write(skills_dir.join("a.md"), "alpha").unwrap();
-    std::fs::write(skills_dir.join("b.md"), "beta").unwrap();
+    std::fs::write(
+        skills_dir.join("a.md"),
+        "---\nname: alpha\ndescription: Alpha package guidance\n---\nalpha body",
+    )
+    .unwrap();
+    std::fs::write(
+        skills_dir.join("b.md"),
+        "---\nname: beta\ndescription: Beta package guidance\n---\nbeta body",
+    )
+    .unwrap();
 
     let d1 = author::compute_digest(&skills_dir).unwrap();
     let d2 = author::compute_digest(&skills_dir).unwrap();
     assert_eq!(d1, d2, "same content must produce same digest");
 
-    std::fs::write(skills_dir.join("b.md"), "gamma").unwrap();
+    std::fs::write(
+        skills_dir.join("b.md"),
+        "---\nname: beta\ndescription: Beta package guidance\n---\ngamma body",
+    )
+    .unwrap();
     let d3 = author::compute_digest(&skills_dir).unwrap();
     assert_ne!(d1, d3, "different content must produce different digest");
+}
+
+#[test]
+fn local_and_published_skill_digests_use_frontmatter_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills_dir = dir.path().join("skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    let raw_content =
+        "---\nname: usage\ndescription: Complete package usage guidance\n---\npackage guidance";
+    std::fs::write(skills_dir.join("guide.md"), raw_content).unwrap();
+    let published = vec![lpm_registry::Skill {
+        name: "usage".into(),
+        description: Some("Complete package usage guidance".into()),
+        globs: Vec::new(),
+        content: Some("package guidance".into()),
+        raw_content: Some(raw_content.into()),
+        size_bytes: Some(raw_content.len() as u64),
+    }];
+
+    assert_eq!(
+        author::compute_digest(&skills_dir).unwrap(),
+        compute_published_skills_digest(&published)
+    );
 }
 
 #[test]

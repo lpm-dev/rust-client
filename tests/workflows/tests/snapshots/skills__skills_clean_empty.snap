@@ -4,6 +4,12 @@ expression: envelope
 ---
 {
   "success": true,
+  "dry_run": false,
   "cleaned": false,
-  "files_removed": 0
+  "removed": [],
+  "files_removed": 0,
+  "bytes_removed": 0,
+  "would_remove": [],
+  "preserved_publisher_files": [],
+  "skipped": []
 }
