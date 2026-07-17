@@ -1361,12 +1361,17 @@ pub(super) fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
 }
 
 fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
-    let mut key_to_index = HashMap::with_capacity(packages.len());
+    let mut registry_key_to_index = HashMap::with_capacity(packages.len());
     let mut source_id_to_index = HashMap::with_capacity(packages.len());
     for (idx, package) in packages.iter().enumerate() {
-        key_to_index
-            .entry(link_target_lookup_key(&package.name, &package.version))
-            .or_insert(idx);
+        if matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Registry { .. })
+        ) {
+            registry_key_to_index
+                .entry(link_target_lookup_key(&package.name, &package.version))
+                .or_insert(idx);
+        }
         if let Some(source_id) = package.wrapper_id_for_source() {
             source_id_to_index.entry(source_id).or_insert(idx);
         }
@@ -1393,7 +1398,7 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .map_or(local_name.as_str(), String::as_str);
             let next_idx = source_id_to_index
                 .get(version)
-                .or_else(|| key_to_index.get(&link_target_lookup_key(target, version)));
+                .or_else(|| registry_key_to_index.get(&link_target_lookup_key(target, version)));
             if let Some(next_idx) = next_idx
                 && retained.insert(*next_idx)
             {
@@ -1401,7 +1406,8 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
             }
         }
         for (peer_name, version) in &package.peers {
-            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
+            if let Some(next_idx) =
+                registry_key_to_index.get(&link_target_lookup_key(peer_name, version))
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
@@ -1409,11 +1415,16 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
         }
     }
 
-    let mut retained_keys = HashSet::with_capacity(retained.len());
+    let mut retained_registry_keys = HashSet::with_capacity(retained.len());
     let mut retained_source_ids = HashSet::with_capacity(retained.len());
     for idx in &retained {
         let package = &packages[*idx];
-        retained_keys.insert(link_target_lookup_key(&package.name, &package.version));
+        if matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Registry { .. })
+        ) {
+            retained_registry_keys.insert(link_target_lookup_key(&package.name, &package.version));
+        }
         if let Some(source_id) = package.wrapper_id_for_source() {
             retained_source_ids.insert(source_id);
         }
@@ -1430,10 +1441,10 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .get(local_name)
                 .map_or(local_name.as_str(), String::as_str);
             retained_source_ids.contains(version)
-                || retained_keys.contains(&link_target_lookup_key(target, version))
+                || retained_registry_keys.contains(&link_target_lookup_key(target, version))
         });
         package.peers.retain(|(name, version)| {
-            retained_keys.contains(&link_target_lookup_key(name, version))
+            retained_registry_keys.contains(&link_target_lookup_key(name, version))
         });
         kept.push(package);
     }
@@ -1578,7 +1589,7 @@ pub(super) fn filter_dependency_engine_packages(
     packages: &mut Vec<InstallPackage>,
     policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> Result<usize, LpmError> {
-    let mut skipped: HashSet<(String, String)> = HashSet::new();
+    let mut skipped = 0usize;
     let mut kept = Vec::with_capacity(packages.len());
 
     for package in packages.drain(..) {
@@ -1589,28 +1600,16 @@ pub(super) fn filter_dependency_engine_packages(
         if policy.enforce_dependency(&package.name, &package.version, required, package.optional)? {
             kept.push(package);
         } else {
-            skipped.insert((package.name.clone(), package.version.clone()));
+            skipped += 1;
         }
     }
 
-    if !skipped.is_empty() {
-        for package in &mut kept {
-            package.dependencies.retain(|(local, version)| {
-                let target = package
-                    .aliases
-                    .get(local)
-                    .map_or(local.as_str(), String::as_str);
-                !skipped.contains(&(target.to_string(), version.clone()))
-            });
-            package
-                .peers
-                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
-        }
+    if skipped > 0 {
         prune_unreachable_packages(&mut kept);
     }
 
     *packages = kept;
-    Ok(skipped.len())
+    Ok(skipped)
 }
 
 pub(super) fn try_lockfile_fast_path(

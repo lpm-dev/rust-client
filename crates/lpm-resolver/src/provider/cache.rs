@@ -298,7 +298,7 @@ impl LpmDependencyProvider {
         Vec<OverrideHit>,
         Vec<SkippedDependency>,
         HashMap<String, String>,
-        HashMap<String, String>,
+        RootDependencies,
     ) {
         let hits = self.overrides.take_hits();
         let mut skipped_dependencies: Vec<_> = self
@@ -314,7 +314,7 @@ impl LpmDependencyProvider {
             )
         });
         let root_aliases = self.root_aliases.into_inner();
-        let root_deps = self.root_deps;
+        let root_dependencies = self.root_dependencies;
         // Surface Arc<CachedPackageInfo> directly — deep-cloning each
         // entry's seven nested HashMaps moved ~7 MB per cold resolve on
         // `bench/fixture-large` (hidden inside `pubgrub_ms`). Arc::clone is
@@ -327,6 +327,12 @@ impl LpmDependencyProvider {
                 .map(|e| (e.key().clone(), Arc::clone(e.value())))
                 .collect(),
         };
-        (cache, hits, skipped_dependencies, root_aliases, root_deps)
+        (
+            cache,
+            hits,
+            skipped_dependencies,
+            root_aliases,
+            root_dependencies,
+        )
     }
 }

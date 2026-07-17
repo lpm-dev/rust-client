@@ -120,6 +120,7 @@ pub(super) struct NonRegistryPreResolveResult {
     /// `node_modules/<canonical>` — matches consumer expectation
     /// when the local name aliases the workspace member.
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+    pub(super) optional_registry_roots: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -127,12 +128,19 @@ pub(super) struct V2WorkspaceRootPreResolveResult {
     pub(super) install_pkgs: Vec<InstallPackage>,
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+    pub(super) optional_registry_roots: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct LocalSourceExpansionResult {
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryRootOptionality {
+    optional: HashSet<String>,
+    required: HashSet<String>,
 }
 
 pub(super) struct InstallRoutingContext {
@@ -342,6 +350,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         return Ok(V2WorkspaceRootPreResolveResult::default());
     }
 
+    let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
     for member in direct_workspace_member_deps {
         let node_engine = read_pkg_json_node_engine(
@@ -380,11 +389,17 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         json_output,
         WorkspaceTransitiveMode::SourceGraph,
     )?;
+    let optional_registry_roots = merge_optional_registry_roots(
+        &dependency_names_before_expansion,
+        &HashSet::new(),
+        registry_root_optionality(&install_pkgs, &source_deps),
+    );
 
     Ok(V2WorkspaceRootPreResolveResult {
         install_pkgs,
         source_deps,
         additional_workspace_links,
+        optional_registry_roots,
     })
 }
 
@@ -507,6 +522,7 @@ pub(super) fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
 ///   non-Registry source entries — falls back to fresh-resolve.
 ///   Correctness fine; warm-restart perf follow-up.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn pre_resolve_non_registry_deps(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -521,6 +537,30 @@ pub(super) async fn pre_resolve_non_registry_deps(
     // installs (the common case); the detection becomes a
     // no-op.
     workspace_members: &[WorkspaceMemberLink],
+) -> Result<NonRegistryPreResolveResult, LpmError> {
+    pre_resolve_non_registry_deps_with_optional_registry_roots(
+        client,
+        store,
+        project_dir,
+        deps,
+        json_output,
+        strict_integrity,
+        workspace_members,
+        &HashSet::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    project_dir: &Path,
+    deps: &mut HashMap<String, String>,
+    json_output: bool,
+    strict_integrity: bool,
+    workspace_members: &[WorkspaceMemberLink],
+    inherited_optional_registry_roots: &HashSet<String>,
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Gate the manifest boundary for non-registry specifiers.
     //
@@ -700,6 +740,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
             install_pkgs: Vec::new(),
             source_deps: HashMap::new(),
             additional_workspace_links: Vec::new(),
+            optional_registry_roots: inherited_optional_registry_roots.clone(),
         });
     }
 
@@ -1158,6 +1199,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
     // - Stash per-source-string dep specs in `source_deps_out` for
     // the post-resolve fix-up at install.rs:2663+.
     //
+    let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let LocalSourceExpansionResult {
         source_deps: source_deps_out,
         additional_workspace_links,
@@ -1169,11 +1211,17 @@ pub(super) async fn pre_resolve_non_registry_deps(
         json_output,
         WorkspaceTransitiveMode::RootSymlinkOnly,
     )?;
+    let optional_registry_roots = merge_optional_registry_roots(
+        &dependency_names_before_expansion,
+        inherited_optional_registry_roots,
+        registry_root_optionality(&install_pkgs, &source_deps_out),
+    );
 
     Ok(NonRegistryPreResolveResult {
         install_pkgs,
         source_deps: source_deps_out,
         additional_workspace_links,
+        optional_registry_roots,
     })
 }
 
@@ -1363,6 +1411,11 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
         ))
     })?;
 
+    let optional_names = pkg_json
+        .get("optionalDependencies")
+        .and_then(|value| value.as_object())
+        .map(|deps| deps.keys().map(String::as_str).collect::<HashSet<_>>())
+        .unwrap_or_default();
     let mut out = Vec::new();
     for field in [
         "dependencies",
@@ -1374,6 +1427,9 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
             continue;
         };
         for (local_name, raw) in deps {
+            if field == "dependencies" && optional_names.contains(local_name.as_str()) {
+                continue;
+            }
             let Some(raw_str) = raw.as_str() else {
                 continue;
             };
@@ -1652,6 +1708,7 @@ fn promote_workspace_member_source_graph(
     project_dir: &Path,
     spec: &mut SourceDep,
     matched_member: &WorkspaceMemberLink,
+    root_link_name: Option<&str>,
     consumer_deps_map: &mut HashMap<String, String>,
     install_pkgs_out: &mut Vec<InstallPackage>,
     source_deps_out: &mut HashMap<String, Vec<SourceDep>>,
@@ -1671,6 +1728,16 @@ fn promote_workspace_member_source_graph(
     let source_string = workspace_member_source(project_dir, &matched_member.source_dir);
     if let Some(existing_source) = visited.get(&realpath) {
         spec.target_source = Some(existing_source.clone());
+        if let Some(root_link_name) = root_link_name
+            && let Some(package) = install_pkgs_out
+                .iter_mut()
+                .find(|package| package.source == *existing_source)
+        {
+            let root_links = package.root_link_names.get_or_insert_default();
+            if !root_links.iter().any(|name| name == root_link_name) {
+                root_links.push(root_link_name.to_string());
+            }
+        }
         return Ok(());
     }
     visited.insert(realpath.clone(), source_string.clone());
@@ -1688,7 +1755,7 @@ fn promote_workspace_member_source_graph(
         source: source_string.clone(),
         dependencies: Vec::new(),
         aliases: HashMap::new(),
-        root_link_names: Some(Vec::new()),
+        root_link_names: Some(root_link_name.into_iter().map(str::to_string).collect()),
         is_direct: false,
         is_lpm: false,
         peers: Vec::new(),
@@ -1809,22 +1876,31 @@ pub(super) fn recurse_local_source_deps(
                         available_str,
                     )));
                 };
-                additional_workspace_links.push(WorkspaceMemberLink {
-                    name: spec.local_name.clone(),
-                    version: matched_member.version.clone(),
-                    source_dir: matched_member.source_dir.clone(),
-                });
+                let optional_root_link = matches!(
+                    workspace_transitives,
+                    WorkspaceTransitiveMode::RootSymlinkOnly
+                ) && spec.optional;
+                if !optional_root_link {
+                    additional_workspace_links.push(WorkspaceMemberLink {
+                        name: spec.local_name.clone(),
+                        version: matched_member.version.clone(),
+                        source_dir: matched_member.source_dir.clone(),
+                    });
+                }
                 if matches!(
                     workspace_transitives,
                     WorkspaceTransitiveMode::RootSymlinkOnly
-                ) {
+                ) && !spec.optional
+                {
                     continue;
                 }
+                let root_link_name = optional_root_link.then(|| spec.local_name.clone());
 
                 promote_workspace_member_source_graph(
                     project_dir,
                     spec,
                     matched_member,
+                    root_link_name.as_deref(),
                     consumer_deps_map,
                     install_pkgs_out,
                     source_deps_out,
@@ -1880,21 +1956,27 @@ pub(super) fn recurse_local_source_deps(
                                 member.name,
                             ));
                         }
-                        // Invariant invariant — see immediate
-                        // file:/link: arms for the rationale. Push
-                        // the matched member under the parent's
-                        // local_name so the caller adds it to the
-                        // root-symlink set.
-                        additional_workspace_links.push(WorkspaceMemberLink {
-                            name: spec.local_name.clone(),
-                            version: member.version.clone(),
-                            source_dir: member.source_dir.clone(),
-                        });
-                        if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph) {
+                        let optional_root_link = matches!(
+                            workspace_transitives,
+                            WorkspaceTransitiveMode::RootSymlinkOnly
+                        ) && spec.optional;
+                        if !optional_root_link {
+                            additional_workspace_links.push(WorkspaceMemberLink {
+                                name: spec.local_name.clone(),
+                                version: member.version.clone(),
+                                source_dir: member.source_dir.clone(),
+                            });
+                        }
+                        if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph)
+                            || optional_root_link
+                        {
+                            let root_link_name =
+                                optional_root_link.then(|| spec.local_name.clone());
                             promote_workspace_member_source_graph(
                                 project_dir,
                                 spec,
                                 member,
+                                root_link_name.as_deref(),
                                 consumer_deps_map,
                                 install_pkgs_out,
                                 source_deps_out,
@@ -2088,6 +2170,16 @@ fn apply_local_source_optionality(
     packages: &mut [InstallPackage],
     source_deps: &HashMap<String, Vec<SourceDep>>,
 ) {
+    let local_sources = all_local_sources(source_deps);
+    let required_sources = required_local_sources(packages, source_deps);
+    for package in packages {
+        if local_sources.contains(package.source.as_str()) {
+            package.optional = !required_sources.contains(package.source.as_str());
+        }
+    }
+}
+
+fn all_local_sources(source_deps: &HashMap<String, Vec<SourceDep>>) -> HashSet<&str> {
     let mut local_sources: HashSet<&str> = HashSet::with_capacity(source_deps.len() * 2);
     for (source, specs) in source_deps {
         local_sources.insert(source);
@@ -2097,7 +2189,14 @@ fn apply_local_source_optionality(
             }
         }
     }
+    local_sources
+}
 
+fn required_local_sources<'a>(
+    packages: &[InstallPackage],
+    source_deps: &'a HashMap<String, Vec<SourceDep>>,
+) -> HashSet<&'a str> {
+    let local_sources = all_local_sources(source_deps);
     let mut required_sources: HashSet<&str> = HashSet::with_capacity(local_sources.len());
     let mut queue = VecDeque::with_capacity(local_sources.len());
     for package in packages.iter() {
@@ -2131,10 +2230,45 @@ fn apply_local_source_optionality(
             }
         }
     }
+    required_sources
+}
 
-    for package in packages {
-        if local_sources.contains(package.source.as_str()) {
-            package.optional = !required_sources.contains(package.source.as_str());
+fn registry_root_optionality(
+    packages: &[InstallPackage],
+    source_deps: &HashMap<String, Vec<SourceDep>>,
+) -> RegistryRootOptionality {
+    let required_sources = required_local_sources(packages, source_deps);
+    let mut optionality = RegistryRootOptionality::default();
+    for (source, specs) in source_deps {
+        let parent_required = required_sources.contains(source.as_str());
+        for spec in specs {
+            if !matches!(spec.kind, DepKind::Registry) {
+                continue;
+            }
+            if parent_required && !spec.optional {
+                optionality.required.insert(spec.local_name.clone());
+            } else {
+                optionality.optional.insert(spec.local_name.clone());
+            }
         }
     }
+    optionality
+}
+
+fn merge_optional_registry_roots(
+    dependency_names_before_expansion: &HashSet<String>,
+    inherited_optional: &HashSet<String>,
+    source_optionality: RegistryRootOptionality,
+) -> HashSet<String> {
+    let mut optional = inherited_optional.clone();
+    optional.extend(source_optionality.optional);
+    for name in source_optionality.required {
+        optional.remove(&name);
+    }
+    for name in dependency_names_before_expansion {
+        if !inherited_optional.contains(name) {
+            optional.remove(name);
+        }
+    }
+    optional
 }

@@ -946,7 +946,8 @@ async fn run_with_options_under_store_lock(
             install_pkgs: mut spike_pre_resolved_install_pkgs,
             source_deps: mut spike_pre_resolved_source_deps,
             additional_workspace_links,
-        } = pre_resolve_non_registry_deps(
+            optional_registry_roots,
+        } = pre_resolve_non_registry_deps_with_optional_registry_roots(
             &arc_client,
             &store,
             project_dir,
@@ -954,6 +955,7 @@ async fn run_with_options_under_store_lock(
             json_output,
             strict_integrity,
             &all_workspace_members,
+            &v2_workspace_root_pre_resolve.optional_registry_roots,
         )
         .await?;
 
@@ -995,6 +997,7 @@ async fn run_with_options_under_store_lock(
             resolver_policy.clone(),
             auto_install_peers,
             !omit_policy.optional,
+            &optional_registry_roots,
             &spike_pre_resolved_install_pkgs,
             &spike_pre_resolved_source_deps,
             &workspace_member_deps,

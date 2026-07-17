@@ -137,7 +137,43 @@ pub async fn resolve_greedy_with_options_and_policy(
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
 ) -> Result<ResolveResult, ResolveError> {
-    let _span = tracing::debug_span!("resolve_greedy", n_deps = dependencies.len()).entered();
+    resolve_greedy_with_root_dependencies_options_and_policy(
+        client,
+        crate::resolve::RootDependencies::required(dependencies),
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        include_optional_dependencies,
+        policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
+    client: Arc<RegistryClient>,
+    root_dependencies: crate::resolve::RootDependencies,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
+    let _span = tracing::debug_span!(
+        "resolve_greedy",
+        n_deps = root_dependencies.dependencies.len()
+    )
+    .entered();
     let pass_start = Instant::now();
 
     // Reset profiling accumulators. We measure greedy work in `pubgrub_ms`
@@ -147,8 +183,8 @@ pub async fn resolve_greedy_with_options_and_policy(
     lpm_registry::timing::reset();
     let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
 
-    let mut state = ResolveState::new_with_options_and_policy(
-        dependencies,
+    let mut state = ResolveState::new_with_root_dependencies_and_policy(
+        root_dependencies,
         overrides,
         include_optional_dependencies,
         policy.clone(),

@@ -1,10 +1,19 @@
 use super::prelude::*;
 
 impl LpmDependencyProvider {
+    #[cfg(test)]
     pub fn new(
         client: Arc<RegistryClient>,
         rt: Handle,
         root_deps: HashMap<String, String>,
+    ) -> Self {
+        Self::new_with_root_dependencies(client, rt, RootDependencies::required(root_deps))
+    }
+
+    pub fn new_with_root_dependencies(
+        client: Arc<RegistryClient>,
+        rt: Handle,
+        root_dependencies: RootDependencies,
     ) -> Self {
         LpmDependencyProvider {
             client,
@@ -18,7 +27,7 @@ impl LpmDependencyProvider {
             fetch_wait_timeout: Duration::ZERO,
             walker_done: Arc::new(AtomicBool::new(false)),
             metrics: StreamingBfsMetrics::new(),
-            root_deps,
+            root_dependencies,
             split_packages: HashSet::new(),
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
@@ -32,10 +41,25 @@ impl LpmDependencyProvider {
     }
 
     /// Create a provider with multi-version splitting for specific packages.
+    #[cfg(test)]
     pub fn new_with_splits(
         client: Arc<RegistryClient>,
         rt: Handle,
         root_deps: HashMap<String, String>,
+        splits: HashSet<String>,
+    ) -> Self {
+        Self::new_with_root_dependencies_and_splits(
+            client,
+            rt,
+            RootDependencies::required(root_deps),
+            splits,
+        )
+    }
+
+    pub fn new_with_root_dependencies_and_splits(
+        client: Arc<RegistryClient>,
+        rt: Handle,
+        root_dependencies: RootDependencies,
         splits: HashSet<String>,
     ) -> Self {
         LpmDependencyProvider {
@@ -50,7 +74,7 @@ impl LpmDependencyProvider {
             fetch_wait_timeout: Duration::ZERO,
             walker_done: Arc::new(AtomicBool::new(false)),
             metrics: StreamingBfsMetrics::new(),
-            root_deps,
+            root_dependencies,
             split_packages: splits,
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),

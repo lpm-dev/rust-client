@@ -312,7 +312,7 @@ pub struct LpmDependencyProvider {
     /// passes; install.rs reads the snapshot after resolution for
     /// `timing.resolve.streaming_bfs` JSON output.
     pub(super) metrics: StreamingBfsMetrics,
-    pub(super) root_deps: HashMap<String, String>,
+    pub(super) root_dependencies: RootDependencies,
     /// Packages that should be split into per-parent identities.
     pub(super) split_packages: HashSet<String>,
     /// Fully-parsed override IR. Records every applied override into its
@@ -326,7 +326,7 @@ pub struct LpmDependencyProvider {
     pub(super) batch_disabled: RefCell<bool>,
     pub(super) policy: ResolverPolicy,
     /// Root-level npm-alias edges accumulated as `get_dependencies(Root)`
-    /// walks `self.root_deps`. Shape: `local_name → target_canonical_name`.
+    /// walks `self.root_dependencies`. Shape: `local_name → target_canonical_name`.
     /// Surfaced via `into_parts()` so `ResolveResult.root_aliases` carries
     /// the map into the install pipeline, which feeds it to the linker.
     pub(super) root_aliases: RefCell<HashMap<String, String>>,

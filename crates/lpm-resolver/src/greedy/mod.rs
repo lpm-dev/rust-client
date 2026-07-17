@@ -80,11 +80,13 @@ use crate::provider::CachedPackageInfo;
 use crate::ranges::NpmRange;
 use crate::resolve::ResolveError;
 
-pub use entry::resolve_greedy_with_options_and_policy;
+pub use entry::resolve_greedy_with_root_dependencies_options_and_policy;
 pub use fused::{
     resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
     resolve_greedy_fused_with_cache_options_and_policy,
+    resolve_greedy_fused_with_cache_options_and_policy_roots,
     resolve_greedy_fused_with_cache_options_policy_and_selected_events,
+    resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots,
 };
 pub use types::PeerConflictReport;
 

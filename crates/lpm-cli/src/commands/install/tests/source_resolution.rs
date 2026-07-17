@@ -994,6 +994,86 @@ fn read_source_dep_specs_propagates_unsupported_transitive_error() {
     );
 }
 
+#[test]
+fn read_source_dep_specs_optional_dependency_overrides_required_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("local-source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("package.json"),
+        br#"{
+          "name": "local-source",
+          "version": "0.1.0",
+          "dependencies": { "native": "git+https://example.com/overridden.git" },
+          "optionalDependencies": { "native": "file:./native" }
+        }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(source_dir.join("native")).unwrap();
+
+    let specs = read_source_dep_specs(&source_dir)
+        .expect("overridden required declaration must not be classified");
+    assert!(
+        matches!(
+            specs.as_slice(),
+            [SourceDep {
+                local_name,
+                kind: DepKind::FileDir,
+                optional: true,
+                ..
+            }] if local_name == "native"
+        ),
+        "only the optional winning declaration should remain: {specs:?}",
+    );
+}
+
+#[tokio::test]
+async fn pre_resolve_marks_duplicate_local_dependency_optional_after_override() {
+    let store_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let project = tempfile::tempdir().unwrap();
+    let host = project.path().join("packages/local-host");
+    let native = project.path().join("packages/local-native");
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::write(
+        host.join("package.json"),
+        br#"{
+          "name":"local-host",
+          "version":"1.0.0",
+          "dependencies":{"local-native":"file:../local-native"},
+          "optionalDependencies":{"local-native":"file:../local-native"}
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        native.join("package.json"),
+        br#"{"name":"local-native","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mut deps = HashMap::from([(
+        "local-host".to_string(),
+        "file:./packages/local-host".to_string(),
+    )]);
+
+    let mut result =
+        pre_resolve_non_registry_deps(&client, &store, project.path(), &mut deps, true, false, &[])
+            .await
+            .expect("pre-resolve duplicate local dependency");
+    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps);
+
+    let native = result
+        .install_pkgs
+        .iter()
+        .find(|package| package.name == "local-native")
+        .expect("local-native install package");
+    assert!(
+        native.optional,
+        "overridden local dependency must be optional"
+    );
+}
+
 /// when a local source's
 /// `package.json` declares `"<name>": "workspace:*"` for a name
 /// that matches a workspace member, `recurse_local_source_deps`

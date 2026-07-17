@@ -7255,6 +7255,286 @@ fn strict_install_skips_incompatible_optional_file_dependency_from_local_source(
 }
 
 #[tokio::test]
+async fn optional_local_engine_skip_preserves_required_registry_package_with_same_identity() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "registry-host",
+            "version": "1.0.0",
+            "main": "index.js",
+            "dependencies": { "foo": "1.0.0" }
+        }),
+        &[("index.js", b"module.exports = require('foo');\n")],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'registry-foo';\n")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"source-aware-engine-skip",
+            "version":"1.0.0",
+            "dependencies":{
+                "local-host":"file:./packages/local-host",
+                "registry-host":"1.0.0"
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"local-foo":"file:../local-foo"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-foo/package.json",
+        r#"{
+            "name":"foo",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .output()
+        .expect("run source-aware dependency-engine install");
+    assert!(
+        output.status.success(),
+        "skipping the optional local foo must preserve required registry foo\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .args(["-e", "process.stdout.write(require('registry-host'))"])
+        .output()
+        .expect("require registry host after source-aware engine skip");
+    assert!(
+        runtime.status.success() && String::from_utf8_lossy(&runtime.stdout) == "registry-foo",
+        "required registry foo must remain installed and linked\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+}
+
+async fn run_optional_registry_dependency_from_local_source_case(resolver: Option<&str>) {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-registry-native",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-registry-from-local-source",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"optional-registry-native":"1.0.0"}
+        }"#,
+    );
+
+    let mut command = dependency_engine_install_command(&project, &mock.url());
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+    let output = command
+        .output()
+        .expect("run optional registry dependency from local source install");
+    assert!(
+        output.status.success(),
+        "an incompatible optional registry child of a local source must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+    assert!(
+        !project
+            .path()
+            .join("node_modules/optional-registry-native")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn greedy_skips_incompatible_optional_registry_dependency_from_local_source() {
+    run_optional_registry_dependency_from_local_source_case(None).await;
+}
+
+#[tokio::test]
+async fn pubgrub_skips_incompatible_optional_registry_dependency_from_local_source() {
+    run_optional_registry_dependency_from_local_source_case(Some("pubgrub")).await;
+}
+
+async fn run_missing_optional_registry_dependency_from_local_source_case(resolver: Option<&str>) {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"missing-optional-registry-from-local-source",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"missing-optional-registry":"1.0.0"}
+        }"#,
+    );
+
+    let mut command = dependency_engine_install_command(&project, &mock.url());
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+    let output = command
+        .output()
+        .expect("run missing optional registry dependency from local source install");
+    assert!(
+        output.status.success(),
+        "an unavailable optional registry child of a local source must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+}
+
+#[tokio::test]
+async fn greedy_skips_missing_optional_registry_dependency_from_local_source() {
+    run_missing_optional_registry_dependency_from_local_source_case(None).await;
+}
+
+#[tokio::test]
+async fn pubgrub_skips_missing_optional_registry_dependency_from_local_source() {
+    run_missing_optional_registry_dependency_from_local_source_case(Some("pubgrub")).await;
+}
+
+#[test]
+fn strict_install_skips_incompatible_optional_workspace_dependency_from_local_source() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-workspace-from-local-source",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "dependencies":{"local-host":"file:./vendor/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "vendor/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"workspace-native":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-native/package.json",
+        r#"{
+            "name":"workspace-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run optional workspace dependency from local source install");
+
+    assert!(
+        output.status.success(),
+        "an incompatible optional workspace child of a local source must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+    assert!(
+        !project
+            .path()
+            .join("node_modules/workspace-native")
+            .exists(),
+        "a skipped optional workspace child must not leave a root symlink",
+    );
+}
+
+#[test]
+fn optional_dependency_overrides_duplicate_required_local_source_dependency() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-local-override",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "dependencies":{"local-native":"file:../local-native"},
+            "optionalDependencies":{"local-native":"file:../local-native"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-native/package.json",
+        r#"{
+            "name":"local-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run duplicate local dependency override install");
+
+    assert!(
+        output.status.success(),
+        "optionalDependencies must override a duplicate dependencies entry\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+}
+
+#[tokio::test]
 async fn strict_install_does_not_fetch_descendant_orphaned_by_optional_engine_skip() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(

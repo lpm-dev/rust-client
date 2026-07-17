@@ -77,6 +77,8 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use crate::ranges::NpmRange;
     #[allow(unused_imports)]
+    pub(super) use crate::resolve::RootDependencies;
+    #[allow(unused_imports)]
     pub(super) use dashmap::DashMap;
     #[allow(unused_imports)]
     pub(super) use lpm_registry::{RegistryClient, RouteMode, RouteTable, UpstreamRoute};

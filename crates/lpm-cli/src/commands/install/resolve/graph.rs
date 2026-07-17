@@ -86,7 +86,10 @@ pub(super) fn load_lockfile_graph_packages(
     Ok(fast.packages)
 }
 
-pub(super) fn root_resolve_requests(deps: &HashMap<String, String>) -> Vec<ResolveRequest> {
+pub(super) fn root_resolve_requests(
+    deps: &HashMap<String, String>,
+    optional_names: &HashSet<String>,
+) -> Vec<ResolveRequest> {
     let mut requests = Vec::with_capacity(deps.len());
     let mut entries: Vec<(&String, &String)> = deps.iter().collect();
     entries.sort_by_key(|(name, _)| *name);
@@ -99,7 +102,7 @@ pub(super) fn root_resolve_requests(deps: &HashMap<String, String>) -> Vec<Resol
             range,
             parent: None,
             depth: 0,
-            optional: false,
+            optional: optional_names.contains(local_name),
             root: true,
             direct: true,
         });

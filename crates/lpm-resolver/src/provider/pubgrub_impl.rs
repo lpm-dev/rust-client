@@ -272,7 +272,8 @@ impl DependencyProvider for LpmDependencyProvider {
             // path behavior.
             if self.fetch_wait_timeout.is_zero() {
                 let uncached: Vec<String> = self
-                    .root_deps
+                    .root_dependencies
+                    .dependencies
                     .iter()
                     .map(|(local, range)| {
                         crate::ranges::parse_npm_alias(range)
@@ -320,7 +321,11 @@ impl DependencyProvider for LpmDependencyProvider {
             }
 
             let mut constraints = pubgrub::Map::default();
-            for (dep_name, dep_range_str) in &self.root_deps {
+            for (dep_name, dep_range_str) in &self.root_dependencies.dependencies {
+                let edge_is_optional = self.root_dependencies.is_optional(dep_name);
+                if edge_is_optional && !self.include_optional_dependencies {
+                    continue;
+                }
                 // Root-level alias rewrite: if the consumer's package.json
                 // declares `"local": "npm:target@range"`, the resolver
                 // must key the PubGrub constraint on `target` (the real
@@ -340,8 +345,15 @@ impl DependencyProvider for LpmDependencyProvider {
                 };
 
                 let pkg = ResolverPackage::from_dep_name(&target_name);
-                // Ensure dep is cached so we know its versions
-                self.ensure_cached(&pkg)?;
+                if let Err(error) = self.ensure_cached(&pkg) {
+                    if edge_is_optional {
+                        tracing::debug!(
+                            "optional root dep {dep_name} fetch failed; skipping: {error}"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
                 let available = self.available_versions(&pkg);
 
                 // **Defense-in-depth.** `workspace:<rest>` must
@@ -369,6 +381,13 @@ impl DependencyProvider for LpmDependencyProvider {
                 } else {
                     self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
                 };
+
+                if edge_is_optional && !available.iter().any(|version| range.contains(version)) {
+                    tracing::debug!(
+                        "optional root dep {dep_name}@{range_str} has no matching version; skipping"
+                    );
+                    continue;
+                }
 
                 constraints.insert(pkg, range);
             }

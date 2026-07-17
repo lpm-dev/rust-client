@@ -5,7 +5,7 @@ use super::prelude::*;
 pub(super) fn format_solution(
     solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    root_deps: &HashMap<String, String>,
+    root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
     skipped_dependencies: Vec<SkippedDependency>,
 ) -> Result<(Vec<ResolvedPackage>, usize), ResolveError> {
@@ -118,7 +118,7 @@ pub(super) fn format_solution(
             }
         })
         .collect();
-    mark_optional_reachability(&mut resolved, cache, root_deps, root_aliases);
+    mark_optional_reachability(&mut resolved, cache, root_dependencies, root_aliases);
     let platform_skipped =
         validate_selected_dependency_skips(&resolved, cache, skipped_dependencies)?;
     dedupe_peer_superset_packages(&mut resolved);
@@ -193,7 +193,7 @@ fn validate_selected_dependency_skips(
 pub(super) fn mark_optional_reachability(
     packages: &mut [ResolvedPackage],
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    root_deps: &HashMap<String, String>,
+    root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
 ) {
     if packages.is_empty() {
@@ -215,7 +215,10 @@ pub(super) fn mark_optional_reachability(
 
     let mut required = vec![false; packages.len()];
     let mut queue = VecDeque::new();
-    for local_name in root_deps.keys() {
+    for local_name in root_dependencies.dependencies.keys() {
+        if root_dependencies.is_optional(local_name) {
+            continue;
+        }
         let target = root_aliases
             .get(local_name)
             .map_or(local_name.as_str(), String::as_str);

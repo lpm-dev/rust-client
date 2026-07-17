@@ -217,6 +217,7 @@ pub(in crate::commands::install) async fn run(
     resolver_policy: lpm_resolver::ResolverPolicy,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
+    optional_registry_roots: &HashSet<String>,
     pre_resolved_install_pkgs: &[InstallPackage],
     pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
     workspace_member_deps: &[WorkspaceMemberLink],
@@ -254,7 +255,7 @@ pub(in crate::commands::install) async fn run(
             let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
             let mut packages: HashMap<PackageIdentity, PackageDraft> =
                 HashMap::with_capacity(deps.len().saturating_mul(4).max(32));
-            let root_requests = root_resolve_requests(deps);
+            let root_requests = root_resolve_requests(deps, optional_registry_roots);
             stats.root_requests = root_requests.len() as u64;
 
             for request in root_requests {
@@ -494,6 +495,7 @@ pub(in crate::commands::install) async fn run(
         resolver_policy,
         auto_install_peers,
         include_optional_dependencies,
+        optional_registry_roots,
         all_workspace_members,
         catalog_resolutions,
         pre_resolved_install_pkgs,
@@ -855,6 +857,7 @@ async fn compute_parity_if_requested(
     resolver_policy: lpm_resolver::ResolverPolicy,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
+    optional_registry_roots: &HashSet<String>,
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     pre_resolved_install_pkgs: &[InstallPackage],
@@ -878,20 +881,25 @@ async fn compute_parity_if_requested(
                 "LPM_NPM_FANOUT",
                 default_fusion_npm_fanout(false, 0),
             );
-            let resolve_result = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
-                client,
+            let root_dependencies = lpm_resolver::RootDependencies::with_optional_names(
                 deps.clone(),
-                override_set,
-                route_table.clone(),
-                npm_fanout,
-                None,
-                shared_cache,
-                auto_install_peers,
-                include_optional_dependencies,
-                resolver_policy,
-            )
-            .await
-            .map_err(crate::resolver_error::resolver_error_to_lpm)?;
+                optional_registry_roots.clone(),
+            );
+            let resolve_result =
+                lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy_roots(
+                    client,
+                    root_dependencies,
+                    override_set,
+                    route_table.clone(),
+                    npm_fanout,
+                    None,
+                    shared_cache,
+                    auto_install_peers,
+                    include_optional_dependencies,
+                    resolver_policy,
+                )
+                .await
+                .map_err(crate::resolver_error::resolver_error_to_lpm)?;
 
             let mut packages = resolved_to_install_packages_with_workspace_members(
                 &resolve_result.packages,

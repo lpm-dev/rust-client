@@ -1,5 +1,42 @@
 use super::prelude::*;
 
+/// Resolver input for dependency edges attached to the resolver's synthetic root.
+///
+/// Optional names use the manifest's local dependency key, including npm aliases.
+#[derive(Debug, Clone, Default)]
+pub struct RootDependencies {
+    pub(crate) dependencies: HashMap<String, String>,
+    pub(crate) optional_names: HashSet<String>,
+}
+
+impl RootDependencies {
+    /// Builds resolver input where every root edge is required.
+    pub fn required(dependencies: HashMap<String, String>) -> Self {
+        Self {
+            dependencies,
+            optional_names: HashSet::new(),
+        }
+    }
+
+    /// Builds resolver input with the named root edges treated as optional.
+    /// Names absent from `dependencies` are discarded.
+    pub fn with_optional_names(
+        dependencies: HashMap<String, String>,
+        mut optional_names: HashSet<String>,
+    ) -> Self {
+        optional_names.retain(|name| dependencies.contains_key(name));
+        Self {
+            dependencies,
+            optional_names,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_optional(&self, local_name: &str) -> bool {
+        self.optional_names.contains(local_name)
+    }
+}
+
 /// A resolved package: name + selected version + its dependencies.
 #[derive(Debug, Clone)]
 pub struct ResolvedPackage {

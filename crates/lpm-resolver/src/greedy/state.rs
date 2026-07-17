@@ -210,6 +210,7 @@ pub(super) struct ResolveState {
     /// Root deps from `package.json`. Stored so we can reconstruct
     /// each root edge's range when seeding.
     pub(super) root_deps: HashMap<String, String>,
+    pub(super) optional_root_names: HashSet<String>,
     /// Edge work queue. Drained by the main loop.
     pub(super) task_queue: VecDeque<Edge>,
     /// Resolved nodes indexed by canonical → list of `(version,
@@ -317,14 +318,34 @@ impl ResolveState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_options_and_policy(
         root_deps: HashMap<String, String>,
         overrides: OverrideSet,
         include_optional_dependencies: bool,
         policy: ResolverPolicy,
     ) -> Self {
+        Self::new_with_root_dependencies_and_policy(
+            crate::resolve::RootDependencies::required(root_deps),
+            overrides,
+            include_optional_dependencies,
+            policy,
+        )
+    }
+
+    pub(super) fn new_with_root_dependencies_and_policy(
+        root_dependencies: crate::resolve::RootDependencies,
+        overrides: OverrideSet,
+        include_optional_dependencies: bool,
+        policy: ResolverPolicy,
+    ) -> Self {
+        let crate::resolve::RootDependencies {
+            dependencies: root_deps,
+            optional_names: optional_root_names,
+        } = root_dependencies;
         ResolveState {
             root_deps,
+            optional_root_names,
             task_queue: VecDeque::with_capacity(256),
             resolved: AHashMap::with_capacity(512),
             nodes: Vec::with_capacity(512),
@@ -418,6 +439,10 @@ impl ResolveState {
         let mut entries: Vec<_> = self.root_deps.iter().collect();
         entries.sort_by_key(|(name, _)| *name);
         for (name, range_str) in entries {
+            let optional = self.optional_root_names.contains(name);
+            if optional && !self.include_optional_dependencies {
+                continue;
+            }
             let (canonical_name, effective_range) = match crate::ranges::parse_npm_alias(range_str)
             {
                 Some(alias) => {
@@ -452,9 +477,9 @@ impl ResolveState {
                 canonical,
                 range,
                 behavior: DepBehavior {
-                    required: true,
+                    required: !optional,
                     peer: false,
-                    optional: false,
+                    optional,
                 },
             });
         }
