@@ -1,9 +1,9 @@
 use miette::Result;
 
 use crate::{
-    auth, auth_storage_notice, color_policy, commands, engine_check, install_state, output,
-    provenance_fetch, release_age_config, save_spec, script_policy_config, tool_pin_validation,
-    update_check,
+    auth, auth_storage_notice, color_policy, commands, engine_check, install_state,
+    lpm_skills_config, output, provenance_fetch, release_age_config, save_spec,
+    script_policy_config, tool_pin_validation, update_check,
 };
 
 use super::args::{
@@ -146,7 +146,8 @@ fn check_fast_lane_admission(
     crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
     let policy_extension_configs =
         crate::commands::install::policy_extensions::load_policy_extension_configs(&global_config)?;
-    let package_skills_ready = global_config.get_bool("noSkills").unwrap_or(false)
+    let package_skills_ready = !lpm_skills_config::LpmSkillsPreference::Config
+        .resolve(&global_config)?
         || crate::commands::skills::package::materialization_complete(project_dir, package_json);
     if policy_extension_configs.is_empty() && package_skills_ready {
         Ok(FastLaneAdmission::ExitAllowed)
@@ -493,6 +494,7 @@ async fn async_main() -> Result<()> {
                 unverified_provenance,
                 unverified_provenance_all,
                 linker,
+                skills,
                 no_skills,
                 no_editor_setup,
                 no_security_summary,
@@ -593,6 +595,7 @@ async fn async_main() -> Result<()> {
                     offline,
                     force,
                     linker,
+                    skills,
                     no_skills,
                     no_editor_setup,
                     no_security_summary,
@@ -679,8 +682,10 @@ async fn async_main() -> Result<()> {
                         .into(),
                 ));
             }
-            let cfg = commands::config::GlobalConfig::load();
+            let cfg = commands::config::GlobalConfig::load_checked()?;
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+            let lpm_skills_preference =
+                lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills);
 
             // Resolve the audit-after-install precedence chain ONCE
             // before threading the resolved boolean into every install
@@ -871,7 +876,6 @@ async fn async_main() -> Result<()> {
                     ))
                 } else {
                     // Bare install path.
-                    let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
                     let eff_no_editor =
                         no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
                     let eff_no_sec =
@@ -902,7 +906,7 @@ async fn async_main() -> Result<()> {
                         no_engine_strict,
                         cli_strict_peer_dependencies,
                         cli_linker,
-                        eff_no_skills,
+                        lpm_skills_preference,
                         eff_no_editor,
                         eff_no_sec,
                         eff_auto_build,
@@ -966,6 +970,7 @@ async fn async_main() -> Result<()> {
                     cli.verbose,
                     eff_audit_after_install,
                     timing,
+                    lpm_skills_preference,
                 )
                 .await
             } else {
@@ -1009,6 +1014,7 @@ async fn async_main() -> Result<()> {
                         cli.verbose,
                         eff_audit_after_install,
                         timing,
+                        lpm_skills_preference,
                     )
                     .await
                 } else {
@@ -1037,6 +1043,7 @@ async fn async_main() -> Result<()> {
                         cli.verbose,
                         eff_audit_after_install,
                         timing,
+                        lpm_skills_preference,
                     )
                     .await
                 }
@@ -1112,6 +1119,7 @@ async fn async_main() -> Result<()> {
                 force,
                 dry_run,
                 no_install_deps,
+                skills,
                 no_skills,
                 no_editor_setup,
                 pm,
@@ -1126,6 +1134,9 @@ async fn async_main() -> Result<()> {
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let config = commands::config::GlobalConfig::load_checked()?;
+            let no_skills = !lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills)
+                .resolve(&config)?;
             // engines.* preflight: run BEFORE add mutates package.json
             // so a constraint violation can't leave the project
             // half-modified. Skip in --dry-run since nothing is
@@ -2462,6 +2473,7 @@ async fn async_main() -> Result<()> {
                 unverified_provenance,
                 unverified_provenance_all,
                 linker,
+                skills,
                 no_skills,
                 no_editor_setup,
                 no_security_summary,
@@ -2493,9 +2505,10 @@ async fn async_main() -> Result<()> {
 
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cwd = resolve_install_project_dir(&cwd, false, cli.json)?;
-            let cfg = commands::config::GlobalConfig::load();
+            let cfg = commands::config::GlobalConfig::load_checked()?;
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
-            let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
+            let lpm_skills_preference =
+                lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills);
             let eff_no_editor =
                 no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
             let eff_no_sec =
@@ -2607,7 +2620,7 @@ async fn async_main() -> Result<()> {
                 no_engine_strict,
                 cli_strict_peer_dependencies,
                 cli_linker,
-                eff_no_skills,
+                lpm_skills_preference,
                 eff_no_editor,
                 eff_no_sec,
                 eff_auto_build,

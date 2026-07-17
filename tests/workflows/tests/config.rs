@@ -41,6 +41,100 @@ fn config_without_action_requires_interactive_terminal() {
 }
 
 #[test]
+fn config_lpm_skills_without_set_requires_interactive_terminal() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-skills","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "lpm-skills"])
+        .output()
+        .expect("failed to run lpm config lpm-skills");
+
+    assert!(
+        !output.status.success(),
+        "lpm config lpm-skills without --set and without a TTY must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("lpm config lpm-skills requires a TTY; use `--set true|false` instead"),
+        "non-interactive error must explain the --set form, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn config_lpm_skills_set_false_persists_boolean_and_migrates_legacy_key() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-skills","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\nnoSkills = false\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "lpm-skills", "--set", "false"])
+        .output()
+        .expect("failed to run lpm config lpm-skills --set false");
+
+    assert!(
+        output.status.success(),
+        "lpm config lpm-skills --set false failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config lpm-skills --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(
+        envelope["auto-install-lpm-skills"],
+        serde_json::json!(false)
+    );
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "auto-install-lpm-skills": false
+    }
+    "###);
+
+    let content = std::fs::read_to_string(config_path(&project)).expect("config file must exist");
+    assert!(
+        content.contains("auto-install-lpm-skills = false"),
+        "wizard must persist a native TOML boolean, got:\n{content}"
+    );
+    assert!(
+        content.contains("registry = \"https://registry.example.test\""),
+        "wizard must preserve unrelated config, got:\n{content}"
+    );
+    assert!(
+        !content.contains("noSkills"),
+        "wizard must remove the migrated legacy key, got:\n{content}"
+    );
+}
+
+#[test]
+fn generic_config_set_lpm_skills_rejects_non_boolean_values() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-skills","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "set", "auto-install-lpm-skills", "sometimes"])
+        .output()
+        .expect("failed to run generic lpm-skills config setter");
+
+    assert!(!output.status.success(), "invalid boolean value must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("`auto-install-lpm-skills` must be true or false"),
+        "invalid boolean error must name the canonical key, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !config_path(&project).exists(),
+        "invalid lpm-skills config must not create config.toml"
+    );
+}
+
+#[test]
 fn config_set_writes_value_into_isolated_home() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
 

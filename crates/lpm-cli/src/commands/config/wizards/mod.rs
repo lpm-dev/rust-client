@@ -1,6 +1,7 @@
 mod common;
 mod firewall;
 mod integrity;
+mod lpm_skills;
 mod release_age;
 mod sandbox;
 mod scripts;
@@ -56,6 +57,9 @@ pub(in crate::commands::config) use integrity::{
 #[cfg(test)]
 pub(in crate::commands::config) use integrity::{
     INTEGRITY_SOURCE_HINT, INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT,
+};
+pub(in crate::commands::config) use lpm_skills::{
+    format_current_lpm_skills, read_auto_install_lpm_skills, run_lpm_skills_wizard,
 };
 #[cfg(test)]
 pub(in crate::commands::config) use release_age::{

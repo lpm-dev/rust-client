@@ -4,7 +4,8 @@ use clap::{Args, Subcommand};
 #[derive(Args)]
 pub(crate) struct ConfigArgs {
     /// Action: get, set, delete, list, scripts, triage, sandbox,
-    /// sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy.
+    /// sigstore, signatures, trust-policy, typosquat, firewall, integrity,
+    /// release-age, release-age-policy, lpm-skills.
     /// Omit to open the guided configuration editor.
     pub(crate) action: Option<String>,
     /// Config key (for get/set/delete).
@@ -13,8 +14,9 @@ pub(crate) struct ConfigArgs {
     pub(crate) value: Option<String>,
     /// Non-interactive value for the `scripts` / `triage` /
     /// `sandbox` / `sigstore` / `signatures` / `trust-policy` /
-    /// `typosquat` / `firewall` / `integrity` / `release-age` / `release-age-policy` wizards. Required when stdin is not
-    /// a TTY. Examples:
+    /// `typosquat` / `firewall` / `integrity` / `release-age` /
+    /// `release-age-policy` / `lpm-skills` wizards. Required when stdin
+    /// is not a TTY. Examples:
     ///   `lpm config scripts --set triage`
     ///   `lpm config triage --set claude-cli`
     ///   `lpm config sandbox --set strict`
@@ -26,6 +28,7 @@ pub(crate) struct ConfigArgs {
     ///   `lpm config integrity --set tree`
     ///   `lpm config release-age --set 3d`
     ///   `lpm config release-age-policy --set strict`
+    ///   `lpm config lpm-skills --set false`
     #[arg(long = "set", value_name = "VALUE")]
     pub(crate) set: Option<String>,
 }

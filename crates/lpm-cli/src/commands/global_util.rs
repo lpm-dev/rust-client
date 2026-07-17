@@ -64,7 +64,7 @@ pub(super) async fn run_inner_global_install(
         options.no_engine_strict,
         options.strict_peer_dependencies_override,
         None,
-        true,
+        crate::lpm_skills_config::LpmSkillsPreference::Disabled,
         true,
         true,
         options.auto_build,

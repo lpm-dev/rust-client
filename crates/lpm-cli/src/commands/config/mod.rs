@@ -6,6 +6,7 @@ mod wizards;
 mod tests;
 
 use crate::install_ui;
+use crate::lpm_skills_config::{AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY};
 use crate::npm_firewall_config::{FIREWALL_CONFIG_SECTION, NpmFirewallMode};
 use crate::prompt::prompt_err;
 use crate::sandbox_config::ResolvedSandboxMode;
@@ -28,15 +29,17 @@ use wizards::{
     RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES, SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES,
     SIGNATURES_KEY, SIGSTORE_VERIFY_VALUES, TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES,
     TRUST_POLICY_VALUES, format_bool_enabled, format_current_firewall_mode,
-    format_current_integrity_policy, format_current_release_age, format_current_typosquat_guard,
-    parse_config_bool, parse_firewall_mode_selection, parse_integrity_policy_selection,
-    parse_typosquat_guard_selection, persist_firewall_mode_in_config_value, read_bool_value,
+    format_current_integrity_policy, format_current_lpm_skills, format_current_release_age,
+    format_current_typosquat_guard, parse_config_bool, parse_firewall_mode_selection,
+    parse_integrity_policy_selection, parse_typosquat_guard_selection,
+    persist_firewall_mode_in_config_value, read_auto_install_lpm_skills, read_bool_value,
     read_firewall_mode, read_integrity_policy, read_release_age_override,
     read_release_age_policy_override, read_sandbox_mode, read_sigstore_verify, read_string_value,
     read_typosquat_guard_override, reject_looser_typosquat_guard_write, run_firewall_wizard,
-    run_integrity_wizard, run_release_age_policy_wizard, run_release_age_wizard,
-    run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard, run_sigstore_wizard,
-    run_triage_wizard, run_trust_policy_wizard, run_typosquat_wizard, validate_trust_policy_value,
+    run_integrity_wizard, run_lpm_skills_wizard, run_release_age_policy_wizard,
+    run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard,
+    run_sigstore_wizard, run_triage_wizard, run_trust_policy_wizard, run_typosquat_wizard,
+    validate_trust_policy_value,
 };
 
 /// CLI configuration management.
@@ -47,7 +50,7 @@ use wizards::{
 /// Bare `lpm config` opens a guided editor that routes into the focused
 /// wizards below. The direct forms stay available for scripts and deep links.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, eleven focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, twelve focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
@@ -66,8 +69,10 @@ use wizards::{
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
+/// - `lpm config lpm-skills` owns `auto-install-lpm-skills = true | false`
+///   for package-published skills from `@lpm.dev/*` packages.
 ///
-/// All eleven default to interactive in a TTY; `--set <value>` is the
+/// All twelve default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: Option<&str>,
@@ -114,6 +119,9 @@ pub async fn run(
     }
     if action == "release-age-policy" {
         return run_release_age_policy_wizard(&config_path, set, json_output).await;
+    }
+    if action == "lpm-skills" {
+        return run_lpm_skills_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -179,10 +187,9 @@ pub async fn run(
                         &format!("lpm config set {key} {}", requested.as_str()),
                     )?;
                 }
-                SIGNATURES_KEY => {
-                    parse_config_bool(value).map_err(|message| {
-                        LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
-                    })?;
+                SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY => {
+                    parse_config_bool(value)
+                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
                 }
                 TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
                 INTEGRITY_KEY => {
@@ -218,43 +225,48 @@ pub async fn run(
                     parse_firewall_mode_selection(value)?,
                 )?;
             } else if let Some(table) = config.as_table_mut() {
+                if key == AUTO_INSTALL_LPM_SKILLS_KEY {
+                    table.remove(LEGACY_NO_SKILLS_KEY);
+                }
                 if key == TYPOSQUAT_GUARD_KEY
                     && parse_typosquat_guard_selection(value)? == TyposquatGuardSelection::Default
                 {
                     table.remove(key);
                 } else {
-                    let value = if key == SIGNATURES_KEY {
-                        toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
-                            LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
-                        })?)
-                    } else if key == RELEASE_AGE_POLICY_KEY {
-                        toml::Value::String(
-                            crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
-                                .as_str()
-                                .to_string(),
-                        )
-                    } else if key == INTEGRITY_KEY {
-                        toml::Value::String(
-                            parse_integrity_policy_selection(value)?
-                                .as_str()
-                                .to_string(),
-                        )
-                    } else if key == TYPOSQUAT_GUARD_KEY {
-                        toml::Value::String(
-                            parse_typosquat_guard_selection(value)?.as_str().to_string(),
-                        )
-                    } else {
-                        toml::Value::String(value.to_string())
-                    };
+                    let value =
+                        if matches!(key, SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY) {
+                            toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
+                                LpmError::Registry(format!("`{key}` {message}"))
+                            })?)
+                        } else if key == RELEASE_AGE_POLICY_KEY {
+                            toml::Value::String(
+                                crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                                    .as_str()
+                                    .to_string(),
+                            )
+                        } else if key == INTEGRITY_KEY {
+                            toml::Value::String(
+                                parse_integrity_policy_selection(value)?
+                                    .as_str()
+                                    .to_string(),
+                            )
+                        } else if key == TYPOSQUAT_GUARD_KEY {
+                            toml::Value::String(
+                                parse_typosquat_guard_selection(value)?.as_str().to_string(),
+                            )
+                        } else {
+                            toml::Value::String(value.to_string())
+                        };
                     table.insert(key.to_string(), value);
                 }
             }
             write_config(&config_path, &config)?;
             if json_output {
-                let value = if key == SIGNATURES_KEY {
-                    serde_json::Value::Bool(parse_config_bool(value).map_err(|message| {
-                        LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
-                    })?)
+                let value = if matches!(key, SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY) {
+                    serde_json::Value::Bool(
+                        parse_config_bool(value)
+                            .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?,
+                    )
                 } else if key == RELEASE_AGE_POLICY_KEY {
                     serde_json::Value::String(
                         crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
@@ -385,7 +397,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, lpm-skills"
             )));
         }
     }
@@ -475,6 +487,11 @@ async fn run_guided_config_menu(
                 "Release-age scope",
                 format!("current: {}", summary.release_age_policy),
             )
+            .item(
+                "lpm-skills",
+                "LPM.dev package skills",
+                format!("current: {}", summary.lpm_skills),
+            )
             .item("done", "Done", "exit")
             .interact()
             .map_err(prompt_err)?;
@@ -494,6 +511,7 @@ async fn run_guided_config_menu(
             "integrity" => run_integrity_wizard(config_path, None, false).await?,
             "release-age" => run_release_age_wizard(config_path, None, false).await?,
             "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
+            "lpm-skills" => run_lpm_skills_wizard(config_path, None, false).await?,
             "done" => return Ok(()),
             _ => unreachable!("guided config select returned unexpected setting"),
         }
@@ -528,6 +546,7 @@ struct GuidedConfigSummary {
     integrity_mode: String,
     release_age: String,
     release_age_policy: String,
+    lpm_skills: &'static str,
 }
 
 fn read_guided_config_summary(
@@ -562,5 +581,6 @@ fn read_guided_config_summary(
             .unwrap_or_default()
             .as_str()
             .to_string(),
+        lpm_skills: format_current_lpm_skills(read_auto_install_lpm_skills(config_path)?),
     })
 }

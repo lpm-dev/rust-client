@@ -236,7 +236,7 @@ pub async fn run(
         false, // no_engine_strict
         None,  // strict_peer_dependencies_override
         None,  // linker_override
-        true,  // no_skills — deploy outputs are typically Docker images
+        crate::lpm_skills_config::LpmSkillsPreference::Disabled,
         true,  // no_editor_setup — same reason
         false, // no_security_summary — keep findings visible in CI
         false, // auto_build — build is a separate concern
