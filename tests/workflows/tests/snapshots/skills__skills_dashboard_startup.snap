@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/skills.rs
+expression: dashboard.startup
+---
+{
+  "success": true,
+  "url": "[dashboard-url]",
+  "display_url": "[dashboard-display-url]",
+  "port": "[dashboard-port]",
+  "includes_global": false,
+  "read_only": true
+}

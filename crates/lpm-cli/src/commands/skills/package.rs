@@ -5,15 +5,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const MANIFEST_FILE: &str = ".lpm-package-skills.json";
+pub(super) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
 const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PackageSkillsManifest {
-    schema_version: u32,
-    package: String,
-    version: Option<String>,
-    skills: BTreeMap<String, String>,
+pub(super) struct PackageSkillsManifest {
+    pub(super) schema_version: u32,
+    pub(super) package: String,
+    pub(super) version: Option<String>,
+    pub(super) skills: BTreeMap<String, String>,
 }
 
 pub(crate) struct PackageSkillsResult {
@@ -241,7 +241,7 @@ fn validated_entries(skills: &[Skill]) -> Result<Vec<(&str, &str)>, LpmError> {
     Ok(entries)
 }
 
-fn digest(content: &[u8]) -> String {
+pub(super) fn digest(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
 }
 

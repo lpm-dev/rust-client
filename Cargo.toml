@@ -79,6 +79,7 @@ tokio-util = { version = "0.7", features = ["io", "io-util"] }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "blocking", "http2", "gzip", "brotli", "zstd"], default-features = false }
+axum = { version = "0.8", features = ["json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -176,6 +177,7 @@ dashmap = "6"
 chrono = { version = "0.4", features = ["serde"] }
 crc32fast = "1.4"
 hex = "0.4"
+subtle = "2"
 rmp-serde = "1"
 filetime = "0.2"
 

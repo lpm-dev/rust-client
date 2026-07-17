@@ -18,6 +18,13 @@ const MAX_FILE_COUNT: usize = 500;
 const MAX_ARCHIVE_ENTRIES: usize = 500;
 const MAX_DIRECTORY_DEPTH: usize = 12;
 
+#[derive(Clone, Copy)]
+struct LocalTraversal {
+    label: &'static str,
+    skip_git: bool,
+    max_entries: Option<usize>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SourceDescriptor {
@@ -243,7 +250,19 @@ fn load_local(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
     };
     let root = root.canonicalize()?;
     let mut files = BTreeMap::new();
-    collect_local_files(&root, &root, &mut files, 0)?;
+    let mut entry_count = 0;
+    collect_local_files(
+        &root,
+        &root,
+        &mut files,
+        0,
+        LocalTraversal {
+            label: "standalone source",
+            skip_git: true,
+            max_entries: None,
+        },
+        &mut entry_count,
+    )?;
     let digest = tree_digest(&files);
     Ok(SourceTree {
         descriptor: SourceDescriptor::Local {
@@ -255,49 +274,93 @@ fn load_local(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
     })
 }
 
+pub(super) fn read_bounded_skill_directory(
+    root: &Path,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>, LpmError> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LpmError::Registry(format!(
+            "skill root is not a regular directory: {}",
+            root.display()
+        )));
+    }
+    let root = root.canonicalize()?;
+    let mut files = BTreeMap::new();
+    let mut entry_count = 0;
+    collect_local_files(
+        &root,
+        &root,
+        &mut files,
+        0,
+        LocalTraversal {
+            label: "skill directory",
+            skip_git: false,
+            max_entries: Some(MAX_ARCHIVE_ENTRIES),
+        },
+        &mut entry_count,
+    )?;
+    Ok(files)
+}
+
 fn collect_local_files(
     root: &Path,
     directory: &Path,
     files: &mut BTreeMap<PathBuf, Vec<u8>>,
     depth: usize,
+    traversal: LocalTraversal,
+    entry_count: &mut usize,
 ) -> Result<(), LpmError> {
     if depth > MAX_DIRECTORY_DEPTH {
         return Err(LpmError::Registry(format!(
-            "standalone source exceeds the {MAX_DIRECTORY_DEPTH}-directory nesting limit"
+            "{} exceeds the {MAX_DIRECTORY_DEPTH}-directory nesting limit",
+            traversal.label
         )));
     }
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_name() == ".git" {
+        if traversal.skip_git && entry.file_name() == ".git" {
             continue;
+        }
+        *entry_count = (*entry_count).saturating_add(1);
+        if let Some(limit) = traversal.max_entries
+            && *entry_count > limit
+        {
+            return Err(LpmError::Registry(format!(
+                "{} exceeds the {limit}-entry limit",
+                traversal.label
+            )));
         }
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             return Err(LpmError::Registry(format!(
-                "refusing symlink in standalone source: {}",
-                path.display()
+                "refusing symlink in {}: {}",
+                traversal.label,
+                path.display(),
             )));
         }
         if metadata.is_dir() {
-            collect_local_files(root, &path, files, depth + 1)?;
+            collect_local_files(root, &path, files, depth + 1, traversal, entry_count)?;
             continue;
         }
         if !metadata.is_file() {
             return Err(LpmError::Registry(format!(
-                "refusing non-regular file in standalone source: {}",
-                path.display()
+                "refusing non-regular file in {}: {}",
+                traversal.label,
+                path.display(),
             )));
         }
         if files.len() >= MAX_FILE_COUNT {
             return Err(LpmError::Registry(format!(
-                "standalone source exceeds the {MAX_FILE_COUNT}-file limit"
+                "{} exceeds the {MAX_FILE_COUNT}-file limit",
+                traversal.label
             )));
         }
         if metadata.len() > MAX_FILE_BYTES as u64 {
             return Err(LpmError::Registry(format!(
-                "standalone source file exceeds the {MAX_FILE_BYTES}-byte limit: {}",
-                path.display()
+                "{} file exceeds the {MAX_FILE_BYTES}-byte limit: {}",
+                traversal.label,
+                path.display(),
             )));
         }
         let relative = path.strip_prefix(root).map_err(|_| {
@@ -306,12 +369,24 @@ fn collect_local_files(
                 path.display()
             ))
         })?;
-        files.insert(relative.to_path_buf(), std::fs::read(path)?);
+        let mut content = Vec::with_capacity(metadata.len() as usize);
+        std::fs::File::open(&path)?
+            .take((MAX_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut content)?;
+        if content.len() > MAX_FILE_BYTES {
+            return Err(LpmError::Registry(format!(
+                "{} file exceeds the {MAX_FILE_BYTES}-byte limit: {}",
+                traversal.label,
+                path.display(),
+            )));
+        }
+        files.insert(relative.to_path_buf(), content);
     }
     let expanded_bytes = files.values().map(Vec::len).sum::<usize>();
     if expanded_bytes > MAX_EXPANDED_BYTES {
         return Err(LpmError::Registry(format!(
-            "standalone source exceeds the {MAX_EXPANDED_BYTES}-byte content limit"
+            "{} exceeds the {MAX_EXPANDED_BYTES}-byte content limit",
+            traversal.label
         )));
     }
     Ok(())

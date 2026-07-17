@@ -2,9 +2,99 @@
 
 mod support;
 
+use std::io::{BufRead, BufReader};
+use std::process::Child;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
 use support::mock_registry::MockRegistry;
 use support::mock_registry::make_tarball;
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry};
+
+struct DashboardProcess {
+    child: Child,
+    startup: serde_json::Value,
+    origin: String,
+    token: String,
+}
+
+impl DashboardProcess {
+    fn start(project: &TempProject, extra_args: &[&str]) -> Self {
+        let mut command = lpm_spawnable(project);
+        command.args(["--json", "skills", "dashboard", "--no-open"]);
+        command.args(extra_args);
+        let mut child = command.spawn().expect("start skills dashboard");
+        let stdout = child.stdout.take().expect("dashboard stdout must be piped");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut json = String::new();
+            for line in BufReader::new(stdout).lines() {
+                let line = line.expect("read dashboard startup output");
+                json.push_str(&line);
+                json.push('\n');
+                if line.trim() == "}" {
+                    break;
+                }
+            }
+            let _ = sender.send(json);
+        });
+        let startup_output = match receiver.recv_timeout(Duration::from_secs(15)) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("dashboard did not emit startup JSON: {error}");
+            }
+        };
+        reader.join().expect("join dashboard startup reader");
+        let startup: serde_json::Value = serde_json::from_str(&startup_output).unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = child
+                .stderr
+                .take()
+                .map(|stderr| {
+                    std::io::read_to_string(stderr).unwrap_or_else(|_| "<unreadable>".into())
+                })
+                .unwrap_or_default();
+            panic!(
+                "dashboard startup output was not JSON: {error}\nstdout:\n{startup_output}\nstderr:\n{stderr}"
+            );
+        });
+        let launch_url = startup["url"]
+            .as_str()
+            .expect("dashboard startup must contain a URL")
+            .to_string();
+        let (display_url, token) = launch_url
+            .split_once("#token=")
+            .expect("dashboard URL must carry a fragment session token");
+        Self {
+            child,
+            startup,
+            origin: display_url.trim_end_matches('/').into(),
+            token: token.into(),
+        }
+    }
+
+    fn client(&self) -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build dashboard HTTP client")
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        format!("{}{path}", self.origin)
+    }
+}
+
+impl Drop for DashboardProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 fn seed_skill(project: &TempProject, pkg: &str, name: &str, body: &str) {
     project.write_file(&format!(".lpm/skills/{pkg}/{name}.md"), body);
@@ -149,6 +239,269 @@ fn skills_list_on_fresh_project_reports_no_skills_installed() {
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
         "skills list must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn skills_dashboard_serves_authenticated_unified_inventory() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_skill(
+        &project,
+        "alice.tools",
+        "format-code",
+        "---\nname: format-code\ndescription: Format code consistently\n---\n\nFollow the formatter.\n",
+    );
+    let dashboard = DashboardProcess::start(&project, &["--read-only"]);
+
+    insta::assert_json_snapshot!("skills_dashboard_startup", dashboard.startup, {
+        ".url" => "[dashboard-url]",
+        ".display_url" => "[dashboard-display-url]",
+        ".port" => "[dashboard-port]",
+    });
+
+    let response = dashboard
+        .client()
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let inventory: serde_json::Value = response.json().expect("decode dashboard inventory");
+
+    assert_eq!(inventory["counts"]["package"], serde_json::json!(1));
+    assert_eq!(inventory["skills"][0]["name"], "format-code");
+    assert_eq!(inventory["skills"][0]["security"]["status"], "scanned");
+    assert_eq!(inventory["read_only"], true);
+}
+
+#[test]
+fn skills_dashboard_surfaces_a_deleted_package_manifest_skill() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let available =
+        "---\nname: available\ndescription: Use the available package guide\n---\nFollow it.";
+    let missing = "---\nname: missing\ndescription: Use the missing package guide\n---\nFollow it.";
+    project.write_file(".lpm/skills/owner.package/available.md", available);
+    project.write_file(".lpm/skills/owner.package/missing.md", missing);
+    project.write_file(
+        ".lpm/skills/owner.package/.lpm-package-skills.json",
+        &serde_json::json!({
+            "schema_version": 1,
+            "package": "owner.package",
+            "version": "1.0.0",
+            "skills": {
+                "available": hex::encode(Sha256::digest(available.as_bytes())),
+                "missing": hex::encode(Sha256::digest(missing.as_bytes())),
+            }
+        })
+        .to_string(),
+    );
+    std::fs::remove_file(project.path().join(".lpm/skills/owner.package/missing.md")).unwrap();
+    let dashboard = DashboardProcess::start(&project, &["--read-only"]);
+
+    let inventory: serde_json::Value = dashboard
+        .client()
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory")
+        .json()
+        .expect("decode dashboard inventory");
+    let missing = inventory["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "missing")
+        .expect("deleted package skill must remain visible");
+
+    assert_eq!(missing["integrity"], "missing");
+    assert_eq!(missing["healthy"], false);
+    assert_eq!(inventory["counts"]["needs_attention"], 1);
+}
+
+#[test]
+fn skills_dashboard_disable_applies_only_after_preview_confirmation() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "source",
+        "release-notes",
+        "Prepare concise release notes.",
+    );
+    let install = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./source",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("install managed skill");
+    assert!(
+        install.status.success(),
+        "managed skill install must succeed"
+    );
+    let dashboard = DashboardProcess::start(&project, &[]);
+    let client = dashboard.client();
+    let inventory: serde_json::Value = client
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory")
+        .json()
+        .expect("decode dashboard inventory");
+    let skill = inventory["skills"]
+        .as_array()
+        .expect("skills must be an array")
+        .iter()
+        .find(|skill| skill["name"] == "release-notes" && skill["kind"] == "managed")
+        .expect("managed release-notes skill must be present");
+
+    let preview: serde_json::Value = client
+        .post(dashboard.api_url("/api/v1/actions/preview"))
+        .bearer_auth(&dashboard.token)
+        .header(reqwest::header::ORIGIN, &dashboard.origin)
+        .json(&serde_json::json!({
+            "skill_id": skill["id"],
+            "action": "disable",
+            "agents": [],
+        }))
+        .send()
+        .expect("preview dashboard disable")
+        .json()
+        .expect("decode disable preview");
+    assert_eq!(preview["success"], true);
+    assert!(project.file_exists(".agents/skills/release-notes"));
+
+    let applied: serde_json::Value = client
+        .post(dashboard.api_url("/api/v1/actions/apply"))
+        .bearer_auth(&dashboard.token)
+        .header(reqwest::header::ORIGIN, &dashboard.origin)
+        .json(&serde_json::json!({"plan_id": preview["plan_id"]}))
+        .send()
+        .expect("apply dashboard disable")
+        .json()
+        .expect("decode disable result");
+
+    assert_eq!(applied["success"], true);
+    assert_eq!(applied["action"], "disable");
+    assert!(!project.file_exists(".agents/skills/release-notes"));
+    assert!(project.file_exists(".lpm/managed-skills/skills.lock.json"));
+}
+
+#[test]
+fn skills_dashboard_update_applies_the_reviewed_local_source_diff() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "source",
+        "release-notes",
+        "Prepare concise release notes.",
+    );
+    let install = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./source",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("install managed skill");
+    assert!(
+        install.status.success(),
+        "managed skill install must succeed"
+    );
+    seed_standard_skill(
+        &project,
+        "source",
+        "release-notes",
+        "Prepare concise release notes with migration guidance.",
+    );
+    let dashboard = DashboardProcess::start(&project, &[]);
+    let client = dashboard.client();
+    let inventory: serde_json::Value = client
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory")
+        .json()
+        .expect("decode dashboard inventory");
+    let skill = inventory["skills"]
+        .as_array()
+        .expect("skills must be an array")
+        .iter()
+        .find(|skill| skill["name"] == "release-notes" && skill["kind"] == "managed")
+        .expect("managed release-notes skill must be present");
+
+    let preview: serde_json::Value = client
+        .post(dashboard.api_url("/api/v1/actions/preview"))
+        .bearer_auth(&dashboard.token)
+        .header(reqwest::header::ORIGIN, &dashboard.origin)
+        .json(&serde_json::json!({
+            "skill_id": skill["id"],
+            "action": "update",
+            "agents": [],
+        }))
+        .send()
+        .expect("preview dashboard update")
+        .json()
+        .expect("decode update preview");
+    assert!(
+        preview["updates"][0]["diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("migration guidance")),
+        "dashboard update preview must show the source change: {preview}"
+    );
+
+    let applied: serde_json::Value = client
+        .post(dashboard.api_url("/api/v1/actions/apply"))
+        .bearer_auth(&dashboard.token)
+        .header(reqwest::header::ORIGIN, &dashboard.origin)
+        .json(&serde_json::json!({"plan_id": preview["plan_id"]}))
+        .send()
+        .expect("apply dashboard update")
+        .json()
+        .expect("decode update result");
+
+    assert_eq!(applied["success"], true);
+    assert!(
+        project
+            .read_file(".agents/skills/release-notes/SKILL.md")
+            .contains("migration guidance")
+    );
+}
+
+#[test]
+fn skills_dashboard_explicit_busy_port_fails_without_fallback() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind occupied port");
+    let port = listener.local_addr().expect("read occupied port").port();
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "dashboard",
+            "--no-open",
+            "--port",
+            &port.to_string(),
+        ])
+        .output()
+        .expect("run dashboard with an occupied port");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already in use"),
+        "explicit occupied port must explain the collision: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
