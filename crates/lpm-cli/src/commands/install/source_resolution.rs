@@ -54,6 +54,8 @@ pub(super) struct SourceDep {
     /// Classification used to drive both the recursive pre-resolve
     /// and the post-resolve fix-up.
     pub(super) kind: DepKind,
+    /// Whether this edge was declared in `optionalDependencies`.
+    pub(super) optional: bool,
     /// Exact `InstallPackage::source` string for a resolved
     /// directory/link target. Registry-style dependencies leave this
     /// empty and resolve through the registry package index.
@@ -1395,6 +1397,7 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
                 local_name: local_name.clone(),
                 raw_spec: normalized_spec.unwrap_or_else(|| raw_str.to_string()),
                 kind,
+                optional: field == "optionalDependencies",
                 target_source: None,
             });
         }
@@ -1694,7 +1697,7 @@ fn promote_workspace_member_source_graph(
         registry_published_at: None,
         platform: None,
         node_engine,
-        optional: false,
+        optional: spec.optional,
         tarball_url: None,
         metadata_checked_for_tarball: false,
     });
@@ -1947,7 +1950,7 @@ pub(super) fn recurse_local_source_deps(
                     registry_published_at: None,
                     platform: None,
                     node_engine,
-                    optional: false,
+                    optional: spec.optional,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,
                 });
@@ -2076,5 +2079,62 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
         }
         p.dependencies = deps_out;
         p.aliases.extend(aliases_out);
+    }
+
+    apply_local_source_optionality(packages, source_deps);
+}
+
+fn apply_local_source_optionality(
+    packages: &mut [InstallPackage],
+    source_deps: &HashMap<String, Vec<SourceDep>>,
+) {
+    let mut local_sources: HashSet<&str> = HashSet::with_capacity(source_deps.len() * 2);
+    for (source, specs) in source_deps {
+        local_sources.insert(source);
+        for spec in specs {
+            if let Some(target_source) = spec.target_source.as_deref() {
+                local_sources.insert(target_source);
+            }
+        }
+    }
+
+    let mut required_sources: HashSet<&str> = HashSet::with_capacity(local_sources.len());
+    let mut queue = VecDeque::with_capacity(local_sources.len());
+    for package in packages.iter() {
+        if !package.is_direct {
+            continue;
+        }
+        let Some(&source) = local_sources.get(package.source.as_str()) else {
+            continue;
+        };
+        if required_sources.insert(source) {
+            queue.push_back(source);
+        }
+    }
+
+    while let Some(source) = queue.pop_front() {
+        let Some(specs) = source_deps.get(source) else {
+            continue;
+        };
+        for spec in specs {
+            if spec.optional {
+                continue;
+            }
+            let Some(target_source) = spec.target_source.as_deref() else {
+                continue;
+            };
+            let Some(&target_source) = local_sources.get(target_source) else {
+                continue;
+            };
+            if required_sources.insert(target_source) {
+                queue.push_back(target_source);
+            }
+        }
+    }
+
+    for package in packages {
+        if local_sources.contains(package.source.as_str()) {
+            package.optional = !required_sources.contains(package.source.as_str());
+        }
     }
 }

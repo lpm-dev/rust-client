@@ -1360,6 +1360,86 @@ pub(super) fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
     keys
 }
 
+fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
+    let mut key_to_index = HashMap::with_capacity(packages.len());
+    let mut source_id_to_index = HashMap::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        key_to_index
+            .entry(link_target_lookup_key(&package.name, &package.version))
+            .or_insert(idx);
+        if let Some(source_id) = package.wrapper_id_for_source() {
+            source_id_to_index.entry(source_id).or_insert(idx);
+        }
+    }
+
+    let mut retained = HashSet::with_capacity(packages.len());
+    let mut queue = VecDeque::new();
+    for (idx, package) in packages.iter().enumerate() {
+        let has_root_link = package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| !names.is_empty());
+        if (package.is_direct || has_root_link) && retained.insert(idx) {
+            queue.push_back(idx);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let package = &packages[idx];
+        for (local_name, version) in &package.dependencies {
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            let next_idx = source_id_to_index
+                .get(version)
+                .or_else(|| key_to_index.get(&link_target_lookup_key(target, version)));
+            if let Some(next_idx) = next_idx
+                && retained.insert(*next_idx)
+            {
+                queue.push_back(*next_idx);
+            }
+        }
+        for (peer_name, version) in &package.peers {
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
+                && retained.insert(*next_idx)
+            {
+                queue.push_back(*next_idx);
+            }
+        }
+    }
+
+    let mut retained_keys = HashSet::with_capacity(retained.len());
+    let mut retained_source_ids = HashSet::with_capacity(retained.len());
+    for idx in &retained {
+        let package = &packages[*idx];
+        retained_keys.insert(link_target_lookup_key(&package.name, &package.version));
+        if let Some(source_id) = package.wrapper_id_for_source() {
+            retained_source_ids.insert(source_id);
+        }
+    }
+
+    let mut kept = Vec::with_capacity(retained.len());
+    for (idx, mut package) in packages.drain(..).enumerate() {
+        if !retained.contains(&idx) {
+            continue;
+        }
+        package.dependencies.retain(|(local_name, version)| {
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            retained_source_ids.contains(version)
+                || retained_keys.contains(&link_target_lookup_key(target, version))
+        });
+        package.peers.retain(|(name, version)| {
+            retained_keys.contains(&link_target_lookup_key(name, version))
+        });
+        kept.push(package);
+    }
+    *packages = kept;
+}
+
 pub(super) fn filter_dev_packages(
     packages: &mut Vec<InstallPackage>,
     production_roots: &HashSet<String>,
@@ -1526,6 +1606,7 @@ pub(super) fn filter_dependency_engine_packages(
                 .peers
                 .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
         }
+        prune_unreachable_packages(&mut kept);
     }
 
     *packages = kept;

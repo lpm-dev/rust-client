@@ -7207,6 +7207,114 @@ async fn strict_install_skips_incompatible_required_descendant_below_optional_pa
     assert!(!node_modules.join("incompatible-engine").exists());
 }
 
+#[test]
+fn strict_install_skips_incompatible_optional_file_dependency_from_local_source() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"local-engine-optional",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"local-native":"file:../local-native"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-native/package.json",
+        r#"{
+            "name":"local-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run local optional dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "incompatible optional file dependency must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("node_modules/local-host").exists());
+}
+
+#[tokio::test]
+async fn strict_install_does_not_fetch_descendant_orphaned_by_optional_engine_skip() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "orphan-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "incompatible-optional-parent": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "incompatible-optional-parent",
+            "version": "1.0.0",
+            "engines": { "node": ">=999.0.0" },
+            "dependencies": { "orphan-leaf": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "orphan-leaf",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path("orphan-leaf", "1.0.0")))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"engine-orphan-pruning",
+            "version":"1.0.0",
+            "dependencies":{"orphan-host":"1.0.0"}
+        }"#,
+    );
+    let output = dependency_engine_install_command(&project, &mock.url())
+        .env("LPM_RESOLVER", "pubgrub")
+        .output()
+        .expect("run orphan-pruning dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "descendant orphaned by an optional engine skip must not be fetched\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let node_modules = project.path().join("node_modules");
+    assert!(node_modules.join("orphan-host").exists());
+    assert!(!node_modules.join("incompatible-optional-parent").exists());
+    assert!(!node_modules.join("orphan-leaf").exists());
+}
+
 #[tokio::test]
 async fn install_optional_platform_dep_selects_newest_then_skips_current_host() {
     let mock = MockRegistry::start().await;

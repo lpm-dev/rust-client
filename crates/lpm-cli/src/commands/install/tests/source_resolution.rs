@@ -2242,12 +2242,14 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 local_name: "lodash".to_string(),
                 raw_spec: "^4.0.0".to_string(),
                 kind: DepKind::Registry,
+                optional: false,
                 target_source: None,
             },
             SourceDep {
                 local_name: "b".to_string(),
                 raw_spec: "file:../b".to_string(),
                 kind: DepKind::FileDir,
+                optional: false,
                 target_source: Some("directory+./packages/b".to_string()),
             },
         ],
@@ -2326,6 +2328,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             local_name: "@std/path".to_string(),
             raw_spec: "npm:@jsr/std__path@^1.1.0".to_string(),
             kind: DepKind::Registry,
+            optional: false,
             target_source: None,
         }],
     );
@@ -2417,6 +2420,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             local_name: "react".to_string(),
             raw_spec: "file:../react-fork".to_string(),
             kind: DepKind::FileDir,
+            optional: false,
             target_source: Some(fork_source),
         }],
     );
@@ -2464,6 +2468,7 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
             local_name: "missing-from-resolver".to_string(),
             raw_spec: "^1.0.0".to_string(),
             kind: DepKind::Registry,
+            optional: false,
             target_source: None,
         }],
     );
