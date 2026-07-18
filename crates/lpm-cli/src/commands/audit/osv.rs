@@ -608,6 +608,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numeric_cvss_nan_is_unusable() {
+        assert_eq!(cvss_score_to_usable_label("NaN"), None);
+    }
+
+    #[test]
+    fn numeric_cvss_infinity_is_unusable() {
+        assert_eq!(cvss_score_to_usable_label("inf"), None);
+    }
+
+    #[test]
+    fn numeric_cvss_negative_score_is_unusable() {
+        assert_eq!(cvss_score_to_usable_label("-0.1"), None);
+    }
+
+    #[test]
+    fn numeric_cvss_score_above_ten_is_unusable() {
+        assert_eq!(cvss_score_to_usable_label("10.1"), None);
+    }
+
+    #[test]
     fn semver_events_mark_versions_before_fixed_as_affected() {
         let vulnerability: OsvVuln = serde_json::from_value(serde_json::json!({
             "id": "GHSA-test",
