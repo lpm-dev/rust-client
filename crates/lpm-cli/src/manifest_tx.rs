@@ -111,6 +111,59 @@ impl ManifestTransaction {
             });
         }
 
+        Self::finish_install_state_snapshot(snapshots, optional, invalidate)
+    }
+
+    /// Snapshot install state only if every required file still has the
+    /// exact bytes the caller previously read.
+    pub fn snapshot_install_state_if_unchanged(
+        required: &[(&Path, &[u8])],
+        optional: &[&Path],
+        invalidate: &[&Path],
+    ) -> std::io::Result<Self> {
+        let mut snapshots = Vec::with_capacity(required.len() + optional.len());
+        Self::snapshot_optional_paths(&mut snapshots, optional)?;
+        let invalidate = invalidate.iter().map(|p| p.to_path_buf()).collect();
+
+        for (path, expected) in required {
+            let bytes = std::fs::read(path)?;
+            if bytes != *expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} changed since it was read", path.display()),
+                ));
+            }
+            snapshots.push(SnapshotEntry {
+                path: path.to_path_buf(),
+                original_bytes: Some(bytes),
+            });
+        }
+
+        Ok(Self {
+            snapshots,
+            invalidate,
+            committed: false,
+        })
+    }
+
+    fn finish_install_state_snapshot(
+        mut snapshots: Vec<SnapshotEntry>,
+        optional: &[&Path],
+        invalidate: &[&Path],
+    ) -> std::io::Result<Self> {
+        Self::snapshot_optional_paths(&mut snapshots, optional)?;
+
+        Ok(Self {
+            snapshots,
+            invalidate: invalidate.iter().map(|p| p.to_path_buf()).collect(),
+            committed: false,
+        })
+    }
+
+    fn snapshot_optional_paths(
+        snapshots: &mut Vec<SnapshotEntry>,
+        optional: &[&Path],
+    ) -> std::io::Result<()> {
         for path in optional {
             let original_bytes = match std::fs::read(path) {
                 Ok(bytes) => Some(bytes),
@@ -122,12 +175,7 @@ impl ManifestTransaction {
                 original_bytes,
             });
         }
-
-        Ok(Self {
-            snapshots,
-            invalidate: invalidate.iter().map(|p| p.to_path_buf()).collect(),
-            committed: false,
-        })
+        Ok(())
     }
 
     /// Mark the transaction as successful. The `Drop` impl will not

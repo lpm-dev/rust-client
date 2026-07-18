@@ -599,6 +599,48 @@ async fn audit_hydrates_sparse_querybatch_advisories_before_filtering() {
 }
 
 #[tokio::test]
+async fn audit_still_sparse_hydrated_advisory_fails_closed_before_level_filtering() {
+    let project = TempProject::empty(
+        r#"{"name":"still-sparse-osv","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, "vuln-pkg").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"vulns": [{"id": "GHSA-still-sparse"}]}]
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/GHSA-still-sparse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GHSA-still-sparse",
+            "summary": "detail endpoint remained incomplete"
+        })))
+        .mount(mock.server())
+        .await;
+
+    let out = run_audit_json(&project, &mock, &["--level", "info"]);
+    assert!(
+        !out.status.success(),
+        "an advisory that remains incomplete after hydration must fail closed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["osv_degraded"], true);
+    assert!(
+        envelope["osv_degraded_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("remained incomplete")),
+        "unexpected degraded reason: {envelope:#}"
+    );
+}
+
+#[tokio::test]
 async fn audit_osv_outage_exits_nonzero_without_clean_summary() {
     let project = TempProject::empty(
         r#"{"name":"osv-outage","version":"1.0.0","dependencies":{"clean-pkg":"1.0.0"}}"#,
@@ -813,6 +855,202 @@ async fn audit_fix_updates_vulnerable_direct_dependency_and_reinstalls_lockfile(
 }
 
 #[tokio::test]
+async fn audit_fix_apply_installs_the_exact_version_reported_by_dry_run() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-exact-target","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let vulnerable = make_tarball("vuln-pkg", "1.0.0");
+    let fixed = make_tarball("vuln-pkg", "1.0.1");
+    let newer_major = make_tarball("vuln-pkg", "3.0.0");
+    mock.with_full_package_metadata(
+        "vuln-pkg",
+        "3.0.0",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(vulnerable)),
+            ("1.0.1", serde_json::json!({}), Some(fixed)),
+            ("3.0.0", serde_json::json!({}), Some(newer_major)),
+        ],
+    )
+    .await;
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
+    project.write_file(
+        "package.json",
+        r#"{"name":"audit-fix-exact-target","version":"1.0.0","dependencies":{"vuln-pkg":"*"}}"#,
+    );
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-exact-target",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+
+    let out = run_audit_json(&project, &mock, &["fix"]);
+    assert!(
+        out.status.success(),
+        "audit fix must apply the planned target\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["packages"][0]["to"], "1.0.1");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["dependencies"]["vuln-pkg"], "1.0.1");
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert_eq!(lockfile.find_package("vuln-pkg").unwrap().version, "1.0.1");
+}
+
+#[tokio::test]
+async fn audit_fix_aborts_without_overwriting_manifest_edits_made_during_planning() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-manifest-drift","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(750))
+                .set_body_json(serde_json::json!({
+                    "results": [{"vulns": [osv_fixed_vuln(
+                        "GHSA-manifest-drift",
+                        "vuln-pkg",
+                        "1.0.1"
+                    )]}]
+                })),
+        )
+        .mount(mock.server())
+        .await;
+
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()));
+    command.args(["--json", "audit", "fix"]);
+    let child = command.spawn().unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let planning_started = mock
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/v1/querybatch");
+        if planning_started {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit fix never reached OSV planning"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let edited_manifest = r#"{"name":"audit-fix-manifest-drift","version":"1.0.0","description":"external edit","dependencies":{"vuln-pkg":"1.0.0"}}"#;
+    project.write_file("package.json", edited_manifest);
+    let out = child.wait_with_output().unwrap();
+
+    assert!(
+        !out.status.success(),
+        "audit fix must abort when package.json changes during planning\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(project.read_file("package.json"), edited_manifest);
+}
+
+#[tokio::test]
+async fn audit_fix_json_remains_one_document_when_nested_install_applies_overrides() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"audit-fix-json-override",
+            "version":"1.0.0",
+            "dependencies":{"vuln-pkg":"1.0.0"},
+            "lpm":{"overrides":{"helper-pkg":"1.0.1"}}
+        }"#,
+    );
+    let mock = MockRegistry::start().await;
+    let vulnerable = make_tarball("vuln-pkg", "1.0.0");
+    let fixed = make_tarball("vuln-pkg", "1.0.1");
+    mock.with_full_package_metadata(
+        "vuln-pkg",
+        "1.0.1",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({"helper-pkg": "^1.0.0"}),
+                Some(vulnerable),
+            ),
+            (
+                "1.0.1",
+                serde_json::json!({"helper-pkg": "^1.0.0"}),
+                Some(fixed),
+            ),
+        ],
+    )
+    .await;
+    mock.with_full_package_metadata(
+        "helper-pkg",
+        "1.0.1",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("helper-pkg", "1.0.0")),
+            ),
+            (
+                "1.0.1",
+                serde_json::json!({}),
+                Some(make_tarball("helper-pkg", "1.0.1")),
+            ),
+        ],
+    )
+    .await;
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
+    mock.with_osv_querybatch(vec![
+        vec![],
+        vec![osv_fixed_vuln("GHSA-json-override", "vuln-pkg", "1.0.1")],
+    ])
+    .await;
+
+    let out = run_audit_json(&project, &mock, &["fix"]);
+    assert!(
+        out.status.success(),
+        "audit fix with overrides must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "audit fix JSON must remain one document: {error}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(envelope["fixed"], 1);
+}
+
+#[tokio::test]
 async fn audit_fix_updates_optional_dependency_remediation() {
     let project = TempProject::empty(
         r#"{"name":"audit-fix-optional","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"},"optionalDependencies":{"vuln-pkg":"1.0.0"}}"#,
@@ -1009,6 +1247,48 @@ async fn audit_fix_does_not_fetch_remediation_metadata_for_clean_direct_dependen
 }
 
 #[tokio::test]
+async fn audit_fix_skips_source_ambiguous_installed_lockfile_instances() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-source-ambiguity","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    let mut local_fork = lockfile.find_package("vuln-pkg").unwrap().clone();
+    local_fork.source = Some("directory+../local-vuln-pkg".to_string());
+    local_fork.tarball = None;
+    lockfile.add_package(local_fork);
+    lockfile.write_all(&lockfile_path).unwrap();
+    let _ = std::fs::remove_dir_all(project.cache_dir().join("metadata"));
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-source-ambiguity",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    let requests_before = mock.server().received_requests().await.unwrap().len();
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    assert!(out.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["planned"], 0, "{envelope:#}");
+    assert!(
+        envelope["skipped"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("ambiguous lockfile instances")),
+        "unexpected skip reason: {envelope:#}"
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests[requests_before..]
+            .iter()
+            .all(|request| request.url.path() != "/api/registry/vuln-pkg"),
+        "source-ambiguous packages must not be disclosed to a metadata endpoint"
+    );
+}
+
+#[tokio::test]
 async fn audit_fix_plans_lpm_registry_advisory_remediation() {
     let package = "@lpm.dev/test.audit-fix";
     let project = TempProject::empty(&format!(
@@ -1163,6 +1443,7 @@ async fn audit_high_vuln_under_default_policy_exits_nonzero() {
 
     mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
         "GHSA-xxxx-yyyy-zzzz",
+        "vuln-pkg",
         "Severe arbitrary code execution in vuln-pkg",
         "8.5", // CVSS 8.5 → HIGH
     )]])
@@ -1207,6 +1488,7 @@ async fn audit_fail_on_vuln_triggers_when_vulnerability_present() {
 
     mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
         "GHSA-aaaa-bbbb-cccc",
+        "vuln-pkg",
         "RCE",
         "9.1", // CRITICAL
     )]])
@@ -1238,6 +1520,7 @@ async fn audit_fail_on_behavior_does_not_trigger_on_vuln_alone() {
     // therefore exit 0 here.
     mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
         "GHSA-only-osv",
+        "clean-pkg",
         "Vuln",
         "7.5",
     )]])
@@ -1460,6 +1743,7 @@ async fn audit_json_envelope_with_one_vuln_matches_snapshot() {
 
     mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
         "GHSA-snap-1234",
+        "snap-pkg",
         "Snapshot fixture vuln",
         "7.5",
     )]])

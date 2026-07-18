@@ -10,6 +10,13 @@ pub(crate) fn lockfile_npm_metadata_source(
     client: &lpm_registry::RegistryClient,
 ) -> Option<NpmMetadataSource> {
     let pkg = lockfile?.find_package(name)?;
+    locked_package_npm_metadata_source(pkg, client)
+}
+
+pub(crate) fn locked_package_npm_metadata_source(
+    pkg: &lpm_lockfile::LockedPackage,
+    client: &lpm_registry::RegistryClient,
+) -> Option<NpmMetadataSource> {
     let url = lockfile_package_registry_source_url(pkg)?;
     if is_public_npm_origin(&url) {
         return Some(NpmMetadataSource::PublicNpm);

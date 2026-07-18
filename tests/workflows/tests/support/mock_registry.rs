@@ -1778,13 +1778,16 @@ impl MockRegistry {
         self
     }
 
-    /// Build an OSV vulnerability JSON object with the shape `lpm audit`
-    /// expects: `id`, `summary`, `severity = [{ type: "CVSS_V3", score: ... }]`.
-    pub fn osv_vuln(id: &str, summary: &str, cvss_score: &str) -> serde_json::Value {
+    /// Build a complete OSV vulnerability affecting every version of `package`.
+    pub fn osv_vuln(id: &str, package: &str, summary: &str, cvss_score: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
             "summary": summary,
             "severity": [{ "type": "CVSS_V3", "score": cvss_score }],
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": package},
+                "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]
+            }]
         })
     }
 

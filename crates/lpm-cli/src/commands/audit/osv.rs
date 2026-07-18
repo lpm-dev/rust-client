@@ -396,6 +396,11 @@ async fn fetch_osv_advisory(
             vuln.id
         )));
     }
+    if osv_advisory_needs_hydration(&vuln) {
+        return Err(LpmError::Network(format!(
+            "OSV advisory {id} remained incomplete after hydration"
+        )));
+    }
     Ok(vuln)
 }
 

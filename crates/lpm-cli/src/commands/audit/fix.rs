@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{PackageMetadata, RegistryClient};
-use lpm_semver::{Version, VersionReq};
+use lpm_semver::Version;
 
 use crate::install_ui;
-use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
+use crate::npm_public_source::{NpmMetadataSource, locked_package_npm_metadata_source};
 
 use super::discovery::{self, ManagerKind};
 use super::osv::{OsvVulnerability, run_osv_scan};
@@ -68,9 +68,9 @@ async fn run_fix_under_project_lock(
         return Err(LpmError::NotFound("no package.json found".into()));
     }
 
-    let original_content = std::fs::read_to_string(&pkg_json_path)
+    let original_content = std::fs::read(&pkg_json_path)
         .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-    let mut doc: serde_json::Value = serde_json::from_str(&original_content)
+    let mut doc: serde_json::Value = serde_json::from_slice(&original_content)
         .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
 
     let discovery = discovery::discover_packages(project_dir)?;
@@ -109,18 +109,20 @@ async fn run_fix_under_project_lock(
     let mut skipped = Vec::new();
     for dep in audit_fix_direct_deps_from_value(&doc) {
         let target_name = dep.target_name.as_str();
-        let Some(locked_package) =
-            crate::commands::install::select_locked_package_for_requested_spec(
-                &lockfile,
-                target_name,
-                &dep.current_range,
-            )
-        else {
-            skipped.push(AuditFixSkipped {
-                name: dep.local_name,
-                reason: "direct dependency is not present in lpm.lock".into(),
-            });
-            continue;
+        let locked_package = match select_installed_direct_locked_package(
+            project_dir,
+            &lockfile,
+            &dep.local_name,
+            target_name,
+        ) {
+            Ok(package) => package,
+            Err(reason) => {
+                skipped.push(AuditFixSkipped {
+                    name: dep.local_name,
+                    reason,
+                });
+                continue;
+            }
         };
         let installed_version = &locked_package.version;
         let is_lpm_package = target_name.starts_with("@lpm.dev/");
@@ -138,7 +140,7 @@ async fn run_fix_under_project_lock(
         let npm_source = if is_lpm_package {
             None
         } else {
-            match lockfile_npm_metadata_source(Some(&lockfile), target_name, client) {
+            match locked_package_npm_metadata_source(locked_package, client) {
                 Some(source) => Some(source),
                 None => {
                     skipped.push(AuditFixSkipped {
@@ -258,16 +260,20 @@ async fn run_fix_under_project_lock(
 
     let lockfile_binary_path = project_dir.join("lpm.lockb");
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
-    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-        &[pkg_json_path.as_path()],
-        &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
-        &[install_hash_path.as_path()],
-    )
-    .map_err(|error| LpmError::Script(format!("failed to snapshot audit fix state: {error}")))?;
-
     apply_audit_fixes_to_manifest(&mut doc, &planned)?;
     let updated_content = serde_json::to_string_pretty(&doc)
         .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
+
+    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
+        &[(pkg_json_path.as_path(), original_content.as_slice())],
+        &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
+        &[install_hash_path.as_path()],
+    )
+    .map_err(|error| {
+        LpmError::Script(format!(
+            "package.json changed while audit fix was planning; no changes were applied: {error}"
+        ))
+    })?;
 
     lpm_common::write_file_atomic(&pkg_json_path, format!("{updated_content}\n"))
         .map_err(LpmError::Io)?;
@@ -275,40 +281,8 @@ async fn run_fix_under_project_lock(
     audit_fix_remove_optional_file(&lockfile_path)?;
     audit_fix_remove_optional_file(&lockfile_binary_path)?;
 
-    let install_result = crate::commands::install::run_with_options(
-        client,
-        project_dir,
-        false, // keep audit-fix JSON stdout single-document
-        false, // offline
-        crate::commands::install::FrozenLockfileMode::Never,
-        false, // force
-        false, // allow_new
-        false, // strict_integrity
-        false, // no_engine_strict
-        None,  // strict_peer_dependencies_override
-        None,  // linker_override
-        crate::lpm_skills_config::LpmSkillsPreference::Config,
-        false, // no_editor_setup
-        true,  // no_security_summary: audit fix emits its own final report.
-        false, // auto_build
-        None,  // target_set
-        None,  // direct_versions_out
-        None,  // requested_add_count
-        None,  // script_policy_override
-        None,  // advisor_override
-        None,  // min_release_age_override
-        &[],
-        crate::provenance_fetch::DriftIgnorePolicy::default(),
-        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-        crate::commands::install::InstallOmitPolicy::default(),
-        false, // strict_sandbox
-        false, // no_sandbox
-        false, // verbose
-        false, // audit_after_install
-        false, // timing
-        &[],
-    )
-    .await;
+    let install_result =
+        crate::commands::install::run_silent_for_audit_fix(client, project_dir).await;
 
     if let Err(err) = install_result {
         if !json_output {
@@ -317,7 +291,7 @@ async fn run_fix_under_project_lock(
         return Err(err);
     }
 
-    verify_audit_fixes(client, project_dir, &mut planned).await?;
+    verify_audit_fixes(client, project_dir, &planned).await?;
     tx.commit();
 
     emit_audit_fix_report(
@@ -328,6 +302,105 @@ async fn run_fix_under_project_lock(
         started_at.elapsed(),
     );
     Ok(())
+}
+
+fn select_installed_direct_locked_package<'a>(
+    project_dir: &Path,
+    lockfile: &'a lpm_lockfile::Lockfile,
+    local_name: &str,
+    target_name: &str,
+) -> Result<&'a lpm_lockfile::LockedPackage, String> {
+    let manifest_path = installed_direct_manifest_path(project_dir, local_name)?;
+    let content = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "cannot read installed direct dependency {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_slice(&content).map_err(|error| {
+        format!(
+            "installed direct dependency {} has invalid package.json: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let installed_name = manifest
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "installed direct dependency {} is missing its package name",
+                manifest_path.display()
+            )
+        })?;
+    if installed_name != target_name {
+        return Err(format!(
+            "installed direct dependency '{local_name}' resolves to '{installed_name}', expected '{target_name}'"
+        ));
+    }
+    let installed_version = manifest
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "installed direct dependency {} is missing its version",
+                manifest_path.display()
+            )
+        })?;
+
+    let start = lockfile
+        .packages
+        .partition_point(|package| package.name.as_str() < target_name);
+    let end = start
+        + lockfile.packages[start..]
+            .partition_point(|package| package.name.as_str() == target_name);
+    let mut matches = lockfile.packages[start..end]
+        .iter()
+        .filter(|package| package.version == installed_version);
+    let Some(installed) = matches.next() else {
+        return Err(format!(
+            "installed direct dependency {target_name}@{installed_version} is not present in lpm.lock"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "installed direct dependency {target_name}@{installed_version} has ambiguous lockfile instances from multiple sources"
+        ));
+    }
+    Ok(installed)
+}
+
+fn installed_direct_manifest_path(project_dir: &Path, local_name: &str) -> Result<PathBuf, String> {
+    if local_name.contains('\\') {
+        return Err(format!(
+            "dependency name '{local_name}' is not safe to resolve on disk"
+        ));
+    }
+    let parts: Vec<&str> = local_name.split('/').collect();
+    let valid_part = |part: &str| !part.is_empty() && part != "." && part != "..";
+    let valid = match parts.as_slice() {
+        [name] => valid_part(name) && !name.starts_with('@'),
+        [scope, name] => {
+            scope.starts_with('@')
+                && scope.len() > 1
+                && valid_part(scope)
+                && valid_part(name)
+                && !name.starts_with('@')
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(format!(
+            "dependency name '{local_name}' is not safe to resolve on disk"
+        ));
+    }
+
+    let mut path = project_dir.to_path_buf();
+    path.push("node_modules");
+    for part in parts {
+        path.push(part);
+    }
+    path.push("package.json");
+    Ok(path)
 }
 
 fn audit_fix_direct_deps_from_value(doc: &serde_json::Value) -> Vec<AuditFixDirectDep> {
@@ -503,27 +576,10 @@ fn audit_fix_range_for_target(current_range: &str, target: &str) -> Result<Strin
     }
 }
 
-fn update_semver_range(current_range: &str, target: &str) -> Result<String, String> {
-    let target_version = Version::parse(target)
+fn update_semver_range(_current_range: &str, target: &str) -> Result<String, String> {
+    Version::parse(target)
         .map_err(|error| format!("candidate version '{target}' is invalid: {error}"))?;
-    if current_range == "latest"
-        || current_range == "*"
-        || VersionReq::parse(current_range).is_ok_and(|range| range.matches(&target_version))
-    {
-        return Ok(current_range.to_string());
-    }
-    if current_range.starts_with('^') {
-        return Ok(format!("^{target}"));
-    }
-    if current_range.starts_with('~') {
-        return Ok(format!("~{target}"));
-    }
-    if Version::parse(current_range).is_ok() {
-        return Ok(target.to_string());
-    }
-    Err(format!(
-        "patched version {target} is outside dependency range '{current_range}'; refusing to rewrite a complex range automatically"
-    ))
+    Ok(target.to_string())
 }
 
 fn apply_audit_fixes_to_manifest(
@@ -574,31 +630,31 @@ fn apply_audit_fixes_to_manifest(
 async fn verify_audit_fixes(
     client: &RegistryClient,
     project_dir: &Path,
-    fixes: &mut [AuditFixPlan],
+    fixes: &[AuditFixPlan],
 ) -> Result<(), LpmError> {
     let lockfile_path = project_dir.join("lpm.lock");
     let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
         .map_err(|error| LpmError::Script(format!("failed to verify updated lpm.lock: {error}")))?;
 
-    for fix in fixes.iter_mut() {
-        let installed = crate::commands::install::select_locked_package_for_requested_spec(
+    for fix in fixes.iter() {
+        let installed = select_installed_direct_locked_package(
+            project_dir,
             &lockfile,
+            &fix.name,
             &fix.target_name,
-            &fix.new_range,
         )
-        .ok_or_else(|| {
+        .map_err(|reason| {
             LpmError::Script(format!(
-                "audit fix verification could not find direct dependency {} in updated lpm.lock",
+                "audit fix verification could not identify direct dependency {}: {reason}",
                 fix.name
             ))
         })?;
-        if installed.version == fix.from {
+        if installed.version != fix.to {
             return Err(LpmError::Script(format!(
-                "audit fix verification found {} still installed at vulnerable version {}",
-                fix.name, fix.from
+                "audit fix verification expected {} at planned version {}, found {}",
+                fix.name, fix.to, installed.version
             )));
         }
-        fix.to = installed.version.clone();
     }
 
     let discovery = discovery::discover_packages(project_dir)?;
@@ -752,10 +808,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audit_fix_range_preserves_npm_alias_protocol() {
+    fn audit_fix_range_pins_npm_alias_to_planned_target() {
         assert_eq!(
             audit_fix_range_for_target("npm:lodash@^4.17.0", "4.17.21").unwrap(),
-            "npm:lodash@^4.17.0"
+            "npm:lodash@4.17.21"
         );
     }
 
