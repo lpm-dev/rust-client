@@ -550,7 +550,7 @@ impl ResolveState {
                 dependencies.sort_by(|a, b| a.0.cmp(&b.0));
 
                 let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
-                let aliases: HashMap<String, String> = cached_aliases
+                let mut aliases: HashMap<String, String> = cached_aliases
                     .iter()
                     .filter(|(local, _)| alive_locals.contains(local))
                     .map(|(l, t)| (l.clone(), t.clone()))
@@ -573,27 +573,31 @@ impl ResolveState {
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
                 // from the same node table.
-                let peers: Vec<(String, String)> = cache
+                let mut peers = Vec::new();
+                if let Some(peer_deps) = cache
                     .get(&n.canonical)
                     .and_then(|info| info.peer_deps.get(&ver_str))
-                    .map(|peer_deps| {
-                        let mut out: Vec<(String, String)> = peer_deps
-                            .iter()
-                            .filter_map(|(peer_name, peer_range)| {
-                                let parsed_range = NpmRange::parse(peer_range).ok();
-                                resolve_peer_binding_version(
-                                    &pkg,
-                                    peer_name,
-                                    parsed_range.as_ref(),
-                                    &resolved_by_canonical,
-                                )
-                                .map(|(ver, _)| (peer_name.clone(), ver.clone()))
-                            })
-                            .collect();
-                        out.sort_by(|a, b| a.0.cmp(&b.0));
-                        out
-                    })
-                    .unwrap_or_default();
+                {
+                    peers.reserve(peer_deps.len());
+                    for (peer_name, peer_range) in peer_deps {
+                        let Ok(specifier) = crate::PeerSpecifier::parse(peer_name, peer_range)
+                        else {
+                            continue;
+                        };
+                        if specifier.target() != peer_name {
+                            aliases.insert(peer_name.clone(), specifier.target().to_string());
+                        }
+                        if let Some((version, _)) = resolve_peer_binding_version(
+                            &pkg,
+                            specifier.target(),
+                            Some(specifier.comparable_range()),
+                            &resolved_by_canonical,
+                        ) {
+                            peers.push((peer_name.clone(), version.clone()));
+                        }
+                    }
+                    peers.sort_by(|a, b| a.0.cmp(&b.0));
+                }
 
                 ResolvedPackage {
                     package: pkg,

@@ -59,6 +59,7 @@ pub(super) fn load_lockfile_graph_packages(
     let fast = try_lockfile_fast_path(
         &lockfile_path,
         deps,
+        None,
         catalog_resolutions,
         client,
         gate_stats,

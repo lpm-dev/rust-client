@@ -96,5 +96,6 @@ fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
+    lpm_common::enforce_sudo_policy()?;
     cli::run()
 }

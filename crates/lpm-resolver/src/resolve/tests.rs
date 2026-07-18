@@ -865,6 +865,60 @@ async fn resolve_with_prefetch_handles_transitive_npm_alias() {
     );
 }
 
+#[tokio::test]
+async fn pubgrub_formats_npm_alias_peer_with_local_slot_and_canonical_target() {
+    let _env = env_lock().lock().await;
+    let _guard = PubgrubEnvGuard::new();
+
+    let mut host =
+        make_version_metadata("alias-peer-host", "1.0.0", vec![], vec![], vec![], vec![]);
+    host.peer_dependencies =
+        HashMap::from([("react-compat".to_string(), "npm:react@^18.0.0".to_string())]);
+    let prefetched = HashMap::from([
+        (
+            "alias-peer-host".to_string(),
+            make_package_metadata("alias-peer-host", vec![host]),
+        ),
+        (
+            "react".to_string(),
+            make_package_metadata(
+                "react",
+                vec![make_version_metadata(
+                    "react",
+                    "18.3.1",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        ),
+    ]);
+
+    let result = resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([
+            ("alias-peer-host".to_string(), "1.0.0".to_string()),
+            ("react".to_string(), "18.3.1".to_string()),
+        ]),
+        OverrideSet::empty(),
+        Some(prefetched),
+    )
+    .await
+    .expect("npm-alias peer must resolve through its canonical target");
+
+    let host = result
+        .packages
+        .iter()
+        .find(|package| package.package.canonical_name() == "alias-peer-host")
+        .expect("peer consumer must be present");
+    assert_eq!(
+        host.peers,
+        vec![("react-compat".to_string(), "18.3.1".to_string())]
+    );
+    assert_eq!(host.aliases.get("react-compat"), Some(&"react".to_string()));
+}
+
 /// Regression: a non-optional dep with no compatible platform version
 /// still resolves so install-time filtering can produce the required
 /// hard platform error instead of hiding the selected package from the

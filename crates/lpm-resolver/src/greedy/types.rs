@@ -62,6 +62,11 @@ pub(super) struct PeerRequirement {
     pub(super) canonical: CanonicalKey,
     /// Parsed range from the `peerDependencies` value.
     pub(super) range: NpmRange,
+    /// Original declaration, preserved for source-aware diagnostics.
+    pub(super) raw_specifier: String,
+    /// Whether a missing provider can be fetched through the registry
+    /// resolver or requires source routing that this resolver cannot perform.
+    pub(super) install_source: crate::PeerInstallSource,
     /// `peerDependenciesMeta.<name>.optional` flag for this peer.
     /// The peer-drain step skips optional peers when synthesizing
     /// ambient installs (the manifest author opted out); the

@@ -733,7 +733,12 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             let is_optional = peer_deps_meta
                 .get(peer_name)
                 .is_some_and(|meta| meta.optional);
-            match by_name.get(peer_name) {
+            let target_name = v2t
+                .target
+                .aliases
+                .get(peer_name)
+                .map_or(peer_name.as_str(), String::as_str);
+            match by_name.get(target_name) {
                 Some(ver) => derived.push((peer_name.clone(), ver.clone())),
                 None if !is_optional => {
                     tracing::debug!(
@@ -780,10 +785,8 @@ fn populate_one(
 
     let object_dir = store.paths().object_dir(&v2t.source_sri)?;
 
-    // Dep edges resolve through the alias map (consumer's local name
-    // may differ from the canonical target). Peer edges always use
-    // the canonical name as the local (peers are never npm-aliased
-    // — `peerDependencies` keys ARE the canonical name by spec).
+    // Both dependency and peer edges resolve through the alias map;
+    // the local slot can differ from the canonical registry target.
     let mut deps: Vec<DepLink> =
         Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
     for dep in &v2t.target.dependencies {
@@ -844,7 +847,12 @@ fn populate_one(
                 })
                 .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
                 .filter_map(|(peer_name, peer_ver)| {
-                    let peer_key = key_map.get_peer(peer_name, peer_ver)?.clone();
+                    let target_name = v2t
+                        .target
+                        .aliases
+                        .get(peer_name)
+                        .map_or(peer_name.as_str(), String::as_str);
+                    let peer_key = key_map.get_peer(target_name, peer_ver)?.clone();
                     Some(DepLink {
                         local: peer_name.clone(),
                         target: peer_key,

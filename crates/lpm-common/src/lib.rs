@@ -13,6 +13,7 @@ pub mod known_projects;
 pub mod package_name;
 pub mod paths;
 pub mod platform;
+pub mod privilege;
 pub mod provenance;
 pub mod symlink;
 
@@ -29,6 +30,7 @@ pub use paths::{
     is_local_fs, project_install_lock, try_with_exclusive_lock, with_exclusive_lock,
     with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
 };
+pub use privilege::{enforce_sudo_policy, evaluate_sudo_policy};
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
 pub use symlink::{create_dir_symlink_or_junction, create_symlink};
 
@@ -469,5 +471,27 @@ mod tests {
         assert!(!is_loopback_host("8.8.8.8"));
         assert!(!is_loopback_host("registry.npmjs.org"));
         assert!(!is_loopback_host(""));
+    }
+
+    #[test]
+    fn root_process_with_sudo_identity_is_refused() {
+        assert!(evaluate_sudo_policy(0, Some("501"), Some("developer")).is_err());
+    }
+
+    #[test]
+    fn root_process_without_sudo_identity_is_allowed() {
+        assert!(evaluate_sudo_policy(0, None, None).is_ok());
+    }
+
+    #[test]
+    fn non_root_process_ignores_spoofed_sudo_identity() {
+        assert!(evaluate_sudo_policy(501, Some("not-a-uid"), Some("")).is_ok());
+    }
+
+    #[test]
+    fn malformed_root_sudo_identity_is_rejected_fail_closed() {
+        let error = evaluate_sudo_policy(0, Some("not-a-uid"), Some("developer"))
+            .expect_err("malformed sudo identity must be rejected");
+        assert!(error.contains("malformed SUDO_UID"), "{error}");
     }
 }

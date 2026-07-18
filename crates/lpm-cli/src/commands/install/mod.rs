@@ -801,6 +801,7 @@ async fn run_with_options_under_store_lock(
             client,
             project_dir,
             deps: &deps,
+            current_importer_snapshot: &current_importer_snapshot,
             pkg: &pkg,
             lockfile_path: &lockfile_path,
             catalog_resolutions: &catalog_resolutions,
@@ -849,6 +850,7 @@ async fn run_with_options_under_store_lock(
     let lockfile_result = select_lockfile_install_plan(LockfileSelectionInput {
         lockfile_path: &lockfile_path,
         deps: &deps,
+        current_importer_snapshot: &current_importer_snapshot,
         catalog_resolutions: &catalog_resolutions,
         client,
         gate_stats: &gate_stats,

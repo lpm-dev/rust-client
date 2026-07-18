@@ -933,6 +933,7 @@ async fn compute_parity_if_requested(
             try_lockfile_fast_path(
                 &lockfile_path,
                 deps,
+                None,
                 catalog_resolutions,
                 client.as_ref(),
                 &gate_stats,

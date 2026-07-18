@@ -1755,7 +1755,8 @@ fn enqueue_child_deps_skips_bundled_names() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .expect("child dependencies must enqueue");
 
     let queued: Vec<&str> = state
         .task_queue
@@ -1794,7 +1795,8 @@ fn enqueue_child_deps_no_bundled_names_unchanged() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .expect("child dependencies must enqueue");
 
     let mut queued: Vec<&str> = state
         .task_queue
@@ -1830,7 +1832,8 @@ fn enqueue_child_deps_omits_optional_dependencies_when_disabled() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .expect("child dependencies must enqueue");
 
     let queued: Vec<&str> = state
         .task_queue
@@ -1889,7 +1892,8 @@ fn enqueue_child_deps_skips_workspace_specifier_with_warn() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .expect("child dependencies must enqueue");
 
     // Only `plain-dep` should have been enqueued; `workspace-leak`
     // got skipped at the workspace-specifier guard.
@@ -1977,7 +1981,8 @@ fn enqueue_for_parent(parent_canonical: CanonicalKey, info: &CachedPackageInfo) 
         &NpmVersion::parse("1.0.0").unwrap(),
         info,
         &mut state,
-    );
+    )
+    .expect("child dependencies must enqueue");
     state
 }
 
@@ -2100,11 +2105,7 @@ fn peer_collection_alias_aware() {
     // `react` (registry identity) so the peer-drain fetches the right
     // manifest, while preserving the local `peer_name = "my-react"`
     // for the eventual `ResolvedPackage.peers` edge label.
-    let mut info = mk_info_with_peers(&["1.0.0"], &[], &[("my-react", "^18.0.0")], &[]);
-    // Inject the alias map for the latest version.
-    let mut aliases = HashMap::new();
-    aliases.insert("my-react".to_string(), "react".to_string());
-    info.aliases.insert("1.0.0".to_string(), aliases);
+    let info = mk_info_with_peers(&["1.0.0"], &[], &[("my-react", "npm:react@^18.0.0")], &[]);
 
     let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
     assert_eq!(state.peer_requirements.len(), 1);
@@ -2118,12 +2119,7 @@ fn peer_collection_alias_aware() {
 }
 
 #[test]
-fn peer_collection_skips_workspace_specifier() {
-    // A registry-published manifest declaring a `workspace:` peer
-    // is malformed (npm rejects at publish time). The collector
-    // skips it with a workspace-specific log rather than letting
-    // `NpmRange::parse` emit an opaque semver error. Mirrors the
-    // regular-deps loop.
+fn peer_collection_normalizes_workspace_specifier() {
     let info = mk_info_with_peers(
         &["1.0.0"],
         &[],
@@ -2139,34 +2135,40 @@ fn peer_collection_skips_workspace_specifier() {
         .collect();
     assert_eq!(
         names,
-        vec!["legit-peer"],
-        "workspace: peer skipped; legit peer recorded"
+        vec!["internal-peer", "legit-peer"],
+        "workspace peer is retained with a comparable range"
+    );
+    assert!(
+        state.peer_requirements[0]
+            .range
+            .satisfies(&NpmVersion::parse("42.0.0").unwrap())
     );
 }
 
 #[test]
-fn peer_collection_skips_invalid_range() {
-    // Defense: an unparseable peer range emits a debug warn and
-    // is skipped. Does NOT panic / propagate an error — the
-    // resolver must continue resolving the rest of the graph.
+fn peer_collection_rejects_invalid_range() {
     let info = mk_info_with_peers(
         &["1.0.0"],
         &[],
         &[("good-peer", "^1.0.0"), ("bad-peer", "this-is-not-semver")],
         &[],
     );
-    let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
-
-    let names: Vec<&str> = state
-        .peer_requirements
-        .iter()
-        .map(|r| r.peer_name.as_str())
-        .collect();
-    assert_eq!(
-        names,
-        vec!["good-peer"],
-        "unparseable peer range skipped silently"
-    );
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("parent"),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+    let error = enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("parent"),
+        &NpmVersion::parse("1.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .expect_err("invalid peer specifier must fail closed");
+    assert!(matches!(error, ResolveError::InvalidPeerSpecifier { .. }));
 }
 
 #[test]
@@ -2260,6 +2262,8 @@ fn mk_peer_req(
         peer_name: peer_name.to_string(),
         canonical,
         range: NpmRange::parse(range).unwrap(),
+        raw_specifier: range.to_string(),
+        install_source: crate::PeerInstallSource::Registry,
         optional,
     }
 }
@@ -2510,6 +2514,69 @@ async fn peer_drain_synthesizes_ambient_for_missing_peer() {
         edge.behavior.required && !edge.behavior.peer && !edge.behavior.optional,
         "ambient install behaves as a required regular dep"
     );
+}
+
+#[tokio::test]
+async fn peer_drain_synthesizes_alias_slot_for_registry_alias_peer() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("alias-host"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "react-compat",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    ));
+
+    let info = mk_info_arc(&["18.3.1"], &[]);
+    let synth = drain_peer_requirements_one_pass(&mut state, true, move |canonical| {
+        let info = Arc::clone(&info);
+        async move {
+            assert_eq!(canonical, CanonicalKey::npm("react"));
+            Ok(info)
+        }
+    })
+    .await
+    .expect("alias peer must synthesize");
+
+    assert_eq!(synth[0].local_name, "react-compat");
+    assert_eq!(synth[0].canonical, CanonicalKey::npm("react"));
+    assert_eq!(
+        state.root_aliases.get("react-compat"),
+        Some(&"react".to_string())
+    );
+    assert_eq!(state.ambient_peer_installs, vec!["react-compat"]);
+}
+
+#[tokio::test]
+async fn peer_drain_rejects_missing_provider_with_unsupported_source() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("source-host"), "1.0.0");
+    let mut requirement = mk_peer_req(
+        consumer,
+        "source-peer",
+        CanonicalKey::npm("source-peer"),
+        "*",
+        false,
+    );
+    requirement.raw_specifier = "file:../source-peer".to_string();
+    requirement.install_source = crate::PeerInstallSource::UnsupportedOriginal {
+        scheme: "file".to_string(),
+        specifier: "file:../source-peer".to_string(),
+    };
+    state.peer_requirements.push(requirement);
+
+    let error = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("unsupported source must fail before fetching {canonical}")
+    })
+    .await
+    .expect_err("missing unsupported-source peer must fail explicitly");
+    assert!(matches!(
+        error,
+        ResolveError::UnsupportedPeerAutoInstallSource { .. }
+    ));
 }
 
 #[tokio::test]

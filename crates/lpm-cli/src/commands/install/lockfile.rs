@@ -52,6 +52,7 @@ pub(super) fn lockfile_needs_peer_state_repair(
 pub(super) struct LockfileSelectionInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
     pub(super) client: &'a RegistryClient,
     pub(super) gate_stats: &'a GateStats,
@@ -71,6 +72,7 @@ pub(super) fn select_lockfile_install_plan(
         let candidate = try_lockfile_fast_path(
             input.lockfile_path,
             input.deps,
+            Some(input.current_importer_snapshot),
             input.catalog_resolutions,
             input.client,
             input.gate_stats,
@@ -106,6 +108,7 @@ pub(super) fn select_lockfile_install_plan(
     let candidate = try_lockfile_fast_path(
         input.lockfile_path,
         input.deps,
+        Some(input.current_importer_snapshot),
         input.catalog_resolutions,
         input.client,
         input.gate_stats,
@@ -592,6 +595,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) client: &'a RegistryClient,
     pub(super) project_dir: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
     pub(super) pkg: &'a lpm_workspace::PackageJson,
     pub(super) lockfile_path: &'a Path,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
@@ -643,6 +647,7 @@ pub(super) async fn run_offline_install_phase(
         client,
         project_dir,
         deps,
+        current_importer_snapshot,
         pkg,
         lockfile_path,
         catalog_resolutions,
@@ -730,6 +735,7 @@ pub(super) async fn run_offline_install_phase(
     let fast = try_lockfile_fast_path(
         lockfile_path,
         deps,
+        Some(current_importer_snapshot),
         catalog_resolutions,
         client,
         gate_stats,
@@ -1409,8 +1415,12 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
             }
         }
         for (peer_name, version) in &package.peers {
+            let target = package
+                .aliases
+                .get(peer_name)
+                .map_or(peer_name.as_str(), String::as_str);
             if let Some(next_idx) =
-                registry_key_to_index.get(&link_target_lookup_key(peer_name, version))
+                registry_key_to_index.get(&link_target_lookup_key(target, version))
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
@@ -1446,8 +1456,10 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
             retained_source_ids.contains(version)
                 || retained_registry_keys.contains(&link_target_lookup_key(target, version))
         });
+        let aliases = &package.aliases;
         package.peers.retain(|(name, version)| {
-            retained_registry_keys.contains(&link_target_lookup_key(name, version))
+            let target = aliases.get(name).map_or(name.as_str(), String::as_str);
+            retained_registry_keys.contains(&link_target_lookup_key(target, version))
         });
         kept.push(package);
     }
@@ -1495,7 +1507,11 @@ pub(super) fn filter_dev_packages(
             }
         }
         for (peer_name, version) in &package.peers {
-            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
+            let target = package
+                .aliases
+                .get(peer_name)
+                .map_or(peer_name.as_str(), String::as_str);
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(target, version))
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
@@ -1538,8 +1554,10 @@ pub(super) fn filter_dev_packages(
                 .map_or(local_name.as_str(), String::as_str);
             retained_keys.contains(&link_target_lookup_key(target, version))
         });
+        let aliases = &package.aliases;
         package.peers.retain(|(name, version)| {
-            retained_keys.contains(&link_target_lookup_key(name, version))
+            let target = aliases.get(name).map_or(name.as_str(), String::as_str);
+            retained_keys.contains(&link_target_lookup_key(target, version))
         });
         kept.push(package);
     }
@@ -1618,6 +1636,7 @@ pub(super) fn filter_dependency_engine_packages(
 pub(super) fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
+    current_importer_snapshot: Option<&lpm_lockfile::ImporterSnapshot>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     // — the URL-reuse gate needs the client to check
     // origin (`is_configured_origin`) and the shared `GateStats`
@@ -1644,6 +1663,13 @@ pub(super) fn try_lockfile_fast_path(
     }
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+
+    if let Some(current_importer_snapshot) = current_importer_snapshot
+        && lockfile.importers.get(".") != Some(current_importer_snapshot)
+    {
+        tracing::debug!("importer snapshot drift detected — invalidating lockfile fast path");
+        return None;
+    }
 
     let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
 
@@ -1783,7 +1809,11 @@ pub(super) fn try_lockfile_fast_path(
     // if the user later moves the auto-installed peer into their
     // `dependencies`, we don't want a double-link entry.
     for ambient in &lockfile.ambient_peer_installs {
-        if let Some(lp) = lockfile.find_package(ambient) {
+        let target = lockfile
+            .root_aliases
+            .get(ambient)
+            .map_or(ambient.as_str(), String::as_str);
+        if let Some(lp) = lockfile.find_package(target) {
             let entry = root_link_map
                 .entry(root_link_key(&lp.name, &lp.version))
                 .or_default();
@@ -2079,16 +2109,19 @@ pub(super) fn resolved_to_install_packages(
         if deps.contains_key(ambient) {
             continue;
         }
+        let target = root_aliases
+            .get(ambient)
+            .map_or(ambient.as_str(), String::as_str);
         if let Some(package) = resolved
             .iter()
-            .filter(|package| package.package.canonical_name() == *ambient)
+            .filter(|package| package.package.canonical_name() == target)
             .max_by(|a, b| a.version.cmp(&b.version))
         {
             // Avoid duplicate locals if the user ALSO listed the peer
             // in their `dependencies` (in which case `deps.keys()`
             // already covered it; we shouldn't double-link).
             let entry = root_link_map
-                .entry(rlk(ambient, &package.version.to_string()))
+                .entry(rlk(target, &package.version.to_string()))
                 .or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());

@@ -227,6 +227,15 @@ pub enum LpmError {
     )]
     PeerDependency(String),
 
+    #[error("refusing to run under sudo: {0}")]
+    #[diagnostic(
+        code(lpm::sudo_execution_refused),
+        help(
+            "Run the command again without `sudo`. LPM uses user-scoped home, cache, store, and configuration paths and will create them with the correct ownership."
+        )
+    )]
+    SudoExecution(String),
+
     #[error("network error: {0}")]
     #[diagnostic(
         code(lpm::network),
@@ -534,6 +543,7 @@ impl LpmError {
             LpmError::Resolution(_) => "resolution_failed",
             LpmError::TyposquatSuspected(_) => "typosquat_suspected",
             LpmError::PeerDependency(_) => "peer_dependency",
+            LpmError::SudoExecution(_) => "sudo_execution_refused",
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
@@ -683,6 +693,7 @@ mod tests {
             LpmError::Registry("x".into()),
             LpmError::Resolution(Box::new(resolution_error_context())),
             LpmError::PeerDependency("x".into()),
+            LpmError::SudoExecution("x".into()),
             LpmError::Network("x".into()),
             LpmError::Http {
                 status: 500,

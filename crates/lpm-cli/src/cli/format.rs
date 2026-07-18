@@ -386,6 +386,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::PeerDependency(reason) => {
             diagnostic_lines("Peer dependency check failed", Some(reason), error)
         }
+        lpm_common::LpmError::SudoExecution(reason) => {
+            diagnostic_lines("Sudo execution refused", Some(reason), error)
+        }
         lpm_common::LpmError::Network(reason) => {
             diagnostic_lines("Network error", Some(reason), error)
         }

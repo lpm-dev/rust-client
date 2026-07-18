@@ -699,7 +699,11 @@ fn compatibility_dependency_links(
         if !seen_local.insert(peer_name.clone()) {
             continue;
         }
-        if let Some(peer_key) = key_map.get_peer(peer_name, peer_version) {
+        let target_name = target
+            .aliases
+            .get(peer_name)
+            .map_or(peer_name.as_str(), String::as_str);
+        if let Some(peer_key) = key_map.get_peer(target_name, peer_version) {
             links.push((peer_name.clone(), peer_key.clone()));
         }
     }

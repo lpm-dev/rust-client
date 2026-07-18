@@ -74,7 +74,7 @@ pub(super) fn format_solution(
             // not in `dependencies`, so carrying its alias entry would
             // be dead weight for the linker.
             let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
-            let aliases: HashMap<String, String> = cached_aliases
+            let mut aliases: HashMap<String, String> = cached_aliases
                 .iter()
                 .filter(|(local, _)| alive_locals.contains(local))
                 .map(|(l, t)| (l.clone(), t.clone()))
@@ -103,6 +103,23 @@ pub(super) fn format_solution(
             // the output Vec — the linker / GraphKey only cares about
             // peers that ARE present.
             let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions);
+            if let Some(peer_deps) = cache
+                .get(&key)
+                .and_then(|info| info.peer_deps.get(&ver_str))
+            {
+                for (peer_name, _) in &peers {
+                    let Some(raw_specifier) = peer_deps.get(peer_name) else {
+                        continue;
+                    };
+                    let Ok(specifier) = crate::PeerSpecifier::parse(peer_name, raw_specifier)
+                    else {
+                        continue;
+                    };
+                    if specifier.target() != peer_name {
+                        aliases.insert(peer_name.clone(), specifier.target().to_string());
+                    }
+                }
+            }
 
             ResolvedPackage {
                 package,

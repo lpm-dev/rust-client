@@ -645,8 +645,16 @@ fn lockfile_fast_path_flags_v1_binary_for_upgrade() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed via TOML fallback");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed via TOML fallback");
 
     assert!(
         result.needs_binary_upgrade,
@@ -690,8 +698,16 @@ fn lockfile_fast_path_flags_missing_binary_for_upgrade() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed with only TOML");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed with only TOML");
 
     assert!(
         result.needs_binary_upgrade,
@@ -730,8 +746,16 @@ fn try_lockfile_fast_path_flags_stale_binary_for_writeback() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed via TOML");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed via TOML");
 
     assert!(
         result.needs_binary_upgrade,
@@ -770,8 +794,16 @@ fn try_lockfile_fast_path_flags_corrupt_binary_for_writeback() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed via TOML");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed via TOML");
 
     assert!(
         result.needs_binary_upgrade,
@@ -812,8 +844,16 @@ fn lockfile_fast_path_skips_upgrade_when_binary_current() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed with both TOML + v2 binary");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed with both TOML + v2 binary");
 
     assert!(
         !result.needs_binary_upgrade,
@@ -855,8 +895,16 @@ fn accepted_gate_url_populates_tarball_url() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed on valid lockfile");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed on valid lockfile");
 
     assert_eq!(result.packages.len(), 1);
     assert_eq!(
@@ -904,8 +952,16 @@ fn try_lockfile_fast_path_restores_registry_signature_metadata() {
     let deps: HashMap<String, String> = [("signed-pkg".to_string(), "^1.0.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed on signed lockfile");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed on signed lockfile");
 
     assert_eq!(result.packages.len(), 1);
     assert_eq!(
@@ -953,8 +1009,9 @@ fn rejected_gate_urls_downgrade_to_none_with_telemetry() {
 
         let deps: HashMap<String, String> = [("victim".to_string(), "^1.0.0".to_string())].into();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], client, &gate_stats, false)
-            .expect("fast path should succeed even with a gate-rejected URL");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, None, &[], client, &gate_stats, false)
+                .expect("fast path should succeed even with a gate-rejected URL");
         (result, gate_stats, dir)
     };
 
@@ -1019,8 +1076,16 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
     let deps: HashMap<String, String> = [("old-entry".to_string(), "^1.0.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed on pre-existing lockfile");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        None,
+        &[],
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed on pre-existing lockfile");
 
     assert_eq!(result.packages[0].tarball_url, None);
 

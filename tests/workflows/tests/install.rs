@@ -6864,6 +6864,402 @@ async fn install_auto_installs_required_peer_dependencies_by_default() {
     );
 }
 
+#[tokio::test]
+async fn install_auto_installs_npm_alias_peer_under_declared_name() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "alias-peer-host",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "react-compat": "npm:react@^18.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('react-compat/package.json').version;\n",
+        )],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "react",
+            "version": "18.3.1"
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "alias-peer-install",
+  "version": "1.0.0",
+  "dependencies": {
+    "alias-peer-host": "1.0.0"
+  }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with npm-alias peer");
+    assert!(
+        install.status.success(),
+        "npm-alias peer install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('alias-peer-host'))")
+        .output()
+        .expect("run alias peer host");
+    assert!(
+        runtime.status.success(),
+        "peer consumer must resolve the alias slot\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "18.3.1");
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("ambient-peer-installs = [\"react-compat\"]")
+            && lockfile.contains("react-compat = \"react\""),
+        "lockfile must preserve the ambient alias slot and canonical target:\n{lockfile}",
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove cold-install links before offline replay");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let replay = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('alias-peer-host'))")
+        .output()
+        .expect("run alias peer host after offline replay");
+    assert_eq!(String::from_utf8_lossy(&replay.stdout), "18.3.1");
+}
+
+#[tokio::test]
+async fn strict_peer_check_compares_named_registry_specifier_version_body() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "named-registry-peer-host",
+            "version": "1.0.0",
+            "peerDependencies": {
+                "react": "work:^18.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "react",
+            "version": "17.0.2"
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "named-registry-peer-check",
+  "version": "1.0.0",
+  "dependencies": {
+    "named-registry-peer-host": "1.0.0",
+    "react": "17.0.2"
+  }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run strict named-registry peer check");
+
+    assert!(
+        !install.status.success(),
+        "work:^18 must reject react@17 under strict peer checks\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        stderr.contains("^18.0.0") && stderr.contains("17.0.2"),
+        "strict peer error must show the comparable range and resolved version:\n{stderr}",
+    );
+}
+
+#[tokio::test]
+async fn mutable_install_rebuilds_lockfile_after_dependency_removal() {
+    let mock = MockRegistry::start().await;
+    for name in ["kept-package", "removed-package"] {
+        mock.with_manifest_package(
+            serde_json::json!({
+                "name": name,
+                "version": "1.0.0"
+            }),
+            &[],
+        )
+        .await;
+    }
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "dependency-removal-lockfile",
+  "version": "1.0.0",
+  "dependencies": {
+    "kept-package": "1.0.0",
+    "removed-package": "1.0.0"
+  }
+}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "dependency-removal-lockfile",
+  "version": "1.0.0",
+  "dependencies": {
+    "kept-package": "1.0.0"
+  }
+}"#,
+    );
+    let reinstall = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("reinstall after dependency removal");
+    assert!(
+        reinstall.status.success(),
+        "reinstall should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&reinstall.stdout).expect("reinstall JSON should parse");
+    assert_eq!(
+        envelope["used_lockfile"].as_bool(),
+        Some(false),
+        "dependency removal must force graph re-resolution",
+    );
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        !lockfile.contains("removed-package"),
+        "re-resolved lockfile must prune removed packages:\n{lockfile}",
+    );
+}
+
+#[tokio::test]
+async fn mutable_install_reclassifies_removed_direct_peer_as_ambient() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-transition-host",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "react": "^18.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('react/package.json').version;\n",
+        )],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "react",
+            "version": "18.3.1"
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "direct-to-ambient-peer",
+  "version": "1.0.0",
+  "dependencies": {
+    "peer-transition-host": "1.0.0",
+    "react": "18.3.1"
+  }
+}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "direct-to-ambient-peer",
+  "version": "1.0.0",
+  "dependencies": {
+    "peer-transition-host": "1.0.0"
+  }
+}"#,
+    );
+    let reinstall = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("reinstall after direct peer removal");
+    assert!(
+        reinstall.status.success(),
+        "peer transition reinstall should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&reinstall.stdout).expect("reinstall JSON should parse");
+    assert_eq!(
+        envelope["used_lockfile"].as_bool(),
+        Some(false),
+        "direct-to-ambient peer transition must force graph re-resolution",
+    );
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("ambient-peer-installs = [\"react\"]"),
+        "re-resolved lockfile must classify react as ambient:\n{lockfile}",
+    );
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('peer-transition-host'))")
+        .output()
+        .expect("run peer transition host");
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "18.3.1",
+        "ambient peer must remain resolvable after transition",
+    );
+}
+
+#[tokio::test]
+async fn offline_install_refuses_manifest_dependency_removal_until_online_rebuild() {
+    let mock = MockRegistry::start().await;
+    for name in ["offline-kept", "offline-removed"] {
+        mock.with_manifest_package(
+            serde_json::json!({
+                "name": name,
+                "version": "1.0.0"
+            }),
+            &[],
+        )
+        .await;
+    }
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "offline-dependency-removal",
+  "version": "1.0.0",
+  "dependencies": {
+    "offline-kept": "1.0.0",
+    "offline-removed": "1.0.0"
+  }
+}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "offline-dependency-removal",
+  "version": "1.0.0",
+  "dependencies": {
+    "offline-kept": "1.0.0"
+  }
+}"#,
+    );
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline install after dependency removal");
+    assert!(
+        !replay.status.success(),
+        "offline replay must fail on importer drift"
+    );
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(
+        stderr.contains("Run `lpm install` online to reconcile"),
+        "offline failure must explain how to rebuild the lockfile:\n{stderr}",
+    );
+    assert!(project.read_file("lpm.lock").contains("offline-removed"));
+}
+
 /// A package whose `optionalDependencies` cannot be satisfied (the optional
 /// is unreachable on the registry) must NOT abort the install. Mandatory
 /// deps and the host package itself must still land.

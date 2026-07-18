@@ -10,6 +10,7 @@ mod greedy;
 mod npm_version;
 mod overrides;
 mod package;
+mod peer_specifier;
 mod policy;
 pub mod profile;
 mod provider;
@@ -44,6 +45,7 @@ pub use overrides::{
     OverrideSource, OverrideTarget, override_selector_target_name,
 };
 pub use package::{CanonicalKey, ResolverPackage};
+pub use peer_specifier::{PeerInstallSource, PeerSpecifier, PeerSpecifierError};
 pub use policy::{ReleaseTimeStatus, ResolverPolicy, TrustEvidence, TrustPolicyMode};
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta, is_platform_compatible};
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};

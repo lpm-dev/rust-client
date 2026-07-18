@@ -120,6 +120,7 @@ pub(super) async fn run_install_freshness_phase(
             if let Some(fast) = try_lockfile_fast_path(
                 input.lockfile_path,
                 input.manifest_deps,
+                None,
                 &[],
                 input.client,
                 &gate_stats,

@@ -14,13 +14,16 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 struct PeerRequirement {
+    local_name: String,
     target_name: String,
     range: lpm_resolver::NpmRange,
+    install_source: lpm_resolver::PeerInstallSource,
     optional: bool,
 }
 
 #[derive(Debug, Clone)]
 struct AmbientPeerPlan {
+    local_name: String,
     target_name: String,
     version: String,
 }
@@ -51,7 +54,7 @@ pub(super) async fn drain_ambient_peer_installs(
         return Ok(());
     }
 
-    let mut ambient_done = HashSet::new();
+    let mut ambient_done: HashSet<(String, String)> = HashSet::new();
     loop {
         let plans = ambient_peer_plans(
             packages,
@@ -71,11 +74,11 @@ pub(super) async fn drain_ambient_peer_installs(
         let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
         for plan in plans {
             stats.peer_requests_enqueued += 1;
-            ambient_done.insert(plan.target_name.clone());
+            ambient_done.insert((plan.local_name.clone(), plan.target_name.clone()));
             pending.push(Box::pin(resolve_node(
                 ResolveRequest {
-                    local_name: plan.target_name.clone(),
-                    root_ancestor: plan.target_name.clone(),
+                    local_name: plan.local_name.clone(),
+                    root_ancestor: plan.local_name,
                     target_name: plan.target_name,
                     range: plan.version,
                     parent: None,
@@ -186,21 +189,41 @@ async fn ambient_peer_plans(
     metadata_queue: &Arc<Semaphore>,
     metadata_stats: &Arc<MetadataStats>,
     resolver_policy: &lpm_resolver::ResolverPolicy,
-    ambient_done: &HashSet<String>,
+    ambient_done: &HashSet<(String, String)>,
 ) -> Result<Vec<AmbientPeerPlan>, LpmError> {
-    let mut grouped: BTreeMap<String, Vec<PeerRequirement>> = BTreeMap::new();
-    for requirement in collect_peer_requirements(packages) {
+    let mut grouped: BTreeMap<(String, String), Vec<PeerRequirement>> = BTreeMap::new();
+    for requirement in collect_peer_requirements(packages)? {
         grouped
-            .entry(requirement.target_name.clone())
+            .entry((
+                requirement.local_name.clone(),
+                requirement.target_name.clone(),
+            ))
             .or_default()
             .push(requirement);
     }
 
     let mut plans = Vec::new();
-    for (target_name, reqs) in grouped {
-        if ambient_done.contains(&target_name)
+    for ((local_name, target_name), reqs) in grouped {
+        if ambient_done.contains(&(local_name.clone(), target_name.clone()))
             || reqs.iter().all(|req| req.optional)
             || peer_group_satisfied_by_existing(packages, &target_name, &reqs)
+        {
+            continue;
+        }
+        if let Some(requirement) = reqs
+            .iter()
+            .find(|requirement| !requirement.optional && !requirement.install_source.is_registry())
+            && !packages.keys().any(|(name, _)| name == &target_name)
+            && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
+        {
+            return Err(LpmError::Registry(format!(
+                "cannot auto-install required peer `{}`: specifier {:?} uses unsupported `{}:` source routing; install a compatible provider explicitly",
+                requirement.local_name, specifier, scheme
+            )));
+        }
+        if reqs
+            .iter()
+            .any(|requirement| !requirement.optional && !requirement.install_source.is_registry())
         {
             continue;
         }
@@ -222,6 +245,7 @@ async fn ambient_peer_plans(
             )));
         };
         plans.push(AmbientPeerPlan {
+            local_name,
             target_name,
             version: version.to_string(),
         });
@@ -231,31 +255,28 @@ async fn ambient_peer_plans(
 
 fn collect_peer_requirements(
     packages: &HashMap<PackageIdentity, PackageDraft>,
-) -> Vec<PeerRequirement> {
+) -> Result<Vec<PeerRequirement>, LpmError> {
     let mut requirements = Vec::new();
     for draft in packages.values() {
         let version = &draft.package.version;
         let Some(peer_deps) = draft.info.peer_deps.get(version) else {
             continue;
         };
-        let aliases = draft.info.aliases.get(version);
         let optional_peers = draft.info.optional_peer_names.get(version);
         for (peer_name, peer_range) in peer_deps {
-            let Ok(range) = lpm_resolver::NpmRange::parse(peer_range) else {
-                continue;
-            };
-            let target_name = aliases
-                .and_then(|aliases| aliases.get(peer_name))
-                .cloned()
-                .unwrap_or_else(|| peer_name.clone());
+            let specifier = lpm_resolver::PeerSpecifier::parse(peer_name, peer_range)
+                .map_err(|error| LpmError::Registry(error.to_string()))?;
+            let (target_name, range, install_source) = specifier.into_parts();
             requirements.push(PeerRequirement {
+                local_name: peer_name.clone(),
                 target_name,
                 range,
+                install_source,
                 optional: optional_peers.is_some_and(|peers| peers.contains(peer_name)),
             });
         }
     }
-    requirements
+    Ok(requirements)
 }
 
 fn peer_group_satisfied_by_existing(
@@ -341,15 +362,21 @@ pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity
         };
         let mut peers = Vec::with_capacity(peer_deps.len());
         for (peer_name, peer_range) in peer_deps {
-            let Some(candidates) = available.get(peer_name) else {
+            let Ok(specifier) = lpm_resolver::PeerSpecifier::parse(peer_name, peer_range) else {
                 continue;
             };
-            let Ok(range) = lpm_resolver::NpmRange::parse(peer_range) else {
+            if specifier.target() != peer_name {
+                draft
+                    .package
+                    .aliases
+                    .insert(peer_name.clone(), specifier.target().to_string());
+            }
+            let Some(candidates) = available.get(specifier.target()) else {
                 continue;
             };
             if let Some((_, version)) = candidates
                 .iter()
-                .filter(|(version, _)| range.satisfies(version))
+                .filter(|(version, _)| specifier.comparable_range().satisfies(version))
                 .max_by(|(left, _), (right, _)| left.cmp(right))
             {
                 peers.push((peer_name.clone(), version.clone()));
