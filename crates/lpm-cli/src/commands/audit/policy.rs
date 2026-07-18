@@ -1,5 +1,15 @@
 use lpm_common::LpmError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum AuditLevel {
+    #[value(alias = "low")]
+    Info,
+    #[value(alias = "medium")]
+    Moderate,
+    High,
+    Critical,
+}
+
 /// Convert a severity string to a numeric level for comparison.
 /// Higher = more severe.
 pub(super) fn severity_level(severity: &str) -> u8 {
@@ -13,12 +23,12 @@ pub(super) fn severity_level(severity: &str) -> u8 {
 }
 
 /// Get the minimum severity level from a --level flag value.
-pub(super) fn min_severity_level(level: &str) -> u8 {
-    match level.to_lowercase().as_str() {
-        "high" => 3,
-        "moderate" => 2,
-        "info" => 1,
-        _ => 0,
+pub(super) fn min_severity_level(level: AuditLevel) -> u8 {
+    match level {
+        AuditLevel::Critical => 4,
+        AuditLevel::High => 3,
+        AuditLevel::Moderate => 2,
+        AuditLevel::Info => 1,
     }
 }
 

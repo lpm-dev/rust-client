@@ -38,6 +38,7 @@ use types::{AuditIssue, AuditResult};
 
 pub use fix::run_fix;
 pub use install_summary::run_install_summary;
+pub(crate) use policy::AuditLevel;
 pub use secrets::run_secrets;
 pub use signatures::run_signatures;
 pub use types::AuditCounts;
@@ -181,7 +182,7 @@ pub async fn run(
     client: &RegistryClient,
     project_dir: &Path,
     json_output: bool,
-    level: Option<&str>,
+    level: Option<AuditLevel>,
     fail_on: Option<&str>,
 ) -> Result<(), LpmError> {
     let fail_policy = match fail_on {
@@ -219,15 +220,23 @@ pub async fn run(
     // ── LPM registry metadata (@lpm.dev packages only) ──────────
     if !lpm_packages.is_empty() {
         let names: Vec<String> = lpm_packages.iter().map(|(n, _)| n.clone()).collect();
-        let metadata_map = client.batch_metadata(&names).await.unwrap_or_default();
+        let metadata_map = client.batch_metadata(&names).await.map_err(|error| {
+            LpmError::Registry(format!(
+                "LPM registry metadata lookup failed during audit: {error}"
+            ))
+        })?;
 
         for (name, version) in &lpm_packages {
-            let Some(metadata) = metadata_map.get(name) else {
-                continue;
-            };
-            let Some(ver_meta) = metadata.version(version).or_else(|| metadata.latest()) else {
-                continue;
-            };
+            let metadata = metadata_map.get(name).ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "LPM registry returned no metadata for installed package {name}@{version}"
+                ))
+            })?;
+            let ver_meta = metadata.version(version).ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "LPM registry metadata omitted installed version {name}@{version}"
+                ))
+            })?;
             checked_lpm += 1;
             let mut issues: Vec<AuditIssue> = Vec::new();
             collect_registry_issues(ver_meta, &mut issues);
@@ -335,7 +344,12 @@ pub async fn run(
             &behavioral_results,
             &discovery,
             checked_lpm,
+            osv_degraded_reason.is_some(),
         );
+    }
+
+    if osv_degraded_reason.is_some() {
+        return Err(LpmError::ExitCode(1));
     }
 
     // ── Exit code: non-zero based on --fail-on policy ──

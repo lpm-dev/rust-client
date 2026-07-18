@@ -691,6 +691,101 @@ async fn install_with_audit_after_install_flag_appends_summary_line() {
 }
 
 #[tokio::test]
+async fn install_osv_outage_suppresses_audit_after_install_summary() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("maintenance"))
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-outage","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "audit-after-install outage must not fail a successful install: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Audited"),
+        "incomplete audit must not emit zero-vulnerability summary: {stderr}"
+    );
+    assert!(
+        stderr.contains("audit-after-install failed"),
+        "audit outage should remain visible to operators: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_audit_after_install_counts_lpm_registry_advisories() {
+    let mock = MockRegistry::start().await;
+    let package = "@lpm.dev/test.audit-after-install";
+    let tarball = make_tarball(package, "1.0.0");
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!(
+                        "{}{}",
+                        mock.url(),
+                        MockRegistry::tarball_path(package, "1.0.0")
+                    ),
+                    "integrity": compute_integrity(&tarball)
+                },
+                "_vulnerabilities": [{
+                    "id": "LPM-ADV-INSTALL",
+                    "summary": "test advisory",
+                    "severity": "high"
+                }]
+            }
+        }
+    });
+    mock.with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"audit-lpm-advisory","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install must succeed: {stderr}");
+    assert!(
+        stderr.contains("1 vulnerability"),
+        "LPM registry advisory must be included in the install audit count: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn install_no_audit_after_install_overrides_env() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("ms", "2.1.3");

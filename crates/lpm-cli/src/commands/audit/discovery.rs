@@ -345,57 +345,27 @@ fn discover_from_bun_lockfile(project_root: &Path) -> Result<DiscoveryResult, Lp
 fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
     let nm_dir = project_root.join("node_modules");
 
-    // Pass 1: Read all packages and collect unresolved dependency names
-    let mut entries: Vec<(DiscoveredPackage, Vec<String>)> = Vec::new();
+    let mut entries: Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf)> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    collect_node_modules_entries(project_root, &nm_dir, &mut entries, &mut visited);
 
-    if let Ok(dir_entries) = std::fs::read_dir(&nm_dir) {
-        for entry in dir_entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden dirs, .package-lock.json, .lpm, etc.
-            if name.starts_with('.') {
-                continue;
-            }
-
-            if name.starts_with('@') {
-                // Scoped package — descend one level
-                let scope_dir = entry.path();
-                if let Ok(scoped_entries) = std::fs::read_dir(&scope_dir) {
-                    for scoped_entry in scoped_entries.flatten() {
-                        let scoped_name = scoped_entry.file_name().to_string_lossy().to_string();
-                        let full_name = format!("{name}/{scoped_name}");
-                        if let Some(result) = read_package_from_node_modules(
-                            project_root,
-                            &scoped_entry.path(),
-                            &full_name,
-                        ) {
-                            entries.push(result);
-                        }
-                    }
-                }
-            } else if let Some(result) =
-                read_package_from_node_modules(project_root, &entry.path(), &name)
-            {
-                entries.push(result);
-            }
-        }
-    }
-
-    // Pass 2: Build name → version lookup, then resolve dependency edges
-    let version_lookup: std::collections::HashMap<String, String> = entries
+    let version_lookup: std::collections::HashMap<std::path::PathBuf, (String, String)> = entries
         .iter()
-        .map(|(pkg, _)| (pkg.name.clone(), pkg.version.clone()))
+        .map(|(pkg, _, pkg_dir)| (pkg_dir.clone(), (pkg.name.clone(), pkg.version.clone())))
         .collect();
 
     let packages = entries
         .into_iter()
-        .map(|(mut pkg, dep_names)| {
+        .map(|(mut pkg, dep_names, pkg_dir)| {
             pkg.dependencies = dep_names
                 .into_iter()
                 .filter_map(|dep_name| {
-                    version_lookup
-                        .get(&dep_name)
-                        .map(|ver| (dep_name, ver.clone()))
+                    resolve_node_modules_dependency(
+                        &pkg_dir,
+                        &dep_name,
+                        project_root,
+                        &version_lookup,
+                    )
                 })
                 .collect();
             pkg
@@ -409,6 +379,114 @@ fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
         is_degraded: true,
         is_yarn_pnp: false,
         packages,
+    }
+}
+
+fn collect_node_modules_entries(
+    project_root: &Path,
+    node_modules: &Path,
+    entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf)>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let Ok(metadata) = std::fs::symlink_metadata(node_modules) else {
+        return;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return;
+    }
+    let Ok(identity) = node_modules.canonicalize() else {
+        return;
+    };
+    if !visited.insert(identity) {
+        return;
+    }
+    let Ok(dir_entries) = std::fs::read_dir(node_modules) else {
+        return;
+    };
+
+    for entry in dir_entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+
+        if name.starts_with('@') {
+            let Ok(scoped_entries) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for scoped_entry in scoped_entries.flatten() {
+                let Ok(scoped_type) = scoped_entry.file_type() else {
+                    continue;
+                };
+                if !scoped_type.is_dir() || scoped_type.is_symlink() {
+                    continue;
+                }
+                let scoped_name = scoped_entry.file_name().to_string_lossy().to_string();
+                let full_name = format!("{name}/{scoped_name}");
+                collect_node_modules_package(
+                    project_root,
+                    &scoped_entry.path(),
+                    &full_name,
+                    entries,
+                    visited,
+                );
+            }
+        } else {
+            collect_node_modules_package(project_root, &entry.path(), &name, entries, visited);
+        }
+    }
+}
+
+fn collect_node_modules_package(
+    project_root: &Path,
+    package_dir: &Path,
+    name: &str,
+    entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf)>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    if let Some((package, dependencies)) =
+        read_package_from_node_modules(project_root, package_dir, name)
+    {
+        entries.push((package, dependencies, package_dir.to_path_buf()));
+    }
+    collect_node_modules_entries(
+        project_root,
+        &package_dir.join("node_modules"),
+        entries,
+        visited,
+    );
+}
+
+fn resolve_node_modules_dependency(
+    package_dir: &Path,
+    dependency: &str,
+    project_root: &Path,
+    versions: &std::collections::HashMap<std::path::PathBuf, (String, String)>,
+) -> Option<(String, String)> {
+    let mut base = package_dir.to_path_buf();
+    loop {
+        let candidate = base.join("node_modules").join(dependency);
+        if let Some(version) = versions.get(&candidate) {
+            return Some(version.clone());
+        }
+        let parent = base.parent()?;
+        base = if parent
+            .file_name()
+            .is_some_and(|name| name == "node_modules")
+        {
+            parent.parent()?.to_path_buf()
+        } else {
+            parent.to_path_buf()
+        };
+        if !base.starts_with(project_root) {
+            return None;
+        }
     }
 }
 
@@ -426,6 +504,11 @@ fn read_package_from_node_modules(
     let content = std::fs::read_to_string(&pkg_json_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let version = json.get("version")?.as_str()?.to_string();
+    let canonical_name = json
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or(name)
+        .to_string();
 
     let rel_path = pkg_dir.strip_prefix(project_root).ok()?;
     let path = rel_path.to_string_lossy().to_string();
@@ -445,7 +528,7 @@ fn read_package_from_node_modules(
 
     Some((
         DiscoveredPackage {
-            name: name.to_string(),
+            name: canonical_name,
             version,
             path,
             integrity: None,
@@ -751,6 +834,61 @@ mod tests {
             express.dependencies[0],
             ("qs".to_string(), "6.14.0".to_string())
         );
+    }
+
+    #[test]
+    fn node_modules_fallback_discovers_nested_transitive_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"parent":"1.0.0"}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/parent/node_modules/child")).unwrap();
+        fs::write(
+            dir.path().join("node_modules/parent/package.json"),
+            r#"{"name":"parent","version":"1.0.0","dependencies":{"child":"1.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("node_modules/parent/node_modules/child/package.json"),
+            r#"{"name":"child","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let result = discover_from_node_modules(dir.path());
+
+        assert_eq!(result.packages.len(), 2);
+        assert!(result.packages.iter().any(|package| {
+            package.name == "child" && package.path == "node_modules/parent/node_modules/child"
+        }));
+        let parent = result
+            .packages
+            .iter()
+            .find(|package| package.name == "parent")
+            .unwrap();
+        assert_eq!(
+            parent.dependencies,
+            vec![("child".to_string(), "1.0.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn node_modules_fallback_uses_manifest_name_for_npm_alias_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/local-alias")).unwrap();
+        fs::write(
+            dir.path().join("node_modules/local-alias/package.json"),
+            r#"{"name":"canonical-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let result = discover_from_node_modules(dir.path());
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].name, "canonical-package");
+        assert_eq!(result.packages[0].path, "node_modules/local-alias");
     }
 
     #[test]

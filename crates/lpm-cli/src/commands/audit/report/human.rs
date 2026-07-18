@@ -251,6 +251,7 @@ pub(in crate::commands::audit) fn print_summary(
     behavioral: &BehavioralSummary,
     discovery: &DiscoveryResult,
     checked_lpm: usize,
+    osv_degraded: bool,
 ) {
     eprintln!();
 
@@ -262,7 +263,12 @@ pub(in crate::commands::audit) fn print_summary(
         .map(|r| r.issues.len())
         .sum();
 
-    if vuln_count == 0 && lpm_issues == 0 && behavioral.packages_with_findings == 0 {
+    if osv_degraded {
+        install_ui::warn(&format!(
+            "Audit incomplete · {total_scanned} {} scanned",
+            install_ui::packages_word(total_scanned)
+        ));
+    } else if vuln_count == 0 && lpm_issues == 0 && behavioral.packages_with_findings == 0 {
         let mut parts = vec![format!("{total_scanned} scanned")];
         if checked_lpm > 0 {
             parts.push(format!("{checked_lpm} LPM audited"));

@@ -305,7 +305,7 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
     // lockfile and produce a coherent envelope. Mock OSV to keep the
     // test offline.
     let mock = MockRegistry::start().await;
-    mock.with_osv_querybatch(vec![]).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
     let osv_url = format!("{}/v1/querybatch", mock.url());
     let out_audit = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", &osv_url)

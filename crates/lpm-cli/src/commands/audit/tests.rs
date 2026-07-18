@@ -43,6 +43,14 @@ fn severity_level_unknown() {
 }
 
 #[test]
+fn cvss_vector_uses_its_computed_base_score() {
+    assert_eq!(
+        cvss_score_to_label("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N"),
+        "MEDIUM"
+    );
+}
+
+#[test]
 fn confusion_warns_on_popular_npm_name() {
     let packages = vec![("@lpm.dev/owner.lodash".to_string(), "1.0.0".to_string())];
     let warnings = check_dependency_confusion(&packages);
@@ -136,7 +144,7 @@ fn cvss_score_parsing() {
     assert_eq!(cvss_score_to_label("7.5"), "HIGH");
     assert_eq!(cvss_score_to_label("5.0"), "MEDIUM");
     assert_eq!(cvss_score_to_label("2.0"), "LOW");
-    assert_eq!(cvss_score_to_label("CVSS:3.1/AV:N/AC:L"), "HIGH");
+    assert_eq!(cvss_score_to_label("CVSS:3.1/AV:N/AC:L"), "UNKNOWN");
     assert_eq!(cvss_score_to_label("unknown"), "UNKNOWN");
 }
 

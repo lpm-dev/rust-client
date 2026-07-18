@@ -42,6 +42,7 @@ lpm-dashboard = { workspace = true }
 lpm-migrate = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+cvss = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }

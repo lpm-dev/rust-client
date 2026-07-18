@@ -67,6 +67,49 @@ fn verbose_long_form_survives() {
 }
 
 #[test]
+fn audit_level_rejects_unknown_severity() {
+    let error = match Cli::try_parse_from(["lpm", "audit", "--level", "severe"]) {
+        Ok(_) => panic!("unknown audit severity must fail during argument parsing"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+}
+
+#[test]
+fn audit_level_accepts_critical_severity() {
+    let cli = Cli::try_parse_from(["lpm", "audit", "--level", "critical"])
+        .expect("documented critical audit severity should parse");
+    let Some(Commands::Audit(security::AuditArgs { level, .. })) = cli.command else {
+        panic!("expected Audit command");
+    };
+    assert_eq!(level, Some(commands::audit::AuditLevel::Critical));
+}
+
+#[test]
+fn audit_level_accepts_documented_severity_aliases() {
+    let low = Cli::try_parse_from(["lpm", "audit", "--level", "low"])
+        .expect("documented low audit severity alias should parse");
+    let medium = Cli::try_parse_from(["lpm", "audit", "--level", "medium"])
+        .expect("documented medium audit severity alias should parse");
+
+    let Some(Commands::Audit(security::AuditArgs {
+        level: low_level, ..
+    })) = low.command
+    else {
+        panic!("expected Audit command for low alias");
+    };
+    let Some(Commands::Audit(security::AuditArgs {
+        level: medium_level,
+        ..
+    })) = medium.command
+    else {
+        panic!("expected Audit command for medium alias");
+    };
+    assert_eq!(low_level, Some(commands::audit::AuditLevel::Info));
+    assert_eq!(medium_level, Some(commands::audit::AuditLevel::Moderate));
+}
+
+#[test]
 fn config_without_action_parses_to_guided_editor() {
     let cli = Cli::try_parse_from(["lpm", "config"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
