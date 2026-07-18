@@ -360,9 +360,7 @@ async fn query_osv_batch_with_warnings(
 }
 
 fn osv_advisory_needs_hydration(vuln: &OsvVuln) -> bool {
-    vuln.summary.is_none()
-        || vuln.affected.is_empty()
-        || (vuln.severity.is_empty() && vuln.database_specific.severity.is_none())
+    vuln.summary.is_none() || vuln.affected.is_empty() || extract_usable_severity(vuln).is_none()
 }
 
 async fn fetch_osv_advisory(
@@ -530,61 +528,79 @@ fn parse_osv_event_version(version: &str) -> Result<Version, String> {
 
 /// Extract the highest severity string from OSV severity entries.
 fn extract_severity(vuln: &OsvVuln) -> String {
-    let mut labels: Vec<String> = vuln
-        .severity
+    extract_usable_severity(vuln)
+        .unwrap_or("UNKNOWN")
+        .to_string()
+}
+
+fn extract_usable_severity(vuln: &OsvVuln) -> Option<&'static str> {
+    vuln.severity
         .iter()
-        .map(|entry| cvss_score_to_label(&entry.score))
-        .filter(|label| label != "UNKNOWN")
-        .collect();
-    if let Some(severity) = vuln.database_specific.severity.as_deref() {
-        let label = match severity.to_ascii_lowercase().as_str() {
-            "critical" => "CRITICAL",
-            "high" => "HIGH",
-            "moderate" => "MODERATE",
-            "medium" => "MEDIUM",
-            "low" => "LOW",
-            _ => "UNKNOWN",
-        };
-        if label != "UNKNOWN" {
-            labels.push(label.to_string());
-        }
-    }
-    labels
-        .into_iter()
+        .filter_map(|entry| cvss_score_to_usable_label(&entry.score))
+        .chain(
+            vuln.database_specific
+                .severity
+                .as_deref()
+                .and_then(database_severity_to_usable_label),
+        )
         .max_by_key(|label| severity_level(label))
-        .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+fn database_severity_to_usable_label(severity: &str) -> Option<&'static str> {
+    if severity.eq_ignore_ascii_case("critical") {
+        Some("CRITICAL")
+    } else if severity.eq_ignore_ascii_case("high") {
+        Some("HIGH")
+    } else if severity.eq_ignore_ascii_case("moderate") {
+        Some("MODERATE")
+    } else if severity.eq_ignore_ascii_case("medium") {
+        Some("MEDIUM")
+    } else if severity.eq_ignore_ascii_case("low") {
+        Some("LOW")
+    } else {
+        None
+    }
 }
 
 /// Convert a CVSS vector string to a severity label.
+#[cfg(test)]
 pub(super) fn cvss_score_to_label(score_str: &str) -> String {
+    cvss_score_to_usable_label(score_str)
+        .unwrap_or("UNKNOWN")
+        .to_string()
+}
+
+fn cvss_score_to_usable_label(score_str: &str) -> Option<&'static str> {
     if let Ok(score) = score_str.parse::<f64>() {
-        return if score >= 9.0 {
-            "CRITICAL".to_string()
+        if !score.is_finite() || !(0.0..=10.0).contains(&score) {
+            return None;
+        }
+        return Some(if score >= 9.0 {
+            "CRITICAL"
         } else if score >= 7.0 {
-            "HIGH".to_string()
+            "HIGH"
         } else if score >= 4.0 {
-            "MEDIUM".to_string()
+            "MEDIUM"
         } else {
-            "LOW".to_string()
-        };
+            "LOW"
+        });
     }
     if score_str.starts_with("CVSS:3.")
         && ["/AV:", "/AC:", "/PR:", "/UI:", "/S:", "/C:", "/I:", "/A:"]
             .iter()
             .any(|metric| !score_str.contains(metric))
     {
-        return "UNKNOWN".to_string();
+        return None;
     }
     score_str
         .parse::<cvss::Cvss>()
+        .ok()
         .map(|vector| match vector.severity() {
             cvss::Severity::Critical => "CRITICAL",
             cvss::Severity::High => "HIGH",
             cvss::Severity::Medium => "MEDIUM",
             cvss::Severity::Low | cvss::Severity::None => "LOW",
         })
-        .unwrap_or("UNKNOWN")
-        .to_string()
 }
 
 #[cfg(test)]

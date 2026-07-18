@@ -641,6 +641,54 @@ async fn audit_still_sparse_hydrated_advisory_fails_closed_before_level_filterin
 }
 
 #[tokio::test]
+async fn audit_malformed_hydrated_severity_fails_closed_before_level_filtering() {
+    let project = TempProject::empty(
+        r#"{"name":"malformed-osv-severity","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, "vuln-pkg").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"vulns": [{"id": "GHSA-malformed-severity"}]}]
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/GHSA-malformed-severity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GHSA-malformed-severity",
+            "summary": "detail endpoint returned unusable severity data",
+            "severity": [{"type": "CVSS_V3", "score": "not-a-cvss-score"}],
+            "database_specific": {"severity": "urgent"},
+            "affected": [{
+                "package": {"ecosystem": "npm", "name": "vuln-pkg"},
+                "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "1.0.1"}]}]
+            }]
+        })))
+        .mount(mock.server())
+        .await;
+
+    let out = run_audit_json(&project, &mock, &["--level", "info"]);
+    assert!(
+        !out.status.success(),
+        "an advisory with unusable hydrated severity must fail closed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["osv_degraded"], true);
+    assert!(
+        envelope["osv_degraded_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("remained incomplete")),
+        "unexpected degraded reason: {envelope:#}"
+    );
+}
+
+#[tokio::test]
 async fn audit_osv_outage_exits_nonzero_without_clean_summary() {
     let project = TempProject::empty(
         r#"{"name":"osv-outage","version":"1.0.0","dependencies":{"clean-pkg":"1.0.0"}}"#,
