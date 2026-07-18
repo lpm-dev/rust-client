@@ -1059,6 +1059,7 @@ async fn run_with_options_under_store_lock(
             &workspace_member_deps,
             &all_workspace_members,
             &catalog_resolutions,
+            &current_importer_snapshot,
             &current_patches,
             &prior_patch_state,
             &current_patch_fingerprint,

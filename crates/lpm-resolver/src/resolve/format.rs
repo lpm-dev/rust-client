@@ -9,6 +9,28 @@ pub(super) fn format_solution(
     root_aliases: &HashMap<String, String>,
     skipped_dependencies: Vec<SkippedDependency>,
 ) -> Result<(Vec<ResolvedPackage>, usize), ResolveError> {
+    for (package, version) in solution.iter().filter(|(package, _)| !package.is_root()) {
+        let version = version.to_string();
+        let key = CanonicalKey::from(package);
+        let Some(peer_dependencies) = cache
+            .get(&key)
+            .and_then(|info| info.peer_deps.get(&version))
+        else {
+            continue;
+        };
+        for (peer_name, peer_dependency) in peer_dependencies {
+            if let Err(error) = peer_dependency.parsed() {
+                return Err(ResolveError::InvalidPeerSpecifier {
+                    consumer: package.canonical_name(),
+                    version: version.clone(),
+                    peer: peer_name.clone(),
+                    specifier: peer_dependency.raw().to_string(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+    }
+
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
         .iter()
@@ -102,19 +124,24 @@ pub(super) fn format_solution(
             // versions lookup. Missing peers simply don't appear in
             // the output Vec — the linker / GraphKey only cares about
             // peers that ARE present.
-            let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions);
+            let peers = compute_resolved_peers(
+                &package,
+                &ver_str,
+                cache,
+                &resolved_peer_versions,
+                &root_dependencies.explicit_peer_providers,
+            );
             if let Some(peer_deps) = cache
                 .get(&key)
                 .and_then(|info| info.peer_deps.get(&ver_str))
             {
                 for (peer_name, _) in &peers {
-                    let Some(raw_specifier) = peer_deps.get(peer_name) else {
+                    let Some(peer_dependency) = peer_deps.get(peer_name) else {
                         continue;
                     };
-                    let Ok(specifier) = crate::PeerSpecifier::parse(peer_name, raw_specifier)
-                    else {
-                        continue;
-                    };
+                    let specifier = peer_dependency
+                        .parsed()
+                        .expect("selected peer specifiers were validated before formatting");
                     if specifier.target() != peer_name {
                         aliases.insert(peer_name.clone(), specifier.target().to_string());
                     }

@@ -50,6 +50,7 @@ pub(super) struct MergeOutcome {
 pub(super) fn load_lockfile_graph_packages(
     project_dir: &Path,
     deps: &HashMap<String, String>,
+    current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     client: &RegistryClient,
     gate_stats: &GateStats,
@@ -59,7 +60,7 @@ pub(super) fn load_lockfile_graph_packages(
     let fast = try_lockfile_fast_path(
         &lockfile_path,
         deps,
-        None,
+        Some(current_importer_snapshot),
         catalog_resolutions,
         client,
         gate_stats,

@@ -5855,6 +5855,96 @@ async fn install_file_local_dependency_links_into_node_modules() {
 }
 
 #[tokio::test]
+async fn explicit_file_link_and_url_providers_satisfy_matching_source_peers() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "url-react",
+            "version": "18.3.1",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'url-react';\n")],
+    )
+    .await;
+    let url_react = mock.tarball_url("url-react", "18.3.1");
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "file-peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "file-react": "file:./packages/file-react",
+                "link-react": "link:./packages/link-react",
+                "url-react": url_react.clone()
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = [require('file-react'), require('link-react'), require('url-react')].join(',');\n",
+        )],
+    )
+    .await;
+
+    let manifest = serde_json::json!({
+        "name": "explicit-source-peer-providers",
+        "version": "1.0.0",
+        "dependencies": {
+            "file-peer-consumer": "1.0.0",
+            "file-react": "file:./packages/file-react",
+            "link-react": "link:./packages/link-react",
+            "url-react": url_react,
+        }
+    });
+    let project = TempProject::empty(&serde_json::to_string_pretty(&manifest).unwrap());
+    project.write_file(
+        "packages/file-react/package.json",
+        r#"{"name":"file-react","version":"18.3.1","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/file-react/index.js",
+        "module.exports = 'file-react';\n",
+    );
+    project.write_file(
+        "packages/link-react/package.json",
+        r#"{"name":"link-react","version":"18.3.1","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/link-react/index.js",
+        "module.exports = 'link-react';\n",
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with explicit source peer providers");
+    assert!(
+        install.status.success(),
+        "matching source peer providers should satisfy the consumer\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('file-peer-consumer'))")
+        .output()
+        .expect("run file peer consumer");
+    assert!(runtime.status.success(), "runtime peer lookup must succeed");
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "file-react,link-react,url-react"
+    );
+}
+
+#[tokio::test]
 async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(

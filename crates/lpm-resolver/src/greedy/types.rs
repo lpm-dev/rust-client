@@ -62,6 +62,9 @@ pub(super) struct PeerRequirement {
     pub(super) canonical: CanonicalKey,
     /// Parsed range from the `peerDependencies` value.
     pub(super) range: NpmRange,
+    /// Exact source identity required by file/link/URL/git peer specifiers.
+    /// Version and named-registry constraints leave this empty.
+    pub(super) provider_source: Option<crate::PeerProviderSource>,
     /// Original declaration, preserved for source-aware diagnostics.
     pub(super) raw_specifier: String,
     /// Whether a missing provider can be fetched through the registry

@@ -380,7 +380,16 @@ pub(super) fn workspace_member_cache_info(
 
     let mut peer_deps = HashMap::new();
     if !pkg.peer_dependencies.is_empty() {
-        peer_deps.insert(version_str.clone(), pkg.peer_dependencies);
+        peer_deps.insert(
+            version_str.clone(),
+            pkg.peer_dependencies
+                .into_iter()
+                .map(|(name, raw)| {
+                    let spec = lpm_resolver::PeerDependencySpec::new(&name, raw);
+                    (name, spec)
+                })
+                .collect(),
+        );
     }
 
     let mut optional_dep_names = HashMap::new();

@@ -26,7 +26,15 @@ pub fn evaluate_sudo_policy(
 #[cfg(unix)]
 pub fn enforce_sudo_policy() -> Result<(), LpmError> {
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let effective_uid = unsafe { libc::geteuid() };
+    let actual_effective_uid = unsafe { libc::geteuid() };
+    // This test seam can only tighten policy: it simulates root, never disguises root as non-root.
+    let effective_uid = if std::env::var_os("LPM_TEST_FORCE_ROOT_SUDO_POLICY").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        0
+    } else {
+        actual_effective_uid
+    };
     if effective_uid != 0 {
         return Ok(());
     }

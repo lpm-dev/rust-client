@@ -1950,7 +1950,10 @@ fn mk_info_with_peers(
     };
     let mut peer_map = HashMap::new();
     for (n, r) in peers_of_latest {
-        peer_map.insert(n.to_string(), r.to_string());
+        peer_map.insert(
+            n.to_string(),
+            crate::PeerDependencySpec::new(n, r.to_string()),
+        );
     }
     info.peer_deps.insert(latest.to_string(), peer_map);
     if !optional_peers_of_latest.is_empty() {
@@ -2262,6 +2265,7 @@ fn mk_peer_req(
         peer_name: peer_name.to_string(),
         canonical,
         range: NpmRange::parse(range).unwrap(),
+        provider_source: None,
         raw_specifier: range.to_string(),
         install_source: crate::PeerInstallSource::Registry,
         optional,
@@ -2566,6 +2570,9 @@ async fn peer_drain_rejects_missing_provider_with_unsupported_source() {
         scheme: "file".to_string(),
         specifier: "file:../source-peer".to_string(),
     };
+    requirement.provider_source = Some(crate::PeerProviderSource::File(
+        "../source-peer".to_string(),
+    ));
     state.peer_requirements.push(requirement);
 
     let error = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
@@ -2577,6 +2584,51 @@ async fn peer_drain_rejects_missing_provider_with_unsupported_source() {
         error,
         ResolveError::UnsupportedPeerAutoInstallSource { .. }
     ));
+}
+
+#[tokio::test]
+async fn peer_drain_accepts_matching_explicit_file_provider() {
+    let provider = crate::ExplicitPeerProvider::new(
+        "source-peer",
+        "source-peer",
+        "1.0.0",
+        crate::PeerProviderSource::File("../source-peer".to_string()),
+    )
+    .unwrap();
+    let roots = crate::RootDependencies::required(HashMap::new())
+        .with_explicit_peer_providers(vec![provider]);
+    let mut state = ResolveState::new_with_root_dependencies_and_policy(
+        roots,
+        OverrideSet::empty(),
+        true,
+        ResolverPolicy::default(),
+    );
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("source-host"), "1.0.0");
+    let mut requirement = mk_peer_req(
+        consumer,
+        "source-peer",
+        CanonicalKey::npm("source-peer"),
+        "*",
+        false,
+    );
+    requirement.raw_specifier = "file:../source-peer".to_string();
+    requirement.install_source = crate::PeerInstallSource::UnsupportedOriginal {
+        scheme: "file".to_string(),
+        specifier: "file:../source-peer".to_string(),
+    };
+    requirement.provider_source = Some(crate::PeerProviderSource::File(
+        "../source-peer".to_string(),
+    ));
+    state.peer_requirements.push(requirement);
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("matching explicit provider must avoid registry fetch for {canonical}")
+    })
+    .await
+    .expect("matching explicit provider must satisfy the peer");
+
+    assert!(synthesized.is_empty());
 }
 
 #[tokio::test]

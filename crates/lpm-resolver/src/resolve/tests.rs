@@ -358,7 +358,12 @@ fn make_cached_info(
                 (
                     v.to_string(),
                     d.into_iter()
-                        .map(|(k, r)| (k.to_string(), r.to_string()))
+                        .map(|(k, r)| {
+                            (
+                                k.to_string(),
+                                crate::PeerDependencySpec::new(k, r.to_string()),
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -1795,7 +1800,7 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             ));
             acc
         });
-    let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates);
+    let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates, &[]);
     assert_eq!(
         bound_peers,
         vec![("react".to_string(), "17.0.2".to_string())],

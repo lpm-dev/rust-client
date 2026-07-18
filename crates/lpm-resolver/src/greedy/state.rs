@@ -211,6 +211,7 @@ pub(super) struct ResolveState {
     /// each root edge's range when seeding.
     pub(super) root_deps: HashMap<String, String>,
     pub(super) optional_root_names: HashSet<String>,
+    pub(super) explicit_peer_providers: Vec<crate::resolve::ExplicitPeerProvider>,
     /// Edge work queue. Drained by the main loop.
     pub(super) task_queue: VecDeque<Edge>,
     /// Resolved nodes indexed by canonical → list of `(version,
@@ -342,10 +343,12 @@ impl ResolveState {
         let crate::resolve::RootDependencies {
             dependencies: root_deps,
             optional_names: optional_root_names,
+            explicit_peer_providers,
         } = root_dependencies;
         ResolveState {
             root_deps,
             optional_root_names,
+            explicit_peer_providers,
             task_queue: VecDeque::with_capacity(256),
             resolved: AHashMap::with_capacity(512),
             nodes: Vec::with_capacity(512),
@@ -514,6 +517,7 @@ impl ResolveState {
                     .push((None, n.version.to_string()));
                 acc
             });
+        let explicit_peer_providers = self.explicit_peer_providers;
 
         let mut out: Vec<ResolvedPackage> = self
             .nodes
@@ -579,20 +583,33 @@ impl ResolveState {
                     .and_then(|info| info.peer_deps.get(&ver_str))
                 {
                     peers.reserve(peer_deps.len());
-                    for (peer_name, peer_range) in peer_deps {
-                        let Ok(specifier) = crate::PeerSpecifier::parse(peer_name, peer_range)
-                        else {
-                            continue;
-                        };
+                    for (peer_name, peer_dependency) in peer_deps {
+                        let specifier = peer_dependency
+                            .parsed()
+                            .expect("selected peer specifiers are validated while enqueueing deps");
                         if specifier.target() != peer_name {
                             aliases.insert(peer_name.clone(), specifier.target().to_string());
                         }
-                        if let Some((version, _)) = resolve_peer_binding_version(
-                            &pkg,
-                            specifier.target(),
-                            Some(specifier.comparable_range()),
-                            &resolved_by_canonical,
-                        ) {
+                        let resolved = if let Some(range) = specifier.comparable_range() {
+                            resolve_peer_binding_version(
+                                &pkg,
+                                specifier.target(),
+                                Some(range),
+                                &resolved_by_canonical,
+                            )
+                            .map(|(version, _)| version.clone())
+                        } else {
+                            explicit_peer_providers
+                                .iter()
+                                .find(|provider| {
+                                    provider.local_name == *peer_name
+                                        && provider.package_name == specifier.target()
+                                        && specifier
+                                            .matches_provider(&provider.version, &provider.source)
+                                })
+                                .map(|provider| provider.version.to_string())
+                        };
+                        if let Some(version) = resolved {
                             peers.push((peer_name.clone(), version.clone()));
                         }
                     }

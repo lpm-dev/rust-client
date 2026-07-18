@@ -817,3 +817,24 @@ fn dedupe_install_packages_by_identity_merges_workspace_reentry_source_graph() {
         "merged transitive workspace package must stay off root links"
     );
 }
+
+#[test]
+fn explicit_file_install_package_becomes_typed_peer_provider() {
+    let mut package = install_package_for_tarball("ignored", None);
+    package.name = "react".to_string();
+    package.version = "18.3.1".to_string();
+    package.source = "directory+./packages/react".to_string();
+    package.root_link_names = Some(vec!["react".to_string()]);
+    package.is_direct = true;
+
+    let providers = explicit_peer_providers_from_install_packages([&package]).unwrap();
+
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].local_name, "react");
+    assert_eq!(providers[0].package_name, "react");
+    assert_eq!(providers[0].version.to_string(), "18.3.1");
+    assert_eq!(
+        providers[0].source,
+        lpm_resolver::PeerProviderSource::File("packages/react".to_string())
+    );
+}

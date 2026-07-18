@@ -29,6 +29,7 @@ pub(super) fn compute_resolved_peers(
     consumer_version: &str,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     resolved_versions: &HashMap<String, Vec<(Option<String>, String)>>,
+    explicit_peer_providers: &[ExplicitPeerProvider],
 ) -> Vec<(String, String)> {
     let key = CanonicalKey::from(consumer);
     let Some(peer_deps) = cache
@@ -39,15 +40,27 @@ pub(super) fn compute_resolved_peers(
     };
     let mut peers: Vec<(String, String)> = peer_deps
         .iter()
-        .filter_map(|(peer_name, peer_range)| {
-            let specifier = crate::PeerSpecifier::parse(peer_name, peer_range).ok()?;
-            resolve_peer_binding_version(
-                consumer,
-                specifier.target(),
-                Some(specifier.comparable_range()),
-                resolved_versions,
-            )
-            .map(|(version, _)| (peer_name.clone(), version.clone()))
+        .filter_map(|(peer_name, peer_dependency)| {
+            let specifier = peer_dependency
+                .parsed()
+                .expect("format_solution validates selected peer specifiers");
+            if let Some(range) = specifier.comparable_range() {
+                return resolve_peer_binding_version(
+                    consumer,
+                    specifier.target(),
+                    Some(range),
+                    resolved_versions,
+                )
+                .map(|(version, _)| (peer_name.clone(), version.clone()));
+            }
+            explicit_peer_providers
+                .iter()
+                .find(|provider| {
+                    provider.local_name == *peer_name
+                        && provider.package_name == specifier.target()
+                        && specifier.matches_provider(&provider.version, &provider.source)
+                })
+                .map(|provider| (peer_name.clone(), provider.version.to_string()))
         })
         .collect();
     peers.sort_by(|a, b| a.0.cmp(&b.0));
@@ -783,24 +796,37 @@ pub fn check_unmet_peers(
         // at an incompatible version).
         let optional_peers = info.and_then(|i| i.optional_peer_names.get(&ver_str));
 
-        for (peer_name, peer_range_str) in peer_deps {
-            let Ok(specifier) = crate::PeerSpecifier::parse(peer_name, peer_range_str) else {
+        for (peer_name, peer_dependency) in peer_deps {
+            let peer_range_str = peer_dependency.raw();
+            let Ok(specifier) = peer_dependency.parsed() else {
                 warnings.push(PeerWarning {
                     package: canonical.clone(),
                     version: ver_str.clone(),
                     peer: peer_name.clone(),
-                    required_range: peer_range_str.clone(),
+                    required_range: peer_range_str.to_string(),
                     resolved_version: None,
                 });
                 continue;
             };
-            let required_range = specifier.comparable_range().raw().to_string();
-            let resolved_peer_ver = resolve_peer_binding_version(
-                &resolved_pkg.package,
-                specifier.target(),
-                Some(specifier.comparable_range()),
-                &resolved_versions,
+            let required_range = specifier.comparable_range().map_or_else(
+                || peer_range_str.to_string(),
+                |range| range.raw().to_string(),
             );
+            let attached_peer = resolved_pkg
+                .peers
+                .iter()
+                .find(|(attached_name, _)| attached_name == peer_name)
+                .map(|(_, version)| (version, true));
+            let resolved_peer_ver = attached_peer.or_else(|| {
+                specifier.comparable_range().and_then(|range| {
+                    resolve_peer_binding_version(
+                        &resolved_pkg.package,
+                        specifier.target(),
+                        Some(range),
+                        &resolved_versions,
+                    )
+                })
+            });
 
             match resolved_peer_ver {
                 Some((resolved_ver, satisfies)) => {

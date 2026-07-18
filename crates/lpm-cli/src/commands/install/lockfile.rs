@@ -1665,7 +1665,10 @@ pub(super) fn try_lockfile_fast_path(
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
     if let Some(current_importer_snapshot) = current_importer_snapshot
-        && lockfile.importers.get(".") != Some(current_importer_snapshot)
+        && lockfile
+            .importers
+            .get(".")
+            .is_some_and(|locked| locked != current_importer_snapshot)
     {
         tracing::debug!("importer snapshot drift detected — invalidating lockfile fast path");
         return None;

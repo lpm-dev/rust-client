@@ -64,7 +64,7 @@ fn parse_metadata_to_cache_info_inner(
     let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
     let mut deps: HashMap<String, HashMap<String, String>> =
         HashMap::with_capacity(dependency_entry_count);
-    let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut peer_deps: HashMap<String, HashMap<String, crate::PeerDependencySpec>> = HashMap::new();
     let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut optional_peer_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut node_engines: HashMap<String, String> = HashMap::new();
@@ -156,7 +156,10 @@ fn parse_metadata_to_cache_info_inner(
                         tracing::debug!("skipping invalid peer dep name: {dep_name:?}");
                         continue;
                     }
-                    ver_peers.insert(dep_name.clone(), dep_range.clone());
+                    ver_peers.insert(
+                        dep_name.clone(),
+                        crate::PeerDependencySpec::new(dep_name, dep_range.clone()),
+                    );
                 }
                 peer_deps.insert(ver_str.clone(), ver_peers);
             }

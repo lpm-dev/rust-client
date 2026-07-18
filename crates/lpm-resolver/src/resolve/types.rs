@@ -7,6 +7,7 @@ use super::prelude::*;
 pub struct RootDependencies {
     pub(crate) dependencies: HashMap<String, String>,
     pub(crate) optional_names: HashSet<String>,
+    pub(crate) explicit_peer_providers: Vec<ExplicitPeerProvider>,
 }
 
 impl RootDependencies {
@@ -15,6 +16,7 @@ impl RootDependencies {
         Self {
             dependencies,
             optional_names: HashSet::new(),
+            explicit_peer_providers: Vec::new(),
         }
     }
 
@@ -28,12 +30,46 @@ impl RootDependencies {
         Self {
             dependencies,
             optional_names,
+            explicit_peer_providers: Vec::new(),
         }
+    }
+
+    pub fn with_explicit_peer_providers(
+        mut self,
+        explicit_peer_providers: Vec<ExplicitPeerProvider>,
+    ) -> Self {
+        self.explicit_peer_providers = explicit_peer_providers;
+        self
     }
 
     #[inline]
     pub(crate) fn is_optional(&self, local_name: &str) -> bool {
         self.optional_names.contains(local_name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplicitPeerProvider {
+    pub local_name: String,
+    pub package_name: String,
+    pub version: NpmVersion,
+    pub source: crate::PeerProviderSource,
+}
+
+impl ExplicitPeerProvider {
+    pub fn new(
+        local_name: impl Into<String>,
+        package_name: impl Into<String>,
+        version: impl AsRef<str>,
+        source: crate::PeerProviderSource,
+    ) -> Result<Self, String> {
+        let version = NpmVersion::parse(version.as_ref())?;
+        Ok(Self {
+            local_name: local_name.into(),
+            package_name: package_name.into(),
+            version,
+            source,
+        })
     }
 }
 

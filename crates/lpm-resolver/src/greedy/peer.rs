@@ -114,7 +114,9 @@ fn find_version_satisfying_all(
 ) -> Option<NpmVersion> {
     for v in &info.versions {
         // Every requirement's range must accept this version.
-        if !reqs.iter().all(|r| r.range.satisfies(v)) {
+        if !reqs.iter().all(|requirement| {
+            requirement.provider_source.is_none() && requirement.range.satisfies(v)
+        }) {
             continue;
         }
         // Platform filter — same gate the regular dep path uses, so
@@ -180,7 +182,7 @@ fn find_version_satisfying_most<'a>(
         let mut hits = 0usize;
         let mut misses: Vec<usize> = Vec::new();
         for &i in &required_indices {
-            if reqs[i].range.satisfies(v) {
+            if reqs[i].provider_source.is_none() && reqs[i].range.satisfies(v) {
                 hits += 1;
             } else {
                 misses.push(i);
@@ -211,12 +213,26 @@ fn group_satisfied_by_existing(
     canonical: &CanonicalKey,
     reqs: &[&PeerRequirement],
 ) -> bool {
-    let Some(nodes) = state.resolved.get(canonical) else {
-        return false;
-    };
-    nodes
-        .iter()
-        .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+    if state.explicit_peer_providers.iter().any(|provider| {
+        provider.package_name == canonical.to_string()
+            && reqs.iter().all(|requirement| {
+                provider.local_name == requirement.peer_name
+                    && requirement.provider_source.as_ref().map_or_else(
+                        || requirement.range.satisfies(&provider.version),
+                        |required_source| required_source == &provider.source,
+                    )
+            })
+    }) {
+        return true;
+    }
+
+    state.resolved.get(canonical).is_some_and(|nodes| {
+        nodes.iter().any(|(version, _)| {
+            reqs.iter().all(|requirement| {
+                requirement.provider_source.is_none() && requirement.range.satisfies(version)
+            })
+        })
+    })
 }
 
 pub(super) fn peer_resolution_cache_key(
@@ -225,7 +241,11 @@ pub(super) fn peer_resolution_cache_key(
 ) -> PeerResolutionCacheKey {
     let mut parent_peers: Vec<(String, String, bool)> = Vec::with_capacity(reqs.len());
     for req in reqs {
-        parent_peers.push((req.peer_name.clone(), req.range.to_string(), req.optional));
+        parent_peers.push((
+            req.peer_name.clone(),
+            req.raw_specifier.clone(),
+            req.optional,
+        ));
     }
     parent_peers.sort();
 
@@ -258,7 +278,9 @@ fn unsatisfied_required_consumers(
     chosen: &NpmVersion,
 ) -> Vec<(String, String)> {
     reqs.iter()
-        .filter(|req| !req.optional && !req.range.satisfies(chosen))
+        .filter(|req| {
+            !req.optional && (req.provider_source.is_some() || !req.range.satisfies(chosen))
+        })
         .map(|req| peer_conflict_consumer_entry(state, req))
         .collect()
 }
@@ -279,7 +301,7 @@ fn peer_conflict_consumer_entry(state: &ResolveState, req: &PeerRequirement) -> 
         .nodes
         .get(req.consumer as usize)
         .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
-    (consumer_canonical, req.range.to_string())
+    (consumer_canonical, req.raw_specifier.clone())
 }
 
 /// One peer-drain pass.
@@ -348,11 +370,7 @@ pub(super) fn pick_peer_prefetch_candidates(
             continue;
         }
         // Already satisfied by an existing node in the resolved tree.
-        if let Some(nodes) = state.resolved.get(canonical)
-            && nodes
-                .iter()
-                .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
-        {
+        if group_satisfied_by_existing(state, canonical, &reqs) {
             continue;
         }
         // Manifest already in cache — drain pass will hit the fast
@@ -565,13 +583,6 @@ where
         .find(|requirement| !requirement.optional && !requirement.install_source.is_registry())
         && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
     {
-        if state
-            .resolved
-            .get(canonical)
-            .is_some_and(|versions| !versions.is_empty())
-        {
-            return Ok(PeerDrainOutcome::SkippedOptOut);
-        }
         let consumer = state.nodes.get(requirement.consumer as usize).map_or_else(
             || "<unknown>".to_string(),
             |node| format!("{}@{}", node.canonical, node.version),
@@ -631,7 +642,7 @@ where
                     .nodes
                     .get(r.consumer as usize)
                     .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
-                (consumer_canonical, r.range.to_string(), r.optional)
+                (consumer_canonical, r.raw_specifier.clone(), r.optional)
             })
             .collect(),
     })

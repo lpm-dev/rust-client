@@ -1,7 +1,7 @@
 use super::super::graph::{
-    attach_reused_dependency_edge, inline_reuse_can_preserve_optional_state, mark_required_closure,
-    normalize_draft_optional_reachability, package_should_materialize, reusable_existing_version,
-    select_or_reuse_node,
+    attach_reused_dependency_edge, inline_reuse_can_preserve_optional_state,
+    load_lockfile_graph_packages, mark_required_closure, normalize_draft_optional_reachability,
+    package_should_materialize, reusable_existing_version, select_or_reuse_node,
 };
 use super::common::{
     empty_info_value, fake_draft, fake_package, info_with_versions, override_set,
@@ -9,6 +9,40 @@ use super::common::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+#[test]
+fn lockfile_graph_rejects_present_importer_snapshot_drift() {
+    let project = tempfile::tempdir().unwrap();
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                "removed-dependency".to_string(),
+                "1.0.0".to_string(),
+            )]),
+            ..lpm_lockfile::ImporterSnapshot::default()
+        },
+    );
+    lockfile
+        .write_all(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .unwrap();
+
+    let result = load_lockfile_graph_packages(
+        project.path(),
+        &HashMap::new(),
+        &lpm_lockfile::ImporterSnapshot::default(),
+        &[],
+        &lpm_registry::RegistryClient::new(),
+        &super::super::super::GateStats::default(),
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "present importer drift must reject graph replay"
+    );
+}
 
 #[test]
 fn package_materialization_skips_optional_platform_incompatible_package() {

@@ -16,6 +16,15 @@ pub(super) fn parse_cli_or_exit() -> Cli {
     }
 }
 
+pub(super) fn enforce_startup_sudo_policy_or_exit() {
+    let Err(error) = lpm_common::enforce_sudo_policy() else {
+        return;
+    };
+    let args = args_for_cli_parse(std::env::args_os());
+    let json_output = argv_requests_json(&args);
+    exit_with_lpm_error(&error, json_output, lpm_common::DEFAULT_REGISTRY_URL);
+}
+
 pub(super) fn argv_has_global_registry_flag<I>(args: I) -> bool
 where
     I: IntoIterator,

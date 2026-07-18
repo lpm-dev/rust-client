@@ -12,7 +12,10 @@ use super::args::{
     lifecycle as lifecycle_args, network as network_args, registry as registry_args,
     release as release_args, security as security_args,
 };
-use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
+use super::format::{
+    argv_has_global_registry_flag, enforce_startup_sudo_policy_or_exit, exit_with_lpm_error,
+    parse_cli_or_exit,
+};
 use super::helpers::{
     argv_requests_top_level_version, build_install_global_overrides_with_excludes,
     command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
@@ -33,6 +36,7 @@ pub(crate) fn run() -> Result<()> {
     color_policy::init(color_policy::peek_color_choice_from_argv(
         std::env::args_os(),
     ));
+    enforce_startup_sudo_policy_or_exit();
 
     if argv_requests_top_level_version(std::env::args_os()) {
         print_version_with_notice();

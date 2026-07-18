@@ -120,21 +120,30 @@ pub(super) fn enqueue_child_deps(
     // peerBundle interactions; no real package ships both).
     if let Some(peer_deps) = info.peer_deps.get(&ver_str) {
         let optional_peers = info.optional_peer_names.get(&ver_str);
-        let mut peer_entries: Vec<(&String, &String)> = peer_deps.iter().collect();
+        let mut peer_entries: Vec<(&String, &crate::PeerDependencySpec)> =
+            peer_deps.iter().collect();
         peer_entries.sort_by_key(|(name, _)| *name);
 
-        for (peer_name, peer_range_str) in peer_entries {
+        for (peer_name, peer_dependency) in peer_entries {
+            let peer_range_str = peer_dependency.raw();
             let specifier =
-                crate::PeerSpecifier::parse(peer_name, peer_range_str).map_err(|e| {
-                    ResolveError::InvalidPeerSpecifier {
+                peer_dependency
+                    .parsed()
+                    .map_err(|e| ResolveError::InvalidPeerSpecifier {
                         consumer: parent_canonical.to_string(),
                         version: ver_str.clone(),
                         peer: peer_name.clone(),
-                        specifier: peer_range_str.clone(),
+                        specifier: peer_range_str.to_string(),
                         detail: e.to_string(),
-                    }
-                })?;
-            let (target, range, install_source) = specifier.into_parts();
+                    })?;
+            let (target, constraint, install_source) = specifier.clone().into_parts();
+            let (range, provider_source) = match constraint {
+                crate::PeerConstraint::Version(range) => (range, None),
+                crate::PeerConstraint::Source(source) => (
+                    NpmRange::parse("*").expect("wildcard peer range is always valid"),
+                    Some(source),
+                ),
+            };
             let canonical = CanonicalKey::from_dep_name(&target);
 
             let optional = optional_peers.is_some_and(|set| set.contains(peer_name));
@@ -144,7 +153,8 @@ pub(super) fn enqueue_child_deps(
                 peer_name: peer_name.clone(),
                 canonical,
                 range,
-                raw_specifier: peer_range_str.clone(),
+                provider_source,
+                raw_specifier: peer_range_str.to_string(),
                 install_source,
                 optional,
             });

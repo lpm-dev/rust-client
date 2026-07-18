@@ -100,6 +100,59 @@ pub(super) fn dedupe_install_packages_by_identity(packages: &mut Vec<InstallPack
     *packages = deduped;
 }
 
+pub(super) fn explicit_peer_providers_from_install_packages<'a>(
+    packages: impl IntoIterator<Item = &'a InstallPackage>,
+) -> Result<Vec<lpm_resolver::ExplicitPeerProvider>, LpmError> {
+    let packages = packages.into_iter();
+    let (lower_bound, _) = packages.size_hint();
+    let mut providers = Vec::with_capacity(lower_bound);
+    let mut seen = HashSet::with_capacity(lower_bound);
+
+    for package in packages {
+        if package.source.starts_with("registry+") {
+            continue;
+        }
+        let source = lpm_resolver::PeerProviderSource::from_install_source(&package.source)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "cannot classify explicit peer provider source {:?}",
+                    package.source
+                ))
+            })?;
+        let root_link_names = package.root_link_names.clone().unwrap_or_else(|| {
+            if package.is_direct {
+                vec![package.name.clone()]
+            } else {
+                Vec::new()
+            }
+        });
+        for local_name in root_link_names {
+            let identity = format!(
+                "{}\0{}\0{}\0{}",
+                local_name, package.name, package.version, package.source
+            );
+            if !seen.insert(identity) {
+                continue;
+            }
+            let provider = lpm_resolver::ExplicitPeerProvider::new(
+                local_name,
+                package.name.clone(),
+                &package.version,
+                source.clone(),
+            )
+            .map_err(|detail| {
+                LpmError::Registry(format!(
+                    "explicit peer provider {} has invalid version {:?}: {detail}",
+                    package.name, package.version
+                ))
+            })?;
+            providers.push(provider);
+        }
+    }
+
+    Ok(providers)
+}
+
 /// Lightweight representation of a resolved package for the install pipeline.
 /// Used both for fresh resolution results and lockfile-restored packages.
 #[derive(Debug, Clone)]

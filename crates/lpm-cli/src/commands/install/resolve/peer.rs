@@ -17,6 +17,7 @@ struct PeerRequirement {
     local_name: String,
     target_name: String,
     range: lpm_resolver::NpmRange,
+    provider_source: Option<lpm_resolver::PeerProviderSource>,
     install_source: lpm_resolver::PeerInstallSource,
     optional: bool,
 }
@@ -49,6 +50,7 @@ pub(super) async fn drain_ambient_peer_installs(
     gate_stats: Arc<GateStats>,
     force: bool,
     fetch_extract_limiter: FetchExtractLimiter,
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
 ) -> Result<(), LpmError> {
     if !auto_install_peers {
         return Ok(());
@@ -65,6 +67,7 @@ pub(super) async fn drain_ambient_peer_installs(
             metadata_stats,
             resolver_policy,
             &ambient_done,
+            explicit_peer_providers,
         )
         .await?;
         if plans.is_empty() {
@@ -190,6 +193,7 @@ async fn ambient_peer_plans(
     metadata_stats: &Arc<MetadataStats>,
     resolver_policy: &lpm_resolver::ResolverPolicy,
     ambient_done: &HashSet<(String, String)>,
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
 ) -> Result<Vec<AmbientPeerPlan>, LpmError> {
     let mut grouped: BTreeMap<(String, String), Vec<PeerRequirement>> = BTreeMap::new();
     for requirement in collect_peer_requirements(packages)? {
@@ -206,14 +210,18 @@ async fn ambient_peer_plans(
     for ((local_name, target_name), reqs) in grouped {
         if ambient_done.contains(&(local_name.clone(), target_name.clone()))
             || reqs.iter().all(|req| req.optional)
-            || peer_group_satisfied_by_existing(packages, &target_name, &reqs)
+            || peer_group_satisfied_by_existing(
+                packages,
+                &target_name,
+                &reqs,
+                explicit_peer_providers,
+            )
         {
             continue;
         }
         if let Some(requirement) = reqs
             .iter()
             .find(|requirement| !requirement.optional && !requirement.install_source.is_registry())
-            && !packages.keys().any(|(name, _)| name == &target_name)
             && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
         {
             return Err(LpmError::Registry(format!(
@@ -263,14 +271,30 @@ fn collect_peer_requirements(
             continue;
         };
         let optional_peers = draft.info.optional_peer_names.get(version);
-        for (peer_name, peer_range) in peer_deps {
-            let specifier = lpm_resolver::PeerSpecifier::parse(peer_name, peer_range)
-                .map_err(|error| LpmError::Registry(error.to_string()))?;
-            let (target_name, range, install_source) = specifier.into_parts();
+        for (peer_name, peer_dependency) in peer_deps {
+            let specifier = peer_dependency.parsed().map_err(|error| {
+                LpmError::Registry(format!(
+                    "invalid peer dependency {}@{} -> {} {:?}: {error}",
+                    draft.package.name,
+                    draft.package.version,
+                    peer_name,
+                    peer_dependency.raw(),
+                ))
+            })?;
+            let (target_name, constraint, install_source) = specifier.clone().into_parts();
+            let (range, provider_source) = match constraint {
+                lpm_resolver::PeerConstraint::Version(range) => (range, None),
+                lpm_resolver::PeerConstraint::Source(source) => (
+                    lpm_resolver::NpmRange::parse("*")
+                        .expect("wildcard peer range is always valid"),
+                    Some(source),
+                ),
+            };
             requirements.push(PeerRequirement {
                 local_name: peer_name.clone(),
                 target_name,
                 range,
+                provider_source,
                 install_source,
                 optional: optional_peers.is_some_and(|peers| peers.contains(peer_name)),
             });
@@ -283,16 +307,29 @@ fn peer_group_satisfied_by_existing(
     packages: &HashMap<PackageIdentity, PackageDraft>,
     target_name: &str,
     reqs: &[PeerRequirement],
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
 ) -> bool {
-    packages.keys().any(|(name, version)| {
+    let registry_match = packages.keys().any(|(name, version)| {
         if name != target_name {
             return false;
         }
         let Ok(version) = lpm_resolver::NpmVersion::parse(version) else {
             return false;
         };
-        reqs.iter().all(|req| req.range.satisfies(&version))
-    })
+        reqs.iter()
+            .all(|req| req.provider_source.is_none() && req.range.satisfies(&version))
+    });
+    registry_match
+        || explicit_peer_providers.iter().any(|provider| {
+            provider.package_name == target_name
+                && reqs.iter().all(|requirement| {
+                    provider.local_name == requirement.local_name
+                        && requirement.provider_source.as_ref().map_or_else(
+                            || requirement.range.satisfies(&provider.version),
+                            |required_source| required_source == &provider.source,
+                        )
+                })
+        })
 }
 
 fn peer_version_satisfying_all(
@@ -302,7 +339,8 @@ fn peer_version_satisfying_all(
     info.versions
         .iter()
         .find(|version| {
-            reqs.iter().all(|req| req.range.satisfies(version))
+            reqs.iter()
+                .all(|req| req.provider_source.is_none() && req.range.satisfies(version))
                 && platform_allows_peer_version(info, version)
         })
         .cloned()
@@ -319,7 +357,9 @@ fn peer_version_satisfying_most(
         }
         let hits = reqs
             .iter()
-            .filter(|req| !req.optional && req.range.satisfies(version))
+            .filter(|req| {
+                !req.optional && req.provider_source.is_none() && req.range.satisfies(version)
+            })
             .count();
         if hits == 0 {
             continue;
@@ -340,7 +380,10 @@ fn platform_allows_peer_version(
         .is_none_or(lpm_resolver::is_platform_compatible)
 }
 
-pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity, PackageDraft>) {
+pub(super) fn attach_peer_edges_to_drafts(
+    packages: &mut HashMap<PackageIdentity, PackageDraft>,
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
+) -> Result<(), LpmError> {
     let available: HashMap<String, Vec<(lpm_resolver::NpmVersion, String)>> = packages
         .values()
         .filter_map(|package| {
@@ -361,28 +404,47 @@ pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity
             continue;
         };
         let mut peers = Vec::with_capacity(peer_deps.len());
-        for (peer_name, peer_range) in peer_deps {
-            let Ok(specifier) = lpm_resolver::PeerSpecifier::parse(peer_name, peer_range) else {
-                continue;
-            };
+        for (peer_name, peer_dependency) in peer_deps {
+            let specifier = peer_dependency.parsed().map_err(|error| {
+                LpmError::Registry(format!(
+                    "invalid peer dependency {}@{} -> {} {:?}: {error}",
+                    draft.package.name,
+                    draft.package.version,
+                    peer_name,
+                    peer_dependency.raw(),
+                ))
+            })?;
             if specifier.target() != peer_name {
                 draft
                     .package
                     .aliases
                     .insert(peer_name.clone(), specifier.target().to_string());
             }
-            let Some(candidates) = available.get(specifier.target()) else {
-                continue;
-            };
-            if let Some((_, version)) = candidates
-                .iter()
-                .filter(|(version, _)| specifier.comparable_range().satisfies(version))
-                .max_by(|(left, _), (right, _)| left.cmp(right))
-            {
-                peers.push((peer_name.clone(), version.clone()));
+            let resolved = specifier.comparable_range().and_then(|range| {
+                available.get(specifier.target()).and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .filter(|(version, _)| range.satisfies(version))
+                        .max_by(|(left, _), (right, _)| left.cmp(right))
+                        .map(|(_, version)| version.clone())
+                })
+            });
+            let resolved = resolved.or_else(|| {
+                explicit_peer_providers
+                    .iter()
+                    .find(|provider| {
+                        provider.local_name == *peer_name
+                            && provider.package_name == specifier.target()
+                            && specifier.matches_provider(&provider.version, &provider.source)
+                    })
+                    .map(|provider| provider.version.to_string())
+            });
+            if let Some(version) = resolved {
+                peers.push((peer_name.clone(), version));
             }
         }
         peers.sort();
         draft.package.peers = peers;
     }
+    Ok(())
 }

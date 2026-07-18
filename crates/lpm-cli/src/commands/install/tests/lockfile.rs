@@ -1094,3 +1094,46 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
     assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
     assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn current_importer_validation_accepts_snapshotless_compatibility_lockfiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.importers.clear();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "legacy-entry".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some("sha512-test".to_string()),
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        os: Vec::new(),
+        cpu: Vec::new(),
+        libc: Vec::new(),
+        node_engine: None,
+        optional: false,
+        dependencies: Vec::new(),
+        alias_dependencies: Vec::new(),
+        peers: Vec::new(),
+        tarball: None,
+    });
+    lockfile.write_all(&lockfile_path).unwrap();
+
+    let deps = HashMap::from([("legacy-entry".to_string(), "^1.0.0".to_string())]);
+    let current = lpm_lockfile::ImporterSnapshot::default();
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        Some(&current),
+        &[],
+        &RegistryClient::new(),
+        &GateStats::default(),
+        false,
+    );
+
+    assert!(
+        result.is_some(),
+        "a missing importer snapshot is compatibility state, not proven manifest drift"
+    );
+}

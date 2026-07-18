@@ -140,8 +140,14 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         &v2_workspace_root_pre_resolve.optional_registry_roots,
     )
     .await?;
+    let explicit_peer_providers = explicit_peer_providers_from_install_packages(
+        tarball_url_install_pkgs
+            .iter()
+            .chain(v2_workspace_root_pre_resolve.install_pkgs.iter()),
+    )?;
     let resolver_root_dependencies =
-        lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots);
+        lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots)
+            .with_explicit_peer_providers(explicit_peer_providers);
 
     merge_workspace_member_links(
         workspace_member_deps,
