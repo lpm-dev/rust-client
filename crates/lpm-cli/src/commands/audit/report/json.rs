@@ -39,7 +39,7 @@ pub(in crate::commands::audit) fn print_json_report(
     }
 
     let json = serde_json::json!({
-        "success": true,
+        "success": osv_degraded_reason.is_none(),
         "manager": discovery.manager.to_string(),
         "degraded": discovery.is_degraded,
         // `osv_degraded` is true when the OSV advisory database was

@@ -1717,7 +1717,7 @@ async fn async_main() -> Result<()> {
                     &client,
                     &cwd,
                     cli.json,
-                    level.as_deref(),
+                    level,
                     fail_on.as_deref(),
                 )
                 .await

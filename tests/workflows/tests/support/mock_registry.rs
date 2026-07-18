@@ -1727,18 +1727,46 @@ impl MockRegistry {
         self
     }
 
-    /// Mount the OSV `POST /v1/querybatch` endpoint with a fixed response.
+    /// Mount production-shaped OSV batch and advisory endpoints.
     ///
     /// Tests redirect `lpm audit`'s OSV calls here by setting
     /// `LPM_OSV_URL = "{mock.url()}/v1/querybatch"`. `vulns_per_query`
     /// is a list with one entry per query slot — pass an empty Vec for
-    /// "no vulns for this package" or one or more `OsvVulnerability`-shaped
-    /// JSON values for "this package matched these vulns."
+    /// "no vulns for this package" or one or more full OSV advisory JSON
+    /// values for "this package matched these vulns." The batch endpoint
+    /// returns only sparse advisory references; each full advisory is mounted
+    /// at `GET /v1/vulns/{id}`, matching the public OSV API contract.
     pub async fn with_osv_querybatch(&self, vulns_per_query: Vec<Vec<serde_json::Value>>) -> &Self {
+        let mut advisories = HashMap::new();
         let results: Vec<serde_json::Value> = vulns_per_query
             .into_iter()
-            .map(|vulns| serde_json::json!({ "vulns": vulns }))
+            .map(|vulns| {
+                let sparse = vulns
+                    .into_iter()
+                    .map(|advisory| {
+                        let id = advisory
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .expect("OSV advisory fixture must include an id")
+                            .to_string();
+                        advisories.entry(id.clone()).or_insert(advisory);
+                        serde_json::json!({
+                            "id": id,
+                            "modified": "2026-01-01T00:00:00Z"
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({ "vulns": sparse })
+            })
             .collect();
+
+        for (id, advisory) in advisories {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(advisory))
+                .mount(&self.server)
+                .await;
+        }
 
         Mock::given(method("POST"))
             .and(path("/v1/querybatch"))

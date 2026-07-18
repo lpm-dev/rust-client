@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use super::cache::ProjectAuditCache;
 use super::discovery::{DiscoveredPackage, DiscoveryResult, ScanMode};
 use super::inventory;
-use super::policy::{min_severity_level, severity_level};
+use super::policy::{AuditLevel, min_severity_level, severity_level};
 use super::types::{AuditIssue, AuditResult};
 
 /// Behavioral summary stats returned for the final output.
@@ -23,7 +23,7 @@ pub(super) fn run_behavioral_analysis(
     results: &mut Vec<AuditResult>,
     lpm_packages: &[(String, String)],
     _json_output: bool,
-    level: Option<&str>,
+    level: Option<AuditLevel>,
 ) -> BehavioralSummary {
     struct LoadedBehavioralAnalysis {
         name: String,
@@ -175,8 +175,6 @@ pub(super) fn run_behavioral_analysis(
             continue;
         }
 
-        with_findings += 1;
-
         // Apply --level filter
         if let Some(lvl) = level {
             let min_lvl = min_severity_level(lvl);
@@ -185,6 +183,7 @@ pub(super) fn run_behavioral_analysis(
                 continue;
             }
         }
+        with_findings += 1;
 
         // Merge into existing result (for @lpm.dev) or create new entry (npm).
         // Key by "name@version" so different versions of the same package stay separate.
@@ -327,4 +326,50 @@ pub(super) fn analysis_to_issues(
     }
 
     issues
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::audit::discovery::{ManagerKind, ScanMode};
+
+    #[test]
+    fn behavioral_summary_counts_only_findings_that_survive_level_filter() {
+        let project = tempfile::tempdir().unwrap();
+        let package_dir = project.path().join("node_modules/info-only");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"info-only","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("index.js"), "module.exports = 1;\n").unwrap();
+        let discovery = DiscoveryResult {
+            manager: ManagerKind::FallbackNodeModules,
+            lockfile_path: None,
+            project_root: project.path().to_path_buf(),
+            is_degraded: true,
+            is_yarn_pnp: false,
+            packages: vec![DiscoveredPackage {
+                name: "info-only".to_string(),
+                version: "1.0.0".to_string(),
+                path: "node_modules/info-only".to_string(),
+                integrity: None,
+                patch_sha256: None,
+                resolved_url: None,
+                scan_mode: ScanMode::FullLocal,
+                is_dev: false,
+                is_optional: false,
+                dependencies: Vec::new(),
+            }],
+        };
+        let mut results = Vec::new();
+
+        let summary =
+            run_behavioral_analysis(&discovery, &mut results, &[], false, Some(AuditLevel::High));
+
+        assert_eq!(summary.packages_scanned, 1);
+        assert_eq!(summary.packages_with_findings, 0);
+        assert!(results.is_empty());
+    }
 }

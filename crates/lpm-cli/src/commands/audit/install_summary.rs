@@ -49,14 +49,22 @@ pub async fn run_install_summary(
     let mut results: Vec<AuditResult> = Vec::new();
     if !lpm_packages.is_empty() {
         let names: Vec<String> = lpm_packages.iter().map(|(n, _)| n.clone()).collect();
-        let metadata_map = client.batch_metadata(&names).await.unwrap_or_default();
+        let metadata_map = client.batch_metadata(&names).await.map_err(|error| {
+            LpmError::Registry(format!(
+                "LPM registry metadata lookup failed during audit-after-install: {error}"
+            ))
+        })?;
         for (name, version) in &lpm_packages {
-            let Some(metadata) = metadata_map.get(name) else {
-                continue;
-            };
-            let Some(ver_meta) = metadata.version(version).or_else(|| metadata.latest()) else {
-                continue;
-            };
+            let metadata = metadata_map.get(name).ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "LPM registry returned no metadata for installed package {name}@{version}"
+                ))
+            })?;
+            let ver_meta = metadata.version(version).ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "LPM registry metadata omitted installed version {name}@{version}"
+                ))
+            })?;
             let mut issues: Vec<AuditIssue> = Vec::new();
             collect_registry_issues(ver_meta, &mut issues);
             results.push(AuditResult {
@@ -102,10 +110,20 @@ pub async fn run_install_summary(
         /* level */ None,
     )
     .await;
+    if let Some(reason) = osv_outcome.degraded_reason {
+        return Err(LpmError::Network(format!(
+            "audit-after-install OSV scan did not complete: {reason}"
+        )));
+    }
+    let registry_vulnerabilities = results
+        .iter()
+        .flat_map(|result| &result.issues)
+        .filter(|issue| issue.category == "vulnerability")
+        .count();
 
     Ok(Some(AuditCounts {
         packages_audited: total_packages,
-        vulnerabilities: osv_outcome.vulns.len(),
+        vulnerabilities: osv_outcome.vulns.len() + registry_vulnerabilities,
         suspicious: behavioral_results.packages_with_findings,
         elapsed_ms: started.elapsed().as_millis(),
     }))

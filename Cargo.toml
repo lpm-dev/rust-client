@@ -107,6 +107,7 @@ node-semver = "2"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+cvss = "2.2"
 
 # Error display
 miette = { version = "7", features = ["fancy"] }
