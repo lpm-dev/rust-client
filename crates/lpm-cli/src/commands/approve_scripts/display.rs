@@ -27,13 +27,11 @@ pub(super) fn print_version_diff_card_for_blocked(
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
     lpm_root: &lpm_common::LpmRoot,
 ) {
-    let Some((prior_version, binding)) =
-        trusted.latest_binding_for_candidate(
-            &blocked.name,
-            &blocked.version,
-            blocked.source.as_deref(),
-        )
-    else {
+    let Some((prior_version, binding)) = trusted.latest_binding_for_candidate(
+        &blocked.name,
+        &blocked.version,
+        blocked.source.as_deref(),
+    ) else {
         return;
     };
     let diff = crate::version_diff::compute_version_diff(prior_version, binding, blocked);

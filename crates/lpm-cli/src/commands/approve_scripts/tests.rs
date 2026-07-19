@@ -529,10 +529,7 @@ async fn approve_scripts_yes_approves_everything_and_writes_rich_form() {
     assert!(map.contains_key(&sharp_key));
     // Both bindings preserved
     assert_eq!(map[&esbuild_key]["scriptHash"], "sha256-esbuild-hash");
-    assert_eq!(
-        map[&esbuild_key]["integrity"],
-        "sha512-esbuild-integrity"
-    );
+    assert_eq!(map[&esbuild_key]["integrity"], "sha512-esbuild-integrity");
 }
 
 #[tokio::test]
@@ -638,10 +635,7 @@ async fn approve_scripts_specific_package_by_name_approves_only_that_one() {
         .as_object()
         .expect("must be Rich");
     let esbuild_key = blocked_approval_key("esbuild", "0.25.1");
-    assert!(
-        map.contains_key(&esbuild_key),
-        "esbuild must be approved"
-    );
+    assert!(map.contains_key(&esbuild_key), "esbuild must be approved");
     assert!(
         !map.contains_key(&blocked_approval_key("sharp", "0.33.0")),
         "sharp must NOT be approved (was not the target)"
@@ -1233,12 +1227,8 @@ async fn e2e_install_block_review_approve_yes_then_install_is_silent() {
         .await
         .unwrap();
     let manifest = read_manifest(&project.path().join("package.json"));
-    let esbuild_key = TrustedDependencies::rich_key_for_identity(
-        "esbuild",
-        "0.25.1",
-        None,
-        Some("sha512-x"),
-    );
+    let esbuild_key =
+        TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, Some("sha512-x"));
     assert!(
         manifest["lpm"]["trustedDependencies"][esbuild_key.as_str()].is_object(),
         "yes mode must write the rich entry"
@@ -1494,12 +1484,7 @@ async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
     let td = &manifest["lpm"]["trustedDependencies"];
     assert!(td.is_object(), "must be Rich form after first approval");
     let map = td.as_object().unwrap();
-    let esbuild_key = TrustedDependencies::rich_key_for_identity(
-        "esbuild",
-        "0.25.1",
-        None,
-        None,
-    );
+    let esbuild_key = TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, None);
     assert!(map.contains_key(&esbuild_key), "new approval");
     assert!(
         map.contains_key("sharp@*"),
@@ -1624,12 +1609,8 @@ async fn e2e_yes_approves_all_green_and_does_not_refuse() {
         .expect("all-green --yes must succeed");
 
     let manifest = read_manifest(&project.path().join("package.json"));
-    let typescript_key = TrustedDependencies::rich_key_for_identity(
-        "typescript",
-        "5.0.0",
-        None,
-        Some("sha512-t"),
-    );
+    let typescript_key =
+        TrustedDependencies::rich_key_for_identity("typescript", "5.0.0", None, Some("sha512-t"));
     assert!(
         manifest["lpm"]["trustedDependencies"][typescript_key.as_str()].is_object(),
         "green package must be approved after --yes"

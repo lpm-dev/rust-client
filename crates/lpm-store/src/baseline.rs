@@ -82,12 +82,7 @@ pub struct V2BaselineIndex {
 }
 
 impl V2BaselineIndex {
-    fn insert(
-        &mut self,
-        name: String,
-        version: String,
-        baseline: InstalledPackageBaseline,
-    ) {
+    fn insert(&mut self, name: String, version: String, baseline: InstalledPackageBaseline) {
         let source_sri = baseline.integrity.clone();
         let coords = (name.clone(), version.clone());
         match self.unique_source_by_coords.entry(coords) {
@@ -348,8 +343,11 @@ impl V2BaselineIndex {
                 .get(&(name.to_string(), version.to_string()))?
                 .as_deref()?,
         };
-        self.by_identity
-            .get(&(name.to_string(), version.to_string(), source_sri.to_string()))
+        self.by_identity.get(&(
+            name.to_string(),
+            version.to_string(),
+            source_sri.to_string(),
+        ))
     }
 }
 
@@ -787,15 +785,14 @@ mod tests {
         std::fs::write(pkg_dir.join("package.json"), r#"{"name":"legacy"}"#).unwrap();
 
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
-        let resolved =
-            find_installed_package_baseline_indexed(
-                &index,
-                &lpm_root,
-                "legacy",
-                "1.0.0",
-                Some("sha512-stub"),
-            )
-                .expect("v1 fallback must populate the result");
+        let resolved = find_installed_package_baseline_indexed(
+            &index,
+            &lpm_root,
+            "legacy",
+            "1.0.0",
+            Some("sha512-stub"),
+        )
+        .expect("v1 fallback must populate the result");
         assert_eq!(resolved.layout, PackageBaselineLayout::V1);
         assert_eq!(
             resolved.package_dir, resolved.pristine_dir,

@@ -193,12 +193,7 @@ pub(super) fn prepare_live_package_dir(
     store_root: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> Result<PathBuf, String> {
-    let live = live_package_dir(
-        project_dir,
-        identity,
-        store_path,
-        baseline_index,
-    );
+    let live = live_package_dir(project_dir, identity, store_path, baseline_index);
 
     let is_v2_link_entry = path_resolves_under(&live, &v2_links_root(store_root));
     if !is_v2_link_entry && path_lives_in_protected_store_area(&live, store_root) {

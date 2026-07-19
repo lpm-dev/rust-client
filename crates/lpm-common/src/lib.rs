@@ -32,9 +32,7 @@ pub use paths::{
 };
 pub use privilege::{enforce_sudo_policy, evaluate_sudo_policy};
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
-pub use symlink::{
-    create_dir_symlink_or_junction, create_symlink, remove_dir_symlink_or_junction,
-};
+pub use symlink::{create_dir_symlink_or_junction, create_symlink, remove_dir_symlink_or_junction};
 
 /// The LPM scope prefix. All LPM packages live under this scope.
 pub const LPM_SCOPE: &str = "@lpm.dev";

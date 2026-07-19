@@ -17,9 +17,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{
-    TempProject, lpm_spawnable_with_registry, lpm_with_registry, write_signed_unlock,
-};
+use support::{TempProject, lpm_spawnable_with_registry, lpm_with_registry, write_signed_unlock};
 
 /// Mount a scripted package on the mock registry. The package
 /// declares a `postinstall` script in its `package.json` — this is

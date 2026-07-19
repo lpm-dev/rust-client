@@ -1032,8 +1032,8 @@ pub(super) async fn run_online_fetch_phase(
             )> = Vec::new();
 
             for p in &packages {
-                let Some((approved_version, reference_binding)) =
-                    trusted.provenance_reference_for_candidate_identity(
+                let Some((approved_version, reference_binding)) = trusted
+                    .provenance_reference_for_candidate_identity(
                         &p.name,
                         &p.version,
                         Some(&p.source),

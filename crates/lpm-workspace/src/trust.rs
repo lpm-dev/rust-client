@@ -247,10 +247,7 @@ impl TrustedDependencies {
     }
 
     /// Stable identity token for source-qualified Rich entries.
-    pub fn rich_identity_token(
-        source: Option<&str>,
-        integrity: Option<&str>,
-    ) -> Option<String> {
+    pub fn rich_identity_token(source: Option<&str>, integrity: Option<&str>) -> Option<String> {
         if source.is_none() && integrity.is_none() {
             return None;
         }
@@ -407,9 +404,7 @@ impl TrustedDependencies {
                 // package under the inherited name-only approval. See the
                 // method docstring for the cross-version trust laundering
                 // rationale.
-                if let Some(stored) =
-                    Self::binding_for_map(map, name, version, source, integrity)
-                {
+                if let Some(stored) = Self::binding_for_map(map, name, version, source, integrity) {
                     // Field-by-field check. A None field on either side is
                     // a wildcard — only mismatches between two SET values
                     // count as drift. Legacy-upgrade-friendly contract.
@@ -616,20 +611,20 @@ impl TrustedDependencies {
             key != coordinate_key && map.remove(&coordinate_key).is_some();
         let replaced_identity_binding = map
             .insert(
-            key,
-            TrustedDependencyBinding {
-                source: meta.source,
-                integrity: meta.integrity,
-                script_hash: meta.script_hash,
-                provenance_at_approval: meta.provenance_at_approval,
-                behavioral_tags_hash: meta.behavioral_tags_hash,
-                behavioral_tags: meta.behavioral_tags,
-                // `None` is valid: baseline approval with no extras requested.
-                // The match rule interprets `None` as "approved baseline only."
-                capability_hash: meta.capability_hash,
-            },
-        )
-        .is_some();
+                key,
+                TrustedDependencyBinding {
+                    source: meta.source,
+                    integrity: meta.integrity,
+                    script_hash: meta.script_hash,
+                    provenance_at_approval: meta.provenance_at_approval,
+                    behavioral_tags_hash: meta.behavioral_tags_hash,
+                    behavioral_tags: meta.behavioral_tags,
+                    // `None` is valid: baseline approval with no extras requested.
+                    // The match rule interprets `None` as "approved baseline only."
+                    capability_hash: meta.capability_hash,
+                },
+            )
+            .is_some();
         migrated_coordinate_binding || replaced_identity_binding
     }
 
@@ -1151,12 +1146,8 @@ mod tests {
             panic!("approve must upgrade to Rich");
         };
         assert_eq!(map.len(), 1);
-        let key = TrustedDependencies::rich_key_for_identity(
-            "esbuild",
-            "0.25.1",
-            None,
-            Some("sha512-x"),
-        );
+        let key =
+            TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, Some("sha512-x"));
         let binding = map.get(&key).unwrap();
         assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
         assert_eq!(binding.script_hash.as_deref(), Some("sha256-y"));
@@ -1181,12 +1172,8 @@ mod tests {
         let TrustedDependencies::Rich(map) = &td else {
             panic!("expected Rich");
         };
-        let key = TrustedDependencies::rich_key_for_identity(
-            "esbuild",
-            "0.25.1",
-            None,
-            Some("sha512-x"),
-        );
+        let key =
+            TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, Some("sha512-x"));
         let binding = map.get(&key).unwrap();
         assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
         assert_eq!(binding.script_hash.as_deref(), Some("sha256-new"));
@@ -1279,12 +1266,14 @@ mod tests {
         };
         assert!(was_present);
         assert!(!map.contains_key("react@19.0.0"));
-        assert!(map.contains_key(&TrustedDependencies::rich_key_for_identity(
-            "react",
-            "19.0.0",
-            Some("registry+https://registry.npmjs.org"),
-            Some("sha512-react"),
-        )));
+        assert!(
+            map.contains_key(&TrustedDependencies::rich_key_for_identity(
+                "react",
+                "19.0.0",
+                Some("registry+https://registry.npmjs.org"),
+                Some("sha512-react"),
+            ))
+        );
     }
 
     /// Legacy `@*` preserve keys remain visible to lenient lookup but do

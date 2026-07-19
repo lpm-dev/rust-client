@@ -369,11 +369,8 @@ mod windows_tests {
         let external = tempfile::tempdir().unwrap();
         let sentinel = external.path().join("must-survive");
         std::fs::write(&sentinel, b"external data").unwrap();
-        create_dir_symlink_or_junction(
-            external.path(),
-            &project.path().join("node_modules"),
-        )
-        .unwrap();
+        create_dir_symlink_or_junction(external.path(), &project.path().join("node_modules"))
+            .unwrap();
 
         reconcile_project_node_modules(project.path(), &[], None, false).unwrap();
 

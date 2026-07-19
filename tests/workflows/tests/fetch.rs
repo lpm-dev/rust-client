@@ -4,8 +4,7 @@ mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{
-    TempProject, lpm_spawnable_with_registry, lpm_with_registry,
-    write_npm_firewall_global_config,
+    TempProject, lpm_spawnable_with_registry, lpm_with_registry, write_npm_firewall_global_config,
 };
 
 const PACKAGE_JSON: &str = r#"{
@@ -260,16 +259,12 @@ async fn fetch_v1_waits_for_the_store_lock_before_downloading_or_replacing_coord
     let lockfile = seed_lockfile(&mock).await;
     let project = project_with_lockfile(&lockfile);
     std::fs::create_dir_all(project.store_dir()).unwrap();
-    let store_lock = lpm_common::acquire_exclusive_lock(
-        project.store_dir().join(".gc.lock"),
-    )
-    .unwrap();
+    let store_lock =
+        lpm_common::acquire_exclusive_lock(project.store_dir().join(".gc.lock")).unwrap();
     let requests_before = tarball_request_count(&mock, "ms", "2.1.3").await;
 
     let mut command = lpm_spawnable_with_registry(&project, &mock.url());
-    command
-        .env("LPM_STORE_VERSION", "v1")
-        .args(["fetch"]);
+    command.env("LPM_STORE_VERSION", "v1").args(["fetch"]);
     let child = command.spawn().expect("spawn lpm fetch");
 
     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
