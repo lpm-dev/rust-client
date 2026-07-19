@@ -48,7 +48,7 @@ use self::build_cache::{
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
 pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
-use self::package_dir::prepare_live_package_dir;
+use self::package_dir::{PackageLookupIdentity, prepare_live_package_dir};
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
 use self::scripts::{
@@ -58,7 +58,9 @@ use self::scripts::{
     warn_stale_trusted_deps, widen_to_build_by_policy,
 };
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
-pub(crate) use self::trust::{TrustReason, evaluate_trust};
+#[cfg(test)]
+pub(crate) use self::trust::evaluate_trust;
+pub(crate) use self::trust::{TrustReason, evaluate_trust_for_identity};
 
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
@@ -184,7 +186,7 @@ pub(crate) async fn run_with_report(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_under_store_lock(
+pub(crate) async fn run_under_store_lock(
     project_dir: &Path,
     specific_packages: &[String],
     all: bool,
@@ -301,6 +303,7 @@ async fn run_under_store_lock(
             &lpm_root,
             &lp.name,
             &lp.version,
+            lp.integrity.as_deref(),
         ) {
             Some(baseline) => baseline,
             None => continue,
@@ -337,10 +340,11 @@ async fn run_under_store_lock(
         // `is_scope_trusted` scope glob AND the green-tier auto-
         // trust path (*active only under
         // [`ScriptPolicy::Triage`]).
-        let trust_reason = evaluate_trust(
+        let trust_reason = evaluate_trust_for_identity(
             &pkg_dir,
             &lp.name,
             &lp.version,
+            lp.source.as_deref(),
             lp.integrity.as_deref(),
             &scripts,
             &policy,
@@ -1155,9 +1159,12 @@ async fn run_under_store_lock(
         // Windows (always copies) get a no-op return.
         let live_pkg_dir = match prepare_live_package_dir(
             project_dir,
-            &pkg.name,
-            &pkg.version,
-            pkg.wrapper_id.as_deref(),
+            PackageLookupIdentity::new(
+                &pkg.name,
+                &pkg.version,
+                pkg.wrapper_id.as_deref(),
+                Some(&pkg.source_integrity),
+            ),
             &pkg.store_path,
             &store_root,
             Some(&baseline_index),

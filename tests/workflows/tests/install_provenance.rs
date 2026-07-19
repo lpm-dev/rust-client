@@ -25,7 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
 use support::assertions;
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_with_registry, write_signed_unlock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -272,6 +272,69 @@ fn write_manifest_without_approval(project: &TempProject) {
     project.write_file(
         "package.json",
         &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn install_provenance_drift_never_routes_a_local_source_through_a_registry() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+          "name": "local-provenance-routing",
+          "version": "1.0.0",
+          "dependencies": { "private-local": "file:./private-local" },
+          "lpm": {
+            "trustedDependencies": {
+              "private-local@1.0.0": {
+                "integrity": "sha512-prior-source",
+                "scriptHash": "sha256-prior-script",
+                "provenanceAtApproval": {
+                  "present": true,
+                  "publisher": "github:private/private-local",
+                  "workflowPath": ".github/workflows/publish.yml",
+                  "workflowRef": "refs/tags/v1.0.0"
+                }
+              }
+            }
+          }
+        }"#,
+    );
+    project.write_file(
+        "private-local/package.json",
+        r#"{"name":"private-local","version":"1.0.0","main":"index.js"}"#,
+    );
+    project.write_file("private-local/index.js", "module.exports = 'private';\n");
+    write_signed_unlock(&project, &["trust-bulk-approve"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run local-source install");
+    assert!(
+        output.status.success(),
+        "local-source install failed before provenance routing completed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let private_requests: Vec<String> = mock
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .filter(|path| path.contains("private-local"))
+        .collect();
+    assert!(
+        private_requests.is_empty(),
+        "local source identity must not trigger a registry metadata lookup; requests: {private_requests:?}; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

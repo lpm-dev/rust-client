@@ -628,7 +628,13 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                 return None;
             }
 
-            let pkg_dir = resolve_blocked_package_dir(store, name, version, extras.baseline_index);
+            let pkg_dir = resolve_blocked_package_dir(
+                store,
+                name,
+                version,
+                integrity.as_deref(),
+                extras.baseline_index,
+            );
 
             let script_data = compute_script_hash_with_phase_bodies(&pkg_dir)?;
             let script_hash = script_data.hash;
@@ -671,11 +677,15 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                 .map(|(_, body)| lpm_security::static_gate::classify_with_context(body, Some(&ctx)))
                 .reduce(lpm_security::triage::StaticTier::worse_of);
 
+            let entry = metadata.get(name, version, integrity.as_deref());
+            let source = entry.and_then(|entry| entry.source.as_deref());
+
             // Strict gate query. binds approvals to
             // (name, version, integrity, script_hash).
-            let trust = policy.can_run_scripts_strict(
+            let trust = policy.can_run_scripts_strict_for_identity(
                 name,
                 version,
+                source,
                 integrity.as_deref(),
                 Some(&script_hash),
             );
@@ -691,7 +701,12 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                 // with CapabilityNotApproved downstream — no remediation
                 // path for the user.
                 TrustMatch::Strict => {
-                    let binding = policy.trusted_dependencies.get_binding(name, version);
+                    let binding = policy.trusted_dependencies.get_binding(
+                        name,
+                        version,
+                        source,
+                        integrity.as_deref(),
+                    );
                     if requested_capabilities
                         .requires_review_despite_strict_match(user_bound, binding)
                     {
@@ -739,7 +754,6 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             // populates `metadata` from the same registry responses
             // the cooldown check already fetched, so this is a
             // memory-only hash-map lookup per package.
-            let entry = metadata.get(name, version, integrity.as_deref());
             Some(BlockedPackage {
                 name: name.clone(),
                 version: version.clone(),
@@ -783,10 +797,11 @@ fn resolve_blocked_package_dir(
     store: &PackageStore,
     name: &str,
     version: &str,
+    integrity: Option<&str>,
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
 ) -> PathBuf {
     baseline_index
-        .and_then(|index| index.lookup(name, version))
+        .and_then(|index| index.lookup(name, version, integrity))
         .map_or_else(
             || store.package_dir(name, version),
             |baseline| baseline.package_dir.clone(),

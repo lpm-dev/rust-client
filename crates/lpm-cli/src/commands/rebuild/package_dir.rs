@@ -1,11 +1,33 @@
 use lpm_store::V2BaselineIndex;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy)]
+pub(super) struct PackageLookupIdentity<'a> {
+    pub(super) name: &'a str,
+    pub(super) version: &'a str,
+    pub(super) wrapper_id: Option<&'a str>,
+    pub(super) source_integrity: Option<&'a str>,
+}
+
+impl<'a> PackageLookupIdentity<'a> {
+    pub(super) fn new(
+        name: &'a str,
+        version: &'a str,
+        wrapper_id: Option<&'a str>,
+        source_integrity: Option<&'a str>,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            wrapper_id,
+            source_integrity,
+        }
+    }
+}
+
 pub(super) fn live_package_dir(
     project_dir: &Path,
-    name: &str,
-    version: &str,
-    wrapper_id: Option<&str>,
+    identity: PackageLookupIdentity<'_>,
     store_path: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
@@ -19,9 +41,7 @@ pub(super) fn live_package_dir(
         .map(|root| lpm_store::v2::Store::from_lpm_root(&root));
     live_package_dir_with_v2(
         project_dir,
-        name,
-        version,
-        wrapper_id,
+        identity,
         store_path,
         v2_store.as_ref(),
         baseline_index,
@@ -42,13 +62,17 @@ pub(super) fn live_package_dir(
 /// disambiguation.
 pub(super) fn live_package_dir_with_v2(
     project_dir: &Path,
-    name: &str,
-    version: &str,
-    wrapper_id: Option<&str>,
+    identity: PackageLookupIdentity<'_>,
     store_path: &Path,
     v2_store: Option<&lpm_store::v2::Store>,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
+    let PackageLookupIdentity {
+        name,
+        version,
+        wrapper_id,
+        source_integrity,
+    } = identity;
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     let nm = project_dir.join("node_modules");
 
@@ -106,7 +130,7 @@ pub(super) fn live_package_dir_with_v2(
     // coexistence (a sibling project's patched copy can't appear in
     // a project that didn't symlink it).
     if let Some(index) = baseline_index
-        && let Some(b) = index.lookup(name, version)
+        && let Some(b) = index.lookup(name, version, source_integrity)
     {
         return b.package_dir.clone();
     }
@@ -164,18 +188,14 @@ pub(super) fn live_package_dir_with_v2(
 /// function itself stays free of UI concerns.
 pub(super) fn prepare_live_package_dir(
     project_dir: &Path,
-    pkg_name: &str,
-    pkg_version: &str,
-    wrapper_id: Option<&str>,
+    identity: PackageLookupIdentity<'_>,
     store_path: &Path,
     store_root: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> Result<PathBuf, String> {
     let live = live_package_dir(
         project_dir,
-        pkg_name,
-        pkg_version,
-        wrapper_id,
+        identity,
         store_path,
         baseline_index,
     );
@@ -183,14 +203,17 @@ pub(super) fn prepare_live_package_dir(
     let is_v2_link_entry = path_resolves_under(&live, &v2_links_root(store_root));
     if !is_v2_link_entry && path_lives_in_protected_store_area(&live, store_root) {
         return Err(format!(
-            "package {pkg_name}@{pkg_version} not linked into project — \
+            "package {}@{} not linked into project — \
              refusing to run lifecycle script inside the store. \
-             Run `lpm install` to materialize the wrapper tree, then retry."
+             Run `lpm install` to materialize the wrapper tree, then retry.",
+            identity.name, identity.version,
         ));
     }
     if !is_v2_link_entry && path_is_symlink(&live) {
         return Err(format!(
-            "package {pkg_name}@{pkg_version} resolved to a symlinked lifecycle directory at {}",
+            "package {}@{} resolved to a symlinked lifecycle directory at {}",
+            identity.name,
+            identity.version,
             live.display()
         ));
     }

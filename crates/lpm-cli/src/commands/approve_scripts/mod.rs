@@ -67,7 +67,8 @@ mod prelude {
     pub(super) use super::manifest::find_blocked_by_arg;
     #[allow(unused_imports)]
     pub(super) use super::manifest::{
-        BlockedLookup, extract_trusted_dependencies, lookup_blocked_by_arg, write_back,
+        BlockedLookup, blocked_identity_selector, extract_trusted_dependencies,
+        lookup_blocked_by_arg, write_back,
     };
     #[allow(unused_imports)]
     pub(super) use super::metadata::{

@@ -596,7 +596,7 @@ pub(super) async fn run_link_and_finish(
 
     let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
     if auto_build_attempted {
-        match crate::commands::rebuild::run_with_report(
+        match crate::commands::rebuild::run_under_store_lock(
             project_dir,
             &[],
             false,

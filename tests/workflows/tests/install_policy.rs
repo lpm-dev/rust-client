@@ -17,7 +17,9 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry, write_signed_unlock};
+use support::{
+    TempProject, lpm_spawnable_with_registry, lpm_with_registry, write_signed_unlock,
+};
 
 /// Mount a scripted package on the mock registry. The package
 /// declares a `postinstall` script in its `package.json` — this is
@@ -532,6 +534,44 @@ async fn install_policy_allow_reports_no_blocked_packages_after_running_dependen
         build_state["blocked_packages"],
         serde_json::json!([]),
         "successful allow-policy auto-build must persist an empty blocked set: {build_state}",
+    );
+}
+
+#[tokio::test]
+async fn install_policy_allow_v1_completes_auto_build_without_reacquiring_the_store_lock() {
+    let project = empty_project_with_dep("scripted-marker");
+    let mock = MockRegistry::start().await;
+    mount_marker_scripted_pkg(&mock, "scripted-marker").await;
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env("LPM_STORE_VERSION", "v1").args([
+        "install",
+        "--policy=allow",
+        "--auto-build",
+        "--no-sandbox",
+    ]);
+    let child = command.spawn().expect("spawn v1 allow-policy install");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("v1 auto-build must not deadlock on its own store lock")
+    .expect("join v1 auto-build process");
+
+    assert!(
+        output.status.success(),
+        "v1 auto-build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/scripted-marker/postinstall-marker.txt")
+            .exists(),
+        "v1 auto-build must execute the dependency postinstall after lock-aware rebuild entry",
     );
 }
 

@@ -65,9 +65,7 @@ fn live_package_dir_resolves_isolated_layout() {
 
     let resolved = live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None),
         &store_fallback,
         None,
     );
@@ -93,9 +91,7 @@ fn live_package_dir_resolves_isolated_scoped_name() {
 
     let resolved = live_package_dir(
         project.path(),
-        "@esbuild/darwin-arm64",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("@esbuild/darwin-arm64", "0.21.5", None, None),
         &store_fallback,
         None,
     );
@@ -115,9 +111,7 @@ fn live_package_dir_resolves_hoisted_layout() {
 
     let resolved = live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None),
         &store_fallback,
         None,
     );
@@ -145,9 +139,7 @@ fn live_package_dir_falls_back_to_store_when_unlinked() {
 
     let resolved = live_package_dir_with_v2(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None),
         &store_fallback,
         None,
         None,
@@ -179,9 +171,7 @@ fn live_package_dir_resolves_v2_direct_dep_via_project_symlink() {
 
     let resolved = live_package_dir(
         project.path(),
-        "express",
-        "4.21.0",
-        None,
+        PackageLookupIdentity::new("express", "4.21.0", None, None),
         &store_fallback,
         None,
     );
@@ -239,7 +229,7 @@ fn live_package_dir_resolves_v2_transitive_via_store_walk() {
     let entry = v2_store
         .populate_link_entry(LinkEntryRequest {
             graph_key: std::sync::Arc::new(key),
-            source_sri: sri,
+            source_sri: sri.clone(),
             object_dir,
             deps: vec![],
             platform: std::sync::Arc::new(lpm_store::v2::LinkMetaPlatform {
@@ -254,9 +244,7 @@ fn live_package_dir_resolves_v2_transitive_via_store_walk() {
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
     let resolved = live_package_dir_with_v2(
         project.path(),
-        "deeply-nested",
-        "1.0.0",
-        None,
+        PackageLookupIdentity::new("deeply-nested", "1.0.0", None, Some(&sri)),
         &store_fallback,
         Some(&v2_store),
         None,
@@ -283,9 +271,7 @@ fn live_package_dir_prefers_isolated_when_both_exist() {
 
     let resolved = live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None),
         &store_fallback,
         None,
     );
@@ -317,9 +303,7 @@ fn prepare_live_package_dir_returns_isolated_path_when_present() {
 
     let resolved = prepare_live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None),
         &store_pkg,
         store_root.path(),
         None,
@@ -351,9 +335,7 @@ fn prepare_live_package_dir_errors_when_unlinked() {
 
     let err = prepare_live_package_dir(
         project.path(),
-        "missing-pkg",
-        "1.0.0",
-        None,
+        PackageLookupIdentity::new("missing-pkg", "1.0.0", None, None),
         &store_pkg,
         store_root.path(),
         None,
@@ -412,9 +394,7 @@ fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
 
     prepare_live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None),
         &store_pkg,
         store_root.path(),
         None,
@@ -1362,7 +1342,7 @@ fn auto_build_call_site_threads_effective_policy() {
         "/src/commands/install/lifecycle.rs"
     ));
     const TRUST_CALL: &str = "crate::commands::rebuild::all_scripted_packages_trusted(";
-    const REBUILD_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const REBUILD_CALL: &str = "crate::commands::rebuild::run_under_store_lock(";
     const POLICY_ARG: &str = "effective_policy";
 
     let trust_pos = src

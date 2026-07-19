@@ -167,24 +167,19 @@ pub async fn run(
     )
     .await?;
 
-    let client = Arc::new(client.clone_with_config());
-    let store = Arc::new(store);
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
-    let mut tasks = JoinSet::new();
-
-    for target in targets {
-        let client = Arc::clone(&client);
-        let store = Arc::clone(&store);
-        let store_v2 = store_v2.clone();
-        let semaphore = Arc::clone(&semaphore);
-        tasks.spawn(async move { fetch_one(client, store, store_v2, semaphore, target).await });
-    }
-
-    while let Some(joined) = tasks.join_next().await {
-        let result = joined
-            .map_err(|e| LpmError::Registry(format!("fetch worker failed to join: {e}")))??;
-        results.push(result);
-    }
+    let v2_enabled = store_v2.is_some();
+    let fetches = fetch_targets_under_store_lock(
+        Arc::new(client.clone_with_config()),
+        Arc::new(store),
+        store_v2,
+        targets,
+    );
+    let mut fetched = if v2_enabled {
+        lpm_common::with_shared_lock_async(lpm_root.store_lock(), fetches).await?
+    } else {
+        lpm_common::with_exclusive_lock_async(lpm_root.store_lock(), fetches).await?
+    };
+    results.append(&mut fetched);
 
     results.sort_by(|a, b| {
         a.name
@@ -223,6 +218,32 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+async fn fetch_targets_under_store_lock(
+    client: Arc<RegistryClient>,
+    store: Arc<PackageStore>,
+    store_v2: Option<Arc<lpm_store::v2::Store>>,
+    targets: Vec<FetchTarget>,
+) -> Result<Vec<FetchPackageResult>, LpmError> {
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
+    let mut tasks = JoinSet::new();
+    for target in targets {
+        let client = Arc::clone(&client);
+        let store = Arc::clone(&store);
+        let store_v2 = store_v2.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.spawn(async move { fetch_one(client, store, store_v2, semaphore, target).await });
+    }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    while let Some(joined) = tasks.join_next().await {
+        results.push(
+            joined
+                .map_err(|e| LpmError::Registry(format!("fetch worker failed to join: {e}")))??,
+        );
+    }
+    Ok(results)
 }
 
 fn v2_store_for_fetch(lpm_root: &LpmRoot) -> Result<Option<Arc<lpm_store::v2::Store>>, LpmError> {

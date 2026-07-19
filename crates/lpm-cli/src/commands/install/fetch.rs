@@ -1033,7 +1033,12 @@ pub(super) async fn run_online_fetch_phase(
 
             for p in &packages {
                 let Some((approved_version, reference_binding)) =
-                    trusted.provenance_reference_for_candidate(&p.name, &p.version)
+                    trusted.provenance_reference_for_candidate_identity(
+                        &p.name,
+                        &p.version,
+                        Some(&p.source),
+                        p.integrity.as_deref(),
+                    )
                 else {
                     continue;
                 };
@@ -1057,40 +1062,57 @@ pub(super) async fn run_online_fetch_phase(
                 // Extract the candidate version's attestation ref
                 // from the resolver's TTL cache (same pattern as the
                 // cooldown gate above).
-                let attestation_ref = if p.is_lpm {
-                    match lpm_common::PackageName::parse(&p.name) {
-                        Ok(pkg_name) => lpm_registry::timing::with_metadata_purpose(
+                let metadata_route = crate::provenance_fetch::approval_metadata_route(
+                    &arc_client,
+                    &route_table,
+                    &p.name,
+                    Some(&p.source),
+                );
+                let metadata = match metadata_route {
+                    crate::provenance_fetch::ApprovalMetadataRoute::LpmPackage => {
+                        let Ok(pkg_name) = lpm_common::PackageName::parse(&p.name) else {
+                            continue;
+                        };
+                        lpm_registry::timing::with_metadata_purpose(
                             lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
                             arc_client.get_package_metadata(&pkg_name),
                         )
                         .await
                         .ok()
-                        .and_then(|meta| {
-                            meta.versions
-                                .get(&p.version)
-                                .and_then(|v| v.dist.as_ref())
-                                .and_then(|d| d.attestations.clone())
-                        }),
-                        Err(_) => None,
                     }
-                } else {
-                    // follow-up: route via RouteTable so
-                    // the provenance-drift gate doesn't fall through to
-                    // public npm for a custom-registry package.
-                    let route = route_table.route_for_package(&p.name);
-                    lpm_registry::timing::with_metadata_purpose(
-                        lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
-                        arc_client.get_npm_metadata_routed(&p.name, route),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|meta| {
-                        meta.versions
-                            .get(&p.version)
-                            .and_then(|v| v.dist.as_ref())
-                            .and_then(|d| d.attestations.clone())
-                    })
+                    crate::provenance_fetch::ApprovalMetadataRoute::LpmProxyOnly => {
+                        lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_npm_package_metadata_proxy_only(&p.name),
+                        )
+                        .await
+                        .ok()
+                    }
+                    crate::provenance_fetch::ApprovalMetadataRoute::NpmDirect => {
+                        lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_npm_metadata_direct(&p.name),
+                        )
+                        .await
+                        .ok()
+                    }
+                    crate::provenance_fetch::ApprovalMetadataRoute::Custom(route) => {
+                        lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_npm_metadata_routed(&p.name, route),
+                        )
+                        .await
+                        .ok()
+                    }
+                    crate::provenance_fetch::ApprovalMetadataRoute::NonRegistry
+                    | crate::provenance_fetch::ApprovalMetadataRoute::Unavailable => continue,
                 };
+                let attestation_ref = metadata.and_then(|meta| {
+                    meta.versions
+                        .get(&p.version)
+                        .and_then(|v| v.dist.as_ref())
+                        .and_then(|d| d.attestations.clone())
+                });
 
                 // When the operator skip-listed this name (CLI
                 // `--unverified-provenance`) OR set the fleet-wide

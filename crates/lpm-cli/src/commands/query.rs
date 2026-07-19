@@ -87,6 +87,7 @@ pub async fn run(
                     &lpm_root_inner,
                     &pkg.name,
                     &pkg.version,
+                    pkg.integrity.as_deref(),
                 )
                 .map_or_else(
                     || inv.discovery.project_root.join(&pkg.path),

@@ -209,12 +209,37 @@ impl SecurityPolicy {
             .matches_strict(name, version, integrity, script_hash)
     }
 
+    /// Source-qualified strict gate for project install identities.
+    pub fn can_run_scripts_strict_for_identity(
+        &self,
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> TrustMatch {
+        self.trusted_dependencies.matches_strict_for_identity(
+            name,
+            version,
+            source,
+            integrity,
+            script_hash,
+        )
+    }
+
     /// Look up the rich binding for a specific `name@version` so the
     /// capability-hash enforcement path can inspect
     /// [`TrustedDependencyBinding::capability_hash`]. Returns `None`
     /// for legacy-bare-name approvals and for packages with no approval.
-    pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
-        self.trusted_dependencies.get_binding(name, version)
+    pub fn get_binding(
+        &self,
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        integrity: Option<&str>,
+    ) -> Option<&TrustedDependencyBinding> {
+        self.trusted_dependencies
+            .get_binding(name, version, source, integrity)
     }
 
     /// Check if a package was published too recently.

@@ -669,6 +669,7 @@ async fn install_with_audit_after_install_flag_appends_summary_line() {
         r#"{"name":"audit-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
         .args([
             "install",
             "--audit-after-install",

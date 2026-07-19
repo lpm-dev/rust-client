@@ -97,7 +97,13 @@ pub(crate) fn scriptable_package_rows(
         // v2-aware lookup, routed through the invocation-local index. See
         // [`package_baseline_dir`] for the silent-skip-vs-real-skip
         // semantic.
-        let pkg_dir = package_baseline_dir_indexed(&baseline_index, lpm_root, name, version)?;
+        let pkg_dir = package_baseline_dir_indexed(
+            &baseline_index,
+            lpm_root,
+            name,
+            version,
+            integrity.as_deref(),
+        )?;
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
@@ -133,7 +139,7 @@ pub(crate) fn scriptable_package_rows(
         // they're already untrusted.
         let capability_blocks_trust = if base_trusted {
             let binding = if strict_trust {
-                policy.get_binding(name, version)
+                policy.get_binding(name, version, None, integrity.as_deref())
             } else {
                 None // scope-trust has no binding to bind a hash to
             };
@@ -317,7 +323,13 @@ pub fn all_scripted_packages_trusted(
         // v2-aware lookup, routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
-        let pkg_dir = match package_baseline_dir_indexed(&baseline_index, lpm_root, name, version) {
+        let pkg_dir = match package_baseline_dir_indexed(
+            &baseline_index,
+            lpm_root,
+            name,
+            version,
+            integrity.as_deref(),
+        ) {
             Some(p) => p,
             None => continue,
         };

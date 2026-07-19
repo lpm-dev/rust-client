@@ -242,10 +242,46 @@ pub(crate) fn evaluate_trust(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> TrustReason {
+    evaluate_trust_for_identity(
+        package_dir,
+        name,
+        version,
+        None,
+        integrity,
+        scripts,
+        policy,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_trust_for_identity(
+    package_dir: &Path,
+    name: &str,
+    version: &str,
+    source: Option<&str>,
+    integrity: Option<&str>,
+    scripts: &HashMap<String, String>,
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    force_security_floor: bool,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> TrustReason {
     let candidate = evaluate_trust_unsuspended(
         package_dir,
         name,
         version,
+        source,
         integrity,
         scripts,
         policy,
@@ -283,7 +319,7 @@ pub(crate) fn evaluate_trust(
     // None) and missing bindings both fail this check, collapsing
     // into CapabilityNotApproved — which 6d's UX surfaces as a
     // distinct reason from Untrusted.
-    match policy.get_binding(name, version) {
+    match policy.get_binding(name, version, source, integrity) {
         Some(binding) if requested_capabilities.is_approved_by(binding) => after_force,
         _ => TrustReason::CapabilityNotApproved,
     }
@@ -299,6 +335,7 @@ pub(super) fn evaluate_trust_unsuspended(
     package_dir: &Path,
     name: &str,
     version: &str,
+    source: Option<&str>,
     integrity: Option<&str>,
     scripts: &HashMap<String, String>,
     policy: &SecurityPolicy,
@@ -309,7 +346,13 @@ pub(super) fn evaluate_trust_unsuspended(
     >,
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
-    let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash.as_deref());
+    let strict = policy.can_run_scripts_strict_for_identity(
+        name,
+        version,
+        source,
+        integrity,
+        script_hash.as_deref(),
+    );
     match strict {
         TrustMatch::Strict => return TrustReason::StrictBinding,
         TrustMatch::LegacyNameOnly => return TrustReason::LegacyName,

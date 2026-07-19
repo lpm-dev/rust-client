@@ -11,6 +11,7 @@ use crate::validation::{
     validate_bin_name, validate_bin_target,
 };
 use lpm_common::LpmError;
+use lpm_common::remove_dir_symlink_or_junction;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,7 @@ pub(crate) fn reconcile_empty_hoisted_root(project_dir: &Path) -> Result<(), Lpm
         .as_ref()
         .is_some_and(|metadata| metadata.file_type().is_symlink())
     {
-        std::fs::remove_file(&node_modules).map_err(|error| {
+        remove_dir_symlink_or_junction(&node_modules).map_err(|error| {
             LpmError::Store(format!(
                 "hoisted linker: failed to remove symlinked node_modules at {}: {error}",
                 node_modules.display()
@@ -102,6 +103,25 @@ mod empty_reconcile_tests {
             sentinel.exists(),
             "empty reconciliation must not delete through a node_modules symlink"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod empty_reconcile_windows_tests {
+    use super::*;
+
+    #[test]
+    fn empty_reconcile_removes_a_node_modules_junction_without_touching_its_target() {
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sentinel = external.path().join("must-survive");
+        std::fs::write(&sentinel, b"external data").unwrap();
+        create_symlink_or_junction(external.path(), &project.path().join("node_modules")).unwrap();
+
+        reconcile_empty_hoisted_root(project.path()).unwrap();
+
+        assert!(sentinel.exists());
+        assert!(!project.path().join("node_modules").exists());
     }
 }
 

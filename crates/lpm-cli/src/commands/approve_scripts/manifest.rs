@@ -20,6 +20,17 @@ pub(super) enum BlockedLookup<'a> {
     Ambiguous { candidates: Vec<&'a BlockedPackage> },
 }
 
+pub(super) fn blocked_identity_selector(blocked: &BlockedPackage) -> String {
+    let base = format!("{}@{}", blocked.name, blocked.version);
+    match TrustedDependencies::rich_identity_token(
+        blocked.source.as_deref(),
+        blocked.integrity.as_deref(),
+    ) {
+        Some(identity) => format!("{base}#{identity}"),
+        None => base,
+    }
+}
+
 pub(super) fn lookup_blocked_by_arg<'a>(
     blocked: &'a [BlockedPackage],
     arg: &str,
@@ -28,10 +39,26 @@ pub(super) fn lookup_blocked_by_arg<'a>(
         // arg COULD be `name@version` OR a scoped name `@scope/pkg`.
         // Distinguish: if the `@` is at position 0, it's the scope marker.
         if at > 0 {
-            let (name, version) = (&arg[..at], &arg[at + 1..]);
+            let (name, version_and_identity) = (&arg[..at], &arg[at + 1..]);
+            let (version, identity) = version_and_identity
+                .split_once('#')
+                .map_or((version_and_identity, None), |(version, identity)| {
+                    (version, Some(identity))
+                });
             let matches: Vec<&BlockedPackage> = blocked
                 .iter()
-                .filter(|b| b.name == name && b.version == version)
+                .filter(|b| {
+                    b.name == name
+                        && b.version == version
+                        && identity.is_none_or(|expected| {
+                            TrustedDependencies::rich_identity_token(
+                                b.source.as_deref(),
+                                b.integrity.as_deref(),
+                            )
+                            .as_deref()
+                                == Some(expected)
+                        })
+                })
                 .collect();
             return match matches.as_slice() {
                 [] => BlockedLookup::NotFound,

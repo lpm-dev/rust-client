@@ -35,6 +35,7 @@ pub(super) fn approval_metadata_from_blocked(
     provenance_at_approval: Option<ProvenanceSnapshot>,
 ) -> ApprovalMetadata {
     ApprovalMetadata {
+        source: blocked.source.clone(),
         integrity: blocked.integrity.clone(),
         script_hash: blocked.script_hash.clone(),
         provenance_at_approval,
@@ -70,7 +71,12 @@ pub(super) fn approval_metadata_preserving_existing_provenance(
 ) -> ApprovalMetadata {
     let mut meta = approval_metadata_from_blocked(blocked, capability_hash, incoming);
     if meta.provenance_at_approval.is_none()
-        && let Some(existing) = trusted.binding_for_exact_version(&blocked.name, &blocked.version)
+        && let Some(existing) = trusted.binding_for_exact_identity(
+            &blocked.name,
+            &blocked.version,
+            blocked.source.as_deref(),
+            blocked.integrity.as_deref(),
+        )
         && let Some(prior) = existing.provenance_at_approval.clone()
     {
         meta.provenance_at_approval = Some(prior);

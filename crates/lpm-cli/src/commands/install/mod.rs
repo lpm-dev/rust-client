@@ -1640,7 +1640,9 @@ async fn run_with_options_under_store_lock(
                 );
                 None
             } else {
-                match crate::commands::audit::run_install_summary(client, project_dir).await {
+                match crate::commands::audit::run_install_summary(client, project_dir, true)
+                .await
+                {
                     Ok(opt) => opt,
                     Err(e) => {
                         tracing::warn!("audit-after-install failed: {e}");

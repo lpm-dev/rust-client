@@ -32,9 +32,16 @@ pub(crate) fn find_project_baseline(
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
+    expected_integrity: Option<&str>,
 ) -> Option<lpm_store::InstalledPackageBaseline> {
     if let Some(index) = index {
-        return lpm_store::find_installed_package_baseline_indexed(index, lpm_root, name, version);
+        return lpm_store::find_installed_package_baseline_indexed(
+            index,
+            lpm_root,
+            name,
+            version,
+            expected_integrity,
+        );
     }
     lpm_store::find_installed_package_baseline(lpm_root, name, version)
         .ok()
@@ -152,6 +159,7 @@ impl PackageInventory {
                                     root,
                                     &pkg.name,
                                     &pkg.version,
+                                    pkg.integrity.as_deref(),
                                 )
                             })
                             .and_then(|baseline| {

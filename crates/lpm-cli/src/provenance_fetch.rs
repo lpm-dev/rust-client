@@ -47,7 +47,7 @@ use std::time::Instant;
 pub type ApprovalProvenanceKey = (String, String, Option<String>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ApprovalMetadataRoute {
+pub(crate) enum ApprovalMetadataRoute {
     LpmPackage,
     LpmProxyOnly,
     NpmDirect,
@@ -56,7 +56,7 @@ enum ApprovalMetadataRoute {
     Unavailable,
 }
 
-fn approval_metadata_route(
+pub(crate) fn approval_metadata_route(
     registry: &lpm_registry::RegistryClient,
     route_table: &lpm_registry::RouteTable,
     name: &str,

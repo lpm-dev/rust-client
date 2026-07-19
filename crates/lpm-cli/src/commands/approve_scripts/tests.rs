@@ -277,12 +277,14 @@ fn approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_
         workflow_ref: Some("refs/tags/v1.0.0".into()),
         attestation_cert_sha256: Some("sha256-leaf-prior".into()),
     };
+    let blocked = make_blocked("acme-widget", "1.0.0");
     let mut trusted = TrustedDependencies::default();
     trusted.approve_with_metadata(
         "acme-widget",
         "1.0.0",
         ApprovalMetadata {
-            integrity: Some("sha512-prior".into()),
+            source: blocked.source.clone(),
+            integrity: blocked.integrity.clone(),
             script_hash: Some("sha256-prior".into()),
             provenance_at_approval: Some(prior_snap),
             behavioral_tags_hash: None,
@@ -291,7 +293,6 @@ fn approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_
         },
     );
 
-    let blocked = make_blocked("acme-widget", "1.0.0");
     let meta = approval_metadata_preserving_existing_provenance(&trusted, &blocked, None, None);
     let preserved = meta
         .provenance_at_approval
@@ -383,6 +384,16 @@ fn make_blocked(name: &str, version: &str) -> BlockedPackage {
         behavioral_tags_hash: None,
         behavioral_tags: None,
     }
+}
+
+fn blocked_approval_key(name: &str, version: &str) -> String {
+    let blocked = make_blocked(name, version);
+    TrustedDependencies::rich_key_for_identity(
+        name,
+        version,
+        blocked.source.as_deref(),
+        blocked.integrity.as_deref(),
+    )
 }
 
 /// helper: `make_blocked` + explicit tier.
@@ -512,12 +523,14 @@ async fn approve_scripts_yes_approves_everything_and_writes_rich_form() {
     let td = &after["lpm"]["trustedDependencies"];
     assert!(td.is_object(), "must be Rich (object) form, got: {td}");
     let map = td.as_object().unwrap();
-    assert!(map.contains_key("esbuild@0.25.1"));
-    assert!(map.contains_key("sharp@0.33.0"));
+    let esbuild_key = blocked_approval_key("esbuild", "0.25.1");
+    let sharp_key = blocked_approval_key("sharp", "0.33.0");
+    assert!(map.contains_key(&esbuild_key));
+    assert!(map.contains_key(&sharp_key));
     // Both bindings preserved
-    assert_eq!(map["esbuild@0.25.1"]["scriptHash"], "sha256-esbuild-hash");
+    assert_eq!(map[&esbuild_key]["scriptHash"], "sha256-esbuild-hash");
     assert_eq!(
-        map["esbuild@0.25.1"]["integrity"],
+        map[&esbuild_key]["integrity"],
         "sha512-esbuild-integrity"
     );
 }
@@ -535,7 +548,8 @@ async fn approve_scripts_yes_emits_warning_in_json_mode() {
         .await
         .unwrap();
     let after = read_manifest(&dir.path().join("package.json"));
-    assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
+    let key = blocked_approval_key("esbuild", "0.25.1");
+    assert!(after["lpm"]["trustedDependencies"][key.as_str()].is_object());
 }
 
 #[tokio::test]
@@ -563,7 +577,7 @@ async fn approve_scripts_yes_legacy_array_upgrades_to_rich() {
     assert!(td.is_object(), "legacy array must be upgraded to Rich");
     let map = td.as_object().unwrap();
     // New approval
-    assert!(map.contains_key("esbuild@0.25.1"));
+    assert!(map.contains_key(&blocked_approval_key("esbuild", "0.25.1")));
     // Legacy entry preserved as `<name>@*`
     assert!(map.contains_key("sharp@*"));
 }
@@ -623,12 +637,13 @@ async fn approve_scripts_specific_package_by_name_approves_only_that_one() {
     let map = after["lpm"]["trustedDependencies"]
         .as_object()
         .expect("must be Rich");
+    let esbuild_key = blocked_approval_key("esbuild", "0.25.1");
     assert!(
-        map.contains_key("esbuild@0.25.1"),
+        map.contains_key(&esbuild_key),
         "esbuild must be approved"
     );
     assert!(
-        !map.contains_key("sharp@0.33.0"),
+        !map.contains_key(&blocked_approval_key("sharp", "0.33.0")),
         "sharp must NOT be approved (was not the target)"
     );
 }
@@ -652,7 +667,8 @@ async fn approve_scripts_specific_package_with_at_version_approves_only_that_one
     .unwrap();
 
     let after = read_manifest(&dir.path().join("package.json"));
-    assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
+    let key = blocked_approval_key("esbuild", "0.25.1");
+    assert!(after["lpm"]["trustedDependencies"][key.as_str()].is_object());
 }
 
 #[tokio::test]
@@ -707,6 +723,28 @@ async fn find_blocked_by_arg_handles_scoped_names_with_at_in_scope() {
 
     let by_plain = find_blocked_by_arg(&blocked, "plain");
     assert_eq!(by_plain.unwrap().name, "plain");
+}
+
+#[test]
+fn lookup_blocked_by_arg_disambiguates_same_coordinates_by_exact_identity() {
+    let mut source_a = make_blocked("react", "19.0.0");
+    source_a.source = Some("directory+./fork-a".into());
+    source_a.integrity = Some("sha512-identical".into());
+    let mut source_b = make_blocked("react", "19.0.0");
+    source_b.source = Some("directory+./fork-b".into());
+    source_b.integrity = Some("sha512-identical".into());
+    let blocked = vec![source_a, source_b];
+
+    let identity = TrustedDependencies::rich_identity_token(
+        blocked[1].source.as_deref(),
+        blocked[1].integrity.as_deref(),
+    )
+    .expect("blocked package has an exact identity");
+    let hit = lookup_blocked_by_arg(&blocked, &format!("react@19.0.0#{identity}"));
+    let BlockedLookup::Match(hit) = hit else {
+        panic!("identity-qualified selector must match exactly one blocked row");
+    };
+    assert_eq!(hit.source.as_deref(), Some("directory+./fork-b"));
 }
 
 // ── Atomic write semantics ──────────────────────────────────────
@@ -1195,8 +1233,14 @@ async fn e2e_install_block_review_approve_yes_then_install_is_silent() {
         .await
         .unwrap();
     let manifest = read_manifest(&project.path().join("package.json"));
+    let esbuild_key = TrustedDependencies::rich_key_for_identity(
+        "esbuild",
+        "0.25.1",
+        None,
+        Some("sha512-x"),
+    );
     assert!(
-        manifest["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object(),
+        manifest["lpm"]["trustedDependencies"][esbuild_key.as_str()].is_object(),
         "yes mode must write the rich entry"
     );
 
@@ -1450,7 +1494,13 @@ async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
     let td = &manifest["lpm"]["trustedDependencies"];
     assert!(td.is_object(), "must be Rich form after first approval");
     let map = td.as_object().unwrap();
-    assert!(map.contains_key("esbuild@0.25.1"), "new approval");
+    let esbuild_key = TrustedDependencies::rich_key_for_identity(
+        "esbuild",
+        "0.25.1",
+        None,
+        None,
+    );
+    assert!(map.contains_key(&esbuild_key), "new approval");
     assert!(
         map.contains_key("sharp@*"),
         "legacy entry preserved as `<name>@*`"
@@ -1574,8 +1624,14 @@ async fn e2e_yes_approves_all_green_and_does_not_refuse() {
         .expect("all-green --yes must succeed");
 
     let manifest = read_manifest(&project.path().join("package.json"));
+    let typescript_key = TrustedDependencies::rich_key_for_identity(
+        "typescript",
+        "5.0.0",
+        None,
+        Some("sha512-t"),
+    );
     assert!(
-        manifest["lpm"]["trustedDependencies"]["typescript@5.0.0"].is_object(),
+        manifest["lpm"]["trustedDependencies"][typescript_key.as_str()].is_object(),
         "green package must be approved after --yes"
     );
 }
@@ -1599,8 +1655,9 @@ async fn e2e_yes_passes_through_when_static_tier_is_none_legacy_state() {
         .expect("--yes against None-tiered (legacy) state must succeed");
 
     let manifest = read_manifest(&project.path().join("package.json"));
+    let key = blocked_approval_key("legacy-pkg", "1.0.0");
     assert!(
-        manifest["lpm"]["trustedDependencies"]["legacy-pkg@1.0.0"].is_object(),
+        manifest["lpm"]["trustedDependencies"][key.as_str()].is_object(),
         "legacy-state entry must be approved on --yes pass-through",
     );
 }
@@ -1887,7 +1944,10 @@ async fn approve_scripts_yes_skips_packages_already_strict_approved_in_manifest(
         .as_object()
         .expect("Rich form");
     assert!(map.contains_key("esbuild@0.25.1"), "esbuild preserved");
-    assert!(map.contains_key("sharp@0.33.0"), "sharp newly approved");
+    assert!(
+        map.contains_key(&blocked_approval_key("sharp", "0.33.0")),
+        "sharp newly approved"
+    );
     // The esbuild binding must NOT have been re-written from the
     // state file (which would be a no-op overwrite, but we want the
     // helper to skip already-approved entries entirely).
@@ -2018,7 +2078,8 @@ async fn approve_scripts_yes_does_not_skip_packages_with_binding_drift() {
         .unwrap();
 
     let after = read_manifest(&dir.path().join("package.json"));
-    let binding = &after["lpm"]["trustedDependencies"]["esbuild@0.25.1"];
+    let key = blocked_approval_key("esbuild", "0.25.1");
+    let binding = &after["lpm"]["trustedDependencies"][key.as_str()];
     assert_eq!(
         binding["scriptHash"], "sha256-NEW",
         "drift must trigger re-approval with the new script hash"
@@ -2055,7 +2116,8 @@ async fn approve_scripts_yes_json_emits_warning_only_in_json_warnings_field() {
         .unwrap();
 
     let after = read_manifest(&dir.path().join("package.json"));
-    assert!(after["lpm"]["trustedDependencies"]["esbuild@0.25.1"].is_object());
+    let key = blocked_approval_key("esbuild", "0.25.1");
+    assert!(after["lpm"]["trustedDependencies"][key.as_str()].is_object());
     // The function should have completed without panicking. The
     // CLI-level subprocess test verifies the stdout layer.
 }

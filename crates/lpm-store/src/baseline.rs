@@ -53,7 +53,7 @@ pub enum PackageBaselineLayout {
 }
 
 /// Invocation-local index over the v2 store's link entries, keyed by
-/// `(name, version)`.
+/// `(name, version, source_sri)`.
 ///
 /// Built once per `lpm rebuild` / `lpm approve-scripts` /
 /// `all_scripted_packages_trusted` / `scriptable_package_rows` from a
@@ -67,21 +67,44 @@ pub enum PackageBaselineLayout {
 /// global store that's 5M sidecar reads per invocation, pure waste since the
 /// link-entry layout doesn't change mid-command.
 ///
-/// **First-match semantics preserved.** When the same
-/// `(name, version)` appears under multiple graph keys (multi-source-
-/// same-coords or peer-divergent installs sharing coords), the first
-/// entry seen in `iter_link_entries()` directory order wins —
-/// matching the legacy linear scan's tie-breaking.
+/// Peer-divergent link entries with the same source SRI share one
+/// lifecycle baseline because their package bytes are identical. Distinct
+/// source SRIs remain independently addressable and an identity-free lookup
+/// fails closed when coordinates are ambiguous.
 ///
 /// Construction is best-effort: malformed sidecars are silently
 /// skipped. An empty index is cheap and safe — callers on stores
 /// with no v2 entries get an empty map and pay only the v1 fallback.
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
-    by_coords: HashMap<(String, String), InstalledPackageBaseline>,
+    by_identity: HashMap<(String, String, String), InstalledPackageBaseline>,
+    unique_source_by_coords: HashMap<(String, String), Option<String>>,
 }
 
 impl V2BaselineIndex {
+    fn insert(
+        &mut self,
+        name: String,
+        version: String,
+        baseline: InstalledPackageBaseline,
+    ) {
+        let source_sri = baseline.integrity.clone();
+        let coords = (name.clone(), version.clone());
+        match self.unique_source_by_coords.entry(coords) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(source_sri.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_deref() != Some(source_sri.as_str()) {
+                    entry.insert(None);
+                }
+            }
+        }
+        self.by_identity
+            .entry((name, version, source_sri))
+            .or_insert(baseline);
+    }
+
     /// Build a project-scoped index by walking only the link entries
     /// the project's `<project>/node_modules/` tree actually points
     /// at, BFS'd through each entry's `LinkMeta.deps` to cover
@@ -126,7 +149,7 @@ impl V2BaselineIndex {
 
         let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let links_root = store_v2.paths().links_root();
-        let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
+        let mut index = Self::default();
 
         // Seeds: every direct symlink under `<project>/node_modules/`
         // whose target lives inside `<links_root>/<key>/`. Direct-bin
@@ -223,14 +246,16 @@ impl V2BaselineIndex {
             // walk inserts before the BFS, and BFS itself is FIFO, so
             // the chosen entry is whichever is closer to the project
             // root in the symlink graph.
-            by_coords
-                .entry((meta_name, meta_version))
-                .or_insert(InstalledPackageBaseline {
+            index.insert(
+                meta_name,
+                meta_version,
+                InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
                     integrity: meta_sri,
                     layout: PackageBaselineLayout::V2,
-                });
+                },
+            );
             for dep in &meta_deps {
                 // `LinkMeta.deps` carries the full 64-hex digest; the
                 // on-disk dir name uses the first 16 chars. See
@@ -261,7 +286,7 @@ impl V2BaselineIndex {
             }
         }
 
-        Ok(Self { by_coords })
+        Ok(index)
     }
 
     /// Walk every v2 link entry under `lpm_root` once and produce an
@@ -279,18 +304,8 @@ impl V2BaselineIndex {
     /// project-side script state.
     pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
         let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
-        let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
+        let mut index = Self::default();
         for (link_dir, meta) in store_v2.iter_link_entries()? {
-            let key = (meta.name.clone(), meta.version.clone());
-            // First-match wins. `iter_link_entries` returns directory
-            // order, which matches the legacy linear scan's
-            // tie-breaking. Re-running this walk twice on the same
-            // disk state must produce the same map; that's why we
-            // skip the insert when a coord is already populated
-            // rather than overwrite.
-            if by_coords.contains_key(&key) {
-                continue;
-            }
             let package_dir = link_dir.join("node_modules").join(&meta.name);
             if !package_dir.exists() {
                 // Sidecar present but link entry missing the package
@@ -303,8 +318,9 @@ impl V2BaselineIndex {
                 Ok(p) if p.exists() => p,
                 _ => package_dir.clone(),
             };
-            by_coords.insert(
-                key,
+            index.insert(
+                meta.name,
+                meta.version,
                 InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
@@ -313,13 +329,27 @@ impl V2BaselineIndex {
                 },
             );
         }
-        Ok(Self { by_coords })
+        Ok(index)
     }
 
-    /// O(1) lookup. `None` means no v2 link entry covers the
-    /// `(name, version)` pair — caller should fall back to v1.
-    pub fn lookup(&self, name: &str, version: &str) -> Option<&InstalledPackageBaseline> {
-        self.by_coords.get(&(name.to_string(), version.to_string()))
+    /// O(1) lookup by coordinates and expected source SRI. When the caller
+    /// lacks an expected SRI, coordinates resolve only if exactly one source
+    /// identity is present.
+    pub fn lookup(
+        &self,
+        name: &str,
+        version: &str,
+        source_sri: Option<&str>,
+    ) -> Option<&InstalledPackageBaseline> {
+        let source_sri = match source_sri {
+            Some(source_sri) => source_sri,
+            None => self
+                .unique_source_by_coords
+                .get(&(name.to_string(), version.to_string()))?
+                .as_deref()?,
+        };
+        self.by_identity
+            .get(&(name.to_string(), version.to_string(), source_sri.to_string()))
     }
 }
 
@@ -441,14 +471,16 @@ pub fn find_installed_package_baseline_indexed(
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
+    expected_integrity: Option<&str>,
 ) -> Option<InstalledPackageBaseline> {
-    if let Some(b) = index.lookup(name, version) {
+    if let Some(b) = index.lookup(name, version, expected_integrity) {
         return Some(b.clone());
     }
     let store_v1 = PackageStore::from_root(lpm_root);
     let pkg_dir = store_v1.package_dir(name, version);
     if pkg_dir.exists()
         && let Some(integrity) = read_stored_integrity(&pkg_dir)
+        && expected_integrity.is_none_or(|expected| expected == integrity)
     {
         return Some(InstalledPackageBaseline {
             package_dir: pkg_dir.clone(),
@@ -624,7 +656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
-        assert!(index.lookup("nonexistent", "1.0.0").is_none());
+        assert!(index.lookup("nonexistent", "1.0.0", None).is_none());
     }
 
     /// A populated v2 store yields a hit through the indexed lookup.
@@ -656,7 +688,7 @@ mod tests {
 
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
         let hit = index
-            .lookup("lodash", "4.17.21")
+            .lookup("lodash", "4.17.21", Some(&sri))
             .expect("populated link entry must be indexed");
         assert_eq!(hit.layout, PackageBaselineLayout::V2);
         assert_eq!(hit.integrity, sri);
@@ -674,6 +706,68 @@ mod tests {
             hit.package_dir, hit.pristine_dir,
             "v2 entries must surface a distinct pristine_dir"
         );
+    }
+
+    #[test]
+    fn v2_baseline_index_preserves_distinct_same_coordinate_source_integrities() {
+        use crate::v2::{GraphKey, GraphKeyInputs, LinkerModeTag, PlatformTuple};
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
+        let source_a = synthetic_sri(b"baseline_index/react/source-a");
+        let source_b = synthetic_sri(b"baseline_index/react/source-b");
+
+        for (source_sri, source_identity) in
+            [(&source_a, "file:source-a"), (&source_b, "file:source-b")]
+        {
+            write_object(
+                &store,
+                source_sri,
+                &[(
+                    "package.json",
+                    b"{\"name\":\"react\",\"version\":\"19.0.0\"}",
+                )],
+            );
+            let graph_key = GraphKey::derive(
+                &GraphKeyInputs::new(
+                    "react",
+                    "19.0.0",
+                    PlatformTuple::new("darwin", "arm64", None),
+                    LinkerModeTag::Isolated,
+                )
+                .with_source_identity(Some(source_identity.to_string())),
+            );
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: std::sync::Arc::new(graph_key),
+                    source_sri: source_sri.clone(),
+                    object_dir: store.paths().object_dir(source_sri).unwrap(),
+                    deps: vec![],
+                    platform: std::sync::Arc::new(sample_meta_platform()),
+                })
+                .unwrap();
+        }
+
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        assert_eq!(
+            index.by_identity.len(),
+            2,
+            "source-distinct packages must not collapse to one lifecycle baseline"
+        );
+        assert_eq!(
+            index
+                .lookup("react", "19.0.0", Some(&source_a))
+                .map(|baseline| baseline.integrity.as_str()),
+            Some(source_a.as_str()),
+        );
+        assert_eq!(
+            index
+                .lookup("react", "19.0.0", Some(&source_b))
+                .map(|baseline| baseline.integrity.as_str()),
+            Some(source_b.as_str()),
+        );
+        assert!(index.lookup("react", "19.0.0", None).is_none());
     }
 
     /// `find_installed_package_baseline_indexed` falls through to v1
@@ -694,7 +788,13 @@ mod tests {
 
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
         let resolved =
-            find_installed_package_baseline_indexed(&index, &lpm_root, "legacy", "1.0.0")
+            find_installed_package_baseline_indexed(
+                &index,
+                &lpm_root,
+                "legacy",
+                "1.0.0",
+                Some("sha512-stub"),
+            )
                 .expect("v1 fallback must populate the result");
         assert_eq!(resolved.layout, PackageBaselineLayout::V1);
         assert_eq!(
@@ -779,24 +879,17 @@ mod tests {
         )
         .unwrap();
 
-        // Sanity: the global index could return either entry — that's
-        // exactly the ambiguity the project-scoped lookup is meant to
-        // eliminate.
+        // The global index fails closed because the same coordinates carry
+        // two source identities. The project-scoped lookup below remains
+        // unambiguous because only the linked identity is reachable.
         let global = V2BaselineIndex::build(&lpm_root).unwrap();
-        let global_hit = global.lookup("lodash", "1.0.0").unwrap();
-        let global_resolves_correctly = global_hit
-            .package_dir
-            .starts_with(entry_patched.join("node_modules"));
-        // We don't assert which one global returns — just that the
-        // project-scoped variant below is unambiguous about the right
-        // answer.
-        let _ = global_resolves_correctly;
+        assert!(global.lookup("lodash", "1.0.0", None).is_none());
 
         // The project-scoped index MUST land on the patched entry
         // because that's where project A's symlink resolves to. This
         let project_index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
         let project_hit = project_index
-            .lookup("lodash", "1.0.0")
+            .lookup("lodash", "1.0.0", None)
             .expect("project-scoped index must resolve the package");
         assert!(
             project_hit
@@ -871,7 +964,7 @@ mod tests {
 
         let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
         let hit = index
-            .lookup("cli-tool", "1.0.0")
+            .lookup("cli-tool", "1.0.0", None)
             .expect("compatibility root symlink must seed the owning link entry");
         assert!(
             hit.package_dir.starts_with(entry.join("node_modules")),
@@ -979,14 +1072,14 @@ mod tests {
         .unwrap();
 
         let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
-        let consumer_hit = index.lookup("consumer", "1.0.0").unwrap();
+        let consumer_hit = index.lookup("consumer", "1.0.0", None).unwrap();
         assert!(
             consumer_hit
                 .package_dir
                 .starts_with(consumer_entry.join("node_modules"))
         );
         let tslib_hit = index
-            .lookup("tslib", "2.0.0")
+            .lookup("tslib", "2.0.0", None)
             .expect("BFS through LinkMeta.deps must reach the transitive");
         assert!(
             tslib_hit
@@ -1053,7 +1146,7 @@ mod tests {
 
         let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
         let hit = index
-            .lookup("@scope/pkg", "1.0.0")
+            .lookup("@scope/pkg", "1.0.0", None)
             .expect("scoped direct dependency must seed the project-scoped index");
         assert!(
             hit.package_dir.starts_with(entry.join("node_modules")),
@@ -1124,12 +1217,12 @@ mod tests {
 
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
         let hit = index
-            .lookup("react", "18.0.0")
+            .lookup("react", "18.0.0", Some(&sri))
             .expect("either entry should satisfy the lookup");
         // Re-build and confirm the same entry wins. Stable
         // first-match-wins in the face of multi-entry coords.
         let index2 = V2BaselineIndex::build(&lpm_root).unwrap();
-        let hit2 = index2.lookup("react", "18.0.0").unwrap();
+        let hit2 = index2.lookup("react", "18.0.0", Some(&sri)).unwrap();
         assert_eq!(
             hit.package_dir, hit2.package_dir,
             "rebuilding the index against the same disk state must \

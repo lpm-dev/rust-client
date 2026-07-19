@@ -854,7 +854,11 @@ pub fn blocked_to_json_with_provenance(
         >,
     >,
 ) -> serde_json::Value {
-    let version_diff = match trusted.latest_binding_for_name(&blocked.name, &blocked.version) {
+    let version_diff = match trusted.latest_binding_for_candidate(
+        &blocked.name,
+        &blocked.version,
+        blocked.source.as_deref(),
+    ) {
         None => serde_json::Value::Null,
         Some((prior_version, binding)) => {
             let diff = compute_version_diff(prior_version, binding, blocked);

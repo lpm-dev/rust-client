@@ -3,7 +3,10 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
+use support::{
+    TempProject, lpm_spawnable_with_registry, lpm_with_registry,
+    write_npm_firewall_global_config,
+};
 
 const PACKAGE_JSON: &str = r#"{
   "name": "fetch-app",
@@ -248,6 +251,48 @@ async fn fetch_v1_preserves_sha256_for_offline_frozen_replay() {
         ])
         .assert()
         .success();
+}
+
+#[tokio::test]
+async fn fetch_v1_waits_for_the_store_lock_before_downloading_or_replacing_coordinates() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    std::fs::create_dir_all(project.store_dir()).unwrap();
+    let store_lock = lpm_common::acquire_exclusive_lock(
+        project.store_dir().join(".gc.lock"),
+    )
+    .unwrap();
+    let requests_before = tarball_request_count(&mock, "ms", "2.1.3").await;
+
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["fetch"]);
+    let child = command.spawn().expect("spawn lpm fetch");
+
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert_eq!(
+        tarball_request_count(&mock, "ms", "2.1.3").await,
+        requests_before,
+        "v1 fetch must acquire the exclusive store lock before checking or replacing a coordinate"
+    );
+
+    drop(store_lock);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("fetch should finish after the store lock is released")
+    .expect("join fetch process");
+    assert!(
+        output.status.success(),
+        "fetch failed after the lock was released:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

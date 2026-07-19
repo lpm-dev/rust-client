@@ -119,7 +119,7 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
         "/src/commands/install/fetch.rs"
     ));
     const DRIFT_MARKER: &str = "provenance-drift gate";
-    const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_under_store_lock(";
     const FETCH_HANDOFF: &str = "run_online_fetch_phase(OnlineFetchPhaseInput";
     const AUTO_BUILD_HANDOFF: &str = "run_online_auto_build_phase(OnlineAutoBuildPhaseInput";
 

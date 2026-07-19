@@ -13,8 +13,10 @@ pub(super) fn package_baseline_dir_indexed(
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
+    integrity: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
+    find_installed_package_baseline_indexed(index, lpm_root, name, version, integrity)
+        .map(|b| b.package_dir)
 }
 
 pub(super) fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String>> {

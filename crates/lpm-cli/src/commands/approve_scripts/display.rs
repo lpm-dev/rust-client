@@ -28,7 +28,11 @@ pub(super) fn print_version_diff_card_for_blocked(
     lpm_root: &lpm_common::LpmRoot,
 ) {
     let Some((prior_version, binding)) =
-        trusted.latest_binding_for_name(&blocked.name, &blocked.version)
+        trusted.latest_binding_for_candidate(
+            &blocked.name,
+            &blocked.version,
+            blocked.source.as_deref(),
+        )
     else {
         return;
     };
@@ -37,11 +41,17 @@ pub(super) fn print_version_diff_card_for_blocked(
         return;
     }
     let store_dir_for = |version: &str| -> Option<std::path::PathBuf> {
+        let expected_integrity = if version == blocked.version {
+            blocked.integrity.as_deref()
+        } else {
+            binding.integrity.as_deref()
+        };
         crate::commands::audit::inventory::find_project_baseline(
             baseline_index,
             lpm_root,
             &blocked.name,
             version,
+            expected_integrity,
         )
         .map(|b| b.package_dir)
     };
@@ -173,6 +183,7 @@ pub(super) fn print_full_script(
         lpm_root,
         &blocked.name,
         &blocked.version,
+        blocked.integrity.as_deref(),
     ) {
         Some(b) => b.package_dir,
         None => {

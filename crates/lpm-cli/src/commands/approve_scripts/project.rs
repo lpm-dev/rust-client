@@ -52,9 +52,10 @@ pub fn compute_effective_blocked_set<'a>(
         .blocked_packages
         .iter()
         .filter(|bp| {
-            let trust = trusted.matches_strict(
+            let trust = trusted.matches_strict_for_identity(
                 &bp.name,
                 &bp.version,
+                bp.source.as_deref(),
                 bp.integrity.as_deref(),
                 bp.script_hash.as_deref(),
             );
@@ -64,7 +65,12 @@ pub fn compute_effective_blocked_set<'a>(
                 // gate also passes — i.e., no widening requested
                 // OR the binding's capability_hash covers it.
                 TrustMatch::Strict => {
-                    let binding = trusted.get_binding(&bp.name, &bp.version);
+                    let binding = trusted.get_binding(
+                        &bp.name,
+                        &bp.version,
+                        bp.source.as_deref(),
+                        bp.integrity.as_deref(),
+                    );
                     requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
                 }
                 TrustMatch::LegacyNameOnly => {
@@ -326,13 +332,13 @@ async fn run_under_store_lock(
             BlockedLookup::Ambiguous { candidates } => {
                 let mut keys: Vec<String> = candidates
                     .iter()
-                    .map(|blocked| format!("{}@{}", blocked.name, blocked.version))
+                    .map(|blocked| blocked_identity_selector(blocked))
                     .collect();
                 keys.sort();
                 keys.dedup();
                 return Err(LpmError::Script(format!(
                     "package '{arg}' is ambiguous in the blocked set — {} rows match. \
-                     Re-run with `name@version` to disambiguate. Candidates: {}",
+                     Re-run with an exact candidate selector. Candidates: {}",
                     candidates.len(),
                     keys.join(", "),
                 )));
@@ -375,7 +381,11 @@ async fn run_under_store_lock(
                 &lpm_root,
             );
             let prompt = if trusted
-                .latest_binding_for_name(&target.name, &target.version)
+                .latest_binding_for_candidate(
+                    &target.name,
+                    &target.version,
+                    target.source.as_deref(),
+                )
                 .is_some()
             {
                 format!("Accept new {}@{}?", target.name, target.version)
@@ -650,7 +660,11 @@ async fn run_under_store_lock(
         // B(i), `KeepOld` does NOT rewrite a resolver pin or
         // downgrade — it just declines the candidate.
         let is_update = trusted
-            .latest_binding_for_name(&blocked.name, &blocked.version)
+            .latest_binding_for_candidate(
+                &blocked.name,
+                &blocked.version,
+                blocked.source.as_deref(),
+            )
             .is_some();
 
         // The View option re-prints the full script and re-prompts. To

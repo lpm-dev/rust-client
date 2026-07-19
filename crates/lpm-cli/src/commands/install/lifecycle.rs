@@ -478,7 +478,7 @@ pub(super) async fn run_online_auto_build_phase(
 
     let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
     if auto_build_attempted {
-        match crate::commands::rebuild::run_with_report(
+        match crate::commands::rebuild::run_under_store_lock(
             project_dir,
             &[],
             false,
@@ -577,7 +577,11 @@ pub(super) fn compute_post_install_version_diff_hints(
 ) -> Vec<String> {
     let mut hints = Vec::new();
     for bp in &blocked_capture.state.blocked_packages {
-        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        let Some((prior_version, binding)) = trusted.latest_binding_for_candidate(
+            &bp.name,
+            &bp.version,
+            bp.source.as_deref(),
+        )
         else {
             continue;
         };
@@ -695,7 +699,11 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
         ) {
             continue;
         }
-        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        let Some((prior_version, binding)) = trusted.latest_binding_for_candidate(
+            &bp.name,
+            &bp.version,
+            bp.source.as_deref(),
+        )
         else {
             continue;
         };
