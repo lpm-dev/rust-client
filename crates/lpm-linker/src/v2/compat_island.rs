@@ -686,7 +686,7 @@ fn compatibility_dependency_links(
         }
     }
 
-    for (peer_name, peer_version) in &target.peers {
+    for (peer_name, peer_binding) in &target.peers {
         if !is_safe_root_link_name(peer_name) {
             tracing::warn!(
                 "v2 linker: skipping unsafe compatibility peer local name {:?} for {}@{}",
@@ -703,7 +703,7 @@ fn compatibility_dependency_links(
             .aliases
             .get(peer_name)
             .map_or(peer_name.as_str(), String::as_str);
-        if let Some(peer_key) = key_map.get_peer(target_name, peer_version) {
+        if let Some(peer_key) = key_map.get_peer(target_name, peer_binding) {
             links.push((peer_name.clone(), peer_key.clone()));
         }
     }

@@ -338,14 +338,18 @@ fn peer_group_satisfied_by_existing(
     });
     registry_match
         || explicit_peer_providers.iter().any(|provider| {
-            provider.package_name == target_name
-                && reqs.iter().all(|requirement| {
-                    provider.local_name == requirement.local_name
-                        && requirement.provider_source.as_ref().map_or_else(
-                            || requirement.range.satisfies(&provider.version),
-                            |required_source| required_source == &provider.source,
-                        )
-                })
+            reqs.iter().all(|requirement| {
+                provider.local_name == requirement.local_name
+                    && requirement.provider_source.as_ref().map_or_else(
+                        || {
+                            provider.package_name == target_name
+                                && provider
+                                    .parsed_version()
+                                    .is_some_and(|version| requirement.range.satisfies(version))
+                        },
+                        |required_source| required_source.matches_provider(&provider.source),
+                    )
+            })
         })
 }
 
@@ -449,12 +453,16 @@ pub(super) fn attach_peer_edges_to_drafts(
             let resolved = resolved.or_else(|| {
                 explicit_peer_providers
                     .iter()
-                    .find(|provider| {
-                        provider.local_name == *peer_name
-                            && provider.package_name == specifier.target()
-                            && specifier.matches_provider(&provider.version, &provider.source)
+                    .find(|provider| provider.matches_specifier(peer_name, specifier))
+                    .map(|provider| {
+                        if provider.package_name != *peer_name {
+                            draft
+                                .package
+                                .aliases
+                                .insert(peer_name.clone(), provider.package_name.clone());
+                        }
+                        provider.source_id.clone()
                     })
-                    .map(|provider| provider.version.to_string())
             });
             if let Some(version) = resolved {
                 peers.push((peer_name.clone(), version));

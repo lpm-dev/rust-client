@@ -479,9 +479,15 @@ fn registry_speculation_key_matches_install_package_key() {
     package.name = "react".to_string();
     package.version = "19.0.0".to_string();
     package.source = "registry+https://registry.npmjs.org".to_string();
+    package.integrity = Some("sha512-registry-content".to_string());
 
     assert_eq!(
-        registry_install_pkg_key(&package.name, &package.version, &route_table),
+        registry_install_pkg_key(
+            &package.name,
+            &package.version,
+            &route_table,
+            package.integrity.as_deref(),
+        ),
         install_pkg_key(&package)
     );
 }

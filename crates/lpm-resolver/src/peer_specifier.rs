@@ -9,7 +9,10 @@ pub enum PeerProviderSource {
     Registry,
     File(String),
     Link(String),
-    Tarball(String),
+    Tarball {
+        url: String,
+        integrity: Option<String>,
+    },
     Git {
         url: String,
         refspec: Option<String>,
@@ -17,7 +20,7 @@ pub enum PeerProviderSource {
 }
 
 impl PeerProviderSource {
-    pub fn from_install_source(source: &str) -> Option<Self> {
+    pub fn from_install_source(source: &str, integrity: Option<&str>) -> Option<Self> {
         if source.starts_with("registry+") {
             return Some(Self::Registry);
         }
@@ -31,7 +34,10 @@ impl PeerProviderSource {
             if let Some(path) = value.strip_prefix("file:") {
                 return Some(Self::File(normalize_source_path(path)));
             }
-            return Some(Self::Tarball(value.to_string()));
+            return Some(Self::Tarball {
+                url: value.to_string(),
+                integrity: integrity.map(str::to_string),
+            });
         }
         None
     }
@@ -41,8 +47,30 @@ impl PeerProviderSource {
             Self::Registry => "registry",
             Self::File(_) => "file",
             Self::Link(_) => "link",
-            Self::Tarball(_) => "url",
+            Self::Tarball { .. } => "url",
             Self::Git { .. } => "git",
+        }
+    }
+
+    #[inline]
+    pub fn matches_provider(&self, provider: &Self) -> bool {
+        match (self, provider) {
+            (
+                Self::Tarball {
+                    url: required_url,
+                    integrity: required_integrity,
+                },
+                Self::Tarball {
+                    url: provider_url,
+                    integrity: provider_integrity,
+                },
+            ) => {
+                required_url == provider_url
+                    && required_integrity
+                        .as_ref()
+                        .is_none_or(|required| provider_integrity.as_ref() == Some(required))
+            }
+            _ => self == provider,
         }
     }
 }
@@ -63,10 +91,10 @@ impl PeerConstraint {
     }
 
     #[inline]
-    pub fn matches(&self, version: &NpmVersion, source: &PeerProviderSource) -> bool {
+    pub fn matches(&self, version: Option<&NpmVersion>, source: &PeerProviderSource) -> bool {
         match self {
-            Self::Version(range) => range.satisfies(version),
-            Self::Source(required) => required == source,
+            Self::Version(range) => version.is_some_and(|version| range.satisfies(version)),
+            Self::Source(required) => required.matches_provider(source),
         }
     }
 }
@@ -161,10 +189,10 @@ impl PeerSpecifier {
                 raw,
                 PeerProviderSource::Link(normalize_source_path(&path)),
             )),
-            Ok(Specifier::Tarball { url, .. }) => Ok(Self::source(
+            Ok(Specifier::Tarball { url, integrity }) => Ok(Self::source(
                 peer_name,
                 raw,
-                PeerProviderSource::Tarball(url),
+                PeerProviderSource::Tarball { url, integrity },
             )),
             Ok(Specifier::Git { url, refspec }) => Ok(Self::source(
                 peer_name,
@@ -245,11 +273,15 @@ impl PeerSpecifier {
     #[inline]
     pub fn matches_registry_version(&self, version: &NpmVersion) -> bool {
         self.constraint
-            .matches(version, &PeerProviderSource::Registry)
+            .matches(Some(version), &PeerProviderSource::Registry)
     }
 
     #[inline]
-    pub fn matches_provider(&self, version: &NpmVersion, source: &PeerProviderSource) -> bool {
+    pub fn matches_provider(
+        &self,
+        version: Option<&NpmVersion>,
+        source: &PeerProviderSource,
+    ) -> bool {
         self.constraint.matches(version, source)
     }
 
@@ -489,7 +521,10 @@ mod tests {
             ),
             (
                 "https://example.com/react.tgz",
-                PeerProviderSource::Tarball("https://example.com/react.tgz".to_string()),
+                PeerProviderSource::Tarball {
+                    url: "https://example.com/react.tgz".to_string(),
+                    integrity: None,
+                },
             ),
         ];
         for (raw, expected) in cases {
@@ -499,6 +534,25 @@ mod tests {
             );
             assert!(!spec.install_source.is_registry());
         }
+    }
+
+    #[test]
+    fn tarball_source_identity_distinguishes_declared_integrity() {
+        let first = PeerSpecifier::parse("react", "https://example.com/react.tgz#sha512-AAAAAAAA")
+            .expect("first integrity-pinned URL must parse");
+        let second = PeerSpecifier::parse("react", "https://example.com/react.tgz#sha512-BBBBBBBB")
+            .expect("second integrity-pinned URL must parse");
+
+        let PeerConstraint::Source(first_source) = first.constraint() else {
+            panic!("first URL must be a source constraint");
+        };
+        let PeerConstraint::Source(second_source) = second.constraint() else {
+            panic!("second URL must be a source constraint");
+        };
+        assert_ne!(
+            first_source, second_source,
+            "the same URL with different declared SRI must identify different peer content"
+        );
     }
 
     #[test]

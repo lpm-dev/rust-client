@@ -12,7 +12,7 @@
 //! 3. `version`
 //! 4. Platform tuple `(os, cpu, libc)` — libc empty on non-Linux
 //! 5. Linker mode tag (`isolated` | `hoisted`)
-//! 6. Sorted peer-context: `peer_name@peer_version` joined by `,`
+//! 6. Sorted peer-context: `peer_name@binding` joined by `,`
 //!    (always empty in hoisted mode)
 //! 7. Sorted dep edges: `local => target_name@target_version`
 //!    joined by `,`
@@ -264,10 +264,10 @@ impl GraphKey {
 
     /// Compute the graph key from a complete [`GraphKeyInputs`] struct.
     ///
-    /// Peer pinning contributes to the key for every linker mode that
+    /// Peer bindings contribute to the key for every linker mode that
     /// materializes peer siblings inside the shared link entry. Without
     /// this, two installs with the same package/dependency graph but
-    /// different peer versions could reuse one link entry and expose
+    /// different peer versions or sources could reuse one link entry and expose
     /// the wrong peer layout.
     pub fn derive(inputs: &GraphKeyInputs) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -333,8 +333,8 @@ impl GraphKey {
     /// `raw_deps` — `(local, resolved_version)` pairs from
     ///   `LinkTarget::dependencies`. `aliases` maps each `local` to
     ///   its canonical target name (identity if absent — no alias).
-    /// `peers`    — `(canonical_name, resolved_version)` pairs from
-    ///   `LinkTarget::peers`.
+    /// `peers` — `(canonical_name, binding)` pairs from `LinkTarget::peers`.
+    ///   A binding is an exact registry version or source wrapper ID.
     #[allow(clippy::too_many_arguments)]
     pub fn derive_raw(
         name: &str,

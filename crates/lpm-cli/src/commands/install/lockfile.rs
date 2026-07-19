@@ -357,14 +357,12 @@ fn patch_fresh_tarball_urls(
 
 fn locked_package_key(package: &lpm_lockfile::LockedPackage) -> String {
     let source = package.source.as_deref().unwrap_or("");
-    let mut key =
-        String::with_capacity(package.name.len() + 1 + package.version.len() + 1 + source.len());
-    key.push_str(&package.name);
-    key.push('\x00');
-    key.push_str(&package.version);
-    key.push('\x00');
-    key.push_str(source);
-    key
+    install_pkg_key_parts(
+        &package.name,
+        &package.version,
+        source,
+        package.integrity.as_deref(),
+    )
 }
 
 fn write_lockfile_and_measure(
@@ -1369,9 +1367,9 @@ pub(super) fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
     keys
 }
 
-fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
+pub(super) fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
     let mut registry_key_to_index = HashMap::with_capacity(packages.len());
-    let mut source_id_to_index = HashMap::with_capacity(packages.len());
+    let mut source_key_to_index = HashMap::with_capacity(packages.len());
     for (idx, package) in packages.iter().enumerate() {
         if matches!(
             package.source_kind(),
@@ -1382,7 +1380,9 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .or_insert(idx);
         }
         if let Some(source_id) = package.wrapper_id_for_source() {
-            source_id_to_index.entry(source_id).or_insert(idx);
+            source_key_to_index
+                .entry(link_target_lookup_key(&package.name, &source_id))
+                .or_insert(idx);
         }
     }
 
@@ -1405,22 +1405,25 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .aliases
                 .get(local_name)
                 .map_or(local_name.as_str(), String::as_str);
-            let next_idx = source_id_to_index
-                .get(version)
-                .or_else(|| registry_key_to_index.get(&link_target_lookup_key(target, version)));
+            let target_key = link_target_lookup_key(target, version);
+            let next_idx = source_key_to_index
+                .get(&target_key)
+                .or_else(|| registry_key_to_index.get(&target_key));
             if let Some(next_idx) = next_idx
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
             }
         }
-        for (peer_name, version) in &package.peers {
+        for (peer_name, binding) in &package.peers {
             let target = package
                 .aliases
                 .get(peer_name)
                 .map_or(peer_name.as_str(), String::as_str);
-            if let Some(next_idx) =
-                registry_key_to_index.get(&link_target_lookup_key(target, version))
+            let target_key = link_target_lookup_key(target, binding);
+            if let Some(next_idx) = source_key_to_index
+                .get(&target_key)
+                .or_else(|| registry_key_to_index.get(&target_key))
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
@@ -1429,7 +1432,7 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
     }
 
     let mut retained_registry_keys = HashSet::with_capacity(retained.len());
-    let mut retained_source_ids = HashSet::with_capacity(retained.len());
+    let mut retained_source_keys = HashSet::with_capacity(retained.len());
     for idx in &retained {
         let package = &packages[*idx];
         if matches!(
@@ -1439,7 +1442,7 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
             retained_registry_keys.insert(link_target_lookup_key(&package.name, &package.version));
         }
         if let Some(source_id) = package.wrapper_id_for_source() {
-            retained_source_ids.insert(source_id);
+            retained_source_keys.insert(link_target_lookup_key(&package.name, &source_id));
         }
     }
 
@@ -1453,13 +1456,16 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .aliases
                 .get(local_name)
                 .map_or(local_name.as_str(), String::as_str);
-            retained_source_ids.contains(version)
-                || retained_registry_keys.contains(&link_target_lookup_key(target, version))
+            let target_key = link_target_lookup_key(target, version);
+            retained_source_keys.contains(&target_key)
+                || retained_registry_keys.contains(&target_key)
         });
         let aliases = &package.aliases;
-        package.peers.retain(|(name, version)| {
+        package.peers.retain(|(name, binding)| {
             let target = aliases.get(name).map_or(name.as_str(), String::as_str);
-            retained_registry_keys.contains(&link_target_lookup_key(target, version))
+            let target_key = link_target_lookup_key(target, binding);
+            retained_source_keys.contains(&target_key)
+                || retained_registry_keys.contains(&target_key)
         });
         kept.push(package);
     }
@@ -1579,6 +1585,9 @@ pub(super) fn filter_platform_packages(
         }
         if package.optional {
             skipped.insert((package.name.clone(), package.version.clone()));
+            if let Some(source_id) = package.wrapper_id_for_source() {
+                skipped.insert((package.name.clone(), source_id));
+            }
             continue;
         }
         return Err(LpmError::Registry(format!(
@@ -1596,9 +1605,11 @@ pub(super) fn filter_platform_packages(
                     .map_or(local.as_str(), String::as_str);
                 !skipped.contains(&(target.to_string(), version.clone()))
             });
-            package
-                .peers
-                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
+            let aliases = &package.aliases;
+            package.peers.retain(|(name, binding)| {
+                let target = aliases.get(name).map_or(name.as_str(), String::as_str);
+                !skipped.contains(&(target.to_string(), binding.clone()))
+            });
         }
     }
 
@@ -1664,14 +1675,22 @@ pub(super) fn try_lockfile_fast_path(
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
-    if let Some(current_importer_snapshot) = current_importer_snapshot
-        && lockfile
-            .importers
-            .get(".")
-            .is_some_and(|locked| locked != current_importer_snapshot)
-    {
-        tracing::debug!("importer snapshot drift detected — invalidating lockfile fast path");
-        return None;
+    if let Some(current_importer_snapshot) = current_importer_snapshot {
+        match lockfile.importers.get(".") {
+            Some(locked) if locked != current_importer_snapshot => {
+                tracing::debug!(
+                    "importer snapshot drift detected — invalidating lockfile fast path"
+                );
+                return None;
+            }
+            None if !accept_unsafe_sources => {
+                tracing::debug!(
+                    "importer snapshot missing — mutable/frozen installs must rebuild the graph"
+                );
+                return None;
+            }
+            Some(_) | None => {}
+        }
     }
 
     let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
@@ -1856,12 +1875,13 @@ pub(super) fn try_lockfile_fast_path(
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
                 .collect();
 
-            // restore per-package peer pinning from the
+            // Restore per-package peer bindings from the
             // lockfile. Same string shape as `dependencies`:
-            // `<peer_name>@<version>`. Empty for packages without
-            // peer dependencies (most of the tree). Load-bearing for
-            // v2 graph-key reproducibility — the v2 linker hashes
-            // peer pinning into the link-entry identity, so a warm
+            // `<peer_name>@<binding>`, where a binding is an exact
+            // registry version or a non-registry source wrapper ID.
+            // Empty for packages without peer dependencies (most of the tree).
+            // Load-bearing for v2 graph-key reproducibility — the v2 linker
+            // hashes peer bindings into the link-entry identity, so a warm
             // install that forgets peer state computes a different
             // graph key than the cold install and silently
             // materializes a separate link entry (worst case: shares

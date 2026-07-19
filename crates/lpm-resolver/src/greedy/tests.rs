@@ -2671,8 +2671,8 @@ async fn peer_drain_accepts_matching_explicit_file_provider() {
         "source-peer",
         "1.0.0",
         crate::PeerProviderSource::File("../source-peer".to_string()),
-    )
-    .unwrap();
+        "f-source-peer",
+    );
     let roots = crate::RootDependencies::required(HashMap::new())
         .with_explicit_peer_providers(vec![provider]);
     let mut state = ResolveState::new_with_root_dependencies_and_policy(

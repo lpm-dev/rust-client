@@ -142,8 +142,16 @@ pub(super) fn format_solution(
                     let specifier = peer_dependency
                         .parsed()
                         .expect("selected peer specifiers were validated before formatting");
-                    if specifier.target() != peer_name {
-                        aliases.insert(peer_name.clone(), specifier.target().to_string());
+                    let target = root_dependencies
+                        .explicit_peer_providers
+                        .iter()
+                        .find(|provider| provider.matches_specifier(peer_name, specifier))
+                        .map_or_else(
+                            || specifier.target(),
+                            |provider| provider.package_name.as_str(),
+                        );
+                    if target != peer_name {
+                        aliases.insert(peer_name.clone(), target.to_string());
                     }
                 }
             }

@@ -185,6 +185,49 @@ fn workspace_protocol_dep_is_extracted_before_resolver_sees_it() {
 }
 
 #[test]
+fn file_workspace_overlap_is_retained_as_a_direct_v2_source_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("packages/react")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "peer-consumer": "1.0.0",
+    "react": "file:./packages/react"
+  }
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/react/package.json"),
+        r#"{"name":"react","version":"18.3.1"}"#,
+    )
+    .unwrap();
+
+    let package = lpm_workspace::read_package_json(&root.join("package.json")).unwrap();
+    let mut deps = package.dependencies.clone();
+    let context = prepare_workspace_install_context(root, &package, &mut deps, true, true)
+        .expect("workspace context must prepare");
+
+    assert!(
+        context
+            .direct_workspace_member_deps
+            .iter()
+            .any(|member| member.name == "react"),
+        "file/link workspace overlaps must remain available to v2 source pre-resolution"
+    );
+    assert!(
+        !deps.contains_key("react"),
+        "the workspace-backed source must stay out of registry resolution"
+    );
+}
+
+#[test]
 fn workspace_member_cache_info_normalizes_jsr_dependency_aliases() {
     let dir = tempfile::tempdir().unwrap();
     let member_dir = dir.path().join("packages/app");

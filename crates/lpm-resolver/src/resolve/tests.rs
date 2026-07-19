@@ -1439,6 +1439,34 @@ fn peer_check_attached_wrong_version_produces_warning() {
 }
 
 #[test]
+fn source_peer_accepts_matching_local_alias_even_when_package_name_differs() {
+    let consumer = ResolverPackage::npm("source-peer-consumer");
+    let cache = HashMap::from([(
+        CanonicalKey::from(&consumer),
+        make_cached_info(
+            &["1.0.0"],
+            vec![],
+            vec![("1.0.0", vec![("react-compat", "file:../packages/react")])],
+        ),
+    )]);
+    let provider = ExplicitPeerProvider::new(
+        "react-compat",
+        "react",
+        "18.3.1",
+        crate::PeerProviderSource::File("../packages/react".to_string()),
+        "f-react-source",
+    );
+
+    let peers = compute_resolved_peers(&consumer, "1.0.0", &cache, &HashMap::new(), &[provider]);
+
+    assert_eq!(
+        peers,
+        vec![("react-compat".to_string(), "f-react-source".to_string())],
+        "source peers match the declared root slot and exact source, not package.json name"
+    );
+}
+
+#[test]
 fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
     let plugin_pkg = ResolverPackage::npm("esbuild-plugins-node-modules-polyfill");
     let esbuild_nested_a = ResolverPackage::npm("esbuild").with_context("vite");

@@ -213,15 +213,20 @@ fn group_satisfied_by_existing(
     canonical: &CanonicalKey,
     reqs: &[&PeerRequirement],
 ) -> bool {
+    let canonical_name = canonical.to_string();
     if state.explicit_peer_providers.iter().any(|provider| {
-        provider.package_name == canonical.to_string()
-            && reqs.iter().all(|requirement| {
-                provider.local_name == requirement.peer_name
-                    && requirement.provider_source.as_ref().map_or_else(
-                        || requirement.range.satisfies(&provider.version),
-                        |required_source| required_source == &provider.source,
-                    )
-            })
+        reqs.iter().all(|requirement| {
+            provider.local_name == requirement.peer_name
+                && requirement.provider_source.as_ref().map_or_else(
+                    || {
+                        provider.package_name == canonical_name
+                            && provider
+                                .parsed_version()
+                                .is_some_and(|version| requirement.range.satisfies(version))
+                    },
+                    |required_source| required_source.matches_provider(&provider.source),
+                )
+        })
     }) {
         return true;
     }

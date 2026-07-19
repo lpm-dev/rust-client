@@ -5855,6 +5855,41 @@ async fn install_file_local_dependency_links_into_node_modules() {
 }
 
 #[tokio::test]
+async fn direct_file_package_without_semver_version_installs_when_no_peer_consumes_it() {
+    let project = TempProject::empty(
+        r#"{"name":"private-file-dep","version":"1.0.0","dependencies":{"private-pkg":"file:./packages/private-pkg"}}"#,
+    );
+    project.write_file(
+        "packages/private-pkg/package.json",
+        r#"{"name":"private-pkg","version":"dev","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/private-pkg/index.js",
+        "module.exports = 'private-dev';\n",
+    );
+
+    lpm(&project)
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('private-pkg'))")
+        .output()
+        .expect("run private file package");
+    assert!(runtime.status.success(), "private file package must load");
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "private-dev");
+}
+
+#[tokio::test]
 async fn explicit_file_link_and_url_providers_satisfy_matching_source_peers() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(
@@ -5941,6 +5976,160 @@ async fn explicit_file_link_and_url_providers_satisfy_matching_source_peers() {
     assert_eq!(
         String::from_utf8_lossy(&runtime.stdout),
         "file-react,link-react,url-react"
+    );
+}
+
+#[tokio::test]
+async fn aliased_file_provider_preserves_source_peer_identity_on_cold_and_warm_installs() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "aliased-source-peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "react-compat": "file:./packages/react"
+            }
+        }),
+        &[("index.js", b"module.exports = require('react-compat');\n")],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "aliased-source-peer-root",
+  "version": "1.0.0",
+  "dependencies": {
+    "aliased-source-peer-consumer": "1.0.0",
+    "react-compat": "file:./packages/react"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/react/package.json",
+        r#"{"name":"react","version":"18.3.1","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/react/index.js",
+        "module.exports = 'aliased-file-react';\n",
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("react-compat@f-"),
+        "lockfile peer binding must persist source identity instead of only version:\n{lockfile}"
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    let warm = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "--json",
+            "install",
+            "--offline",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run warm aliased source-peer install");
+    assert!(
+        warm.status.success(),
+        "warm source-peer install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&warm.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(envelope["used_lockfile"].as_bool(), Some(true));
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('aliased-source-peer-consumer'))")
+        .output()
+        .expect("run aliased source peer consumer");
+    assert!(runtime.status.success(), "aliased source peer must load");
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "aliased-file-react"
+    );
+}
+
+#[tokio::test]
+async fn workspace_overlapped_file_provider_satisfies_matching_source_peer() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "workspace-source-peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "react": "file:./packages/react"
+            }
+        }),
+        &[("index.js", b"module.exports = require('react');\n")],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-source-peer-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "workspace-source-peer-consumer": "1.0.0",
+    "react": "file:./packages/react"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/react/package.json",
+        r#"{"name":"react","version":"18.3.1","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/react/index.js",
+        "module.exports = 'workspace-file-react';\n",
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install workspace-overlapped source peer");
+    assert!(
+        install.status.success(),
+        "workspace-overlapped provider must remain available to peer resolution\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('workspace-source-peer-consumer'))")
+        .output()
+        .expect("run workspace source peer consumer");
+    assert!(runtime.status.success(), "workspace source peer must load");
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "workspace-file-react"
     );
 }
 
@@ -7182,6 +7371,76 @@ async fn mutable_install_rebuilds_lockfile_after_dependency_removal() {
         !lockfile.contains("removed-package"),
         "re-resolved lockfile must prune removed packages:\n{lockfile}",
     );
+}
+
+#[tokio::test]
+async fn mutable_install_rebuilds_snapshotless_lockfile_after_dependency_removal() {
+    let mock = MockRegistry::start().await;
+    for name in ["snapshot-kept", "snapshot-removed"] {
+        mock.with_manifest_package(
+            serde_json::json!({
+                "name": name,
+                "version": "1.0.0"
+            }),
+            &[],
+        )
+        .await;
+    }
+    let project = TempProject::empty(
+        r#"{
+  "name": "snapshotless-dependency-removal",
+  "version": "1.0.0",
+  "dependencies": {
+    "snapshot-kept": "1.0.0",
+    "snapshot-removed": "1.0.0"
+  }
+}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    lockfile.importers.clear();
+    lockfile.write_to_file(&lockfile_path).unwrap();
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "snapshotless-dependency-removal",
+  "version": "1.0.0",
+  "dependencies": {
+    "snapshot-kept": "1.0.0"
+  }
+}"#,
+    );
+
+    let reinstall = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("reinstall after snapshotless dependency removal");
+    assert!(
+        reinstall.status.success(),
+        "snapshotless mutable install must rebuild\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&reinstall.stdout).unwrap();
+    assert_eq!(envelope["used_lockfile"].as_bool(), Some(false));
+    let rebuilt = project.read_file("lpm.lock");
+    assert!(!rebuilt.contains("snapshot-removed"), "{rebuilt}");
 }
 
 #[tokio::test]

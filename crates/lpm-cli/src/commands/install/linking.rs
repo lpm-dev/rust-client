@@ -75,6 +75,17 @@ pub(super) fn link_target_lookup_key(name: &str, version: &str) -> String {
     k
 }
 
+fn link_target_identity_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
+    let wrapper_id = wrapper_id.unwrap_or("");
+    let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + wrapper_id.len());
+    key.push_str(name);
+    key.push('\x00');
+    key.push_str(version);
+    key.push('\x00');
+    key.push_str(wrapper_id);
+    key
+}
+
 pub(super) fn local_source_sri_for_target(target: &LinkTarget) -> String {
     let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
     let seed = format!(
@@ -94,15 +105,23 @@ pub(super) fn build_v2_targets(
     let sri_by_pkg: HashMap<String, String> = packages
         .iter()
         .filter_map(|p| {
-            p.integrity
-                .clone()
-                .map(|sri| (link_target_lookup_key(&p.name, &p.version), sri))
+            p.integrity.clone().map(|sri| {
+                (
+                    link_target_identity_key(
+                        &p.name,
+                        &p.version,
+                        p.wrapper_id_for_source().as_deref(),
+                    ),
+                    sri,
+                )
+            })
         })
         .collect();
 
     let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
     for target in link_targets {
-        let lookup_key = link_target_lookup_key(&target.name, &target.version);
+        let lookup_key =
+            link_target_identity_key(&target.name, &target.version, target.wrapper_id.as_deref());
         let sri = match target.materialization {
             lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
             lpm_linker::Materialization::DirectorySource => {

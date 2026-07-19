@@ -1,29 +1,9 @@
 use super::prelude::*;
 
-/// Intersect a consumer's declared `peerDependencies` against the
-/// install set's resolved-versions lookup. Returns
-/// `(peer_name, resolved_version)` pairs sorted by peer_name (stable
-/// for GraphKey hashing).
-///
-/// **What "resolved" means here.** The pubgrub / greedy arms have
-/// already finished resolution by the time we reach this helper, so
-/// the install set is fixed. Peer resolution at this stage is just a
-/// lookup: for each declared peer, does the install set contain a
-/// version of that package? If yes, that version IS the resolved
-/// peer (peer-dep ranges don't multi-select — a peer is whatever
-/// version of the named package is in scope).
-///
-/// **What's NOT here.** Split-aware peer resolution (consumer in
-/// context X picks peer in context X first, falling back to
-/// unsplit). The upstream `check_unmet_peers` does this for warning
-/// generation. For the v2 GraphKey we use the simpler lookup because
-/// the audit-fixture scope doesn't exercise splits, and a
-/// pessimistic (slightly over-binding) GraphKey is acceptable —
-/// worst case is fewer cross-project sharing hits, never an
-/// incorrect share. When split-aware resolution becomes load-bearing
-/// (once cross-project benchmarks make it load-bearing), this helper grows the
-/// `unsplit_versions` parameter the same way `resolve_peer_version`
-/// already does.
+/// Resolve a consumer's in-scope peer bindings after graph resolution.
+/// Registry peers bind to the selected exact version, preferring the
+/// consumer's split context. Source peers bind to the matching explicit
+/// provider's wrapper ID. Results are sorted by peer name for stable hashing.
 pub(super) fn compute_resolved_peers(
     consumer: &ResolverPackage,
     consumer_version: &str,
@@ -55,12 +35,8 @@ pub(super) fn compute_resolved_peers(
             }
             explicit_peer_providers
                 .iter()
-                .find(|provider| {
-                    provider.local_name == *peer_name
-                        && provider.package_name == specifier.target()
-                        && specifier.matches_provider(&provider.version, &provider.source)
-                })
-                .map(|provider| (peer_name.clone(), provider.version.to_string()))
+                .find(|provider| provider.matches_specifier(peer_name, specifier))
+                .map(|provider| (peer_name.clone(), provider.source_id.clone()))
         })
         .collect();
     peers.sort_by(|a, b| a.0.cmp(&b.0));

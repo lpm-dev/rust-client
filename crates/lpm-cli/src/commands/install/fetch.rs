@@ -1977,16 +1977,11 @@ pub(super) fn registry_install_pkg_key(
     name: &str,
     version: &str,
     route_table: &RouteTable,
+    integrity: Option<&str>,
 ) -> String {
     let registry_url = registry_source_url_for(name, route_table);
     let source = format!("registry+{registry_url}");
-    let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + source.len());
-    key.push_str(name);
-    key.push('\x00');
-    key.push_str(version);
-    key.push('\x00');
-    key.push_str(&source);
-    key
+    install_pkg_key_parts(name, version, &source, integrity)
 }
 
 /// /: stream metadata AND dispatch speculative
@@ -2223,7 +2218,12 @@ pub(super) fn spawn_speculation_dispatcher(
                 if !already_dispatched.insert(key) {
                     return;
                 }
-                let package_key = registry_install_pkg_key(&name, &version, &route_table_spec);
+                let package_key = registry_install_pkg_key(
+                    &name,
+                    &version,
+                    &route_table_spec,
+                    integrity.as_deref(),
+                );
 
                 let skip_auth_bearing_custom_speculation = matches!(
                     route_table_spec.route_for_package(&name),
@@ -2449,7 +2449,7 @@ pub(super) async fn speculative_download_and_store(
     // package to a private mirror. Tarball-URL packages have a
     // different source_id and naturally don't share locks with
     // speculation — that's correct (speculation never targets them).
-    let speculation_key = registry_install_pkg_key(name, version, route_table);
+    let speculation_key = registry_install_pkg_key(name, version, route_table, integrity);
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 

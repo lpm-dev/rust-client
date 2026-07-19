@@ -22,8 +22,8 @@
 //!
 //! # Peer-context
 //!
-//! Each [`LinkTarget`] carries `peers: Vec<(String, String)>`
-//! threaded through from the resolver
+//! Each [`LinkTarget`] carries peer names paired with exact registry
+//! versions or non-registry source wrapper IDs, threaded from the resolver
 //! (`ResolvedPackage.peers` → `InstallPackage.peers` →
 //! `LinkTarget.peers`). The linker uses these to:
 //!
@@ -34,7 +34,7 @@
 //!   reaches the peer.
 //! - Fold the peer-context into [`GraphKey`] via
 //!   `GraphKeyInputs::with_peers`, so two projects sharing the same
-//!   edge graph but different peer pinning produce distinct keys.
+//!   edge graph but different peer bindings produce distinct keys.
 //!   Without this, cross-project sharing of `links/<key>/` would be
 //!   incorrect for any package whose peer resolution depends on
 //!   the consuming project's other packages.
@@ -846,13 +846,13 @@ fn populate_one(
                     }
                 })
                 .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
-                .filter_map(|(peer_name, peer_ver)| {
+                .filter_map(|(peer_name, peer_binding)| {
                     let target_name = v2t
                         .target
                         .aliases
                         .get(peer_name)
                         .map_or(peer_name.as_str(), String::as_str);
-                    let peer_key = key_map.get_peer(target_name, peer_ver)?.clone();
+                    let peer_key = key_map.get_peer(target_name, peer_binding)?.clone();
                     Some(DepLink {
                         local: peer_name.clone(),
                         target: peer_key,

@@ -52,24 +52,42 @@ impl RootDependencies {
 pub struct ExplicitPeerProvider {
     pub local_name: String,
     pub package_name: String,
-    pub version: NpmVersion,
+    pub version: String,
     pub source: crate::PeerProviderSource,
+    pub source_id: String,
+    parsed_version: Option<NpmVersion>,
 }
 
 impl ExplicitPeerProvider {
     pub fn new(
         local_name: impl Into<String>,
         package_name: impl Into<String>,
-        version: impl AsRef<str>,
+        version: impl Into<String>,
         source: crate::PeerProviderSource,
-    ) -> Result<Self, String> {
-        let version = NpmVersion::parse(version.as_ref())?;
-        Ok(Self {
+        source_id: impl Into<String>,
+    ) -> Self {
+        let version = version.into();
+        let parsed_version = NpmVersion::parse(&version).ok();
+        Self {
             local_name: local_name.into(),
             package_name: package_name.into(),
             version,
             source,
-        })
+            source_id: source_id.into(),
+            parsed_version,
+        }
+    }
+
+    #[inline]
+    pub fn parsed_version(&self) -> Option<&NpmVersion> {
+        self.parsed_version.as_ref()
+    }
+
+    #[inline]
+    pub fn matches_specifier(&self, local_name: &str, specifier: &crate::PeerSpecifier) -> bool {
+        self.local_name == local_name
+            && (specifier.comparable_range().is_none() || self.package_name == specifier.target())
+            && specifier.matches_provider(self.parsed_version(), &self.source)
     }
 }
 
@@ -97,11 +115,8 @@ pub struct ResolvedPackage {
     /// callers compute `aliases.get(local).unwrap_or(local)` to get
     /// the target.
     pub aliases: HashMap<String, String>,
-    /// Resolved peers that ARE in scope for this consumer in the
-    /// install set. Shape: `(peer_name, resolved_version)` — same
-    /// edge shape as `dependencies`, but read from
-    /// `peerDependencies` / `peerDependenciesMeta` and intersected
-    /// against the install set's resolved versions.
+    /// Resolved peers that are in scope for this consumer. Each binding is
+    /// an exact registry version or a non-registry source wrapper ID.
     ///
     /// Sorted by peer_name for deterministic lockfile / GraphKey
     /// hashing. Empty when this package declares no peers OR when
@@ -109,7 +124,7 @@ pub struct ResolvedPackage {
     /// (`check_unmet_peers` surfaces those as `PeerWarning`s).
     ///
     /// The v2 GraphKey folds these in so two projects sharing the
-    /// same edge graph but different peer pinning produce distinct
+    /// same edge graph but different peer bindings produce distinct
     /// keys. Without this field, v2's `links/<key>/` entries silently
     /// shared across peer-divergent installs.
     pub peers: Vec<(String, String)>,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lpm_common::LpmError;
@@ -15,24 +15,23 @@ use crate::{LinkDependency, LinkTarget};
 /// Public so callers can hold a reference across spawn boundaries
 /// without reaching into linker private API.
 ///
-/// Two lookup indexes plus one duplicate guard:
+/// Three lookup indexes:
 /// - `by_triple` — full `(name, version, wrapper_id)` identity. Used
 ///   by `populate_one` to fetch this target's own key and to resolve
 ///   source-aware dependency edges.
 /// - `by_coords` — `(name, version)` only. Used only when the install
 ///   graph has a single unambiguous package at those coordinates.
-/// - `source_identities` — `(name, wrapper_id)` guard so one source
-///   identity cannot appear twice with diverging versions.
+/// - `by_source` — `(name, wrapper_id)`. Resolves source-bound peer edges
+///   and rejects duplicate source identities.
 ///
 /// Keys are stored as a single `String` using a `\x00`-separated
 /// compound key: `"name\x00version"` for `by_coords` and
 /// `"name\x00version\x00wrapper_id"` for `by_triple`. Package names
 /// and versions never contain null bytes, so there is no collision risk.
-/// This lets lookups form the key with a single `format!` call (1 alloc)
-/// instead of cloning each field separately (2–3 allocs per lookup).
 pub struct KeyMap {
     by_triple: HashMap<String, Arc<GraphKey>>,
     by_coords: HashMap<String, CoordEntry>,
+    by_source: HashMap<String, Arc<GraphKey>>,
 }
 
 enum CoordEntry {
@@ -97,10 +96,11 @@ impl KeyMap {
             })
     }
 
-    pub(super) fn get_peer(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
+    pub(super) fn get_peer(&self, name: &str, binding: &str) -> Option<&Arc<GraphKey>> {
         self.by_triple
-            .get(&triple_key(name, version, None))
-            .or_else(|| self.get_by_coords_unambiguous(name, version))
+            .get(&triple_key(name, binding, None))
+            .or_else(|| self.get_by_coords_unambiguous(name, binding))
+            .or_else(|| self.by_source.get(&name_wrapper_key(name, binding)))
     }
 
     fn get_by_coords_unambiguous(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
@@ -117,7 +117,7 @@ pub(super) fn derive_graph_keys(
     linker_tag: LinkerModeTag,
 ) -> Result<KeyMap, LpmError> {
     let mut by_triple: HashMap<String, Arc<GraphKey>> = HashMap::with_capacity(targets.len());
-    let mut source_identities: HashSet<String> = HashSet::with_capacity(targets.len());
+    let mut by_source: HashMap<String, Arc<GraphKey>> = HashMap::with_capacity(targets.len());
     let mut by_coords: HashMap<String, CoordEntry> = HashMap::with_capacity(targets.len());
 
     for v2t in targets {
@@ -157,7 +157,7 @@ pub(super) fn derive_graph_keys(
         }
         if let Some(wrapper_id) = v2t.target.wrapper_id.as_deref() {
             let wkey = name_wrapper_key(&v2t.target.name, wrapper_id);
-            if !source_identities.insert(wkey) {
+            if by_source.insert(wkey, key.clone()).is_some() {
                 return Err(LpmError::Store(format!(
                     "v2 linker: duplicate source identity for {} wrapper_id={wrapper_id:?}",
                     v2t.target.name
@@ -178,5 +178,6 @@ pub(super) fn derive_graph_keys(
     Ok(KeyMap {
         by_triple,
         by_coords,
+        by_source,
     })
 }

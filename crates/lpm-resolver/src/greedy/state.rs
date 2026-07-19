@@ -601,13 +601,16 @@ impl ResolveState {
                         } else {
                             explicit_peer_providers
                                 .iter()
-                                .find(|provider| {
-                                    provider.local_name == *peer_name
-                                        && provider.package_name == specifier.target()
-                                        && specifier
-                                            .matches_provider(&provider.version, &provider.source)
+                                .find(|provider| provider.matches_specifier(peer_name, specifier))
+                                .map(|provider| {
+                                    if provider.package_name != *peer_name {
+                                        aliases.insert(
+                                            peer_name.clone(),
+                                            provider.package_name.clone(),
+                                        );
+                                    }
+                                    provider.source_id.clone()
                                 })
-                                .map(|provider| provider.version.to_string())
                         };
                         if let Some(version) = resolved {
                             peers.push((peer_name.clone(), version.clone()));

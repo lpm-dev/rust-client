@@ -1812,6 +1812,77 @@ fn link_packages_v2_resolves_multi_source_same_coords_with_source_edges() {
     );
 }
 
+#[test]
+fn link_packages_v2_resolves_source_bound_peer_when_same_coords_are_ambiguous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let file_sri = synthetic_sri(b"source_peer/file");
+    let link_sri = synthetic_sri(b"source_peer/link");
+    let consumer_sri = synthetic_sri(b"source_peer/consumer");
+    write_object(
+        &store,
+        &file_sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.3.1\"}",
+            ),
+            ("index.js", b"module.exports = 'file-react';\n"),
+        ],
+    );
+    write_object(
+        &store,
+        &link_sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.3.1\"}",
+            ),
+            ("index.js", b"module.exports = 'link-react';\n"),
+        ],
+    );
+    write_object(
+        &store,
+        &consumer_sri,
+        &[(
+            "package.json",
+            b"{\"name\":\"consumer\",\"version\":\"1.0.0\",\"peerDependencies\":{\"react\":\"file:../react\"}}",
+        )],
+    );
+
+    let mut file_react = target("react", "18.3.1", &file_sri, true);
+    file_react.target.wrapper_id = Some("f-aaaaaaaaaaaaaaaa".into());
+    let mut link_react = target("react", "18.3.1", &link_sri, false);
+    link_react.target.wrapper_id = Some("l-bbbbbbbbbbbbbbbb".into());
+    let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+    consumer.target.peers = vec![("react".into(), "f-aaaaaaaaaaaaaaaa".into())];
+
+    let result = link_packages_v2(
+        &project,
+        vec![file_react, link_react, consumer],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+    let consumer_package = result
+        .materialized
+        .iter()
+        .find(|materialized| materialized.name == "consumer")
+        .map(|materialized| materialized.destination.clone())
+        .expect("consumer must be materialized");
+    let consumer_link_dir = consumer_package.parent().unwrap().parent().unwrap();
+    let peer = consumer_link_dir.join("node_modules/react/index.js");
+
+    assert_eq!(
+        std::fs::read_to_string(peer).expect("the exact source-bound peer must be linked"),
+        "module.exports = 'file-react';\n"
+    );
+}
+
 // ── F1 — patch_fingerprint cross-project isolation ──────────────────
 //
 // **Load-bearing for the patch-engine contract under v2.** Patches

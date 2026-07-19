@@ -67,11 +67,6 @@ pub(super) fn prepare_workspace_install_context(
         (Vec::new(), catalog_resolutions)
     };
 
-    let direct_workspace_member_deps = if requested_v2_mode {
-        workspace_member_deps.clone()
-    } else {
-        Vec::new()
-    };
     let all_workspace_members = all_workspace_members(workspace.as_ref());
 
     pre_extract_file_link_workspace_members(
@@ -81,6 +76,11 @@ pub(super) fn prepare_workspace_install_context(
         project_dir,
         json_output,
     );
+    let direct_workspace_member_deps = if requested_v2_mode {
+        workspace_member_deps.clone()
+    } else {
+        Vec::new()
+    };
 
     Ok(WorkspaceInstallContext {
         workspace,

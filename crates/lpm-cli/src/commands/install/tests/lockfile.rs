@@ -1096,7 +1096,7 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
 }
 
 #[test]
-fn current_importer_validation_accepts_snapshotless_compatibility_lockfiles() {
+fn current_importer_validation_rejects_snapshotless_lockfiles() {
     let dir = tempfile::tempdir().unwrap();
     let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
     let mut lockfile = lpm_lockfile::Lockfile::new();
@@ -1121,7 +1121,10 @@ fn current_importer_validation_accepts_snapshotless_compatibility_lockfiles() {
     lockfile.write_all(&lockfile_path).unwrap();
 
     let deps = HashMap::from([("legacy-entry".to_string(), "^1.0.0".to_string())]);
-    let current = lpm_lockfile::ImporterSnapshot::default();
+    let current = lpm_lockfile::ImporterSnapshot {
+        dependencies: [("legacy-entry".to_string(), "^1.0.0".to_string())].into(),
+        ..lpm_lockfile::ImporterSnapshot::default()
+    };
     let result = try_lockfile_fast_path(
         &lockfile_path,
         &deps,
@@ -1133,7 +1136,33 @@ fn current_importer_validation_accepts_snapshotless_compatibility_lockfiles() {
     );
 
     assert!(
-        result.is_some(),
-        "a missing importer snapshot is compatibility state, not proven manifest drift"
+        result.is_none(),
+        "snapshotless state cannot prove that removed roots or peer-role transitions are absent"
+    );
+}
+
+#[test]
+fn source_peer_reachability_uses_target_name_with_wrapper_identity() {
+    let mut consumer = fake_pkg("consumer", "1.0.0", true);
+    let mut first_provider = fake_pkg("first-provider", "dev", false);
+    first_provider.source = "directory+./shared-source".to_string();
+    let mut selected_provider = first_provider.clone();
+    selected_provider.name = "selected-provider".to_string();
+    let binding = selected_provider
+        .wrapper_id_for_source()
+        .expect("directory providers have wrapper identities");
+    consumer
+        .peers
+        .push((selected_provider.name.clone(), binding));
+    let mut packages = vec![consumer, first_provider, selected_provider];
+
+    prune_unreachable_packages(&mut packages);
+
+    assert_eq!(
+        packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["consumer", "selected-provider"]
     );
 }
