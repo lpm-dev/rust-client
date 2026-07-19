@@ -524,6 +524,82 @@ fn resolved_to_install_packages_uses_npmrc_override_when_present() {
     );
 }
 
+fn locked_source_package(
+    name: &str,
+    version: &str,
+    source: &str,
+    integrity: Option<&str>,
+) -> lpm_lockfile::LockedPackage {
+    lpm_lockfile::LockedPackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        source: Some(source.to_string()),
+        integrity: integrity.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn locked_root_selection_distinguishes_registry_and_file_sources_at_same_coordinates() {
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(locked_source_package(
+        "react",
+        "19.0.0",
+        "registry+https://registry.npmjs.org",
+        Some("sha512-registry"),
+    ));
+    lockfile.add_package(locked_source_package(
+        "react",
+        "19.0.0",
+        "directory+./packages/react",
+        None,
+    ));
+
+    let registry = select_locked_package_for_requested_spec(&lockfile, "react", "19.0.0")
+        .expect("registry request must resolve exactly");
+    assert_eq!(
+        registry.source.as_deref(),
+        Some("registry+https://registry.npmjs.org")
+    );
+    let directory =
+        select_locked_package_for_requested_spec(&lockfile, "react", "file:./packages/react")
+            .expect("file request must resolve exactly");
+    assert_eq!(
+        directory.source.as_deref(),
+        Some("directory+./packages/react")
+    );
+}
+
+#[test]
+fn locked_root_selection_uses_declared_sri_for_identical_tarball_urls() {
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for integrity in ["sha256-first", "sha512-second"] {
+        lockfile.add_package(locked_source_package(
+            "react",
+            "19.0.0",
+            "tarball+https://example.com/react.tgz",
+            Some(integrity),
+        ));
+    }
+
+    let selected = select_locked_package_for_requested_spec(
+        &lockfile,
+        "react",
+        "https://example.com/react.tgz#sha512-second",
+    )
+    .expect("declared SRI must select one exact tarball source");
+    assert_eq!(selected.integrity.as_deref(), Some("sha512-second"));
+    assert!(
+        select_locked_package_for_requested_spec(
+            &lockfile,
+            "react",
+            "https://example.com/react.tgz",
+        )
+        .is_none(),
+        "an unpinned URL must not select arbitrarily when content pins differ"
+    );
+}
+
 // ── lockfile repair and URL gate tests ───────────────────────
 
 /// `handle_tarball_not_found` must delete the project's own `lpm.lock` /
@@ -652,7 +728,7 @@ fn lockfile_fast_path_flags_v1_binary_for_upgrade() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed via TOML fallback");
 
@@ -705,7 +781,7 @@ fn lockfile_fast_path_flags_missing_binary_for_upgrade() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed with only TOML");
 
@@ -753,7 +829,7 @@ fn try_lockfile_fast_path_flags_stale_binary_for_writeback() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed via TOML");
 
@@ -801,7 +877,7 @@ fn try_lockfile_fast_path_flags_corrupt_binary_for_writeback() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed via TOML");
 
@@ -851,7 +927,7 @@ fn lockfile_fast_path_skips_upgrade_when_binary_current() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed with both TOML + v2 binary");
 
@@ -902,7 +978,7 @@ fn accepted_gate_url_populates_tarball_url() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed on valid lockfile");
 
@@ -959,7 +1035,7 @@ fn try_lockfile_fast_path_restores_registry_signature_metadata() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed on signed lockfile");
 
@@ -1009,9 +1085,16 @@ fn rejected_gate_urls_downgrade_to_none_with_telemetry() {
 
         let deps: HashMap<String, String> = [("victim".to_string(), "^1.0.0".to_string())].into();
         let gate_stats = GateStats::default();
-        let result =
-            try_lockfile_fast_path(&lockfile_path, &deps, None, &[], client, &gate_stats, false)
-                .expect("fast path should succeed even with a gate-rejected URL");
+        let result = try_lockfile_fast_path(
+            &lockfile_path,
+            &deps,
+            None,
+            &[],
+            client,
+            &gate_stats,
+            LockfileReplayPolicy::Online,
+        )
+        .expect("fast path should succeed even with a gate-rejected URL");
         (result, gate_stats, dir)
     };
 
@@ -1083,7 +1166,7 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
         &[],
         &client,
         &gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .expect("fast path should succeed on pre-existing lockfile");
 
@@ -1132,12 +1215,28 @@ fn current_importer_validation_rejects_snapshotless_lockfiles() {
         &[],
         &RegistryClient::new(),
         &GateStats::default(),
-        false,
+        LockfileReplayPolicy::Online,
     );
 
     assert!(
         result.is_none(),
         "snapshotless state cannot prove that removed roots or peer-role transitions are absent"
+    );
+
+    let compatibility_result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        Some(&current),
+        &[],
+        &RegistryClient::new(),
+        &GateStats::default(),
+        LockfileReplayPolicy::Offline {
+            allow_snapshotless_lockfile: true,
+        },
+    );
+    assert!(
+        compatibility_result.is_some(),
+        "explicit offline compatibility policy must admit snapshotless replay"
     );
 }
 

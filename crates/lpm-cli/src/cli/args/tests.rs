@@ -985,6 +985,45 @@ fn install_timing_flag_parses() {
 }
 
 #[test]
+fn snapshotless_lockfile_compatibility_requires_offline_for_install_and_ci() {
+    assert!(Cli::try_parse_from(["lpm", "install", "--allow-snapshotless-lockfile"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "ci", "--allow-snapshotless-lockfile"]).is_err());
+
+    let install = Cli::try_parse_from([
+        "lpm",
+        "install",
+        "--offline",
+        "--allow-snapshotless-lockfile",
+    ])
+    .unwrap();
+    match install.command.expect("install command") {
+        Commands::Install(lifecycle::InstallArgs {
+            offline,
+            allow_snapshotless_lockfile,
+            ..
+        }) => {
+            assert!(offline);
+            assert!(allow_snapshotless_lockfile);
+        }
+        _ => panic!("expected Install command"),
+    }
+
+    let ci =
+        Cli::try_parse_from(["lpm", "ci", "--offline", "--allow-snapshotless-lockfile"]).unwrap();
+    match ci.command.expect("ci command") {
+        Commands::Ci(build::CiArgs {
+            offline,
+            allow_snapshotless_lockfile,
+            ..
+        }) => {
+            assert!(offline);
+            assert!(allow_snapshotless_lockfile);
+        }
+        _ => panic!("expected Ci command"),
+    }
+}
+
+#[test]
 fn install_fail_if_no_match_flag_parses() {
     let cli = Cli::try_parse_from([
         "lpm",

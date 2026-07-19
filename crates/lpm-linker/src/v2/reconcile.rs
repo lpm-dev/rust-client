@@ -158,7 +158,7 @@ pub(super) fn create_root_symlinks(
         if names.is_empty() {
             continue;
         }
-        let key = key_map.get_for(&v2t.target).ok_or_else(|| {
+        let key = key_map.get_for(v2t).ok_or_else(|| {
             LpmError::Store(format!(
                 "v2 linker: missing graph key for {}@{} during root-symlink pass",
                 v2t.target.name, v2t.target.version

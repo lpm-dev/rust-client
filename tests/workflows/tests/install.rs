@@ -6134,7 +6134,77 @@ async fn workspace_overlapped_file_provider_satisfies_matching_source_peer() {
 }
 
 #[tokio::test]
-async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
+async fn workspace_overlapped_file_provider_satisfies_matching_source_peer_in_v1() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "workspace-source-peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "react": "file:./packages/react"
+            }
+        }),
+        &[("index.js", b"module.exports = require('react');\n")],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-source-peer-root-v1",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "workspace-source-peer-consumer": "1.0.0",
+    "react": "file:./packages/react"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/react/package.json",
+        r#"{"name":"react","version":"18.3.1","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/react/index.js",
+        "module.exports = 'workspace-file-react-v1';\n",
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install v1 workspace-overlapped source peer");
+    assert!(
+        install.status.success(),
+        "v1 workspace-overlapped provider must remain available to peer resolution\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('workspace-source-peer-consumer'))")
+        .output()
+        .expect("run v1 workspace source peer consumer");
+    assert!(
+        runtime.status.success(),
+        "v1 workspace source peer must load"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "workspace-file-react-v1"
+    );
+}
+
+#[tokio::test]
+async fn install_v2_preserves_registry_and_file_source_edges_on_cold_and_offline_replay() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(
         serde_json::json!({
@@ -6253,6 +6323,128 @@ async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
         String::from_utf8_lossy(&nested_react.stdout),
         "local-react",
         "consumer's react edge must resolve to its file: react package",
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    let offline = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline source identity replay");
+    assert!(
+        offline.status.success(),
+        "offline source identity replay must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&offline.stdout),
+        String::from_utf8_lossy(&offline.stderr),
+    );
+
+    let offline_root = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('react'))")
+        .output()
+        .expect("run offline root react require");
+    assert_eq!(
+        String::from_utf8_lossy(&offline_root.stdout),
+        "registry-react",
+        "offline root dependency must retain the registry source",
+    );
+
+    let offline_nested = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('consumer'))")
+        .output()
+        .expect("run offline consumer require");
+    assert_eq!(
+        String::from_utf8_lossy(&offline_nested.stdout),
+        "local-react",
+        "offline consumer edge must retain the file source",
+    );
+}
+
+#[tokio::test]
+async fn offline_replay_preserves_same_url_dependencies_with_distinct_sri_pins() {
+    let server = MockServer::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "react",
+            "version": "19.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'integrity-pinned-react';\n")],
+    );
+    Mock::given(method("GET"))
+        .and(path("/react.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/react.tgz", server.uri());
+    let sha256 = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha256,
+        &tarball,
+    );
+    let sha512 = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha512,
+        &tarball,
+    );
+    let project = TempProject::empty(
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "same-url-distinct-sri",
+            "version": "1.0.0",
+            "dependencies": {
+                "react-sha256": format!("{url}#{sha256}"),
+                "react-sha512": format!("{url}#{sha512}")
+            }
+        }))
+        .unwrap(),
+    );
+
+    lpm_with_registry(&project, &server.uri())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let cold_sha256 = std::fs::canonicalize(project.path().join("node_modules/react-sha256"))
+        .expect("cold sha256 alias must resolve");
+    let cold_sha512 = std::fs::canonicalize(project.path().join("node_modules/react-sha512"))
+        .expect("cold sha512 alias must resolve");
+    assert_ne!(
+        cold_sha256, cold_sha512,
+        "cold install must keep distinct declared SRI identities"
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    lpm_with_registry(&project, &server.uri())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let offline_sha256 = std::fs::canonicalize(project.path().join("node_modules/react-sha256"))
+        .expect("offline sha256 alias must resolve");
+    let offline_sha512 = std::fs::canonicalize(project.path().join("node_modules/react-sha512"))
+        .expect("offline sha512 alias must resolve");
+    assert_ne!(
+        offline_sha256, offline_sha512,
+        "offline replay must keep distinct declared SRI identities"
     );
 }
 
@@ -7441,6 +7633,119 @@ async fn mutable_install_rebuilds_snapshotless_lockfile_after_dependency_removal
     assert_eq!(envelope["used_lockfile"].as_bool(), Some(false));
     let rebuilt = project.read_file("lpm.lock");
     assert!(!rebuilt.contains("snapshot-removed"), "{rebuilt}");
+}
+
+#[tokio::test]
+async fn offline_install_rejects_snapshotless_lockfile_by_default() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "snapshotless-offline-default",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "snapshotless-offline-root",
+  "version": "1.0.0",
+  "dependencies": {
+    "snapshotless-offline-default": "1.0.0"
+  }
+}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    lockfile.importers.clear();
+    lockfile.write_to_file(&lockfile_path).unwrap();
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+
+    let offline = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run default snapshotless offline install");
+    assert!(
+        !offline.status.success(),
+        "offline replay must fail closed when the root importer snapshot is missing"
+    );
+    let stderr = String::from_utf8_lossy(&offline.stderr);
+    assert!(stderr.contains("root importer snapshot"), "{stderr}");
+    assert!(stderr.contains("--allow-snapshotless-lockfile"), "{stderr}");
+}
+
+#[tokio::test]
+async fn offline_install_allows_snapshotless_lockfile_only_with_explicit_opt_in() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "snapshotless-offline-opt-in",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "snapshotless-offline-opt-in-root",
+  "version": "1.0.0",
+  "dependencies": {
+    "snapshotless-offline-opt-in": "1.0.0"
+  }
+}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    lockfile.importers.clear();
+    lockfile.write_to_file(&lockfile_path).unwrap();
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+
+    let offline = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--allow-snapshotless-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run opted-in snapshotless offline install");
+    assert!(
+        offline.status.success(),
+        "explicit snapshotless compatibility replay must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&offline.stdout),
+        String::from_utf8_lossy(&offline.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&offline.stderr);
+    assert!(stderr.contains("snapshotless"), "{stderr}");
+    assert!(stderr.contains("stale"), "{stderr}");
 }
 
 #[tokio::test]

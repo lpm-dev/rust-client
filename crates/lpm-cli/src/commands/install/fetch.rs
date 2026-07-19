@@ -339,24 +339,14 @@ pub(super) async fn run_online_fetch_phase(
         for (lt, p) in link_targets.iter().zip(packages.iter()) {
             match lt.materialization {
                 lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
-                    Some(sri) => acc.push(lpm_linker::v2::V2Target {
-                        target: lt.clone(),
-                        source_sri: sri.to_string(),
-                        verified_object_integrity: None,
-                        fresh_object: None,
-                    }),
+                    Some(sri) => acc.push(v2_target(p, lt.clone(), sri.to_string())),
                     None => {
                         all_have_sri = false;
                         break;
                     }
                 },
                 lpm_linker::Materialization::DirectorySource => {
-                    acc.push(lpm_linker::v2::V2Target {
-                        target: lt.clone(),
-                        source_sri: local_source_sri_for_target(lt),
-                        verified_object_integrity: None,
-                        fresh_object: None,
-                    });
+                    acc.push(v2_target(p, lt.clone(), local_source_sri_for_target(lt)));
                 }
             }
         }
@@ -432,15 +422,7 @@ pub(super) async fn run_online_fetch_phase(
                             local_source_sri_for_target(lt)
                         }
                     };
-                    Some((
-                        install_pkg_key(p),
-                        lpm_linker::v2::V2Target {
-                            target: lt.clone(),
-                            source_sri: sri,
-                            verified_object_integrity: None,
-                            fresh_object: None,
-                        },
-                    ))
+                    Some((install_pkg_key(p), v2_target(p, lt.clone(), sri)))
                 })
                 .collect()
         } else {

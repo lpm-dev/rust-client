@@ -678,6 +678,7 @@ pub async fn dlx(
             install.root(),
             false, // json_output
             false, // offline
+            false, // allow_snapshotless_lockfile
             crate::commands::install::FrozenLockfileMode::Never,
             false, // force
             options.allow_new,

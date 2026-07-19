@@ -154,6 +154,7 @@ pub async fn run_with_options(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    allow_snapshotless_lockfile: bool,
     frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
@@ -281,6 +282,7 @@ pub async fn run_with_options(
         project_dir,
         json_output,
         offline,
+        allow_snapshotless_lockfile,
         frozen_lockfile,
         force,
         allow_new,
@@ -324,6 +326,7 @@ pub(crate) async fn run_silent_for_audit_fix(
         project_dir,
         true,
         false,
+        false,
         FrozenLockfileMode::Never,
         false,
         false,
@@ -363,6 +366,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    allow_snapshotless_lockfile: bool,
     frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
@@ -416,6 +420,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             project_dir,
             json_output,
             offline,
+            allow_snapshotless_lockfile,
             frozen_lockfile,
             force,
             allow_new,
@@ -459,6 +464,7 @@ async fn run_with_options_under_store_lock(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    allow_snapshotless_lockfile: bool,
     frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
@@ -781,17 +787,13 @@ async fn run_with_options_under_store_lock(
 
     let arc_client = Arc::new(client.clone_with_config());
 
-    let v2_workspace_root_pre_resolve = if requested_v2_mode {
-        pre_resolve_v2_direct_workspace_member_deps(
-            project_dir,
-            &mut deps,
-            &direct_workspace_member_deps,
-            &all_workspace_members,
-            json_output,
-        )?
-    } else {
-        V2WorkspaceRootPreResolveResult::default()
-    };
+    let v2_workspace_root_pre_resolve = pre_resolve_v2_direct_workspace_member_deps(
+        project_dir,
+        &mut deps,
+        &direct_workspace_member_deps,
+        &all_workspace_members,
+        json_output,
+    )?;
     if requested_v2_mode {
         workspace_member_deps.clear();
     }
@@ -841,6 +843,7 @@ async fn run_with_options_under_store_lock(
             emit_timing,
             global_config: &global_config,
             strict_integrity,
+            allow_snapshotless_lockfile,
             compatibility_bin_names,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
         })

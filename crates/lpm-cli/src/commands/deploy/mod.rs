@@ -229,6 +229,7 @@ pub async fn run(
         &plan.output_dir,
         json_output,
         false, // offline
+        false, // allow_snapshotless_lockfile
         crate::commands::install::FrozenLockfileMode::Never,
         false, // force — don't force re-link, the output dir is fresh
         false, // allow_new — deploy should not bypass minimumReleaseAge

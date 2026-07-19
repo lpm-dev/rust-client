@@ -338,6 +338,11 @@ pub(crate) struct CiArgs {
     #[arg(long)]
     pub(crate) offline: bool,
 
+    /// Permit offline replay of a legacy lockfile that has no root importer
+    /// snapshot. This can retain stale roots or peer-role transitions.
+    #[arg(long, requires = "offline")]
+    pub(crate) allow_snapshotless_lockfile: bool,
+
     /// Allow recently published packages (skip minimumReleaseAge check).
     #[arg(long)]
     pub(crate) allow_new: bool,

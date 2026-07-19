@@ -1050,7 +1050,7 @@ mod tests {
             crate::Source::Registry {
                 url: "https://registry.npmjs.org".into(),
             }
-            .source_id(),
+            .source_id_with_integrity(Some("sha512-registry")),
         );
         let tarball_key = crate::PackageKey::new(
             "react",

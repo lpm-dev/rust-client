@@ -106,9 +106,8 @@ impl Source {
     }
 
     /// Returns the wrapper identity for a package source and its content pin.
-    /// Tarball integrity is identity-bearing because one URL can be declared
-    /// with different SRI values over time. Other source kinds are fully
-    /// identified by their canonical source string.
+    /// Registry and tarball integrity are identity-bearing because one origin
+    /// can serve different content under the same package coordinates.
     pub fn source_id_with_integrity(&self, integrity: Option<&str>) -> String {
         match (self, integrity) {
             (Source::Tarball { url }, Some(integrity)) => {
@@ -117,6 +116,13 @@ impl Source {
                 identity.push('\0');
                 identity.push_str(integrity);
                 format!("t-{}", hash16(&identity))
+            }
+            (Source::Registry { url }, Some(integrity)) => {
+                let mut identity = String::with_capacity(url.len() + 1 + integrity.len());
+                identity.push_str(url);
+                identity.push('\0');
+                identity.push_str(integrity);
+                format!("npm-{}", hash16(&identity))
             }
             _ => self.source_id(),
         }

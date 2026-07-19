@@ -27,10 +27,18 @@ pub(super) struct WorkspaceMemberLink {
     pub(super) source_dir: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct DirectWorkspaceMemberProvider {
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) source_dir: PathBuf,
+    pub(super) source: String,
+}
+
 pub(super) struct WorkspaceInstallContext {
     pub(super) workspace: Option<lpm_workspace::Workspace>,
     pub(super) workspace_member_deps: Vec<WorkspaceMemberLink>,
-    pub(super) direct_workspace_member_deps: Vec<WorkspaceMemberLink>,
+    pub(super) direct_workspace_member_deps: Vec<DirectWorkspaceMemberProvider>,
     pub(super) all_workspace_members: Vec<WorkspaceMemberLink>,
     pub(super) catalog_resolutions: Vec<lpm_workspace::CatalogProtocolResolution>,
 }
@@ -69,18 +77,30 @@ pub(super) fn prepare_workspace_install_context(
 
     let all_workspace_members = all_workspace_members(workspace.as_ref());
 
-    pre_extract_file_link_workspace_members(
+    let overlapped_provider_sources = pre_extract_file_link_workspace_members(
         deps,
         &mut workspace_member_deps,
         &all_workspace_members,
         project_dir,
         json_output,
     );
-    let direct_workspace_member_deps = if requested_v2_mode {
-        workspace_member_deps.clone()
-    } else {
-        Vec::new()
-    };
+    let direct_workspace_member_deps = workspace_member_deps
+        .iter()
+        .filter_map(|member| {
+            let overlapped_source = overlapped_provider_sources.get(&member.name);
+            if !requested_v2_mode && overlapped_source.is_none() {
+                return None;
+            }
+            Some(DirectWorkspaceMemberProvider {
+                name: member.name.clone(),
+                version: member.version.clone(),
+                source_dir: member.source_dir.clone(),
+                source: overlapped_source
+                    .cloned()
+                    .unwrap_or_else(|| workspace_member_source(project_dir, &member.source_dir)),
+            })
+        })
+        .collect();
 
     Ok(WorkspaceInstallContext {
         workspace,
@@ -495,7 +515,7 @@ pub(super) fn append_workspace_links_from_local_packages(
     packages: &[InstallPackage],
     workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
     all_workspace_members: &[WorkspaceMemberLink],
-    skip_workspace_members: &[WorkspaceMemberLink],
+    skip_workspace_members: &[DirectWorkspaceMemberProvider],
 ) {
     if all_workspace_members.is_empty() {
         return;
@@ -591,9 +611,9 @@ pub(super) fn pre_extract_file_link_workspace_members(
     all_workspace_members: &[WorkspaceMemberLink],
     project_dir: &Path,
     json_output: bool,
-) {
+) -> HashMap<String, String> {
     if all_workspace_members.is_empty() {
-        return;
+        return HashMap::new();
     }
     // Canonicalize where possible; fall back to the lexical path on
     // error (EACCES, ENOENT on intermediate components, broken symlink
@@ -661,8 +681,17 @@ pub(super) fn pre_extract_file_link_workspace_members(
         .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
     let mut seen = existing;
+    let mut provider_sources = HashMap::with_capacity(to_remove.len());
     for (dep_name, member_link, raw_spec) in to_remove {
         deps.remove(&dep_name);
+        let source = if let Some(path) = raw_spec.strip_prefix("file:") {
+            format!("directory+{path}")
+        } else if let Some(path) = raw_spec.strip_prefix("link:") {
+            format!("link+{path}")
+        } else {
+            continue;
+        };
+        provider_sources.insert(dep_name.clone(), source);
         let key = (
             member_link.name.clone(),
             canonicalize_path(&member_link.source_dir),
@@ -678,6 +707,7 @@ pub(super) fn pre_extract_file_link_workspace_members(
             workspace_member_deps.push(member_link);
         }
     }
+    provider_sources
 }
 
 ///

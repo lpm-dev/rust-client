@@ -1166,12 +1166,18 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         source_dir: bar_dir,
     };
     let mut deps = HashMap::new();
+    let foo_provider = DirectWorkspaceMemberProvider {
+        name: foo.name.clone(),
+        version: foo.version.clone(),
+        source_dir: foo.source_dir.clone(),
+        source: workspace_member_source(project_dir.path(), &foo.source_dir),
+    };
 
     let mut result = pre_resolve_v2_direct_workspace_member_deps(
         project_dir.path(),
         &mut deps,
-        std::slice::from_ref(&foo),
-        &[foo.clone(), bar.clone()],
+        std::slice::from_ref(&foo_provider),
+        &[foo, bar.clone()],
         true,
     )
     .expect("v2 direct workspace pre-resolve should promote workspace child");

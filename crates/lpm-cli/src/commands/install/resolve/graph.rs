@@ -64,7 +64,7 @@ pub(super) fn load_lockfile_graph_packages(
         catalog_resolutions,
         client,
         gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     )
     .ok_or_else(|| {
         LpmError::Registry(format!(

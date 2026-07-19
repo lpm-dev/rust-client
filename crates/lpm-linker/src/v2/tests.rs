@@ -95,6 +95,7 @@ fn target(name: &str, version: &str, sri: &str, is_direct: bool) -> V2Target {
             patch_fingerprint: None,
         },
         source_sri: sri.into(),
+        source_identity: sri.into(),
         verified_object_integrity: None,
         fresh_object: None,
     }
@@ -1812,6 +1813,77 @@ fn link_packages_v2_resolves_multi_source_same_coords_with_source_edges() {
     );
 }
 
+fn assert_source_sris_get_distinct_link_entries(wrapper_id: Option<&str>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let first_project = tmp.path().join("first-project");
+    let second_project = tmp.path().join("second-project");
+    std::fs::create_dir_all(&first_project).unwrap();
+    std::fs::create_dir_all(&second_project).unwrap();
+
+    let first_sri = synthetic_sri(b"same-coordinates/first-source");
+    let second_sri = synthetic_sri(b"same-coordinates/second-source");
+    write_object(
+        &store,
+        &first_sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"19.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'first';\n"),
+        ],
+    );
+    write_object(
+        &store,
+        &second_sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"19.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'second';\n"),
+        ],
+    );
+
+    let mut first_target = target("react", "19.0.0", &first_sri, true);
+    first_target.target.wrapper_id = wrapper_id.map(str::to_string);
+    let first = link_packages_v2(
+        &first_project,
+        vec![first_target],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+
+    let mut second_target = target("react", "19.0.0", &second_sri, true);
+    second_target.target.wrapper_id = wrapper_id.map(str::to_string);
+    let second = link_packages_v2(
+        &second_project,
+        vec![second_target],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+
+    assert_ne!(
+        first.materialized[0].destination, second.materialized[0].destination,
+        "different source content at the same package coordinates must not share a global link entry"
+    );
+}
+
+#[test]
+fn link_packages_v2_separates_same_relative_local_source_across_projects() {
+    assert_source_sris_get_distinct_link_entries(Some("f-same-relative-path"));
+}
+
+#[test]
+fn link_packages_v2_separates_registry_content_at_same_coordinates() {
+    assert_source_sris_get_distinct_link_entries(None);
+}
+
 #[test]
 fn link_packages_v2_resolves_source_bound_peer_when_same_coords_are_ambiguous() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2669,10 +2741,7 @@ fn link_v2_finalize_replaces_symlinked_scope_parent_before_root_symlink_write() 
             .is_symlink(),
         "scoped root link must be recreated under the real scope directory",
     );
-    let key = plan
-        .key_map
-        .get_for(&plan.augmented_targets[0].target)
-        .unwrap();
+    let key = plan.key_map.get_for(&plan.augmented_targets[0]).unwrap();
     assert!(
         symlink_points_to(&root_link, &store.paths().link_package_dir(key)),
         "scoped root link should point at the v2 link package dir",

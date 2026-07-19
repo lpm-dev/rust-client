@@ -1105,6 +1105,7 @@ pub async fn run_add_packages(
             project_dir,
             json_output,
             false, // offline
+            false, // allow_snapshotless_lockfile
             FrozenLockfileMode::Never,
             force,
             allow_new,
@@ -1478,6 +1479,7 @@ pub async fn run_install_filtered_add(
                 install_root,
                 json_output,
                 false, // offline
+                false, // allow_snapshotless_lockfile
                 FrozenLockfileMode::Never,
                 force,
                 allow_new,

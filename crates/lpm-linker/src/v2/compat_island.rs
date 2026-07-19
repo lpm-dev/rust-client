@@ -556,7 +556,7 @@ fn collect_compatibility_roots_for_bins<'a>(
         if !is_direct(&v2t.target) {
             continue;
         }
-        let Some(key) = key_map.get_for(&v2t.target) else {
+        let Some(key) = key_map.get_for(v2t) else {
             continue;
         };
         let pkg_json_path = store.paths().link_package_dir(key).join("package.json");
@@ -615,7 +615,7 @@ fn collect_compatibility_entries<'a>(
 ) -> Result<Vec<CompatibilityEntry<'a>>, LpmError> {
     let mut targets_by_key_dir: HashMap<String, &V2Target> = HashMap::with_capacity(targets.len());
     for v2t in targets {
-        if let Some(key) = key_map.get_for(&v2t.target) {
+        if let Some(key) = key_map.get_for(v2t) {
             targets_by_key_dir.insert(key.dir_name().to_string(), v2t);
         }
     }
@@ -624,7 +624,7 @@ fn collect_compatibility_entries<'a>(
     let mut seen: HashSet<String> = HashSet::with_capacity(targets.len());
     let mut entries = Vec::new();
     while let Some(v2t) = queue.pop_front() {
-        let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+        let key = key_map.get_for(v2t).cloned().ok_or_else(|| {
             LpmError::Store(format!(
                 "v2 linker: missing graph key for compatibility package {}@{}",
                 v2t.target.name, v2t.target.version
@@ -1116,7 +1116,7 @@ fn rewire_project_roots_to_compat(
 ) -> Result<(), LpmError> {
     let nm = ensure_node_modules_dir(project_dir)?;
     for v2t in targets {
-        let Some(key) = key_map.get_for(&v2t.target) else {
+        let Some(key) = key_map.get_for(v2t) else {
             continue;
         };
         let Some(package_dir) = compatibility_links.package_dir_for_key(key) else {

@@ -124,7 +124,7 @@ pub(super) async fn run_install_freshness_phase(
                 &[],
                 input.client,
                 &gate_stats,
-                false,
+                LockfileReplayPolicy::Online,
             ) {
                 let mut policy_packages = fast.packages;
                 if input.omit_policy.dev {

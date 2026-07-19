@@ -49,12 +49,10 @@
 //!
 //! # Multi-source disambiguation
 //!
-//! The internal key map keys by `(name, version, wrapper_id)`, not
-//! `(name, version)`. Two `LinkTarget`s with the same `(name,
-//! version)` but different sources (e.g., one `Source::Registry` +
-//! one `Source::Tarball` distinguished by `wrapper_id`) get
-//! distinct GraphKeys via `with_root_link_names` + the dep-edge
-//! disambiguation that flows from each target's own `wrapper_id`.
+//! The internal key map keys every target and edge by exact source identity,
+//! including registry origin/content and project-qualified local sources.
+//! Human-readable wrapper IDs remain layout labels and are not trusted as
+//! globally unique identities.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -97,6 +95,10 @@ pub struct V2Target {
     /// SRI of the source tarball. Required to locate the object dir
     /// at `<HOME>/.lpm/store/v2/objects/<sri>/`.
     pub source_sri: String,
+    /// Exact source identity used by GraphKey derivation and edge lookup.
+    /// Unlike `LinkTarget.wrapper_id`, this is globally qualified and also
+    /// covers registry packages.
+    pub source_identity: String,
     /// Verified object digest available on warm cache hits.
     pub verified_object_integrity: Option<VerifiedObjectIntegrity>,
     /// Object produced by the extraction path for immediate link-populate.
@@ -776,7 +778,7 @@ fn populate_one(
     key_map: &KeyMap,
     meta_platform: &Arc<LinkMetaPlatform>,
 ) -> Result<PopulatedEntry, LpmError> {
-    let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+    let key = key_map.get_for(v2t).cloned().ok_or_else(|| {
         LpmError::Store(format!(
             "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
             v2t.target.name, v2t.target.version
@@ -901,7 +903,7 @@ fn existing_link_entry_packages(
 
     let mut materialized = Vec::with_capacity(plan.augmented_targets.len());
     for v2t in &plan.augmented_targets {
-        let key = plan.key_map.get_for(&v2t.target).ok_or_else(|| {
+        let key = plan.key_map.get_for(v2t).ok_or_else(|| {
             LpmError::Store(format!(
                 "v2 linker: missing graph key for {}@{} during existing-link validation",
                 v2t.target.name, v2t.target.version

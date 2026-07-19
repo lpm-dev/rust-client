@@ -228,6 +228,58 @@ fn file_workspace_overlap_is_retained_as_a_direct_v2_source_provider() {
 }
 
 #[test]
+fn file_workspace_overlap_is_retained_with_exact_source_in_v1() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("packages/react")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "react": "file:./packages/react" }
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/react/package.json"),
+        r#"{"name":"react","version":"18.3.1"}"#,
+    )
+    .unwrap();
+
+    let package = lpm_workspace::read_package_json(&root.join("package.json")).unwrap();
+    let mut deps = package.dependencies.clone();
+    let context = prepare_workspace_install_context(root, &package, &mut deps, false, true)
+        .expect("workspace context must prepare");
+
+    assert_eq!(context.direct_workspace_member_deps.len(), 1);
+    assert_eq!(
+        context.direct_workspace_member_deps[0].source,
+        "directory+./packages/react"
+    );
+    let resolved = pre_resolve_v2_direct_workspace_member_deps(
+        root,
+        &mut deps,
+        &context.direct_workspace_member_deps,
+        &context.all_workspace_members,
+        true,
+    )
+    .unwrap();
+    let providers = explicit_peer_providers_from_install_packages(resolved.install_pkgs.iter())
+        .expect("provider classification must succeed");
+    let specifier = lpm_resolver::PeerSpecifier::parse("react", "file:./packages/react")
+        .expect("peer source must parse");
+    assert!(
+        providers
+            .iter()
+            .any(|provider| provider.matches_specifier("react", &specifier)),
+        "v1 provider must match the exact file peer source"
+    );
+}
+
+#[test]
 fn workspace_member_cache_info_normalizes_jsr_dependency_aliases() {
     let dir = tempfile::tempdir().unwrap();
     let member_dir = dir.path().join("packages/app");

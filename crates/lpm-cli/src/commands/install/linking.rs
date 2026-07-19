@@ -75,17 +75,6 @@ pub(super) fn link_target_lookup_key(name: &str, version: &str) -> String {
     k
 }
 
-fn link_target_identity_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
-    let wrapper_id = wrapper_id.unwrap_or("");
-    let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + wrapper_id.len());
-    key.push_str(name);
-    key.push('\x00');
-    key.push_str(version);
-    key.push('\x00');
-    key.push_str(wrapper_id);
-    key
-}
-
 pub(super) fn local_source_sri_for_target(target: &LinkTarget) -> String {
     let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
     let seed = format!(
@@ -98,32 +87,63 @@ pub(super) fn local_source_sri_for_target(target: &LinkTarget) -> String {
     lpm_store::compute_sri_hash(seed.as_bytes())
 }
 
+pub(super) fn v2_source_identity(package: &InstallPackage, source_sri: &str) -> String {
+    let mut seed = String::with_capacity(
+        24 + package.name.len() + package.version.len() + package.source.len() + source_sri.len(),
+    );
+    seed.push_str("lpm-v2-source-identity");
+    for part in [
+        package.name.as_str(),
+        package.version.as_str(),
+        package.source.as_str(),
+        source_sri,
+    ] {
+        seed.push('\0');
+        seed.push_str(part);
+    }
+    lpm_store::compute_sri_hash(seed.as_bytes())
+}
+
+pub(super) fn v2_target(
+    package: &InstallPackage,
+    target: LinkTarget,
+    source_sri: String,
+) -> lpm_linker::v2::V2Target {
+    let source_identity = v2_source_identity(package, &source_sri);
+    lpm_linker::v2::V2Target {
+        target,
+        source_sri,
+        source_identity,
+        verified_object_integrity: None,
+        fresh_object: None,
+    }
+}
+
 pub(super) fn build_v2_targets(
     packages: &[InstallPackage],
     link_targets: &[LinkTarget],
 ) -> Result<Vec<lpm_linker::v2::V2Target>, LpmError> {
-    let sri_by_pkg: HashMap<String, String> = packages
-        .iter()
-        .filter_map(|p| {
-            p.integrity.clone().map(|sri| {
-                (
-                    link_target_identity_key(
-                        &p.name,
-                        &p.version,
-                        p.wrapper_id_for_source().as_deref(),
-                    ),
-                    sri,
-                )
-            })
-        })
-        .collect();
+    if packages.len() != link_targets.len() {
+        return Err(LpmError::Registry(format!(
+            "v2 install: package/target count mismatch ({} packages, {} targets)",
+            packages.len(),
+            link_targets.len()
+        )));
+    }
 
     let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
-    for target in link_targets {
-        let lookup_key =
-            link_target_identity_key(&target.name, &target.version, target.wrapper_id.as_deref());
+    for (package, target) in packages.iter().zip(link_targets) {
+        if package.name != target.name
+            || package.version != target.version
+            || package.wrapper_id_for_source() != target.wrapper_id
+        {
+            return Err(LpmError::Registry(format!(
+                "v2 install: package/target identity mismatch for {}@{}",
+                target.name, target.version
+            )));
+        }
         let sri = match target.materialization {
-            lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
+            lpm_linker::Materialization::CasBacked => package.integrity.clone(),
             lpm_linker::Materialization::DirectorySource => {
                 Some(local_source_sri_for_target(target))
             }
@@ -134,12 +154,7 @@ pub(super) fn build_v2_targets(
                 target.name, target.version
             ))
         })?;
-        v2_targets.push(lpm_linker::v2::V2Target {
-            target: target.clone(),
-            source_sri: sri,
-            verified_object_integrity: None,
-            fresh_object: None,
-        });
+        v2_targets.push(v2_target(package, target.clone(), sri));
     }
 
     Ok(v2_targets)

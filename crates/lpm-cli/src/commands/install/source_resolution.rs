@@ -343,7 +343,7 @@ pub(super) fn expand_local_source_install_packages(
 pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
     project_dir: &Path,
     deps: &mut HashMap<String, String>,
-    direct_workspace_member_deps: &[WorkspaceMemberLink],
+    direct_workspace_member_deps: &[DirectWorkspaceMemberProvider],
     all_workspace_members: &[WorkspaceMemberLink],
     json_output: bool,
 ) -> Result<V2WorkspaceRootPreResolveResult, LpmError> {
@@ -361,7 +361,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         install_pkgs.push(InstallPackage {
             name: member.name.clone(),
             version: member.version.clone(),
-            source: workspace_member_source(project_dir, &member.source_dir),
+            source: member.source.clone(),
             dependencies: Vec::new(),
             aliases: HashMap::new(),
             root_link_names: Some(vec![member.name.clone()]),

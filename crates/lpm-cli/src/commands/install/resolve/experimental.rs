@@ -947,7 +947,9 @@ async fn compute_parity_if_requested(
                 catalog_resolutions,
                 client.as_ref(),
                 &gate_stats,
-                true,
+                LockfileReplayPolicy::Offline {
+                    allow_snapshotless_lockfile: false,
+                },
             )
             .map(|fast| fast.packages)
             .ok_or_else(|| {
