@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use lpm_common::LpmError;
 
-use crate::{PackageStore, read_stored_integrity};
+use crate::{PackageStore, StoreVersion, read_stored_integrity};
 
 /// Resolved location of a package's source bytes along with the
 /// integrity SRI recorded for that copy. Returned by
@@ -77,12 +77,19 @@ pub enum PackageBaselineLayout {
 /// with no v2 entries get an empty map and pay only the v1 fallback.
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
-    by_identity: HashMap<(String, String, String), InstalledPackageBaseline>,
+    by_integrity: HashMap<(String, String, String), InstalledPackageBaseline>,
+    by_source_identity: HashMap<(String, String, String), InstalledPackageBaseline>,
     unique_source_by_coords: HashMap<(String, String), Option<String>>,
 }
 
 impl V2BaselineIndex {
-    fn insert(&mut self, name: String, version: String, baseline: InstalledPackageBaseline) {
+    fn insert(
+        &mut self,
+        name: String,
+        version: String,
+        source_identity: Option<String>,
+        baseline: InstalledPackageBaseline,
+    ) {
         let source_sri = baseline.integrity.clone();
         let coords = (name.clone(), version.clone());
         match self.unique_source_by_coords.entry(coords) {
@@ -95,9 +102,17 @@ impl V2BaselineIndex {
                 }
             }
         }
-        self.by_identity
-            .entry((name, version, source_sri))
-            .or_insert(baseline);
+        self.by_integrity
+            .entry((name.clone(), version.clone(), source_sri))
+            .or_insert_with(|| baseline.clone());
+        if let Some(package_source_id) = source_identity
+            .as_deref()
+            .and_then(|identity| identity.split_once('\0').map(|(source_id, _)| source_id))
+        {
+            self.by_source_identity
+                .entry((name, version, package_source_id.to_string()))
+                .or_insert(baseline);
+        }
     }
 
     /// Build a project-scoped index by walking only the link entries
@@ -216,6 +231,7 @@ impl V2BaselineIndex {
             let crate::v2::link_meta::LinkMeta {
                 name: meta_name,
                 version: meta_version,
+                source_identity: meta_source_identity,
                 source_sri: meta_sri,
                 deps: meta_deps,
                 ..
@@ -244,6 +260,7 @@ impl V2BaselineIndex {
             index.insert(
                 meta_name,
                 meta_version,
+                meta_source_identity,
                 InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
@@ -316,6 +333,7 @@ impl V2BaselineIndex {
             index.insert(
                 meta.name,
                 meta.version,
+                meta.source_identity,
                 InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
@@ -343,11 +361,22 @@ impl V2BaselineIndex {
                 .get(&(name.to_string(), version.to_string()))?
                 .as_deref()?,
         };
-        self.by_identity.get(&(
+        self.by_integrity.get(&(
             name.to_string(),
             version.to_string(),
             source_sri.to_string(),
         ))
+    }
+
+    /// O(1) lookup by the exact lockfile package source identity.
+    pub fn lookup_source_identity(
+        &self,
+        name: &str,
+        version: &str,
+        source_id: &str,
+    ) -> Option<&InstalledPackageBaseline> {
+        self.by_source_identity
+            .get(&(name.to_string(), version.to_string(), source_id.to_string()))
     }
 }
 
@@ -483,6 +512,37 @@ pub fn find_installed_package_baseline_indexed(
         return Some(InstalledPackageBaseline {
             package_dir: pkg_dir.clone(),
             pristine_dir: pkg_dir,
+            integrity,
+            layout: PackageBaselineLayout::V1,
+        });
+    }
+    None
+}
+
+/// Exact-identity variant used by lifecycle and rebuild security paths.
+pub fn find_installed_package_baseline_exact_indexed(
+    index: &V2BaselineIndex,
+    lpm_root: &lpm_common::LpmRoot,
+    store_version: StoreVersion,
+    name: &str,
+    version: &str,
+    source_id: &str,
+    expected_integrity: Option<&str>,
+) -> Option<InstalledPackageBaseline> {
+    if store_version == StoreVersion::V2 {
+        return index
+            .lookup_source_identity(name, version, source_id)
+            .cloned();
+    }
+    let store_v1 = PackageStore::from_root(lpm_root);
+    let package_dir = store_v1.package_dir(name, version);
+    if package_dir.exists()
+        && let Some(integrity) = read_stored_integrity(&package_dir)
+        && expected_integrity.is_none_or(|expected| expected == integrity)
+    {
+        return Some(InstalledPackageBaseline {
+            package_dir: package_dir.clone(),
+            pristine_dir: package_dir,
             integrity,
             layout: PackageBaselineLayout::V1,
         });
@@ -749,7 +809,7 @@ mod tests {
 
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
         assert_eq!(
-            index.by_identity.len(),
+            index.by_integrity.len(),
             2,
             "source-distinct packages must not collapse to one lifecycle baseline"
         );
@@ -798,6 +858,42 @@ mod tests {
             resolved.package_dir, resolved.pristine_dir,
             "v1 entries alias pristine_dir to package_dir (the v1 store \
              dir is never mutated by patches)"
+        );
+    }
+
+    #[test]
+    fn exact_v2_lookup_does_not_fall_through_to_a_v1_coordinate() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store_v1 = PackageStore::from_root(&lpm_root);
+        let package_dir = store_v1.package_dir("shared", "1.0.0");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join(".integrity"), "sha512-shared").unwrap();
+        let index = V2BaselineIndex::default();
+
+        let resolved = find_installed_package_baseline_exact_indexed(
+            &index,
+            &lpm_root,
+            StoreVersion::V2,
+            "shared",
+            "1.0.0",
+            "npm-exact-source",
+            Some("sha512-shared"),
+        );
+
+        assert!(resolved.is_none());
+        assert_eq!(
+            find_installed_package_baseline_exact_indexed(
+                &index,
+                &lpm_root,
+                StoreVersion::V1,
+                "shared",
+                "1.0.0",
+                "npm-exact-source",
+                Some("sha512-shared"),
+            )
+            .map(|baseline| baseline.layout),
+            Some(PackageBaselineLayout::V1),
         );
     }
 
@@ -850,6 +946,7 @@ mod tests {
                 graph_key_digest_hex: format!("{suffix}{suffix}{suffix}{suffix}"),
                 name: "lodash".into(),
                 version: "1.0.0".into(),
+                source_identity: None,
                 source_sri: format!("sha512-stub-{suffix}"),
                 object_path: format!("objects/sha512-stub-{suffix}"),
                 deps: vec![],
@@ -898,6 +995,12 @@ mod tests {
             project_hit.package_dir,
             entry_patched
         );
+        assert!(
+            project_index
+                .lookup_source_identity("lodash", "1.0.0", "npm-legacy")
+                .is_none(),
+            "sidecars without an exact source identity must not satisfy lifecycle lookups"
+        );
     }
 
     /// Direct-bin compatibility rewires `node_modules/<pkg>` to a
@@ -930,6 +1033,7 @@ mod tests {
                 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
             name: "cli-tool".into(),
             version: "1.0.0".into(),
+            source_identity: None,
             source_sri: "sha512-stub-cli-tool".into(),
             object_path: "objects/sha512-stub-cli-tool".into(),
             deps: vec![],
@@ -1008,6 +1112,7 @@ mod tests {
             graph_key_digest_hex: tslib_full.clone(),
             name: "tslib".into(),
             version: "2.0.0".into(),
+            source_identity: None,
             source_sri: "sha512-stub-tslib".into(),
             object_path: "objects/sha512-stub-tslib".into(),
             deps: vec![],
@@ -1040,6 +1145,7 @@ mod tests {
             ),
             name: "consumer".into(),
             version: "1.0.0".into(),
+            source_identity: None,
             source_sri: "sha512-stub-consumer".into(),
             object_path: "objects/sha512-stub-consumer".into(),
             deps: vec![LinkMetaDep {
@@ -1119,6 +1225,7 @@ mod tests {
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
             name: "@scope/pkg".into(),
             version: "1.0.0".into(),
+            source_identity: None,
             source_sri: "sha512-stub-scoped".into(),
             object_path: "objects/sha512-stub-scoped".into(),
             deps: vec![],

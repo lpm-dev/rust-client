@@ -136,6 +136,9 @@ pub async fn run(
     let lpm_root = LpmRoot::from_env()?;
     let store = PackageStore::from_root(&lpm_root);
     let store_v2 = v2_store_for_fetch(&lpm_root)?;
+    if store_v2.is_none() {
+        validate_v1_target_identities(&targets)?;
+    }
 
     let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
     let firewall_preflight = prepare_npm_firewall_materialization_preflight(
@@ -244,6 +247,30 @@ async fn fetch_targets_under_store_lock(
         );
     }
     Ok(results)
+}
+
+fn validate_v1_target_identities(targets: &[FetchTarget]) -> Result<(), LpmError> {
+    let mut identities = std::collections::HashMap::with_capacity(targets.len());
+    for target in targets {
+        let coordinates = (&target.name, &target.version);
+        let source = match &target.source {
+            FetchSource::Registry {
+                registry_url,
+                tarball_url,
+            } => ("registry", registry_url.as_str(), tarball_url.as_str()),
+            FetchSource::RemoteTarball { url } => ("remote_tarball", url.as_str(), url.as_str()),
+        };
+        let identity = (target.integrity.as_str(), source);
+        if let Some(previous) = identities.insert(coordinates, identity)
+            && previous != identity
+        {
+            return Err(LpmError::Store(format!(
+                "lpm fetch cannot cache distinct source identities for {}@{} in store v1; use the default store v2 by unsetting LPM_STORE_VERSION",
+                target.name, target.version
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn v2_store_for_fetch(lpm_root: &LpmRoot) -> Result<Option<Arc<lpm_store::v2::Store>>, LpmError> {
@@ -738,6 +765,33 @@ mod tests {
         let err = classify_package(&package, &FetchPlatform::parse("linux/x64/glibc").unwrap())
             .unwrap_err();
         assert!(err.to_string().contains("missing tarball URL"));
+    }
+
+    #[test]
+    fn v1_fetch_rejects_same_coordinates_with_distinct_source_identities() {
+        let first = FetchTarget {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: "sha512-first".into(),
+            source: FetchSource::Registry {
+                registry_url: "https://registry-a.example".into(),
+                tarball_url: "https://registry-a.example/shared.tgz".into(),
+            },
+        };
+        let second = FetchTarget {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: "sha512-second".into(),
+            source: FetchSource::Registry {
+                registry_url: "https://registry-b.example".into(),
+                tarball_url: "https://registry-b.example/shared.tgz".into(),
+            },
+        };
+
+        let error = validate_v1_target_identities(&[first, second]).unwrap_err();
+
+        assert!(error.to_string().contains("store v2"));
+        assert!(error.to_string().contains("shared@1.0.0"));
     }
 
     #[test]

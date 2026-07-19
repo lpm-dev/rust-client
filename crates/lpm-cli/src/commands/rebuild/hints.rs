@@ -1,5 +1,5 @@
-use super::scripts::{BUILD_MARKER, package_baseline_dir_indexed, read_lifecycle_scripts};
-use super::trust::{evaluate_trust, name_matches_trusted_scope, parse_trusted_scopes};
+use super::scripts::{BUILD_MARKER, read_lifecycle_scripts};
+use super::trust::{evaluate_trust_for_identity, name_matches_trusted_scope, parse_trusted_scopes};
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::color::Painted;
@@ -33,7 +33,7 @@ pub(crate) struct ScriptableHintRow {
 /// packages lack an SRI hash or the caller couldn't resolve one); the
 /// strict gate still works, just with a weaker binding.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scriptable_package_rows(
+pub(crate) fn scriptable_package_rows_for_identities(
     // switched `&PackageStore`
     // (v1-only) for `&LpmRoot` so per-package lookups can route
     // through `find_installed_package_baseline` and pick up v2-
@@ -42,7 +42,7 @@ pub(crate) fn scriptable_package_rows(
     // install scripts" even when prisma-codegen / esbuild / sharp
     // were waiting in the v2 store.
     lpm_root: &lpm_common::LpmRoot,
-    packages: &[(String, String, Option<String>)], // (name, version, integrity)
+    packages: &[crate::build_state::InstalledPackageIdentity],
     policy: &SecurityPolicy,
     project_dir: &Path,
     // Without these two
@@ -55,6 +55,7 @@ pub(crate) fn scriptable_package_rows(
     // yet parse the project capability set.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
+    store_version: lpm_store::StoreVersion,
 ) -> Vec<ScriptableHintRow> {
     use rayon::prelude::*;
 
@@ -92,71 +93,84 @@ pub(crate) fn scriptable_package_rows(
     // (hint print + `unbuilt` filter) does not depend on a specific
     // ordering of equally-typed rows but the Vec preserves
     // input order anyway under rayon's stable collect.
-    let per_pkg = |(name, version, integrity): &(String, String, Option<String>)|
-     -> Option<ScriptableHintRow> {
-        // v2-aware lookup, routed through the invocation-local index. See
-        // [`package_baseline_dir`] for the silent-skip-vs-real-skip
-        // semantic.
-        let pkg_dir = package_baseline_dir_indexed(
-            &baseline_index,
-            lpm_root,
-            name,
-            version,
-            integrity.as_deref(),
-        )?;
-        let pkg_json_path = pkg_dir.join("package.json");
+    let per_pkg =
+        |identity: &crate::build_state::InstalledPackageIdentity| -> Option<ScriptableHintRow> {
+            let name = &identity.name;
+            let version = &identity.version;
+            let integrity = &identity.integrity;
+            // v2-aware lookup, routed through the invocation-local index. See
+            // [`package_baseline_dir`] for the silent-skip-vs-real-skip
+            // semantic.
+            let package_key = identity.package_key();
+            let pkg_dir = lpm_store::find_installed_package_baseline_exact_indexed(
+                &baseline_index,
+                lpm_root,
+                store_version,
+                &package_key.name,
+                &package_key.version,
+                &package_key.source_id,
+                integrity.as_deref(),
+            )?
+            .package_dir;
+            let pkg_json_path = pkg_dir.join("package.json");
 
-        let scripts = match read_lifecycle_scripts(&pkg_json_path) {
-            Some(s) if !s.is_empty() => s,
-            _ => return None,
-        };
-
-        let is_built = pkg_dir.join(BUILD_MARKER).exists();
-
-        // Strict/tiered gate — same four-way match as `rebuild::run` at
-        // the main rebuild loop. `Strict` + `LegacyNameOnly` are trusted;
-        // `BindingDrift` + `NotTrusted` are not. A legacy bare-name
-        // entry counts as trusted here because `rebuild::run` will
-        // still run the script (with a deprecation warning), so the
-        // hint must not mislead the user about what the subsequent
-        // `lpm rebuild` will do.
-        let script_hash = compute_script_hash(&pkg_dir);
-        let trust = policy.can_run_scripts_strict(
-            name,
-            version,
-            integrity.as_deref(),
-            script_hash.as_deref(),
-        );
-        let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
-        let scope_trust = name_matches_trusted_scope(name, &trusted_scopes);
-        let base_trusted = strict_trust || scope_trust;
-
-        // If the script-
-        // hash / scope layer would trust the package but the
-        // capability gate rejects it, `lpm rebuild` will NOT run
-        // the script. The hint must reflect that accurately.
-        // BindingDrift / NotTrusted don't need this adjustment —
-        // they're already untrusted.
-        let capability_blocks_trust = if base_trusted {
-            let binding = if strict_trust {
-                policy.get_binding(name, version, None, integrity.as_deref())
-            } else {
-                None // scope-trust has no binding to bind a hash to
+            let scripts = match read_lifecycle_scripts(&pkg_json_path) {
+                Some(s) if !s.is_empty() => s,
+                _ => return None,
             };
-            requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
-        } else {
-            false
-        };
-        let is_trusted = base_trusted && !capability_blocks_trust;
 
-        Some(ScriptableHintRow {
-            name: name.clone(),
-            version: version.clone(),
-            scripts,
-            is_built,
-            is_trusted,
-        })
-    };
+            let is_built = pkg_dir.join(BUILD_MARKER).exists();
+
+            // Strict/tiered gate — same four-way match as `rebuild::run` at
+            // the main rebuild loop. `Strict` + `LegacyNameOnly` are trusted;
+            // `BindingDrift` + `NotTrusted` are not. A legacy bare-name
+            // entry counts as trusted here because `rebuild::run` will
+            // still run the script (with a deprecation warning), so the
+            // hint must not mislead the user about what the subsequent
+            // `lpm rebuild` will do.
+            let script_hash = compute_script_hash(&pkg_dir);
+            let trust = policy.can_run_scripts_strict_for_identity(
+                name,
+                version,
+                identity.source.as_deref(),
+                integrity.as_deref(),
+                script_hash.as_deref(),
+            );
+            let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
+            let scope_trust = name_matches_trusted_scope(name, &trusted_scopes);
+            let base_trusted = strict_trust || scope_trust;
+
+            // If the script-
+            // hash / scope layer would trust the package but the
+            // capability gate rejects it, `lpm rebuild` will NOT run
+            // the script. The hint must reflect that accurately.
+            // BindingDrift / NotTrusted don't need this adjustment —
+            // they're already untrusted.
+            let capability_blocks_trust = if base_trusted {
+                let binding = if strict_trust {
+                    policy.get_binding(
+                        name,
+                        version,
+                        identity.source.as_deref(),
+                        integrity.as_deref(),
+                    )
+                } else {
+                    None // scope-trust has no binding to bind a hash to
+                };
+                requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
+            } else {
+                false
+            };
+            let is_trusted = base_trusted && !capability_blocks_trust;
+
+            Some(ScriptableHintRow {
+                name: name.clone(),
+                version: version.clone(),
+                scripts,
+                is_built,
+                is_trusted,
+            })
+        };
 
     let rows: Vec<ScriptableHintRow> = packages.par_iter().filter_map(per_pkg).collect();
 
@@ -167,6 +181,37 @@ pub(crate) fn scriptable_package_rows(
     );
 
     rows
+}
+
+#[cfg(test)]
+pub(crate) fn scriptable_package_rows(
+    lpm_root: &lpm_common::LpmRoot,
+    packages: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+) -> Vec<ScriptableHintRow> {
+    let identities = packages
+        .iter()
+        .map(|(name, version, integrity)| {
+            crate::build_state::InstalledPackageIdentity::new(
+                name,
+                version,
+                None,
+                integrity.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    scriptable_package_rows_for_identities(
+        lpm_root,
+        &identities,
+        policy,
+        project_dir,
+        requested_capabilities,
+        user_bound,
+        lpm_store::StoreVersion::V1,
+    )
 }
 
 /// Show the install-time build hint (called from install.rs).
@@ -180,7 +225,7 @@ pub fn show_install_build_hint(
     // `scriptable_package_rows` for why this is `&LpmRoot` not
     // `&PackageStore`.
     lpm_root: &lpm_common::LpmRoot,
-    packages: &[(String, String, Option<String>)], // (name, version, integrity)
+    packages: &[crate::build_state::InstalledPackageIdentity],
     policy: &SecurityPolicy,
     project_dir: &Path,
     // threaded to
@@ -190,13 +235,14 @@ pub fn show_install_build_hint(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
 ) {
-    let rows = scriptable_package_rows(
+    let rows = scriptable_package_rows_for_identities(
         lpm_root,
         packages,
         policy,
         project_dir,
         requested_capabilities,
         user_bound,
+        lpm_store::StoreVersion::from_env(),
     );
     let unbuilt: Vec<&ScriptableHintRow> = rows.iter().filter(|r| !r.is_built).collect();
 
@@ -273,7 +319,7 @@ pub fn show_install_build_hint(
 /// whether to skip the auto-build step entirely), matching the
 /// previous semantics.
 #[allow(clippy::too_many_arguments)]
-pub fn all_scripted_packages_trusted(
+pub fn all_scripted_package_identities_trusted(
     // see
     // `scriptable_package_rows` for why this is `&LpmRoot` not
     // `&PackageStore`. Without the v2-aware lookup, the predicate
@@ -281,7 +327,8 @@ pub fn all_scripted_packages_trusted(
     // scripts (silent skip of v2 packages), suppressing the
     // auto-build path entirely.
     lpm_root: &lpm_common::LpmRoot,
-    packages: &[(String, String, Option<String>)], // (name, version, integrity)
+    store_version: lpm_store::StoreVersion,
+    packages: &[crate::build_state::InstalledPackageIdentity],
     policy: &SecurityPolicy,
     project_dir: &Path,
     effective_policy: ScriptPolicy,
@@ -319,18 +366,23 @@ pub fn all_scripted_packages_trusted(
 
     let mut has_any_unbuilt = false;
 
-    for (name, version, integrity) in packages {
+    for identity in packages {
+        let name = &identity.name;
+        let version = &identity.version;
+        let integrity = &identity.integrity;
         // v2-aware lookup, routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
-        let pkg_dir = match package_baseline_dir_indexed(
+        let pkg_dir = match lpm_store::find_installed_package_baseline_exact_indexed(
             &baseline_index,
             lpm_root,
+            store_version,
             name,
             version,
+            &identity.package_key().source_id,
             integrity.as_deref(),
         ) {
-            Some(p) => p,
+            Some(baseline) => baseline.package_dir,
             None => continue,
         };
         let pkg_json_path = pkg_dir.join("package.json");
@@ -348,10 +400,11 @@ pub fn all_scripted_packages_trusted(
         // Unbuilt with scripts — first fresh trust-check.
         has_any_unbuilt = true;
 
-        let reason = evaluate_trust(
+        let reason = evaluate_trust_for_identity(
             &pkg_dir,
             name,
             version,
+            identity.source.as_deref(),
             integrity.as_deref(),
             &scripts,
             policy,
@@ -368,4 +421,44 @@ pub fn all_scripted_packages_trusted(
     }
 
     has_any_unbuilt // true only if there are unbuilt scripts AND all are trusted
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn all_scripted_packages_trusted(
+    lpm_root: &lpm_common::LpmRoot,
+    packages: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    force_security_floor: bool,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> bool {
+    let identities = packages
+        .iter()
+        .map(|(name, version, integrity)| {
+            crate::build_state::InstalledPackageIdentity::new(
+                name,
+                version,
+                None,
+                integrity.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    all_scripted_package_identities_trusted(
+        lpm_root,
+        lpm_store::StoreVersion::V1,
+        &identities,
+        policy,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+    )
 }

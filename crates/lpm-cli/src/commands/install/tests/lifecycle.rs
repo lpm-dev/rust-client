@@ -80,14 +80,100 @@ fn blocked_set_source_metadata_fails_closed_for_ambiguous_install_identity() {
     second.source = "registry+https://registry-b.example".into();
 
     let metadata = blocked_set_source_metadata(&[first, second]);
-    let entry = metadata
-        .get("same-coordinates", "1.0.0", Some("sha512-shared"))
-        .expect("ambiguous identity remains represented");
+    let sources = metadata
+        .by_pkg
+        .values()
+        .filter_map(|entry| entry.source.as_deref())
+        .collect::<std::collections::HashSet<_>>();
 
-    assert!(
-        entry.source.is_none(),
-        "approval provenance must not select an arbitrary source"
+    assert_eq!(metadata.by_pkg.len(), 2);
+    assert_eq!(
+        sources,
+        std::collections::HashSet::from([
+            "registry+https://registry-a.example",
+            "registry+https://registry-b.example",
+        ])
     );
+}
+
+#[test]
+fn advisor_package_lookup_selects_the_exact_v1_hoisted_version() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().join("node_modules/shared");
+    let nested = project
+        .path()
+        .join("node_modules/consumer/node_modules/shared");
+    for (directory, version, integrity) in [
+        (&root, "1.0.0", "sha512-root"),
+        (&nested, "2.0.0", "sha512-nested"),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("package.json"),
+            format!(
+                r#"{{"name":"shared","version":"{version}","scripts":{{"install":"node install.js"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(directory.join(".integrity"), integrity).unwrap();
+    }
+    let materialized = vec![
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            destination: root,
+        },
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "2.0.0".into(),
+            destination: nested.clone(),
+        },
+    ];
+    let identity = crate::build_state::InstalledPackageIdentity::new(
+        "shared",
+        "2.0.0",
+        Some("registry+https://registry.npmjs.org".into()),
+        Some("sha512-nested".into()),
+    );
+
+    let resolved = advisor_package_dir(&identity, &materialized, None);
+
+    assert_eq!(resolved.as_deref(), Some(nested.as_path()));
+}
+
+#[test]
+fn advisor_package_lookup_rejects_ambiguous_v1_source_materializations() {
+    let project = tempfile::tempdir().unwrap();
+    let source_a = project.path().join("source-a");
+    let source_b = project.path().join("source-b");
+    for directory in [&source_a, &source_b] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("package.json"),
+            r#"{"name":"shared","version":"1.0.0"}"#,
+        )
+        .unwrap();
+    }
+    let materialized = vec![
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            destination: source_a,
+        },
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            destination: source_b,
+        },
+    ];
+    let identity = crate::build_state::InstalledPackageIdentity::new(
+        "shared",
+        "1.0.0",
+        Some("directory+./source-a".into()),
+        None,
+    );
+
+    assert!(advisor_package_dir(&identity, &materialized, None).is_none());
 }
 
 /// The drift gate must appear before the install pipeline hands off to
@@ -222,6 +308,7 @@ fn select_approvals_returns_none_when_auto_build_skipped() {
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-x".to_string()),
         String::new(),
     ));
@@ -238,6 +325,7 @@ fn select_approvals_returns_view_when_auto_build_fires() {
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-x".to_string()),
         String::new(),
     ));
@@ -247,6 +335,7 @@ fn select_approvals_returns_view_when_auto_build_fires() {
     assert!(view.contains(&(
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-x".to_string()),
         String::new(),
     )));

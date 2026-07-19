@@ -137,6 +137,8 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
     };
     let result = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
         std::fs::remove_dir_all(path)
+    } else if metadata.file_type().is_symlink() {
+        remove_node_modules_link(path)
     } else {
         std::fs::remove_file(path)
     };
@@ -146,6 +148,26 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
             path.display()
         ))
     })
+}
+
+#[cfg(windows)]
+fn remove_node_modules_link(path: &Path) -> std::io::Result<()> {
+    match remove_dir_symlink_or_junction(path) {
+        Ok(()) => Ok(()),
+        Err(directory_error) => std::fs::remove_file(path).map_err(|file_error| {
+            std::io::Error::new(
+                file_error.kind(),
+                format!(
+                    "directory-link removal failed ({directory_error}); file-link removal failed ({file_error})"
+                ),
+            )
+        }),
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_node_modules_link(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 /// Create `<project>/node_modules/<root_link_name>` symlinks pointing
@@ -376,5 +398,22 @@ mod windows_tests {
 
         assert!(sentinel.exists());
         assert!(!project.path().join("node_modules").exists());
+    }
+
+    #[test]
+    fn entry_reconcile_removes_a_package_junction_without_touching_its_target() {
+        let project = tempfile::tempdir().unwrap();
+        let node_modules = project.path().join("node_modules");
+        std::fs::create_dir(&node_modules).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sentinel = external.path().join("must-survive");
+        std::fs::write(&sentinel, b"external data").unwrap();
+        let package_link = node_modules.join("old-package");
+        create_dir_symlink_or_junction(external.path(), &package_link).unwrap();
+
+        remove_node_modules_entry(&package_link, "stale package junction").unwrap();
+
+        assert!(sentinel.exists());
+        assert!(!package_link.exists());
     }
 }

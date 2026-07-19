@@ -116,6 +116,18 @@ pub(super) fn emit_yes_warning_banner(count: usize, json_output: bool) {
 pub(super) fn print_package_card(blocked: &BlockedPackage) {
     println!();
     println!("  {}@{}", blocked.name.bold(), blocked.version.dimmed(),);
+    if let Some(source) = &blocked.source {
+        println!(
+            "    {:<14}{}",
+            "Source:".dimmed(),
+            truncate_for_display(source, 60),
+        );
+    }
+    println!(
+        "    {:<14}{}",
+        "Selector:".dimmed(),
+        blocked_identity_selector(blocked),
+    );
     if let Some(integrity) = &blocked.integrity {
         println!(
             "    {:<14}{}",

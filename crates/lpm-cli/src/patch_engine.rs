@@ -2113,6 +2113,7 @@ mod tests {
             graph_key_digest_hex: "abcdef0123456789".repeat(4),
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
+            source_identity: None,
             source_sri: "sha512-v2-baseline".to_string(),
             object_path: "objects/sha512-zzz".to_string(),
             deps: Vec::new(),

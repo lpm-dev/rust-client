@@ -1332,6 +1332,7 @@ mod tests {
         ScriptablePackage {
             name: name.into(),
             version: "1.0.0".into(),
+            source: None,
             integrity: None,
             wrapper_id: None,
             store_path: PathBuf::new(),

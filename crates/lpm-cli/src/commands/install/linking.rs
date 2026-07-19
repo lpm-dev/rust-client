@@ -111,7 +111,16 @@ pub(super) fn v2_source_identity(
         seed.push('\0');
         seed.push_str(part);
     }
-    lpm_store::compute_sri_hash(seed.as_bytes())
+    let exact = lpm_store::compute_sri_hash(seed.as_bytes());
+    let package_source_id = package.source_kind().map_or_else(
+        |_| lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        |source| source.source_id_with_integrity(package.integrity.as_deref()),
+    );
+    let mut identity = String::with_capacity(package_source_id.len() + exact.len() + 1);
+    identity.push_str(&package_source_id);
+    identity.push('\0');
+    identity.push_str(&exact);
+    identity
 }
 
 pub(super) fn v2_target(
@@ -548,9 +557,16 @@ pub(super) async fn run_link_and_finish(
 
     // capture the install-time blocked set into
     // build-state.json. Same wiring as the online path — see comment there.
-    let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
+    let installed_with_integrity: Vec<crate::build_state::InstalledPackageIdentity> = packages
         .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .map(|p| {
+            crate::build_state::InstalledPackageIdentity::new(
+                p.name.clone(),
+                p.version.clone(),
+                Some(p.source.clone()),
+                p.integrity.clone(),
+            )
+        })
         .collect();
     let blocked_set_metadata =
         crate::commands::install::lifecycle::blocked_set_source_metadata(&packages);
@@ -565,17 +581,19 @@ pub(super) async fn run_link_and_finish(
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
-    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
-        lpm_root,
-        &installed_with_integrity,
-        &policy,
-        project_dir,
-        effective_policy,
-        force_security_floor,
-        &offline_requested_capabilities,
-        &offline_user_bound,
-        None,
-    );
+    let all_trusted_for_auto_build =
+        crate::commands::rebuild::all_scripted_package_identities_trusted(
+            lpm_root,
+            lpm_store::StoreVersion::from_env(),
+            &installed_with_integrity,
+            &policy,
+            project_dir,
+            effective_policy,
+            force_security_floor,
+            &offline_requested_capabilities,
+            &offline_user_bound,
+            None,
+        );
     let auto_build_attempted = should_auto_build(
         auto_build,
         script_policy_cfg.auto_build,
@@ -583,16 +601,17 @@ pub(super) async fn run_link_and_finish(
         effective_policy,
     );
 
-    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
-        project_dir,
-        &store,
-        &installed_with_integrity,
-        &policy,
-        &blocked_set_metadata,
-        &offline_requested_capabilities,
-        &offline_user_bound,
-        None,
-    )?;
+    let mut blocked_capture =
+        crate::build_state::capture_blocked_set_after_install_with_metadata_for_identities(
+            project_dir,
+            &store,
+            &installed_with_integrity,
+            &policy,
+            &blocked_set_metadata,
+            &offline_requested_capabilities,
+            &offline_user_bound,
+            None,
+        )?;
 
     let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
     if auto_build_attempted {
@@ -632,9 +651,10 @@ pub(super) async fn run_link_and_finish(
             .cloned()
             .collect::<HashSet<_>>();
         blocked_capture =
-            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
+            crate::build_state::capture_blocked_set_after_install_with_metadata_for_identities_and_exclusions(
                 project_dir,
                 &store,
+                lpm_store::StoreVersion::from_env(),
                 &installed_with_integrity,
                 &policy,
                 &blocked_set_metadata,

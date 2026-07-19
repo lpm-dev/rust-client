@@ -1358,6 +1358,7 @@ async fn run_with_options_under_store_lock(
         route_table: &route_table,
         project_dir,
         packages: &packages,
+        materialized_packages: &link_result.materialized,
         package: &pkg,
         store: &store,
         used_lockfile,

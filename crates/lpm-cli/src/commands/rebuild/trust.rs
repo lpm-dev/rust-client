@@ -67,8 +67,8 @@ pub(super) fn name_matches_trusted_scope(package_name: &str, scopes: &[String]) 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrustReason {
-    /// Rich strict binding: `{name, version,
-    /// integrity, scriptHash}` tuple matches an approved entry.
+    /// Rich strict binding whose exact source/content identity and script hash
+    /// match an approved entry.
     StrictBinding,
     /// Pre-legacy bare-name `trustedDependencies: ["name"]`
     /// entry. Matched via `TrustMatch::LegacyNameOnly`. Callers
@@ -202,6 +202,7 @@ impl TrustReason {
 /// the security floor at "no execution without current user approval
 /// intent".
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn evaluate_trust(
     package_dir: &Path,
     name: &str,
@@ -379,19 +380,12 @@ pub(super) fn evaluate_trust_unsuspended(
         if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
             && let Some(set) = advisor_approvals
         {
-            // M29: the approval key includes a script_bundle_hash that
-            // isn't available here without threading the bodies in.
-            // Today script classification is whole-package, so an
-            // approval for `(name, version, integrity)` is unique on
-            // that triple — match on the first three fields and
-            // ignore the bundle hash slot. A future per-phase refactor
-            // would tighten this to the full 4-tuple by threading the
-            // body hash through to this site.
+            // Classification is package-wide, so one source-qualified package
+            // identity has one bundle verdict for this install session.
             let integrity_owned: Option<String> = integrity.map(str::to_string);
-            if set
-                .iter()
-                .any(|(n, v, i, _)| n == name && v == version && *i == integrity_owned)
-            {
+            if set.iter().any(|(n, v, s, i, _)| {
+                n == name && v == version && s.as_deref() == source && *i == integrity_owned
+            }) {
                 return TrustReason::AdvisorApprovedThisRun;
             }
         }

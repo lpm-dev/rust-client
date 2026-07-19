@@ -868,6 +868,13 @@ pub fn blocked_to_json_with_provenance(
     let mut entry = serde_json::json!({
         "name": blocked.name,
         "version": blocked.version,
+        "source": blocked.source,
+        "identity_selector": lpm_workspace::TrustedDependencies::rich_key_for_identity(
+            &blocked.name,
+            &blocked.version,
+            blocked.source.as_deref(),
+            blocked.integrity.as_deref(),
+        ),
         "integrity": blocked.integrity,
         "script_hash": blocked.script_hash,
         "phases_present": blocked.phases_present,
@@ -1871,6 +1878,19 @@ mod tests {
         // Existing fields still present.
         assert_eq!(v["name"], serde_json::json!("esbuild"));
         assert_eq!(v["static_tier"], serde_json::json!("green"));
+        assert_eq!(
+            v["source"],
+            serde_json::json!("registry+https://registry.npmjs.org")
+        );
+        assert_eq!(
+            v["identity_selector"],
+            serde_json::json!(lpm_workspace::TrustedDependencies::rich_key_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some("registry+https://registry.npmjs.org"),
+                Some("sha512-esbuild-0.25.1"),
+            ))
+        );
     }
 
     #[test]

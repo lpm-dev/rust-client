@@ -291,6 +291,36 @@ async fn fetch_v1_waits_for_the_store_lock_before_downloading_or_replacing_coord
 }
 
 #[tokio::test]
+async fn fetch_v1_rejects_distinct_sources_that_share_package_coordinates() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut parsed =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("lockfile parses");
+    let mut second = parsed.packages[0].clone();
+    second.source = Some("registry+https://registry-b.example".into());
+    second.tarball = Some("https://registry-b.example/ms/-/ms-2.1.3.tgz".into());
+    second.integrity = Some(compute_integrity(b"registry-b bytes"));
+    parsed.packages.push(second);
+    parsed
+        .write_to_file(&lockfile_path)
+        .expect("write conflicting v1 lockfile identities");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("distinct source identities"));
+    assert!(stderr.contains("ms@2.1.3"));
+}
+
+#[tokio::test]
 async fn fetch_uses_store_cache_without_downloading_again() {
     let mock = MockRegistry::start().await;
     mount_ms(&mock).await;

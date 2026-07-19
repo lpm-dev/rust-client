@@ -962,6 +962,7 @@ mod tests {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
             name: name.to_string(),
             version: version.to_string(),
+            source_identity: None,
             source_sri: sri.clone(),
             object_path: object_path.clone(),
             deps: vec![],

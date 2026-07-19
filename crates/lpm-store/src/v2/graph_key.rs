@@ -224,6 +224,7 @@ impl GraphKeyInputs {
 pub struct GraphKey {
     name: String,
     version: String,
+    source_identity: Option<String>,
     digest: [u8; 32],
     /// Cached, pre-computed result of `<safe_name>@<version>+<short_hex>`.
     /// Computed once at construction; returned as `&str` by `dir_name()`.
@@ -307,6 +308,7 @@ impl GraphKey {
         Self {
             name: inputs.name.clone(),
             version: inputs.version.clone(),
+            source_identity: inputs.source_identity.clone(),
             digest,
             dir_name,
         }
@@ -370,6 +372,7 @@ impl GraphKey {
         Self {
             name: name.to_owned(),
             version: version.to_owned(),
+            source_identity: source_identity.map(str::to_owned),
             digest,
             dir_name,
         }
@@ -390,6 +393,7 @@ impl GraphKey {
         Self {
             name,
             version,
+            source_identity: None,
             digest,
             dir_name,
         }
@@ -408,6 +412,12 @@ impl GraphKey {
     #[inline]
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Exact source identity retained from graph-key derivation.
+    #[inline]
+    pub fn source_identity(&self) -> Option<&str> {
+        self.source_identity.as_deref()
     }
 
     /// Full BLAKE3 digest (256 bits / 32 bytes).

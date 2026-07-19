@@ -46,8 +46,10 @@ use self::build_cache::{
     marker_requires_key_validation, read_build_marker_key, read_v2_graph_key_digest,
 };
 #[cfg(test)]
+pub use self::hints::all_scripted_packages_trusted;
+#[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
-pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
+pub use self::hints::{all_scripted_package_identities_trusted, show_install_build_hint};
 use self::package_dir::{PackageLookupIdentity, prepare_live_package_dir};
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
@@ -287,6 +289,7 @@ pub(crate) async fn run_under_store_lock(
     // same-coordinate packages coexist; the project-scoped walk avoids
     // returning a sibling project's patched copy of the same package.
     let baseline_index = V2BaselineIndex::for_project(project_dir, &lpm_root)?;
+    let store_version = lpm_store::StoreVersion::from_env();
 
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
@@ -298,11 +301,14 @@ pub(crate) async fn run_under_store_lock(
         // installs); silent skip preserves the previously
         // `pkg_json_path.exists()` semantic for non-store sources
         // while fixing the v2-installed-and-skipped data-loss bug.
-        let baseline = match lpm_store::find_installed_package_baseline_indexed(
+        let package_key = lp.package_key();
+        let baseline = match lpm_store::find_installed_package_baseline_exact_indexed(
             &baseline_index,
             &lpm_root,
-            &lp.name,
-            &lp.version,
+            store_version,
+            &package_key.name,
+            &package_key.version,
+            &package_key.source_id,
             lp.integrity.as_deref(),
         ) {
             Some(baseline) => baseline,
@@ -398,6 +404,7 @@ pub(crate) async fn run_under_store_lock(
         scriptable_packages.push(ScriptablePackage {
             name: lp.name.clone(),
             version: lp.version.clone(),
+            source: lp.source.clone(),
             integrity: lp.integrity.clone(),
             wrapper_id,
             store_path: pkg_dir,
@@ -493,7 +500,14 @@ pub(crate) async fn run_under_store_lock(
     };
     let covered_packages = selected_for_policy
         .iter()
-        .map(|pkg| (pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()))
+        .map(|pkg| {
+            (
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.source.clone(),
+                pkg.integrity.clone(),
+            )
+        })
         .collect::<Vec<_>>();
 
     // Filter out already-built (unless --force)
@@ -1157,17 +1171,20 @@ pub(crate) async fn run_under_store_lock(
         // a script that mutates its own package files doesn't bleed
         // into the global store. macOS (clonefile, already CoW) and
         // Windows (always copies) get a no-op return.
+        let package_key = pkg.package_key();
+        let exact_v2_index = pkg.graph_key_digest.as_ref().map(|_| &baseline_index);
         let live_pkg_dir = match prepare_live_package_dir(
             project_dir,
             PackageLookupIdentity::new(
                 &pkg.name,
                 &pkg.version,
                 pkg.wrapper_id.as_deref(),
+                Some(&package_key.source_id),
                 Some(&pkg.source_integrity),
             ),
             &pkg.store_path,
             &store_root,
-            Some(&baseline_index),
+            exact_v2_index,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -1256,6 +1273,7 @@ pub(crate) async fn run_under_store_lock(
                             built_packages.push((
                                 pkg.name.clone(),
                                 pkg.version.clone(),
+                                pkg.source.clone(),
                                 pkg.integrity.clone(),
                             ));
                             continue;
@@ -1411,7 +1429,12 @@ pub(crate) async fn run_under_store_lock(
                 tracing::warn!("failed to write build marker for {}: {e}", pkg.name);
             }
             successes += 1;
-            built_packages.push((pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()));
+            built_packages.push((
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.source.clone(),
+                pkg.integrity.clone(),
+            ));
         } else {
             failures += 1;
         }
