@@ -90,11 +90,21 @@ fn seed_store_package(
 }
 
 /// Write a synthetic `lpm.lock`.
-fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
-    write_lockfile_at(project.path(), entries);
+fn write_lockfile(
+    project: &TempProject,
+    entries: &[(&str, &str, &[&str])],
+    root_dependencies: &[(&str, &str)],
+    patches: &[(&str, &str, &str)],
+) {
+    write_lockfile_at(project.path(), entries, root_dependencies, patches);
 }
 
-fn write_lockfile_at(base_dir: &std::path::Path, entries: &[(&str, &str, &[&str])]) {
+fn write_lockfile_at(
+    base_dir: &std::path::Path,
+    entries: &[(&str, &str, &[&str])],
+    root_dependencies: &[(&str, &str)],
+    patches: &[(&str, &str, &str)],
+) {
     let pkgs: Vec<String> = entries
         .iter()
         .map(|(name, version, deps)| {
@@ -116,7 +126,23 @@ fn write_lockfile_at(base_dir: &std::path::Path, entries: &[(&str, &str, &[&str]
         lpm_lockfile::LOCKFILE_VERSION,
         pkgs.join("\n")
     );
-    std::fs::write(base_dir.join("lpm.lock"), toml).unwrap();
+    let lockfile_path = base_dir.join("lpm.lock");
+    std::fs::write(&lockfile_path, toml).unwrap();
+
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: root_dependencies
+                .iter()
+                .map(|(name, spec)| ((*name).to_string(), (*spec).to_string()))
+                .collect(),
+            patches_fingerprint: (!patches.is_empty()).then(|| patch_state_fingerprint(patches)),
+            auto_install_peers: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile.write_to_file(&lockfile_path).unwrap();
 }
 
 fn patch_sha256_at(base_dir: &std::path::Path, rel_path: &str) -> String {
@@ -256,9 +282,15 @@ fn build_patch_install_fixture(
 }}"#
         ),
     );
-    write_lockfile(project, &[(pkg_name, pkg_version, &[])]);
-
     let key = format!("{pkg_name}@{pkg_version}");
+    let root_spec = format!("^{pkg_version}");
+    write_lockfile(
+        project,
+        &[(pkg_name, pkg_version, &[])],
+        &[(pkg_name, &root_spec)],
+        &[(&key, &patch_rel, &integrity)],
+    );
+
     append_lockfile_patch_records(project, &[(&key, &patch_rel, &integrity)]);
     let fp = patch_state_fingerprint(&[(&key, &patch_rel, &integrity)]);
     write_patch_state(
@@ -344,7 +376,12 @@ fn install_patches_in_workspace_member_resolve_path_from_member_manifest() {
         ),
     )
     .unwrap();
-    write_lockfile_at(&member_dir, &[("lodash", "4.17.21", &[])]);
+    write_lockfile_at(
+        &member_dir,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.21")],
+        &[("lodash@4.17.21", patch_rel, &integrity)],
+    );
     append_lockfile_patch_records_at(&member_dir, &[("lodash@4.17.21", patch_rel, &integrity)]);
     let fingerprint = patch_state_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
     let patch_state = serde_json::json!({
@@ -549,7 +586,12 @@ fn install_patches_hard_errors_on_missing_patch_file() {
 }}"#
         ),
     );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash@4.17.21", patch_rel, &integrity)],
+    );
     // Pre-stage matching state so the offline drift gate passes; the
     // missing-file check fires inside the apply pass.
     let fp = patch_state_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
@@ -698,7 +740,12 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
 }}"#
     );
     project.write_file("package.json", &manifest_v1);
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash@4.17.21", "patches/v1.patch", &integrity)],
+    );
     append_lockfile_patch_records(
         &project,
         &[("lodash@4.17.21", "patches/v1.patch", &integrity)],
@@ -774,7 +821,12 @@ fn install_patches_offline_hard_errors_on_patch_fingerprint_mismatch() {
 }}"#
         ),
     );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
+    );
     append_lockfile_patch_records(
         &project,
         &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
@@ -844,7 +896,12 @@ fn install_patches_offline_hard_errors_when_patches_exist_but_no_state_file() {
 }}"#
         ),
     );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
+    );
     append_lockfile_patch_records(
         &project,
         &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
@@ -887,7 +944,12 @@ fn install_patches_offline_hard_errors_when_patches_removed_with_prior_state() {
   "dependencies": { "lodash": "^4.17.0" }
 }"#,
     );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.0")],
+        &[],
+    );
     write_patch_state(
         &project,
         "sha256-prior-fingerprint",
@@ -944,7 +1006,12 @@ fn install_patches_deletes_patch_state_file_when_patches_removed() {
   "dependencies": { "lodash": "^4.17.0" }
 }"#,
     );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.21", &[])],
+        &[("lodash", "^4.17.0")],
+        &[],
+    );
     let empty_fp = patch_state_fingerprint(&[]);
     write_patch_state(&project, &empty_fp, &[], &[]);
 

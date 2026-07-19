@@ -254,9 +254,10 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
 // analysis fires on installed packages, not on a synthesized lockfile-only
 // inventory.
 
-/// `lpm migrate` produces an `lpm.lock` whose entries flow cleanly into
-/// `lpm install --offline` and `lpm audit`. Asserts each step's
-/// post-condition without requiring a real npm registry round-trip.
+/// `lpm migrate` produces a legacy-compatible snapshotless `lpm.lock` whose
+/// entries flow cleanly into explicitly opted-in offline replay and `lpm audit`.
+/// Asserts each step's post-condition without requiring a real npm registry
+/// round-trip.
 #[tokio::test]
 async fn flow_migrate_install_audit_lockfile_round_trips() {
     let project = TempProject::from_fixture("migrate-npm");
@@ -291,7 +292,7 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
         &[("index.js", "module.exports = function() { return 'ms' }\n")],
     );
     let out_install = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline"])
+        .args(["install", "--offline", "--allow-snapshotless-lockfile"])
         .output()
         .expect("spawn lpm install");
     assert!(
@@ -544,12 +545,15 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
         "doctor --fix must create .gitattributes regardless of unrelated check failures"
     );
 
-    // Step 2: install --offline. Must succeed cleanly against the
-    // doctored state (no re-introduction of the fixed issues).
+    // Step 2: install --offline. The binary-format fixture is intentionally
+    // snapshotless, so explicitly enable compatibility replay. It must succeed
+    // cleanly against the doctored state (no re-introduction of the fixed issues).
     let mut install_cmd = lpm_with_registry(&project, "http://127.0.0.1:1");
-    install_cmd
-        .env("LPM_LINKER", "isolated")
-        .args(["install", "--offline"]);
+    install_cmd.env("LPM_LINKER", "isolated").args([
+        "install",
+        "--offline",
+        "--allow-snapshotless-lockfile",
+    ]);
     let out_install = install_cmd.output().expect("spawn install");
     assert!(
         out_install.status.success(),

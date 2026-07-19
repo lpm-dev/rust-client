@@ -49,7 +49,12 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// Synthetic `lpm.lock` containing the given `(name, version, deps)` entries.
-fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
+fn write_lockfile(
+    project: &TempProject,
+    entries: &[(&str, &str, &[&str])],
+    root_dependencies: &[(&str, &str)],
+    lpm_overrides: &[(&str, &str)],
+) {
     let pkgs: Vec<String> = entries
         .iter()
         .map(|(name, version, deps)| {
@@ -72,6 +77,25 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
         pkgs.join("\n")
     );
     project.write_file("lpm.lock", &toml);
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: root_dependencies
+                .iter()
+                .map(|(name, spec)| ((*name).to_string(), (*spec).to_string()))
+                .collect(),
+            lpm_overrides: lpm_overrides
+                .iter()
+                .map(|(name, spec)| ((*name).to_string(), (*spec).to_string()))
+                .collect(),
+            auto_install_peers: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile.write_to_file(&lockfile_path).unwrap();
 }
 
 /// Seed a fake but well-formed entry in `<HOME>/.lpm/store/v1/<safe>@<v>/`.
@@ -283,7 +307,12 @@ fn offline_install_hard_errors_when_overrides_removed_with_prior_state() {
   "dependencies": { "lodash": "^4.17.0" }
 }"#,
     );
-    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.20", &[])],
+        &[("lodash", "^4.17.0")],
+        &[],
+    );
     seed_store_package(&project, "lodash", "4.17.20");
     write_overrides_state(
         &project,
@@ -332,7 +361,12 @@ fn offline_install_hard_errors_on_overrides_fingerprint_mismatch() {
   "lpm": { "overrides": { "lodash": "5.0.0" } }
 }"#,
     );
-    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.20", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash", "5.0.0")],
+    );
     seed_store_package(&project, "lodash", "4.17.20");
     write_overrides_state(
         &project,
@@ -378,7 +412,12 @@ fn offline_install_hard_errors_when_overrides_exist_but_no_state_file() {
   "lpm": { "overrides": { "lodash": "4.17.20" } }
 }"#,
     );
-    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.20", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash", "4.17.20")],
+    );
     seed_store_package(&project, "lodash", "4.17.20");
     // Intentionally no overrides-state.json.
 
@@ -420,7 +459,12 @@ fn offline_install_succeeds_when_overrides_fingerprint_matches() {
   "lpm": { "overrides": { "lodash": "4.17.20" } }
 }"#,
     );
-    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    write_lockfile(
+        &project,
+        &[("lodash", "4.17.20", &[])],
+        &[("lodash", "^4.17.0")],
+        &[("lodash", "4.17.20")],
+    );
     seed_store_package(&project, "lodash", "4.17.20");
     let fingerprint = override_state_fingerprint(&[("lpm.overrides", "lodash", "4.17.20")]);
     write_overrides_state(

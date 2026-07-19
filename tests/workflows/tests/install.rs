@@ -12679,7 +12679,7 @@ integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXP
     std::fs::write(project.path().join("lpm.lock"), lockfile_toml).unwrap();
 
     let out = lpm(&project)
-        .args(["install", "--offline"])
+        .args(["install", "--offline", "--allow-snapshotless-lockfile"])
         .output()
         .expect("spawn lpm install --offline");
 
@@ -12705,11 +12705,10 @@ integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXP
 #[test]
 fn install_offline_accepts_pre_r25_v1_lockfile_when_auto_install_peers_off() {
     // Inverse: with `lpm.autoInstallPeers = false` the user has
-    // explicitly opted out of auto-install, so the v1 lockfile can
-    // be trusted (no ambient peers were ever generated). The
-    // offline arm must NOT refuse — that would be a regression for
-    // every project that pinned `autoInstallPeers = false` to
-    // preserve pre-R2 semantics.
+    // explicitly opted out of auto-install, so the v1 peer state can
+    // be trusted (no ambient peers were ever generated). Snapshotless
+    // replay still requires the explicit compatibility option, but the
+    // peer-repair gate must not refuse afterward.
     //
     // The install will likely fail later (no store seeded, no
     // network) but it must NOT fail with the R2.5 repair-gate
@@ -12735,7 +12734,7 @@ integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXP
     std::fs::write(project.path().join("lpm.lock"), lockfile_toml).unwrap();
 
     let out = lpm(&project)
-        .args(["install", "--offline"])
+        .args(["install", "--offline", "--allow-snapshotless-lockfile"])
         .output()
         .expect("spawn lpm install --offline");
 
