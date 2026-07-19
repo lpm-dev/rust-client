@@ -552,6 +552,8 @@ pub(super) async fn run_link_and_finish(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+    let blocked_set_metadata =
+        crate::commands::install::lifecycle::blocked_set_source_metadata(&packages);
     // Parse the project
     // capability request + user bound so the offline / lockfile-
     // fast-path install also catches capability-widening packages.
@@ -586,7 +588,7 @@ pub(super) async fn run_link_and_finish(
         &store,
         &installed_with_integrity,
         &policy,
-        &crate::build_state::BlockedSetMetadata::default(),
+        &blocked_set_metadata,
         &offline_requested_capabilities,
         &offline_user_bound,
         None,
@@ -635,7 +637,7 @@ pub(super) async fn run_link_and_finish(
                 &store,
                 &installed_with_integrity,
                 &policy,
-                &crate::build_state::BlockedSetMetadata::default(),
+                &blocked_set_metadata,
                 &offline_requested_capabilities,
                 &offline_user_bound,
                 None,

@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn v2_cache_recheck_never_falls_back_to_the_v1_sidecar() {
+    assert!(!super::super::fetch::may_reuse_v1_entry_after_fetch_lock(
+        false, true
+    ));
+    assert!(super::super::fetch::may_reuse_v1_entry_after_fetch_lock(
+        false, false
+    ));
+    assert!(!super::super::fetch::may_reuse_v1_entry_after_fetch_lock(
+        true, false
+    ));
+}
+
+#[test]
 fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
     let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
         "name": "fixture",

@@ -279,7 +279,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     let blocked_metadata_start = std::time::Instant::now();
     let mut blocked_metadata_ms = 0u128;
     let blocked_set_metadata = if used_lockfile {
-        let metadata = blocked_set_metadata_from_previous_state(project_dir);
+        let metadata = blocked_set_metadata_from_previous_state(project_dir, packages);
         tracing::debug!(
             "perf.reuse_blocked_set_metadata pkgs={} entries={} ms={}",
             packages.len(),
@@ -895,32 +895,74 @@ pub(super) fn collect_amber_classification_requests(
 
 pub(super) fn blocked_set_metadata_from_previous_state(
     project_dir: &Path,
+    packages: &[InstallPackage],
 ) -> crate::build_state::BlockedSetMetadata {
+    let mut metadata = blocked_set_source_metadata(packages);
     let Some(previous) = crate::build_state::read_build_state(project_dir) else {
-        return crate::build_state::BlockedSetMetadata::default();
-    };
-
-    let mut metadata = crate::build_state::BlockedSetMetadata {
-        by_pkg: std::collections::HashMap::with_capacity(previous.blocked_packages.len()),
+        return metadata;
     };
     for package in previous.blocked_packages {
         if package.published_at.is_none()
             && package.behavioral_tags_hash.is_none()
             && package.behavioral_tags.is_none()
+            && package.source.is_none()
         {
             continue;
         }
 
+        let current_entry = metadata.get(
+            &package.name,
+            &package.version,
+            package.integrity.as_deref(),
+        );
+        let source = match current_entry {
+            Some(entry) => entry.source.clone(),
+            None => package.source,
+        };
         metadata.insert(
             package.name,
             package.version,
+            package.integrity,
             crate::build_state::BlockedSetMetadataEntry {
+                source,
                 published_at: package.published_at,
                 behavioral_tags_hash: package.behavioral_tags_hash,
                 behavioral_tags: package.behavioral_tags,
                 provenance_at_capture: None,
             },
         );
+    }
+    metadata
+}
+
+pub(super) fn blocked_set_source_metadata(
+    packages: &[InstallPackage],
+) -> crate::build_state::BlockedSetMetadata {
+    let mut metadata = crate::build_state::BlockedSetMetadata {
+        by_pkg: std::collections::HashMap::with_capacity(packages.len()),
+    };
+    for package in packages {
+        use std::collections::hash_map::Entry;
+
+        let key = (
+            package.name.clone(),
+            package.version.clone(),
+            package.integrity.clone(),
+        );
+        match metadata.by_pkg.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(crate::build_state::BlockedSetMetadataEntry {
+                    source: Some(package.source.clone()),
+                    ..Default::default()
+                });
+            }
+            Entry::Occupied(mut slot)
+                if slot.get().source.as_deref() != Some(package.source.as_str()) =>
+            {
+                slot.insert(crate::build_state::BlockedSetMetadataEntry::default());
+            }
+            Entry::Occupied(_) => {}
+        }
     }
     metadata
 }
@@ -934,7 +976,7 @@ pub(super) async fn build_blocked_set_metadata(
     route_table: &RouteTable,
     packages: &[InstallPackage],
 ) -> crate::build_state::BlockedSetMetadata {
-    let mut out = crate::build_state::BlockedSetMetadata::default();
+    let mut out = blocked_set_source_metadata(packages);
 
     // — provenance capture moved out of install.
     //
@@ -1007,9 +1049,6 @@ pub(super) async fn build_blocked_set_metadata(
                 Err(_) => None,
             }
         } else {
-            // follow-up: route via RouteTable so
-            // blocked-set metadata capture for custom-registry
-            // packages doesn't fall through to public npm.
             let route = route_table.route_for_package(&p.name);
             client.get_npm_blocked_set_meta(&p.name, route).await
         };
@@ -1050,7 +1089,9 @@ pub(super) async fn build_blocked_set_metadata(
             Some((
                 p.name.clone(),
                 p.version.clone(),
+                p.integrity.clone(),
                 crate::build_state::BlockedSetMetadataEntry {
+                    source: Some(p.source.clone()),
                     published_at,
                     behavioral_tags_hash,
                     behavioral_tags,
@@ -1067,14 +1108,15 @@ pub(super) async fn build_blocked_set_metadata(
 
     // Sequential insert into `out` after the concurrent fetches land.
     // Order is deterministic because `join_all` preserves the input order
-    // and the downstream `BlockedSetMetadata` is keyed by (name, version)
+    // and the downstream `BlockedSetMetadata` is keyed by
+    // (name, version, integrity)
     // — identical output to the serial loop.
-    for (name, version, e) in futures::future::join_all(entry_futures)
+    for (name, version, integrity, e) in futures::future::join_all(entry_futures)
         .await
         .into_iter()
         .flatten()
     {
-        out.insert(name, version, e);
+        out.merge_enrichment(name, version, integrity, e);
     }
 
     // Permanent perf diagnostic. dropped the `prov_sum_ms`

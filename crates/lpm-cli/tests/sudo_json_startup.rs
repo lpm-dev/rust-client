@@ -37,3 +37,28 @@ fn sudo_refusal_uses_the_json_error_envelope() {
         serde_json::json!("sudo_execution_refused")
     );
 }
+
+#[test]
+fn sudo_hosts_helper_reaches_its_own_validation() {
+    let project = tempfile::tempdir().unwrap();
+    let lpm_home = tempfile::tempdir().unwrap();
+    let (status, stdout, stderr) = common::run_lpm_with_env(
+        project.path(),
+        lpm_home.path(),
+        None,
+        &[
+            ("LPM_TEST_FORCE_ROOT_SUDO_POLICY", "1"),
+            ("SUDO_UID", "501"),
+            ("SUDO_USER", "developer"),
+        ],
+        &["internal-hosts-file", "invalid-action"],
+    );
+
+    assert!(!status.success(), "invalid helper action must fail");
+    assert!(stdout.trim().is_empty(), "plain errors belong on stderr");
+    assert!(
+        stderr.contains("unknown internal hosts-file action 'invalid-action'"),
+        "helper validation must run instead of the sudo startup refusal: {stderr}",
+    );
+    assert!(!stderr.contains("sudo_execution_refused"));
+}

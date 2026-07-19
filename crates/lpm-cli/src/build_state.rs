@@ -153,6 +153,9 @@ pub struct DriftIgnoreAuditRecord {
 pub struct BlockedPackage {
     pub name: String,
     pub version: String,
+    /// Exact lockfile source used for installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// SRI integrity hash from the lockfile, if known. binds
     /// approvals to this so a registry-side tarball swap re-opens review.
     pub integrity: Option<String>,
@@ -331,9 +334,10 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{}@{}|{}|{}",
+                "{}@{}|{}|{}|{}",
                 p.name,
                 p.version,
+                p.source.as_deref().unwrap_or(""),
                 p.integrity.as_deref().unwrap_or(""),
                 p.script_hash.as_deref().unwrap_or(""),
             )
@@ -361,17 +365,20 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
 /// behavioral analysis, lockfile fast-path without a metadata fetch
 /// for that version — all work).
 ///
-/// Keyed by `(name, version)` rather than a richer package identity
-/// because the blocked-set capture operates on the `installed` tuple
-/// list, not lockfile rows.
+/// Keyed by `(name, version, integrity)`, matching the installed identity
+/// available to blocked-set capture. The exact source is carried in the
+/// entry and degrades to `None` when that tuple is source-ambiguous.
 #[derive(Debug, Clone, Default)]
 pub struct BlockedSetMetadata {
-    pub by_pkg: std::collections::HashMap<(String, String), BlockedSetMetadataEntry>,
+    pub by_pkg:
+        std::collections::HashMap<(String, String, Option<String>), BlockedSetMetadataEntry>,
 }
 
 /// One entry in [`BlockedSetMetadata`].
 #[derive(Debug, Clone, Default)]
 pub struct BlockedSetMetadataEntry {
+    /// Exact lockfile source used to install this package.
+    pub source: Option<String>,
     /// RFC 3339 publish timestamp from the registry's `time` map for
     /// this version. `None` for offline, fast-path without a metadata
     /// fetch, or packages whose registry response omits the timestamp.
@@ -411,17 +418,53 @@ pub struct BlockedSetMetadataEntry {
 }
 
 impl BlockedSetMetadata {
-    /// Lookup for `(name, version)`. Returns a reference to the entry
+    /// Lookup for `(name, version, integrity)`. Returns a reference to the entry
     /// or `None` if the caller didn't provide metadata for this
     /// package (graceful degradation — the captured fields just stay
     /// `None`).
-    pub fn get(&self, name: &str, version: &str) -> Option<&BlockedSetMetadataEntry> {
-        self.by_pkg.get(&(name.to_string(), version.to_string()))
+    pub fn get(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+    ) -> Option<&BlockedSetMetadataEntry> {
+        self.by_pkg.get(&(
+            name.to_string(),
+            version.to_string(),
+            integrity.map(str::to_string),
+        ))
     }
 
-    /// Insert / overwrite metadata for `(name, version)`.
-    pub fn insert(&mut self, name: String, version: String, entry: BlockedSetMetadataEntry) {
-        self.by_pkg.insert((name, version), entry);
+    /// Insert or overwrite metadata for `(name, version, integrity)`.
+    pub fn insert(
+        &mut self,
+        name: String,
+        version: String,
+        integrity: Option<String>,
+        entry: BlockedSetMetadataEntry,
+    ) {
+        self.by_pkg.insert((name, version, integrity), entry);
+    }
+
+    /// Merge registry enrichment only when it belongs to the selected source.
+    pub fn merge_enrichment(
+        &mut self,
+        name: String,
+        version: String,
+        integrity: Option<String>,
+        entry: BlockedSetMetadataEntry,
+    ) {
+        use std::collections::hash_map::Entry;
+
+        match self.by_pkg.entry((name, version, integrity)) {
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            Entry::Occupied(mut slot) if slot.get().source == entry.source => {
+                slot.insert(entry);
+            }
+            Entry::Occupied(_) => {}
+        }
     }
 }
 
@@ -696,10 +739,11 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             // populates `metadata` from the same registry responses
             // the cooldown check already fetched, so this is a
             // memory-only hash-map lookup per package.
-            let entry = metadata.get(name, version);
+            let entry = metadata.get(name, version, integrity.as_deref());
             Some(BlockedPackage {
                 name: name.clone(),
                 version: version.clone(),
+                source: entry.and_then(|e| e.source.clone()),
                 integrity: integrity.clone(),
                 script_hash: Some(script_hash),
                 phases_present,
@@ -1200,6 +1244,7 @@ mod tests {
         BlockedPackage {
             name: name.to_string(),
             version: version.to_string(),
+            source: None,
             integrity: integrity.map(String::from),
             script_hash: script_hash.map(String::from),
             phases_present: vec!["postinstall".to_string()],
@@ -1364,6 +1409,7 @@ mod tests {
         let original = make_state(vec![BlockedPackage {
             name: "esbuild".into(),
             version: "0.25.1".into(),
+            source: None,
             integrity: Some("sha512-foo".into()),
             script_hash: Some("sha256-bar".into()),
             phases_present: vec!["preinstall".into(), "postinstall".into()],
@@ -1938,6 +1984,7 @@ mod tests {
         let package_with_added_fields = BlockedPackage {
             name: "sharp".into(),
             version: "0.33.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some("sha512-aaa".into()),
             script_hash: Some("sha256-bbb".into()),
             phases_present: vec!["postinstall".into()],
@@ -1968,6 +2015,7 @@ mod tests {
         let original = BlockedPackage {
             name: "puppeteer".into(),
             version: "22.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some("sha512-pp".into()),
             script_hash: Some("sha256-pp".into()),
             phases_present: vec!["postinstall".into()],
@@ -2086,6 +2134,7 @@ mod tests {
         metadata.insert(
             "sharp".to_string(),
             "0.33.0".to_string(),
+            None,
             make_metadata(Some("T12:34:56Z"), Some("sha256-tag-hash-abc")),
         );
 
@@ -2162,6 +2211,7 @@ mod tests {
         metadata.insert(
             "some-npm-pkg".to_string(),
             "1.0.0".to_string(),
+            None,
             make_metadata(Some("T00:00:00Z"), None),
         );
 
@@ -2231,6 +2281,7 @@ mod tests {
             m.insert(
                 "sharp".to_string(),
                 "0.33.0".to_string(),
+                None,
                 make_metadata(Some("T00:00:00Z"), Some("sha256-aaa")),
             );
             m
@@ -2240,6 +2291,7 @@ mod tests {
             m.insert(
                 "sharp".to_string(),
                 "0.33.0".to_string(),
+                None,
                 make_metadata(Some("T00:00:00Z"), Some("sha256-bbb")),
             );
             m

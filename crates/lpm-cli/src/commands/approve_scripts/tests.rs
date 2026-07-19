@@ -153,9 +153,9 @@ fn map_with(
     name: &str,
     version: &str,
     status: ProvenanceStatus,
-) -> HashMap<(String, String), ProvenanceStatus> {
+) -> HashMap<(String, String, Option<String>), ProvenanceStatus> {
     let mut m = HashMap::new();
-    m.insert((name.to_string(), version.to_string()), status);
+    m.insert((name.to_string(), version.to_string(), None), status);
     m
 }
 
@@ -164,9 +164,9 @@ fn map_with(
 #[test]
 fn snapshot_for_binding_verified_projects_under_both_modes() {
     let map = map_with("axios", "1.14.0", verified_status());
-    let deny = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", EnforceMode::Deny)
+    let deny = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", None, EnforceMode::Deny)
         .expect("Verified must succeed under Deny");
-    let warn = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", EnforceMode::Warn)
+    let warn = snapshot_for_binding_with_mode(&map, "axios", "1.14.0", None, EnforceMode::Warn)
         .expect("Verified must succeed under Warn");
     assert_eq!(deny, warn);
     assert!(deny.is_some());
@@ -187,7 +187,7 @@ fn snapshot_for_binding_deny_refuses_on_verification_rejected() {
             reason: "DSSE signature mismatch".into(),
         },
     );
-    let err = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", EnforceMode::Deny)
+    let err = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", None, EnforceMode::Deny)
         .expect_err("Deny mode must refuse on VerificationRejected");
     assert!(matches!(err, LpmError::ProvenanceVerification(_)));
     let msg = err.to_string();
@@ -221,7 +221,7 @@ fn snapshot_for_binding_warn_returns_none_on_verification_rejected() {
             reason: "Rekor SET verification failed".into(),
         },
     );
-    let result = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", EnforceMode::Warn)
+    let result = snapshot_for_binding_with_mode(&map, "axios", "1.14.1", None, EnforceMode::Warn)
         .expect("Warn mode must allow the approval through");
     assert!(
         result.is_none(),
@@ -237,12 +237,12 @@ fn snapshot_for_binding_non_rejection_statuses_ignore_mode() {
     let absent_map = map_with("pkg", "1.0.0", ProvenanceStatus::Absent);
     let transport_map = map_with("pkg", "1.0.0", ProvenanceStatus::TransportDegraded);
     for mode in [EnforceMode::Deny, EnforceMode::Warn] {
-        let absent = snapshot_for_binding_with_mode(&absent_map, "pkg", "1.0.0", mode)
+        let absent = snapshot_for_binding_with_mode(&absent_map, "pkg", "1.0.0", None, mode)
             .expect("Absent must project under both modes");
         let snap = absent.expect("Absent projects to Some(present:false)");
         assert!(!snap.present);
 
-        let transport = snapshot_for_binding_with_mode(&transport_map, "pkg", "1.0.0", mode)
+        let transport = snapshot_for_binding_with_mode(&transport_map, "pkg", "1.0.0", None, mode)
             .expect("TransportDegraded must project under both modes");
         assert!(transport.is_none());
     }
@@ -253,9 +253,9 @@ fn snapshot_for_binding_non_rejection_statuses_ignore_mode() {
 /// only gates statuses that are present in the map.
 #[test]
 fn snapshot_for_binding_missing_pkg_projects_to_none_under_both_modes() {
-    let map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+    let map: HashMap<(String, String, Option<String>), ProvenanceStatus> = HashMap::new();
     for mode in [EnforceMode::Deny, EnforceMode::Warn] {
-        let r = snapshot_for_binding_with_mode(&map, "pkg", "1.0.0", mode)
+        let r = snapshot_for_binding_with_mode(&map, "pkg", "1.0.0", None, mode)
             .expect("missing pkg projects to Ok(None) regardless of mode");
         assert!(r.is_none());
     }
@@ -370,6 +370,7 @@ fn make_blocked(name: &str, version: &str) -> BlockedPackage {
     BlockedPackage {
         name: name.to_string(),
         version: version.to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(format!("sha512-{name}-integrity")),
         script_hash: Some(format!("sha256-{name}-hash")),
         phases_present: vec!["postinstall".to_string()],
@@ -1018,6 +1019,7 @@ fn agg_row_tiered(
     crate::global_blocked_set::AggregateBlockedRow {
         name: name.into(),
         version: version.into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
         integrity: Some("sha512-fixture".into()),
         script_hash: Some("sha256-fixture".into()),
         phases_present: vec!["postinstall".into()],
@@ -1031,6 +1033,7 @@ fn agg_row_no_tier(name: &str, version: &str) -> crate::global_blocked_set::Aggr
     crate::global_blocked_set::AggregateBlockedRow {
         name: name.into(),
         version: version.into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
         integrity: Some("sha512-fixture".into()),
         script_hash: Some("sha256-fixture".into()),
         phases_present: vec!["postinstall".into()],
@@ -2072,6 +2075,7 @@ fn row(name: &str, version: &str, origins: &[&str]) -> AggregateBlockedRow {
     AggregateBlockedRow {
         name: name.into(),
         version: version.into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
         integrity: Some(format!("sha512-{name}{version}")),
         script_hash: Some(format!("sha256-{name}{version}")),
         phases_present: vec!["postinstall".into()],
@@ -2095,8 +2099,12 @@ fn global_approval_provenance<'a>(
     registry: &'a lpm_registry::RegistryClient,
     verify_policy: &'a VerifyPolicy,
 ) -> global::GlobalApprovalProvenance<'a> {
+    static ROUTES: std::sync::LazyLock<lpm_registry::RouteTable> = std::sync::LazyLock::new(|| {
+        lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct)
+    });
     global::GlobalApprovalProvenance {
         registry,
+        route_table: &ROUTES,
         verify_policy,
         runtime_enforce: verify_policy.enforce,
     }
@@ -2117,6 +2125,7 @@ fn seed_global_manifest_with_blocked(
         .map(|row| crate::build_state::BlockedPackage {
             name: row.name,
             version: row.version,
+            source: row.source,
             integrity: row.integrity,
             script_hash: row.script_hash,
             phases_present: row.phases_present,
@@ -2508,6 +2517,7 @@ fn capability_widening_row_stays_in_effective_blocked_set() {
         blocked_packages: vec![BlockedPackage {
             name: "esbuild".into(),
             version: "0.25.1".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: None,
             script_hash: Some("sha256-h".into()),
             phases_present: vec!["postinstall".into()],
@@ -2563,6 +2573,7 @@ fn baseline_request_drops_strict_matched_row() {
         blocked_packages: vec![BlockedPackage {
             name: "esbuild".into(),
             version: "0.25.1".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: None,
             script_hash: Some("sha256-h".into()),
             phases_present: vec!["postinstall".into()],

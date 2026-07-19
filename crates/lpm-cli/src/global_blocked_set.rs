@@ -53,6 +53,7 @@ use std::path::PathBuf;
 pub struct AggregateBlockedRow {
     pub name: String,
     pub version: String,
+    pub source: Option<String>,
     pub integrity: Option<String>,
     pub script_hash: Option<String>,
     /// Which lifecycle phases are present (preinstall/install/postinstall).
@@ -136,7 +137,7 @@ pub fn aggregate_with_manifest_and_trust(
     manifest: &GlobalManifest,
     trusted: &GlobalTrustedDependencies,
 ) -> AggregateBlockedSet {
-    // Keyed by `(name, version, integrity-or-empty, script_hash-or-empty)`
+    // Keyed by `(name, version, source, integrity-or-empty, script_hash-or-empty)`
     // so DIFFERENT bindings for the same name@version stay separate.
     let mut by_key: BTreeMap<DedupKey, (AggregateBlockedRow, Vec<String>)> = BTreeMap::new();
     let mut unreadable_origins: Vec<String> = Vec::new();
@@ -177,6 +178,7 @@ pub fn aggregate_with_manifest_and_trust(
                     AggregateBlockedRow {
                         name: blocked.name.clone(),
                         version: blocked.version.clone(),
+                        source: blocked.source.clone(),
                         integrity: blocked.integrity.clone(),
                         script_hash: blocked.script_hash.clone(),
                         phases_present: blocked.phases_present.clone(),
@@ -214,12 +216,14 @@ pub fn aggregate_with_manifest_and_trust(
         (
             a.name.as_str(),
             a.version.as_str(),
+            &a.source,
             &a.integrity,
             &a.script_hash,
         )
             .cmp(&(
                 b.name.as_str(),
                 b.version.as_str(),
+                &b.source,
                 &b.integrity,
                 &b.script_hash,
             ))
@@ -251,6 +255,7 @@ fn read_global_manifest_or_empty(root: &LpmRoot) -> Result<GlobalManifest, LpmEr
 struct DedupKey {
     name: String,
     version: String,
+    source: String,
     integrity: String, // "" when None
     script_hash: String,
 }
@@ -260,6 +265,7 @@ impl DedupKey {
         Self {
             name: b.name.clone(),
             version: b.version.clone(),
+            source: b.source.clone().unwrap_or_default(),
             integrity: b.integrity.clone().unwrap_or_default(),
             script_hash: b.script_hash.clone().unwrap_or_default(),
         }
@@ -323,6 +329,7 @@ mod tests {
         BlockedPackage {
             name: name.into(),
             version: version.into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: integ.map(String::from),
             script_hash: script.map(String::from),
             phases_present: vec!["postinstall".into()],

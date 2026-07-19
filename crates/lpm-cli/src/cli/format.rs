@@ -17,10 +17,14 @@ pub(super) fn parse_cli_or_exit() -> Cli {
 }
 
 pub(super) fn enforce_startup_sudo_policy_or_exit() {
+    let raw_args: Vec<_> = std::env::args_os().collect();
+    if argv_is_internal_hosts_file_helper(raw_args.iter().cloned()) {
+        return;
+    }
     let Err(error) = lpm_common::enforce_sudo_policy() else {
         return;
     };
-    let args = args_for_cli_parse(std::env::args_os());
+    let args = args_for_cli_parse(raw_args);
     let json_output = argv_requests_json(&args);
     exit_with_lpm_error(&error, json_output, lpm_common::DEFAULT_REGISTRY_URL);
 }
@@ -37,6 +41,15 @@ where
                 .to_str()
                 .is_some_and(|value| value.starts_with("--registry="))
     })
+}
+
+pub(super) fn argv_is_internal_hosts_file_helper<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
+    let mut args = args.into_iter().skip(1).map(Into::into);
+    args.next().is_some_and(|arg| arg == "internal-hosts-file")
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -924,6 +937,25 @@ fn clap_help_hint(error: &clap::Error, fallback: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sudo_policy_exemption_is_limited_to_the_internal_hosts_helper() {
+        assert!(argv_is_internal_hosts_file_helper([
+            "lpm",
+            "internal-hosts-file",
+            "cleanup"
+        ]));
+        assert!(!argv_is_internal_hosts_file_helper([
+            "lpm",
+            "install",
+            "internal-hosts-file"
+        ]));
+        assert!(!argv_is_internal_hosts_file_helper([
+            "lpm",
+            "--json",
+            "internal-hosts-file"
+        ]));
+    }
     fn plain_slim_line(line: &SlimErrorLine) -> String {
         let raw = match line {
             SlimErrorLine::Failed(message) | SlimErrorLine::Detail(message) => message,

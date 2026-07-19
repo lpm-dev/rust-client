@@ -307,9 +307,11 @@ pub(super) fn print_summary(
     // surface `provenance.verified` per package. `None` for callers
     // that have no map in scope (the read-only `--list` path bypasses
     // it entirely; the per-package named approval path uses the
-    // single-entry helper directly). When `Some(_)`, the map's keys
-    // are the same `(name, version)` pairs as the blocked set.
-    provenance_by_pkg: Option<&HashMap<(String, String), ProvenanceStatus>>,
+    // single-entry helper directly). When `Some(_)`, the map is keyed
+    // by each blocked package's `(name, version, source)` identity.
+    provenance_by_pkg: Option<
+        &HashMap<crate::provenance_fetch::ApprovalProvenanceKey, ProvenanceStatus>,
+    >,
 ) {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();

@@ -265,7 +265,7 @@ async fn fetch_one(
         .acquire_owned()
         .await
         .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
-    let (data, computed_sri) = client
+    let (data, _computed_sri) = client
         .download_tarball_with_integrity(target.source.url(), Some(&target.integrity))
         .await?;
     drop(permit);
@@ -273,18 +273,19 @@ async fn fetch_one(
     let source = target.source.clone();
     let name = target.name.clone();
     let version = target.version.clone();
+    let integrity = target.integrity.clone();
     tokio::task::spawn_blocking(move || -> Result<(), LpmError> {
         if let Some(store_v2) = store_v2 {
-            store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
+            store_v2.extract_object_from_bytes(&data, Some(&integrity))?;
             return Ok(());
         }
 
         match source {
             FetchSource::Registry { .. } => {
-                store.store_package(&name, &version, &data)?;
+                store.store_package_with_integrity(&name, &version, &data, &integrity)?;
             }
             FetchSource::RemoteTarball { .. } => {
-                store.store_tarball_at_cas_path(&computed_sri, &data)?;
+                store.store_tarball_at_cas_path(&integrity, &data)?;
             }
         }
         Ok(())
@@ -381,7 +382,9 @@ fn is_cached(
     }
 
     match &target.source {
-        FetchSource::Registry { .. } => store.has_package(&target.name, &target.version),
+        FetchSource::Registry { .. } => {
+            store.has_package_with_integrity(&target.name, &target.version, &target.integrity)
+        }
         FetchSource::RemoteTarball { .. } => store.has_tarball(&target.integrity),
     }
 }
@@ -798,6 +801,34 @@ mod tests {
         assert_eq!(
             target.source.url(),
             "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+        );
+    }
+
+    #[test]
+    fn v1_registry_cache_hit_requires_the_lockfile_integrity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(root.path());
+        let cached_dir = store.package_dir("cached", "1.0.0");
+        std::fs::create_dir_all(&cached_dir).unwrap();
+        std::fs::write(
+            cached_dir.join("package.json"),
+            br#"{"name":"cached","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(cached_dir.join(".integrity"), "sha512-cached-source").unwrap();
+        let target = FetchTarget {
+            name: "cached".into(),
+            version: "1.0.0".into(),
+            integrity: "sha256-different-source".into(),
+            source: FetchSource::Registry {
+                registry_url: "https://registry.example".into(),
+                tarball_url: "https://registry.example/cached.tgz".into(),
+            },
+        };
+
+        assert!(
+            !is_cached(&target, &store, None),
+            "a coordinate-only v1 entry must not satisfy a different lockfile SRI"
         );
     }
 }

@@ -50,7 +50,13 @@ impl RegistryClient {
     // ─── Metadata Cache ──────────────────────────────────────────────
 
     pub(super) fn lpm_metadata_cache_key(&self, name: &str) -> String {
-        source_scoped_cache_key("lpm", &self.base_url, name)
+        let bearer = self.current_bearer(AuthPosture::AuthRequired);
+        let principal = bearer_principal_fingerprint(
+            bearer.as_deref(),
+            self.http.identity_fp_for_url(&self.base_url),
+        );
+        let source = self.base_url.trim_end_matches('/');
+        format!("lpm:{principal}:{}:{source}:{name}", source.len())
     }
 
     pub(super) fn npm_worker_metadata_cache_key(&self, name: &str) -> String {

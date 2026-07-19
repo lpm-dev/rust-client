@@ -26,6 +26,19 @@ impl PackageStore {
         self.store_at_dir(dir, &label, tarball_data)
     }
 
+    /// Extract a registry tarball while preserving its verified declared SRI.
+    pub fn store_package_with_integrity(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_data: &[u8],
+        integrity_sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        let dir = self.package_dir(name, version);
+        let label = format!("{name}@{version}");
+        self.store_at_dir_with_integrity(dir, &label, tarball_data, integrity_sri)
+    }
+
     /// Shared inner extraction logic used by [`Self::store_package`]
     /// and [`Self::store_tarball_at_cas_path`].
     ///

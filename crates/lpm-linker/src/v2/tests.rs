@@ -1,4 +1,21 @@
 use super::*;
+
+#[cfg(unix)]
+#[test]
+fn empty_reconcile_never_traverses_symlinked_node_modules() {
+    let project = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let sentinel = external.path().join("must-survive");
+    std::fs::write(&sentinel, b"external data").unwrap();
+    std::os::unix::fs::symlink(external.path(), project.path().join("node_modules")).unwrap();
+
+    super::reconcile::reconcile_project_node_modules(project.path(), &[], None, false).unwrap();
+
+    assert!(
+        sentinel.exists(),
+        "empty reconciliation must not delete through a node_modules symlink"
+    );
+}
 use crate::LinkDependency;
 #[cfg(target_os = "macos")]
 use lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME;

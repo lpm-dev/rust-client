@@ -347,8 +347,15 @@ async fn run_under_store_lock(
                 runtime_sigstore_source,
             )?;
         }
-        let provenance_by_pkg = fetch_provenance_for_effective_set(
+        let routed = crate::commands::registry_reads::prepare_routed_read_context(
             registry,
+            project_dir,
+            std::slice::from_ref(&target.name),
+            json_output,
+        )?;
+        let provenance_by_pkg = fetch_provenance_for_effective_set(
+            &routed.client,
+            &routed.route_table,
             std::slice::from_ref(target),
             &verify_policy,
         )
@@ -395,6 +402,7 @@ async fn run_under_store_lock(
                 &provenance_by_pkg,
                 &target.name,
                 &target.version,
+                target.source.as_deref(),
                 runtime_enforce,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
@@ -504,8 +512,20 @@ async fn run_under_store_lock(
             runtime_sigstore_source,
         )?;
     }
-    let provenance_by_pkg = fetch_provenance_for_effective_set(
+    let route_specs: Vec<String> = effective_state
+        .blocked_packages
+        .iter()
+        .map(|package| package.name.clone())
+        .collect();
+    let routed = crate::commands::registry_reads::prepare_routed_read_context(
         registry,
+        project_dir,
+        &route_specs,
+        json_output,
+    )?;
+    let provenance_by_pkg = fetch_provenance_for_effective_set(
+        &routed.client,
+        &routed.route_table,
         &effective_state.blocked_packages,
         &verify_policy,
     )
@@ -544,6 +564,7 @@ async fn run_under_store_lock(
                 &provenance_by_pkg,
                 &blocked.name,
                 &blocked.version,
+                blocked.source.as_deref(),
                 runtime_enforce,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
@@ -733,6 +754,7 @@ async fn run_under_store_lock(
             &provenance_by_pkg,
             &blocked.name,
             &blocked.version,
+            blocked.source.as_deref(),
             runtime_enforce,
         )?;
         let meta = approval_metadata_preserving_existing_provenance(

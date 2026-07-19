@@ -170,8 +170,13 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) publish_ages: HashMap<(String, String), u64>,
     pub(super) min_release_age_secs: u64,
     pub(super) install_provenance_status_map:
-        HashMap<(String, String), lpm_common::ProvenanceStatus>,
+        HashMap<crate::provenance_fetch::ApprovalProvenanceKey, lpm_common::ProvenanceStatus>,
     pub(super) fresh_urls: HashMap<String, String>,
+}
+
+#[inline]
+pub(super) fn may_reuse_v1_entry_after_fetch_lock(force: bool, v2_mode: bool) -> bool {
+    !force && !v2_mode
 }
 
 pub(super) async fn run_online_fetch_phase(
@@ -995,8 +1000,10 @@ pub(super) async fn run_online_fetch_phase(
     // only packages the drift gate fetched for are present; the
     // `blocked_to_json_with_provenance` helper omits the
     // `provenance` block when the key is absent.
-    let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
-        HashMap::new();
+    let mut install_provenance_status_map: HashMap<
+        crate::provenance_fetch::ApprovalProvenanceKey,
+        lpm_common::ProvenanceStatus,
+    > = HashMap::new();
     if !used_lockfile && !drift_ignore_policy.ignores_all() {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
@@ -1117,8 +1124,10 @@ pub(super) async fn run_online_fetch_phase(
                     );
                     // Record for the install --json envelope
                     // before consuming for the drift gate.
-                    install_provenance_status_map
-                        .insert((p.name.clone(), p.version.clone()), status.clone());
+                    install_provenance_status_map.insert(
+                        (p.name.clone(), p.version.clone(), Some(p.source.clone())),
+                        status.clone(),
+                    );
                     // Projection: `Unverified(snap)` / `Disabled(snap)`
                     // → Some(snap), `Absent` → Some(present:false),
                     // `TransportDegraded` → None. `VerificationRejected`
@@ -1207,8 +1216,10 @@ pub(super) async fn run_online_fetch_phase(
                                     // returning so a `--json` consumer that
                                     // tees stderr can correlate the failure
                                     // with the per-package envelope.
-                                    install_provenance_status_map
-                                        .insert((p.name.clone(), p.version.clone()), status);
+                                    install_provenance_status_map.insert(
+                                        (p.name.clone(), p.version.clone(), Some(p.source.clone())),
+                                        status,
+                                    );
                                     return Err(LpmError::ProvenanceVerification(reason));
                                 }
                             };
@@ -1216,8 +1227,10 @@ pub(super) async fn run_online_fetch_phase(
                         }
                         Err(other) => return Err(other),
                     };
-                    install_provenance_status_map
-                        .insert((p.name.clone(), p.version.clone()), status_for_map);
+                    install_provenance_status_map.insert(
+                        (p.name.clone(), p.version.clone(), Some(p.source.clone())),
+                        status_for_map,
+                    );
                     snapshot_for_drift
                 };
 
@@ -1530,10 +1543,12 @@ pub(super) async fn run_online_fetch_phase(
                 // Source-aware existence check: a registry-CAS hit must NOT
                 // satisfy a Source::Tarball pkg with the same
                 // (name, version).
-                let store_path_pre_fetch = (!force_flag)
+                let may_reuse_v1 =
+                    may_reuse_v1_entry_after_fetch_lock(force_flag, store_v2_ref.is_some());
+                let store_path_pre_fetch = may_reuse_v1
                     .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
                     .flatten();
-                if !force_flag
+                if may_reuse_v1
                     && p.store_has_for_install_layout(
                         &store_ref,
                         store_v2_ref.as_deref(),
@@ -1554,28 +1569,6 @@ pub(super) async fn run_online_fetch_phase(
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None)?;
-                    // The v2 object dir was populated by the sibling's fetch
-                    // task. The per-key fetch lock above ensures we observe
-                    // the post-extract state, so dispatch the v2 link entry in
-                    // the same shape as the post-fetch path below.
-                    let v2_link_h: Option<V2LinkHandle> =
-                        if let (Some(plan), Some(target), Some(store_v2)) = (
-                            v2_plan_arc.as_ref(),
-                            v2_target_for_pkg.as_ref(),
-                            store_v2_ref.as_ref(),
-                        ) {
-                            let plan_c = std::sync::Arc::clone(plan);
-                            let target_c = target.clone();
-                            let store_c = std::sync::Arc::clone(store_v2);
-                            Some(spawn_v2_link_task(
-                                plan_c,
-                                target_c,
-                                store_c,
-                                Arc::clone(&v2_link_task_semaphore_c),
-                            ))
-                        } else {
-                            None
-                        };
                     overall.inc(1);
                     spec_tracker_c.mark_consumed_if_completed(&package_key);
                     return Ok::<FetchTaskResult, LpmError>((
@@ -1587,7 +1580,7 @@ pub(super) async fn run_online_fetch_phase(
                             ..Default::default()
                         },
                         link_h,
-                        v2_link_h,
+                        None,
                         None,
                     ));
                 }

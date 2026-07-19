@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn lpm_metadata_cache_keys_are_partitioned_by_bearer_principal() {
+    let client_a = RegistryClient::new().with_token("principal-a");
+    let client_b = RegistryClient::new().with_token("principal-b");
+
+    assert_ne!(
+        client_a.lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        client_b.lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        "private LPM metadata must not cross authenticated principals"
+    );
+    assert_ne!(
+        client_a.lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        RegistryClient::new().lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        "logged-out reads must not reuse an authenticated principal's metadata"
+    );
+}
+
+#[tokio::test]
+async fn lpm_private_metadata_cache_never_crosses_bearer_principals() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let package = lpm_common::PackageName::parse("@lpm.dev/private.pkg").unwrap();
+    for (token, description) in [("TOKEN-A", "principal-a"), ("TOKEN-B", "principal-b")] {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/private.pkg"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "@lpm.dev/private.pkg",
+                "description": description,
+                "versions": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let make_client = |token: &str| {
+        let mut client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token(token)
+            .with_synchronous_cache_writes(true);
+        client.cache_dir = Some(cache.path().to_path_buf());
+        client
+    };
+
+    let metadata_a = make_client("TOKEN-A")
+        .get_package_metadata(&package)
+        .await
+        .unwrap();
+    let metadata_b = make_client("TOKEN-B")
+        .get_package_metadata(&package)
+        .await
+        .unwrap();
+
+    assert_eq!(metadata_a.description.as_deref(), Some("principal-a"));
+    assert_eq!(metadata_b.description.as_deref(), Some("principal-b"));
+}
+
+#[test]
 fn cache_roundtrip_with_etag() {
     let (client, _tmp) = client_with_temp_cache();
     let meta = test_metadata("@lpm.dev/test.pkg");

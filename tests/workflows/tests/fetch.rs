@@ -16,6 +16,27 @@ async fn mount_ms(mock: &MockRegistry) {
     mock.with_package("ms", "2.1.3", &tarball).await;
 }
 
+async fn mount_ms_with_integrity(mock: &MockRegistry, integrity: &str) {
+    let tarball = make_tarball("ms", "2.1.3");
+    let metadata = serde_json::json!({
+        "name": "ms",
+        "dist-tags": {"latest": "2.1.3"},
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": mock.tarball_url("ms", "2.1.3"),
+                    "integrity": integrity,
+                }
+            }
+        }
+    });
+    mock.with_package_metadata("ms", "2.1.3", &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+}
+
 async fn seed_lockfile(mock: &MockRegistry) -> String {
     let project = TempProject::empty(PACKAGE_JSON);
     let output = lpm_with_registry(&project, &mock.url())
@@ -179,6 +200,54 @@ async fn fetch_reads_lockfile_without_manifest_and_enables_offline_frozen_instal
         String::from_utf8_lossy(&offline.stdout),
         String::from_utf8_lossy(&offline.stderr)
     );
+}
+
+#[tokio::test]
+async fn fetch_v1_preserves_sha256_for_offline_frozen_replay() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    let declared = Integrity::from_bytes(HashAlgorithm::Sha256, &tarball).to_string();
+    mount_ms_with_integrity(&mock, &declared).await;
+
+    let seed = TempProject::empty(PACKAGE_JSON);
+    lpm_with_registry(&seed, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let project = project_with_lockfile(&seed.read_file("lpm.lock"));
+
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["fetch"])
+        .assert()
+        .success();
+
+    let sidecar =
+        std::fs::read_to_string(package_store_dir(&project, "ms", "2.1.3").join(".integrity"))
+            .expect("fetch must write the v1 identity sidecar");
+    assert_eq!(sidecar, declared);
+
+    project.write_file("package.json", PACKAGE_JSON);
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
 }
 
 #[tokio::test]

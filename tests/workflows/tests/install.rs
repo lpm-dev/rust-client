@@ -10021,6 +10021,101 @@ async fn v1_registry_cache_reuse_requires_the_resolved_integrity() {
 }
 
 #[tokio::test]
+async fn concurrent_v1_installs_serialize_shared_coordinate_replacement() {
+    let registry_a = MockRegistry::start().await;
+    let registry_b = MockRegistry::start().await;
+    let tarball_a = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"concurrent-coordinate","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-a';\n")],
+    );
+    let tarball_b = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"concurrent-coordinate","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-b';\n")],
+    );
+    registry_a
+        .with_package("concurrent-coordinate", "1.0.0", &tarball_a)
+        .await;
+    registry_b
+        .with_package("concurrent-coordinate", "1.0.0", &tarball_b)
+        .await;
+    for (registry, tarball) in [(&registry_a, &tarball_a), (&registry_b, &tarball_b)] {
+        Mock::given(method("GET"))
+            .and(path(MockRegistry::tarball_path(
+                "concurrent-coordinate",
+                "1.0.0",
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(1))
+                    .set_body_bytes(tarball.clone()),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(registry.server())
+            .await;
+    }
+
+    let project_a = TempProject::empty(
+        r#"{"name":"concurrent-a","version":"1.0.0","dependencies":{"concurrent-coordinate":"1.0.0"}}"#,
+    );
+    let project_b = TempProject::empty(
+        r#"{"name":"concurrent-b","version":"1.0.0","dependencies":{"concurrent-coordinate":"1.0.0"}}"#,
+    );
+    let shared_home = project_a.home().join(".lpm");
+    let shared_store = shared_home.join("store");
+    let configure = |command: &mut assert_cmd::Command, registry: &MockRegistry| {
+        command
+            .env("LPM_HOME", &shared_home)
+            .env("LPM_STORE_DIR", &shared_store)
+            .env("LPM_STORE_VERSION", "v1")
+            .arg("--registry")
+            .arg(registry.url())
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ]);
+    };
+    let mut command_a = lpm(&project_a);
+    configure(&mut command_a, &registry_a);
+    let mut command_b = lpm(&project_b);
+    configure(&mut command_b, &registry_b);
+
+    let started = std::time::Instant::now();
+    let wait_a = tokio::task::spawn_blocking(move || command_a.output().unwrap());
+    let wait_b = tokio::task::spawn_blocking(move || command_b.output().unwrap());
+    let (output_a, output_b) = tokio::join!(wait_a, wait_b);
+    let output_a = output_a.expect("join registry A install");
+    let output_b = output_b.expect("join registry B install");
+
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(1700),
+        "v1 installs sharing a coordinate store must hold an exclusive store lock"
+    );
+    assert!(
+        output_a.status.success(),
+        "registry A install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output_a.stdout),
+        String::from_utf8_lossy(&output_a.stderr)
+    );
+    assert!(
+        output_b.status.success(),
+        "registry B install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output_b.stdout),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+    assert_eq!(
+        project_a.read_file("node_modules/concurrent-coordinate/index.js"),
+        "module.exports = 'registry-a';\n"
+    );
+    assert_eq!(
+        project_b.read_file("node_modules/concurrent-coordinate/index.js"),
+        "module.exports = 'registry-b';\n"
+    );
+}
+
+#[tokio::test]
 async fn metadata_cache_is_partitioned_by_configured_registry_origin() {
     let registry_a = MockRegistry::start().await;
     let registry_b = MockRegistry::start().await;

@@ -28,7 +28,7 @@ pub(super) struct OnlineInstallReportInput<'a> {
     pub(super) applied_patches: &'a [patch_engine::AppliedPatch],
     pub(super) blocked_capture: &'a crate::build_state::BlockedSetCapture,
     pub(super) install_provenance_status_map:
-        &'a HashMap<(String, String), lpm_common::ProvenanceStatus>,
+        &'a HashMap<crate::provenance_fetch::ApprovalProvenanceKey, lpm_common::ProvenanceStatus>,
     pub(super) audit_summary_for_envelope: &'a Option<crate::commands::audit::AuditCounts>,
     pub(super) force_security_floor: bool,
     pub(super) timing_detail_mode: TimingDetailMode,

@@ -13,6 +13,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                 crate::build_state::BlockedPackage {
                     name: "scripted-meta".into(),
                     version: "1.0.0".into(),
+                    source: Some("registry+https://old.registry.example".into()),
                     integrity: Some("sha512-meta".into()),
                     script_hash: Some("sha256-script".into()),
                     phases_present: vec!["postinstall".into()],
@@ -26,6 +27,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                 crate::build_state::BlockedPackage {
                     name: "scripted-empty".into(),
                     version: "1.0.0".into(),
+                    source: None,
                     integrity: Some("sha512-empty".into()),
                     script_hash: Some("sha256-empty".into()),
                     phases_present: vec!["postinstall".into()],
@@ -42,12 +44,19 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
     )
     .unwrap();
 
-    let metadata = blocked_set_metadata_from_previous_state(dir.path());
+    let mut current = fake_pkg("scripted-meta", "1.0.0", false);
+    current.source = "registry+https://current.registry.example".into();
+    current.integrity = Some("sha512-meta".into());
+    let metadata = blocked_set_metadata_from_previous_state(dir.path(), &[current]);
 
     assert_eq!(metadata.by_pkg.len(), 1);
     let entry = metadata
-        .get("scripted-meta", "1.0.0")
+        .get("scripted-meta", "1.0.0", Some("sha512-meta"))
         .expect("metadata replay should include enriched prior rows");
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("registry+https://current.registry.example")
+    );
     assert_eq!(entry.published_at.as_deref(), Some("2026-04-22T00:00:00Z"));
     assert_eq!(entry.behavioral_tags_hash.as_deref(), Some("sha256-tags"));
     let tags = entry
@@ -55,7 +64,30 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
         .as_deref()
         .expect("metadata replay should preserve behavioral tag names");
     assert_eq!(tags, ["network", "eval"]);
-    assert!(metadata.get("scripted-empty", "1.0.0").is_none());
+    assert!(
+        metadata
+            .get("scripted-empty", "1.0.0", Some("sha512-empty"))
+            .is_none()
+    );
+}
+
+#[test]
+fn blocked_set_source_metadata_fails_closed_for_ambiguous_install_identity() {
+    let mut first = fake_pkg("same-coordinates", "1.0.0", false);
+    first.source = "registry+https://registry-a.example".into();
+    first.integrity = Some("sha512-shared".into());
+    let mut second = first.clone();
+    second.source = "registry+https://registry-b.example".into();
+
+    let metadata = blocked_set_source_metadata(&[first, second]);
+    let entry = metadata
+        .get("same-coordinates", "1.0.0", Some("sha512-shared"))
+        .expect("ambiguous identity remains represented");
+
+    assert!(
+        entry.source.is_none(),
+        "approval provenance must not select an arbitrary source"
+    );
 }
 
 /// The drift gate must appear before the install pipeline hands off to
@@ -254,6 +286,7 @@ fn bc_with_tiers(green: usize, amber: usize, red: usize) -> crate::build_state::
     let build_bp = |name: &str, tier: StaticTier| crate::build_state::BlockedPackage {
         name: name.into(),
         version: "1.0.0".into(),
+        source: None,
         integrity: None,
         script_hash: None,
         phases_present: vec!["postinstall".into()],
@@ -457,6 +490,7 @@ fn bp_for_diff(
     crate::build_state::BlockedPackage {
         name: name.into(),
         version: version.into(),
+        source: None,
         integrity: Some(format!("sha512-{name}-{version}")),
         script_hash: script_hash.map(String::from),
         phases_present: vec!["postinstall".into()],

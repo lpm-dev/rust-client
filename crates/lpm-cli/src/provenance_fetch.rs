@@ -44,6 +44,83 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+pub type ApprovalProvenanceKey = (String, String, Option<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalMetadataRoute {
+    LpmPackage,
+    LpmProxyOnly,
+    NpmDirect,
+    Custom(lpm_registry::UpstreamRoute),
+    NonRegistry,
+    Unavailable,
+}
+
+fn approval_metadata_route(
+    registry: &lpm_registry::RegistryClient,
+    route_table: &lpm_registry::RouteTable,
+    name: &str,
+    source: Option<&str>,
+) -> ApprovalMetadataRoute {
+    let Some(source) = source else {
+        return ApprovalMetadataRoute::Unavailable;
+    };
+    let Ok(source) = lpm_lockfile::Source::parse(source) else {
+        return ApprovalMetadataRoute::Unavailable;
+    };
+    let lpm_lockfile::Source::Registry { url } = source else {
+        return ApprovalMetadataRoute::NonRegistry;
+    };
+
+    if crate::npm_public_source::is_public_npm_origin(&url) {
+        return ApprovalMetadataRoute::NpmDirect;
+    }
+    if crate::npm_public_source::is_lpm_registry_origin(&url, registry) {
+        return if name.starts_with("@lpm.dev/") {
+            ApprovalMetadataRoute::LpmPackage
+        } else {
+            ApprovalMetadataRoute::LpmProxyOnly
+        };
+    }
+
+    match route_table.route_for_package(name) {
+        lpm_registry::UpstreamRoute::Custom { target, auth }
+            if registry_urls_match(&url, &target.base_url) =>
+        {
+            ApprovalMetadataRoute::Custom(lpm_registry::UpstreamRoute::Custom { target, auth })
+        }
+        _ => ApprovalMetadataRoute::Unavailable,
+    }
+}
+
+fn registry_urls_match(left: &str, right: &str) -> bool {
+    let (Ok(mut left), Ok(mut right)) = (reqwest::Url::parse(left), reqwest::Url::parse(right))
+    else {
+        return false;
+    };
+    if !matches!(left.scheme(), "http" | "https")
+        || !matches!(right.scheme(), "http" | "https")
+        || left.query().is_some()
+        || right.query().is_some()
+        || left.fragment().is_some()
+        || right.fragment().is_some()
+    {
+        return false;
+    }
+    normalize_registry_path(&mut left);
+    normalize_registry_path(&mut right);
+    left == right
+}
+
+fn normalize_registry_path(url: &mut reqwest::Url) {
+    let normalized = url.path().trim_end_matches('/').to_string();
+    url.set_path(if normalized.is_empty() {
+        "/"
+    } else {
+        &normalized
+    });
+}
+
 /// Canonicalized policy for the
 /// `--ignore-provenance-drift[-all]` override flags on `lpm install`.
 ///
@@ -753,21 +830,20 @@ pub(crate) fn map_fetch_result_to_status(
 /// there is nothing to enforce against. The two axes are
 /// independent on purpose (see [`SkipPolicy`] doc).
 ///
-/// The lpm-vs-npm metadata-fetch dispatch by `@lpm.dev/` name prefix
-/// mirrors `install.rs::build_blocked_set_metadata`. The 5-min metadata
-/// cache absorbs the typical "install then immediately approve-scripts"
-/// case (no network call); the on-disk attestation cache under
-/// `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
-/// approvals across runs.
+/// Metadata routing follows each persisted install source. Local, link,
+/// tarball, and git sources never trigger a registry lookup; registry
+/// sources must match the public npm origin, the configured LPM origin,
+/// or an authenticated route in `route_table`.
 ///
 /// `registry` is the invocation's configured client. Reusing it keeps
-/// approval-time metadata on the same registry origin, auth session, npm
-/// route, TLS policy, and source-qualified cache namespace as installation.
+/// approval-time metadata on the same registry origin, auth session, TLS
+/// policy, and source-qualified cache namespace as installation.
 pub async fn fetch_provenance_for_pkgs(
     registry: &lpm_registry::RegistryClient,
-    pkgs: &[(String, String)],
+    route_table: &lpm_registry::RouteTable,
+    pkgs: &[ApprovalProvenanceKey],
     verify_policy: &VerifyPolicy,
-) -> HashMap<(String, String), ProvenanceStatus> {
+) -> HashMap<ApprovalProvenanceKey, ProvenanceStatus> {
     let cache_root = match lpm_common::paths::LpmRoot::from_env() {
         Ok(root) => root.cache_metadata_attestations(),
         Err(_) => {
@@ -785,20 +861,34 @@ pub async fn fetch_provenance_for_pkgs(
     let http_ref = &http;
     let verify_policy_ref = verify_policy;
 
-    let futures = pkgs.iter().map(move |(name, version)| async move {
-        // lpm vs npm dispatch by name prefix mirrors
-        // `install.rs::build_blocked_set_metadata`.
-        let meta = if name.starts_with("@lpm.dev/") {
-            match lpm_common::PackageName::parse(name) {
+    let futures = pkgs.iter().map(move |(name, version, source)| async move {
+        let key = (name.clone(), version.clone(), source.clone());
+        let meta = match approval_metadata_route(registry, route_table, name, source.as_deref()) {
+            ApprovalMetadataRoute::LpmPackage => match lpm_common::PackageName::parse(name) {
                 Ok(pkg_name) => registry.get_package_metadata(&pkg_name).await.ok(),
                 Err(_) => None,
+            },
+            ApprovalMetadataRoute::LpmProxyOnly => registry
+                .get_npm_package_metadata_proxy_only(name)
+                .await
+                .ok(),
+            ApprovalMetadataRoute::NpmDirect => registry.get_npm_metadata_direct(name).await.ok(),
+            ApprovalMetadataRoute::Custom(route) => {
+                registry.get_npm_metadata_routed(name, route).await.ok()
             }
-        } else {
-            registry.get_npm_package_metadata(name).await.ok()
+            ApprovalMetadataRoute::NonRegistry => {
+                return (key, ProvenanceStatus::Absent);
+            }
+            ApprovalMetadataRoute::Unavailable => {
+                return (key, ProvenanceStatus::TransportDegraded);
+            }
+        };
+        let Some(meta) = meta else {
+            return (key, ProvenanceStatus::TransportDegraded);
         };
         let attestation_ref = meta
-            .as_ref()
-            .and_then(|m| m.versions.get(version))
+            .versions
+            .get(version)
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
 
@@ -813,7 +903,7 @@ pub async fn fetch_provenance_for_pkgs(
             let raw =
                 fetch_unverified_snapshot(http_ref, name, version, attestation_ref.as_ref()).await;
             let status = relabel_skip_status_for_enforce_mode(raw, verify_policy_ref.enforce);
-            return ((name.clone(), version.clone()), status);
+            return (key, status);
         }
 
         let raw = fetch_provenance_snapshot(
@@ -826,7 +916,7 @@ pub async fn fetch_provenance_for_pkgs(
         )
         .await;
         let status = map_fetch_result_to_status(name, version, raw);
-        ((name.clone(), version.clone()), status)
+        (key, status)
     });
     futures::future::join_all(futures)
         .await
@@ -947,6 +1037,190 @@ pub async fn fetch_unverified_snapshot(
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+
+    fn no_env(_name: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn approval_provenance_never_routes_non_registry_sources() {
+        let client = lpm_registry::RegistryClient::new();
+        let routes = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+
+        for source in [
+            "directory+packages/private",
+            "link+packages/private",
+            "tarball+https://artifacts.example/private.tgz",
+            "git+ssh://git@example.com/private.git",
+        ] {
+            assert_eq!(
+                approval_metadata_route(&client, &routes, "private-name", Some(source)),
+                ApprovalMetadataRoute::NonRegistry,
+                "{source} must not trigger a registry metadata request",
+            );
+        }
+    }
+
+    #[test]
+    fn approval_provenance_uses_public_npm_direct_even_in_proxy_mode() {
+        let client = lpm_registry::RegistryClient::new();
+        let routes = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+
+        assert_eq!(
+            approval_metadata_route(
+                &client,
+                &routes,
+                "react",
+                Some("registry+https://registry.npmjs.org"),
+            ),
+            ApprovalMetadataRoute::NpmDirect,
+        );
+    }
+
+    #[test]
+    fn approval_provenance_requires_custom_route_to_match_installed_origin() {
+        let client = lpm_registry::RegistryClient::new();
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            "@private:registry=https://registry.private.example/\n",
+            "test",
+            &no_env,
+        );
+        let routes = lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc)
+            .expect("npmrc has no errors");
+
+        assert!(matches!(
+            approval_metadata_route(
+                &client,
+                &routes,
+                "@private/pkg",
+                Some("registry+https://registry.private.example"),
+            ),
+            ApprovalMetadataRoute::Custom(_),
+        ));
+        assert_eq!(
+            approval_metadata_route(
+                &client,
+                &routes,
+                "@private/pkg",
+                Some("registry+https://other.private.example"),
+            ),
+            ApprovalMetadataRoute::Unavailable,
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_provenance_for_local_source_makes_no_registry_request() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().as_os_str().to_owned())]);
+        let worker = wiremock::MockServer::start().await;
+        let registry = lpm_registry::RegistryClient::new()
+            .with_base_url(worker.uri())
+            .with_cache_dir(None);
+        let routes = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+        let packages = vec![(
+            "private-name".to_string(),
+            "1.0.0".to_string(),
+            Some("directory+packages/private".to_string()),
+        )];
+
+        let statuses =
+            fetch_provenance_for_pkgs(&registry, &routes, &packages, &VerifyPolicy::default())
+                .await;
+
+        assert!(matches!(
+            statuses.get(&packages[0]),
+            Some(ProvenanceStatus::Absent)
+        ));
+        assert!(worker.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_provenance_for_public_npm_source_bypasses_worker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let home = tempfile::tempdir().expect("temp home");
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().as_os_str().to_owned())]);
+        let worker = wiremock::MockServer::start().await;
+        let npm = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/react"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "react",
+                "versions": {"19.0.0": {"name": "react", "version": "19.0.0"}}
+            })))
+            .expect(1)
+            .mount(&npm)
+            .await;
+        let registry = lpm_registry::RegistryClient::new()
+            .with_base_url(worker.uri())
+            .with_npm_registry_url(npm.uri())
+            .with_cache_dir(None);
+        let routes = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+        let packages = vec![(
+            "react".to_string(),
+            "19.0.0".to_string(),
+            Some("registry+https://registry.npmjs.org".to_string()),
+        )];
+
+        let statuses =
+            fetch_provenance_for_pkgs(&registry, &routes, &packages, &VerifyPolicy::default())
+                .await;
+
+        assert!(matches!(
+            statuses.get(&packages[0]),
+            Some(ProvenanceStatus::Absent)
+        ));
+        assert!(worker.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_provenance_for_custom_source_uses_matching_custom_route() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let home = tempfile::tempdir().expect("temp home");
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().as_os_str().to_owned())]);
+        let worker = wiremock::MockServer::start().await;
+        let custom = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@private/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "@private/pkg",
+                "versions": {"1.0.0": {"name": "@private/pkg", "version": "1.0.0"}}
+            })))
+            .expect(1)
+            .mount(&custom)
+            .await;
+        let registry = lpm_registry::RegistryClient::new()
+            .with_base_url(worker.uri())
+            .with_cache_dir(None);
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            &format!("@private:registry={}\n", custom.uri()),
+            "test",
+            &no_env,
+        );
+        let routes = lpm_registry::RouteTable::new(lpm_registry::RouteMode::Proxy, npmrc)
+            .expect("npmrc has no errors");
+        let packages = vec![(
+            "@private/pkg".to_string(),
+            "1.0.0".to_string(),
+            Some(format!("registry+{}", custom.uri())),
+        )];
+
+        let statuses =
+            fetch_provenance_for_pkgs(&registry, &routes, &packages, &VerifyPolicy::default())
+                .await;
+
+        assert!(matches!(
+            statuses.get(&packages[0]),
+            Some(ProvenanceStatus::Absent)
+        ));
+        assert!(worker.received_requests().await.unwrap().is_empty());
+    }
 
     // ── DriftIgnorePolicy::from_cli ─────────────────────────────
 

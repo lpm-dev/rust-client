@@ -413,46 +413,48 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
-    lpm_common::with_shared_lock_async(
-        store_lock_path,
-        run_with_options_under_store_lock(
-            client,
-            project_dir,
-            json_output,
-            offline,
-            allow_snapshotless_lockfile,
-            frozen_lockfile,
-            force,
-            allow_new,
-            strict_integrity,
-            dependency_engine_policy,
-            strict_peer_dependencies_override,
-            linker_override,
-            lpm_skills_preference,
-            no_editor_setup,
-            no_security_summary,
-            auto_build,
-            target_set,
-            direct_versions_out,
-            requested_add_count,
-            script_policy_override,
-            advisor_override,
-            min_release_age_override,
-            min_release_age_exclude,
-            drift_ignore_policy,
-            verify_policy,
-            omit_policy,
-            strict_sandbox,
-            no_sandbox,
-            verbose,
-            audit_after_install,
-            timing,
-            compatibility_bin_names,
-            emit_install_report,
-            &lpm_root,
-        ),
-    )
-    .await
+    let store_version = lpm_store::StoreVersion::from_env();
+    let install = run_with_options_under_store_lock(
+        client,
+        project_dir,
+        json_output,
+        offline,
+        allow_snapshotless_lockfile,
+        frozen_lockfile,
+        force,
+        allow_new,
+        strict_integrity,
+        dependency_engine_policy,
+        strict_peer_dependencies_override,
+        linker_override,
+        lpm_skills_preference,
+        no_editor_setup,
+        no_security_summary,
+        auto_build,
+        target_set,
+        direct_versions_out,
+        requested_add_count,
+        script_policy_override,
+        advisor_override,
+        min_release_age_override,
+        min_release_age_exclude,
+        drift_ignore_policy,
+        verify_policy,
+        omit_policy,
+        strict_sandbox,
+        no_sandbox,
+        verbose,
+        audit_after_install,
+        timing,
+        compatibility_bin_names,
+        emit_install_report,
+        &lpm_root,
+    );
+    if store_version.is_v2() {
+        lpm_common::with_shared_lock_async(store_lock_path, install).await
+    } else {
+        lpm_common::with_exclusive_lock_async(store_lock_path, install).await
+    }
 }
 
 /// Body of [`run_with_options`] — the actual install pipeline. Lives

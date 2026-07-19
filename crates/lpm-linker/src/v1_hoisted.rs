@@ -17,7 +17,22 @@ use std::path::{Path, PathBuf};
 pub(crate) fn reconcile_empty_hoisted_root(project_dir: &Path) -> Result<(), LpmError> {
     let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
-    if node_modules.exists() {
+    let node_modules_metadata = match node_modules.symlink_metadata() {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if node_modules_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        std::fs::remove_file(&node_modules).map_err(|error| {
+            LpmError::Store(format!(
+                "hoisted linker: failed to remove symlinked node_modules at {}: {error}",
+                node_modules.display()
+            ))
+        })?;
+    } else if node_modules_metadata.is_some() {
         let entries = std::fs::read_dir(&node_modules).map_err(|error| {
             LpmError::Store(format!(
                 "hoisted linker: failed to read {} while reconciling an empty install: {error}",
@@ -67,6 +82,27 @@ fn remove_hoisted_entry(path: &Path) -> Result<(), LpmError> {
             path.display()
         ))
     })
+}
+
+#[cfg(all(test, unix))]
+mod empty_reconcile_tests {
+    use super::*;
+
+    #[test]
+    fn empty_reconcile_never_traverses_symlinked_node_modules() {
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sentinel = external.path().join("must-survive");
+        std::fs::write(&sentinel, b"external data").unwrap();
+        std::os::unix::fs::symlink(external.path(), project.path().join("node_modules")).unwrap();
+
+        reconcile_empty_hoisted_root(project.path()).unwrap();
+
+        assert!(
+            sentinel.exists(),
+            "empty reconciliation must not delete through a node_modules symlink"
+        );
+    }
 }
 
 /// Walk the consumer chain from `start_idx` upward until we find a

@@ -879,6 +879,7 @@ impl RegistryClient {
         // attempt so the rotated token is used on retry.
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                let cache_key = self.lpm_metadata_cache_key(&scoped);
                 let cache_validator = use_cache
                     .then(|| self.read_cache_validator(&cache_key))
                     .flatten();

@@ -44,8 +44,19 @@ pub(super) fn reconcile_project_node_modules(
     preserve_internal_lpm_dir: bool,
 ) -> Result<(), LpmError> {
     let nm = project_dir.join("node_modules");
-    if !nm.exists() {
-        return Ok(());
+    match nm.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&nm).map_err(|error| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to remove symlinked project node_modules at {}: {error}",
+                    nm.display()
+                ))
+            })?;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
     }
 
     let mut desired = HashSet::new();
