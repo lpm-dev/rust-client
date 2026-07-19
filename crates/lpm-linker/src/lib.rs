@@ -76,6 +76,7 @@ pub fn reconcile_empty_install(
             link_packages(project_dir, &[], false, None)?;
         }
         LinkerMode::Hoisted => {
+            v1_hoisted::reconcile_empty_hoisted_root(project_dir)?;
             link_packages_hoisted(project_dir, &[], false, None)?;
         }
     }

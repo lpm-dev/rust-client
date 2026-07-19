@@ -14,6 +14,61 @@ use lpm_common::LpmError;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+pub(crate) fn reconcile_empty_hoisted_root(project_dir: &Path) -> Result<(), LpmError> {
+    let layout = LayoutPaths::for_project(project_dir);
+    let node_modules = project_dir.join("node_modules");
+    if node_modules.exists() {
+        let entries = std::fs::read_dir(&node_modules).map_err(|error| {
+            LpmError::Store(format!(
+                "hoisted linker: failed to read {} while reconciling an empty install: {error}",
+                node_modules.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(LpmError::Io)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let managed =
+                !name.starts_with('.') || matches!(name, ".bin" | ".lpm" | ".lpm-metadata.json");
+            if managed {
+                remove_hoisted_entry(&entry.path())?;
+            }
+        }
+    }
+
+    let hoisted_root = layout.hoisted_root();
+    if hoisted_root.exists() {
+        std::fs::remove_dir_all(&hoisted_root).map_err(|error| {
+            LpmError::Store(format!(
+                "hoisted linker: failed to remove stale state at {}: {error}",
+                hoisted_root.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn remove_hoisted_entry(path: &Path) -> Result<(), LpmError> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    let result = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|error| {
+        LpmError::Store(format!(
+            "hoisted linker: failed to remove stale package entry at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 /// Walk the consumer chain from `start_idx` upward until we find a
 /// package whose `(name, version)` IS the hoisted-at-root instance for
 /// its name (i.e., `hoisted[pkg.name] == cur_idx`). Returns that

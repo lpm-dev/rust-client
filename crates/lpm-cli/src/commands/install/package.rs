@@ -118,6 +118,7 @@ pub(super) fn dedupe_install_packages_by_identity(packages: &mut Vec<InstallPack
 
 pub(super) fn explicit_peer_providers_from_install_packages<'a>(
     packages: impl IntoIterator<Item = &'a InstallPackage>,
+    project_dir: &Path,
 ) -> Result<Vec<lpm_resolver::ExplicitPeerProvider>, LpmError> {
     let packages = packages.into_iter();
     let (lower_bound, _) = packages.size_hint();
@@ -128,9 +129,10 @@ pub(super) fn explicit_peer_providers_from_install_packages<'a>(
         if package.source.starts_with("registry+") {
             continue;
         }
-        let source = lpm_resolver::PeerProviderSource::from_install_source(
+        let source = lpm_resolver::PeerProviderSource::from_install_source_at(
             &package.source,
             package.integrity.as_deref(),
+            project_dir,
         )
         .ok_or_else(|| {
             LpmError::Registry(format!(
@@ -249,12 +251,9 @@ impl InstallPackage {
         lpm_lockfile::Source::parse(&self.source)
     }
 
-    /// source-
-    /// aware existence check. For `Source::Tarball` packages,
-    /// checks the integrity-keyed CAS layout
-    /// ([`PackageStore::has_tarball`]); everything else falls back
-    /// to the legacy `(name, version)`-keyed
-    /// [`PackageStore::has_package`].
+    /// Source-aware existence check. Tarballs use their integrity-keyed CAS
+    /// layout, while registry entries require the exact selected integrity in
+    /// the coordinate-keyed v1 slot.
     ///
     /// Trust-on-first-use `Source::Tarball` (integrity = None)
     /// returns `false` even when a coincidentally-named registry
@@ -283,6 +282,11 @@ impl InstallPackage {
                 // path.
                 let abs = project_dir.join(&path);
                 abs.is_dir() && abs.join("package.json").is_file()
+            }
+            Ok(lpm_lockfile::Source::Registry { .. }) => {
+                self.integrity.as_deref().is_some_and(|expected| {
+                    store.has_package_with_integrity(&self.name, &self.version, expected)
+                })
             }
             _ => store.has_package(&self.name, &self.version),
         }

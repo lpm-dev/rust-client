@@ -267,8 +267,9 @@ fn file_workspace_overlap_is_retained_with_exact_source_in_v1() {
         true,
     )
     .unwrap();
-    let providers = explicit_peer_providers_from_install_packages(resolved.install_pkgs.iter())
-        .expect("provider classification must succeed");
+    let providers =
+        explicit_peer_providers_from_install_packages(resolved.install_pkgs.iter(), root)
+            .expect("provider classification must succeed");
     let specifier = lpm_resolver::PeerSpecifier::parse("react", "file:./packages/react")
         .expect("peer source must parse");
     assert!(

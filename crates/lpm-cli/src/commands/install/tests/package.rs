@@ -23,6 +23,24 @@ fn install_package_source_kind_parses_registry() {
     }
 }
 
+#[test]
+fn registry_store_hits_require_the_selected_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(dir.path());
+    let tarball = build_minimal_tarball_with_pkg("registry-hit", "1.0.0");
+    let stored_path = store
+        .store_package("registry-hit", "1.0.0", &tarball)
+        .unwrap();
+    let stored_integrity = lpm_store::read_stored_integrity(&stored_path).unwrap();
+    let mut package = fake_pkg("registry-hit", "1.0.0", true);
+
+    package.integrity = Some("sha512-different".to_string());
+    assert!(!package.store_has_source_aware(&store, dir.path()));
+
+    package.integrity = Some(stored_integrity);
+    assert!(package.store_has_source_aware(&store, dir.path()));
+}
+
 // ── invariant: prevent silent source substitution ───────
 // A registry-CAS hit at (name, version) must not fulfill a
 // Source::Tarball dep with the same name+version. These tests lock the
@@ -920,7 +938,8 @@ fn explicit_file_install_package_becomes_typed_peer_provider() {
     package.root_link_names = Some(vec!["react".to_string()]);
     package.is_direct = true;
 
-    let providers = explicit_peer_providers_from_install_packages([&package]).unwrap();
+    let providers =
+        explicit_peer_providers_from_install_packages([&package], Path::new(".")).unwrap();
 
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0].local_name, "react");
@@ -941,7 +960,7 @@ fn non_semver_source_package_can_be_indexed_as_an_explicit_peer_provider() {
     package.root_link_names = Some(vec!["private-react".to_string()]);
     package.is_direct = true;
 
-    let providers = explicit_peer_providers_from_install_packages([&package])
+    let providers = explicit_peer_providers_from_install_packages([&package], Path::new("."))
         .expect("an unrelated private source package must not require a semver version");
 
     assert_eq!(providers.len(), 1);

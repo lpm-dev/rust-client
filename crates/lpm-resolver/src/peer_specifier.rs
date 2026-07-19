@@ -21,18 +21,42 @@ pub enum PeerProviderSource {
 
 impl PeerProviderSource {
     pub fn from_install_source(source: &str, integrity: Option<&str>) -> Option<Self> {
+        Self::from_install_source_with_project(source, integrity, None)
+    }
+
+    /// Parse an install source while normalizing local paths into the install
+    /// project's coordinate space.
+    pub fn from_install_source_at(
+        source: &str,
+        integrity: Option<&str>,
+        install_project_dir: &Path,
+    ) -> Option<Self> {
+        Self::from_install_source_with_project(source, integrity, Some(install_project_dir))
+    }
+
+    fn from_install_source_with_project(
+        source: &str,
+        integrity: Option<&str>,
+        install_project_dir: Option<&Path>,
+    ) -> Option<Self> {
+        let normalize_local = |path: &str| {
+            install_project_dir.map_or_else(
+                || normalize_source_path(path),
+                |project_dir| project_relative_source_path(path, project_dir, project_dir),
+            )
+        };
         if source.starts_with("registry+") {
             return Some(Self::Registry);
         }
         if let Some(path) = source.strip_prefix("directory+") {
-            return Some(Self::File(normalize_source_path(path)));
+            return Some(Self::File(normalize_local(path)));
         }
         if let Some(path) = source.strip_prefix("link+") {
-            return Some(Self::Link(normalize_source_path(path)));
+            return Some(Self::Link(normalize_local(path)));
         }
         if let Some(value) = source.strip_prefix("tarball+") {
             if let Some(path) = value.strip_prefix("file:") {
-                return Some(Self::File(normalize_source_path(path)));
+                return Some(Self::File(normalize_local(path)));
             }
             return Some(Self::Tarball {
                 url: value.to_string(),
@@ -272,20 +296,7 @@ impl PeerSpecifier {
             | PeerConstraint::Source(PeerProviderSource::Link(path)) => path,
             _ => return,
         };
-        let declaring_dir = declaring_dir
-            .canonicalize()
-            .unwrap_or_else(|_| lexical_normalize(declaring_dir));
-        let install_project_dir = install_project_dir
-            .canonicalize()
-            .unwrap_or_else(|_| lexical_normalize(install_project_dir));
-        let source_path = Path::new(path);
-        let absolute = if source_path.is_absolute() {
-            lexical_normalize(source_path)
-        } else {
-            lexical_normalize(&declaring_dir.join(source_path))
-        };
-        let rebased = pathdiff::diff_paths(&absolute, &install_project_dir).unwrap_or(absolute);
-        *path = normalize_source_path(&rebased.to_string_lossy());
+        *path = project_relative_source_path(path, declaring_dir, install_project_dir);
     }
 
     #[inline]
@@ -473,14 +484,33 @@ fn split_named_registry(raw: &str) -> Option<(&str, &str)> {
 }
 
 fn normalize_source_path(raw: &str) -> String {
-    let path = Path::new(raw);
-    let mut normalized = std::path::PathBuf::with_capacity(raw.len());
-    for component in path.components() {
-        if !matches!(component, Component::CurDir) {
-            normalized.push(component.as_os_str());
-        }
-    }
-    normalized.to_string_lossy().into_owned()
+    lexical_normalize(Path::new(raw))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn project_relative_source_path(
+    raw: &str,
+    declaring_dir: &Path,
+    install_project_dir: &Path,
+) -> String {
+    let declaring_dir = declaring_dir
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(declaring_dir));
+    let install_project_dir = install_project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(install_project_dir));
+    let source_path = Path::new(raw);
+    let absolute = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        declaring_dir.join(source_path)
+    };
+    let absolute = absolute
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(&absolute));
+    let rebased = pathdiff::diff_paths(&absolute, &install_project_dir).unwrap_or(absolute);
+    normalize_source_path(&rebased.to_string_lossy())
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -616,6 +646,27 @@ mod tests {
                 dependency.raw(),
                 raw,
                 "diagnostics must retain manifest text"
+            );
+        }
+    }
+
+    #[test]
+    fn install_source_paths_use_the_same_project_relative_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let react = project.path().join("packages/react");
+        std::fs::create_dir_all(&react).unwrap();
+        let expected =
+            PeerProviderSource::File(Path::new("packages/react").to_string_lossy().into_owned());
+        let absolute_source = format!("directory+{}", react.display());
+
+        for source in [
+            "directory+./packages/consumer/../react",
+            absolute_source.as_str(),
+        ] {
+            assert_eq!(
+                PeerProviderSource::from_install_source_at(source, None, project.path()),
+                Some(expected.clone()),
+                "{source}"
             );
         }
     }

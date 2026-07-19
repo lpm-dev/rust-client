@@ -1534,7 +1534,11 @@ pub(super) async fn run_online_fetch_phase(
                     .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
                     .flatten();
                 if !force_flag
-                    && p.store_has_source_aware(&store_ref, &project_dir_buf)
+                    && p.store_has_for_install_layout(
+                        &store_ref,
+                        store_v2_ref.as_deref(),
+                        &project_dir_buf,
+                    )
                     && let Some(existing_path) = store_path_pre_fetch
                 {
                     // A sibling completed the fetch while we waited on the
@@ -2982,13 +2986,14 @@ pub(super) async fn fetch_and_store_legacy(
             .extract_object_from_bytes_with_fresh_integrity(&bytes, p.integrity.as_deref())?;
         (timings, Some(object), sri)
     } else {
+        let source_sri = p.integrity.as_deref().unwrap_or(&computed_sri);
         let (_, stage) = store.store_package_from_file_timed(
             &p.name,
             &p.version,
             downloaded.file.path(),
-            &computed_sri,
+            source_sri,
         )?;
-        (stage, None, computed_sri)
+        (stage, None, source_sri.to_string())
     };
 
     Ok((

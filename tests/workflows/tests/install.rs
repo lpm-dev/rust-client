@@ -1275,6 +1275,80 @@ fn removing_final_dependency_reconciles_links_and_records_empty_importer_in_supp
     }
 }
 
+fn assert_empty_hoisted_install_reconciles_without_metadata(metadata_contents: Option<&[u8]>) {
+    let project = TempProject::empty(
+        r#"{
+  "name": "empty-hoisted-reconciliation",
+  "version": "1.0.0",
+  "dependencies": {
+    "only-dependency": "file:./only-dependency"
+  }
+}"#,
+    );
+    project.write_file(
+        "only-dependency/package.json",
+        r#"{"name":"only-dependency","version":"1.0.0"}"#,
+    );
+
+    lpm(&project)
+        .env("LPM_STORE_VERSION", "v1")
+        .env("LPM_LINKER", "hoisted")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let installed_dependency = project.path().join("node_modules/only-dependency");
+    assert!(installed_dependency.is_dir());
+    project.write_file("node_modules/.cache/user-owned.txt", "keep\n");
+
+    let metadata_path = project.path().join(".lpm/hoisted/metadata.json");
+    match metadata_contents {
+        Some(contents) => std::fs::write(&metadata_path, contents).unwrap(),
+        None => std::fs::remove_file(&metadata_path).unwrap(),
+    }
+    project.write_file(
+        "package.json",
+        r#"{"name":"empty-hoisted-reconciliation","version":"1.0.0"}"#,
+    );
+
+    lpm(&project)
+        .env("LPM_STORE_VERSION", "v1")
+        .env("LPM_LINKER", "hoisted")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        installed_dependency.symlink_metadata().is_err(),
+        "an empty hoisted install must remove managed packages without relying on metadata"
+    );
+    assert_eq!(
+        project.read_file("node_modules/.cache/user-owned.txt"),
+        "keep\n",
+        "empty reconciliation must preserve unrelated hidden node_modules state"
+    );
+}
+
+#[test]
+fn empty_hoisted_install_removes_managed_packages_when_metadata_is_missing() {
+    assert_empty_hoisted_install_reconciles_without_metadata(None);
+}
+
+#[test]
+fn empty_hoisted_install_removes_managed_packages_when_metadata_is_corrupt() {
+    assert_empty_hoisted_install_reconciles_without_metadata(Some(b"not json"));
+}
+
 #[test]
 fn offline_final_dependency_removal_rejects_without_mutating_install_state() {
     let project = TempProject::empty(
@@ -6393,7 +6467,10 @@ async fn workspace_overlapped_file_provider_satisfies_matching_source_peer_in_v1
     );
 }
 
-async fn assert_workspace_member_relative_source_peer_reentry(store_version: &str) {
+async fn assert_workspace_member_relative_source_peer_reentry(
+    store_version: &str,
+    root_provider: impl FnOnce(&TempProject) -> String,
+) {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(
         serde_json::json!({
@@ -6410,17 +6487,22 @@ async fn assert_workspace_member_relative_source_peer_reentry(store_version: &st
         )],
     )
     .await;
-    let project = TempProject::empty(
-        r#"{
-  "name": "workspace-member-relative-peer-root",
-  "version": "1.0.0",
-  "private": true,
-  "workspaces": ["packages/*"],
-  "dependencies": {
-    "workspace-peer-reentry": "1.0.0",
-    "react": "file:./packages/react"
-  }
-}"#,
+    let project =
+        TempProject::empty(r#"{"name":"workspace-member-relative-peer-root","version":"1.0.0"}"#);
+    let root_provider = root_provider(&project);
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "workspace-member-relative-peer-root",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "dependencies": {
+                "workspace-peer-reentry": "1.0.0",
+                "react": root_provider,
+            }
+        }))
+        .unwrap(),
     );
     project.write_file(
         "packages/consumer/package.json",
@@ -6483,12 +6565,48 @@ async fn assert_workspace_member_relative_source_peer_reentry(store_version: &st
 
 #[tokio::test]
 async fn workspace_member_relative_source_peer_matches_project_provider_in_v1() {
-    assert_workspace_member_relative_source_peer_reentry("v1").await;
+    assert_workspace_member_relative_source_peer_reentry("v1", |_| {
+        "file:./packages/consumer/../react".to_string()
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn workspace_member_relative_source_peer_matches_project_provider_in_v2() {
-    assert_workspace_member_relative_source_peer_reentry("v2").await;
+    assert_workspace_member_relative_source_peer_reentry("v2", |_| {
+        "file:./packages/consumer/../react".to_string()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn workspace_member_relative_source_peer_matches_absolute_provider_in_v1() {
+    assert_workspace_member_relative_source_peer_reentry("v1", |project| {
+        format!(
+            "file:{}",
+            project
+                .path()
+                .join("packages/react")
+                .to_string_lossy()
+                .replace('\\', "/")
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn workspace_member_relative_source_peer_matches_absolute_provider_in_v2() {
+    assert_workspace_member_relative_source_peer_reentry("v2", |project| {
+        format!(
+            "file:{}",
+            project
+                .path()
+                .join("packages/react")
+                .to_string_lossy()
+                .replace('\\', "/")
+        )
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -9742,6 +9860,345 @@ async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
     assert_eq!(
         stored_integrity, expected_integrity,
         "store .integrity file must match the lockfile claim and the tarball hash"
+    );
+}
+
+async fn mount_registry_package_with_integrity(
+    mock: &MockRegistry,
+    name: &str,
+    version: &str,
+    tarball: &[u8],
+    integrity: &str,
+) {
+    let metadata = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "main": "index.js",
+                "dist": {
+                    "tarball": mock.tarball_url(name, version),
+                    "integrity": integrity,
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_package_metadata(name, version, tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+}
+
+#[tokio::test]
+async fn v1_registry_installs_preserve_declared_sha1_and_sha256_integrities() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    for (stream_fetch, algorithm) in [
+        ("1", HashAlgorithm::Sha1),
+        ("1", HashAlgorithm::Sha256),
+        ("0", HashAlgorithm::Sha1),
+        ("0", HashAlgorithm::Sha256),
+    ] {
+        let mock = MockRegistry::start().await;
+        let name = match algorithm {
+            HashAlgorithm::Sha1 => "declared-sha1",
+            HashAlgorithm::Sha256 => "declared-sha256",
+            HashAlgorithm::Sha512 => unreachable!(),
+        };
+        let tarball = make_tarball_from_pkg_json(
+            serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "main": "index.js"
+            }),
+            &[("index.js", b"module.exports = 'declared-integrity';\n")],
+        );
+        let expected = Integrity::from_bytes(algorithm, &tarball).to_string();
+        mount_registry_package_with_integrity(&mock, name, "1.0.0", &tarball, &expected).await;
+        let project = TempProject::empty(
+            &serde_json::to_string(&serde_json::json!({
+                "name": "declared-integrity-preservation",
+                "version": "1.0.0",
+                "dependencies": { name: "1.0.0" }
+            }))
+            .unwrap(),
+        );
+
+        lpm_with_registry(&project, &mock.url())
+            .env("LPM_STORE_VERSION", "v1")
+            .env("LPM_STREAM_FETCH", stream_fetch)
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .assert()
+            .success();
+
+        let lockfile =
+            lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
+        let locked = lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == name)
+            .unwrap();
+        assert_eq!(
+            locked.integrity.as_deref(),
+            Some(expected.as_str()),
+            "stream={stream_fetch}, algorithm={algorithm:?}: lockfile must preserve the declared SRI"
+        );
+        let stored = std::fs::read_to_string(
+            project
+                .store_dir()
+                .join("v1")
+                .join(format!("{name}@1.0.0/.integrity")),
+        )
+        .unwrap();
+        assert_eq!(
+            stored, expected,
+            "stream={stream_fetch}, algorithm={algorithm:?}: v1 sidecar must preserve the declared SRI"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v1_registry_cache_reuse_requires_the_resolved_integrity() {
+    let registry_b = MockRegistry::start().await;
+    let tarball_a = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"same-coordinate","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-a';\n")],
+    );
+    let tarball_b = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"same-coordinate","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-b';\n")],
+    );
+    registry_b
+        .with_package("same-coordinate", "1.0.0", &tarball_b)
+        .await;
+
+    let project_b = TempProject::empty(
+        r#"{"name":"registry-b-project","version":"1.0.0","dependencies":{"same-coordinate":"1.0.0"}}"#,
+    );
+    lpm_store::PackageStore::at(project_b.store_dir())
+        .store_package("same-coordinate", "1.0.0", &tarball_a)
+        .unwrap();
+    lpm_with_registry(&project_b, &registry_b.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let expected_b = compute_integrity(&tarball_b);
+    let shared_sidecar = std::fs::read_to_string(
+        project_b
+            .store_dir()
+            .join("v1/same-coordinate@1.0.0/.integrity"),
+    )
+    .unwrap();
+    assert_eq!(
+        shared_sidecar, expected_b,
+        "the shared v1 slot must be replaced with registry B's verified bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            project_b
+                .path()
+                .join("node_modules/same-coordinate/index.js")
+        )
+        .unwrap(),
+        "module.exports = 'registry-b';\n",
+        "a v1 cache entry from another registry must not substitute different resolved content"
+    );
+}
+
+#[tokio::test]
+async fn metadata_cache_is_partitioned_by_configured_registry_origin() {
+    let registry_a = MockRegistry::start().await;
+    let registry_b = MockRegistry::start().await;
+    let tarball_a = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"metadata-origin","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-a';\n")],
+    );
+    let tarball_b = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"metadata-origin","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-b';\n")],
+    );
+    registry_a
+        .with_package("metadata-origin", "1.0.0", &tarball_a)
+        .await;
+    registry_b
+        .with_package("metadata-origin", "1.0.0", &tarball_b)
+        .await;
+
+    let project_a = TempProject::empty(
+        r#"{"name":"registry-a-project","version":"1.0.0","dependencies":{"metadata-origin":"1.0.0"}}"#,
+    );
+    lpm_with_registry(&project_a, &registry_a.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let project_b = TempProject::empty(
+        r#"{"name":"registry-b-project","version":"1.0.0","dependencies":{"metadata-origin":"1.0.0"}}"#,
+    );
+    lpm_with_registry(&project_b, &registry_b.url())
+        .env("LPM_HOME", project_a.home().join(".lpm"))
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile_b =
+        lpm_lockfile::Lockfile::read_from_file(&project_b.path().join("lpm.lock")).unwrap();
+    let locked_b = lockfile_b
+        .packages
+        .iter()
+        .find(|package| package.name == "metadata-origin")
+        .unwrap();
+    assert_eq!(
+        locked_b.integrity.as_deref(),
+        Some(compute_integrity(&tarball_b).as_str()),
+        "registry B's metadata must determine the selected integrity"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            project_b
+                .path()
+                .join("node_modules/metadata-origin/index.js")
+        )
+        .unwrap(),
+        "module.exports = 'registry-b';\n",
+        "a warm metadata cache must not substitute content resolved from another registry origin"
+    );
+}
+
+#[tokio::test]
+async fn v1_offline_replay_rejects_same_coordinates_with_different_integrity() {
+    let registry_a = MockRegistry::start().await;
+    let registry_b = MockRegistry::start().await;
+    let tarball_a = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"offline-coordinate","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-a';\n")],
+    );
+    let tarball_b = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"offline-coordinate","version":"1.0.0","main":"index.js"}),
+        &[("index.js", b"module.exports = 'registry-b';\n")],
+    );
+    registry_a
+        .with_package("offline-coordinate", "1.0.0", &tarball_a)
+        .await;
+    registry_b
+        .with_package("offline-coordinate", "1.0.0", &tarball_b)
+        .await;
+
+    let cached_a = TempProject::empty(
+        r#"{"name":"cached-a","version":"1.0.0","dependencies":{"offline-coordinate":"1.0.0"}}"#,
+    );
+    lpm_with_registry(&cached_a, &registry_a.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let locked_b = TempProject::empty(
+        r#"{"name":"locked-b","version":"1.0.0","dependencies":{"offline-coordinate":"1.0.0"}}"#,
+    );
+    lpm_with_registry(&locked_b, &registry_b.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(locked_b.path().join("node_modules")).unwrap();
+
+    let offline = lpm_with_registry(&locked_b, &registry_b.url())
+        .env("LPM_HOME", cached_a.home().join(".lpm"))
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run v1 offline replay against a colliding cache entry");
+    assert!(
+        !offline.status.success(),
+        "offline replay must reject a coordinate-only cache hit with different integrity\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&offline.stdout),
+        String::from_utf8_lossy(&offline.stderr),
+    );
+}
+
+#[test]
+fn v2_local_tarball_install_materializes_an_object_with_the_lockfile_sha256_identity() {
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "local-tarball-v2",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'local-tarball-v2';\n")],
+    );
+    let project = TempProject::empty(
+        r#"{"name":"local-tarball-v2-root","version":"1.0.0","dependencies":{"local-tarball-v2":"file:./local-tarball-v2.tgz"}}"#,
+    );
+    std::fs::write(project.path().join("local-tarball-v2.tgz"), &tarball).unwrap();
+
+    lpm(&project)
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
+    let integrity = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "local-tarball-v2")
+        .and_then(|package| package.integrity.as_deref())
+        .expect("local tarball lockfile entry must retain integrity");
+    assert!(integrity.starts_with("sha256-"));
+    let store = lpm_store::v2::Store::from_lpm_root(&lpm_common::LpmRoot::from_dir(
+        project.home().join(".lpm"),
+    ));
+    assert!(
+        store.reusable_object_dir(integrity).unwrap().is_some(),
+        "the v1 sidecar accepted for migration must use the same SHA-256 identity as the lockfile"
     );
 }
 

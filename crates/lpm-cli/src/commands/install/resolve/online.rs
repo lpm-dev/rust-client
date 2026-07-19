@@ -144,6 +144,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         tarball_url_install_pkgs
             .iter()
             .chain(v2_workspace_root_pre_resolve.install_pkgs.iter()),
+        project_dir,
     )?;
     let resolver_root_dependencies =
         lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots)

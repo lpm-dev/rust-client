@@ -244,8 +244,10 @@ pub(in crate::commands::install) async fn run(
     let store = PackageStore::from_root(lpm_root);
     let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
     let gate_stats = Arc::new(GateStats::default());
-    let explicit_peer_providers =
-        explicit_peer_providers_from_install_packages(pre_resolved_install_pkgs.iter())?;
+    let explicit_peer_providers = explicit_peer_providers_from_install_packages(
+        pre_resolved_install_pkgs.iter(),
+        project_dir,
+    )?;
 
     let setup_ms = start.elapsed().as_millis();
     let resolve_start = Instant::now();
@@ -896,7 +898,10 @@ async fn compute_parity_if_requested(
                 optional_registry_roots.clone(),
             )
             .with_explicit_peer_providers(
-                explicit_peer_providers_from_install_packages(pre_resolved_install_pkgs.iter())?,
+                explicit_peer_providers_from_install_packages(
+                    pre_resolved_install_pkgs.iter(),
+                    project_dir,
+                )?,
             );
             let resolve_result =
                 lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy_roots(

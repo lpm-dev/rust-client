@@ -883,10 +883,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 ))
             })?;
 
-        // SHA-256 of the bytes — the CAS key for tarball-local.
-        // (Distinct from the SRI written into `.integrity` by the
-        // shared `store_at_dir` helper, which uses sha512 by default
-        // for parity with the registry/remote-tarball arms.)
+        // SHA-256 of the bytes — the CAS key and persisted source identity
+        // for tarball-local.
         let content_sha256_hex = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
