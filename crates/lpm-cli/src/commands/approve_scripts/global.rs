@@ -8,6 +8,13 @@ use super::prelude::*;
 /// top-level globally-installed package instead of per-dep.
 pub const GROUP_AUTO_THRESHOLD: usize = 10;
 
+#[derive(Clone, Copy)]
+pub(super) struct GlobalApprovalProvenance<'a> {
+    pub(super) registry: &'a lpm_registry::RegistryClient,
+    pub(super) verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
+    pub(super) runtime_enforce: crate::provenance_fetch::EnforceMode,
+}
+
 /// Global-scope approve-scripts entry point. Mirrors [`run`] but sources
 /// the blocked set from [`crate::global_blocked_set`] and persists
 /// approvals to `~/.lpm/global/trusted-dependencies.json` instead of
@@ -26,7 +33,8 @@ pub const GROUP_AUTO_THRESHOLD: usize = 10;
 /// still remain per dependency binding row. Grouped output auto-enables
 /// when the effective set exceeds [`GROUP_AUTO_THRESHOLD`] and the caller
 /// didn't explicitly set it.
-pub async fn run_global(
+pub async fn run_global_with_client(
+    registry: &lpm_registry::RegistryClient,
     package: Option<&str>,
     yes: bool,
     list: bool,
@@ -37,12 +45,26 @@ pub async fn run_global(
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
     lpm_common::with_shared_lock_async(
         lock_path,
-        run_global_under_store_lock(package, yes, list, group, dry_run, json_output),
+        run_global_under_store_lock(registry, package, yes, list, group, dry_run, json_output),
     )
     .await
 }
 
+#[cfg(test)]
+pub async fn run_global(
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
+    group: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let registry = lpm_registry::RegistryClient::new();
+    run_global_with_client(&registry, package, yes, list, group, dry_run, json_output).await
+}
+
 async fn run_global_under_store_lock(
+    registry: &lpm_registry::RegistryClient,
     package: Option<&str>,
     yes: bool,
     list: bool,
@@ -152,32 +174,20 @@ async fn run_global_under_store_lock(
             runtime_sigstore_source,
         )?;
     }
+    let provenance = GlobalApprovalProvenance {
+        registry,
+        verify_policy: &verify_policy,
+        runtime_enforce,
+    };
 
     // ── Named-package approval path ───────────────────────────────
     if let Some(arg) = package {
-        return run_global_named(
-            &root,
-            &aggregate,
-            arg,
-            dry_run,
-            json_output,
-            &verify_policy,
-            runtime_enforce,
-        )
-        .await;
+        return run_global_named(provenance, &root, &aggregate, arg, dry_run, json_output).await;
     }
 
     // ── Bulk-approve mode ─────────────────────────────────────────
     if yes {
-        return run_global_bulk_yes(
-            &root,
-            &aggregate,
-            dry_run,
-            json_output,
-            &verify_policy,
-            runtime_enforce,
-        )
-        .await;
+        return run_global_bulk_yes(provenance, &root, &aggregate, dry_run, json_output).await;
     }
 
     // ── Interactive walk ──────────────────────────────────────────
@@ -195,13 +205,12 @@ async fn run_global_under_store_lock(
         )));
     }
     run_global_interactive(
+        provenance,
         &root,
         &aggregate,
         effective_group,
         dry_run,
         json_output,
-        &verify_policy,
-        runtime_enforce,
     )
     .await
 }
@@ -425,13 +434,17 @@ pub(super) fn rerun_next_steps_json(origins: &[String]) -> serde_json::Value {
 /// [`run_global_under_store_lock`]) → `global_tx_lock` (inner exclusive,
 /// taken here). Do not invert.
 pub(super) async fn run_global_bulk_yes(
+    provenance_context: GlobalApprovalProvenance<'_>,
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     dry_run: bool,
     json_output: bool,
-    verify_policy: &crate::provenance_fetch::VerifyPolicy,
-    runtime_enforce: crate::provenance_fetch::EnforceMode,
 ) -> Result<(), LpmError> {
+    let GlobalApprovalProvenance {
+        registry,
+        verify_policy,
+        runtime_enforce,
+    } = provenance_context;
     // Refuse global `--yes` for any aggregate row classified outside
     // the green tier — parity with the project `--yes` gate. The gate
     // runs BEFORE the provenance fetch + banner emission so a refused
@@ -453,7 +466,7 @@ pub(super) async fn run_global_bulk_yes(
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
     let provenance =
-        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
+        crate::provenance_fetch::fetch_provenance_for_pkgs(registry, &pairs, verify_policy).await;
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
     // so a verifier rejection (which returns
@@ -600,14 +613,18 @@ pub(super) async fn run_global_bulk_yes(
 /// [`run_global_under_store_lock`]) → `global_tx_lock` (inner exclusive,
 /// taken here). Do not invert.
 pub(super) async fn run_global_named(
+    provenance_context: GlobalApprovalProvenance<'_>,
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     arg: &str,
     dry_run: bool,
     json_output: bool,
-    verify_policy: &crate::provenance_fetch::VerifyPolicy,
-    runtime_enforce: crate::provenance_fetch::EnforceMode,
 ) -> Result<(), LpmError> {
+    let GlobalApprovalProvenance {
+        registry,
+        verify_policy,
+        runtime_enforce,
+    } = provenance_context;
     // Bare-name lookup must refuse silently-picking-first when multiple
     // rows match. Aggregate rows are deduped
     // by `(name, version, integrity, script_hash)` per the dedup rule,
@@ -654,7 +671,7 @@ pub(super) async fn run_global_named(
     // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
     let provenance =
-        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
+        crate::provenance_fetch::fetch_provenance_for_pkgs(registry, &pairs, verify_policy).await;
     let snap = snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
 
     let lock_path = root.global_tx_lock();
@@ -939,14 +956,18 @@ pub(super) async fn commit_global_approval(
 /// [`commit_global_approval`], which takes `global_tx_lock` so each
 /// per-row commit is serialized against parallel `--global` flows.
 pub(super) async fn run_global_interactive(
+    provenance_context: GlobalApprovalProvenance<'_>,
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     group: bool,
     dry_run: bool,
     _json_output: bool,
-    verify_policy: &crate::provenance_fetch::VerifyPolicy,
-    runtime_enforce: crate::provenance_fetch::EnforceMode,
 ) -> Result<(), LpmError> {
+    let GlobalApprovalProvenance {
+        registry,
+        verify_policy,
+        runtime_enforce,
+    } = provenance_context;
     use crate::prompt::prompt_err;
 
     // pre-fetch provenance for every aggregate row in one
@@ -959,7 +980,7 @@ pub(super) async fn run_global_interactive(
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
     let provenance =
-        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
+        crate::provenance_fetch::fetch_provenance_for_pkgs(registry, &pairs, verify_policy).await;
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();

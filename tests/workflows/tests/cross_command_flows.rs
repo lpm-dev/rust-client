@@ -57,6 +57,18 @@ fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &s
 /// store-resident package can run without a full mock-registry install
 /// pass. Returns the integrity sentinel the engine reads back.
 fn seed_store(project: &TempProject, name: &str, version: &str, files: &[(&str, &str)]) -> String {
+    let integrity = format!("sha512-fixture-{name}-{version}");
+    seed_store_with_integrity(project, name, version, files, &integrity);
+    integrity
+}
+
+fn seed_store_with_integrity(
+    project: &TempProject,
+    name: &str,
+    version: &str,
+    files: &[(&str, &str)],
+    integrity: &str,
+) {
     let safe = name.replace(['/', '\\'], "+");
     let dir = project
         .store_dir()
@@ -75,9 +87,7 @@ fn seed_store(project: &TempProject, name: &str, version: &str, files: &[(&str, 
         }
         std::fs::write(&p, content).unwrap();
     }
-    let integrity = format!("sha512-fixture-{name}-{version}");
-    std::fs::write(dir.join(".integrity"), &integrity).unwrap();
-    integrity
+    std::fs::write(dir.join(".integrity"), integrity).unwrap();
 }
 
 /// Parse a `--json` envelope from stdout, stripping ANSI first.
@@ -285,11 +295,20 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
     // Step 2: seed the store with the package referenced in the
     // migrated lockfile (the `ms@2.1.3` dep), then install --offline.
     // This proves the lockfile's package set is install-readable.
-    seed_store(
+    let migrated_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
+    let migrated_integrity = migrated_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "ms" && package.version == "2.1.3")
+        .and_then(|package| package.integrity.as_deref())
+        .expect("migrated ms package must retain its source integrity");
+    seed_store_with_integrity(
         &project,
         "ms",
         "2.1.3",
         &[("index.js", "module.exports = function() { return 'ms' }\n")],
+        migrated_integrity,
     );
     let out_install = lpm_with_registry(&project, "http://127.0.0.1:1")
         .args(["install", "--offline", "--allow-snapshotless-lockfile"])
@@ -499,7 +518,7 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
 #[test]
 fn flow_doctor_fix_install_post_fix_install_is_clean() {
     let project = TempProject::empty(r#"{"name":"flow-doctor-fix","version":"0.0.0"}"#);
-    seed_store(
+    let integrity = seed_store(
         &project,
         "ms",
         "2.1.3",
@@ -517,8 +536,9 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
     // (regenerate lpm.lockb + write .gitattributes).
     let lockfile = format!(
         "[metadata]\nlockfile-version = {}\nresolved-with = \"greedy-fusion\"\n\n\
-         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n",
-        lpm_lockfile::LOCKFILE_VERSION
+         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\nintegrity = \"{}\"\n",
+        lpm_lockfile::LOCKFILE_VERSION,
+        integrity,
     );
     project.write_file("lpm.lock", &lockfile);
     assert!(

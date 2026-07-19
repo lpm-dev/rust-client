@@ -2091,6 +2091,17 @@ fn deny_verify_policy() -> VerifyPolicy {
     }
 }
 
+fn global_approval_provenance<'a>(
+    registry: &'a lpm_registry::RegistryClient,
+    verify_policy: &'a VerifyPolicy,
+) -> global::GlobalApprovalProvenance<'a> {
+    global::GlobalApprovalProvenance {
+        registry,
+        verify_policy,
+        runtime_enforce: verify_policy.enforce,
+    }
+}
+
 fn seed_global_manifest_with_blocked(
     root: &lpm_common::LpmRoot,
     top_level: &str,
@@ -2255,14 +2266,14 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
         unreadable_origins: vec![],
     };
     let policy = deny_verify_policy();
+    let registry = lpm_registry::RegistryClient::new();
     let err = run_global_named(
+        global_approval_provenance(&registry, &policy),
         &root,
         &agg,
         "esbuild",
         false,
         true,
-        &policy,
-        EnforceMode::Deny,
     )
     .await
     .unwrap_err();
@@ -2328,9 +2339,16 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
     };
     // JSON mode so no interactive prompts and output goes to stdout.
     let policy = deny_verify_policy();
-    run_global_bulk_yes(&root, &agg, false, true, &policy, EnforceMode::Deny)
-        .await
-        .unwrap();
+    let registry = lpm_registry::RegistryClient::new();
+    run_global_bulk_yes(
+        global_approval_provenance(&registry, &policy),
+        &root,
+        &agg,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
     let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
     assert!(trust.trusted.contains_key("esbuild@0.25.1"));
     assert!(trust.trusted.contains_key("sharp@0.33.0"));
@@ -2351,14 +2369,14 @@ async fn run_global_named_approves_only_the_matched_row() {
         unreadable_origins: vec![],
     };
     let policy = deny_verify_policy();
+    let registry = lpm_registry::RegistryClient::new();
     run_global_named(
+        global_approval_provenance(&registry, &policy),
         &root,
         &agg,
         "sharp",
         false,
         true,
-        &policy,
-        EnforceMode::Deny,
     )
     .await
     .unwrap();
@@ -2378,14 +2396,14 @@ async fn run_global_named_errors_for_unknown_package() {
         unreadable_origins: vec![],
     };
     let policy = deny_verify_policy();
+    let registry = lpm_registry::RegistryClient::new();
     let err = run_global_named(
+        global_approval_provenance(&registry, &policy),
         &root,
         &agg,
         "ghost",
         false,
         true,
-        &policy,
-        EnforceMode::Deny,
     )
     .await
     .unwrap_err();
@@ -2620,28 +2638,28 @@ async fn global_named_approvals_do_not_clobber_each_other() {
     let task_a = tokio::spawn(async move {
         let root = lpm_common::LpmRoot::from_dir(&root_a);
         let policy = deny_verify_policy();
+        let registry = lpm_registry::RegistryClient::new();
         run_global_named(
+            global_approval_provenance(&registry, &policy),
             &root,
             &agg_a,
             "esbuild@0.25.1",
             false,
             true,
-            &policy,
-            EnforceMode::Deny,
         )
         .await
     });
     let task_b = tokio::spawn(async move {
         let root = lpm_common::LpmRoot::from_dir(&root_b);
         let policy = deny_verify_policy();
+        let registry = lpm_registry::RegistryClient::new();
         run_global_named(
+            global_approval_provenance(&registry, &policy),
             &root,
             &agg_b,
             "sharp@0.33.0",
             false,
             true,
-            &policy,
-            EnforceMode::Deny,
         )
         .await
     });

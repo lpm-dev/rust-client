@@ -759,7 +759,12 @@ pub(crate) fn map_fetch_result_to_status(
 /// case (no network call); the on-disk attestation cache under
 /// `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
 /// approvals across runs.
+///
+/// `registry` is the invocation's configured client. Reusing it keeps
+/// approval-time metadata on the same registry origin, auth session, npm
+/// route, TLS policy, and source-qualified cache namespace as installation.
 pub async fn fetch_provenance_for_pkgs(
+    registry: &lpm_registry::RegistryClient,
     pkgs: &[(String, String)],
     verify_policy: &VerifyPolicy,
 ) -> HashMap<(String, String), ProvenanceStatus> {
@@ -775,11 +780,9 @@ pub async fn fetch_provenance_for_pkgs(
         }
     };
     let http = reqwest::Client::new();
-    let registry = lpm_registry::RegistryClient::new();
 
     let cache_root_ref = &cache_root;
     let http_ref = &http;
-    let registry_ref = &registry;
     let verify_policy_ref = verify_policy;
 
     let futures = pkgs.iter().map(move |(name, version)| async move {
@@ -787,11 +790,11 @@ pub async fn fetch_provenance_for_pkgs(
         // `install.rs::build_blocked_set_metadata`.
         let meta = if name.starts_with("@lpm.dev/") {
             match lpm_common::PackageName::parse(name) {
-                Ok(pkg_name) => registry_ref.get_package_metadata(&pkg_name).await.ok(),
+                Ok(pkg_name) => registry.get_package_metadata(&pkg_name).await.ok(),
                 Err(_) => None,
             }
         } else {
-            registry_ref.get_npm_package_metadata(name).await.ok()
+            registry.get_npm_package_metadata(name).await.ok()
         };
         let attestation_ref = meta
             .as_ref()

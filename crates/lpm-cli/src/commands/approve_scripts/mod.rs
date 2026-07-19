@@ -33,12 +33,16 @@ mod project;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub use global::run_global;
 #[allow(unused_imports)]
-pub use global::{GROUP_AUTO_THRESHOLD, run_global};
+pub use global::{GROUP_AUTO_THRESHOLD, run_global_with_client};
 #[allow(unused_imports)]
 pub use metadata::SCHEMA_VERSION;
+#[cfg(test)]
+pub use project::run;
 #[allow(unused_imports)]
-pub use project::{compute_effective_blocked_set, run};
+pub use project::{compute_effective_blocked_set, run_with_client};
 
 mod prelude {
     #[allow(unused_imports)]
@@ -73,7 +77,7 @@ mod prelude {
         snapshot_for_binding, snapshot_for_binding_with_mode,
     };
     #[allow(unused_imports)]
-    pub(super) use super::project::{InteractiveChoice, compute_effective_blocked_set, run};
+    pub(super) use super::project::{InteractiveChoice, compute_effective_blocked_set};
     #[allow(unused_imports)]
     pub(super) use crate::build_state::{self, BlockedPackage, BuildState};
     #[allow(unused_imports)]

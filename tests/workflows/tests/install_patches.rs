@@ -18,6 +18,7 @@
 mod support;
 
 use std::path::PathBuf;
+use support::mock_registry::compute_integrity;
 use support::{TempProject, lpm_with_registry};
 
 /// Every test in this file asserts on the
@@ -57,6 +58,10 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn fixture_integrity(name: &str, version: &str) -> String {
+    compute_integrity(format!("{name}@{version}").as_bytes())
+}
+
 /// Seed `<store>/v1/<safe>@<v>/` with package.json, the supplied source
 /// files, and the `.integrity` sentinel. Returns the integrity string
 /// the engine reads back from disk.
@@ -84,7 +89,7 @@ fn seed_store_package(
         }
         std::fs::write(&p, content).unwrap();
     }
-    let integrity = format!("sha512-fixture-{name}-{version}");
+    let integrity = fixture_integrity(name, version);
     std::fs::write(dir.join(".integrity"), &integrity).unwrap();
     integrity
 }
@@ -108,6 +113,7 @@ fn write_lockfile_at(
     let pkgs: Vec<String> = entries
         .iter()
         .map(|(name, version, deps)| {
+            let integrity = fixture_integrity(name, version);
             let deps_block = if deps.is_empty() {
                 String::new()
             } else {
@@ -118,7 +124,9 @@ fn write_lockfile_at(
                     .join(", ");
                 format!("\ndependencies = [{inner}]")
             };
-            format!("[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n")
+            format!(
+                "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\nintegrity = \"{integrity}\"{deps_block}\n"
+            )
         })
         .collect();
     let toml = format!(

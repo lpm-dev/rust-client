@@ -22,6 +22,7 @@
 
 mod support;
 
+use support::mock_registry::compute_integrity;
 use support::{TempProject, lpm_with_registry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -48,6 +49,10 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn fixture_integrity(name: &str, version: &str) -> String {
+    compute_integrity(format!("{name}@{version}").as_bytes())
+}
+
 /// Synthetic `lpm.lock` containing the given `(name, version, deps)` entries.
 fn write_lockfile(
     project: &TempProject,
@@ -58,6 +63,7 @@ fn write_lockfile(
     let pkgs: Vec<String> = entries
         .iter()
         .map(|(name, version, deps)| {
+            let integrity = fixture_integrity(name, version);
             let deps_block = if deps.is_empty() {
                 String::new()
             } else {
@@ -68,7 +74,9 @@ fn write_lockfile(
                     .join(", ");
                 format!("\ndependencies = [{inner}]")
             };
-            format!("[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n")
+            format!(
+                "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\nintegrity = \"{integrity}\"{deps_block}\n"
+            )
         })
         .collect();
     let toml = format!(
@@ -114,7 +122,7 @@ fn seed_store_package(project: &TempProject, name: &str, version: &str) {
         format!(r#"{{"name":"{name}","version":"{version}"}}"#),
     )
     .unwrap();
-    std::fs::write(dir.join(".integrity"), "sha512-fixture").unwrap();
+    std::fs::write(dir.join(".integrity"), fixture_integrity(name, version)).unwrap();
 }
 
 /// Write a synthetic `.lpm/overrides-state.json`. `parsed` is the

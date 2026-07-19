@@ -1,5 +1,15 @@
 use super::prelude::*;
 
+struct ProjectApprovalInvocation<'a> {
+    registry: &'a lpm_registry::RegistryClient,
+    project_dir: &'a Path,
+    package: Option<&'a str>,
+    yes: bool,
+    list: bool,
+    dry_run: bool,
+    json_output: bool,
+}
+
 /// Filter the persisted build-state's blocked set against the current
 /// `trustedDependencies` and return only the entries that are STILL
 /// blocked.
@@ -77,7 +87,8 @@ pub fn compute_effective_blocked_set<'a>(
 ///
 /// `list`: read-only listing of the blocked set. Mutually exclusive with
 /// `yes`. Cannot be combined with `package`.
-pub async fn run(
+pub async fn run_with_client(
+    registry: &lpm_registry::RegistryClient,
     project_dir: &Path,
     package: Option<&str>,
     yes: bool,
@@ -91,40 +102,53 @@ pub async fn run(
     // mid-walk without this gate.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     let lock_path = lpm_root.store_lock();
-    lpm_common::with_shared_lock_async(
-        lock_path,
-        run_under_store_lock(
-            project_dir,
-            package,
-            yes,
-            list,
-            dry_run,
-            json_output,
-            lpm_root,
-        ),
+    let invocation = ProjectApprovalInvocation {
+        registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
+    };
+    lpm_common::with_shared_lock_async(lock_path, run_under_store_lock(invocation, lpm_root)).await
+}
+
+#[cfg(test)]
+pub async fn run(
+    project_dir: &Path,
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let registry = lpm_registry::RegistryClient::new();
+    run_with_client(
+        &registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
     )
     .await
 }
 
 async fn run_under_store_lock(
-    project_dir: &Path,
-    package: Option<&str>,
-    yes: bool,
-    list: bool,
-    // When true, the review flow runs end-to-end (card rendering,
-    // interactive prompts, diff surfaces, outcome accounting) but NO
-    // persisted state mutates —
-    // [`write_back`] short-circuits at each of its three call sites
-    // (direct-approve, `--yes`, interactive walk) and
-    // [`print_summary`] surfaces `"dry_run": true` in the JSON
-    // envelope. No-op when combined with `--list` (already
-    // read-only); the JSON envelope for `--list --dry-run` still
-    // carries the `dry_run` flag so agents can distinguish
-    // preview-of-listing from plain-listing at parse time.
-    dry_run: bool,
-    json_output: bool,
+    invocation: ProjectApprovalInvocation<'_>,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    let ProjectApprovalInvocation {
+        registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
+    } = invocation;
     // ── Argument validation ─────────────────────────────────────────
     //
     // Mutual exclusion: `--yes` and `--list` are contradictory (one mutates,
@@ -323,8 +347,12 @@ async fn run_under_store_lock(
                 runtime_sigstore_source,
             )?;
         }
-        let provenance_by_pkg =
-            fetch_provenance_for_effective_set(std::slice::from_ref(target), &verify_policy).await;
+        let provenance_by_pkg = fetch_provenance_for_effective_set(
+            registry,
+            std::slice::from_ref(target),
+            &verify_policy,
+        )
+        .await;
 
         let reviewed_by_prompt = !json_output && is_tty();
         let confirmed = if reviewed_by_prompt {
@@ -476,8 +504,12 @@ async fn run_under_store_lock(
             runtime_sigstore_source,
         )?;
     }
-    let provenance_by_pkg =
-        fetch_provenance_for_effective_set(&effective_state.blocked_packages, &verify_policy).await;
+    let provenance_by_pkg = fetch_provenance_for_effective_set(
+        registry,
+        &effective_state.blocked_packages,
+        &verify_policy,
+    )
+    .await;
 
     // ── --yes (bulk approve) ────────────────────────────────────────
 
