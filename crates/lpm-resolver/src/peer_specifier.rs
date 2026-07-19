@@ -1,4 +1,4 @@
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use crate::provider::is_valid_dep_name;
 use crate::ranges::NpmRange;
@@ -140,6 +140,22 @@ impl PeerDependencySpec {
         Self { raw, parsed }
     }
 
+    /// Parse a peer declared in a nested package while comparing local
+    /// source paths in the install project's coordinate space.
+    pub fn new_rebased(
+        peer_name: &str,
+        raw: impl Into<String>,
+        declaring_dir: &Path,
+        install_project_dir: &Path,
+    ) -> Self {
+        let raw = raw.into();
+        let parsed = PeerSpecifier::parse(peer_name, &raw).map(|mut specifier| {
+            specifier.rebase_local_source(declaring_dir, install_project_dir);
+            specifier
+        });
+        Self { raw, parsed }
+    }
+
     #[inline]
     pub fn raw(&self) -> &str {
         &self.raw
@@ -248,6 +264,28 @@ impl PeerSpecifier {
             },
             constraint: PeerConstraint::Source(source),
         }
+    }
+
+    fn rebase_local_source(&mut self, declaring_dir: &Path, install_project_dir: &Path) {
+        let path = match &mut self.constraint {
+            PeerConstraint::Source(PeerProviderSource::File(path))
+            | PeerConstraint::Source(PeerProviderSource::Link(path)) => path,
+            _ => return,
+        };
+        let declaring_dir = declaring_dir
+            .canonicalize()
+            .unwrap_or_else(|_| lexical_normalize(declaring_dir));
+        let install_project_dir = install_project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| lexical_normalize(install_project_dir));
+        let source_path = Path::new(path);
+        let absolute = if source_path.is_absolute() {
+            lexical_normalize(source_path)
+        } else {
+            lexical_normalize(&declaring_dir.join(source_path))
+        };
+        let rebased = pathdiff::diff_paths(&absolute, &install_project_dir).unwrap_or(absolute);
+        *path = normalize_source_path(&rebased.to_string_lossy());
     }
 
     #[inline]
@@ -445,6 +483,24 @@ fn normalize_source_path(raw: &str) -> String {
     normalized.to_string_lossy().into_owned()
 }
 
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::with_capacity(path.as_os_str().len());
+    for component in path.components() {
+        match component {
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(component.as_os_str()),
+            },
+            Component::CurDir => {}
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +589,34 @@ mod tests {
                 matches!(spec.constraint(), PeerConstraint::Source(source) if source == &expected)
             );
             assert!(!spec.install_source.is_registry());
+        }
+    }
+
+    #[test]
+    fn nested_source_specs_rebase_into_install_project_coordinates() {
+        let project = Path::new("/repo");
+        let declaring_dir = Path::new("/repo/packages/consumer");
+        for (raw, expected) in [
+            (
+                "file:../react",
+                PeerProviderSource::File("packages/react".to_string()),
+            ),
+            (
+                "link:../react",
+                PeerProviderSource::Link("packages/react".to_string()),
+            ),
+        ] {
+            let dependency = PeerDependencySpec::new_rebased("react", raw, declaring_dir, project);
+            let specifier = dependency.parsed().expect("rebased source must parse");
+            assert!(
+                matches!(specifier.constraint(), PeerConstraint::Source(source) if source == &expected),
+                "{raw} must be compared relative to the install project"
+            );
+            assert_eq!(
+                dependency.raw(),
+                raw,
+                "diagnostics must retain manifest text"
+            );
         }
     }
 

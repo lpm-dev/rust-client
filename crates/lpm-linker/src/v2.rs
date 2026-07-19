@@ -74,7 +74,10 @@ mod reconcile;
 
 use self::bin_shims::create_bin_links_v2;
 pub use self::compat_island::project_compatibility_bins_ready;
-use self::compat_island::{create_project_compatibility_links, normalize_compatibility_bin_names};
+use self::compat_island::{
+    create_project_compatibility_links, normalize_compatibility_bin_names,
+    remove_project_compatibility_root,
+};
 pub use self::keymap::KeyMap;
 use self::keymap::derive_graph_keys;
 #[cfg(test)]
@@ -105,6 +108,14 @@ pub struct V2Target {
     /// Warm cache paths cannot construct this value, so they leave it empty
     /// and use populate-time object validation.
     pub fresh_object: Option<ExtractedObject>,
+}
+
+/// Remove project-local links, bins, and compatibility state for an empty graph.
+pub fn reconcile_empty_project(project_dir: &Path) -> Result<(), LpmError> {
+    cleanup_v1_state(project_dir)?;
+    reconcile_project_node_modules(project_dir, &[], None, true)?;
+    bin_shims::clear_bin_dir(project_dir)?;
+    remove_project_compatibility_root(project_dir)
 }
 
 /// Pre-computed plan handed across the three-phase v2 link API

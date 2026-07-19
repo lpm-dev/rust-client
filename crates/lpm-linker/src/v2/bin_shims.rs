@@ -33,7 +33,7 @@ enum UnixBinInvocation {
     Shebang(UnixShebangInvocation),
 }
 
-fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
+pub(super) fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
     if bin_dir.symlink_metadata().is_err() {
         return Ok(());

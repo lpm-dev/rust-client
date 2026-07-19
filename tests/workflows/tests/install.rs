@@ -1169,6 +1169,190 @@ fn empty_deps_second_install_is_up_to_date() {
 }
 
 #[test]
+fn removing_final_dependency_reconciles_links_and_records_empty_importer_in_supported_layouts() {
+    for (store_version, linker_mode) in [("v1", "isolated"), ("v1", "hoisted"), ("v2", "isolated")]
+    {
+        let case = format!("{store_version}/{linker_mode}");
+        let project = TempProject::empty(
+            r#"{
+  "name": "remove-final-dependency",
+  "version": "1.0.0",
+  "dependencies": {
+    "only-dependency": "file:./only-dependency"
+  }
+}"#,
+        );
+        project.write_file(
+            "only-dependency/package.json",
+            r#"{
+  "name": "only-dependency",
+  "version": "1.0.0",
+  "bin": { "only-command": "cli.js" }
+}"#,
+        );
+        project.write_file("only-dependency/cli.js", "#!/usr/bin/env node\n");
+
+        lpm(&project)
+            .env("LPM_STORE_VERSION", store_version)
+            .env("LPM_LINKER", linker_mode)
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .assert()
+            .success();
+        assert!(
+            project
+                .path()
+                .join("node_modules/only-dependency")
+                .symlink_metadata()
+                .is_ok(),
+            "{case}: initial install must create the root dependency link"
+        );
+        let bin_shim = project.path().join("node_modules/.bin/only-command");
+        if bin_shim.symlink_metadata().is_err() {
+            std::fs::create_dir_all(bin_shim.parent().unwrap()).unwrap();
+            std::fs::write(&bin_shim, "stale bin shim").unwrap();
+        }
+        assert!(
+            bin_shim.symlink_metadata().is_ok(),
+            "{case}: test setup must contain a stale dependency bin shim"
+        );
+
+        project.write_file(
+            "package.json",
+            r#"{"name":"remove-final-dependency","version":"1.0.0"}"#,
+        );
+        lpm(&project)
+            .env("LPM_STORE_VERSION", store_version)
+            .env("LPM_LINKER", linker_mode)
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            project
+                .path()
+                .join("node_modules/only-dependency")
+                .symlink_metadata()
+                .is_err(),
+            "{case}: removing the final dependency must remove its stale root link"
+        );
+        assert!(
+            project
+                .path()
+                .join("node_modules/.bin/only-command")
+                .symlink_metadata()
+                .is_err(),
+            "{case}: removing the final dependency must remove its stale bin shim"
+        );
+        let lockfile =
+            lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
+        assert!(lockfile.packages.is_empty(), "{case}");
+        let importer = lockfile
+            .importers
+            .get(".")
+            .expect("mutable empty installs must persist the current importer snapshot");
+        assert!(
+            importer.dependencies.is_empty()
+                && importer.dev_dependencies.is_empty()
+                && importer.optional_dependencies.is_empty()
+                && importer.peer_dependencies.is_empty(),
+            "{case}: empty importer must record empty dependency sections: {importer:?}"
+        );
+        assert_eq!(
+            importer.auto_install_peers,
+            Some(true),
+            "{case}: empty importer must retain graph-affecting peer policy"
+        );
+    }
+}
+
+#[test]
+fn offline_final_dependency_removal_rejects_without_mutating_install_state() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "offline-remove-final-dependency",
+  "version": "1.0.0",
+  "dependencies": {
+    "only-dependency": "file:./only-dependency"
+  }
+}"#,
+    );
+    project.write_file(
+        "only-dependency/package.json",
+        r#"{"name":"only-dependency","version":"1.0.0"}"#,
+    );
+    lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lockfile_before = std::fs::read(project.path().join("lpm.lock")).unwrap();
+    let lockfile_bin_before = std::fs::read(project.path().join("lpm.lockb")).ok();
+    let install_hash_before = std::fs::read(project.path().join(".lpm/install-hash")).unwrap();
+    project.write_file(
+        "package.json",
+        r#"{"name":"offline-remove-final-dependency","version":"1.0.0"}"#,
+    );
+
+    let offline = lpm(&project)
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline install after final dependency removal");
+    assert!(
+        !offline.status.success(),
+        "offline replay must reject final-dependency importer drift"
+    );
+    let stderr = String::from_utf8_lossy(&offline.stderr);
+    assert!(
+        stderr.contains("Run `lpm install` online to reconcile"),
+        "offline rejection must explain how to rebuild safely:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).unwrap(),
+        lockfile_before,
+        "offline rejection must not rewrite the text lockfile"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        lockfile_bin_before,
+        "offline rejection must not rewrite the binary lockfile"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join(".lpm/install-hash")).unwrap(),
+        install_hash_before,
+        "offline rejection must not bless the drifted manifest hash"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/only-dependency")
+            .symlink_metadata()
+            .is_ok(),
+        "offline rejection must preserve the previously installed root link"
+    );
+}
+
+#[test]
 fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
     let project = TempProject::empty(
         r#"{
@@ -6201,6 +6385,104 @@ async fn workspace_overlapped_file_provider_satisfies_matching_source_peer_in_v1
         String::from_utf8_lossy(&runtime.stdout),
         "workspace-file-react-v1"
     );
+}
+
+async fn assert_workspace_member_relative_source_peer_reentry(store_version: &str) {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "workspace-peer-reentry",
+            "version": "1.0.0",
+            "main": "index.js",
+            "dependencies": {
+                "workspace-source-consumer": "1.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('workspace-source-consumer');\n",
+        )],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-member-relative-peer-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "workspace-peer-reentry": "1.0.0",
+    "react": "file:./packages/react"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/consumer/package.json",
+        r#"{
+  "name": "workspace-source-consumer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "peerDependencies": {
+    "react": "file:../react"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/consumer/index.js",
+        "module.exports = require('react');\n",
+    );
+    project.write_file(
+        "packages/react/package.json",
+        r#"{"name":"react","version":"18.3.1","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/react/index.js",
+        "module.exports = 'member-relative-react';\n",
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", store_version)
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install workspace member-relative source peer");
+    assert!(
+        install.status.success(),
+        "{store_version} workspace member-relative peer must match the project-relative provider\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('workspace-peer-reentry'))")
+        .output()
+        .expect("run workspace member-relative source peer consumer");
+    assert!(
+        runtime.status.success(),
+        "{store_version} workspace re-entry graph must be runtime-resolvable\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "member-relative-react"
+    );
+}
+
+#[tokio::test]
+async fn workspace_member_relative_source_peer_matches_project_provider_in_v1() {
+    assert_workspace_member_relative_source_peer_reentry("v1").await;
+}
+
+#[tokio::test]
+async fn workspace_member_relative_source_peer_matches_project_provider_in_v2() {
+    assert_workspace_member_relative_source_peer_reentry("v2").await;
 }
 
 #[tokio::test]

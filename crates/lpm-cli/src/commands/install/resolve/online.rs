@@ -250,7 +250,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     );
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
+                    seed_workspace_resolver_cache(
+                        &shared_cache,
+                        all_workspace_members,
+                        project_dir,
+                    )?;
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
@@ -365,7 +369,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let dep_names: Vec<String> = deps.keys().cloned().collect();
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
+                    seed_workspace_resolver_cache(
+                        &shared_cache,
+                        all_workspace_members,
+                        project_dir,
+                    )?;
                     let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
                     let walker_done: WalkerDone =
                         Arc::new(std::sync::atomic::AtomicBool::new(false));

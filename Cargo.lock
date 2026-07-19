@@ -3564,6 +3564,7 @@ dependencies = [
  "lpm-registry",
  "lpm-semver",
  "node-semver",
+ "pathdiff",
  "pubgrub",
  "serde",
  "serde_json",

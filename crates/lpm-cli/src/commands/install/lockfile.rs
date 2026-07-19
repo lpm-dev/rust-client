@@ -427,6 +427,7 @@ fn emit_fast_path_lockfile_rewrite_notice(
 
 pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) project_dir: &'a Path,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) cleanup_catalogs_in_pipeline: bool,
     pub(super) json_output: bool,
@@ -439,6 +440,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) force_security_floor: bool,
     pub(super) override_set: &'a OverrideSet,
     pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) requested_v2_mode: bool,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
 }
@@ -448,6 +450,7 @@ pub(super) async fn run_empty_dependency_install_phase(
 ) -> Result<(), LpmError> {
     let EmptyDependencyInstallInput {
         project_dir,
+        current_importer_snapshot,
         policy_extension_configs,
         cleanup_catalogs_in_pipeline,
         json_output,
@@ -460,6 +463,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         force_security_floor,
         override_set,
         linker_mode,
+        requested_v2_mode,
         object_integrity_policy,
         dependency_engine_policy,
     } = input;
@@ -469,8 +473,22 @@ pub(super) async fn run_empty_dependency_install_phase(
     }
     let policy_extension_stats =
         run_policy_extensions(policy_extension_configs, project_dir, &[], json_output).await?;
-    let elapsed = start.elapsed();
-    let total_ms = elapsed.as_millis();
+    if override_set.is_empty()
+        && overrides_state::read_state(project_dir).is_some()
+        && let Err(e) = overrides_state::delete_state(project_dir)
+    {
+        tracing::warn!("failed to delete stale overrides-state.json: {e}");
+    }
+    lpm_linker::reconcile_empty_install(project_dir, requested_v2_mode, linker_mode)?;
+    materialize_empty_install_artifacts(project_dir, current_importer_snapshot)?;
+    write_post_install_hash(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        dependency_engine_policy,
+    );
+
+    let total_ms = start.elapsed().as_millis();
     if json_output {
         let mut json = serde_json::json!({
             "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
@@ -523,19 +541,6 @@ pub(super) async fn run_empty_dependency_install_phase(
         output::success("No dependencies to install");
     }
 
-    if override_set.is_empty()
-        && overrides_state::read_state(project_dir).is_some()
-        && let Err(e) = overrides_state::delete_state(project_dir)
-    {
-        tracing::warn!("failed to delete stale overrides-state.json: {e}");
-    }
-    materialize_empty_install_artifacts(project_dir)?;
-    write_post_install_hash(
-        project_dir,
-        linker_mode,
-        object_integrity_policy,
-        dependency_engine_policy,
-    );
     Ok(())
 }
 

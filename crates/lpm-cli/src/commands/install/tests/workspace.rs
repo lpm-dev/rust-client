@@ -296,11 +296,14 @@ fn workspace_member_cache_info_normalizes_jsr_dependency_aliases() {
     )
     .unwrap();
 
-    let info = workspace_member_cache_info(&WorkspaceMemberLink {
-        name: "app".to_string(),
-        version: "1.0.0".to_string(),
-        source_dir: member_dir,
-    })
+    let info = workspace_member_cache_info(
+        &WorkspaceMemberLink {
+            name: "app".to_string(),
+            version: "1.0.0".to_string(),
+            source_dir: member_dir,
+        },
+        dir.path(),
+    )
     .expect("valid jsr dependency should normalize")
     .expect("valid workspace member should produce cache info");
 

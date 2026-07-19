@@ -886,7 +886,7 @@ async fn compute_parity_if_requested(
         ExperimentalResolverParityMode::Disabled => unreachable!(),
         ExperimentalResolverParityMode::FreshResolve { .. } => {
             let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-            seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
+            seed_workspace_resolver_cache(&shared_cache, all_workspace_members, project_dir)?;
             let npm_fanout = positive_usize_env_or_default(
                 "LPM_NPM_FANOUT",
                 default_fusion_npm_fanout(false, 0),

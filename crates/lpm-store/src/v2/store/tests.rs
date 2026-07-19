@@ -2730,7 +2730,7 @@ fn find_link_package_dir_locates_populated_entry() {
 /// into a v2 object dir atomically, preserving package contents
 /// and `.lpm-security.json` if present.
 #[test]
-fn populate_object_from_v1_copies_extracted_package_dir() {
+fn populate_object_from_v1_copies_extracted_package_dir_when_integrity_matches() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
 
@@ -2750,9 +2750,8 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     std::fs::create_dir_all(v1_pkg_dir.join("src")).unwrap();
     std::fs::write(v1_pkg_dir.join("src/inner.js"), b"// inner").unwrap();
     std::fs::write(v1_pkg_dir.join(".lpm-security.json"), b"{\"tags\":[]}").unwrap();
-    std::fs::write(v1_pkg_dir.join(".integrity"), b"sha512-stale").unwrap();
-
     let sri = synthetic_sri(b"populate_object_from_v1");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert_eq!(object_dir, store.paths().object_dir(&sri).unwrap());
     // Package contents copied through.
@@ -2773,8 +2772,7 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
         std::fs::read(object_dir.join(".lpm-security.json")).unwrap(),
         b"{\"tags\":[]}"
     );
-    // `.integrity` rewritten to the caller-supplied SRI rather
-    // than v1's stale value.
+    // `.integrity` remains bound to the verified caller-supplied SRI.
     assert_eq!(
         std::fs::read(object_dir.join(".integrity")).unwrap(),
         sri.as_bytes()
@@ -2784,6 +2782,70 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     // touching anything.
     let again = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert_eq!(again, object_dir);
+}
+
+#[test]
+fn populate_object_from_v1_rejects_mismatched_integrity_without_publishing_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let v1_pkg_dir = dir.path().join("fake-v1/mismatched/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"mismatched\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    let requested_sri = synthetic_sri(b"requested-content");
+    let stored_sri = synthetic_sri(b"different-v1-content");
+    std::fs::write(v1_pkg_dir.join(".integrity"), stored_sri).unwrap();
+
+    let error = store
+        .populate_object_from_v1(&v1_pkg_dir, &requested_sri)
+        .unwrap_err();
+    assert!(
+        matches!(error, LpmError::IntegrityMismatch { .. }),
+        "mismatched v1 evidence must surface as an integrity mismatch: {error}"
+    );
+    assert!(
+        store
+            .paths()
+            .object_dir(&requested_sri)
+            .unwrap()
+            .symlink_metadata()
+            .is_err(),
+        "rejected v1 bytes must not be published under the requested v2 SRI"
+    );
+}
+
+#[test]
+fn populate_object_from_v1_rejects_missing_integrity_without_publishing_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let v1_pkg_dir = dir.path().join("fake-v1/missing/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"missing\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    let requested_sri = synthetic_sri(b"requested-content");
+
+    let error = store
+        .populate_object_from_v1(&v1_pkg_dir, &requested_sri)
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("missing .integrity"),
+        "missing v1 evidence must fail closed with an actionable error: {error}"
+    );
+    assert!(
+        store
+            .paths()
+            .object_dir(&requested_sri)
+            .unwrap()
+            .symlink_metadata()
+            .is_err(),
+        "unverified v1 bytes must not be published under the requested v2 SRI"
+    );
 }
 
 /// When `.lpm-security.json` is missing in v1 (rare, e.g. a
@@ -2803,6 +2865,7 @@ fn populate_object_from_v1_runs_analysis_when_security_cache_missing() {
     .unwrap();
 
     let sri = synthetic_sri(b"populate_object_from_v1_no_cache");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert!(
         object_dir.join(".lpm-security.json").is_file(),

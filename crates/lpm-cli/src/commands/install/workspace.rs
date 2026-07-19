@@ -349,6 +349,7 @@ pub(super) fn reject_workspace_self_dependency(
 
 pub(super) fn workspace_member_cache_info(
     member: &WorkspaceMemberLink,
+    project_dir: &Path,
 ) -> Result<Option<lpm_resolver::CachedPackageInfo>, LpmError> {
     let Some(version) = lpm_resolver::NpmVersion::parse(&member.version).ok() else {
         return Ok(None);
@@ -405,7 +406,12 @@ pub(super) fn workspace_member_cache_info(
             pkg.peer_dependencies
                 .into_iter()
                 .map(|(name, raw)| {
-                    let spec = lpm_resolver::PeerDependencySpec::new(&name, raw);
+                    let spec = lpm_resolver::PeerDependencySpec::new_rebased(
+                        &name,
+                        raw,
+                        &member.source_dir,
+                        project_dir,
+                    );
                     (name, spec)
                 })
                 .collect(),
@@ -464,9 +470,10 @@ pub(super) fn workspace_member_cache_info(
 pub(super) fn seed_workspace_resolver_cache(
     shared_cache: &lpm_resolver::SharedCache,
     members: &[WorkspaceMemberLink],
+    project_dir: &Path,
 ) -> Result<(), LpmError> {
     for member in members {
-        let Some(info) = workspace_member_cache_info(member)? else {
+        let Some(info) = workspace_member_cache_info(member, project_dir)? else {
             continue;
         };
         let key = lpm_resolver::CanonicalKey::from_dep_name(&member.name);

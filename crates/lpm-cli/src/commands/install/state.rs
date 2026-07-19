@@ -374,16 +374,19 @@ fn decide_dependency_engine_freshness(
     }
 }
 
-/// Empty installs still need the same durable on-disk markers the
-/// freshness cache keys on: `lpm.lock`, `node_modules/`, and the
-/// standard `lpm.lockb`/`.gitattributes` sidecar written by the main
-/// lockfile path. Without these, the empty-deps short-circuit would
-/// succeed once but never become warm-cache fresh, so every later
-/// `lpm install`, `lpm dev`, and sync fast-lane probe would fall back
-/// to the slow path despite the manifest already being fully applied.
-pub(super) fn materialize_empty_install_artifacts(project_dir: &Path) -> Result<(), LpmError> {
+/// Empty installs still need the durable lockfile/importer state and
+/// project directories that freshness checks validate. `write_all`
+/// applies the same binary-sidecar policy as a non-empty install.
+pub(super) fn materialize_empty_install_artifacts(
+    project_dir: &Path,
+    current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
+) -> Result<(), LpmError> {
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    lpm_lockfile::Lockfile::default()
+    let mut lockfile = lpm_lockfile::Lockfile::default();
+    lockfile
+        .importers
+        .insert(".".to_string(), current_importer_snapshot.clone());
+    lockfile
         .write_all(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
 

@@ -744,28 +744,6 @@ async fn run_with_options_under_store_lock(
         force,
     })?;
 
-    if deps.is_empty() && workspace_member_deps.is_empty() {
-        run_empty_dependency_install_phase(EmptyDependencyInstallInput {
-            project_dir,
-            policy_extension_configs: &policy_extension_configs,
-            cleanup_catalogs_in_pipeline,
-            json_output,
-            start,
-            timing_detail_mode,
-            setup_install_state_ms: wf_setup_install_state_ms,
-            setup_route_table_ms: wf_setup_route_table_ms,
-            emit_timing,
-            target_set,
-            force_security_floor,
-            override_set: &override_set,
-            linker_mode,
-            object_integrity_policy,
-            dependency_engine_policy: dependency_engine_policy.as_ref(),
-        })
-        .await?;
-        return Ok(());
-    }
-
     let LockfileDriftState {
         prior_overrides_state,
         overrides_changed,
@@ -848,6 +826,30 @@ async fn run_with_options_under_store_lock(
             dependency_engine_policy: dependency_engine_policy.as_ref(),
         })
         .await;
+    }
+
+    if deps.is_empty() && workspace_member_deps.is_empty() {
+        run_empty_dependency_install_phase(EmptyDependencyInstallInput {
+            project_dir,
+            current_importer_snapshot: &current_importer_snapshot,
+            policy_extension_configs: &policy_extension_configs,
+            cleanup_catalogs_in_pipeline,
+            json_output,
+            start,
+            timing_detail_mode,
+            setup_install_state_ms: wf_setup_install_state_ms,
+            setup_route_table_ms: wf_setup_route_table_ms,
+            emit_timing,
+            target_set,
+            force_security_floor,
+            override_set: &override_set,
+            linker_mode,
+            requested_v2_mode,
+            object_integrity_policy,
+            dependency_engine_policy: dependency_engine_policy.as_ref(),
+        })
+        .await?;
+        return Ok(());
     }
 
     let lockfile_result = select_lockfile_install_plan(LockfileSelectionInput {

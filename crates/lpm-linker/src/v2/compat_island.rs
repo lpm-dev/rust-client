@@ -743,7 +743,7 @@ fn ensure_real_dir_or_create(path: &Path, label: &str) -> Result<(), LpmError> {
     }
 }
 
-fn remove_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError> {
+pub(super) fn remove_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError> {
     let lpm_dir = project_dir.join("node_modules").join(".lpm");
     let metadata = match lpm_dir.symlink_metadata() {
         Ok(metadata) => metadata,

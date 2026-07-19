@@ -1417,15 +1417,10 @@ impl Store {
     ///   migrations. If absent, the helper re-runs analysis to
     ///   match `extract_object`'s post-write contract.
     ///
-    /// **Limitation.** This helper trusts the caller to provide a
-    /// `(v1_pkg_dir, sri)` pair where the SRI matches the extracted
-    /// bytes. The install pipeline derives `sri` from the lockfile
-    /// or from the prior install's recorded integrity; both come
-    /// from the same SHA-512 the v1 extract recorded, so the trust
-    /// is sound under normal flows. A pathological `(v1_pkg_dir,
-    /// wrong_sri)` pair would land bytes at the wrong v2 key, but
-    /// that's an upstream programmer error, not a security boundary
-    /// the helper enforces.
+    /// Translation is allowed only when the v1 entry's `.integrity`
+    /// evidence exactly matches `sri`. Coordinate-only v1 lookups can
+    /// otherwise select bytes from another registry that published the
+    /// same package name and version.
     pub fn populate_object_from_v1(
         &self,
         v1_pkg_dir: &Path,
@@ -1448,6 +1443,26 @@ impl Store {
                 "v1 → v2 translation: source dir {} is not readable",
                 v1_pkg_dir.display()
             )));
+        }
+        let stored_sri = crate::read_stored_integrity(v1_pkg_dir).ok_or_else(|| {
+            LpmError::Store(format!(
+                "v1 → v2 translation: source dir {} is missing .integrity evidence",
+                v1_pkg_dir.display()
+            ))
+        })?;
+        let stored_sri = stored_sri.trim();
+        let requested_integrity = Integrity::parse(sri)?;
+        let stored_integrity = Integrity::parse(stored_sri).map_err(|error| {
+            LpmError::Store(format!(
+                "v1 → v2 translation: source dir {} has invalid .integrity evidence: {error}",
+                v1_pkg_dir.display()
+            ))
+        })?;
+        if stored_integrity != requested_integrity {
+            return Err(LpmError::IntegrityMismatch {
+                expected: sri.to_string(),
+                actual: stored_sri.to_string(),
+            });
         }
         if let Some(parent) = object_dir.parent() {
             std::fs::create_dir_all(parent)
