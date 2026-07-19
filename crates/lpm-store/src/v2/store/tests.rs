@@ -1928,7 +1928,7 @@ fn extract_object_from_bytes_accepts_correct_integrity() {
 }
 
 #[test]
-fn extract_object_from_bytes_accepts_correct_sha1_integrity() {
+fn extract_object_from_bytes_uses_verified_sha1_as_object_identity() {
     use base64::Engine;
     use sha1::{Digest, Sha1};
 
@@ -1940,10 +1940,28 @@ fn extract_object_from_bytes_accepts_correct_sha1_integrity() {
         base64::engine::general_purpose::STANDARD.encode(Sha1::digest(&tarball))
     );
 
-    let (_obj_dir, sri, _) = store
+    let (obj_dir, sri, _) = store
         .extract_object_from_bytes(&tarball, Some(&expected))
         .unwrap();
-    assert_eq!(sri, crate::compute_sri_hash(&tarball));
+    assert_eq!(sri, expected);
+    assert_eq!(obj_dir, store.paths().object_dir(&sri).unwrap());
+    assert!(store.reusable_object_dir(&sri).unwrap().is_some());
+}
+
+#[test]
+fn extract_object_from_bytes_uses_verified_sha256_as_object_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let expected = crate::compute_sri_hash_sha256(&tarball);
+
+    let (obj_dir, sri, _) = store
+        .extract_object_from_bytes(&tarball, Some(&expected))
+        .unwrap();
+
+    assert_eq!(sri, expected);
+    assert_eq!(obj_dir, store.paths().object_dir(&sri).unwrap());
+    assert!(store.reusable_object_dir(&sri).unwrap().is_some());
 }
 
 #[test]

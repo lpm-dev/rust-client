@@ -311,9 +311,12 @@ pub(super) async fn run_online_fetch_phase(
 
     // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
     // CAS-backed target arrives with both
-    // (a) a known SRI (`p.integrity = Some(_)`), and
+    // (a) a known SHA-512 SRI, and
     // (b) resolver-threaded peers (`LinkTarget.peers` populated, or
     // the package declares no peer dependencies).
+    // Verified SHA-256/SHA-1 declarations remain the exact object identity,
+    // but use post-fetch planning so the plan cannot inspect the declared
+    // object path before extraction publishes its integrity sidecar.
     // Otherwise `link_v2_prepare` would silently produce an
     // empty-peer-context graph key for any target whose peers are
     // discovered post-fetch by reading `objects/<sri>/package.json`,
@@ -339,8 +342,10 @@ pub(super) async fn run_online_fetch_phase(
         for (lt, p) in link_targets.iter().zip(packages.iter()) {
             match lt.materialization {
                 lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
-                    Some(sri) => acc.push(v2_target(p, lt.clone(), sri.to_string())),
-                    None => {
+                    Some(sri) if sri.starts_with("sha512-") => {
+                        acc.push(v2_target(p, lt.clone(), sri.to_string()));
+                    }
+                    Some(_) | None => {
                         all_have_sri = false;
                         break;
                     }
@@ -3059,13 +3064,15 @@ pub(super) async fn fetch_and_store_tarball_url(
     let (data, computed_sri) = client
         .download_tarball_with_integrity(url, p.integrity.as_deref())
         .await?;
+    let source_sri = p.integrity.as_deref().unwrap_or(&computed_sri);
     let download_ms = download_start.elapsed().as_millis();
     drop(permit);
 
     // download_tarball_with_integrity already verified the SRI when
-    // p.integrity was Some; on trust-on-first-use it returned the
-    // computed SRI we need to record. integrity_ms folds into
-    // download_ms because the verify is a single string compare.
+    // p.integrity was Some. Preserve that declared algorithm and digest as
+    // the source identity; trust-on-first-use uses the computed SHA-512 SRI.
+    // integrity_ms folds into download_ms because verification happened in
+    // the download call.
     let integrity_ms = 0;
 
     let extract_permit_wait_start = std::time::Instant::now();
@@ -3075,22 +3082,21 @@ pub(super) async fn fetch_and_store_tarball_url(
     let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
         // — v2 path. The Source::Tarball case
         // already has bytes + SRI in hand; route them straight into
-        // `extract_object_from_bytes`. The downloader returns the
-        // declaration's algorithm when one was supplied, while v2
-        // objects are keyed by the extractor's canonical sha512 SRI.
+        // `extract_object_from_bytes`. Verified declarations retain their
+        // exact SRI; unpinned content uses the computed SHA-512 identity.
         let (object, sri, stage) =
-            store_v2.extract_object_from_bytes_with_fresh_integrity(&data, Some(&computed_sri))?;
+            store_v2.extract_object_from_bytes_with_fresh_integrity(&data, Some(source_sri))?;
         (stage, Some(object), sri)
     } else {
         let extract_start = std::time::Instant::now();
-        let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+        let _store_path = store.store_tarball_at_cas_path(source_sri, &data)?;
         (
             lpm_store::StageTimings {
                 extract_ms: extract_start.elapsed().as_millis(),
                 ..Default::default()
             },
             None,
-            computed_sri,
+            source_sri.to_string(),
         )
     };
 

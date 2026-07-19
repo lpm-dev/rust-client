@@ -1353,7 +1353,7 @@ fn offline_final_dependency_removal_rejects_without_mutating_install_state() {
 }
 
 #[test]
-fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
+fn empty_mutable_install_keeps_importer_lockfile_toml_only_and_reports_fresh() {
     let project = TempProject::empty(
         r#"{
         "name": "empty-deps-lockb-refresh",
@@ -1372,12 +1372,23 @@ fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr),
     );
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
+    let importer = lockfile
+        .importers
+        .get(".")
+        .expect("empty mutable install must persist the root importer snapshot");
     assert!(
-        project.file_exists("lpm.lockb"),
-        "first install must materialize lpm.lockb"
+        importer.dependencies.is_empty()
+            && importer.dev_dependencies.is_empty()
+            && importer.optional_dependencies.is_empty()
+            && importer.peer_dependencies.is_empty(),
+        "empty importer must record empty dependency sections: {importer:?}"
     );
-
-    std::fs::remove_file(project.path().join("lpm.lockb")).expect("remove lpm.lockb");
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "importer snapshots are TOML-only and must not produce lpm.lockb"
+    );
 
     let second = lpm(&project)
         .args(["install"])
@@ -1389,23 +1400,18 @@ fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
         String::from_utf8_lossy(&second.stdout),
         String::from_utf8_lossy(&second.stderr),
     );
-    assert!(
-        project.file_exists("lpm.lockb"),
-        "bare install must regenerate missing lpm.lockb before reporting fresh"
-    );
-
-    let doctor = lpm(&project)
-        .args(["doctor"])
-        .output()
-        .expect("failed to run lpm doctor");
-    let doctor_output = format!(
+    let combined = format!(
         "{}{}",
-        String::from_utf8_lossy(&doctor.stdout),
-        String::from_utf8_lossy(&doctor.stderr)
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
     );
     assert!(
-        !doctor_output.contains("lpm.lockb missing"),
-        "doctor must not keep warning after bare install regenerated lpm.lockb:\n{doctor_output}"
+        combined.contains("up to date"),
+        "second empty install must use the coherent TOML lockfile state:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "fresh importer-bearing installs must remain TOML-only"
     );
 }
 
@@ -6706,6 +6712,21 @@ async fn offline_replay_preserves_same_url_dependencies_with_distinct_sri_pins()
     assert_ne!(
         cold_sha256, cold_sha512,
         "cold install must keep distinct declared SRI identities"
+    );
+
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
+    let locked_integrities: std::collections::BTreeSet<String> = lockfile
+        .packages
+        .iter()
+        .filter(|package| package.name == "react")
+        .filter_map(|package| package.integrity.clone())
+        .collect();
+    assert_eq!(
+        locked_integrities,
+        std::collections::BTreeSet::from([sha256.to_string(), sha512.to_string()]),
+        "lockfile must retain both declared tarball pins for exact offline selection: {:#?}",
+        lockfile.packages
     );
 
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();

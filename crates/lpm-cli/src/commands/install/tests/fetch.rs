@@ -238,14 +238,13 @@ async fn tarball_url_install_v2_extracts_object() {
 }
 
 #[tokio::test]
-async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
+async fn tarball_url_install_v2_preserves_verified_sha256_declaration() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let body = build_test_tarball();
     let declared_sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
-    let canonical_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -274,13 +273,13 @@ async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
     .await
     .expect("v2 tarball install must accept matching sha256 declarations");
 
-    assert_eq!(computed_sri, canonical_sri);
+    assert_eq!(computed_sri, declared_sri);
     assert!(
         store_v2
             .reusable_object_dir(&computed_sri)
             .unwrap()
             .is_some(),
-        "v2 object lookups must use the canonical sha512 SRI"
+        "v2 object lookups must preserve the verified declared SRI"
     );
     assert!(
         fresh_object.is_some(),

@@ -828,7 +828,13 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
-    if deps.is_empty() && workspace_member_deps.is_empty() {
+    if deps.is_empty()
+        && workspace_member_deps.is_empty()
+        && v2_workspace_root_pre_resolve.install_pkgs.is_empty()
+        && v2_workspace_root_pre_resolve
+            .additional_workspace_links
+            .is_empty()
+    {
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             current_importer_snapshot: &current_importer_snapshot,

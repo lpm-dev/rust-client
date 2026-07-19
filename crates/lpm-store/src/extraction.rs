@@ -39,9 +39,22 @@ impl PackageStore {
         label: &str,
         tarball_data: &[u8],
     ) -> Result<PathBuf, LpmError> {
+        let sri = compute_sri_hash(tarball_data);
+        self.store_at_dir_with_integrity(dir, label, tarball_data, &sri)
+    }
+
+    pub(crate) fn store_at_dir_with_integrity(
+        &self,
+        dir: PathBuf,
+        label: &str,
+        tarball_data: &[u8],
+        integrity_sri: &str,
+    ) -> Result<PathBuf, LpmError> {
         // Fast path: already stored
         if dir.exists() {
-            if is_complete_package_dir(&dir) {
+            if is_complete_package_dir(&dir)
+                && crate::read_stored_integrity(&dir).as_deref() == Some(integrity_sri)
+            {
                 tracing::debug!("store hit: {label}");
                 return Ok(dir);
             }
@@ -86,8 +99,7 @@ impl PackageStore {
         // leaves the `.integrity` marker untouched goes undetected. A
         // byte-integrity recompute would need a Merkle digest of the
         // extracted directory + a place to store it; not implemented.
-        let sri = compute_sri_hash(tarball_data);
-        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &sri) {
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), integrity_sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
         }

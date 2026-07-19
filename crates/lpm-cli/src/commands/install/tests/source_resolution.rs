@@ -228,17 +228,16 @@ async fn pre_resolve_extracts_tarball_url_deps_from_manifest() {
 }
 
 #[tokio::test]
-async fn pre_resolve_handles_declared_integrity_correctly() {
-    // SRI declared in the dep specifier (e.g. via a `#sha512-…`
-    // suffix) flows through the verify path. Mismatch errors;
-    // match succeeds.
+async fn pre_resolve_preserves_declared_sha256_integrity() {
+    // A non-SHA-512 SRI declared in the dependency specifier flows through
+    // verification, CAS storage, and InstallPackage identity unchanged.
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     let body = build_test_tarball();
-    let correct_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let correct_sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
 
     Mock::given(method("GET"))
         .and(path("/foo.tgz"))
@@ -251,7 +250,7 @@ async fn pre_resolve_handles_declared_integrity_correctly() {
     let store = PackageStore::at(store_root.path());
     let client = Arc::new(RegistryClient::new());
 
-    // Spec with #sha512-… integrity — Specifier::parse picks it up.
+    // Spec with #sha256-… integrity — Specifier::parse picks it up.
     let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{correct_sri}"))]);
 
     let install_pkgs = pre_resolve_non_registry_deps(
@@ -269,6 +268,11 @@ async fn pre_resolve_handles_declared_integrity_correctly() {
     assert_eq!(install_pkgs.len(), 1);
     assert_eq!(
         install_pkgs[0].integrity.as_deref(),
+        Some(correct_sri.as_str())
+    );
+    let stored = store.tarball_store_path(&correct_sri).unwrap();
+    assert_eq!(
+        lpm_store::read_stored_integrity(&stored).as_deref(),
         Some(correct_sri.as_str())
     );
 }

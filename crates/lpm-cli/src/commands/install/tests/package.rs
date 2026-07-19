@@ -806,6 +806,41 @@ fn build_v2_targets_selects_integrity_by_source_wrapper_identity() {
 }
 
 #[test]
+fn build_v2_targets_preserves_declared_tarball_pins_after_content_hash_writeback() {
+    let mut sha256 = install_package_for_tarball("https://example.com/react.tgz", None);
+    sha256.integrity = Some("sha256-DECLARED".to_string());
+    let mut sha512 = sha256.clone();
+    sha512.integrity = Some("sha512-DECLARED".to_string());
+
+    let link_target = |package: &InstallPackage| LinkTarget {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        store_path: PathBuf::from("unused"),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: None,
+        wrapper_id: package.wrapper_id_for_source(),
+        materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
+        patch_fingerprint: None,
+    };
+    let link_targets = [link_target(&sha256), link_target(&sha512)];
+
+    sha256.integrity = Some("sha512-COMPUTED".to_string());
+    sha512.integrity = Some("sha512-COMPUTED".to_string());
+    let targets = build_v2_targets(&[sha256, sha512], &link_targets)
+        .expect("content hash writeback must not replace declared tarball identity");
+
+    assert_eq!(targets[0].source_sri, "sha512-COMPUTED");
+    assert_eq!(targets[1].source_sri, "sha512-COMPUTED");
+    assert_ne!(
+        targets[0].source_identity, targets[1].source_identity,
+        "distinct declared pins must remain distinct graph identities for identical bytes"
+    );
+}
+
+#[test]
 fn install_pkg_key_distinguishes_registry_from_tarball_with_same_name_version() {
     // Construct both halves of the collision case:
     // - a registry react@19.0.0 (the fork's parent)

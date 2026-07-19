@@ -87,15 +87,25 @@ pub(super) fn local_source_sri_for_target(target: &LinkTarget) -> String {
     lpm_store::compute_sri_hash(seed.as_bytes())
 }
 
-pub(super) fn v2_source_identity(package: &InstallPackage, source_sri: &str) -> String {
+pub(super) fn v2_source_identity(
+    package: &InstallPackage,
+    target: &LinkTarget,
+    source_sri: &str,
+) -> String {
+    let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
     let mut seed = String::with_capacity(
-        24 + package.name.len() + package.version.len() + package.source.len() + source_sri.len(),
+        24 + package.name.len()
+            + package.version.len()
+            + package.source.len()
+            + wrapper_id.len()
+            + source_sri.len(),
     );
     seed.push_str("lpm-v2-source-identity");
     for part in [
         package.name.as_str(),
         package.version.as_str(),
         package.source.as_str(),
+        wrapper_id,
         source_sri,
     ] {
         seed.push('\0');
@@ -109,7 +119,7 @@ pub(super) fn v2_target(
     target: LinkTarget,
     source_sri: String,
 ) -> lpm_linker::v2::V2Target {
-    let source_identity = v2_source_identity(package, &source_sri);
+    let source_identity = v2_source_identity(package, &target, &source_sri);
     lpm_linker::v2::V2Target {
         target,
         source_sri,
@@ -133,10 +143,7 @@ pub(super) fn build_v2_targets(
 
     let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
     for (package, target) in packages.iter().zip(link_targets) {
-        if package.name != target.name
-            || package.version != target.version
-            || package.wrapper_id_for_source() != target.wrapper_id
-        {
+        if package.name != target.name || package.version != target.version {
             return Err(LpmError::Registry(format!(
                 "v2 install: package/target identity mismatch for {}@{}",
                 target.name, target.version

@@ -107,7 +107,7 @@ impl PackageStore {
             "tarball:{}",
             integrity_sri.chars().take(24).collect::<String>()
         );
-        self.store_at_dir(dir, &label, tarball_data)
+        self.store_at_dir_with_integrity(dir, &label, tarball_data, integrity_sri)
     }
 
     /// Extract a local-file tarball into the content-addressable
@@ -307,9 +307,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[("package.json", b"{}")]);
-        let sri = sha512_sri(&tarball);
+        let sri = sha256_sri(&tarball);
         let path = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
-        assert!(path.join(".integrity").exists());
+        assert_eq!(
+            std::fs::read_to_string(path.join(".integrity")).unwrap(),
+            sri
+        );
     }
 
     #[test]

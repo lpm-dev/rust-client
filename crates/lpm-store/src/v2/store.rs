@@ -840,9 +840,9 @@ impl Store {
         result.map(|object| (object, timings))
     }
 
-    /// Extract from a buffered byte slice when the SRI isn't known
-    /// upfront. Hashes the bytes (SHA-512), verifies against
-    /// `expected_integrity` if provided, then delegates to
+    /// Extract from a buffered byte slice when the SRI may not be known
+    /// upfront. Hashes the bytes, verifies against `expected_integrity`
+    /// if provided, then delegates to
     /// [`Self::extract_object_with_timings`].
     ///
     /// This is the install pipeline's v2 entry point: it pairs with
@@ -850,11 +850,9 @@ impl Store {
     /// before extracting (the permit is released between download
     /// and extract, so the buffer doesn't pin a network slot).
     ///
-    /// `expected_integrity` is the registry-supplied SRI. If `Some`
-    /// and starts with `sha512-`, mismatch returns
-    /// [`LpmError::IntegrityMismatch`]. Non-sha512 expected values
-    /// are logged + trusted (matches v1's
-    /// `stream_and_store_package` policy at lib.rs:644-658).
+    /// A verified declared SRI remains the object identity, including
+    /// SHA-256 and SHA-1 declarations. Unpinned content uses the computed
+    /// SHA-512 SRI.
     pub fn extract_object_from_bytes(
         &self,
         tarball_data: &[u8],
@@ -919,9 +917,10 @@ impl Store {
             }
         }
 
+        let source_sri = expected_integrity.unwrap_or(&computed_sri);
         let (object, timings) =
-            self.extract_object_with_timings_and_policy(&computed_sri, tarball_data, policy)?;
-        Ok((object, computed_sri, timings))
+            self.extract_object_with_timings_and_policy(source_sri, tarball_data, policy)?;
+        Ok((object, source_sri.to_string(), timings))
     }
 
     /// Populate `links/<graph-key>/` with the package bytes, sibling
