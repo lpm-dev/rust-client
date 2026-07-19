@@ -219,10 +219,18 @@ async fn ambient_peer_plans(
         {
             continue;
         }
-        if let Some(requirement) = reqs
-            .iter()
-            .find(|requirement| !requirement.optional && !requirement.install_source.is_registry())
-            && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
+        let has_registry_provider = packages.iter().any(|((name, _), draft)| {
+            name == &target_name
+                && draft.package.is_direct
+                && draft
+                    .package
+                    .root_link_names
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| name == &local_name))
+        });
+        if let Some(requirement) = reqs.iter().find(|requirement| {
+            requires_unsupported_peer_auto_install(requirement, has_registry_provider)
+        }) && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
         {
             return Err(LpmError::Registry(format!(
                 "cannot auto-install required peer `{}`: specifier {:?} uses unsupported `{}:` source routing; install a compatible provider explicitly",
@@ -259,6 +267,15 @@ async fn ambient_peer_plans(
         });
     }
     Ok(plans)
+}
+
+fn requires_unsupported_peer_auto_install(
+    requirement: &PeerRequirement,
+    has_registry_provider: bool,
+) -> bool {
+    !requirement.optional
+        && !requirement.install_source.is_registry()
+        && (requirement.provider_source.is_some() || !has_registry_provider)
 }
 
 fn collect_peer_requirements(
@@ -447,4 +464,48 @@ pub(super) fn attach_peer_edges_to_drafts(
         draft.package.peers = peers;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unsupported_requirement(
+        provider_source: Option<lpm_resolver::PeerProviderSource>,
+    ) -> PeerRequirement {
+        PeerRequirement {
+            local_name: "react".to_string(),
+            target_name: "react".to_string(),
+            range: lpm_resolver::NpmRange::parse("^18.0.0").unwrap(),
+            provider_source,
+            install_source: lpm_resolver::PeerInstallSource::UnsupportedOriginal {
+                scheme: "work".to_string(),
+                specifier: "work:^18.0.0".to_string(),
+            },
+            optional: false,
+        }
+    }
+
+    #[test]
+    fn named_registry_peer_defers_to_explicit_registry_provider() {
+        let requirement = unsupported_requirement(None);
+
+        assert!(!requires_unsupported_peer_auto_install(&requirement, true));
+    }
+
+    #[test]
+    fn named_registry_peer_without_explicit_provider_requires_source_routing() {
+        let requirement = unsupported_requirement(None);
+
+        assert!(requires_unsupported_peer_auto_install(&requirement, false));
+    }
+
+    #[test]
+    fn exact_source_peer_does_not_accept_registry_provider() {
+        let requirement = unsupported_requirement(Some(lpm_resolver::PeerProviderSource::File(
+            "../react".to_string(),
+        )));
+
+        assert!(requires_unsupported_peer_auto_install(&requirement, true));
+    }
 }

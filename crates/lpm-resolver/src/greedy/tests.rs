@@ -2587,6 +2587,84 @@ async fn peer_drain_rejects_missing_provider_with_unsupported_source() {
 }
 
 #[tokio::test]
+async fn peer_drain_defers_named_registry_mismatch_to_explicit_registry_provider() {
+    let mut state = ResolveState::new(
+        HashMap::from([("react".to_string(), "17.0.2".to_string())]),
+        OverrideSet::empty(),
+    );
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(
+        &mut state,
+        CanonicalKey::npm("named-registry-host"),
+        "1.0.0",
+    );
+    let _provider = push_node(&mut state, CanonicalKey::npm("react"), "17.0.2");
+    let mut requirement = mk_peer_req(
+        consumer,
+        "react",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    );
+    requirement.raw_specifier = "work:^18.0.0".to_string();
+    requirement.install_source = crate::PeerInstallSource::UnsupportedOriginal {
+        scheme: "work".to_string(),
+        specifier: "work:^18.0.0".to_string(),
+    };
+    state.peer_requirements.push(requirement);
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("explicit registry provider must prevent auto-install fetch for {canonical}")
+    })
+    .await
+    .expect("named-registry peer mismatch must reach post-resolution validation");
+
+    assert!(synthesized.is_empty());
+}
+
+#[tokio::test]
+async fn peer_drain_rejects_named_registry_mismatch_when_root_slot_targets_an_alias() {
+    let mut state = ResolveState::new(
+        HashMap::from([("react".to_string(), "npm:preact@10.26.9".to_string())]),
+        OverrideSet::empty(),
+    );
+    state
+        .root_aliases
+        .insert("react".to_string(), "preact".to_string());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(
+        &mut state,
+        CanonicalKey::npm("named-registry-host"),
+        "1.0.0",
+    );
+    let _transitive_react = push_node(&mut state, CanonicalKey::npm("react"), "17.0.2");
+    let mut requirement = mk_peer_req(
+        consumer,
+        "react",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    );
+    requirement.raw_specifier = "work:^18.0.0".to_string();
+    requirement.install_source = crate::PeerInstallSource::UnsupportedOriginal {
+        scheme: "work".to_string(),
+        specifier: "work:^18.0.0".to_string(),
+    };
+    state.peer_requirements.push(requirement);
+
+    let error = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("unsupported named registry source must fail before fetching {canonical}")
+    })
+    .await
+    .expect_err("an aliased root slot must not masquerade as the required provider");
+
+    assert!(matches!(
+        error,
+        ResolveError::UnsupportedPeerAutoInstallSource { .. }
+    ));
+}
+
+#[tokio::test]
 async fn peer_drain_accepts_matching_explicit_file_provider() {
     let provider = crate::ExplicitPeerProvider::new(
         "source-peer",

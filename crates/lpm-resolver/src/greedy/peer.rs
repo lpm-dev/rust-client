@@ -578,10 +578,23 @@ where
         return Ok(PeerDrainOutcome::SkippedOptOut);
     }
 
-    if let Some(requirement) = reqs
-        .iter()
-        .find(|requirement| !requirement.optional && !requirement.install_source.is_registry())
-        && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
+    let canonical_name = canonical.to_string();
+    let has_explicit_root_registry_provider = state
+        .resolved
+        .get(canonical)
+        .is_some_and(|versions| !versions.is_empty())
+        && reqs.first().is_some_and(|requirement| {
+            state.root_deps.contains_key(&requirement.peer_name)
+                && state
+                    .root_aliases
+                    .get(&requirement.peer_name)
+                    .is_none_or(|target| target == &canonical_name)
+        });
+    if let Some(requirement) = reqs.iter().find(|requirement| {
+        !requirement.optional
+            && !requirement.install_source.is_registry()
+            && (requirement.provider_source.is_some() || !has_explicit_root_registry_provider)
+    }) && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
     {
         let consumer = state.nodes.get(requirement.consumer as usize).map_or_else(
             || "<unknown>".to_string(),
@@ -593,6 +606,12 @@ where
             specifier: specifier.to_string(),
             scheme: scheme.to_string(),
         });
+    }
+    if reqs
+        .iter()
+        .any(|requirement| !requirement.optional && !requirement.install_source.is_registry())
+    {
+        return Ok(PeerDrainOutcome::SkippedOptOut);
     }
 
     let cache_key = peer_resolution_cache_key(canonical, reqs);

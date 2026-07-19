@@ -816,7 +816,14 @@ pub fn check_unmet_peers(
                 .peers
                 .iter()
                 .find(|(attached_name, _)| attached_name == peer_name)
-                .map(|(_, version)| (version, true));
+                .map(|(_, version)| {
+                    let satisfies = specifier.comparable_range().is_none_or(|range| {
+                        NpmVersion::parse(version)
+                            .ok()
+                            .is_some_and(|parsed| range.satisfies(&parsed))
+                    });
+                    (version, satisfies)
+                });
             let resolved_peer_ver = attached_peer.or_else(|| {
                 specifier.comparable_range().and_then(|range| {
                     resolve_peer_binding_version(

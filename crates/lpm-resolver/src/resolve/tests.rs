@@ -1387,6 +1387,58 @@ fn peer_check_wrong_version_produces_warning() {
 }
 
 #[test]
+fn peer_check_attached_wrong_version_produces_warning() {
+    let consumer_pkg = ResolverPackage::npm("peer-consumer");
+    let react_pkg = ResolverPackage::npm("react");
+    let resolved = vec![
+        ResolvedPackage {
+            package: consumer_pkg.clone(),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: vec![("react".to_string(), "17.0.2".to_string())],
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            package: react_pkg.clone(),
+            version: NpmVersion::parse("17.0.2").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        },
+    ];
+    let mut cache = HashMap::new();
+    cache.insert(
+        CanonicalKey::from(&consumer_pkg),
+        make_cached_info(
+            &["1.0.0"],
+            vec![],
+            vec![("1.0.0", vec![("react", "^18.0.0")])],
+        ),
+    );
+    cache.insert(
+        CanonicalKey::from(&react_pkg),
+        make_cached_info(&["17.0.2"], vec![], vec![]),
+    );
+
+    let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].peer, "react");
+    assert_eq!(warnings[0].required_range, "^18.0.0");
+    assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
+}
+
+#[test]
 fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
     let plugin_pkg = ResolverPackage::npm("esbuild-plugins-node-modules-polyfill");
     let esbuild_nested_a = ResolverPackage::npm("esbuild").with_context("vite");
