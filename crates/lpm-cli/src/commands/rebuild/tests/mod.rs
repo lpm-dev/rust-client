@@ -502,7 +502,11 @@ fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
     let store_pkg = store_root.path().join("esbuild@0.21.5");
     std::fs::create_dir_all(&store_pkg).unwrap();
     let store_file = store_pkg.join("package.json");
-    std::fs::write(&store_file, b"{\"name\":\"esbuild\"}").unwrap();
+    std::fs::write(
+        &store_file,
+        b"{\"name\":\"esbuild\",\"version\":\"0.21.5\"}",
+    )
+    .unwrap();
 
     let layout = lpm_linker::LayoutPaths::for_project(project.path());
     let live = layout
