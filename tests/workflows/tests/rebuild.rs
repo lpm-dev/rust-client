@@ -651,6 +651,40 @@ fn rebuild_named_missing_package_fails_in_json_mode() {
 }
 
 #[test]
+fn rebuild_named_package_selects_every_installed_version() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-named-versions", None, &[]);
+    seed_scripted_package(&project, "shared", "1.0.0", "echo first");
+    seed_scripted_package(&project, "shared", "2.0.0", "echo second");
+    write_lockfile_for_packages(&project, &[("shared", "1.0.0"), ("shared", "2.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "shared", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild shared --dry-run --json");
+    assert!(
+        out.status.success(),
+        "named rebuild should accept every matching installed identity\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope = assertions::parse_json_output(&out.stdout);
+    let packages = envelope["packages"]
+        .as_array()
+        .expect("dry-run packages array");
+    let versions = packages
+        .iter()
+        .map(|package| package["version"].as_str().expect("package version"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(packages.len(), 2, "named rebuild dropped an identity");
+    assert_eq!(
+        versions,
+        std::collections::HashSet::from(["1.0.0", "2.0.0"]),
+    );
+}
+
+#[test]
 fn rebuild_json_reports_empty_work_without_blank_stdout() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-empty-json", None, &[]);

@@ -258,6 +258,150 @@ async fn mount_amber_dep(mock: &MockRegistry, tarball: &[u8]) {
     mount_batch_metadata(mock, &[(AMBER_DEP_NAME, AMBER_DEP_VERSION, tarball)]).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn v2_auto_build_preflight_reads_exact_v2_script_bodies() {
+    const NAME: &str = "v2-preflight-diff";
+    const PRIOR_VERSION: &str = "1.0.0";
+    const CANDIDATE_VERSION: &str = "2.0.0";
+    const PRIOR_SCRIPT: &str = "node build.js";
+    const CANDIDATE_SCRIPT: &str = "node build-next.js";
+
+    let mock = MockRegistry::start().await;
+    let prior_tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": NAME,
+            "version": PRIOR_VERSION,
+            "scripts": { "postinstall": PRIOR_SCRIPT }
+        }),
+        &[("build.js", b"process.exit(0);\n")],
+    );
+    let candidate_tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": NAME,
+            "version": CANDIDATE_VERSION,
+            "scripts": { "postinstall": CANDIDATE_SCRIPT }
+        }),
+        &[("build-next.js", b"process.exit(0);\n")],
+    );
+    let prior_integrity = support::mock_registry::compute_integrity(&prior_tarball);
+    let candidate_integrity = support::mock_registry::compute_integrity(&candidate_tarball);
+    let metadata = serde_json::json!({
+        "name": NAME,
+        "dist-tags": { "latest": CANDIDATE_VERSION },
+        "versions": {
+            PRIOR_VERSION: {
+                "name": NAME,
+                "version": PRIOR_VERSION,
+                "dist": {
+                    "tarball": format!("{}/tarballs/{NAME}/-/{NAME}-{PRIOR_VERSION}.tgz", mock.url()),
+                    "integrity": prior_integrity,
+                },
+                "dependencies": {}
+            },
+            CANDIDATE_VERSION: {
+                "name": NAME,
+                "version": CANDIDATE_VERSION,
+                "dist": {
+                    "tarball": format!("{}/tarballs/{NAME}/-/{NAME}-{CANDIDATE_VERSION}.tgz", mock.url()),
+                    "integrity": candidate_integrity,
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            PRIOR_VERSION: "2024-01-01T00:00:00.000Z",
+            CANDIDATE_VERSION: "2024-02-01T00:00:00.000Z"
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        NAME,
+        metadata,
+        &[
+            (PRIOR_VERSION, prior_tarball),
+            (CANDIDATE_VERSION, candidate_tarball),
+        ],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "v2-preflight-diff-project",
+            "version": "1.0.0",
+            "dependencies": { NAME: PRIOR_VERSION }
+        }))
+        .unwrap(),
+    );
+    let first = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .arg("install")
+        .output()
+        .expect("install prior v2 package");
+    assert!(
+        first.status.success(),
+        "prior v2 install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/build-state.json")).unwrap();
+    let prior = &state["blocked_packages"][0];
+    assert_eq!(prior["name"], NAME);
+    let source = prior["source"].as_str().expect("prior source identity");
+    let integrity = prior["integrity"].as_str().expect("prior integrity");
+    let script_hash = prior["script_hash"].as_str().expect("prior script hash");
+    let mut trusted = serde_json::Map::new();
+    trusted.insert(
+        format!("{NAME}@{PRIOR_VERSION}"),
+        serde_json::json!({
+            "source": source,
+            "integrity": integrity,
+            "scriptHash": script_hash
+        }),
+    );
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "v2-preflight-diff-project",
+            "version": "1.0.0",
+            "dependencies": { NAME: CANDIDATE_VERSION },
+            "lpm": {
+                "scriptPolicy": "triage",
+                "trustedDependencies": trusted
+            }
+        }))
+        .unwrap(),
+    );
+    write_signed_unlock(&project, &["scripts-triage", "trust-bulk-approve"]);
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["install", "--auto-build"])
+        .output()
+        .expect("install candidate v2 package with auto-build");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "candidate v2 install failed\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&second.stdout),
+    );
+    assert!(
+        stderr.contains("PREFLIGHT"),
+        "missing preflight card:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--- scripts.postinstall")
+            && stderr.contains(PRIOR_SCRIPT)
+            && stderr.contains(CANDIDATE_SCRIPT),
+        "v2 preflight must render the unified script diff:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("scripts not in store"),
+        "v2 preflight must not probe legacy package directories:\n{stderr}",
+    );
+}
+
 // ─── Mock claude-cli helper ────────────────────────────────────────────
 
 /// Drop a `claude` shell script into a fresh temp dir and return

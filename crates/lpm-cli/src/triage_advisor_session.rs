@@ -27,18 +27,17 @@
 //! **Classify.** Prompted amber packages flow through
 //! `classify_amber()`. Only packages where EVERY amber phase returns
 //! `Approve` land in the ephemeral
-//! `(name, version, Option<integrity>)` approval set. Any `Manual` /
-//! `Abstain` / failure on any phase blocks the package from the set —
-//! it stays prompted (blocked set on disk → `lpm approve-scripts`).
+//! `(name, version, source, integrity, script_bundle_hash)` approval
+//! set. Any `Manual` / `Abstain` / failure on any phase blocks the
+//! package from the set — it stays prompted (blocked set on disk →
+//! `lpm approve-scripts`).
 //!
-//! **Source-aware identity.** The approval key includes the
-//! integrity hash (or `None` when no integrity is available, e.g.
-//! workspace / link / file sources), NOT just `(name, version)`. The
-//! install pipeline treats same-coord packages from different
-//! sources as distinct, so collapsing identity to a pair would mean
-//! approving one source's `pkg@1.0.0` could auto-run a different
-//! source's `pkg@1.0.0` in the same install. Triple keying matches
-//! `compute_blocked_packages_with_metadata`'s identity exactly.
+//! **Source- and script-aware identity.** Source and integrity keep
+//! equal-coordinate installations independent even when local sources
+//! have no integrity. The script-bundle hash prevents a verdict from
+//! crossing to different lifecycle bytes within the same install
+//! identity. The key matches the identity consulted by blocked-set
+//! capture and rebuild trust evaluation.
 //!
 //! # Ephemeral by construction
 //!
@@ -229,14 +228,13 @@ pub struct AdvisorSession {
     /// Provider slug as configured — used in the warn-once line so
     /// the user knows which advisor was attempted.
     configured_slug: Option<String>,
-    /// `(name, version, Option<integrity>)` → `Approve` verdict. The
+    /// `(name, version, source, integrity, script_bundle_hash)` → `Approve`
+    /// verdict. The
     /// set the install path hands to
     /// `compute_blocked_packages_with_metadata` and `evaluate_trust`
-    /// as the ephemeral approval list. The integrity slot makes the
-    /// key source-aware: workspace / file / link installations of
-    /// the same coord with no registry integrity are distinct
-    /// entries from registry installs that carry integrity, so an
-    /// approval on one source cannot leak to a sibling source.
+    /// as the ephemeral approval list. Source keeps workspace, file,
+    /// and link variants distinct when integrity is unavailable; the
+    /// bundle hash keeps approvals bound to the exact scripts reviewed.
     approvals: HashSet<AdvisorApprovalKey>,
     /// Set to `true` after the single degrade-warning fires. Guards
     /// against repeat warnings if a future caller does extra preflight.
@@ -405,9 +403,9 @@ impl AdvisorSession {
     /// equivalent), which preserves the safe default. The install
     /// never fails because the advisor failed.
     ///
-    /// `candidates` should be deduplicated by `(name, version)` —
-    /// duplicate invocations waste tokens / wall-clock without
-    /// changing the outcome.
+    /// `candidates` should be deduplicated by exact source/content identity —
+    /// duplicate invocations waste tokens / wall-clock without changing the
+    /// outcome.
     pub async fn classify_amber(&mut self, candidates: &[AmberPackageRequest]) {
         let Some(adapter) = self.adapter.as_deref() else {
             return;
@@ -571,7 +569,7 @@ impl AdvisorSession {
         // Serial application of approvals — single-thread mutation,
         // no locks. Order doesn't matter because the approval set is
         // a `HashSet` keyed by
-        // `(name, version, integrity, script_bundle_hash)`.
+        // `(name, version, source, integrity, script_bundle_hash)`.
         for result in results {
             if result.outcome == PackageAdvisorOutcome::Approve && result.has_phases {
                 self.approvals.insert((

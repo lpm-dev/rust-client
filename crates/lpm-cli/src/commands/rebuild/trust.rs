@@ -88,8 +88,8 @@ pub(crate) enum TrustReason {
     ///
     /// `script-policy = "triage"` + worst-wins classification is
     /// Amber/AmberLlm + an in-memory [`crate::triage_advisor_session::AdvisorSession`]
-    /// returned `Approve` for this `(name, version)` during the
-    /// current install. The approval is **ephemeral**: it lives
+    /// returned `Approve` for this exact source/content/script identity
+    /// during the current install. The approval is **ephemeral**: it lives
     /// only for the lifetime of the `AdvisorSession` (one install
     /// run), is never written to `trustedDependencies`, and is
     /// invisible to a later standalone `lpm rebuild` invocation
@@ -235,8 +235,9 @@ pub(crate) fn evaluate_trust(
     // In-memory ephemeral approval set
     // populated by the install path's
     // [`crate::triage_advisor_session::AdvisorSession`]. A package
-    // whose `(name, version)` appears here AND classifies amber
-    // under triage yields [`TrustReason::AdvisorApprovedThisRun`].
+    // whose exact source/content/script identity appears here AND
+    // classifies amber under triage yields
+    // [`TrustReason::AdvisorApprovedThisRun`].
     // `None` (or empty) preserves portable L1-3 behaviour — the
     // standalone `lpm rebuild` path passes `None`.
     advisor_approvals: Option<

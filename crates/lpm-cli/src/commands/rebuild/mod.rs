@@ -71,7 +71,7 @@ use lpm_common::color::Painted;
 use lpm_sandbox::SandboxMode;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
 use lpm_store::{PackageBaselineLayout, V2BaselineIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -111,8 +111,8 @@ pub async fn run(
     // → unchanged); adds tier-based auto-trust for greens
     // under [`ScriptPolicy::Triage`].
     effective_policy: ScriptPolicy,
-    // In-memory advisor-approved
-    // `(name, version)` set from this install's
+    // In-memory advisor-approved exact source/content/script identities from
+    // this install's
     // [`crate::triage_advisor_session::AdvisorSession`]. Standalone
     // `lpm rebuild` invocations pass `None` — the trust manifest is
     // the only authority. The install path's autoBuild call passes
@@ -463,25 +463,37 @@ pub(crate) async fn run_under_store_lock(
 
     // Determine which packages to build
     let selected_for_policy: Vec<&ScriptablePackage> = if !specific_packages.is_empty() {
-        // Build specific packages by name
         let mut selected = Vec::new();
+        let mut selected_identities = HashSet::new();
         let mut missing = Vec::new();
         for name in specific_packages {
-            let found = scriptable_packages
+            let suffix = format!(".{name}");
+            let mut matched = false;
+            for pkg in scriptable_packages
                 .iter()
-                .find(|p| p.name == *name || p.name.ends_with(&format!(".{name}")));
-            match found {
-                Some(pkg) => selected.push(pkg),
-                None => {
-                    let safe_name = lpm_common::sanitize_for_terminal(name);
-                    if !json_output {
-                        install_ui::warn(&format!(
-                            "{safe_name} has no lifecycle scripts or is not installed"
-                        ));
-                    }
-                    missing.push(safe_name);
+                .filter(|pkg| pkg.name == *name || pkg.name.ends_with(&suffix))
+            {
+                matched = true;
+                let identity = (
+                    pkg.name.clone(),
+                    pkg.version.clone(),
+                    pkg.source.clone(),
+                    pkg.integrity.clone(),
+                );
+                if selected_identities.insert(identity) {
+                    selected.push(pkg);
                 }
             }
+            if matched {
+                continue;
+            }
+            let safe_name = lpm_common::sanitize_for_terminal(name);
+            if !json_output {
+                install_ui::warn(&format!(
+                    "{safe_name} has no lifecycle scripts or is not installed"
+                ));
+            }
+            missing.push(safe_name);
         }
         if !missing.is_empty() {
             let package_word = if missing.len() == 1 {

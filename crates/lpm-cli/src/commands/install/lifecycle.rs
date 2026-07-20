@@ -497,7 +497,8 @@ pub(super) async fn run_online_auto_build_phase(
         maybe_emit_pre_autobuild_version_diff_cards(
             project_dir,
             store,
-            auto_build_attempted,
+            lpm_root,
+            lpm_store::StoreVersion::from_env(),
             effective_policy,
             &blocked_capture,
             json_output,
@@ -684,22 +685,21 @@ pub(super) fn maybe_emit_post_install_version_diff_hints(
 /// the script will auto-execute imminently; under (b) there's
 /// something to diff against.
 ///
-/// Reads store bodies for both sides via
-/// [`crate::build_state::read_install_phase_bodies`]; the prior
-/// side gracefully degrades to "(prior not in store)" when the
-/// cache has been cleaned or the extractor hasn't populated
-/// `<store>/{name}@{prior}/`.
+/// Reads store bodies for both sides via their active store layout.
+/// V2 resolves the candidate from the current project's exact link
+/// identity and the prior version from the exact source/content
+/// identity retained in the v2 cache. V1 uses its coordinate-keyed
+/// legacy package directory. Missing prior bytes degrade to the
+/// renderer's "prior not in store" note.
 pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
     project_dir: &Path,
     store: &lpm_store::PackageStore,
-    auto_build_attempted: bool,
+    lpm_root: &lpm_common::LpmRoot,
+    store_version: lpm_store::StoreVersion,
     effective_policy: crate::script_policy_config::ScriptPolicy,
     blocked_capture: &crate::build_state::BlockedSetCapture,
     json_output: bool,
 ) {
-    if !auto_build_attempted {
-        return;
-    }
     if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
         return;
     }
@@ -709,6 +709,9 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
     let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
         return;
     };
+    let mut v2_indices_built = false;
+    let mut current_v2_index = None;
+    let mut cached_v2_index = None;
 
     let mut cards: Vec<String> = Vec::new();
     for bp in &blocked_capture.state.blocked_packages {
@@ -735,12 +738,44 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
             continue;
         }
 
-        let candidate_pkg_dir = store.package_dir(&bp.name, &bp.version);
-        let prior_pkg_dir = store.package_dir(&bp.name, prior_version);
-        let candidate_bodies = crate::version_diff::phase_bodies_from_pairs(
-            crate::build_state::read_install_phase_bodies(&candidate_pkg_dir),
-        );
-        let prior_pairs = crate::build_state::read_install_phase_bodies(&prior_pkg_dir);
+        if store_version.is_v2() && !v2_indices_built {
+            current_v2_index = lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root).ok();
+            cached_v2_index = lpm_store::V2BaselineIndex::build(lpm_root).ok();
+            v2_indices_built = true;
+        }
+        let (candidate_pkg_dir, prior_pkg_dir) = if store_version.is_v2() {
+            (
+                current_v2_index.as_ref().and_then(|index| {
+                    v2_preflight_package_dir(
+                        index,
+                        &bp.name,
+                        &bp.version,
+                        bp.source.as_deref(),
+                        bp.integrity.as_deref(),
+                    )
+                }),
+                cached_v2_index.as_ref().and_then(|index| {
+                    v2_preflight_package_dir(
+                        index,
+                        &bp.name,
+                        prior_version,
+                        binding.source.as_deref(),
+                        binding.integrity.as_deref(),
+                    )
+                }),
+            )
+        } else {
+            (
+                Some(store.package_dir(&bp.name, &bp.version)),
+                Some(store.package_dir(&bp.name, prior_version)),
+            )
+        };
+        let candidate_pairs = candidate_pkg_dir.map_or_else(Vec::new, |dir| {
+            crate::build_state::read_install_phase_bodies(&dir)
+        });
+        let prior_pairs = prior_pkg_dir.map_or_else(Vec::new, |dir| {
+            crate::build_state::read_install_phase_bodies(&dir)
+        });
         let prior_bodies = if prior_pairs.is_empty() {
             // Empty-vec result collapses two real cases: (a) prior
             // store dir missing entirely (cache clean / fresh clone),
@@ -754,17 +789,19 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
         } else {
             Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
         };
-        let candidate_bodies_opt = if candidate_bodies.is_empty() {
+        let candidate_bodies = if candidate_pairs.is_empty() {
             None
         } else {
-            Some(candidate_bodies)
+            Some(crate::version_diff::phase_bodies_from_pairs(
+                candidate_pairs,
+            ))
         };
 
         if let Some(card) = crate::version_diff::render_preflight_card(
             &diff,
             &bp.name,
             prior_bodies.as_ref(),
-            candidate_bodies_opt.as_ref(),
+            candidate_bodies.as_ref(),
         ) {
             cards.push(card);
         }
@@ -783,6 +820,28 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
         eprintln!("{card}");
     }
     eprintln!();
+}
+
+fn v2_preflight_package_dir(
+    index: &lpm_store::V2BaselineIndex,
+    name: &str,
+    version: &str,
+    source: Option<&str>,
+    expected_integrity: Option<&str>,
+) -> Option<PathBuf> {
+    let baseline = match source {
+        Some(source) => {
+            let source_id = lpm_lockfile::Source::parse(source)
+                .ok()?
+                .source_id_with_integrity(expected_integrity);
+            index.lookup_source_identity(name, version, &source_id)
+        }
+        None => index.lookup(name, version, expected_integrity),
+    }?;
+    if expected_integrity.is_some_and(|expected| expected != baseline.integrity.as_str()) {
+        return None;
+    }
+    Some(baseline.package_dir.clone())
 }
 
 /// Read `trustedDependencies` from the
