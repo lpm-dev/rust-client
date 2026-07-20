@@ -449,7 +449,7 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
         ".lpm/build-state.json",
         &format!(
             r#"{{
-                "state_version": 1,
+                "state_version": 3,
                 "blocked_set_fingerprint": "sha256-flow-fixture",
                 "captured_at": "2026-05-14T00:00:00Z",
                 "blocked_packages": [

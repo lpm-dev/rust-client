@@ -56,7 +56,7 @@ fn write_empty_build_state(project: &TempProject) {
     project.write_file(
         ".lpm/build-state.json",
         r#"{
-    "state_version": 1,
+    "state_version": 3,
     "blocked_set_fingerprint": "sha256-empty",
     "captured_at": "2026-04-22T00:00:00Z",
     "blocked_packages": []
@@ -704,7 +704,7 @@ fn write_blocked_build_state_with_drift(
     };
     let body = format!(
         r#"{{
-            "state_version": 1,
+            "state_version": 3,
             "blocked_set_fingerprint": "sha256-fixture-stable",
             "captured_at": "2026-04-22T00:00:00Z",
             "blocked_packages": [
@@ -1100,7 +1100,7 @@ fn approve_scripts_list_distinguishes_equal_coordinates_by_source_and_selector()
     project.write_file(
         ".lpm/build-state.json",
         &serde_json::to_string_pretty(&serde_json::json!({
-            "state_version": 1,
+            "state_version": 3,
             "blocked_set_fingerprint": "sha256-source-identities",
             "captured_at": "2026-04-22T00:00:00Z",
             "blocked_packages": blocked_packages,
@@ -1179,7 +1179,7 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
         })
         .collect();
     let state = serde_json::json!({
-        "state_version": 1,
+        "state_version": 3,
         "blocked_set_fingerprint": "sha256-cli-audit-fixture",
         "captured_at": "2026-04-11T00:00:00Z",
         "blocked_packages": blocked,
