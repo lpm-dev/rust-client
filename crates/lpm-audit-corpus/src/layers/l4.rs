@@ -274,11 +274,11 @@ async fn classify_one_with_advisor(
     let version = pkg.version.as_deref().unwrap_or("unknown");
 
     // Cache lookup. The cache key folds in every input
-    // axis that affects the verdict: package identity (name +
-    // version), every amber phase body, plus the advisor's prompt
-    // template hash + provider slug + model version. A cache hit
-    // means we've already classified an identical input and can
-    // skip the LLM round-trip.
+    // axis that affects the verdict: package identity, every amber
+    // phase body, plus the advisor's prompt template hash + provider
+    // slug + model version. Corpus entries are public-registry
+    // manifests without a resolved source or integrity, so those
+    // identity slots remain absent here.
     let cache_phases: Vec<(&str, &str)> = amber_phases
         .iter()
         .map(|(phase, script)| (*phase, script.script.as_str()))
@@ -291,6 +291,8 @@ async fn classify_one_with_advisor(
     let cache_key = build_cache_key(&CacheKeyInputs {
         package_name: &pkg.name,
         package_version: version,
+        source: None,
+        integrity: None,
         amber_phases: &cache_phases,
         repository: pkg.repository.as_deref(),
         referenced_scripts: &cache_refs,

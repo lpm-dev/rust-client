@@ -380,15 +380,17 @@ pub(super) fn evaluate_trust_unsuspended(
         // install.
         if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
             && let Some(set) = advisor_approvals
+            && let Some(script_bundle_hash) = script_hash.as_deref()
+            && crate::triage_advisor_session::contains_exact_approval(
+                set,
+                name,
+                version,
+                source,
+                integrity,
+                script_bundle_hash,
+            )
         {
-            // Classification is package-wide, so one source-qualified package
-            // identity has one bundle verdict for this install session.
-            let integrity_owned: Option<String> = integrity.map(str::to_string);
-            if set.iter().any(|(n, v, s, i, _)| {
-                n == name && v == version && s.as_deref() == source && *i == integrity_owned
-            }) {
-                return TrustReason::AdvisorApprovedThisRun;
-            }
+            return TrustReason::AdvisorApprovedThisRun;
         }
     }
 

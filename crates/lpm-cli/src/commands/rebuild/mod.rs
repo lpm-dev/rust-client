@@ -467,13 +467,44 @@ pub(crate) async fn run_under_store_lock(
         let mut selected_identities = HashSet::new();
         let mut missing = Vec::new();
         for name in specific_packages {
-            let suffix = format!(".{name}");
-            let mut matched = false;
+            let canonical_name = if scriptable_packages.iter().any(|pkg| pkg.name == *name) {
+                Some(name.as_str())
+            } else {
+                let suffix = format!(".{name}");
+                let candidates: std::collections::BTreeSet<&str> = scriptable_packages
+                    .iter()
+                    .filter_map(|pkg| pkg.name.ends_with(&suffix).then_some(pkg.name.as_str()))
+                    .collect();
+                match candidates.len() {
+                    0 => None,
+                    1 => candidates.iter().next().copied(),
+                    _ => {
+                        let safe_name = lpm_common::sanitize_for_terminal(name);
+                        let choices = candidates
+                            .into_iter()
+                            .map(lpm_common::sanitize_for_terminal)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(LpmError::Registry(format!(
+                            "ambiguous package name `{safe_name}`; use one of: {choices}"
+                        )));
+                    }
+                }
+            };
+            let Some(canonical_name) = canonical_name else {
+                let safe_name = lpm_common::sanitize_for_terminal(name);
+                if !json_output {
+                    install_ui::warn(&format!(
+                        "{safe_name} has no lifecycle scripts or is not installed"
+                    ));
+                }
+                missing.push(safe_name);
+                continue;
+            };
             for pkg in scriptable_packages
                 .iter()
-                .filter(|pkg| pkg.name == *name || pkg.name.ends_with(&suffix))
+                .filter(|pkg| pkg.name == canonical_name)
             {
-                matched = true;
                 let identity = (
                     pkg.name.clone(),
                     pkg.version.clone(),
@@ -484,16 +515,6 @@ pub(crate) async fn run_under_store_lock(
                     selected.push(pkg);
                 }
             }
-            if matched {
-                continue;
-            }
-            let safe_name = lpm_common::sanitize_for_terminal(name);
-            if !json_output {
-                install_ui::warn(&format!(
-                    "{safe_name} has no lifecycle scripts or is not installed"
-                ));
-            }
-            missing.push(safe_name);
         }
         if !missing.is_empty() {
             let package_word = if missing.len() == 1 {

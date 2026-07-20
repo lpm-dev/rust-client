@@ -685,6 +685,67 @@ fn rebuild_named_package_selects_every_installed_version() {
 }
 
 #[test]
+fn rebuild_exact_name_does_not_select_unrelated_suffix_names() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-exact-name", None, &[]);
+    seed_scripted_package(&project, "foo", "1.0.0", "echo exact");
+    seed_scripted_package(&project, "alice.foo", "1.0.0", "echo alice");
+    seed_scripted_package(&project, "bob.foo", "1.0.0", "echo bob");
+    write_lockfile_for_packages(
+        &project,
+        &[
+            ("foo", "1.0.0"),
+            ("alice.foo", "1.0.0"),
+            ("bob.foo", "1.0.0"),
+        ],
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "foo", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild foo --dry-run --json");
+    assert!(
+        out.status.success(),
+        "exact named rebuild failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope = assertions::parse_json_output(&out.stdout);
+    let packages = envelope["packages"]
+        .as_array()
+        .expect("dry-run packages array");
+    assert_eq!(packages.len(), 1, "exact name selected suffix packages");
+    assert_eq!(packages[0]["name"], "foo");
+}
+
+#[test]
+fn rebuild_short_name_rejects_multiple_canonical_matches() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-ambiguous-name", None, &[]);
+    seed_scripted_package(&project, "alice.foo", "1.0.0", "echo alice");
+    seed_scripted_package(&project, "bob.foo", "1.0.0", "echo bob");
+    write_lockfile_for_packages(&project, &[("alice.foo", "1.0.0"), ("bob.foo", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "foo", "--dry-run"])
+        .output()
+        .expect("spawn ambiguous lpm rebuild foo --dry-run --json");
+    assert!(
+        !out.status.success(),
+        "ambiguous short name must not rebuild multiple packages\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope = assertions::parse_json_output(&out.stdout);
+    let error = envelope["error"].to_string();
+    assert!(
+        error.contains("alice.foo") && error.contains("bob.foo") && error.contains("ambiguous"),
+        "ambiguity error must list the canonical choices: {envelope}",
+    );
+}
+
+#[test]
 fn rebuild_json_reports_empty_work_without_blank_stdout() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-empty-json", None, &[]);

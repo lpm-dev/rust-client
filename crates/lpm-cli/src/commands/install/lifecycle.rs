@@ -752,6 +752,7 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
                         &bp.version,
                         bp.source.as_deref(),
                         bp.integrity.as_deref(),
+                        bp.script_hash.as_deref(),
                     )
                 }),
                 cached_v2_index.as_ref().and_then(|index| {
@@ -761,6 +762,7 @@ pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
                         prior_version,
                         binding.source.as_deref(),
                         binding.integrity.as_deref(),
+                        binding.script_hash.as_deref(),
                     )
                 }),
             )
@@ -828,15 +830,24 @@ fn v2_preflight_package_dir(
     version: &str,
     source: Option<&str>,
     expected_integrity: Option<&str>,
+    expected_script_hash: Option<&str>,
 ) -> Option<PathBuf> {
+    let expected_script_hash = expected_script_hash?;
     let baseline = match source {
         Some(source) => {
             let source_id = lpm_lockfile::Source::parse(source)
                 .ok()?
                 .source_id_with_integrity(expected_integrity);
-            index.lookup_source_identity(name, version, &source_id)
+            index.lookup_source_identity_with_script_hash(
+                name,
+                version,
+                &source_id,
+                expected_script_hash,
+            )
         }
-        None => index.lookup(name, version, expected_integrity),
+        None => {
+            index.lookup_with_script_hash(name, version, expected_integrity?, expected_script_hash)
+        }
     }?;
     if expected_integrity.is_some_and(|expected| expected != baseline.integrity.as_str()) {
         return None;
@@ -915,10 +926,12 @@ pub(super) fn collect_amber_classification_requests(
         else {
             continue;
         };
-        let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
-        if bodies.is_empty() {
+        let Some(script_data) =
+            lpm_security::script_hash::compute_script_hash_with_phase_bodies(&pkg_dir)
+        else {
             continue;
-        }
+        };
+        let bodies = script_data.phase_bodies;
         // Read the package's `repository` URL from the same store package.json.
         // It feeds both the advisor prompt and the classifier widening that
         // converts delegate-to-local-file + matching identity into Green.
@@ -983,6 +996,7 @@ pub(super) fn collect_amber_classification_requests(
             version: version.clone(),
             source: identity.source.clone(),
             integrity: integrity.clone(),
+            script_bundle_hash: script_data.hash,
             repository,
             amber_phases,
             referenced_scripts,
@@ -1273,6 +1287,90 @@ pub(super) async fn build_blocked_set_metadata(
         meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
     );
     out
+}
+
+#[cfg(test)]
+mod v2_preflight_tests {
+    use super::v2_preflight_package_dir;
+    use chrono::Utc;
+    use lpm_store::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+
+    #[test]
+    fn preflight_selects_same_source_copy_by_script_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let links_root = dir.path().join("store").join("v2").join("links");
+        let source = "registry+https://registry.example";
+        let source_sri = "sha512-shared-source";
+        let package_source_id = lpm_lockfile::Source::parse(source)
+            .unwrap()
+            .source_id_with_integrity(Some(source_sri));
+        let mut package_dirs = Vec::with_capacity(2);
+
+        for (suffix, script) in [
+            ("aaaaaaaaaaaaaaaa", "node wrong.js"),
+            ("bbbbbbbbbbbbbbbb", "node expected.js"),
+        ] {
+            let link_dir = links_root.join(format!("shared@1.0.0+{suffix}"));
+            let package_dir = link_dir.join("node_modules").join("shared");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::write(
+                package_dir.join("package.json"),
+                format!(
+                    r#"{{"name":"shared","version":"1.0.0","scripts":{{"postinstall":"{script}"}}}}"#
+                ),
+            )
+            .unwrap();
+            LinkMeta {
+                schema: 1,
+                graph_key: format!("shared@1.0.0+{suffix}"),
+                graph_key_digest_hex: format!("{suffix}{suffix}{suffix}{suffix}"),
+                name: "shared".into(),
+                version: "1.0.0".into(),
+                source_identity: Some(format!("{package_source_id}\0variant-{suffix}")),
+                source_sri: source_sri.into(),
+                object_path: "objects/sha512-shared-source".into(),
+                deps: vec![],
+                platform: std::sync::Arc::new(LinkMetaPlatform {
+                    os: "test".into(),
+                    cpu: "test".into(),
+                    libc: None,
+                }),
+                created_at: Utc::now(),
+                last_referenced_at: Utc::now(),
+            }
+            .write_to(&link_dir)
+            .unwrap();
+            package_dirs.push(package_dir);
+        }
+
+        let expected_hash = lpm_security::script_hash::compute_script_hash(&package_dirs[1])
+            .expect("expected script hash");
+        let index = lpm_store::V2BaselineIndex::build(&lpm_root).unwrap();
+
+        let selected = v2_preflight_package_dir(
+            &index,
+            "shared",
+            "1.0.0",
+            Some(source),
+            Some(source_sri),
+            Some(&expected_hash),
+        )
+        .expect("preflight must find the exact script identity");
+
+        assert_eq!(selected, package_dirs[1]);
+        assert!(
+            v2_preflight_package_dir(
+                &index,
+                "shared",
+                "1.0.0",
+                Some(source),
+                Some(source_sri),
+                None,
+            )
+            .is_none()
+        );
+    }
 }
 
 // is_install_up_to_date() moved to crate::install_state::check_install_state()

@@ -67,18 +67,21 @@ pub enum PackageBaselineLayout {
 /// global store that's 5M sidecar reads per invocation, pure waste since the
 /// link-entry layout doesn't change mid-command.
 ///
-/// Peer-divergent link entries with the same source SRI share one
-/// lifecycle baseline because their package bytes are identical. Distinct
-/// source SRIs remain independently addressable and an identity-free lookup
-/// fails closed when coordinates are ambiguous.
+/// Peer-divergent link entries often have identical bytes, but patched and
+/// unpatched links can share a source identity while differing in lifecycle
+/// content. The index retains every same-identity candidate so exact consumers
+/// can select by canonical script hash. Distinct source SRIs remain
+/// independently addressable and an identity-free lookup fails closed when
+/// coordinates are ambiguous.
 ///
 /// Construction is best-effort: malformed sidecars are silently
 /// skipped. An empty index is cheap and safe — callers on stores
-/// with no v2 entries get an empty map and pay only the v1 fallback.
+/// with no v2 entries get an empty map and can apply their own layout-specific
+/// fallback behavior.
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
-    by_integrity: HashMap<(String, String, String), InstalledPackageBaseline>,
-    by_source_identity: HashMap<(String, String, String), InstalledPackageBaseline>,
+    by_integrity: HashMap<(String, String, String), Vec<InstalledPackageBaseline>>,
+    by_source_identity: HashMap<(String, String, String), Vec<InstalledPackageBaseline>>,
     unique_source_by_coords: HashMap<(String, String), Option<String>>,
 }
 
@@ -104,14 +107,16 @@ impl V2BaselineIndex {
         }
         self.by_integrity
             .entry((name.clone(), version.clone(), source_sri))
-            .or_insert_with(|| baseline.clone());
+            .or_default()
+            .push(baseline.clone());
         if let Some(package_source_id) = source_identity
             .as_deref()
             .and_then(|identity| identity.split_once('\0').map(|(source_id, _)| source_id))
         {
             self.by_source_identity
                 .entry((name, version, package_source_id.to_string()))
-                .or_insert(baseline);
+                .or_default()
+                .push(baseline);
         }
     }
 
@@ -313,7 +318,10 @@ impl V2BaselineIndex {
     /// tie-breaking is incorrect under multi-link-per-coords
     /// states. `for_project` is the supported lookup path for
     /// `lpm rebuild` / `lpm approve-scripts` and any other read of
-    /// project-side script state.
+    /// project-side script state. Global callers with a script hash can use
+    /// [`Self::lookup_with_script_hash`] or
+    /// [`Self::lookup_source_identity_with_script_hash`]; coordinate-only
+    /// lookups retain the first candidate and are not collision-safe.
     pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
         let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let mut index = Self::default();
@@ -361,11 +369,13 @@ impl V2BaselineIndex {
                 .get(&(name.to_string(), version.to_string()))?
                 .as_deref()?,
         };
-        self.by_integrity.get(&(
-            name.to_string(),
-            version.to_string(),
-            source_sri.to_string(),
-        ))
+        self.by_integrity
+            .get(&(
+                name.to_string(),
+                version.to_string(),
+                source_sri.to_string(),
+            ))?
+            .first()
     }
 
     /// O(1) lookup by the exact lockfile package source identity.
@@ -377,6 +387,47 @@ impl V2BaselineIndex {
     ) -> Option<&InstalledPackageBaseline> {
         self.by_source_identity
             .get(&(name.to_string(), version.to_string(), source_id.to_string()))
+            .and_then(|candidates| candidates.first())
+    }
+
+    /// Lookup by source content identity and canonical lifecycle hash. Hashing
+    /// is lazy over only the same-identity candidates, avoiding a script read
+    /// for every global link entry during index construction.
+    pub fn lookup_with_script_hash(
+        &self,
+        name: &str,
+        version: &str,
+        source_sri: &str,
+        script_hash: &str,
+    ) -> Option<&InstalledPackageBaseline> {
+        self.by_integrity
+            .get(&(
+                name.to_string(),
+                version.to_string(),
+                source_sri.to_string(),
+            ))?
+            .iter()
+            .find(|baseline| {
+                lpm_security::script_hash::compute_script_hash(&baseline.package_dir).as_deref()
+                    == Some(script_hash)
+            })
+    }
+
+    /// Lookup by exact lockfile source identity and canonical lifecycle hash.
+    pub fn lookup_source_identity_with_script_hash(
+        &self,
+        name: &str,
+        version: &str,
+        source_id: &str,
+        script_hash: &str,
+    ) -> Option<&InstalledPackageBaseline> {
+        self.by_source_identity
+            .get(&(name.to_string(), version.to_string(), source_id.to_string()))?
+            .iter()
+            .find(|baseline| {
+                lpm_security::script_hash::compute_script_hash(&baseline.package_dir).as_deref()
+                    == Some(script_hash)
+            })
     }
 }
 
@@ -1332,6 +1383,69 @@ mod tests {
             "rebuilding the index against the same disk state must \
              preserve first-match identity"
         );
+    }
+
+    #[test]
+    fn global_v2_index_selects_same_source_copy_by_script_hash() {
+        use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let links_root = dir.path().join("store").join("v2").join("links");
+        let source_sri = "sha512-shared-source";
+        let source_identity = format!("registry-source\0{source_sri}");
+        let mut package_dirs = Vec::new();
+        for (suffix, script) in [
+            ("aaaaaaaaaaaaaaaa", "node wrong.js"),
+            ("bbbbbbbbbbbbbbbb", "node expected.js"),
+        ] {
+            let link_dir = links_root.join(format!("shared@1.0.0+{suffix}"));
+            let package_dir = link_dir.join("node_modules").join("shared");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::write(
+                package_dir.join("package.json"),
+                format!(
+                    r#"{{"name":"shared","version":"1.0.0","scripts":{{"postinstall":"{script}"}}}}"#
+                ),
+            )
+            .unwrap();
+            LinkMeta {
+                schema: 1,
+                graph_key: format!("shared@1.0.0+{suffix}"),
+                graph_key_digest_hex: format!("{suffix}{suffix}{suffix}{suffix}"),
+                name: "shared".into(),
+                version: "1.0.0".into(),
+                source_identity: Some(source_identity.clone()),
+                source_sri: source_sri.into(),
+                object_path: "objects/sha512-shared-source".into(),
+                deps: vec![],
+                platform: std::sync::Arc::new(LinkMetaPlatform {
+                    os: "darwin".into(),
+                    cpu: "arm64".into(),
+                    libc: None,
+                }),
+                created_at: Utc::now(),
+                last_referenced_at: Utc::now(),
+            }
+            .write_to(&link_dir)
+            .unwrap();
+            package_dirs.push(package_dir);
+        }
+        let expected_hash = lpm_security::script_hash::compute_script_hash(&package_dirs[1])
+            .expect("expected script hash");
+
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        let baseline = index
+            .lookup_source_identity_with_script_hash(
+                "shared",
+                "1.0.0",
+                "registry-source",
+                &expected_hash,
+            )
+            .expect("script hash must disambiguate same-source link entries");
+
+        assert_eq!(baseline.package_dir, package_dirs[1]);
     }
 
     /// `find_installed_package_baseline` must return a result

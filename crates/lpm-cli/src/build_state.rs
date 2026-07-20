@@ -582,9 +582,9 @@ pub fn compute_blocked_packages_with_metadata(
     // short-circuit applies as before.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    // Ephemeral advisor approval set keyed
-    // by `(name, version, Option<integrity>)`. Packages whose
-    // triple appears here are EXCLUDED from the blocked set so
+    // Ephemeral advisor approval set keyed by exact source, content,
+    // and canonical script identity. Exact matches are excluded from
+    // the blocked set so
     // post-install messaging + `lpm approve-scripts` don't report
     // them as still-blocked after the autoBuild path executed
     // their scripts via the AdvisorApprovedThisRun trust path.
@@ -596,8 +596,7 @@ pub fn compute_blocked_packages_with_metadata(
     // stay reachable via `lpm approve-scripts`. See
     // `select_approvals_for_capture` in `crate::commands::install`.
     //
-    // Standalone callers (no install context) pass `None` →
-    // identical to the pre-slice-1 behavior.
+    // Standalone callers (no install context) pass `None`.
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
@@ -682,22 +681,6 @@ fn compute_blocked_packages_with_metadata_and_baseline(
         let version = &identity.version;
         let source = identity.source.as_deref();
         let integrity = &identity.integrity;
-        // Advisor-approved packages are
-        // EXCLUDED from the blocked set entirely. They executed
-        // their scripts via the AdvisorApprovedThisRun trust path
-        // during this install's autoBuild, so listing them as
-        // "still blocked" would emit stale UI + JSON. Keyed on
-        // Matching includes source and integrity so approval cannot cross
-        // between equal-coordinate packages. The bundle hash remains the
-        // final key field because classification is over the package's full
-        // install-script bundle.
-        if let Some(set) = extras.advisor_approvals
-            && set.iter().any(|(n, v, s, i, _)| {
-                n == name && v == version && s.as_deref() == source && i == integrity
-            })
-        {
-            return None;
-        }
         if let Some(set) = extras.execution_exclusions
             && set.contains(&(
                 name.clone(),
@@ -715,6 +698,19 @@ fn compute_blocked_packages_with_metadata_and_baseline(
         let script_hash = script_data.hash;
         let phase_bodies = script_data.phase_bodies;
         let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
+
+        if let Some(set) = extras.advisor_approvals
+            && crate::triage_advisor_session::contains_exact_approval(
+                set,
+                name,
+                version,
+                source,
+                integrity.as_deref(),
+                &script_hash,
+            )
+        {
+            return None;
+        }
 
         // Classify each present phase and aggregate
         // worst-wins. Populated unconditionally (not gated on
@@ -948,7 +944,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
     // see `compute_blocked_packages_with_metadata`.
-    // When `Some`, matching triples are removed from the persisted
+    // When `Some`, exact approval identities are removed from the persisted
     // blocked set before fingerprint + write so post-install JSON
     // + the "remain blocked after auto-build" pointer don't report
     // stale state for packages whose scripts already executed via
@@ -2668,7 +2664,7 @@ mod tests {
     //                       from the persisted blocked set ──────────
 
     #[test]
-    fn slice1_advisor_approved_amber_excluded_from_blocked_set() {
+    fn advisor_approved_amber_with_exact_hash_is_excluded_from_blocked_set() {
         // A package the advisor approves this run must NOT appear in the
         // blocked set written to `.lpm/build-state.json`. Without
         // this, post-install JSON + the "remain blocked after auto-
@@ -2688,6 +2684,10 @@ mod tests {
             "1.0.0".to_string(),
             Some("sha512-test-integrity".to_string()),
         )];
+        let reviewed_hash = lpm_security::script_hash::compute_script_hash(
+            &store.package_dir("amber-pkg", "1.0.0"),
+        )
+        .unwrap();
 
         // Baseline: NO approvals → package appears in blocked set.
         let blocked_without_approval = compute_blocked_packages_with_metadata(
@@ -2702,14 +2702,14 @@ mod tests {
         assert_eq!(blocked_without_approval.len(), 1);
         assert_eq!(blocked_without_approval[0].name, "amber-pkg");
 
-        // With the matching triple in the approval set: EXCLUDED.
+        // With the exact approval identity in the set: EXCLUDED.
         let mut approvals = std::collections::HashSet::new();
         approvals.insert((
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             None,
             Some("sha512-test-integrity".to_string()),
-            String::new(),
+            reviewed_hash,
         ));
         let blocked_with_approval = compute_blocked_packages_with_metadata(
             &store,
@@ -2731,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn slice1_approval_for_other_integrity_does_not_exclude_blocked() {
+    fn advisor_approval_for_other_integrity_does_not_exclude_blocked() {
         // Counter-test for the source-aware key: an approval that
         // shares (name, version) but has different integrity must
         // NOT remove this install's package from the blocked set.
@@ -2776,6 +2776,43 @@ mod tests {
             1,
             "different-integrity approval must not cross-exclude"
         );
+    }
+
+    #[test]
+    fn advisor_approval_with_different_script_bundle_hash_remains_blocked() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "amber-pkg",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let installed = vec![(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-test-integrity".to_string()),
+        )];
+        let approvals = std::collections::HashSet::from([(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            Some("sha512-test-integrity".to_string()),
+            "sha256-reviewed-other-bytes".to_string(),
+        )]);
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+
+        assert_eq!(blocked.len(), 1);
     }
 
     #[test]

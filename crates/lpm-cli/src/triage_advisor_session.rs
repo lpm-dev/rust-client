@@ -42,10 +42,12 @@
 //! # Ephemeral by construction
 //!
 //! Approvals live in memory for the lifetime of this `AdvisorSession`
-//! and never persist:
+//! and never persist as trust state:
 //! - No `trustedDependencies` entry is written.
-//! - No new on-disk state is created (the build-state blocked set is
-//!   still computed by the existing capture path; advisor-approved
+//! - The L4 cache may persist an exact source/content/prompt verdict, but a
+//!   cache hit creates a new in-memory approval for the current install only.
+//! - The build-state blocked set is still computed by the existing capture
+//!   path; advisor-approved
 //!   packages are excluded from it ONLY when auto-build will actually
 //!   execute their scripts this run — see [`select_approvals_for_capture`]
 //!   in [`crate::commands::install`] for the conditional gate. When
@@ -74,16 +76,28 @@ use crate::output;
 /// Type alias for the ephemeral advisor approval key.
 ///
 /// Keyed on `(name, version, source, integrity, script_bundle_hash)`.
-/// The script-bundle hash folds every `(phase, body)` pair the
-/// advisor evaluated into a SHA-256 digest. Today the same digest
-/// applies to every script of the package (whole-package
-/// classification); if a future refactor moves to per-phase
-/// classification, the key automatically distinguishes them. The
-/// The source and integrity slots keep exact install identity; the bundle-hash
-/// slot keeps script-aware identity (so an approval can't leak to
-/// a sibling phase or to a different script body that happens to
-/// share the same package coordinate).
+/// The source and integrity slots keep exact install identity. The
+/// script-bundle slot is the package's canonical install-script hash,
+/// including delegated file content, so approval cannot cross changed
+/// executable bytes.
 pub type AdvisorApprovalKey = (String, String, Option<String>, Option<String>, String);
+
+pub(crate) fn contains_exact_approval(
+    approvals: &HashSet<AdvisorApprovalKey>,
+    name: &str,
+    version: &str,
+    source: Option<&str>,
+    integrity: Option<&str>,
+    script_bundle_hash: &str,
+) -> bool {
+    approvals.iter().any(|(n, v, s, i, h)| {
+        n == name
+            && v == version
+            && s.as_deref() == source
+            && i.as_deref() == integrity
+            && h == script_bundle_hash
+    })
+}
 
 struct AdvisorClassification {
     name: String,
@@ -93,108 +107,6 @@ struct AdvisorClassification {
     script_bundle_hash: String,
     outcome: PackageAdvisorOutcome,
     has_phases: bool,
-}
-
-/// Hash an ordered `(phase, body)` slice into a hex SHA-256 digest.
-/// Used to fold script bodies into [`AdvisorApprovalKey`].
-///
-/// Order is preserved (the caller passes phases in
-/// `EXECUTED_INSTALL_PHASES` order, matching `compute_script_hash`'s
-/// phase ordering). Distinct field separators (`0x1e` records,
-/// `0x00` fields) prevent the `phase="ab" body="cd"` /
-/// `phase="abc" body="d"` ambiguity that naive concatenation would
-/// have.
-pub fn compute_script_bundle_hash(amber_phases: &[(String, String)]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for (phase, body) in amber_phases {
-        hasher.update(phase.as_bytes());
-        hasher.update([0x00]);
-        hasher.update(body.as_bytes());
-        hasher.update([0x1e]);
-    }
-    hex::encode(hasher.finalize())
-}
-
-#[cfg(test)]
-mod bundle_hash_tests {
-    use super::compute_script_bundle_hash;
-
-    /// Identical phase lists hash identically.
-    #[test]
-    fn bundle_hash_is_deterministic_for_same_input() {
-        let a = vec![("preinstall".into(), "echo a".into())];
-        assert_eq!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&a)
-        );
-    }
-
-    /// A different script body produces a different bundle hash. Pins the
-    /// per-script identity property the approval key is supposed to
-    /// guarantee against a future per-phase refactor.
-    #[test]
-    fn bundle_hash_changes_when_body_changes() {
-        let a = vec![("preinstall".into(), "echo a".into())];
-        let b = vec![("preinstall".into(), "echo b".into())];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Different phase → different hash, even with identical body.
-    #[test]
-    fn bundle_hash_changes_when_phase_changes() {
-        let a = vec![("preinstall".into(), "echo a".into())];
-        let b = vec![("postinstall".into(), "echo a".into())];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Order matters — `[a, b]` and `[b, a]` hash differently.
-    #[test]
-    fn bundle_hash_changes_with_phase_order() {
-        let a = vec![
-            ("preinstall".into(), "echo one".into()),
-            ("postinstall".into(), "echo two".into()),
-        ];
-        let b = vec![
-            ("postinstall".into(), "echo two".into()),
-            ("preinstall".into(), "echo one".into()),
-        ];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Distinct field separators close the
-    /// `phase="ab" body="cd"` vs `phase="abc" body="d"`
-    /// concatenation-ambiguity gap.
-    #[test]
-    fn bundle_hash_disambiguates_field_boundaries() {
-        let a = vec![("ab".into(), "cd".into())];
-        let b = vec![("abc".into(), "d".into())];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Empty bundle still produces a stable hash (used as the
-    /// "no amber phases" sentinel — `has_phases` filters them out at
-    /// the call site, but the helper must still be total).
-    #[test]
-    fn bundle_hash_empty_input_is_stable() {
-        let empty: Vec<(String, String)> = Vec::new();
-        let h1 = compute_script_bundle_hash(&empty);
-        let h2 = compute_script_bundle_hash(&empty);
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64, "32-byte SHA-256 encoded as 64 hex chars");
-    }
 }
 
 /// Max in-flight advisor classifications inside
@@ -473,7 +385,7 @@ impl AdvisorSession {
                             version: c.version.clone(),
                             source: c.source.clone(),
                             integrity: c.integrity.clone(),
-                            script_bundle_hash: compute_script_bundle_hash(&c.amber_phases),
+                            script_bundle_hash: c.script_bundle_hash.clone(),
                             outcome,
                             has_phases: !c.amber_phases.is_empty(),
                         };
@@ -524,7 +436,7 @@ impl AdvisorSession {
                                     version: c.version.clone(),
                                     source: c.source.clone(),
                                     integrity: c.integrity.clone(),
-                                    script_bundle_hash: compute_script_bundle_hash(&c.amber_phases),
+                                    script_bundle_hash: c.script_bundle_hash.clone(),
                                     outcome: package_verdict,
                                     has_phases: !c.amber_phases.is_empty(),
                                 };
@@ -556,7 +468,7 @@ impl AdvisorSession {
                         version: c.version.clone(),
                         source: c.source.clone(),
                         integrity: c.integrity.clone(),
-                        script_bundle_hash: compute_script_bundle_hash(&c.amber_phases),
+                        script_bundle_hash: c.script_bundle_hash.clone(),
                         outcome: package_verdict,
                         has_phases: !c.amber_phases.is_empty(),
                     }
@@ -628,6 +540,10 @@ pub struct AmberPackageRequest {
     /// the request must carry the same identity the downstream
     /// trust-evaluation path will use.
     pub integrity: Option<String>,
+    /// Canonical install-script hash from `lpm-security`. It covers every
+    /// executable install phase and the delegated file graph, not only the
+    /// amber prompt text.
+    pub script_bundle_hash: String,
     /// `repository` URL from the package manifest (typically
     /// `package.json > repository.url` or the
     /// legacy shorthand string). Forwarded to the advisor prompt as
@@ -747,6 +663,8 @@ fn build_package_cache_key(
     build_cache_key(&CacheKeyInputs {
         package_name: &c.name,
         package_version: &c.version,
+        source: c.source.as_deref(),
+        integrity: c.integrity.as_deref(),
         amber_phases: &phases,
         repository: c.repository.as_deref(),
         referenced_scripts: &refs,
@@ -945,6 +863,7 @@ mod tests {
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            script_bundle_hash: "sha256-test-p".into(),
             repository: None,
             referenced_scripts: Vec::new(),
             amber_phases: vec![("postinstall".into(), "tsc".into())],
@@ -980,6 +899,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: "sha256-test-approve".into(),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
@@ -989,6 +909,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: "sha256-test-manual".into(),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
@@ -998,6 +919,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: "sha256-test-abstain".into(),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
@@ -1007,6 +929,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: "sha256-test-env-fail".into(),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
@@ -1016,6 +939,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: "sha256-test-int-fail".into(),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: one_phase(),
@@ -1062,6 +986,7 @@ mod tests {
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            script_bundle_hash: "sha256-test-two-phase".into(),
             repository: None,
             referenced_scripts: Vec::new(),
             amber_phases: vec![
@@ -1097,6 +1022,7 @@ mod tests {
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            script_bundle_hash: "sha256-test-empty".into(),
             repository: None,
             referenced_scripts: Vec::new(),
             amber_phases: Vec::new(),
@@ -1114,31 +1040,6 @@ mod tests {
         assert!(!should_advise(Some(StaticTier::Green)));
         assert!(!should_advise(Some(StaticTier::Red)));
         assert!(!should_advise(None));
-    }
-
-    #[tokio::test]
-    async fn ephemeral_no_persistent_state_handles() {
-        // Sanity: the session exposes ONLY a read-only borrow of the
-        // approvals set. There is no method that writes to disk or
-        // returns an owned Vec destined for serialization. This is a
-        // type-level guarantee of the "ephemeral" contract — a future
-        // contributor accidentally persisting approvals would need to
-        // grow the API.
-        //
-        // We assert structurally: serde derives intentionally absent
-        // on AdvisorSession + AmberPackageRequest.
-        fn assert_no_serde<T>() {
-            // Compile-time check via trait absence — wouldn't compile
-            // if a Serialize impl existed; here we just confirm the
-            // negative case via the impl-not-defined position.
-            //
-            // Practically the assertion is "look at the source": no
-            // #[derive(Serialize)] anywhere in this module. This test
-            // is documentation; the real guard is review.
-            let _ = std::marker::PhantomData::<T>;
-        }
-        assert_no_serde::<AdvisorSession>();
-        assert_no_serde::<AmberPackageRequest>();
     }
 
     /// Synthetic slow advisor for the parallelism test. Holds for
@@ -1214,6 +1115,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: format!("sha256-test-{i}"),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: vec![("postinstall".into(), "node install.js".into())],
@@ -1283,6 +1185,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                script_bundle_hash: format!("sha256-test-{i}"),
                 repository: None,
                 referenced_scripts: Vec::new(),
                 amber_phases: vec![("postinstall".into(), "node install.js".into())],
@@ -1375,6 +1278,7 @@ mod tests {
             version: "0.34.4".into(),
             source: None,
             integrity: Some("sha512-abc".into()),
+            script_bundle_hash: "sha256-test-sharp".into(),
             repository: None,
             referenced_scripts: Vec::new(),
             amber_phases: vec![("install".into(), "node install.js".into())],
@@ -1410,6 +1314,7 @@ mod tests {
             version: "0.34.4".into(),
             source: None,
             integrity: Some("sha512-abc".into()),
+            script_bundle_hash: "sha256-test-sharp".into(),
             repository: None,
             referenced_scripts: Vec::new(),
             amber_phases: vec![("install".into(), "node install.js".into())],
@@ -1425,6 +1330,99 @@ mod tests {
             warm_log.iter().all(|l| l != "classify:sharp"),
             "warm run must NOT call adapter.classify_amber (cache hit should skip): {warm_log:?}"
         );
+    }
+
+    #[test]
+    fn cache_key_changes_with_source_and_integrity_identity() {
+        let request = |source: Option<&str>, integrity: Option<&str>| AmberPackageRequest {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            source: source.map(str::to_owned),
+            integrity: integrity.map(str::to_owned),
+            script_bundle_hash: "sha256-test-shared".into(),
+            repository: None,
+            referenced_scripts: Vec::new(),
+            amber_phases: vec![("postinstall".into(), "node install.js".into())],
+        };
+        let registry = build_package_cache_key(
+            &request(
+                Some("registry+https://registry.example"),
+                Some("sha512-registry"),
+            ),
+            "template",
+            "provider",
+            "model",
+        );
+        let local = build_package_cache_key(
+            &request(Some("file:./shared"), None),
+            "template",
+            "provider",
+            "model",
+        );
+        let changed_integrity = build_package_cache_key(
+            &request(
+                Some("registry+https://registry.example"),
+                Some("sha512-other"),
+            ),
+            "template",
+            "provider",
+            "model",
+        );
+
+        assert_ne!(registry, local);
+        assert_ne!(registry, changed_integrity);
+    }
+
+    #[tokio::test]
+    async fn approval_hash_changes_with_referenced_script_content() {
+        let packages = tempfile::tempdir().unwrap();
+        let script_hash = |slot: &str, content: &str| {
+            let package_dir = packages.path().join(slot);
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::write(
+                package_dir.join("package.json"),
+                r#"{"name":"mutable-local","version":"1.0.0","scripts":{"postinstall":"node install.js"}}"#,
+            )
+            .unwrap();
+            std::fs::write(package_dir.join("install.js"), content).unwrap();
+            lpm_security::script_hash::compute_script_hash(&package_dir)
+                .expect("script hash with delegated file")
+        };
+        let first_hash = script_hash("first", "first bytes");
+        let changed_hash = script_hash("changed", "changed bytes");
+        assert_ne!(first_hash, changed_hash);
+
+        let call_log = Arc::new(Mutex::new(Vec::new()));
+        let fake = FakeAdvisor {
+            provider: Provider::ClaudeCli,
+            detect_result: true,
+            test_invoke_result: Ok(AdvisorVerdict::Approve),
+            classify_results: Mutex::new(vec![
+                Ok(AdvisorVerdict::Approve),
+                Ok(AdvisorVerdict::Approve),
+            ]),
+            call_log,
+        };
+        let mut session = session_with_fake(fake);
+        let request = |content: &str, script_bundle_hash: String| AmberPackageRequest {
+            name: "mutable-local".into(),
+            version: "1.0.0".into(),
+            source: Some("file:./mutable-local".into()),
+            integrity: None,
+            script_bundle_hash,
+            repository: None,
+            referenced_scripts: vec![("install.js".into(), content.into())],
+            amber_phases: vec![("postinstall".into(), "node install.js".into())],
+        };
+
+        session
+            .classify_amber(&[
+                request("first bytes", first_hash),
+                request("changed bytes", changed_hash),
+            ])
+            .await;
+
+        assert_eq!(session.approvals().len(), 2);
     }
 
     /// Same default TTL as the production cache. Tests use this so a

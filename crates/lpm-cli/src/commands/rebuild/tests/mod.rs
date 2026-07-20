@@ -1766,7 +1766,6 @@ fn triage_promotes_green_tier_without_manifest_binding() {
     let pkg_dir = write_scripted_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
     let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-
     let reason = evaluate_trust(
         &pkg_dir,
         "some-native-pkg",
@@ -2240,6 +2239,7 @@ fn advisor_approval_promotes_amber_under_triage() {
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
     let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+    let reviewed_hash = compute_script_hash(&pkg_dir).unwrap();
 
     let mut approvals = std::collections::HashSet::new();
     approvals.insert((
@@ -2247,7 +2247,7 @@ fn advisor_approval_promotes_amber_under_triage() {
         "1.0.0".to_string(),
         None,
         None,
-        String::new(),
+        reviewed_hash,
     ));
 
     let reason = evaluate_trust(
@@ -2266,6 +2266,40 @@ fn advisor_approval_promotes_amber_under_triage() {
     );
     assert_eq!(reason, TrustReason::AdvisorApprovedThisRun);
     assert!(reason.is_trusted());
+}
+
+#[test]
+fn advisor_approval_with_different_script_bundle_hash_stays_untrusted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+    let store = PackageStore::at(dir.path().join("store"));
+    let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+    let approvals = std::collections::HashSet::from([(
+        "amber-pkg".to_string(),
+        "1.0.0".to_string(),
+        None,
+        None,
+        "sha256-reviewed-other-bytes".to_string(),
+    )]);
+
+    let reason = evaluate_trust(
+        &pkg_dir,
+        "amber-pkg",
+        "1.0.0",
+        None,
+        &scripts,
+        &policy,
+        dir.path(),
+        ScriptPolicy::Triage,
+        false,
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
+        Some(&approvals),
+    );
+
+    assert_eq!(reason, TrustReason::Untrusted);
 }
 
 #[test]
@@ -2467,6 +2501,7 @@ fn advisor_approval_does_not_leak_across_sources_with_same_coord() {
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
     let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+    let reviewed_hash = compute_script_hash(&pkg_dir).unwrap();
 
     // Approve ONLY the integrity-bearing variant.
     let mut approvals = std::collections::HashSet::new();
@@ -2475,7 +2510,7 @@ fn advisor_approval_does_not_leak_across_sources_with_same_coord() {
         "1.0.0".to_string(),
         None,
         Some("sha512-registry-integrity".to_string()),
-        String::new(),
+        reviewed_hash,
     ));
 
     // Querying for the SAME coord but a DIFFERENT integrity must
