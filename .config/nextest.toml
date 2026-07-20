@@ -7,6 +7,7 @@
 # because `security add-generic-password` delete+add is not atomic.
 # Run these tests serially to avoid the race.
 keychain-serial = { max-threads = 1 }
+verdaccio = { max-threads = 4 }
 
 [profile.audit]
 default-filter = "test(install_realworld_nextjs_fixture_succeeds_through_verdaccio)"
@@ -14,3 +15,7 @@ default-filter = "test(install_realworld_nextjs_fixture_succeeds_through_verdacc
 [[profile.default.overrides]]
 filter = "package(lpm-vault) & test(~tests::)"
 test-group = "keychain-serial"
+
+[[profile.default.overrides]]
+filter = "package(lpm-workflows) & binary_id(/install_real_registry/)"
+test-group = "verdaccio"

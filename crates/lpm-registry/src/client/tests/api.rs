@@ -152,6 +152,79 @@ async fn whoami_retries_429_and_sends_bearer_auth_header() {
 }
 
 #[tokio::test]
+async fn get_skills_sends_bearer_for_private_and_pending_versions() {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("skills-owner-token");
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/skills"))
+        .and(query_param("name", "owner.private-package"))
+        .and(query_param("version", "1.0.2"))
+        .and(header("authorization", "Bearer skills-owner-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "owner.private-package",
+            "version": "1.0.2",
+            "available": true,
+            "skillsCount": 0,
+            "skillsStatus": null,
+            "skills": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let response = client
+        .get_skills("owner.private-package", Some("1.0.2"))
+        .await
+        .expect("owner-authenticated skills lookup should succeed");
+
+    assert_eq!(response.version.as_deref(), Some("1.0.2"));
+    assert!(response.skills.is_empty());
+}
+
+#[tokio::test]
+async fn get_skills_allows_anonymous_public_reads_without_a_bearer() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/skills"))
+        .and(query_param("name", "owner.public-package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "owner.public-package",
+            "version": "1.0.0",
+            "available": true,
+            "skillsCount": 0,
+            "skillsStatus": null,
+            "skills": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let response = client
+        .get_skills("owner.public-package", None)
+        .await
+        .expect("anonymous public skills lookup should succeed");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should retain received requests");
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].headers.contains_key("authorization"));
+    assert_eq!(response.version.as_deref(), Some("1.0.0"));
+    assert!(response.skills.is_empty());
+}
+
+#[tokio::test]
 async fn whoami_retries_500_then_succeeds_after_backoff() {
     use std::sync::{
         Arc,

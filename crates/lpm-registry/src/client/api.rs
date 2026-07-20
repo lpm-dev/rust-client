@@ -309,7 +309,9 @@ impl RegistryClient {
 
     /// Get Agent Skills for a package.
     ///
-    /// Posture: `AnonymousPreferred`.
+    /// Posture: `AuthRequired` — private package skills and publisher-only
+    /// pending versions must follow the same principal as package metadata
+    /// and tarball access.
     ///
     /// Calls: GET /api/registry/skills?name=owner.package-name
     pub async fn get_skills(
@@ -325,7 +327,7 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
             .await
     }
 
