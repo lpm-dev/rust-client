@@ -700,13 +700,14 @@ fn compute_blocked_packages_with_metadata_and_baseline(
         let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
         if let Some(set) = extras.advisor_approvals
+            && let Some(script_hash) = script_hash.as_deref()
             && crate::triage_advisor_session::contains_exact_approval(
                 set,
                 name,
                 version,
                 source,
                 integrity.as_deref(),
-                &script_hash,
+                script_hash,
             )
         {
             return None;
@@ -759,7 +760,7 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             version,
             source,
             integrity.as_deref(),
-            Some(&script_hash),
+            script_hash.as_deref(),
         );
 
         let (is_blocked, binding_drift) = match trust {
@@ -829,7 +830,7 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             version: version.clone(),
             source: source.map(str::to_string),
             integrity: integrity.clone(),
-            script_hash: Some(script_hash),
+            script_hash,
             phases_present,
             binding_drift,
             // populates `static_tier` from the
@@ -1693,6 +1694,7 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+        write_delegate_fixtures(&pkg_dir, scripts);
     }
 
     fn fake_store_at(store_root: &Path) -> PackageStore {
@@ -2259,6 +2261,7 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(pkg_dir.join("install.js"), "module.exports = true\n").unwrap();
     }
 
     #[test]
@@ -2487,6 +2490,25 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+        write_delegate_fixtures(&pkg_dir, scripts);
+    }
+
+    fn write_delegate_fixtures(pkg_dir: &Path, scripts: &serde_json::Value) {
+        let Some(scripts) = scripts.as_object() else {
+            return;
+        };
+        for body in scripts.values().filter_map(serde_json::Value::as_str) {
+            let Some(relative_path) = lpm_security::static_gate::extract_delegate_path(body) else {
+                continue;
+            };
+            let path = pkg_dir.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            if !path.exists() {
+                std::fs::write(path, "module.exports = true\n").unwrap();
+            }
+        }
     }
 
     #[test]
@@ -2816,6 +2838,45 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_delegate_graph_remains_blocked_without_reusable_hash() {
+        let project = tempdir().unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "incomplete-local",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node missing.js"}),
+        );
+        std::fs::remove_file(
+            store
+                .package_dir("incomplete-local", "1.0.0")
+                .join("missing.js"),
+        )
+        .unwrap();
+        let installed = vec![("incomplete-local".to_string(), "1.0.0".to_string(), None)];
+        let approvals = std::collections::HashSet::from([(
+            "incomplete-local".to_string(),
+            "1.0.0".to_string(),
+            None,
+            None,
+            "sha256-stale-approval".to_string(),
+        )]);
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].script_hash, None);
+    }
+
+    #[test]
     fn compute_with_metadata_worst_wins_amber_dominates_green_across_phases() {
         let project = tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
@@ -3128,6 +3189,7 @@ mod tests {
                 r#"{"name":"shared","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
             )
             .unwrap();
+            std::fs::write(package_dir.join("install.js"), "module.exports = true\n").unwrap();
             let identity = InstalledPackageIdentity::new(
                 "shared",
                 "1.0.0",

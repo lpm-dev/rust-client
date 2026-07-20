@@ -90,6 +90,21 @@ fn seed_scripted_package(
     dir
 }
 
+fn seed_package_without_scripts(project: &TempProject, name: &str, version: &str) {
+    let safe = name.replace(['/', '\\'], "+");
+    let dir = project
+        .store_dir()
+        .join("v1")
+        .join(format!("{safe}@{version}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(dir.join(".integrity"), "sha512-fixture-skip-verify").unwrap();
+}
+
 /// Materialize a per-package wrapper at
 /// `<project>/.lpm/wrappers/<safe>@<v>/node_modules/<name>/` by copying
 /// the store entry. A prior fix closed the silent store-fallback
@@ -717,6 +732,27 @@ fn rebuild_exact_name_does_not_select_unrelated_suffix_names() {
         .expect("dry-run packages array");
     assert_eq!(packages.len(), 1, "exact name selected suffix packages");
     assert_eq!(packages[0]["name"], "foo");
+}
+
+#[test]
+fn rebuild_exact_installed_name_without_scripts_does_not_select_suffix_package() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-exact-no-scripts", None, &[]);
+    seed_package_without_scripts(&project, "foo", "1.0.0");
+    seed_scripted_package(&project, "alice.foo", "1.0.0", "echo alice");
+    write_lockfile_for_packages(&project, &[("foo", "1.0.0"), ("alice.foo", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "foo", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild foo --dry-run --json");
+
+    assert!(
+        !out.status.success(),
+        "installed exact package without scripts must not select alice.foo\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
 
 #[test]

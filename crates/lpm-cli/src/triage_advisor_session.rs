@@ -208,10 +208,14 @@ impl AdvisorSession {
             );
             return Self::none(Some(slug.to_string()));
         };
-        let adapter: Box<dyn Advisor> = match provider {
-            Provider::ClaudeCli => Box::new(ClaudeCliAdapter),
-            Provider::Codex => Box::new(CodexAdapter),
-            Provider::Ollama => Box::new(OllamaAdapter::default()),
+        let (adapter, effective_model): (Box<dyn Advisor>, Option<String>) = match provider {
+            Provider::ClaudeCli => (Box::new(ClaudeCliAdapter), None),
+            Provider::Codex => (Box::new(CodexAdapter), None),
+            Provider::Ollama => {
+                let adapter = OllamaAdapter::default();
+                let model = adapter.model.clone();
+                (Box::new(adapter), Some(model))
+            }
         };
         if !adapter.detect().await {
             warn_once(
@@ -231,7 +235,9 @@ impl AdvisorSession {
                 // them. Cache-open failure is non-fatal: the install
                 // continues without a cache.
                 let cache = open_cache_or_warn(json_output);
-                let model_version = provider_version(provider).await.unwrap_or_default();
+                let provider_version = provider_version(provider).await.unwrap_or_default();
+                let model_version =
+                    cache_model_identity(provider, &provider_version, effective_model.as_deref());
                 let template_hash = prompt_template_hash();
                 Self {
                     adapter: Some(adapter),
@@ -638,6 +644,21 @@ fn open_cache_or_warn(json_output: bool) -> Option<Arc<L4Cache>> {
     }
 }
 
+fn cache_model_identity(
+    provider: Provider,
+    provider_version: &str,
+    effective_model: Option<&str>,
+) -> String {
+    let Some(effective_model) = effective_model.filter(|_| provider == Provider::Ollama) else {
+        return provider_version.to_string();
+    };
+    let mut identity = String::with_capacity(provider_version.len() + effective_model.len() + 1);
+    identity.push_str(provider_version);
+    identity.push('\0');
+    identity.push_str(effective_model);
+    identity
+}
+
 /// — build the L4-cache key for one [`AmberPackageRequest`].
 /// Borrows the request's owned strings without copying. Folds in the
 /// repository URL and the referenced-scripts content so a manifest
@@ -665,6 +686,7 @@ fn build_package_cache_key(
         package_version: &c.version,
         source: c.source.as_deref(),
         integrity: c.integrity.as_deref(),
+        script_bundle_hash: &c.script_bundle_hash,
         amber_phases: &phases,
         repository: c.repository.as_deref(),
         referenced_scripts: &refs,
@@ -1371,6 +1393,43 @@ mod tests {
 
         assert_ne!(registry, local);
         assert_ne!(registry, changed_integrity);
+    }
+
+    #[test]
+    fn cache_key_changes_with_canonical_script_hash_when_prompt_is_unchanged() {
+        let request = |script_bundle_hash: &str| AmberPackageRequest {
+            name: "mutable-local".into(),
+            version: "1.0.0".into(),
+            source: Some("file:./mutable-local".into()),
+            integrity: None,
+            script_bundle_hash: script_bundle_hash.into(),
+            repository: None,
+            referenced_scripts: vec![("install.js".into(), "truncated prompt bytes".into())],
+            amber_phases: vec![("postinstall".into(), "node install.js".into())],
+        };
+
+        let first = build_package_cache_key(
+            &request("sha256-canonical-first"),
+            "template",
+            "provider",
+            "model",
+        );
+        let changed = build_package_cache_key(
+            &request("sha256-canonical-changed"),
+            "template",
+            "provider",
+            "model",
+        );
+
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn ollama_cache_identity_includes_effective_model() {
+        assert_ne!(
+            cache_model_identity(Provider::Ollama, "ollama version 1", Some("llama3.2")),
+            cache_model_identity(Provider::Ollama, "ollama version 1", Some("qwen3")),
+        );
     }
 
     #[tokio::test]

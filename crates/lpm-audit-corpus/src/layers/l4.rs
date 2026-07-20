@@ -293,6 +293,7 @@ async fn classify_one_with_advisor(
         package_version: version,
         source: None,
         integrity: None,
+        script_bundle_hash: "audit-corpus-unresolved",
         amber_phases: &cache_phases,
         repository: pkg.repository.as_deref(),
         referenced_scripts: &cache_refs,

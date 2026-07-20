@@ -1410,6 +1410,8 @@ mod tests {
                 ),
             )
             .unwrap();
+            let script_path = script.strip_prefix("node ").unwrap();
+            std::fs::write(package_dir.join(script_path), format!("// {suffix}\n")).unwrap();
             LinkMeta {
                 schema: 1,
                 graph_key: format!("shared@1.0.0+{suffix}"),

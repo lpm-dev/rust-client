@@ -1,27 +1,27 @@
 //! L4 verdict cache.
 //!
-//! Persists `{cache-key → (verdict, cached_at)}` mappings so the second
-//! and subsequent installs of any amber-classified package on a given
-//! machine skip the LLM round-trip entirely.
+//! Persists `{cache-key → (verdict, cached_at)}` mappings so later installs
+//! with the same complete review identity can skip the LLM round-trip.
 //!
 //! # Cache identity
 //!
-//! Cache key = SHA-256 over the five axes a cached verdict implicitly
+//! Cache key = SHA-256 over the six axes a cached verdict implicitly
 //! depends on:
 //!
 //! 1. **Install identity** — `(name, version, source, integrity)` keeps
 //!    registry, file, workspace, and content-pin verdicts independent.
-//! 2. **Script identity** — `(phase, body)` for every amber phase plus
-//!    every referenced file embedded in the prompt.
-//! 3. **Prompt template hash** — rotates on any prompt-template change
+//! 2. **Executable identity** — the canonical script-bundle hash binds the
+//!    verdict to every executable lifecycle phase and reachable local file.
+//! 3. **Prompt evidence** — `(phase, body)` for every amber phase, every
+//!    referenced file embedded in the prompt, and the repository hint.
+//! 4. **Prompt template hash** — rotates on any prompt-template change
 //!    via [`crate::prompt_template_hash`]. A calibration bump
 //!    auto-invalidates every cached verdict the old template produced.
-//! 4. **Provider slug** — `claude-cli`, `codex`, `ollama`. Different
+//! 5. **Provider slug** — `claude-cli`, `codex`, `ollama`. Different
 //!    providers produce different verdicts on the same script; their
 //!    cache namespaces never collide.
-//! 5. **Model version** — captures provider-version drift the slug
-//!    doesn't (e.g. `claude-3-5-sonnet-20241022` vs
-//!    `claude-3-5-sonnet-20250101`).
+//! 6. **Model identity** — captures provider-version drift the slug does not
+//!    and includes the effective model selected for Ollama.
 //!
 //! Any one of these changing produces a different key; the affected
 //! entries are skipped on lookup and overwritten on the next classify.
@@ -68,7 +68,7 @@ use crate::AdvisorVerdict;
 /// Schema version for the on-disk cache file. Bump when the layout
 /// changes in a backward-incompatible way; older files are then
 /// silently discarded on load.
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Default verdict TTL. 30 days. After this, even an exact-key hit is
 /// treated as stale and the advisor is re-invoked.
@@ -379,6 +379,9 @@ pub struct CacheKeyInputs<'a> {
     /// Exact content integrity when available. Integrity-less local sources
     /// remain partitioned by `source`.
     pub integrity: Option<&'a str>,
+    /// Canonical hash of every executable lifecycle phase and its reachable
+    /// delegated file graph.
+    pub script_bundle_hash: &'a str,
     /// `(phase, body)` pairs in canonical order. Filter to amber-only
     /// before passing — green/red phases never reach L4 and would
     /// pollute the key.
@@ -408,8 +411,9 @@ pub struct CacheKeyInputs<'a> {
 /// inputs → same output across machines and runs.
 ///
 /// The hash folds every input axis the verdict depends on:
-/// package_name, package_version, source, integrity, each `(phase, body)`
-/// pair, referenced files, prompt_template_hash, provider_slug, and model_version.
+/// package_name, package_version, source, integrity, canonical script hash,
+/// each `(phase, body)` pair, referenced files, prompt_template_hash,
+/// provider_slug, and model_version.
 /// Distinct separators between fields prevent the
 /// `name="ab" version="cd"` / `name="abc" version="d"` ambiguity that
 /// a naive concatenation would have.
@@ -435,6 +439,8 @@ pub fn build_cache_key(inputs: &CacheKeyInputs<'_>) -> String {
     hash_optional_field(&mut h, inputs.source);
     h.update([FIELD_SEP]);
     hash_optional_field(&mut h, inputs.integrity);
+    h.update([FIELD_SEP]);
+    h.update(inputs.script_bundle_hash.as_bytes());
     h.update([FIELD_SEP]);
     for (phase, body) in inputs.amber_phases {
         h.update(phase.as_bytes());
@@ -506,6 +512,7 @@ mod tests {
             package_version: version,
             source: None,
             integrity: None,
+            script_bundle_hash: "sha256-test-script",
             amber_phases: phases,
             repository: None,
             referenced_scripts: &[],
@@ -529,6 +536,7 @@ mod tests {
             package_version: version,
             source: None,
             integrity: None,
+            script_bundle_hash: "sha256-test-script",
             amber_phases: phases,
             repository,
             referenced_scripts: &[],
@@ -552,6 +560,7 @@ mod tests {
             package_version: version,
             source: None,
             integrity: None,
+            script_bundle_hash: "sha256-test-script",
             amber_phases: phases,
             repository: None,
             referenced_scripts,
@@ -720,6 +729,7 @@ mod tests {
                 package_version: "1.0.0",
                 source,
                 integrity,
+                script_bundle_hash: "sha256-test-script",
                 amber_phases: &[("postinstall", "node install.js")],
                 repository: None,
                 referenced_scripts: &[],
@@ -742,6 +752,27 @@ mod tests {
             )
         );
         assert_ne!(key(None, None), key(Some(""), Some("")));
+    }
+
+    #[test]
+    fn cache_key_distinguishes_canonical_script_hash() {
+        let key = |script_bundle_hash: &str| {
+            build_cache_key(&CacheKeyInputs {
+                package_name: "mutable-local",
+                package_version: "1.0.0",
+                source: Some("file:./mutable-local"),
+                integrity: None,
+                script_bundle_hash,
+                amber_phases: &[("postinstall", "node install.js")],
+                repository: None,
+                referenced_scripts: &[("install.js", "truncated prompt bytes")],
+                prompt_template_hash: "template",
+                provider_slug: "provider",
+                model_version: "model",
+            })
+        };
+
+        assert_ne!(key("sha256-first"), key("sha256-changed"));
     }
 
     #[test]

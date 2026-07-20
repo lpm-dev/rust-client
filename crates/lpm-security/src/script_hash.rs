@@ -89,13 +89,12 @@ const FIELD_SEP: u8 = 0x00;
 /// from `RECORD_SEP` so the annotation can be distinguished from the
 /// start of the next phase.
 const DELEGATE_SEP: u8 = 0x1f;
-const DELEGATE_GRAPH_SEP: u8 = 0x1d;
 const MAX_DELEGATE_GRAPH_FILES: usize = 128;
 const MAX_DELEGATE_GRAPH_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptHashWithPhaseBodies {
-    pub hash: String,
+    pub hash: Option<String>,
     pub phase_bodies: Vec<(String, String)>,
 }
 
@@ -107,14 +106,15 @@ pub struct ScriptHashWithPhaseBodies {
 /// Returns:
 /// - `Some("sha256-<hex>")` if the package's `package.json` contains at
 ///   least one of the [`EXECUTED_INSTALL_PHASES`] entries with a non-empty body
-/// - `None` if the `package.json` is missing, malformed, or contains no
-///   install-time lifecycle scripts at all (callers should treat the
-///   absence as "this package has nothing to approve")
+///   and its delegated executable graph can be read completely
+/// - `None` if the manifest is unavailable, no install-time lifecycle scripts
+///   exist, or the delegated graph cannot be read completely; callers that
+///   know scripts exist must treat an unavailable hash as untrusted
 ///
 /// The function is pure: it reads disk but writes nothing. It does not
 /// touch any state outside `store_pkg_dir/package.json`.
 pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
-    Some(compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash)
+    compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash
 }
 
 pub fn compute_script_hash_with_phase_bodies(
@@ -126,6 +126,7 @@ pub fn compute_script_hash_with_phase_bodies(
     let scripts = parsed.get("scripts")?.as_object()?;
 
     let mut hasher = Sha256::new();
+    let mut complete = true;
     let mut phase_bodies = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
     for (i, phase) in EXECUTED_INSTALL_PHASES.iter().enumerate() {
         if i > 0 {
@@ -154,14 +155,11 @@ pub fn compute_script_hash_with_phase_bodies(
         // content-digest while changing entry points (rename →
         // different annotation → different hash).
         //
-        // Read errors (file missing, IO failure) hash an explicit
-        // sentinel rather than skipping silently. A package that
-        // declares `node install.js` but ships no `install.js`
-        // either fails at exec time (different problem) or trips
-        // the sentinel as a stable marker. Either way, the hash is
-        // deterministic.
+        // A partial graph cannot safely identify the executable bytes. Keep
+        // the phase bodies for review, but withhold a reusable hash so trust
+        // and advisor approvals fail closed.
         if let Some(rel_path) = extract_delegate_path(body) {
-            hash_delegate_graph(&mut hasher, store_pkg_dir, &rel_path);
+            complete &= hash_delegate_graph(&mut hasher, store_pkg_dir, &rel_path);
         }
     }
 
@@ -170,35 +168,29 @@ pub fn compute_script_hash_with_phase_bodies(
     }
 
     Some(ScriptHashWithPhaseBodies {
-        hash: format!("sha256-{}", hex_lower(&hasher.finalize())),
+        hash: complete.then(|| format!("sha256-{}", hex_lower(&hasher.finalize()))),
         phase_bodies,
     })
 }
 
-fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
+fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) -> bool {
     let Some(entry_rel) = normalize_relative_path(rel_path) else {
-        hasher.update([DELEGATE_SEP]);
-        hasher.update(rel_path.as_bytes());
-        hasher.update([FIELD_SEP]);
-        hasher.update(b"<delegate-path-invalid>");
-        return;
+        return false;
     };
 
-    let root = store_pkg_dir
-        .canonicalize()
-        .unwrap_or_else(|_| store_pkg_dir.to_path_buf());
+    let Ok(root) = store_pkg_dir.canonicalize() else {
+        return false;
+    };
     let mut queue = VecDeque::from([(entry_rel, 0usize)]);
     let mut seen = HashSet::new();
     let mut visited = 0usize;
 
     while let Some((rel, depth)) = queue.pop_front() {
-        if visited >= MAX_DELEGATE_GRAPH_FILES {
-            hasher.update([DELEGATE_GRAPH_SEP]);
-            hasher.update(b"<delegate-graph-file-limit>");
-            break;
-        }
         if !seen.insert(rel.clone()) {
             continue;
+        }
+        if visited >= MAX_DELEGATE_GRAPH_FILES {
+            return false;
         }
         visited += 1;
 
@@ -210,45 +202,46 @@ fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str
         let abs = store_pkg_dir.join(&rel);
         let canonical = match abs.canonicalize() {
             Ok(path) => path,
-            Err(_) => {
-                hasher.update(b"<delegate-unreadable>");
-                continue;
-            }
+            Err(_) => return false,
         };
         if !canonical.starts_with(&root) {
-            hasher.update(b"<delegate-outside-package>");
-            continue;
+            return false;
         }
 
         let bytes = match std::fs::read(&canonical) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                hasher.update(b"<delegate-unreadable>");
-                continue;
-            }
+            Err(_) => return false,
         };
         let mut inner = Sha256::new();
         inner.update(&bytes);
         hasher.update(inner.finalize());
 
-        if depth >= MAX_DELEGATE_GRAPH_DEPTH {
-            hasher.update([DELEGATE_GRAPH_SEP]);
-            hasher.update(b"<delegate-graph-depth-limit>");
-            continue;
-        }
-
-        let mut next =
-            discover_local_js_dependencies(&bytes, rel.parent().unwrap_or(Path::new("")));
+        let Some(mut next) = discover_local_js_dependencies(
+            &bytes,
+            rel.parent().unwrap_or(Path::new("")),
+            store_pkg_dir,
+        ) else {
+            return false;
+        };
         next.sort();
+        if depth >= MAX_DELEGATE_GRAPH_DEPTH && !next.is_empty() {
+            return false;
+        }
         for candidate in next {
             if !seen.contains(&candidate) {
                 queue.push_back((candidate, depth + 1));
             }
         }
     }
+
+    true
 }
 
-fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf> {
+fn discover_local_js_dependencies(
+    bytes: &[u8],
+    base_dir: &Path,
+    store_pkg_dir: &Path,
+) -> Option<Vec<PathBuf>> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -257,14 +250,16 @@ fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf>
             let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
             };
-            for candidate in resolve_local_js_specifier(base_dir, spec) {
-                if seen.insert(candidate.clone()) {
-                    out.push(candidate);
-                }
+            if !(spec.starts_with("./") || spec.starts_with("../")) {
+                continue;
+            }
+            let candidate = resolve_local_js_specifier(store_pkg_dir, base_dir, spec)?;
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
             }
         }
     }
-    out
+    Some(out)
 }
 
 fn import_regexes() -> &'static [regex::Regex] {
@@ -282,14 +277,17 @@ fn import_regexes() -> &'static [regex::Regex] {
     })
 }
 
-fn resolve_local_js_specifier(base_dir: &Path, specifier: &str) -> Vec<PathBuf> {
-    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
-        return Vec::new();
-    }
-    let Some(path) = normalize_relative_path(base_dir.join(specifier)) else {
-        return Vec::new();
-    };
-    js_resolution_candidates(path)
+fn resolve_local_js_specifier(
+    store_pkg_dir: &Path,
+    base_dir: &Path,
+    specifier: &str,
+) -> Option<PathBuf> {
+    let path = normalize_relative_path(base_dir.join(specifier))?;
+    let candidates = js_resolution_candidates(path);
+    candidates
+        .iter()
+        .find(|candidate| std::fs::symlink_metadata(store_pkg_dir.join(candidate)).is_ok())
+        .cloned()
 }
 
 fn js_resolution_candidates(path: PathBuf) -> Vec<PathBuf> {
@@ -381,6 +379,7 @@ mod tests {
             dir.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
         let hash = compute_script_hash(dir.path()).unwrap();
         assert!(
             hash.starts_with("sha256-"),
@@ -413,11 +412,12 @@ mod tests {
                 "prepare": "ignored",
             }),
         );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
 
         let combined = compute_script_hash_with_phase_bodies(dir.path()).unwrap();
         assert_eq!(
             combined.hash,
-            compute_script_hash(dir.path()).expect("script hash")
+            Some(compute_script_hash(dir.path()).expect("script hash"))
         );
         assert_eq!(
             combined.phase_bodies,
@@ -464,6 +464,7 @@ mod tests {
                 "postinstall": "echo done",
             }),
         );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
         let h1 = compute_script_hash(dir.path()).unwrap();
         let h2 = compute_script_hash(dir.path()).unwrap();
         let h3 = compute_script_hash(dir.path()).unwrap();
@@ -566,6 +567,8 @@ mod tests {
                 "test": "vitest",
             }),
         );
+        fs::write(dir1.path().join("install.js"), "module.exports = true\n").unwrap();
+        fs::write(dir2.path().join("install.js"), "module.exports = true\n").unwrap();
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
         assert_eq!(
@@ -581,6 +584,8 @@ mod tests {
         let dir2 = tempdir().unwrap();
         write_pkg_json(dir1.path(), &serde_json::json!({"install": "node a.js"}));
         write_pkg_json(dir2.path(), &serde_json::json!({"install": "node b.js"}));
+        fs::write(dir1.path().join("a.js"), "module.exports = true\n").unwrap();
+        fs::write(dir2.path().join("b.js"), "module.exports = true\n").unwrap();
         assert_ne!(
             compute_script_hash(dir1.path()).unwrap(),
             compute_script_hash(dir2.path()).unwrap(),
@@ -805,23 +810,103 @@ mod tests {
         assert_eq!(h, h2);
     }
 
-    /// A delegate-shape script body whose target file is missing
-    /// hashes a stable sentinel rather than crashing or skipping.
     #[test]
-    fn compute_script_hash_deterministic_when_delegated_file_is_missing() {
-        let dir1 = tempdir().unwrap();
-        let dir2 = tempdir().unwrap();
+    fn compute_script_hash_returns_none_when_delegated_file_is_missing() {
+        let dir = tempdir().unwrap();
         write_pkg_json(
-            dir1.path(),
+            dir.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_resolves_extensionless_local_dependencies() {
+        let dir = tempdir().unwrap();
         write_pkg_json(
-            dir2.path(),
+            dir.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
-        let h1 = compute_script_hash(dir1.path()).unwrap();
-        let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(h1, h2);
+        fs::write(dir.path().join("install.js"), "require('./payload')\n").unwrap();
+        fs::write(dir.path().join("payload.js"), "module.exports = true\n").unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_some());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_transitive_delegate_escapes_package() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        fs::write(dir.path().join("install.js"), "require('../outside.js')\n").unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_delegate_graph_exceeds_depth_limit() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node depth-0.js"}),
+        );
+        for depth in 0..=MAX_DELEGATE_GRAPH_DEPTH {
+            fs::write(
+                dir.path().join(format!("depth-{depth}.js")),
+                format!("require('./depth-{}.js')\n", depth + 1),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.path()
+                .join(format!("depth-{}.js", MAX_DELEGATE_GRAPH_DEPTH + 1)),
+            "module.exports = 'unseen payload'\n",
+        )
+        .unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_delegate_graph_exceeds_file_limit() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node entry.js"}),
+        );
+        let mut entry = String::with_capacity(MAX_DELEGATE_GRAPH_FILES * 24);
+        for index in 0..MAX_DELEGATE_GRAPH_FILES {
+            entry.push_str(&format!("require('./leaf-{index}.js')\n"));
+            fs::write(
+                dir.path().join(format!("leaf-{index}.js")),
+                "module.exports = true\n",
+            )
+            .unwrap();
+        }
+        fs::write(dir.path().join("entry.js"), entry).unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_script_hash_returns_none_when_delegate_resolves_outside_package() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let external_script = external.path().join("payload.js");
+        fs::write(&external_script, "module.exports = 'outside'\n").unwrap();
+        symlink(external_script, dir.path().join("install.js")).unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
     }
 
     /// The shared recognizer in

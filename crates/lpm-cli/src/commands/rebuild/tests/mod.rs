@@ -25,6 +25,15 @@ fn write_store_package(
         ),
     )
     .unwrap();
+    let scripts: serde_json::Value = serde_json::from_str(scripts_json).unwrap();
+    for body in scripts
+        .as_object()
+        .into_iter()
+        .flat_map(|scripts| scripts.values())
+        .filter_map(serde_json::Value::as_str)
+    {
+        write_delegate_fixture(&pkg_dir, body);
+    }
     if built {
         std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
     }
@@ -35,6 +44,17 @@ fn write_store_package(
     // calls silently skip every fixture entry. Real installs always
     // write `.integrity`; this synthesizes the same shape.
     std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
+}
+
+fn write_delegate_fixture(pkg_dir: &Path, body: &str) {
+    let Some(relative_path) = lpm_security::static_gate::extract_delegate_path(body) else {
+        return;
+    };
+    let path = pkg_dir.join(relative_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, "module.exports = true\n").unwrap();
 }
 
 // ── live_package_dir tests ─────────────────────────
@@ -1744,6 +1764,7 @@ fn write_scripted_pkg(
             ),
         )
         .unwrap();
+    write_delegate_fixture(&pkg_dir, postinstall);
     // see `write_store_package`
     // for why `.integrity` is required for the v1 fallback in
     // `find_installed_package_baseline`.

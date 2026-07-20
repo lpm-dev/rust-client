@@ -254,6 +254,11 @@ pub(crate) async fn run_under_store_lock(
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
+    let installed_names: std::collections::BTreeSet<&str> = lockfile
+        .packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
 
     // Read the force-security-floor
     // kill-switch once per invocation and thread it through every
@@ -442,6 +447,17 @@ pub(crate) async fn run_under_store_lock(
     }
 
     if scriptable_packages.is_empty() {
+        if !specific_packages.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "requested {} {} have no lifecycle scripts or are not installed",
+                if specific_packages.len() == 1 {
+                    "package"
+                } else {
+                    "packages"
+                },
+                specific_packages.join(", ")
+            )));
+        }
         if json_output {
             let result = if dry_run {
                 rebuild_dry_run_envelope(&[], force_security_floor)
@@ -467,13 +483,14 @@ pub(crate) async fn run_under_store_lock(
         let mut selected_identities = HashSet::new();
         let mut missing = Vec::new();
         for name in specific_packages {
-            let canonical_name = if scriptable_packages.iter().any(|pkg| pkg.name == *name) {
+            let canonical_name = if installed_names.contains(name.as_str()) {
                 Some(name.as_str())
             } else {
                 let suffix = format!(".{name}");
-                let candidates: std::collections::BTreeSet<&str> = scriptable_packages
+                let candidates: std::collections::BTreeSet<&str> = installed_names
                     .iter()
-                    .filter_map(|pkg| pkg.name.ends_with(&suffix).then_some(pkg.name.as_str()))
+                    .copied()
+                    .filter(|installed_name| installed_name.ends_with(&suffix))
                     .collect();
                 match candidates.len() {
                     0 => None,
@@ -501,6 +518,19 @@ pub(crate) async fn run_under_store_lock(
                 missing.push(safe_name);
                 continue;
             };
+            if !scriptable_packages
+                .iter()
+                .any(|pkg| pkg.name == canonical_name)
+            {
+                let safe_name = lpm_common::sanitize_for_terminal(name);
+                if !json_output {
+                    install_ui::warn(&format!(
+                        "{safe_name} has no lifecycle scripts or is not installed"
+                    ));
+                }
+                missing.push(safe_name);
+                continue;
+            }
             for pkg in scriptable_packages
                 .iter()
                 .filter(|pkg| pkg.name == canonical_name)

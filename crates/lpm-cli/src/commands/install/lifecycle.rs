@@ -931,6 +931,9 @@ pub(super) fn collect_amber_classification_requests(
         else {
             continue;
         };
+        let Some(script_bundle_hash) = script_data.hash else {
+            continue;
+        };
         let bodies = script_data.phase_bodies;
         // Read the package's `repository` URL from the same store package.json.
         // It feeds both the advisor prompt and the classifier widening that
@@ -996,7 +999,7 @@ pub(super) fn collect_amber_classification_requests(
             version: version.clone(),
             source: identity.source.clone(),
             integrity: integrity.clone(),
-            script_bundle_hash: script_data.hash,
+            script_bundle_hash,
             repository,
             amber_phases,
             referenced_scripts,
@@ -1321,6 +1324,8 @@ mod v2_preflight_tests {
                 ),
             )
             .unwrap();
+            let script_path = script.strip_prefix("node ").unwrap();
+            std::fs::write(package_dir.join(script_path), format!("// {suffix}\n")).unwrap();
             LinkMeta {
                 schema: 1,
                 graph_key: format!("shared@1.0.0+{suffix}"),
