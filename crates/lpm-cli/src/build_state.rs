@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `<= BUILD_STATE_VERSION`; refuse newer versions (forward-incompatible
 /// bumps signal a meaningful schema change that older readers can't
 /// interpret safely).
-pub const BUILD_STATE_VERSION: u32 = 1;
+pub const BUILD_STATE_VERSION: u32 = 2;
 
 /// Filename inside `<project_dir>/.lpm/`.
 pub const BUILD_STATE_FILENAME: &str = "build-state.json";

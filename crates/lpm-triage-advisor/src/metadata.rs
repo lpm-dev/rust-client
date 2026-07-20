@@ -4,9 +4,8 @@
 //!
 //! Three fields per run, all best-effort:
 //! - Provider slug (always known when an advisor is invoked).
-//! - Binary path + version string (where applicable; CLI providers
-//!   only — Ollama's "version" is the loaded model name, surfaced
-//!   separately via the model setting on [`crate::OllamaAdapter`]).
+//! - Binary path + version string where available, plus the separately selected
+//!   effective model.
 //! - Prompt-template hash: SHA-256 of the canonical prompt rendering
 //!   for a fixed test input. The hash changes iff [`crate::build_prompt`]
 //!   changes. Lets a future comparative study attribute uplift drift
@@ -70,6 +69,23 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// audit reading a sidecar from a different machine).
 pub fn binary_path(provider: Provider) -> Option<PathBuf> {
     detection::resolve_binary(provider)
+}
+
+/// Stable cache identity for a provider invocation. Persistent caching is
+/// unavailable when either the provider version or effective model is opaque;
+/// otherwise a provider or CLI configuration change could reuse a verdict
+/// produced by different code or a different model.
+pub fn cache_model_identity(
+    provider_version: Option<&str>,
+    effective_model: Option<&str>,
+) -> Option<String> {
+    let provider_version = provider_version?;
+    let effective_model = effective_model?;
+    let mut identity = String::with_capacity(provider_version.len() + effective_model.len() + 1);
+    identity.push_str(provider_version);
+    identity.push('\0');
+    identity.push_str(effective_model);
+    Some(identity)
 }
 
 /// Best-effort version string. Spawns `<binary> --version`, captures
@@ -147,5 +163,19 @@ mod tests {
         assert_eq!(h1, h2);
         assert!(h1.starts_with("sha256-"));
         assert_eq!(h1.len(), 7 + 64); // "sha256-" + 32 bytes hex
+    }
+
+    #[test]
+    fn cache_model_identity_requires_observable_version_and_effective_model() {
+        assert_eq!(cache_model_identity(Some("cli 1"), None), None);
+        assert_eq!(cache_model_identity(None, Some("model-a")), None);
+        assert_ne!(
+            cache_model_identity(Some("cli 1"), Some("model-a")),
+            cache_model_identity(Some("cli 1"), Some("model-b")),
+        );
+        assert_ne!(
+            cache_model_identity(Some("cli 1"), Some("model-a")),
+            cache_model_identity(Some("cli 2"), Some("model-a")),
+        );
     }
 }

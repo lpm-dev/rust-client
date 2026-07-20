@@ -21,7 +21,7 @@
 //!    providers produce different verdicts on the same script; their
 //!    cache namespaces never collide.
 //! 6. **Model identity** — captures provider-version drift the slug does not
-//!    and includes the effective model selected for Ollama.
+//!    and includes the effective model selected for the advisor.
 //!
 //! Any one of these changing produces a different key; the affected
 //! entries are skipped on lookup and overwritten on the next classify.
@@ -379,8 +379,8 @@ pub struct CacheKeyInputs<'a> {
     /// Exact content integrity when available. Integrity-less local sources
     /// remain partitioned by `source`.
     pub integrity: Option<&'a str>,
-    /// Canonical hash of every executable lifecycle phase and its reachable
-    /// delegated file graph.
+    /// Canonical hash of every executable lifecycle phase and the
+    /// package-owned content tree.
     pub script_bundle_hash: &'a str,
     /// `(phase, body)` pairs in canonical order. Filter to amber-only
     /// before passing — green/red phases never reach L4 and would

@@ -67,8 +67,8 @@ use futures::StreamExt;
 use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
     Advisor, AdvisorFailure, AdvisorVerdict, AmberScript, CacheKeyInputs, ClaudeCliAdapter,
-    CodexAdapter, L4Cache, OllamaAdapter, Provider, build_cache_key, prompt_template_hash,
-    provider_version,
+    CodexAdapter, L4Cache, OllamaAdapter, Provider, build_cache_key, cache_model_identity,
+    prompt_template_hash, provider_version,
 };
 
 use crate::output;
@@ -209,8 +209,16 @@ impl AdvisorSession {
             return Self::none(Some(slug.to_string()));
         };
         let (adapter, effective_model): (Box<dyn Advisor>, Option<String>) = match provider {
-            Provider::ClaudeCli => (Box::new(ClaudeCliAdapter), None),
-            Provider::Codex => (Box::new(CodexAdapter), None),
+            Provider::ClaudeCli => {
+                let adapter = ClaudeCliAdapter::default();
+                let model = adapter.model.clone();
+                (Box::new(adapter), model)
+            }
+            Provider::Codex => {
+                let adapter = CodexAdapter::default();
+                let model = adapter.model.clone();
+                (Box::new(adapter), model)
+            }
             Provider::Ollama => {
                 let adapter = OllamaAdapter::default();
                 let model = adapter.model.clone();
@@ -234,10 +242,12 @@ impl AdvisorSession {
                 // so the per-package classify path doesn't repeat
                 // them. Cache-open failure is non-fatal: the install
                 // continues without a cache.
-                let cache = open_cache_or_warn(json_output);
-                let provider_version = provider_version(provider).await.unwrap_or_default();
+                let provider_version = provider_version(provider).await;
                 let model_version =
-                    cache_model_identity(provider, &provider_version, effective_model.as_deref());
+                    cache_model_identity(provider_version.as_deref(), effective_model.as_deref());
+                let cache = model_version
+                    .as_ref()
+                    .and_then(|_| open_cache_or_warn(json_output));
                 let template_hash = prompt_template_hash();
                 Self {
                     adapter: Some(adapter),
@@ -246,7 +256,7 @@ impl AdvisorSession {
                     warned_about_unavailable: false,
                     cache,
                     prompt_template_hash: template_hash,
-                    model_version,
+                    model_version: model_version.unwrap_or_default(),
                 }
             }
             Err(AdvisorFailure::EnvironmentNotReady(msg)) => {
@@ -547,8 +557,8 @@ pub struct AmberPackageRequest {
     /// trust-evaluation path will use.
     pub integrity: Option<String>,
     /// Canonical install-script hash from `lpm-security`. It covers every
-    /// executable install phase and the delegated file graph, not only the
-    /// amber prompt text.
+    /// executable install phase and the package-owned content tree, not only
+    /// the amber prompt text.
     pub script_bundle_hash: String,
     /// `repository` URL from the package manifest (typically
     /// `package.json > repository.url` or the
@@ -642,21 +652,6 @@ fn open_cache_or_warn(json_output: bool) -> Option<Arc<L4Cache>> {
             None
         }
     }
-}
-
-fn cache_model_identity(
-    provider: Provider,
-    provider_version: &str,
-    effective_model: Option<&str>,
-) -> String {
-    let Some(effective_model) = effective_model.filter(|_| provider == Provider::Ollama) else {
-        return provider_version.to_string();
-    };
-    let mut identity = String::with_capacity(provider_version.len() + effective_model.len() + 1);
-    identity.push_str(provider_version);
-    identity.push('\0');
-    identity.push_str(effective_model);
-    identity
 }
 
 /// — build the L4-cache key for one [`AmberPackageRequest`].
@@ -1427,9 +1422,20 @@ mod tests {
     #[test]
     fn ollama_cache_identity_includes_effective_model() {
         assert_ne!(
-            cache_model_identity(Provider::Ollama, "ollama version 1", Some("llama3.2")),
-            cache_model_identity(Provider::Ollama, "ollama version 1", Some("qwen3")),
+            cache_model_identity(Some("ollama version 1"), Some("llama3.2")),
+            cache_model_identity(Some("ollama version 1"), Some("qwen3")),
         );
+    }
+
+    #[test]
+    fn cloud_cli_cache_identity_includes_effective_model() {
+        for provider in [Provider::ClaudeCli, Provider::Codex] {
+            let _ = provider;
+            assert_ne!(
+                cache_model_identity(Some("cli version 1"), Some("model-a")),
+                cache_model_identity(Some("cli version 1"), Some("model-b")),
+            );
+        }
     }
 
     #[tokio::test]

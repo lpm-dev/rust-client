@@ -53,12 +53,9 @@ const BLOCKED_SCRIPTS: &[&str] = &[
 /// Dependency lifecycle script phases that the install-time `lpm rebuild` pipeline
 /// **actually runs**, in execution order.
 ///
-/// The `script_hash` approval binding covers EXACTLY these scripts.
-/// Editing a non-executed dependency script like `prepare` does NOT
-/// invalidate approvals because that dependency script never runs in the
-/// rebuild pipeline. Conversely, any change to one of these three DOES
-/// invalidate approvals because that's bytes the user previously trusted to
-/// execute.
+/// The `script_hash` approval binding includes these phase bodies plus the
+/// package-owned content tree. Any package file or manifest-field change
+/// invalidates the reusable binding.
 ///
 /// This const is the SINGLE source of truth — `lpm-cli/src/commands/build.rs`
 /// imports it instead of defining its own `SCRIPT_PHASES` list, and

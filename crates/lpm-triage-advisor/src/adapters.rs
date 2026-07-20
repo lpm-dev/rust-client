@@ -24,6 +24,13 @@ use crate::{
 
 const OLLAMA_GENERATE_URL: &str = "http://localhost:11434/api/generate";
 
+fn configured_cloud_model(variable: &str) -> Option<String> {
+    std::env::var(variable)
+        .ok()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
 /// Default Ollama model. Chosen for ubiquity and small download
 /// footprint — users running a different model can override via the
 /// `LPM_TRIAGE_OLLAMA_MODEL` env var.
@@ -51,8 +58,30 @@ const TEST_SCRIPT: AmberScript<'static> = AmberScript {
 /// Invocation: `claude -p <prompt>` (print mode — one-shot,
 /// non-interactive, prints assistant response and exits). Auth is
 /// handled by the CLI itself (via `ANTHROPIC_API_KEY` env var or its
-/// own login flow).
-pub struct ClaudeCliAdapter;
+/// own login flow). `LPM_TRIAGE_CLAUDE_MODEL` pins an explicit model;
+/// without it, the Claude CLI owns model selection and persistent verdict
+/// caching is disabled by callers.
+pub struct ClaudeCliAdapter {
+    pub model: Option<String>,
+}
+
+impl Default for ClaudeCliAdapter {
+    fn default() -> Self {
+        Self {
+            model: configured_cloud_model("LPM_TRIAGE_CLAUDE_MODEL"),
+        }
+    }
+}
+
+impl ClaudeCliAdapter {
+    fn command_args(&self) -> Vec<&str> {
+        let mut args = vec!["-p"];
+        if let Some(model) = self.model.as_deref() {
+            args.extend(["--model", model]);
+        }
+        args
+    }
+}
 
 #[async_trait]
 impl Advisor for ClaudeCliAdapter {
@@ -73,7 +102,8 @@ impl Advisor for ClaudeCliAdapter {
         script: &AmberScript<'_>,
     ) -> Result<AdvisorVerdict, AdvisorFailure> {
         let prompt = build_prompt(script);
-        let out = run_with_stdin("claude", &["-p"], &prompt, DEFAULT_INVOCATION_TIMEOUT).await?;
+        let args = self.command_args();
+        let out = run_with_stdin("claude", &args, &prompt, DEFAULT_INVOCATION_TIMEOUT).await?;
         parse_verdict(&out)
     }
 }
@@ -86,8 +116,30 @@ impl Advisor for ClaudeCliAdapter {
 ///
 /// Invocation: `codex exec <prompt>` reads the prompt from argv and
 /// emits assistant output to stdout. Auth via API key or
-/// ChatGPT-login that the CLI manages.
-pub struct CodexAdapter;
+/// ChatGPT-login that the CLI manages. `LPM_TRIAGE_CODEX_MODEL` pins an
+/// explicit model; without it, the Codex CLI owns model selection and
+/// persistent verdict caching is disabled by callers.
+pub struct CodexAdapter {
+    pub model: Option<String>,
+}
+
+impl Default for CodexAdapter {
+    fn default() -> Self {
+        Self {
+            model: configured_cloud_model("LPM_TRIAGE_CODEX_MODEL"),
+        }
+    }
+}
+
+impl CodexAdapter {
+    fn command_args(&self) -> Vec<&str> {
+        let mut args = vec!["exec"];
+        if let Some(model) = self.model.as_deref() {
+            args.extend(["--model", model]);
+        }
+        args
+    }
+}
 
 #[async_trait]
 impl Advisor for CodexAdapter {
@@ -111,7 +163,8 @@ impl Advisor for CodexAdapter {
         // Codex reads the prompt from stdin in exec mode; passing it
         // via argv risks shell quoting issues with embedded quotes in
         // script bodies. Stdin is robust.
-        let out = run_with_stdin("codex", &["exec"], &prompt, DEFAULT_INVOCATION_TIMEOUT).await?;
+        let args = self.command_args();
+        let out = run_with_stdin("codex", &args, &prompt, DEFAULT_INVOCATION_TIMEOUT).await?;
         parse_verdict(&out)
     }
 }
@@ -376,9 +429,21 @@ mod tests {
     // Adapters are constructible without side effects.
     #[test]
     fn adapters_construct() {
-        let _ = ClaudeCliAdapter;
-        let _ = CodexAdapter;
+        let _ = ClaudeCliAdapter::default();
+        let _ = CodexAdapter::default();
         let _ = OllamaAdapter::default();
+    }
+
+    #[test]
+    fn cloud_adapters_pin_explicit_models_on_the_cli_invocation() {
+        let claude = ClaudeCliAdapter {
+            model: Some("claude-model".into()),
+        };
+        let codex = CodexAdapter {
+            model: Some("codex-model".into()),
+        };
+        assert_eq!(claude.command_args(), ["-p", "--model", "claude-model"]);
+        assert_eq!(codex.command_args(), ["exec", "--model", "codex-model"]);
     }
 
     #[test]

@@ -179,9 +179,9 @@ impl Default for TrustedDependencies {
 /// persists onto a [`TrustedDependencyBinding`] via
 /// [`TrustedDependencies::approve_with_metadata`].
 ///
-/// All fields are `Option` because each degrades independently to "not
-/// captured" under offline or fetch-error conditions; downstream gates
-/// treat `None` as "no signal, don't claim drift."
+/// Fields are optional because capture can run offline or encounter an
+/// unreadable package. Missing advisory metadata is treated as no signal, but
+/// a missing script hash can never produce durable strict trust.
 ///
 /// All fields are sourced from the matching candidate `BlockedPackage`.
 #[derive(Debug, Clone, Default)]
@@ -405,17 +405,20 @@ impl TrustedDependencies {
                 // method docstring for the cross-version trust laundering
                 // rationale.
                 if let Some(stored) = Self::binding_for_map(map, name, version, source, integrity) {
-                    // Field-by-field check. A None field on either side is
-                    // a wildcard — only mismatches between two SET values
-                    // count as drift. Legacy-upgrade-friendly contract.
+                    // Integrity may be absent for local sources, where the
+                    // source-qualified package key and script hash provide the
+                    // reusable identity. A script hash is never optional for a
+                    // durable grant: without one, changed executable content
+                    // cannot be distinguished from the approved bytes.
                     let integrity_drift = matches!(
                         (stored.integrity.as_deref(), integrity),
                         (Some(s), Some(q)) if s != q
                     );
-                    let script_hash_drift = matches!(
-                        (stored.script_hash.as_deref(), script_hash),
-                        (Some(s), Some(q)) if s != q
-                    );
+                    let script_hash_drift = stored
+                        .script_hash
+                        .as_deref()
+                        .zip(script_hash)
+                        .is_none_or(|(stored_hash, current_hash)| stored_hash != current_hash);
 
                     if integrity_drift || script_hash_drift {
                         return TrustMatch::BindingDrift {
@@ -1033,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_strict_none_query_field_is_wildcard_against_set_stored_field() {
+    fn matches_strict_none_query_integrity_is_wildcard_against_stored_integrity() {
         // If the caller doesn't know the query value (None), and the stored
         // value is set, that's NOT drift — it's "no constraint on the
         // caller side". This is the legacy-upgrade-friendly contract.
@@ -1047,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_strict_none_stored_field_is_wildcard_against_set_query_field() {
+    fn matches_strict_none_stored_integrity_is_wildcard_against_query_integrity() {
         // Mirror image: stored binding has no integrity (legacy-upgrade
         // case), caller queries with a concrete integrity. This should
         // be Strict, not Drift, because there's no stored value to drift
@@ -1346,6 +1349,21 @@ mod tests {
         // contains_name_lenient still walks the sentinel — used by
         // non-trust-decision surfaces like the deprecation warning.
         assert!(td.contains_name_lenient("esbuild"));
+    }
+
+    #[test]
+    fn matches_strict_rejects_concrete_binding_without_reusable_script_hash() {
+        let mut map = HashMap::new();
+        map.insert(
+            "mutable-local@1.0.0".to_string(),
+            TrustedDependencyBinding::default(),
+        );
+        let td = TrustedDependencies::Rich(map);
+
+        assert!(matches!(
+            td.matches_strict("mutable-local", "1.0.0", None, None),
+            TrustMatch::BindingDrift { .. }
+        ));
     }
 
     /// A scoped package whose only Rich entry is the `@scope/pkg@*`

@@ -6,8 +6,8 @@ use lpm_security::triage::StaticTier;
 use lpm_triage_advisor::{
     Advisor, AdvisorFailure, AdvisorVerdict as TriageVerdict, AmberScript as TriageAmberScript,
     CacheKeyInputs, ClaudeCliAdapter, CodexAdapter, L4Cache, OllamaAdapter,
-    Provider as AdvisorProvider, binary_path, build_cache_key, prompt_template_hash,
-    provider_version,
+    Provider as AdvisorProvider, binary_path, build_cache_key, cache_model_identity,
+    prompt_template_hash, provider_version,
 };
 
 use crate::args::Args;
@@ -34,8 +34,16 @@ pub(crate) async fn enrich_advisor_in_place(
     let provider = AdvisorProvider::from_slug(name)
         .ok_or_else(|| format!("unknown advisor '{name}'; valid: claude-cli / codex / ollama"))?;
     let (advisor, model): (Box<dyn Advisor>, Option<String>) = match provider {
-        AdvisorProvider::ClaudeCli => (Box::new(ClaudeCliAdapter), None),
-        AdvisorProvider::Codex => (Box::new(CodexAdapter), None),
+        AdvisorProvider::ClaudeCli => {
+            let adapter = ClaudeCliAdapter::default();
+            let model = adapter.model.clone();
+            (Box::new(adapter), model)
+        }
+        AdvisorProvider::Codex => {
+            let adapter = CodexAdapter::default();
+            let model = adapter.model.clone();
+            (Box::new(adapter), model)
+        }
         AdvisorProvider::Ollama => {
             let a = OllamaAdapter::default();
             let m = Some(a.model.clone());
@@ -96,7 +104,9 @@ pub(crate) async fn enrich_advisor_in_place(
     // env-var disable still applies; if both flag-on + env-off, we
     // surface that in a print line so a confused operator can spot
     // the env-var override.
-    let cache: Option<Arc<L4Cache>> = if args.l4_cache {
+    let cache_model_version =
+        cache_model_identity(stamp.binary_version.as_deref(), stamp.model.as_deref());
+    let cache: Option<Arc<L4Cache>> = if args.l4_cache && cache_model_version.is_some() {
         match L4Cache::open_default() {
             Ok(c) => {
                 if c.is_disabled() {
@@ -125,10 +135,7 @@ pub(crate) async fn enrich_advisor_in_place(
         None
     };
     let cache_template_hash = stamp.prompt_template_hash.clone();
-    let cache_model_version = stamp
-        .binary_version
-        .clone()
-        .unwrap_or_else(|| stamp.model.clone().unwrap_or_default());
+    let cache_model_version = cache_model_version.unwrap_or_default();
     let cache_provider_slug = stamp.provider.clone();
     let cache_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cache_misses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -406,5 +413,18 @@ fn combine_verdict(a: TriageVerdict, b: TriageVerdict) -> TriageVerdict {
         (Manual, _) | (_, Manual) => Manual,
         (Abstain, _) | (_, Abstain) => Abstain,
         (Approve, Approve) => Approve,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_cache_model_identity_includes_binary_version_and_model() {
+        assert_ne!(
+            cache_model_identity(Some("ollama version 1"), Some("llama3.2")),
+            cache_model_identity(Some("ollama version 1"), Some("qwen3")),
+        );
     }
 }

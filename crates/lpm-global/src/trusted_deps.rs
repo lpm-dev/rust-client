@@ -23,10 +23,9 @@
 //! One flat map keyed by `name@version`. The binding payload is
 //! wire-identical to the project-level shape, but it is duplicated in
 //! this crate so `lpm-global` does not depend on `lpm-workspace`.
-//! `script_hash` and `integrity` are both optional because an older
-//! `lpm approve-scripts` run may have approved a package before either
-//! field was reliably available — strict-gate lookup in
-//! [`GlobalTrustedDependencies::matches_strict`] degrades accordingly.
+//! `script_hash` and `integrity` remain optional on disk for backward
+//! compatibility. A missing script hash never grants strict trust; older or
+//! incomplete bindings remain visible as binding drift and require review.
 //!
 //! ## Atomic-write contract
 //!
@@ -174,11 +173,10 @@ impl GlobalTrustedDependencies {
             (None, None) => true,
             _ => false,
         };
-        let script_match = match (binding.script_hash.as_deref(), script_hash) {
-            (Some(stored), Some(queried)) => stored == queried,
-            (None, None) => true,
-            _ => false,
-        };
+        let script_match = matches!(
+            (binding.script_hash.as_deref(), script_hash),
+            (Some(stored), Some(queried)) if stored == queried
+        );
         if integ_match && script_match {
             TrustMatch::Strict
         } else {
@@ -192,11 +190,9 @@ impl GlobalTrustedDependencies {
     /// `(name, version)`. Used by `lpm approve-scripts --global`'s
     /// write path when the user approves a previously-blocked package.
     ///
-    /// Both `integrity` and `script_hash` are optional because the
-    /// blocked-set capture may have missed one (e.g. a registry
-    /// response that lacked the SRI). Approving anyway is a deliberate
-    /// user choice — the strict query degrades to drift-detection for
-    /// any missing field pair.
+    /// Both fields remain optional in this storage API for legacy callers.
+    /// Missing integrity is valid for some local sources, but a missing script
+    /// hash is never reusable and will produce binding drift at enforcement.
     ///
     /// Legacy two-field shortcut for tests
     /// and any caller that genuinely doesn't want to capture provenance.
@@ -451,6 +447,17 @@ mod tests {
         let gtd = GlobalTrustedDependencies::default();
         let m = gtd.matches_strict("ghost", "1.0.0", Some("a"), Some("b"));
         assert_eq!(m, TrustMatch::NotTrusted);
+    }
+
+    #[test]
+    fn matches_strict_rejects_binding_without_reusable_script_hash() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_strict("mutable-local", "1.0.0", None, None);
+
+        assert!(matches!(
+            gtd.matches_strict("mutable-local", "1.0.0", None, None),
+            TrustMatch::BindingDrift { .. }
+        ));
     }
 
     #[test]
