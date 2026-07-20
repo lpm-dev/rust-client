@@ -476,6 +476,330 @@ fn link_entry_content_integrity_recreates_missing_tree_snapshot() {
 }
 
 #[test]
+fn lifecycle_baseline_uses_canonical_script_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_baseline_uses_canonical_script_identity");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let key = arc_key("scripted", "1.0.0");
+    let entry = populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    let baseline = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    let expected = lpm_security::script_hash::compute_script_hash(&baseline.source_dir).unwrap();
+
+    assert_eq!(baseline.content_integrity, expected);
+    assert!(entry.link_dir.join(LIFECYCLE_BASELINE_FILENAME).is_file());
+    assert_eq!(
+        store.lifecycle_entry_lock_path(&package_dir).unwrap(),
+        store
+            .paths()
+            .build_entry_lock_path(&key.digest_hex())
+            .unwrap()
+    );
+}
+
+#[test]
+fn lifecycle_baseline_is_not_persisted_when_tree_exceeds_hash_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_baseline_is_not_persisted_when_tree_exceeds_hash_budget");
+    let mut deep_file = String::new();
+    for depth in 0..=64 {
+        if depth != 0 {
+            deep_file.push('/');
+        }
+        deep_file.push_str("nested");
+    }
+    deep_file.push_str("/payload.js");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"deep-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+            (&deep_file, b"deep"),
+        ],
+    );
+    let key = arc_key("deep-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+
+    let _ = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap();
+
+    assert!(store.lifecycle_baseline(&package_dir).unwrap().is_none());
+}
+
+#[test]
+fn lifecycle_restore_executes_the_authorized_patched_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_restore_executes_the_authorized_patched_baseline");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"patched-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('upstream')"),
+        ],
+    );
+    let key = arc_key("patched-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    assert!(
+        store
+            .prepare_patched_lifecycle_baseline(&package_dir)
+            .unwrap()
+    );
+    std::fs::write(package_dir.join("install.js"), "console.log('patched')").unwrap();
+    let baseline = store
+        .capture_patched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+
+    std::fs::write(package_dir.join("install.js"), "console.log('mutated')").unwrap();
+    std::fs::write(package_dir.join("generated-output.js"), "generated").unwrap();
+    store
+        .restore_lifecycle_package(&package_dir, &baseline.content_integrity)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(package_dir.join("install.js")).unwrap(),
+        "console.log('patched')"
+    );
+    assert!(!package_dir.join("generated-output.js").exists());
+    assert_eq!(
+        lpm_security::script_hash::compute_script_hash(&package_dir).as_deref(),
+        Some(baseline.content_integrity.as_str())
+    );
+}
+
+#[test]
+fn lifecycle_restore_rejects_drifted_baseline_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_restore_rejects_drifted_baseline_source");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"drifted-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let key = arc_key("drifted-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    let baseline = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    std::fs::write(
+        baseline.source_dir.join("install.js"),
+        "console.log('tampered')",
+    )
+    .unwrap();
+
+    let error = store
+        .restore_lifecycle_package(&package_dir, &baseline.content_integrity)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("baseline bytes drifted"));
+}
+
+#[test]
+fn patched_lifecycle_prepare_restores_pristine_bytes_when_baseline_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri =
+        synthetic_sri(b"patched_lifecycle_prepare_restores_pristine_bytes_when_baseline_exists");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"patched-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('upstream')"),
+        ],
+    );
+    let key = arc_key("patched-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    assert!(
+        store
+            .prepare_patched_lifecycle_baseline(&package_dir)
+            .unwrap()
+    );
+    std::fs::write(package_dir.join("install.js"), "console.log('patched')").unwrap();
+    store
+        .capture_patched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    std::fs::write(
+        package_dir.join("install.js"),
+        "console.log('built-output')",
+    )
+    .unwrap();
+
+    assert!(
+        !store
+            .prepare_patched_lifecycle_baseline(&package_dir)
+            .unwrap()
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(package_dir.join("install.js")).unwrap(),
+        "console.log('upstream')"
+    );
+}
+
+#[test]
+fn lifecycle_restore_recreates_scoped_same_name_dependency_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let current_sri = synthetic_sri(b"lifecycle_restore_scoped_same_name/current");
+    let dependency_sri = synthetic_sri(b"lifecycle_restore_scoped_same_name/dependency");
+    let current_object = write_object(
+        &store,
+        &current_sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"@scope/pkg","version":"2.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let dependency_object = write_object(
+        &store,
+        &dependency_sri,
+        &[(
+            "package.json",
+            br#"{"name":"@scope/pkg","version":"1.0.0"}"#,
+        )],
+    );
+    let current_key = arc_key("@scope/pkg", "2.0.0");
+    let dependency_key = arc_key("@scope/pkg", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: dependency_key.clone(),
+            source_sri: dependency_sri,
+            object_dir: dependency_object,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: current_key.clone(),
+            source_sri: current_sri,
+            object_dir: current_object,
+            deps: vec![DepLink {
+                local: "@scope/pkg".into(),
+                target: dependency_key.clone(),
+            }],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&current_key);
+    let baseline = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    std::fs::write(package_dir.join("generated-output.js"), "generated").unwrap();
+
+    store
+        .restore_lifecycle_package(&package_dir, &baseline.content_integrity)
+        .unwrap();
+
+    let nested_dependency = package_dir.join("node_modules").join("@scope").join("pkg");
+    assert_eq!(
+        std::fs::canonicalize(&nested_dependency).unwrap(),
+        std::fs::canonicalize(store.paths().link_package_dir(&dependency_key)).unwrap()
+    );
+    assert!(!package_dir.join("generated-output.js").exists());
+}
+
+#[test]
 fn paths_for_known_sri() {
     let root = std::env::temp_dir().join(format!(
         "lpm-v2-paths-{}-{:?}",

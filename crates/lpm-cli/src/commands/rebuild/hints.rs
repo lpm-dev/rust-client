@@ -1,11 +1,14 @@
 use super::scripts::{BUILD_MARKER, read_lifecycle_scripts};
-use super::trust::{evaluate_trust_for_identity, name_matches_trusted_scope, parse_trusted_scopes};
+use super::trust::{
+    evaluate_trust_for_identity, evaluate_trust_for_identity_with_script_hash,
+    name_matches_trusted_scope, parse_trusted_scopes,
+};
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::color::Painted;
 use lpm_security::script_hash::compute_script_hash;
 use lpm_security::{SecurityPolicy, TrustMatch};
-use lpm_store::V2BaselineIndex;
+use lpm_store::{PackageBaselineLayout, V2BaselineIndex};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -102,7 +105,7 @@ pub(crate) fn scriptable_package_rows_for_identities(
             // [`package_baseline_dir`] for the silent-skip-vs-real-skip
             // semantic.
             let package_key = identity.package_key();
-            let pkg_dir = lpm_store::find_installed_package_baseline_exact_indexed(
+            let baseline = lpm_store::find_installed_package_baseline_exact_indexed(
                 &baseline_index,
                 lpm_root,
                 store_version,
@@ -110,25 +113,23 @@ pub(crate) fn scriptable_package_rows_for_identities(
                 &package_key.version,
                 &package_key.source_id,
                 integrity.as_deref(),
-            )?
-            .package_dir;
-            let pkg_json_path = pkg_dir.join("package.json");
+            )?;
+            let pkg_json_path = baseline.execution_dir.join("package.json");
 
             let scripts = match read_lifecycle_scripts(&pkg_json_path) {
                 Some(s) if !s.is_empty() => s,
                 _ => return None,
             };
 
-            let is_built = pkg_dir.join(BUILD_MARKER).exists();
+            let is_built = baseline.package_dir.join(BUILD_MARKER).exists();
 
-            // Strict/tiered gate — same four-way match as `rebuild::run` at
-            // the main rebuild loop. `Strict` + `LegacyNameOnly` are trusted;
-            // `BindingDrift` + `NotTrusted` are not. A legacy bare-name
-            // entry counts as trusted here because `rebuild::run` will
-            // still run the script (with a deprecation warning), so the
-            // hint must not mislead the user about what the subsequent
-            // `lpm rebuild` will do.
-            let script_hash = compute_script_hash(&pkg_dir);
+            // Strict/tiered gate — coordinate-only legacy entries stay
+            // readable but cannot authorize execution without a content hash.
+            let script_hash = if baseline.layout == PackageBaselineLayout::V2 {
+                baseline.execution_identity
+            } else {
+                compute_script_hash(&baseline.execution_dir)
+            };
             let trust = policy.can_run_scripts_strict_for_identity(
                 name,
                 version,
@@ -136,9 +137,9 @@ pub(crate) fn scriptable_package_rows_for_identities(
                 integrity.as_deref(),
                 script_hash.as_deref(),
             );
-            let strict_trust = matches!(trust, TrustMatch::Strict | TrustMatch::LegacyNameOnly);
+            let strict_trust = matches!(trust, TrustMatch::Strict);
             let scope_trust = name_matches_trusted_scope(name, &trusted_scopes);
-            let base_trusted = strict_trust || scope_trust;
+            let base_trusted = script_hash.is_some() && (strict_trust || scope_trust);
 
             // If the script-
             // hash / scope layer would trust the package but the
@@ -373,7 +374,7 @@ pub fn all_scripted_package_identities_trusted(
         // v2-aware lookup, routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
-        let pkg_dir = match lpm_store::find_installed_package_baseline_exact_indexed(
+        let baseline = match lpm_store::find_installed_package_baseline_exact_indexed(
             &baseline_index,
             lpm_root,
             store_version,
@@ -382,10 +383,10 @@ pub fn all_scripted_package_identities_trusted(
             &identity.package_key().source_id,
             integrity.as_deref(),
         ) {
-            Some(baseline) => baseline.package_dir,
+            Some(baseline) => baseline,
             None => continue,
         };
-        let pkg_json_path = pkg_dir.join("package.json");
+        let pkg_json_path = baseline.execution_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
             Some(s) if !s.is_empty() => s,
@@ -393,28 +394,46 @@ pub fn all_scripted_package_identities_trusted(
         };
 
         // Has scripts — check if built already
-        if pkg_dir.join(BUILD_MARKER).exists() {
+        if baseline.package_dir.join(BUILD_MARKER).exists() {
             continue; // already built, skip
         }
 
         // Unbuilt with scripts — first fresh trust-check.
         has_any_unbuilt = true;
 
-        let reason = evaluate_trust_for_identity(
-            &pkg_dir,
-            name,
-            version,
-            identity.source.as_deref(),
-            integrity.as_deref(),
-            &scripts,
-            policy,
-            project_dir,
-            effective_policy,
-            force_security_floor,
-            requested_capabilities,
-            user_bound,
-            advisor_approvals,
-        );
+        let reason = if baseline.layout == PackageBaselineLayout::V2 {
+            evaluate_trust_for_identity_with_script_hash(
+                baseline.execution_identity.as_deref(),
+                name,
+                version,
+                identity.source.as_deref(),
+                integrity.as_deref(),
+                &scripts,
+                policy,
+                project_dir,
+                effective_policy,
+                force_security_floor,
+                requested_capabilities,
+                user_bound,
+                advisor_approvals,
+            )
+        } else {
+            evaluate_trust_for_identity(
+                &baseline.execution_dir,
+                name,
+                version,
+                identity.source.as_deref(),
+                integrity.as_deref(),
+                &scripts,
+                policy,
+                project_dir,
+                effective_policy,
+                force_security_floor,
+                requested_capabilities,
+                user_bound,
+                advisor_approvals,
+            )
+        };
         if !reason.is_trusted() {
             return false; // at least one untrusted package
         }

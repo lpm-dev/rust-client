@@ -250,8 +250,10 @@ pub(super) fn print_global_list(
                 serde_json::json!({
                     "name": r.name,
                     "version": r.version,
+                    "source": r.source,
                     "integrity": r.integrity,
                     "script_hash": r.script_hash,
+                    "identity_selector": aggregate_identity_selector(r),
                     "phases_present": r.phases_present,
                     "binding_drift": r.binding_drift,
                     "origins": r.origins,
@@ -308,9 +310,8 @@ pub(super) fn print_global_list(
             );
             for r in rows {
                 println!(
-                    "    {} @ {}{}",
-                    r.name,
-                    r.version.dimmed(),
+                    "    {}{}",
+                    aggregate_identity_selector(r),
                     if r.binding_drift {
                         "  [binding drift]".yellow().to_string()
                     } else {
@@ -323,9 +324,8 @@ pub(super) fn print_global_list(
     } else {
         for r in &aggregate.rows {
             println!(
-                "  {} @ {} — used by {}{}",
-                r.name.bold(),
-                r.version.dimmed(),
+                "  {} — used by {}{}",
+                aggregate_identity_selector(r).bold(),
                 r.origins.join(", "),
                 if r.binding_drift {
                     "  [binding drift]".yellow().to_string()
@@ -514,10 +514,12 @@ pub(super) async fn run_global_bulk_yes(
         let mut trust = lpm_global::trusted_deps::read_for(root_for_body)?;
         for (idx, snap) in row_snapshots_for_body {
             let row = &aggregate_for_body.rows[idx];
-            trust.insert_binding(
+            trust.insert_binding_for_identity(
                 &row.name,
                 &row.version,
+                row.source.clone(),
                 lpm_global::TrustedDependencyBinding {
+                    source: None,
                     integrity: row.integrity.clone(),
                     script_hash: row.script_hash.clone(),
                     provenance_at_approval: snap,
@@ -561,8 +563,10 @@ pub(super) async fn run_global_bulk_yes(
                 let mut entry = serde_json::json!({
                     "name": r.name,
                     "version": r.version,
+                    "source": r.source,
                     "integrity": r.integrity,
                     "script_hash": r.script_hash,
+                    "identity_selector": aggregate_identity_selector(r),
                 });
                 if let Some(status) =
                     provenance.get(&(r.name.clone(), r.version.clone(), r.source.clone()))
@@ -620,7 +624,7 @@ pub(super) async fn run_global_bulk_yes(
             if aggregate.rows.len() == 1 { "" } else { "s" },
         ));
         output::info(
-            "Trust is bound to the current (name, version, integrity, script_hash) tuple — \
+            "Trust is bound to the current (name, version, source, integrity, script_hash) tuple — \
              any subsequent drift re-opens review.",
         );
         emit_rerun_hint_stderr(&origins);
@@ -630,7 +634,7 @@ pub(super) async fn run_global_bulk_yes(
 
 /// Named-package approval: `lpm approve-scripts --global esbuild` or
 /// `--global esbuild@0.25.1`. Finds the matching row by name or
-/// `name@version` substring, writes one trust binding under the global
+/// exact identity selector, writes one trust binding under the global
 /// tx lock.
 ///
 /// **Lock order:** `store_lock` (outer shared, held by the parent
@@ -652,7 +656,7 @@ pub(super) async fn run_global_named(
     } = provenance_context;
     // Bare-name lookup must refuse silently-picking-first when multiple
     // rows match. Aggregate rows are deduped
-    // by `(name, version, integrity, script_hash)` per the dedup rule,
+    // by `(name, version, source, integrity, script_hash)` per the dedup rule,
     // so a single bare name can legitimately resolve to multiple rows
     // (same package at different versions, OR same name@version with
     // different tarball bindings across install roots). Silently
@@ -672,18 +676,17 @@ pub(super) async fn run_global_named(
             )));
         }
         AggregateLookup::Ambiguous { candidates } => {
-            // List the concrete name@version strings the user could
-            // disambiguate with. Sorted + deduped so the hint is
-            // deterministic regardless of row order.
+            // List exact selectors so equal-coordinate source variants remain
+            // actionable instead of pointing back to the ambiguous input.
             let mut keys: Vec<String> = candidates
                 .iter()
-                .map(|r| format!("{}@{}", r.name, r.version))
+                .map(|r| aggregate_identity_selector(r))
                 .collect();
             keys.sort();
             keys.dedup();
             return Err(LpmError::Script(format!(
                 "package '{arg}' is ambiguous in the global blocked set — {} rows match. \
-                 Re-run with `name@version` to disambiguate. Candidates: {}",
+                 Re-run with an exact identity selector. Candidates: {}",
                 candidates.len(),
                 keys.join(", "),
             )));
@@ -716,10 +719,12 @@ pub(super) async fn run_global_named(
     let snap_for_body = snap;
     lpm_common::with_exclusive_lock_async(lock_path, async move {
         let mut trust = lpm_global::trusted_deps::read_for(root_for_body)?;
-        trust.insert_binding(
+        trust.insert_binding_for_identity(
             &row_for_body.name,
             &row_for_body.version,
+            row_for_body.source.clone(),
             lpm_global::TrustedDependencyBinding {
+                source: None,
                 integrity: row_for_body.integrity.clone(),
                 script_hash: row_for_body.script_hash.clone(),
                 provenance_at_approval: snap_for_body,
@@ -751,8 +756,10 @@ pub(super) async fn run_global_named(
         let mut approved_entry = serde_json::json!({
             "name": row.name,
             "version": row.version,
+            "source": row.source,
             "integrity": row.integrity,
             "script_hash": row.script_hash,
+            "identity_selector": aggregate_identity_selector(row),
         });
         if let Some(status) =
             provenance.get(&(row.name.clone(), row.version.clone(), row.source.clone()))
@@ -794,15 +801,13 @@ pub(super) async fn run_global_named(
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if dry_run {
         output::info(&format!(
-            "DRY RUN — would approve {} @ {} globally. No changes written.",
-            row.name.bold(),
-            row.version.dimmed()
+            "DRY RUN — would approve {} globally. No changes written.",
+            aggregate_identity_selector(row).bold(),
         ));
     } else {
         output::success(&format!(
-            "Approved {} @ {} globally.",
-            row.name.bold(),
-            row.version.dimmed()
+            "Approved {} globally.",
+            aggregate_identity_selector(row).bold(),
         ));
         emit_rerun_hint_stderr(&origins);
     }
@@ -816,12 +821,12 @@ pub(super) async fn run_global_named(
 /// - `NotFound` — zero rows match the given arg. Caller surfaces
 ///   NotFound with a hint toward `--list`.
 /// - `Ambiguous` — a BARE NAME matched multiple rows (different
-///   versions, or same name@version with drifted bindings across
+///   versions, or same name@version with drifted source/content bindings across
 ///   install roots). Caller surfaces a Script error listing the
 ///   candidates so the user can re-run with `name@version`.
 ///
 /// `name@version` form cannot be ambiguous by construction — dedup in
-/// the aggregator is keyed by `(name, version, integrity, script_hash)`,
+/// the aggregator is keyed by `(name, version, source, integrity, script_hash)`,
 /// so two rows with the same `name@version` imply different bindings
 /// and that IS the disambiguation signal we want to preserve.
 #[derive(Debug)]
@@ -839,15 +844,31 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
     rows: &'a [crate::global_blocked_set::AggregateBlockedRow],
     arg: &str,
 ) -> AggregateLookup<'a> {
-    if let Some((name, version)) = arg.rsplit_once('@')
+    if let Some((name, version_and_identity)) = arg.rsplit_once('@')
         && !name.is_empty()
     {
+        let (version, identity) = version_and_identity
+            .split_once('#')
+            .map_or((version_and_identity, None), |(version, identity)| {
+                (version, Some(identity))
+            });
         // name@version form: collect ALL matches (different bindings
         // across installs), not just the first. One match → Match;
         // multiple → Ambiguous; zero → NotFound.
         let matches: Vec<&crate::global_blocked_set::AggregateBlockedRow> = rows
             .iter()
-            .filter(|r| r.name == name && r.version == version)
+            .filter(|r| {
+                r.name == name
+                    && r.version == version
+                    && identity.is_none_or(|expected| {
+                        lpm_global::trusted_deps::rich_identity_token(
+                            r.source.as_deref(),
+                            r.integrity.as_deref(),
+                        )
+                        .as_deref()
+                            == Some(expected)
+                    })
+            })
             .collect();
         match matches.as_slice() {
             [] => AggregateLookup::NotFound,
@@ -874,6 +895,7 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
 pub(super) struct AggregateRowKey {
     name: String,
     version: String,
+    source: Option<String>,
     integrity: Option<String>,
     script_hash: Option<String>,
 }
@@ -883,10 +905,19 @@ impl AggregateRowKey {
         Self {
             name: row.name.clone(),
             version: row.version.clone(),
+            source: row.source.clone(),
             integrity: row.integrity.clone(),
             script_hash: row.script_hash.clone(),
         }
     }
+}
+
+pub(super) fn aggregate_identity_selector(
+    row: &crate::global_blocked_set::AggregateBlockedRow,
+) -> String {
+    let base = format!("{}@{}", row.name, row.version);
+    lpm_global::trusted_deps::rich_identity_token(row.source.as_deref(), row.integrity.as_deref())
+        .map_or(base.clone(), |identity| format!("{base}#{identity}"))
 }
 
 pub(super) fn group_remaining_rows_by_origin<'a>(
@@ -923,9 +954,8 @@ pub(super) fn print_origin_group_card(
     );
     for row in rows.iter().take(8) {
         println!(
-            "    {} @ {}{}",
-            row.name,
-            row.version.dimmed(),
+            "    {}{}",
+            aggregate_identity_selector(row),
             if row.binding_drift {
                 "  [binding drift]".yellow().to_string()
             } else {
@@ -961,10 +991,12 @@ pub(super) async fn commit_global_approval(
     let lock_path = root.global_tx_lock();
     lpm_common::with_exclusive_lock_async(lock_path, async move {
         let mut trust = lpm_global::trusted_deps::read_for(root)?;
-        trust.insert_binding(
+        trust.insert_binding_for_identity(
             &row.name,
             &row.version,
+            row.source.clone(),
             lpm_global::TrustedDependencyBinding {
+                source: None,
                 integrity: row.integrity.clone(),
                 script_hash: row.script_hash.clone(),
                 provenance_at_approval: snap,
@@ -1115,14 +1147,16 @@ pub(super) async fn run_global_interactive(
                         }
 
                         print_aggregate_card(row);
-                        let row_choice: &str =
-                            cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
-                                .item("approve", "Approve", "")
-                                .item("skip", "Skip", "")
-                                .item("quit", "Quit — stop here; approved rows kept", "")
-                                .initial_value("approve")
-                                .interact()
-                                .map_err(prompt_err)?;
+                        let row_choice: &str = cliclack::select(format!(
+                            "{} — approve?",
+                            aggregate_identity_selector(row)
+                        ))
+                        .item("approve", "Approve", "")
+                        .item("skip", "Skip", "")
+                        .item("quit", "Quit — stop here; approved rows kept", "")
+                        .initial_value("approve")
+                        .interact()
+                        .map_err(prompt_err)?;
 
                         match row_choice {
                             "approve" => {
@@ -1203,13 +1237,14 @@ pub(super) async fn run_global_interactive(
     // interactive walk which is also per-row).
     for row in &aggregate.rows {
         print_aggregate_card(row);
-        let choice: &str = cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
-            .item("approve", "Approve", "")
-            .item("skip", "Skip", "")
-            .item("quit", "Quit — stop here; approved rows kept", "")
-            .initial_value("approve")
-            .interact()
-            .map_err(prompt_err)?;
+        let choice: &str =
+            cliclack::select(format!("{} — approve?", aggregate_identity_selector(row)))
+                .item("approve", "Approve", "")
+                .item("skip", "Skip", "")
+                .item("quit", "Quit — stop here; approved rows kept", "")
+                .initial_value("approve")
+                .interact()
+                .map_err(prompt_err)?;
 
         match choice {
             "approve" => {
@@ -1269,9 +1304,8 @@ pub(super) async fn run_global_interactive(
 
 pub(super) fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
     println!(
-        "  {} @ {}{}",
-        row.name.bold(),
-        row.version.dimmed(),
+        "  {}{}",
+        aggregate_identity_selector(row).bold(),
         if row.binding_drift {
             "  [binding drift]".yellow()
         } else {
@@ -1280,6 +1314,9 @@ pub(super) fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlo
     );
     println!("    phases: {}", row.phases_present.join(", ").dimmed());
     println!("    origins: {}", row.origins.join(", ").dimmed());
+    if let Some(source) = &row.source {
+        println!("    source: {}", source.dimmed());
+    }
     if let Some(integ) = &row.integrity {
         println!("    integrity: {}", integ.dimmed());
     }

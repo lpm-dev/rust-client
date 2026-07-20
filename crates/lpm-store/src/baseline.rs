@@ -34,6 +34,12 @@ pub struct InstalledPackageBaseline {
     /// ADD/DELETE-hunk existence checks) MUST consult this field
     /// rather than `package_dir` to stay correct under both layouts.
     pub pristine_dir: PathBuf,
+    /// Immutable post-patch, pre-build tree used for lifecycle review and
+    /// rematerialization. Under v1 this aliases [`Self::package_dir`].
+    pub execution_dir: PathBuf,
+    /// Exact content identity of [`Self::execution_dir`]. Missing for v1 and
+    /// for legacy v2 links that have not completed baseline capture.
+    pub execution_identity: Option<String>,
     /// SRI string of the source tarball — `meta.source_sri` under v2,
     /// `<package_dir>/.integrity` under v1.
     pub integrity: String,
@@ -254,6 +260,12 @@ impl V2BaselineIndex {
                 Ok(p) if p.exists() => p,
                 _ => package_dir.clone(),
             };
+            let lifecycle_baseline = store_v2.lifecycle_baseline(&package_dir).ok().flatten();
+            let execution_dir = lifecycle_baseline.as_ref().map_or_else(
+                || pristine_dir.clone(),
+                |baseline| baseline.source_dir.clone(),
+            );
+            let execution_identity = lifecycle_baseline.map(|baseline| baseline.content_integrity);
             // Project-scoped: in a single project a (name, version) is
             // resolved by exactly one link entry, except the
             // multi-source-same-coords corner case (two distinct
@@ -269,6 +281,8 @@ impl V2BaselineIndex {
                 InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
+                    execution_dir,
+                    execution_identity,
                     integrity: meta_sri,
                     layout: PackageBaselineLayout::V2,
                 },
@@ -338,6 +352,12 @@ impl V2BaselineIndex {
                 Ok(p) if p.exists() => p,
                 _ => package_dir.clone(),
             };
+            let lifecycle_baseline = store_v2.lifecycle_baseline(&package_dir).ok().flatten();
+            let execution_dir = lifecycle_baseline.as_ref().map_or_else(
+                || pristine_dir.clone(),
+                |baseline| baseline.source_dir.clone(),
+            );
+            let execution_identity = lifecycle_baseline.map(|baseline| baseline.content_integrity);
             index.insert(
                 meta.name,
                 meta.version,
@@ -345,6 +365,8 @@ impl V2BaselineIndex {
                 InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
+                    execution_dir,
+                    execution_identity,
                     integrity: meta.source_sri,
                     layout: PackageBaselineLayout::V2,
                 },
@@ -407,10 +429,7 @@ impl V2BaselineIndex {
                 source_sri.to_string(),
             ))?
             .iter()
-            .find(|baseline| {
-                lpm_security::script_hash::compute_script_hash(&baseline.package_dir).as_deref()
-                    == Some(script_hash)
-            })
+            .find(|baseline| baseline.execution_identity.as_deref() == Some(script_hash))
     }
 
     /// Lookup by exact lockfile source identity and canonical lifecycle hash.
@@ -424,10 +443,7 @@ impl V2BaselineIndex {
         self.by_source_identity
             .get(&(name.to_string(), version.to_string(), source_id.to_string()))?
             .iter()
-            .find(|baseline| {
-                lpm_security::script_hash::compute_script_hash(&baseline.package_dir).as_deref()
-                    == Some(script_hash)
-            })
+            .find(|baseline| baseline.execution_identity.as_deref() == Some(script_hash))
     }
 }
 
@@ -562,7 +578,9 @@ pub fn find_installed_package_baseline_indexed(
     {
         return Some(InstalledPackageBaseline {
             package_dir: pkg_dir.clone(),
-            pristine_dir: pkg_dir,
+            pristine_dir: pkg_dir.clone(),
+            execution_dir: pkg_dir,
+            execution_identity: None,
             integrity,
             layout: PackageBaselineLayout::V1,
         });
@@ -593,7 +611,9 @@ pub fn find_installed_package_baseline_exact_indexed(
     {
         return Some(InstalledPackageBaseline {
             package_dir: package_dir.clone(),
-            pristine_dir: package_dir,
+            pristine_dir: package_dir.clone(),
+            execution_dir: package_dir,
+            execution_identity: None,
             integrity,
             layout: PackageBaselineLayout::V1,
         });
@@ -669,9 +689,18 @@ pub fn find_installed_package_baseline(
                     Ok(p) if p.exists() => p,
                     _ => package_dir.clone(),
                 };
+                let lifecycle_baseline = store_v2.lifecycle_baseline(&package_dir).ok().flatten();
+                let execution_dir = lifecycle_baseline.as_ref().map_or_else(
+                    || pristine_dir.clone(),
+                    |baseline| baseline.source_dir.clone(),
+                );
+                let execution_identity =
+                    lifecycle_baseline.map(|baseline| baseline.content_integrity);
                 return Ok(Some(InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
+                    execution_dir,
+                    execution_identity,
                     integrity: meta.source_sri,
                     layout: PackageBaselineLayout::V2,
                 }));
@@ -695,7 +724,9 @@ pub fn find_installed_package_baseline(
             // the same path here keeps the patch engine layout-agnostic
             // (read pristine bytes from `pristine_dir`, write
             // destinations via `MaterializedPackage.destination`).
-            pristine_dir: pkg_dir,
+            pristine_dir: pkg_dir.clone(),
+            execution_dir: pkg_dir,
+            execution_identity: None,
             integrity,
             layout: PackageBaselineLayout::V1,
         }));
@@ -1392,6 +1423,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
         let links_root = dir.path().join("store").join("v2").join("links");
         let source_sri = "sha512-shared-source";
         let source_identity = format!("registry-source\0{source_sri}");
@@ -1432,10 +1464,17 @@ mod tests {
             }
             .write_to(&link_dir)
             .unwrap();
+            store
+                .capture_patched_lifecycle_baseline(&package_dir)
+                .unwrap()
+                .unwrap();
             package_dirs.push(package_dir);
         }
-        let expected_hash = lpm_security::script_hash::compute_script_hash(&package_dirs[1])
-            .expect("expected script hash");
+        let expected_hash = store
+            .lifecycle_baseline(&package_dirs[1])
+            .unwrap()
+            .unwrap()
+            .content_integrity;
 
         let index = V2BaselineIndex::build(&lpm_root).unwrap();
         let baseline = index

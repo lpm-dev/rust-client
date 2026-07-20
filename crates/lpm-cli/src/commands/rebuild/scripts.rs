@@ -57,6 +57,7 @@ pub(super) struct ScriptablePackage {
     pub(super) wrapper_id: Option<String>,
     pub(super) store_path: std::path::PathBuf,
     pub(super) pristine_path: std::path::PathBuf,
+    pub(super) execution_identity: Option<String>,
     pub(super) source_integrity: String,
     pub(super) graph_key_digest: Option<String>,
     pub(super) scripts: HashMap<String, String>,

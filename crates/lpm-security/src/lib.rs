@@ -95,8 +95,8 @@ pub struct SecurityPolicy {
     ///
     /// Packages trusted to run lifecycle scripts. The type is
     /// [`TrustedDependencies`] so the strict gate
-    /// ([`Self::can_run_scripts_strict`]) can bind to
-    /// `{name, version, integrity, script_hash}`. The legacy
+    /// ([`Self::can_run_scripts_strict_for_identity`]) can bind to
+    /// `{name, version, source, integrity, script_hash}`. The legacy
     /// [`Self::can_run_scripts`] method is preserved as a name-only
     /// fallback for manifests with the legacy `Vec<String>` form.
     pub trusted_dependencies: TrustedDependencies,
@@ -177,22 +177,21 @@ impl SecurityPolicy {
     /// script hash. Used by legacy callers; superseded by
     /// [`Self::can_run_scripts_strict`].
     ///
-    /// Callers should prefer [`Self::can_run_scripts_strict`] which binds
-    /// to the full `{name, version, integrity, script_hash}` tuple. The
-    /// lenient check is kept only for backwards compatibility with manifests
-    /// that still have the legacy `Vec<String>` form.
+    /// Callers should prefer [`Self::can_run_scripts_strict_for_identity`],
+    /// which binds the complete source/content identity. The lenient check is
+    /// retained only for migration and non-execution compatibility surfaces.
     pub fn can_run_scripts(&self, package_name: &str) -> bool {
         self.trusted_dependencies
             .contains_name_lenient(package_name)
     }
 
-    /// Strict gate: returns the full [`TrustMatch`] result for a package
-    /// against the project's trustedDependencies, considering name +
-    /// version + integrity + script hash.
+    /// Source-less compatibility gate for callers that cannot yet supply the
+    /// package source. Execution paths should use
+    /// [`Self::can_run_scripts_strict_for_identity`].
     ///
     /// `lpm rebuild` should branch on the result:
     /// - [`TrustMatch::Strict`] → run the script
-    /// - [`TrustMatch::LegacyNameOnly`] → run the script + emit a deprecation warning
+    /// - [`TrustMatch::LegacyNameOnly`] → keep blocked and offer migration
     /// - [`TrustMatch::BindingDrift`] → SKIP the script + warn the user to re-review
     /// - [`TrustMatch::NotTrusted`] → SKIP the script
     pub fn can_run_scripts_strict(

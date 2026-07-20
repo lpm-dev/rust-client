@@ -32,7 +32,10 @@
 
 use lpm_common::LpmError;
 use lpm_security::{
-    SecurityPolicy, TrustMatch, script_hash::compute_script_hash_with_phase_bodies,
+    SecurityPolicy, TrustMatch,
+    script_hash::{
+        compute_script_hash_with_phase_bodies, script_hash_with_phase_bodies_for_content_identity,
+    },
     triage::StaticTier,
 };
 use lpm_store::PackageStore;
@@ -692,9 +695,28 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             return None;
         }
 
-        let pkg_dir = resolve_blocked_package_dir(store, identity, extras.baseline_index)?;
+        let lifecycle = resolve_blocked_package(store, identity, extras.baseline_index)?;
+        let pkg_dir = lifecycle.package_dir;
 
-        let script_data = compute_script_hash_with_phase_bodies(&pkg_dir)?;
+        let script_data = match (
+            extras.baseline_index.is_some(),
+            lifecycle.content_identity.as_deref(),
+        ) {
+            (_, Some(content_identity)) => {
+                script_hash_with_phase_bodies_for_content_identity(&pkg_dir, content_identity)?
+            }
+            (true, None) => {
+                let phase_bodies = read_install_phase_bodies(&pkg_dir);
+                if phase_bodies.is_empty() {
+                    return None;
+                }
+                lpm_security::script_hash::ScriptHashWithPhaseBodies {
+                    hash: None,
+                    phase_bodies,
+                }
+            }
+            (false, None) => compute_script_hash_with_phase_bodies(&pkg_dir)?,
+        };
         let script_hash = script_data.hash;
         let phase_bodies = script_data.phase_bodies;
         let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
@@ -793,22 +815,10 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                     (false, false)
                 }
             }
-            // Legacy bare-name entry covers it leniently — NOT blocked
-            // (the existing build pipeline will run the script with a
-            // deprecation warning). Legacy entries have no binding to check the capability
-            // hash against; the helper returns true for any widening
-            // request against a Legacy match. That's correct — a
-            // bare-name approval cannot cover a widening capability
-            // request, and surfacing such packages in the blocked set
-            // lets the user upgrade to a rich capability-hash-bearing
-            // approval via `lpm approve-scripts`.
-            TrustMatch::LegacyNameOnly => {
-                if requested_capabilities.requires_review_despite_strict_match(user_bound, None) {
-                    (true, false)
-                } else {
-                    (false, false)
-                }
-            }
+            // Coordinate-only legacy entries carry no reusable content
+            // identity. Keep them readable for migration, but never let them
+            // authorize lifecycle execution.
+            TrustMatch::LegacyNameOnly => (true, false),
             // Rich entry exists but the binding doesn't match — BLOCKED
             // and flagged as drift so approve-scripts can show a special
             // "previously approved, please re-review" message.
@@ -871,11 +881,16 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     blocked
 }
 
-fn resolve_blocked_package_dir(
+struct ResolvedLifecyclePackage {
+    package_dir: PathBuf,
+    content_identity: Option<String>,
+}
+
+fn resolve_blocked_package(
     store: &PackageStore,
     identity: &InstalledPackageIdentity,
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
-) -> Option<PathBuf> {
+) -> Option<ResolvedLifecyclePackage> {
     match baseline_index {
         Some(index) => index
             .lookup_source_identity(
@@ -883,8 +898,14 @@ fn resolve_blocked_package_dir(
                 &identity.version,
                 &identity.package_key().source_id,
             )
-            .map(|baseline| baseline.package_dir.clone()),
-        None => Some(store.package_dir(&identity.name, &identity.version)),
+            .map(|baseline| ResolvedLifecyclePackage {
+                package_dir: baseline.execution_dir.clone(),
+                content_identity: baseline.execution_identity.clone(),
+            }),
+        None => Some(ResolvedLifecyclePackage {
+            package_dir: store.package_dir(&identity.name, &identity.version),
+            content_identity: None,
+        }),
     }
 }
 
@@ -2000,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_legacy_name_only_approval_does_not_block() {
+    fn capture_legacy_name_only_approval_remains_blocked() {
         let project = tempdir().unwrap();
         let store_root = tempdir().unwrap();
         fake_store_with_pkg(
@@ -2011,7 +2032,6 @@ mod tests {
         );
         let store = fake_store_at(store_root.path());
 
-        // Legacy bare-name entry — covers esbuild leniently
         let policy = SecurityPolicy {
             trusted_dependencies: TrustedDependencies::Legacy(vec!["esbuild".to_string()]),
             minimum_release_age_secs: 0,
@@ -2025,11 +2045,8 @@ mod tests {
         )
         .unwrap();
 
-        // Legacy approval is enough to NOT block (rebuild will run the script
-        // with a deprecation warning). The blocked set is for things the
-        // user must REVIEW.
-        assert!(capture.state.blocked_packages.is_empty());
-        assert!(!capture.should_emit_warning);
+        assert_eq!(capture.state.blocked_packages.len(), 1);
+        assert!(capture.should_emit_warning);
     }
 
     #[test]
@@ -3160,7 +3177,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn blocked_capture_keeps_same_content_sources_independently_reviewable() {
+    fn blocked_capture_uses_immutable_identity_after_build_output_changes() {
         use lpm_store::v2::link_meta::{LinkMeta, LinkMetaPlatform};
         use lpm_workspace::{ApprovalMetadata, TrustedDependencies};
         use std::sync::Arc;
@@ -3171,6 +3188,7 @@ mod tests {
         let project = root.path().join("project");
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         let links_root = root.path().join("store/v2/links");
+        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
         let integrity = "sha512-identical";
         let sources = ["directory+./fork-a", "directory+./fork-b"];
         let mut package_dirs = Vec::new();
@@ -3217,6 +3235,10 @@ mod tests {
             }
             .write_to(&link_dir)
             .unwrap();
+            v2_store
+                .capture_patched_lifecycle_baseline(&package_dir)
+                .unwrap()
+                .unwrap();
             std::os::unix::fs::symlink(
                 &package_dir,
                 project.join("node_modules").join(format!("shared-{index}")),
@@ -3225,8 +3247,11 @@ mod tests {
             package_dirs.push(package_dir);
         }
 
-        let script_hash = lpm_security::script_hash::compute_script_hash(&package_dirs[0])
-            .expect("fixture has an install script");
+        let script_hash = v2_store
+            .lifecycle_baseline(&package_dirs[0])
+            .unwrap()
+            .unwrap()
+            .content_integrity;
         let mut trusted = TrustedDependencies::default();
         trusted.approve_with_metadata(
             "shared",
@@ -3253,6 +3278,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        std::fs::write(package_dirs[0].join("generated-output.js"), "generated\n").unwrap();
         let baseline_index = lpm_store::V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
 
         let blocked = compute_blocked_packages_with_metadata_and_baseline(

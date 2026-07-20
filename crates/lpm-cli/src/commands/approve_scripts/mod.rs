@@ -14,7 +14,7 @@
 //! - **Direct approve** (`<pkg>`) — approve a single package by name
 //! - **Read-only listing** (`--list`) — print the blocked set, NO mutations
 //!
-//! All approvals are bound to `{name, version, integrity, script_hash}`
+//! All approvals are bound to `{name, version, source, integrity, script_hash}`
 //! per the trust binding contract (see [`lpm_workspace::TrustedDependencies`]).
 //!
 //! ## Output

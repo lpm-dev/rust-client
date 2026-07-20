@@ -71,9 +71,8 @@ pub(crate) enum TrustReason {
     /// match an approved entry.
     StrictBinding,
     /// Pre-legacy bare-name `trustedDependencies: ["name"]`
-    /// entry. Matched via `TrustMatch::LegacyNameOnly`. Callers
-    /// still emit a soft deprecation warning so users migrate to
-    /// the rich form.
+    /// entry. Matched via `TrustMatch::LegacyNameOnly`, kept visible for
+    /// migration, and never treated as executable trust.
     LegacyName,
     /// `lpm.scripts.trustedScopes` glob match (e.g., `@myorg/*`).
     ScopedGlob,
@@ -108,7 +107,7 @@ pub(crate) enum TrustReason {
     /// The user set
     /// `force-security-floor = true` in `~/.lpm/config.toml`. What
     /// would otherwise be a trust-granting result (`StrictBinding`,
-    /// `LegacyName`, `ScopedGlob`, or `GreenTierUnderTriage`) is
+    /// `ScopedGlob`, or `GreenTierUnderTriage`) is
     /// suspended for the duration the flag is set. No persisted state
     /// changes — approvals in `package.json > lpm > trustedDependencies`
     /// remain intact. Unsetting the flag reactivates them on the next
@@ -156,7 +155,6 @@ impl TrustReason {
         matches!(
             self,
             Self::StrictBinding
-                | Self::LegacyName
                 | Self::ScopedGlob
                 | Self::GreenTierUnderTriage
                 | Self::AdvisorApprovedThisRun,
@@ -176,7 +174,7 @@ impl TrustReason {
 /// 1. **Strict gate** ([`SecurityPolicy::can_run_scripts_strict`]).
 ///    A rich binding that matches the full tuple yields
 ///    [`TrustReason::StrictBinding`]; a legacy bare-name entry yields
-///    [`TrustReason::LegacyName`]; a rich binding whose `scriptHash`
+///    the non-executable migration result [`TrustReason::LegacyName`]; a rich binding whose `scriptHash`
 ///    drifted yields [`TrustReason::BindingDrift`] — terminal, never
 ///    overridden by later rules.
 /// 2. **Scope glob** (`lpm.scripts.trustedScopes`). Glob match yields
@@ -213,7 +211,7 @@ pub(crate) fn evaluate_trust(
     project_dir: &Path,
     effective_policy: ScriptPolicy,
     // When `true`, any result that would
-    // otherwise be trust-granting (`StrictBinding`, `LegacyName`,
+    // otherwise be trust-granting (`StrictBinding`,
     // `ScopedGlob`, `GreenTierUnderTriage`) is intercepted and
     // returned as [`TrustReason::SuspendedByForceFloor`]. Callers
     // read this from `GlobalConfig::load().get_bool("force-security-floor")`
@@ -279,8 +277,44 @@ pub(crate) fn evaluate_trust_for_identity(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> TrustReason {
+    let script_hash = compute_script_hash(package_dir);
+    evaluate_trust_for_identity_with_script_hash(
+        script_hash.as_deref(),
+        name,
+        version,
+        source,
+        integrity,
+        scripts,
+        policy,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_trust_for_identity_with_script_hash(
+    script_hash: Option<&str>,
+    name: &str,
+    version: &str,
+    source: Option<&str>,
+    integrity: Option<&str>,
+    scripts: &HashMap<String, String>,
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    force_security_floor: bool,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> TrustReason {
     let candidate = evaluate_trust_unsuspended(
-        package_dir,
+        script_hash,
         name,
         version,
         source,
@@ -334,7 +368,7 @@ pub(crate) fn evaluate_trust_for_identity(
 /// which is strictly a decorator applied by the outer function.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_trust_unsuspended(
-    package_dir: &Path,
+    script_hash: Option<&str>,
     name: &str,
     version: &str,
     source: Option<&str>,
@@ -347,19 +381,17 @@ pub(super) fn evaluate_trust_unsuspended(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> TrustReason {
-    let script_hash = compute_script_hash(package_dir);
-    let strict = policy.can_run_scripts_strict_for_identity(
-        name,
-        version,
-        source,
-        integrity,
-        script_hash.as_deref(),
-    );
+    let strict =
+        policy.can_run_scripts_strict_for_identity(name, version, source, integrity, script_hash);
     match strict {
         TrustMatch::Strict => return TrustReason::StrictBinding,
         TrustMatch::LegacyNameOnly => return TrustReason::LegacyName,
         TrustMatch::BindingDrift { .. } => return TrustReason::BindingDrift,
         TrustMatch::NotTrusted => {}
+    }
+
+    if script_hash.is_none() {
+        return TrustReason::Untrusted;
     }
 
     if is_scope_trusted(name, project_dir) {
@@ -380,7 +412,7 @@ pub(super) fn evaluate_trust_unsuspended(
         // install.
         if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
             && let Some(set) = advisor_approvals
-            && let Some(script_bundle_hash) = script_hash.as_deref()
+            && let Some(script_bundle_hash) = script_hash
             && crate::triage_advisor_session::contains_exact_approval(
                 set,
                 name,

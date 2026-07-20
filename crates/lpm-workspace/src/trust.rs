@@ -30,8 +30,8 @@ use std::collections::HashMap;
 ///   matters — the array form is tried first because it's strictly more
 ///   restrictive (an array can never be confused for a map).
 /// - **Write:** `lpm approve-scripts` upgrades any Legacy variant to Rich on
-///   the first new approval. The `lpm rebuild` strict gate accepts both forms;
-///   legacy bare-name entries match by name only and produce a deprecation warning.
+///   the first new approval. Legacy bare-name entries remain readable and
+///   reviewable, but cannot authorize lifecycle execution without an exact hash.
 /// - **Coexistence:** a manifest stays in the Legacy form until the first
 ///   approval is made through `lpm approve-scripts`, at which point it
 ///   migrates to the Rich form and stays there. There is no downgrade path.
@@ -42,8 +42,8 @@ use std::collections::HashMap;
 #[serde(untagged)]
 pub enum TrustedDependencies {
     /// Legacy form: `["esbuild", "sharp"]`. Bare package names with no
-    /// version, integrity, or script hash binding. The strict gate accepts
-    /// these as `LegacyNameOnly` matches with a deprecation warning.
+    /// version, integrity, or script hash binding. The strict gate surfaces
+    /// these as `LegacyNameOnly` migration matches, never executable trust.
     Legacy(Vec<String>),
     /// Rich form: `{"esbuild@0.25.1#<identity-token>": {source,
     /// integrity, scriptHash}}`. New keys bind the source/content identity;
@@ -334,16 +334,15 @@ impl TrustedDependencies {
     ///
     /// Returns:
     /// - [`TrustMatch::Strict`] if the Rich variant has a `name@version`
-    ///   entry whose stored `integrity` and `script_hash` BOTH equal the
-    ///   queried values. `None` on either side counts as "no constraint" —
-    ///   intentional for the legacy-upgrade path where a Rich entry was
-    ///   inserted before the binding fields were known.
+    ///   entry whose stored integrity, when present, matches the queried
+    ///   integrity and whose concrete `script_hash` equals the queried hash.
+    ///   A missing script hash can never grant durable trust.
     /// - [`TrustMatch::BindingDrift`] if a Rich entry exists for the
     ///   `name@version` key but at least one binding field is set on BOTH
     ///   sides and they differ.
     /// - [`TrustMatch::LegacyNameOnly`] if and only if the Legacy
     ///   `Vec<String>` variant contains the bare `name` string. Caller
-    ///   should warn about deprecation.
+    ///   should keep the package blocked and offer migration.
     /// - [`TrustMatch::NotTrusted`] otherwise.
     ///
     /// **`<name>@*` Rich-form sentinels are NOT honored by this strict
@@ -359,9 +358,8 @@ impl TrustedDependencies {
     /// script_hash checks. The user is forced through `lpm approve-scripts`
     /// on each new version, which writes a concrete `name@version`
     /// entry that closes the loop. `Vec<String>` legacy form is
-    /// preserved as `LegacyNameOnly` because that shape is an explicit
-    /// user-authored decision in the manifest, distinct from the
-    /// auto-generated `@*` sentinel.
+    /// preserved as `LegacyNameOnly` so it can be migrated without granting
+    /// executable trust.
     ///
     /// **Lookup precedence:** concrete `name@version` Rich keys are the
     /// only Rich-form keys that participate in the strict trust decision.

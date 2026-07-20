@@ -25,9 +25,9 @@ struct ProjectApprovalInvocation<'a> {
 /// The filter rule mirrors the install-time blocked-set computation in
 /// [`build_state::compute_blocked_packages`]:
 ///
-/// - [`TrustMatch::Strict`] / [`TrustMatch::LegacyNameOnly`] → REMOVE
-///   from the effective blocked set (the script will run when `lpm rebuild`
-///   eventually executes; the user has nothing to review).
+/// - [`TrustMatch::Strict`] → REMOVE from the effective blocked set.
+/// - [`TrustMatch::LegacyNameOnly`] → KEEP. Coordinate-only entries remain
+///   migration input but cannot authorize lifecycle execution.
 /// - [`TrustMatch::BindingDrift`] → KEEP. Drift is the whole reason we
 ///   re-review. The blocked package's existing `binding_drift` flag is
 ///   already true in this case (set by the install-time capture), so the
@@ -60,10 +60,8 @@ pub fn compute_effective_blocked_set<'a>(
                 bp.script_hash.as_deref(),
             );
             match trust {
-                // Strict / LegacyNameOnly MAY still need review if
-                // the capability gate rejects. Drop only when the
-                // gate also passes — i.e., no widening requested
-                // OR the binding's capability_hash covers it.
+                // A strict match may still need review if the capability gate
+                // rejects. Drop only when that gate also passes.
                 TrustMatch::Strict => {
                     let binding = trusted.get_binding(
                         &bp.name,
@@ -73,9 +71,7 @@ pub fn compute_effective_blocked_set<'a>(
                     );
                     requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
                 }
-                TrustMatch::LegacyNameOnly => {
-                    requested_capabilities.requires_review_despite_strict_match(user_bound, None)
-                }
+                TrustMatch::LegacyNameOnly => true,
                 // BindingDrift / NotTrusted already need review.
                 TrustMatch::BindingDrift { .. } | TrustMatch::NotTrusted => true,
             }

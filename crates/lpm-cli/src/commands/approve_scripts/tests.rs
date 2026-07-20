@@ -1381,11 +1381,7 @@ async fn e2e_install_block_approve_then_script_drift_re_blocks() {
 }
 
 #[tokio::test]
-async fn e2e_install_with_legacy_array_form_does_not_break_install() {
-    // Backwards-compat: a project with the pre-existing legacy array
-    // form must still install. The strict gate sees LegacyNameOnly
-    // for the listed package and treats it as approved (with a
-    // deprecation warning at build time, but install is fine).
+async fn e2e_install_with_legacy_array_form_keeps_package_reviewable() {
     let project = tempdir().unwrap();
     let store_root = tempdir().unwrap();
     let store = PackageStore::at(store_root.path().to_path_buf());
@@ -1418,11 +1414,9 @@ async fn e2e_install_with_legacy_array_form_does_not_break_install() {
     )
     .unwrap();
 
-    // Legacy bare-name approval is enough to NOT block — install
-    // proceeds silently. The deprecation warning is emitted at
-    // `lpm rebuild` time, not here.
-    assert!(cap.state.blocked_packages.is_empty());
-    assert!(!cap.should_emit_warning);
+    assert_eq!(cap.state.blocked_packages.len(), 1);
+    assert_eq!(cap.state.blocked_packages[0].name, "esbuild");
+    assert!(cap.should_emit_warning);
 }
 
 #[tokio::test]
@@ -1470,9 +1464,15 @@ async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
         &read_policy(project.path()),
     )
     .unwrap();
-    // Only esbuild is blocked (sharp is legacy-approved)
-    assert_eq!(cap.state.blocked_packages.len(), 1);
-    assert_eq!(cap.state.blocked_packages[0].name, "esbuild");
+    assert_eq!(cap.state.blocked_packages.len(), 2);
+    let sharp_script_hash = cap
+        .state
+        .blocked_packages
+        .iter()
+        .find(|package| package.name == "sharp")
+        .and_then(|package| package.script_hash.as_deref())
+        .unwrap()
+        .to_string();
 
     // Bulk approve
     run(project.path(), None, true, false, false, true)
@@ -1486,15 +1486,14 @@ async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
     let map = td.as_object().unwrap();
     let esbuild_key = TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, None);
     assert!(map.contains_key(&esbuild_key), "new approval");
-    assert!(
-        map.contains_key("sharp@*"),
-        "legacy entry preserved as `<name>@*`"
-    );
+    let sharp_key = TrustedDependencies::rich_key_for_identity("sharp", "0.33.0", None, None);
+    assert!(map.contains_key(&sharp_key), "legacy approval upgraded");
 
-    // Lenient lookup still finds sharp via the @* sentinel — install
-    // continues to honor it for the legacy use case.
     let policy_after = read_policy(project.path());
-    assert!(policy_after.can_run_scripts("sharp"));
+    assert!(matches!(
+        policy_after.can_run_scripts_strict("sharp", "0.33.0", None, Some(&sharp_script_hash)),
+        TrustMatch::Strict
+    ));
 }
 
 // ── — --yes refusal e2e via run() ──────────
@@ -1723,11 +1722,8 @@ fn compute_effective_blocked_set_removes_strict_matches() {
     assert_eq!(effective[0].name, "sharp");
 }
 
-/// **AUDIT REGRESSION ():** filter must REMOVE entries
-/// covered by a LegacyNameOnly match (the legacy bare-name approval is
-/// honored at install time, so it's not "blocked").
 #[test]
-fn compute_effective_blocked_set_removes_legacy_name_only_matches() {
+fn compute_effective_blocked_set_keeps_legacy_name_only_matches_reviewable() {
     let state = BuildState {
         state_version: BUILD_STATE_VERSION,
         blocked_set_fingerprint: "sha256-test".into(),
@@ -1743,10 +1739,7 @@ fn compute_effective_blocked_set_removes_legacy_name_only_matches() {
         &crate::capability::CapabilitySet::default(),
         &crate::capability::UserBound::default(),
     );
-    assert!(
-        effective.is_empty(),
-        "legacy bare-name approval must be honored as 'not blocked'"
-    );
+    assert_eq!(effective.len(), 1);
 }
 
 /// **AUDIT REGRESSION ():** drifted entries must
@@ -2131,6 +2124,15 @@ fn row(name: &str, version: &str, origins: &[&str]) -> AggregateBlockedRow {
     }
 }
 
+fn row_trust_key(row: &AggregateBlockedRow) -> String {
+    lpm_global::trusted_deps::rich_key_for_identity(
+        &row.name,
+        &row.version,
+        row.source.as_deref(),
+        row.integrity.as_deref(),
+    )
+}
+
 fn deny_verify_policy() -> VerifyPolicy {
     VerifyPolicy {
         enforce: EnforceMode::Deny,
@@ -2284,6 +2286,33 @@ fn lookup_aggregate_by_arg_is_ambiguous_when_name_at_version_matches_multiple_bi
 }
 
 #[test]
+fn lookup_aggregate_by_arg_matches_exact_global_identity_selector() {
+    let mut registry_a = row("shared", "1.0.0", &["tool-a"]);
+    registry_a.source = Some("registry+https://registry-a.example".into());
+    registry_a.integrity = Some("sha512-a".into());
+    let mut registry_b = row("shared", "1.0.0", &["tool-b"]);
+    registry_b.source = Some("registry+https://registry-b.example".into());
+    registry_b.integrity = Some("sha512-b".into());
+    let token = lpm_global::trusted_deps::rich_identity_token(
+        registry_b.source.as_deref(),
+        registry_b.integrity.as_deref(),
+    )
+    .unwrap();
+    let selector = format!("shared@1.0.0#{token}");
+    let rows = vec![registry_a, registry_b];
+
+    let hit = match lookup_aggregate_by_arg(&rows, &selector) {
+        AggregateLookup::Match(row) => row,
+        other => panic!("expected exact identity match, got {other:?}"),
+    };
+
+    assert_eq!(
+        hit.source.as_deref(),
+        Some("registry+https://registry-b.example")
+    );
+}
+
+#[test]
 fn group_remaining_rows_by_origin_omits_rows_already_decided_everywhere() {
     let shared = row("esbuild", "0.25.1", &["eslint", "typescript"]);
     let unique = row("sharp", "0.33.0", &["typescript"]);
@@ -2402,8 +2431,8 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
     .await
     .unwrap();
     let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
-    assert!(trust.trusted.contains_key("esbuild@0.25.1"));
-    assert!(trust.trusted.contains_key("sharp@0.33.0"));
+    assert!(trust.trusted.contains_key(&row_trust_key(&agg.rows[0])));
+    assert!(trust.trusted.contains_key(&row_trust_key(&agg.rows[1])));
 }
 
 /// Named-package approval writes exactly ONE entry to the trust
@@ -2433,8 +2462,8 @@ async fn run_global_named_approves_only_the_matched_row() {
     .await
     .unwrap();
     let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
-    assert!(trust.trusted.contains_key("sharp@0.33.0"));
-    assert!(!trust.trusted.contains_key("esbuild@0.25.1"));
+    assert!(trust.trusted.contains_key(&row_trust_key(&agg.rows[1])));
+    assert!(!trust.trusted.contains_key(&row_trust_key(&agg.rows[0])));
 }
 
 /// Unknown package name surfaces NotFound with an actionable hint
@@ -2722,11 +2751,11 @@ async fn global_named_approvals_do_not_clobber_each_other() {
     let root = lpm_common::LpmRoot::from_dir(&root_path);
     let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
     assert!(
-        trust.trusted.contains_key("esbuild@0.25.1"),
+        trust.trusted.contains_key(&row_trust_key(&agg.rows[0])),
         "first writer's binding survived",
     );
     assert!(
-        trust.trusted.contains_key("sharp@0.33.0"),
+        trust.trusted.contains_key(&row_trust_key(&agg.rows[1])),
         "second writer's binding survived",
     );
 }

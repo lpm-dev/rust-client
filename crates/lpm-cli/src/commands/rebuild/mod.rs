@@ -62,7 +62,9 @@ use self::scripts::{
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
 #[cfg(test)]
 pub(crate) use self::trust::evaluate_trust;
-pub(crate) use self::trust::{TrustReason, evaluate_trust_for_identity};
+pub(crate) use self::trust::{
+    TrustReason, evaluate_trust_for_identity, evaluate_trust_for_identity_with_script_hash,
+};
 
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
@@ -324,9 +326,12 @@ pub(crate) async fn run_under_store_lock(
         } else {
             None
         };
+        let baseline_layout = baseline.layout;
+        let execution_dir = baseline.execution_dir.clone();
+        let execution_identity = baseline.execution_identity.clone();
         let pkg_dir = baseline.package_dir;
         let pristine_path = baseline.pristine_dir;
-        let pkg_json_path = pkg_dir.join("package.json");
+        let pkg_json_path = execution_dir.join("package.json");
 
         if !pkg_json_path.exists() {
             continue;
@@ -351,21 +356,39 @@ pub(crate) async fn run_under_store_lock(
         // `is_scope_trusted` scope glob AND the green-tier auto-
         // trust path (*active only under
         // [`ScriptPolicy::Triage`]).
-        let trust_reason = evaluate_trust_for_identity(
-            &pkg_dir,
-            &lp.name,
-            &lp.version,
-            lp.source.as_deref(),
-            lp.integrity.as_deref(),
-            &scripts,
-            &policy,
-            project_dir,
-            effective_policy,
-            force_security_floor,
-            &requested_capabilities,
-            &user_bound,
-            advisor_approvals,
-        );
+        let trust_reason = if baseline_layout == PackageBaselineLayout::V2 {
+            evaluate_trust_for_identity_with_script_hash(
+                execution_identity.as_deref(),
+                &lp.name,
+                &lp.version,
+                lp.source.as_deref(),
+                lp.integrity.as_deref(),
+                &scripts,
+                &policy,
+                project_dir,
+                effective_policy,
+                force_security_floor,
+                &requested_capabilities,
+                &user_bound,
+                advisor_approvals,
+            )
+        } else {
+            evaluate_trust_for_identity(
+                &execution_dir,
+                &lp.name,
+                &lp.version,
+                lp.source.as_deref(),
+                lp.integrity.as_deref(),
+                &scripts,
+                &policy,
+                project_dir,
+                effective_policy,
+                force_security_floor,
+                &requested_capabilities,
+                &user_bound,
+                advisor_approvals,
+            )
+        };
         let is_trusted = trust_reason.is_trusted();
 
         // Surface drift to the user — even though the script is skipped,
@@ -377,11 +400,8 @@ pub(crate) async fn run_under_store_lock(
                 lp.name, lp.name,
             ));
         }
-        // Surface legacy bare-name entries with a soft deprecation warning,
-        // so users migrate to the strict binding form. Only emit when the
-        // strict gate was the deciding factor (the helper returns
-        // `LegacyName` only when `TrustMatch::LegacyNameOnly` won AND
-        // scope did not).
+        // Surface legacy bare-name entries with a migration warning so users
+        // can replace the blocked, hashless entry with an exact binding.
         if trust_reason == TrustReason::LegacyName && !json_output {
             install_ui::warn(&format!(
                 "{}: legacy bare-name trustedDependencies entry — run \
@@ -414,6 +434,7 @@ pub(crate) async fn run_under_store_lock(
             wrapper_id,
             store_path: pkg_dir,
             pristine_path,
+            execution_identity,
             source_integrity: baseline.integrity,
             graph_key_digest,
             scripts,
@@ -1369,23 +1390,38 @@ pub(crate) async fn run_under_store_lock(
             }
         }
 
-        if build_key.is_some() {
-            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
-            let rematerialize_start = std::time::Instant::now();
-            if let Err(error) = store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
-            {
-                build_cache_metrics.rematerialize_ms +=
-                    elapsed_millis(rematerialize_start.elapsed());
-                if !json_output {
-                    let label = rebuild_package_label(pkg);
-                    install_ui::detail(&format!(
-                        "  {} {label:<package_label_width$}  failed to restore pristine source: {error}",
-                        install_ui::red("✗"),
-                    ));
+        let rematerialize_start = std::time::Instant::now();
+        let rematerialize_result = if pkg.graph_key_digest.is_some() {
+            match pkg.execution_identity.as_deref() {
+                Some(expected_identity) => {
+                    v2_store.restore_lifecycle_package(&pkg.store_path, expected_identity)
                 }
-                failures += 1;
-                continue;
+                None => Err(LpmError::Store(format!(
+                    "v2 lifecycle baseline is unavailable for {}@{}; run `lpm install` to recreate it before rebuilding",
+                    pkg.name, pkg.version
+                ))),
             }
+        } else if build_key.is_some() {
+            v2_store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = rematerialize_result {
+            build_cache_metrics.rematerialize_ms += elapsed_millis(rematerialize_start.elapsed());
+            if !json_output {
+                let label = rebuild_package_label(pkg);
+                install_ui::detail(&format!(
+                    "  {} {label:<package_label_width$}  failed to restore authorized lifecycle baseline: {error}",
+                    install_ui::red("✗"),
+                ));
+            }
+            if json_output {
+                install_ui::failed(&rebuild_package_failure_message(pkg, &error));
+            }
+            failures += 1;
+            continue;
+        }
+        if pkg.graph_key_digest.is_some() || build_key.is_some() {
             build_cache_metrics.rematerialize_ms += elapsed_millis(rematerialize_start.elapsed());
         }
 

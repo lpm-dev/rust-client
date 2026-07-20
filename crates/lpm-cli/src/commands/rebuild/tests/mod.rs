@@ -779,6 +779,7 @@ fn toposort_respects_dependency_order() {
             wrapper_id: None,
             store_path: PathBuf::new(),
             pristine_path: PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::new(),
@@ -795,6 +796,7 @@ fn toposort_respects_dependency_order() {
             wrapper_id: None,
             store_path: PathBuf::new(),
             pristine_path: PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::new(),
@@ -862,6 +864,7 @@ fn toposort_preserves_multiple_versions_of_the_same_package() {
         wrapper_id: None,
         store_path: PathBuf::new(),
         pristine_path: PathBuf::new(),
+        execution_identity: None,
         source_integrity: format!("sha512-{version}"),
         graph_key_digest: None,
         scripts: HashMap::new(),
@@ -923,6 +926,7 @@ fn toposort_preserves_same_version_packages_from_distinct_sources() {
             .map(|source| source.source_id()),
         store_path: PathBuf::new(),
         pristine_path: PathBuf::new(),
+        execution_identity: None,
         source_integrity: "sha512-identical".into(),
         graph_key_digest: None,
         scripts: HashMap::new(),
@@ -999,12 +1003,6 @@ fn scope_trusted_exact_match() {
 #[test]
 fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"lpm":{"trustedDependencies":["esbuild"]}}"#,
-    )
-    .unwrap();
-
     let store = PackageStore::at(dir.path().join("store"));
     let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     write_store_package(
@@ -1014,15 +1012,16 @@ fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
         r#"{"postinstall":"node install.js"}"#,
         false,
     );
+    let script_hash = compute_script_hash(&store.package_dir("esbuild", "1.0.0")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        format!(
+            r#"{{"lpm":{{"trustedDependencies":{{"esbuild@1.0.0":{{"scriptHash":"{script_hash}"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
 
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    // Legacy bare-name `trustedDependencies: ["esbuild"]` matches
-    // as `LegacyNameOnly`, which the strict gate treats as
-    // trusted — same semantic `rebuild::run` uses.
-    //
-    // the policy arg is threaded but not yet
-    // consulted; `ScriptPolicy::Deny` (the default) makes the
-    // default-policy intent explicit. Triage-specific tests cover green-tier promotion separately.
     let trusted = all_scripted_packages_trusted(
         &lpm_root,
         &[("esbuild".to_string(), "1.0.0".to_string(), None)],
@@ -1036,6 +1035,40 @@ fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
     );
 
     assert!(trusted);
+}
+
+#[test]
+fn all_scripted_packages_trusted_rejects_legacy_name_only_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"lpm":{"trustedDependencies":["esbuild"]}}"#,
+    )
+    .unwrap();
+    let store = PackageStore::at(dir.path().join("store"));
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+    write_store_package(
+        &store,
+        "esbuild",
+        "1.0.0",
+        r#"{"postinstall":"node install.js"}"#,
+        false,
+    );
+    let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+    let trusted = all_scripted_packages_trusted(
+        &lpm_root,
+        &[("esbuild".to_string(), "1.0.0".to_string(), None)],
+        &policy,
+        dir.path(),
+        ScriptPolicy::Deny,
+        false,
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
+        None,
+    );
+
+    assert!(!trusted);
 }
 
 #[test]
@@ -1072,12 +1105,6 @@ fn all_scripted_packages_trusted_false_when_any_unbuilt_scripted_package_is_untr
 #[test]
 fn all_scripted_packages_trusted_ignores_already_built_untrusted_packages() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"lpm":{"trustedDependencies":["trusted-pkg"]}}"#,
-    )
-    .unwrap();
-
     let store = PackageStore::at(dir.path().join("store"));
     let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     write_store_package(
@@ -1094,6 +1121,14 @@ fn all_scripted_packages_trusted_ignores_already_built_untrusted_packages() {
         r#"{"postinstall":"node blocked.js"}"#,
         true,
     );
+    let script_hash = compute_script_hash(&store.package_dir("trusted-pkg", "1.0.0")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        format!(
+            r#"{{"lpm":{{"trustedDependencies":{{"trusted-pkg@1.0.0":{{"scriptHash":"{script_hash}"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
 
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
     let trusted = all_scripted_packages_trusted(
@@ -1365,6 +1400,7 @@ fn stale_detection_finds_packages_without_scripts() {
             wrapper_id: None,
             store_path: std::path::PathBuf::new(),
             pristine_path: std::path::PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::from([("postinstall".into(), "node setup".into())]),
@@ -1381,6 +1417,7 @@ fn stale_detection_finds_packages_without_scripts() {
             wrapper_id: None,
             store_path: std::path::PathBuf::new(),
             pristine_path: std::path::PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::from([("postinstall".into(), "node install.js".into())]),
@@ -1413,7 +1450,7 @@ fn stale_detection_finds_packages_without_scripts() {
 // ── strict gate composition tests ──────────
 //
 // These tests exercise the trust-decision logic in isolation: given a
-// SecurityPolicy and a (name, version, integrity, script_hash) tuple,
+// SecurityPolicy and a (name, version, source, integrity, script_hash) tuple,
 // does the strict gate produce the right TrustMatch and does the
 // composition with `is_scope_trusted` produce the right `is_trusted`?
 //
@@ -1476,7 +1513,7 @@ fn build_strict_gate_unknown_package_blocks_script() {
 }
 
 #[test]
-fn build_strict_gate_legacy_bare_name_runs_with_warning() {
+fn build_strict_gate_reports_legacy_bare_name_as_non_strict_match() {
     let policy = SecurityPolicy {
         trusted_dependencies: TrustedDependencies::Legacy(vec!["esbuild".to_string()]),
         minimum_release_age_secs: 0,
@@ -1504,10 +1541,9 @@ fn build_strict_gate_different_version_blocks_script() {
 /// `lpm approve-scripts`, which writes a `name@version` Rich
 /// entry binding trust to `(integrity, script_hash)`.
 ///
-/// The legacy `Vec<String>` form retains `LegacyNameOnly` because
-/// that is an explicit user-authored shape; the `@*` sentinel is
-/// auto-generated and never represented user consent to wildcard
-/// trust.
+/// Both forms remain migration inputs rather than executable trust. The
+/// distinction lets the review path preserve explicitly authored names while
+/// refusing the generated wildcard sentinel as a concrete match.
 #[test]
 fn build_strict_gate_legacy_upgraded_at_star_does_not_auto_trust() {
     let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
@@ -1656,6 +1692,7 @@ fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> Scripta
         wrapper_id: None,
         store_path: std::path::PathBuf::from("/unused"),
         pristine_path: std::path::PathBuf::from("/unused"),
+        execution_identity: None,
         source_integrity: "sha512-unused".into(),
         graph_key_digest: None,
         scripts: HashMap::from([("postinstall".into(), "node x.js".into())]),
@@ -2217,7 +2254,7 @@ fn trust_reason_is_trusted_covers_all_trusted_variants() {
     // forces an explicit decision about whether it counts as
     // trusted. Preferable to a silent default that ships wrong.
     assert!(TrustReason::StrictBinding.is_trusted());
-    assert!(TrustReason::LegacyName.is_trusted());
+    assert!(!TrustReason::LegacyName.is_trusted());
     assert!(TrustReason::ScopedGlob.is_trusted());
     assert!(TrustReason::GreenTierUnderTriage.is_trusted());
     // advisor-approved-this-run grants ephemeral

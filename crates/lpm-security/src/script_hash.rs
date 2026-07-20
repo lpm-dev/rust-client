@@ -98,6 +98,25 @@ const DELEGATE_SEP: u8 = 0x1f;
 const PACKAGE_TREE_SEP: u8 = 0x1d;
 const MAX_DELEGATE_GRAPH_FILES: usize = 128;
 const MAX_DELEGATE_GRAPH_DEPTH: usize = 16;
+const MAX_DELEGATE_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DELEGATE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PACKAGE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PACKAGE_TREE_ENTRIES: usize = 20_000;
+const MAX_PACKAGE_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PACKAGE_TREE_DEPTH: usize = 64;
+
+#[derive(Default)]
+struct PackageTreeBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+struct PackageTreeContext<'a> {
+    root: &'a Path,
+    canonical_root: &'a Path,
+    manifest_identity: &'a [u8],
+    budget: PackageTreeBudget,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptHashWithPhaseBodies {
@@ -125,12 +144,46 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
     compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash
 }
 
+/// Read lifecycle phase bodies while reusing an already-verified package
+/// content identity. v2 callers use this to avoid re-hashing the immutable
+/// baseline tree on every trust/advisor pass.
+pub fn script_hash_with_phase_bodies_for_content_identity(
+    package_dir: &Path,
+    content_identity: &str,
+) -> Option<ScriptHashWithPhaseBodies> {
+    let content = lpm_common::read_capped_state_file(
+        &package_dir.join("package.json"),
+        MAX_PACKAGE_MANIFEST_BYTES,
+    )
+    .ok()??;
+    let parsed: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    let scripts = parsed.get("scripts")?.as_object()?;
+    let phase_bodies: Vec<(String, String)> = EXECUTED_INSTALL_PHASES
+        .iter()
+        .filter_map(|phase| {
+            scripts
+                .get(*phase)
+                .and_then(serde_json::Value::as_str)
+                .filter(|body| !body.is_empty())
+                .map(|body| ((*phase).to_string(), body.to_string()))
+        })
+        .collect();
+    if phase_bodies.is_empty() {
+        return None;
+    }
+    Some(ScriptHashWithPhaseBodies {
+        hash: Some(content_identity.to_string()),
+        phase_bodies,
+    })
+}
+
 pub fn compute_script_hash_with_phase_bodies(
     store_pkg_dir: &Path,
 ) -> Option<ScriptHashWithPhaseBodies> {
     let pkg_json_path = store_pkg_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let content =
+        lpm_common::read_capped_state_file(&pkg_json_path, MAX_PACKAGE_MANIFEST_BYTES).ok()??;
+    let parsed: serde_json::Value = serde_json::from_slice(&content).ok()?;
     let scripts = parsed.get("scripts")?.as_object()?;
 
     let mut hasher = Sha256::new();
@@ -192,24 +245,25 @@ fn hash_package_tree(hasher: &mut Sha256, root: &Path, manifest_identity: &[u8])
         return false;
     };
     let mut relative = PathBuf::new();
-    hash_package_tree_dir(
-        hasher,
+    let mut context = PackageTreeContext {
         root,
-        root,
-        &canonical_root,
-        &mut relative,
+        canonical_root: &canonical_root,
         manifest_identity,
-    )
+        budget: PackageTreeBudget::default(),
+    };
+    hash_package_tree_dir(hasher, root, &mut relative, 0, &mut context)
 }
 
 fn hash_package_tree_dir(
     hasher: &mut Sha256,
-    root: &Path,
     dir: &Path,
-    canonical_root: &Path,
     relative: &mut PathBuf,
-    manifest_identity: &[u8],
+    depth: usize,
+    context: &mut PackageTreeContext<'_>,
 ) -> bool {
+    if depth > MAX_PACKAGE_TREE_DEPTH {
+        return false;
+    }
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -221,12 +275,18 @@ fn hash_package_tree_dir(
         let Ok(file_type) = entry.file_type() else {
             return false;
         };
+        context.budget.entries = context.budget.entries.saturating_add(1);
+        if context.budget.entries > MAX_PACKAGE_TREE_ENTRIES {
+            return false;
+        }
         entries.push((entry.file_name(), entry.path(), file_type));
     }
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
     for (name, path, file_type) in entries {
-        if (dir == root && name == "node_modules") || is_generated_package_entry(root, dir, &name) {
+        if (dir == context.root && name == "node_modules" && file_type.is_dir())
+            || is_generated_package_entry(context.root, dir, &name)
+        {
             continue;
         }
         relative.push(&name);
@@ -235,25 +295,23 @@ fn hash_package_tree_dir(
         };
         let complete = if file_type.is_dir() {
             hash_tree_record(hasher, b"dir", relative_display.as_bytes(), &[]);
-            hash_package_tree_dir(
-                hasher,
-                root,
-                &path,
-                canonical_root,
-                relative,
-                manifest_identity,
-            )
+            hash_package_tree_dir(hasher, &path, relative, depth + 1, context)
         } else if file_type.is_file() {
-            if dir == root && name == "package.json" {
+            if dir == context.root && name == "package.json" {
                 hash_tree_record(
                     hasher,
                     b"manifest",
                     relative_display.as_bytes(),
-                    manifest_identity,
+                    context.manifest_identity,
                 );
                 true
             } else {
-                hash_package_file(hasher, relative_display.as_bytes(), &path)
+                hash_package_file(
+                    hasher,
+                    relative_display.as_bytes(),
+                    &path,
+                    &mut context.budget,
+                )
             }
         } else if file_type.is_symlink() {
             let Ok(target) = std::fs::read_link(&path) else {
@@ -262,7 +320,7 @@ fn hash_package_tree_dir(
             let Ok(canonical_target) = path.canonicalize() else {
                 return false;
             };
-            if !canonical_target.starts_with(canonical_root) {
+            if !canonical_target.starts_with(context.canonical_root) {
                 return false;
             }
             let Some(target) = target.to_str() else {
@@ -329,7 +387,12 @@ fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> bool
     }
 }
 
-fn hash_package_file(hasher: &mut Sha256, relative: &[u8], path: &Path) -> bool {
+fn hash_package_file(
+    hasher: &mut Sha256,
+    relative: &[u8],
+    path: &Path,
+    budget: &mut PackageTreeBudget,
+) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
@@ -342,6 +405,10 @@ fn hash_package_file(hasher: &mut Sha256, relative: &[u8], path: &Path) -> bool 
         };
         if read == 0 {
             break;
+        }
+        budget.bytes = budget.bytes.saturating_add(read as u64);
+        if budget.bytes > MAX_PACKAGE_TREE_BYTES {
+            return false;
         }
         content_hasher.update(&buffer[..read]);
     }
@@ -407,6 +474,7 @@ fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str
     let mut queue = VecDeque::from([(entry_rel, 0usize)]);
     let mut seen = HashSet::new();
     let mut visited = 0usize;
+    let mut total_bytes = 0_u64;
 
     while let Some((rel, depth)) = queue.pop_front() {
         if !seen.insert(rel.clone()) {
@@ -431,10 +499,14 @@ fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str
             return false;
         }
 
-        let bytes = match std::fs::read(&canonical) {
-            Ok(bytes) => bytes,
-            Err(_) => return false,
+        let bytes = match lpm_common::read_capped_state_file(&canonical, MAX_DELEGATE_FILE_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => return false,
         };
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        if total_bytes > MAX_DELEGATE_GRAPH_BYTES {
+            return false;
+        }
         let mut inner = Sha256::new();
         inner.update(&bytes);
         hasher.update(inner.finalize());
@@ -1060,6 +1132,39 @@ mod tests {
         }
 
         assert_eq!(initial, compute_script_hash(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn compute_script_hash_binds_regular_file_named_node_modules() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"install": "node node_modules --verbose"}),
+        );
+        fs::write(dir.path().join("node_modules"), "benign\n").unwrap();
+        let initial = compute_script_hash(dir.path()).unwrap();
+
+        fs::write(dir.path().join("node_modules"), "malicious\n").unwrap();
+
+        assert_ne!(initial, compute_script_hash(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_package_tree_exceeds_depth_budget() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"install": "node install.js"}),
+        );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for _ in 0..65 {
+            nested.push("nested");
+            fs::create_dir(&nested).unwrap();
+        }
+        fs::write(nested.join("payload.js"), "module.exports = true\n").unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
     }
 
     #[test]

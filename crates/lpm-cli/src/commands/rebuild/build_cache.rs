@@ -1337,6 +1337,7 @@ mod tests {
             wrapper_id: None,
             store_path: PathBuf::new(),
             pristine_path: PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-source".into(),
             graph_key_digest: Some("a".repeat(64)),
             scripts: [("postinstall".into(), command.into())]

@@ -425,9 +425,9 @@ pub(crate) enum Commands {
     /// warning emitted by `lpm install` when packages with `preinstall` /
     /// `install` / `postinstall` scripts are not yet covered by an existing
     /// strict approval. Approvals are bound to
-    /// `{name, version, integrity, script_hash}` so that ANY change to the
-    /// script body (or to the package tarball) re-opens the package for
-    /// review on the next install.
+    /// `{name, version, source, integrity, script_hash}` so that any source,
+    /// package-content, or script change re-opens the package for review on
+    /// the next install.
     ///
     /// **Modes:**
     /// - `lpm approve-scripts`               — interactive walk

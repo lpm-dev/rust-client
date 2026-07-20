@@ -852,7 +852,7 @@ fn v2_preflight_package_dir(
     if expected_integrity.is_some_and(|expected| expected != baseline.integrity.as_str()) {
         return None;
     }
-    Some(baseline.package_dir.clone())
+    Some(baseline.execution_dir.clone())
 }
 
 /// Read `trustedDependencies` from the
@@ -922,13 +922,23 @@ pub(super) fn collect_amber_classification_requests(
         let name = &identity.name;
         let version = &identity.version;
         let integrity = &identity.integrity;
-        let Some(pkg_dir) = advisor_package_dir(identity, materialized_packages, baseline_index)
+        let Some((pkg_dir, persisted_identity)) =
+            advisor_package(identity, materialized_packages, baseline_index)
         else {
             continue;
         };
-        let Some(script_data) =
-            lpm_security::script_hash::compute_script_hash_with_phase_bodies(&pkg_dir)
-        else {
+        let script_data = match (baseline_index.is_some(), persisted_identity.as_deref()) {
+            (_, Some(identity)) => {
+                lpm_security::script_hash::script_hash_with_phase_bodies_for_content_identity(
+                    &pkg_dir, identity,
+                )
+            }
+            (true, None) => None,
+            (false, None) => {
+                lpm_security::script_hash::compute_script_hash_with_phase_bodies(&pkg_dir)
+            }
+        };
+        let Some(script_data) = script_data else {
             continue;
         };
         let Some(script_bundle_hash) = script_data.hash else {
@@ -1008,12 +1018,21 @@ pub(super) fn collect_amber_classification_requests(
     out
 }
 
+#[cfg(test)]
 pub(super) fn advisor_package_dir(
     identity: &crate::build_state::InstalledPackageIdentity,
     materialized_packages: &[lpm_linker::MaterializedPackage],
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
 ) -> Option<PathBuf> {
-    let package_dir = if let Some(index) = baseline_index {
+    advisor_package(identity, materialized_packages, baseline_index).map(|(dir, _)| dir)
+}
+
+fn advisor_package(
+    identity: &crate::build_state::InstalledPackageIdentity,
+    materialized_packages: &[lpm_linker::MaterializedPackage],
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+) -> Option<(PathBuf, Option<String>)> {
+    let (package_dir, persisted_identity) = if let Some(index) = baseline_index {
         let package_key = identity.package_key();
         let baseline = index.lookup_source_identity(
             &package_key.name,
@@ -1027,7 +1046,10 @@ pub(super) fn advisor_package_dir(
         {
             return None;
         }
-        baseline.package_dir.clone()
+        (
+            baseline.execution_dir.clone(),
+            baseline.execution_identity.clone(),
+        )
     } else {
         let mut matches = materialized_packages.iter().filter(|materialized| {
             materialized.name == identity.name && materialized.version == identity.version
@@ -1041,7 +1063,7 @@ pub(super) fn advisor_package_dir(
         {
             return None;
         }
-        package_dir
+        (package_dir, None)
     };
 
     let manifest = std::fs::read(package_dir.join("package.json")).ok()?;
@@ -1054,7 +1076,7 @@ pub(super) fn advisor_package_dir(
         return None;
     }
 
-    Some(package_dir)
+    Some((package_dir, persisted_identity))
 }
 
 pub(super) fn blocked_set_metadata_from_previous_state(
@@ -1302,6 +1324,7 @@ mod v2_preflight_tests {
     fn preflight_selects_same_source_copy_by_script_hash() {
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
         let links_root = dir.path().join("store").join("v2").join("links");
         let source = "registry+https://registry.example";
         let source_sri = "sha512-shared-source";
@@ -1346,11 +1369,16 @@ mod v2_preflight_tests {
             }
             .write_to(&link_dir)
             .unwrap();
+            store
+                .capture_patched_lifecycle_baseline(&package_dir)
+                .unwrap()
+                .unwrap();
             package_dirs.push(package_dir);
         }
 
-        let expected_hash = lpm_security::script_hash::compute_script_hash(&package_dirs[1])
-            .expect("expected script hash");
+        let expected_baseline = store.lifecycle_baseline(&package_dirs[1]).unwrap().unwrap();
+        let expected_hash = expected_baseline.content_integrity;
+        let expected_dir = expected_baseline.source_dir;
         let index = lpm_store::V2BaselineIndex::build(&lpm_root).unwrap();
 
         let selected = v2_preflight_package_dir(
@@ -1363,7 +1391,7 @@ mod v2_preflight_tests {
         )
         .expect("preflight must find the exact script identity");
 
-        assert_eq!(selected, package_dirs[1]);
+        assert_eq!(selected, expected_dir);
         assert!(
             v2_preflight_package_dir(
                 &index,

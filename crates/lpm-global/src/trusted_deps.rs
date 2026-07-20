@@ -10,9 +10,10 @@
 //!
 //! ```json
 //! {
-//!   "schema_version": 1,
+//!   "schema_version": 2,
 //!   "trusted": {
-//!     "esbuild@0.25.1": {
+//!     "esbuild@0.25.1#<identity-token>": {
+//!       "source": "registry+https://registry.npmjs.org",
 //!       "integrity": "sha512-...",
 //!       "scriptHash": "sha256-..."
 //!     }
@@ -20,7 +21,7 @@
 //! }
 //! ```
 //!
-//! One flat map keyed by `name@version`. The binding payload is
+//! One flat map keyed by `name@version#identity-token`. The binding payload is
 //! wire-identical to the project-level shape, but it is duplicated in
 //! this crate so `lpm-global` does not depend on `lpm-workspace`.
 //! `script_hash` and `integrity` remain optional on disk for backward
@@ -36,13 +37,12 @@
 //! serializing writes through the global `.tx.lock` when updating
 //! trust state as part of a larger transaction.
 //!
-//! ## Why keyed by `name@version` not `name`
+//! ## Why keys include exact source identity
 //!
-//! Trust is bound to a specific integrity +
-//! script-hash of a specific version. Approving `esbuild@0.20.2`
-//! doesn't automatically trust `esbuild@0.25.1` — the install pipeline
-//! blocks the new version on the expected "re-review" path. Matches
-//! the project-level model exactly.
+//! Trust is bound to source, integrity, script hash, and version. Distinct
+//! registries or local sources can legitimately publish the same coordinates,
+//! so a coordinate-only key cannot represent them safely. Schema-1 keys remain
+//! readable for migration but never grant strict trust.
 
 use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ use std::path::Path;
 /// Binding metadata for one entry in the global trusted-deps map.
 ///
 /// Mirrors the subset of `lpm_workspace::TrustedDependencyBinding`
-/// enforced on the global install path: `integrity`, `script_hash`,
+/// enforced on the global install path: `source`, `integrity`, `script_hash`,
 /// and `provenance_at_approval` (which drives the install-time drift
 /// gate via the synthetic `package.json > lpm > trustedDependencies`
 /// projection used by global installs. The
@@ -75,6 +75,8 @@ use std::path::Path;
 /// type without `lpm-global` needing to depend on `lpm-workspace`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustedDependencyBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity: Option<String>,
     #[serde(
@@ -102,7 +104,7 @@ pub struct TrustedDependencyBinding {
     pub provenance_at_approval: Option<lpm_common::ProvenanceSnapshot>,
 }
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const FILENAME: &str = "trusted-dependencies.json";
 
 /// Top-level shape of `~/.lpm/global/trusted-dependencies.json`.
@@ -127,10 +129,57 @@ impl Default for GlobalTrustedDependencies {
     }
 }
 
-/// Key format used internally + by consumers: `"name@version"`. Single
-/// source of truth so every caller produces the same string.
+/// Coordinate-only key retained for reading and pruning schema-1 entries.
 pub fn rich_key(name: &str, version: &str) -> String {
     format!("{name}@{version}")
+}
+
+/// Stable token for an exact source/content identity.
+pub fn rich_identity_token(source: Option<&str>, integrity: Option<&str>) -> Option<String> {
+    if source.is_none() && integrity.is_none() {
+        return None;
+    }
+    let source = source.unwrap_or_default().as_bytes();
+    let integrity = integrity.unwrap_or_default().as_bytes();
+    let mut identity = Vec::with_capacity(16 + source.len() + integrity.len());
+    identity.extend_from_slice(&(source.len() as u64).to_be_bytes());
+    identity.extend_from_slice(source);
+    identity.extend_from_slice(&(integrity.len() as u64).to_be_bytes());
+    identity.extend_from_slice(integrity);
+    let digest = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha256,
+        &identity,
+    );
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(digest.hash.len() * 2);
+    for byte in digest.hash {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(token)
+}
+
+/// Map key for one exact global package identity.
+pub fn rich_key_for_identity(
+    name: &str,
+    version: &str,
+    source: Option<&str>,
+    integrity: Option<&str>,
+) -> String {
+    match rich_identity_token(source, integrity) {
+        Some(token) => format!("{name}@{version}#{token}"),
+        None => rich_key(name, version),
+    }
+}
+
+fn parse_rich_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (name, version_and_identity) = key.rsplit_once('@')?;
+    let (version, identity) = version_and_identity
+        .split_once('#')
+        .map_or((version_and_identity, None), |(version, identity)| {
+            (version, Some(identity))
+        });
+    Some((name, version, identity))
 }
 
 /// Query result. Mirrors the project-level `TrustMatch` shape so the
@@ -150,7 +199,7 @@ pub enum TrustMatch {
 }
 
 impl GlobalTrustedDependencies {
-    /// Strict query for a `(name, version, integrity, script_hash)`
+    /// Strict query for a `(name, version, source, integrity, script_hash)`
     /// tuple. Mirrors `TrustedDependencies::matches_strict` from
     /// lpm-workspace's project-level counterpart, scoped to the global
     /// trust file.
@@ -158,16 +207,29 @@ impl GlobalTrustedDependencies {
         &self,
         name: &str,
         version: &str,
+        source: Option<&str>,
         integrity: Option<&str>,
         script_hash: Option<&str>,
     ) -> TrustMatch {
-        let key = rich_key(name, version);
-        let Some(binding) = self.trusted.get(&key) else {
-            return TrustMatch::NotTrusted;
+        let exact_key = rich_key_for_identity(name, version, source, integrity);
+        let binding = self.trusted.get(&exact_key);
+        let Some(binding) = binding else {
+            let coordinate_key = rich_key(name, version);
+            if let Some(legacy) = self.trusted.get(&coordinate_key) {
+                return TrustMatch::BindingDrift {
+                    stored: legacy.clone(),
+                };
+            }
+            let candidate = self.trusted.iter().find_map(|(key, binding)| {
+                let (candidate_name, candidate_version, identity) = parse_rich_key(key)?;
+                (candidate_name == name && candidate_version == version && identity.is_some())
+                    .then_some(binding)
+            });
+            return candidate.map_or(TrustMatch::NotTrusted, |stored| TrustMatch::BindingDrift {
+                stored: stored.clone(),
+            });
         };
-        // Strict equality on both fields. If a stored field is `None`,
-        // the caller's field being `Some(_)` counts as drift — the
-        // query's signal is stricter than the stored trust.
+        let source_match = binding.source.as_deref() == source;
         let integ_match = match (binding.integrity.as_deref(), integrity) {
             (Some(stored), Some(queried)) => stored == queried,
             (None, None) => true,
@@ -177,7 +239,7 @@ impl GlobalTrustedDependencies {
             (binding.script_hash.as_deref(), script_hash),
             (Some(stored), Some(queried)) if stored == queried
         );
-        if integ_match && script_match {
+        if exact_key.contains('#') && source_match && integ_match && script_match {
             TrustMatch::Strict
         } else {
             TrustMatch::BindingDrift {
@@ -186,9 +248,8 @@ impl GlobalTrustedDependencies {
         }
     }
 
-    /// Insert-or-overwrite a strict trust binding for the given
-    /// `(name, version)`. Used by `lpm approve-scripts --global`'s
-    /// write path when the user approves a previously-blocked package.
+    /// Insert-or-overwrite a source-less trust binding for tests and legacy
+    /// callers that do not capture provenance.
     ///
     /// Both fields remain optional in this storage API for legacy callers.
     /// Missing integrity is valid for some local sources, but a missing script
@@ -205,9 +266,12 @@ impl GlobalTrustedDependencies {
         integrity: Option<String>,
         script_hash: Option<String>,
     ) {
+        self.schema_version = SCHEMA_VERSION;
+        let key = rich_key_for_identity(name, version, None, integrity.as_deref());
         self.trusted.insert(
-            rich_key(name, version),
+            key,
             TrustedDependencyBinding {
+                source: None,
                 integrity,
                 script_hash,
                 provenance_at_approval: None,
@@ -221,7 +285,26 @@ impl GlobalTrustedDependencies {
     /// drift gate has a reference snapshot to compare future versions
     /// against.
     pub fn insert_binding(&mut self, name: &str, version: &str, binding: TrustedDependencyBinding) {
-        self.trusted.insert(rich_key(name, version), binding);
+        self.schema_version = SCHEMA_VERSION;
+        let key = rich_key_for_identity(
+            name,
+            version,
+            binding.source.as_deref(),
+            binding.integrity.as_deref(),
+        );
+        self.trusted.insert(key, binding);
+    }
+
+    /// Insert a binding under its exact source/content key.
+    pub fn insert_binding_for_identity(
+        &mut self,
+        name: &str,
+        version: &str,
+        source: Option<String>,
+        mut binding: TrustedDependencyBinding,
+    ) {
+        binding.source = source;
+        self.insert_binding(name, version, binding);
     }
 
     /// Remove a trust binding. Used on `uninstall -g <pkg>` to sweep
@@ -231,7 +314,17 @@ impl GlobalTrustedDependencies {
     /// silently. The caller (uninstall) iterates candidates without
     /// knowing which are actually trusted.
     pub fn remove(&mut self, name: &str, version: &str) -> bool {
-        self.trusted.remove(&rich_key(name, version)).is_some()
+        let coordinate_key = rich_key(name, version);
+        let before = self.trusted.len();
+        self.trusted.retain(|key, _| {
+            if key == &coordinate_key {
+                return false;
+            }
+            parse_rich_key(key).is_none_or(|(candidate_name, candidate_version, _)| {
+                candidate_name != name || candidate_version != version
+            })
+        });
+        self.trusted.len() != before
     }
 
     /// Bulk-remove trust bindings. Returns the count of entries that
@@ -359,6 +452,7 @@ mod tests {
 
     fn binding(integ: Option<&str>, script: Option<&str>) -> TrustedDependencyBinding {
         TrustedDependencyBinding {
+            source: None,
             integrity: integ.map(String::from),
             script_hash: script.map(String::from),
             provenance_at_approval: None,
@@ -438,14 +532,20 @@ mod tests {
             Some("sha512-e".into()),
             Some("sha256-s".into()),
         );
-        let m = gtd.matches_strict("esbuild", "0.25.1", Some("sha512-e"), Some("sha256-s"));
+        let m = gtd.matches_strict(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-e"),
+            Some("sha256-s"),
+        );
         assert_eq!(m, TrustMatch::Strict);
     }
 
     #[test]
     fn matches_strict_returns_not_trusted_for_missing_entry() {
         let gtd = GlobalTrustedDependencies::default();
-        let m = gtd.matches_strict("ghost", "1.0.0", Some("a"), Some("b"));
+        let m = gtd.matches_strict("ghost", "1.0.0", None, Some("a"), Some("b"));
         assert_eq!(m, TrustMatch::NotTrusted);
     }
 
@@ -455,7 +555,7 @@ mod tests {
         gtd.insert_strict("mutable-local", "1.0.0", None, None);
 
         assert!(matches!(
-            gtd.matches_strict("mutable-local", "1.0.0", None, None),
+            gtd.matches_strict("mutable-local", "1.0.0", None, None, None),
             TrustMatch::BindingDrift { .. }
         ));
     }
@@ -472,6 +572,7 @@ mod tests {
         let m = gtd.matches_strict(
             "esbuild",
             "0.25.1",
+            None,
             Some("sha512-QUERIED"),
             Some("sha256-same"),
         );
@@ -495,6 +596,7 @@ mod tests {
         let m = gtd.matches_strict(
             "esbuild",
             "0.25.1",
+            None,
             Some("sha512-same"),
             Some("sha256-QUERIED"),
         );
@@ -508,7 +610,7 @@ mod tests {
     fn matches_strict_version_bound_does_not_leak_across_versions() {
         let mut gtd = GlobalTrustedDependencies::default();
         gtd.insert_strict("esbuild", "0.25.1", Some("a".into()), Some("b".into()));
-        let m = gtd.matches_strict("esbuild", "0.25.2", Some("a"), Some("b"));
+        let m = gtd.matches_strict("esbuild", "0.25.2", None, Some("a"), Some("b"));
         assert_eq!(m, TrustMatch::NotTrusted);
     }
 
@@ -521,19 +623,103 @@ mod tests {
     fn matches_strict_missing_stored_field_against_present_query_is_drift() {
         let mut gtd = GlobalTrustedDependencies::default();
         gtd.insert_strict("esbuild", "0.25.1", None, Some("sha256-s".into()));
-        let m = gtd.matches_strict("esbuild", "0.25.1", Some("sha512-e"), Some("sha256-s"));
+        let m = gtd.matches_strict(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-e"),
+            Some("sha256-s"),
+        );
         assert!(matches!(m, TrustMatch::BindingDrift { .. }));
     }
 
     #[test]
     fn insert_strict_overwrites_existing_binding() {
         let mut gtd = GlobalTrustedDependencies::default();
-        gtd.insert_strict("x", "1.0.0", Some("old".into()), None);
-        gtd.insert_strict("x", "1.0.0", Some("new".into()), Some("s".into()));
-        let b = gtd.trusted.get("x@1.0.0").unwrap();
-        assert_eq!(b.integrity.as_deref(), Some("new"));
+        gtd.insert_strict("x", "1.0.0", Some("same".into()), None);
+        gtd.insert_strict("x", "1.0.0", Some("same".into()), Some("s".into()));
+        let key = rich_key_for_identity("x", "1.0.0", None, Some("same"));
+        let b = gtd.trusted.get(&key).unwrap();
+        assert_eq!(b.integrity.as_deref(), Some("same"));
         assert_eq!(b.script_hash.as_deref(), Some("s"));
         assert_eq!(gtd.trusted.len(), 1);
+    }
+
+    #[test]
+    fn distinct_same_coordinate_bindings_are_preserved() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_binding_for_identity(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-a.example".into()),
+            TrustedDependencyBinding {
+                source: None,
+                integrity: Some("sha512-registry-a".into()),
+                script_hash: Some("sha256-script-a".into()),
+                provenance_at_approval: None,
+            },
+        );
+        gtd.insert_binding_for_identity(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-b.example".into()),
+            TrustedDependencyBinding {
+                source: None,
+                integrity: Some("sha512-registry-b".into()),
+                script_hash: Some("sha256-script-b".into()),
+                provenance_at_approval: None,
+            },
+        );
+
+        assert_eq!(gtd.trusted.len(), 2);
+    }
+
+    #[test]
+    fn exact_identity_insert_upgrades_legacy_schema_marker() {
+        let mut gtd = GlobalTrustedDependencies {
+            schema_version: 1,
+            trusted: BTreeMap::new(),
+        };
+
+        gtd.insert_binding_for_identity(
+            "shared",
+            "1.0.0",
+            Some("directory+./shared".into()),
+            TrustedDependencyBinding {
+                source: None,
+                integrity: None,
+                script_hash: Some("sha256-script".into()),
+                provenance_at_approval: None,
+            },
+        );
+
+        assert_eq!(gtd.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn source_qualified_binding_does_not_authorize_sibling_source() {
+        let mut gtd = GlobalTrustedDependencies::default();
+        gtd.insert_binding_for_identity(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-a.example".into()),
+            TrustedDependencyBinding {
+                source: None,
+                integrity: Some("sha512-identical".into()),
+                script_hash: Some("sha256-identical".into()),
+                provenance_at_approval: None,
+            },
+        );
+
+        let sibling = gtd.matches_strict(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-b.example"),
+            Some("sha512-identical"),
+            Some("sha256-identical"),
+        );
+
+        assert!(matches!(sibling, TrustMatch::BindingDrift { .. }));
     }
 
     #[test]
@@ -653,6 +839,7 @@ mod tests {
     fn binding_helper_is_equivalent_to_manual_construction() {
         let a = binding(Some("i"), Some("s"));
         let b = TrustedDependencyBinding {
+            source: None,
             integrity: Some("i".into()),
             script_hash: Some("s".into()),
             provenance_at_approval: None,
@@ -674,6 +861,7 @@ mod tests {
             "esbuild",
             "0.25.1",
             TrustedDependencyBinding {
+                source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: Some("sha512-e".into()),
                 script_hash: Some("sha256-s".into()),
                 provenance_at_approval: Some(provenance_snap(
@@ -685,7 +873,13 @@ mod tests {
         write_at(&path, &gtd).unwrap();
         let read = read_at(&path).unwrap();
         assert_eq!(read, gtd);
-        let snap = read.trusted["esbuild@0.25.1"]
+        let key = rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            Some("registry+https://registry.npmjs.org"),
+            Some("sha512-e"),
+        );
+        let snap = read.trusted[&key]
             .provenance_at_approval
             .as_ref()
             .expect("provenance must round-trip");
@@ -716,9 +910,8 @@ mod tests {
         assert!(bind.provenance_at_approval.is_none());
     }
 
-    /// `insert_binding` is the new write API for paths that capture
-    /// provenance. Asserts overwrite semantics + that the rich
-    /// binding survives.
+    /// `insert_binding` is the write API for paths that already carry exact
+    /// identity. Asserts overwrite semantics for the same source/content key.
     #[test]
     fn insert_binding_stores_rich_binding_and_overwrites() {
         let mut gtd = GlobalTrustedDependencies::default();
@@ -726,13 +919,15 @@ mod tests {
             "esbuild",
             "0.25.1",
             TrustedDependencyBinding {
-                integrity: Some("sha512-old".into()),
+                source: Some("registry+https://registry.npmjs.org".into()),
+                integrity: Some("sha512-same".into()),
                 script_hash: None,
                 provenance_at_approval: None,
             },
         );
         let new = TrustedDependencyBinding {
-            integrity: Some("sha512-new".into()),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            integrity: Some("sha512-same".into()),
             script_hash: Some("sha256-s".into()),
             provenance_at_approval: Some(provenance_snap(
                 "github:evanw/esbuild",
@@ -740,8 +935,14 @@ mod tests {
             )),
         };
         gtd.insert_binding("esbuild", "0.25.1", new.clone());
+        let key = rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            Some("registry+https://registry.npmjs.org"),
+            Some("sha512-same"),
+        );
         assert_eq!(gtd.trusted.len(), 1);
-        assert_eq!(gtd.trusted["esbuild@0.25.1"], new);
+        assert_eq!(gtd.trusted[&key], new);
     }
 
     /// `matches_strict` is the aggregate-filter query and the post-
@@ -753,10 +954,12 @@ mod tests {
     #[test]
     fn matches_strict_ignores_provenance_at_approval() {
         let mut gtd = GlobalTrustedDependencies::default();
-        gtd.insert_binding(
+        gtd.insert_binding_for_identity(
             "esbuild",
             "0.25.1",
+            None,
             TrustedDependencyBinding {
+                source: None,
                 integrity: Some("sha512-e".into()),
                 script_hash: Some("sha256-s".into()),
                 provenance_at_approval: Some(provenance_snap(
@@ -765,7 +968,13 @@ mod tests {
                 )),
             },
         );
-        let m = gtd.matches_strict("esbuild", "0.25.1", Some("sha512-e"), Some("sha256-s"));
+        let m = gtd.matches_strict(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-e"),
+            Some("sha256-s"),
+        );
         assert_eq!(m, TrustMatch::Strict);
     }
 

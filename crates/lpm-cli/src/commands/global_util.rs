@@ -565,11 +565,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         let mut trust = lpm_global::GlobalTrustedDependencies::default();
-        trust.insert_strict(
+        trust.insert_binding_for_identity(
             "esbuild",
             "0.25.1",
-            Some("sha512-x".into()),
-            Some("sha256-y".into()),
+            Some("registry+https://registry.npmjs.org".into()),
+            lpm_global::TrustedDependencyBinding {
+                source: None,
+                integrity: Some("sha512-x".into()),
+                script_hash: Some("sha256-y".into()),
+                provenance_at_approval: None,
+            },
         );
         lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
 
@@ -578,10 +583,18 @@ mod tests {
         let trusted = lpm_block
             .get("trustedDependencies")
             .expect("trustedDependencies must be present");
-        let entry = trusted
-            .get("esbuild@0.25.1")
-            .expect("entry keyed name@version");
+        let key = lpm_global::trusted_deps::rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            Some("registry+https://registry.npmjs.org"),
+            Some("sha512-x"),
+        );
+        let entry = trusted.get(&key).expect("entry keyed by exact identity");
 
+        assert_eq!(
+            entry.get("source").and_then(|v| v.as_str()),
+            Some("registry+https://registry.npmjs.org")
+        );
         assert_eq!(
             entry.get("integrity").and_then(|v| v.as_str()),
             Some("sha512-x")

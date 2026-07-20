@@ -662,10 +662,9 @@ impl CapabilitySet {
     /// - `user_bound`: the same `UserBound` enforcement uses.
     /// - `binding`: the rich binding for the current `(name,
     ///   version)` tuple if present, or `None` for a
-    ///   [`lpm_workspace::TrustMatch::LegacyNameOnly`] match
-    ///   (Legacy bare-name entries have no binding, and their
-    ///   semantic is "baseline-only" — same as `capability_hash =
-    ///   None` in a Rich binding).
+    ///   [`lpm_workspace::TrustMatch::LegacyNameOnly`] match. Legacy
+    ///   bare-name entries have no binding and are independently refused by
+    ///   the lifecycle trust gate.
     ///
     /// # Returns
     ///

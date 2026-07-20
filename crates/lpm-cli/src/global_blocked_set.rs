@@ -44,7 +44,7 @@ use std::path::PathBuf;
 /// installed packages (top-level) pulled it in transitively.
 ///
 /// `origins` is sorted for deterministic output. The same
-/// `(name, version)` with DIFFERENT `(integrity, script_hash)` pairs
+/// `(name, version)` with different `(source, integrity, script_hash)` tuples
 /// produces distinct rows — e.g., if `esbuild@0.25.1` appears in
 /// `eslint`'s tree with binding A and in `typescript`'s tree with
 /// binding B (tarball swap between installs), the user needs to
@@ -70,7 +70,7 @@ pub struct AggregateBlockedRow {
     /// was captured with `script-policy = "deny" | "allow"` (no
     /// classification applied).
     ///
-    /// When the same `(name, version, integrity, script_hash)` aggregate
+    /// When the same `(name, version, source, integrity, script_hash)` aggregate
     /// row is contributed by multiple origins, the strictest tier wins
     /// (see [`merge_static_tier`]) — conservative for the gate that
     /// consumes this field.
@@ -81,7 +81,7 @@ pub struct AggregateBlockedRow {
 }
 
 /// Promote two tier hints to the strictest. Used at dedup-merge time
-/// when the same `(name, version, integrity, script_hash)` is reported
+/// when the same `(name, version, source, integrity, script_hash)` is reported
 /// by more than one origin and the two origins disagree on tier.
 ///
 /// Precedence (most-strict first): `Red > AmberLlm > Amber > Green > None`.
@@ -106,7 +106,7 @@ fn merge_static_tier(a: Option<StaticTier>, b: Option<StaticTier>) -> Option<Sta
 /// Output of [`aggregate_blocked_across_globals`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AggregateBlockedSet {
-    /// Deduped blocked packages, sorted by `(name, version, integrity,
+    /// Deduped blocked packages, sorted by `(name, version, source, integrity,
     /// script_hash)` for deterministic output.
     pub rows: Vec<AggregateBlockedRow>,
     /// Global-manifest entries whose per-install build-state file was
@@ -157,6 +157,7 @@ pub fn aggregate_with_manifest_and_trust(
             let trust_match = trusted.matches_strict(
                 &blocked.name,
                 &blocked.version,
+                blocked.source.as_deref(),
                 blocked.integrity.as_deref(),
                 blocked.script_hash.as_deref(),
             );
@@ -471,7 +472,17 @@ mod tests {
 
         // Approve `esbuild@0.25.1` globally with a matching binding.
         let mut trust = GlobalTrustedDependencies::default();
-        trust.insert_strict("esbuild", "0.25.1", Some("i-T".into()), Some("s-T".into()));
+        trust.insert_binding_for_identity(
+            "esbuild",
+            "0.25.1",
+            Some("registry+https://registry.npmjs.org".into()),
+            lpm_global::TrustedDependencyBinding {
+                source: None,
+                integrity: Some("i-T".into()),
+                script_hash: Some("s-T".into()),
+                provenance_at_approval: None,
+            },
+        );
         lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
 
         let agg = aggregate_blocked_across_globals(&root).unwrap();
@@ -631,7 +642,7 @@ mod tests {
         assert_eq!(agg.rows[0].static_tier, Some(StaticTier::Amber));
     }
 
-    /// Same `(name, version, integrity, script_hash)` reported by two
+    /// Same `(name, version, source, integrity, script_hash)` reported by two
     /// installs with disagreeing tiers must collapse to the strictest:
     /// `Red > AmberLlm > Amber > Green > None`. The gate that consumes
     /// this field treats non-green as refusal, so promoting to strictest

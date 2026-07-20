@@ -414,6 +414,14 @@ fn approve_scripts_global_named_dry_run_does_not_mutate_trust_file() {
     assert_eq!(approved.len(), 1);
     assert_eq!(approved[0]["name"].as_str(), Some("some-blocked-pkg"));
     assert_eq!(approved[0]["version"].as_str(), Some("2.0.0"));
+    assert!(approved[0].get("source").is_some());
+    assert!(
+        approved[0]["identity_selector"]
+            .as_str()
+            .is_some_and(|selector| selector.starts_with("some-blocked-pkg@2.0.0#")),
+        "global approval JSON must expose an exact reusable selector: {}",
+        approved[0]
+    );
 }
 
 /// Pre-seeded trust file stays byte-equal under `--dry-run` —
