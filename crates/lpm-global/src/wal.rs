@@ -168,9 +168,9 @@ pub struct IntentPayload {
     /// reachable through the uninstalling install's tree AND NOT
     /// reachable through any other remaining global install's tree.
     ///
-    /// Sorted by `(name, version)` for deterministic serialization.
-    /// Empty when no other globals exist, when the uninstalling
-    /// install's lockfile is unreadable, or when any other install's
+    /// Sorted by exact persisted key and coordinates for deterministic
+    /// serialization. Empty when the uninstalling install's lockfile is
+    /// unreadable or when any other install's
     /// lockfile is unreadable — the fail-safe collapses to "don't
     /// prune" so a corrupt sibling install can't cause an over-broad
     /// prune that breaks unrelated globals' next reinstall.
@@ -179,15 +179,15 @@ pub struct IntentPayload {
     /// pruning is crash-durable across the uninstall transaction.
     ///
     /// `#[serde(default)]` + `skip_serializing_if = "Vec::is_empty"`
-    /// so older WAL files (pre-M76) deserialize unchanged AND
-    /// non-uninstall Intents stay byte-identical to the pre-M76 shape.
+    /// so older WAL files deserialize unchanged and non-uninstall Intents
+    /// retain their previous wire shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uninstall_trust_prune: Vec<TrustPruneEntry>,
 }
 
-/// One `(name, version)` entry pruned from the host-global trust file
-/// during uninstall. Carried on `TxKind::Uninstall` `IntentPayload`s
-/// so crash recovery can replay the prune step idempotently.
+/// One trust entry pruned from the host-global trust file during uninstall.
+/// Current records carry the exact persisted key; older coordinate-only
+/// records omit it so crash recovery can replay both shapes idempotently.
 ///
 /// Encoded as `{ "name": ..., "version": ... }` rather than a tuple so
 /// future fields (e.g. an audit timestamp, the originating install)
@@ -196,6 +196,8 @@ pub struct IntentPayload {
 pub struct TrustPruneEntry {
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// One ownership mutation applied during commit and replayed during
@@ -1030,15 +1032,10 @@ mod tests {
         assert_eq!(w.path(), path);
     }
 
-    /// M76: Uninstall Intents carry the host-global trust prune set so
-    /// recovery can replay it after a crash. Pin the round-trip
-    /// contract — pre-fix the field didn't exist; a future refactor
-    /// that drops the `skip_serializing_if` would also break wire
-    /// shape stability for non-uninstall Intents.
     #[test]
     fn intent_payload_roundtrips_uninstall_trust_prune() {
         let r = WalRecord::Intent(Box::new(IntentPayload {
-            tx_id: "tx-m76".into(),
+            tx_id: "tx-uninstall-prune".into(),
             kind: TxKind::Uninstall,
             package: "eslint".into(),
             new_root_path: PathBuf::from("/tmp/installs/eslint@9.0.0"),
@@ -1051,10 +1048,12 @@ mod tests {
                 TrustPruneEntry {
                     name: "lodash".into(),
                     version: "4.17.21".into(),
+                    key: Some("lodash@4.17.21#exact".into()),
                 },
                 TrustPruneEntry {
                     name: "axios".into(),
                     version: "1.5.0".into(),
+                    key: None,
                 },
             ],
         }));
@@ -1063,15 +1062,11 @@ mod tests {
         assert_eq!(r, parsed);
     }
 
-    /// M76 forward-compat: pre-M76 WAL files on disk have no
-    /// `uninstall_trust_prune` field. Deserialization must default it
-    /// to an empty Vec without erroring. `#[serde(default)]` on the
-    /// field is the load-bearing guarantee.
     #[test]
     fn old_intent_payload_without_uninstall_trust_prune_still_deserializes() {
         let json = serde_json::json!({
             "op": "intent",
-            "tx_id": "tx-pre-m76",
+            "tx_id": "tx-before-trust-prune",
             "kind": "uninstall",
             "package": "eslint",
             "new_root_path": "/tmp/installs/eslint@9.0.0",
@@ -1087,19 +1082,13 @@ mod tests {
             WalRecord::Intent(p) => {
                 assert!(
                     p.uninstall_trust_prune.is_empty(),
-                    "pre-M76 WAL entries must deserialize with an empty prune list"
+                    "older WAL entries must deserialize with an empty prune list"
                 );
             }
             _ => panic!("expected Intent"),
         }
     }
 
-    /// M76 wire-shape stability: when `uninstall_trust_prune` is empty
-    /// (every non-uninstall Intent + every uninstall on a single
-    /// global), the field must NOT serialize. Older binaries reading
-    /// the WAL must see byte-identical output for Intents written by
-    /// the M76+ binary — `skip_serializing_if = "Vec::is_empty"` is
-    /// the load-bearing guarantee.
     #[test]
     fn intent_payload_omits_empty_uninstall_trust_prune_on_serialize() {
         let r = WalRecord::Intent(Box::new(IntentPayload {
@@ -1119,11 +1108,11 @@ mod tests {
         assert!(
             !body.contains("uninstall_trust_prune"),
             "empty uninstall_trust_prune must be skipped from serialized output \
-             so non-uninstall Intents stay byte-identical to pre-M76; got: {body}"
+             so non-uninstall Intents retain their prior wire shape; got: {body}"
         );
     }
 
-    /// L10: a corrupted WAL frame claiming an oversized payload must
+    /// A corrupted WAL frame claiming an oversized payload must
     /// be treated as a torn tail so the scanner bails cleanly rather
     /// than attempting to interpret the (possibly hostile) length
     /// field. Pin the cap value in the same place so a future bump

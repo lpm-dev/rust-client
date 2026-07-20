@@ -249,14 +249,32 @@ fn synthesize_pkg_json(
 
     if let Some(root) = trust_root {
         let trust = lpm_global::trusted_deps::read_for(root)?;
-        if !trust.trusted.is_empty() {
-            let mut rich = serde_json::Map::new();
+        let mut rich = serde_json::Map::new();
+        if trust.schema_version == lpm_global::trusted_deps::SCHEMA_VERSION {
             for (key, binding) in &trust.trusted {
+                let Some((name, version_and_identity)) = key.rsplit_once('@') else {
+                    continue;
+                };
+                let Some((version, _)) = version_and_identity.split_once('#') else {
+                    continue;
+                };
+                let expected_key = lpm_global::trusted_deps::rich_key_for_identity(
+                    name,
+                    version,
+                    binding.source.as_deref(),
+                    binding.integrity.as_deref(),
+                    binding.script_hash.as_deref(),
+                );
+                if key != &expected_key {
+                    continue;
+                }
                 rich.insert(
                     key.clone(),
-                    serde_json::to_value(binding).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(binding).map_err(LpmError::Json)?,
                 );
             }
+        }
+        if !rich.is_empty() {
             let mut lpm_block = serde_json::Map::new();
             lpm_block.insert(
                 "trustedDependencies".into(),
@@ -588,6 +606,7 @@ mod tests {
             "0.25.1",
             Some("registry+https://registry.npmjs.org"),
             Some("sha512-x"),
+            Some("sha256-y"),
         );
         let entry = trusted.get(&key).expect("entry keyed by exact identity");
 
@@ -603,6 +622,29 @@ mod tests {
             entry.get("scriptHash").and_then(|v| v.as_str()),
             Some("sha256-y")
         );
+    }
+
+    #[test]
+    fn synthesize_pkg_json_does_not_project_schema_one_trust_into_execution_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let trust = lpm_global::GlobalTrustedDependencies {
+            schema_version: 1,
+            trusted: std::collections::BTreeMap::from([(
+                "esbuild@0.25.1".into(),
+                lpm_global::TrustedDependencyBinding {
+                    source: None,
+                    integrity: Some("sha512-x".into()),
+                    script_hash: Some("sha256-y".into()),
+                    provenance_at_approval: None,
+                },
+            )]),
+        };
+        lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
+
+        let value = synthesize_pkg_json("@lpm-global", Some(&root), "eslint", "9.24.0").unwrap();
+
+        assert!(value.get("lpm").is_none());
     }
 
     #[test]

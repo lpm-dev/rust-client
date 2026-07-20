@@ -26,11 +26,11 @@
 //!    tombstone keeps the cleanup retry alive for `store gc`.
 //! 6. Append WAL Commit. Release lock.
 //!
-//! ## Host-global trust pruning (M76)
+//! ## Host-global trust pruning
 //!
 //! Between steps 3 and 4, the uninstall transaction enumerates
-//! `(name, version)` pairs reachable only through the uninstalling
-//! install's tree and prunes the matching rows from
+//! exact `(name, version, source, integrity)` package identities reachable
+//! only through the uninstalling install's tree and prunes the matching rows from
 //! `~/.lpm/global/trusted-dependencies.json`. Reachability is computed
 //! from per-install lockfiles: the uninstalling install's tree minus
 //! the union of every other remaining global install's tree.
@@ -56,9 +56,11 @@ use lpm_global::{
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub async fn run(package: &str, json_output: bool) -> Result<(), LpmError> {
+pub async fn run(package: &str, json_output: bool, preserve_trust: bool) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    let result = with_exclusive_lock(root.global_tx_lock(), || run_under_lock(&root, package))?;
+    let result = with_exclusive_lock(root.global_tx_lock(), || {
+        run_under_lock_with_options(&root, package, preserve_trust)
+    })?;
 
     // Opportunistic tombstone sweep. Uninstall commit
     // just appended the install root to `manifest.tombstones`; a
@@ -71,7 +73,16 @@ pub async fn run(package: &str, json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, LpmError> {
+    run_under_lock_with_options(root, package, false)
+}
+
+fn run_under_lock_with_options(
+    root: &LpmRoot,
+    package: &str,
+    preserve_trust: bool,
+) -> Result<UninstallOutcome, LpmError> {
     let mut manifest = read_for(root)?;
 
     let active = match manifest.packages.get(package).cloned() {
@@ -98,7 +109,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    // L47: validate the manifest-supplied relative install root against
+    // Validate the manifest-supplied relative install root against
     // the same `installs/<name>@<version>` shape the tombstone sweeper
     // enforces, BEFORE joining + the eventual `remove_dir_all`. A
     // poisoned `active.root` of `"."`, `"installs"`, `"../escape"`, or
@@ -121,7 +132,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     };
     let tx_id = mk_tx_id();
 
-    // ─── Step 0: compute trust prune set (M76) ─────────────────────
+    // ─── Step 0: compute trust prune set ───────────────────────────
     //
     // Read THIS install's lockfile + every OTHER remaining global
     // install's lockfile to find `(name, version)` pairs reachable
@@ -132,13 +143,17 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     // Fail-safe: any unreadable lockfile collapses to an empty prune.
     // Stale trust is preferable to lost trust — an over-broad prune
     // could break a sibling install's next reinstall.
-    let trust_prune = compute_uninstall_trust_prune(
-        root,
-        &manifest,
-        package,
-        &active.resolved,
-        &install_root_abs,
-    );
+    let trust_prune = if preserve_trust {
+        Vec::new()
+    } else {
+        compute_uninstall_trust_prune(
+            root,
+            &manifest,
+            package,
+            &active.resolved,
+            &install_root_abs,
+        )
+    };
 
     // ─── Step 1: write Intent ──────────────────────────────────────
     let mut wal = WalWriter::open(root.global_wal())?;
@@ -188,7 +203,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
         // Restore the shims we already removed so PATH resolution stays
         // consistent with the (still-unchanged) manifest.
         //
-        // L50: track restoration failures and propagate them honestly.
+        // Track restoration failures and propagate them honestly.
         // Pre-fix the user always saw "any shims that were removed have
         // been restored" even when restoration also failed, and the
         // WAL Abort was written regardless — leaving PATH and manifest
@@ -280,7 +295,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
         )));
     }
 
-    // ─── Step 2b: apply trust prune (M76) ─────────────────────────
+    // ─── Step 2b: apply trust prune ────────────────────────────────
     //
     // Drop host-global trust entries that were reachable only through
     // this install's tree. Idempotent (`remove_many` returns the
@@ -298,11 +313,17 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     let mut trust_entries_pruned = 0usize;
     if !trust_prune.is_empty() {
         let mut trust = lpm_global::trusted_deps::read_for(root)?;
+        let exact_keys: Vec<&str> = trust_prune
+            .iter()
+            .filter_map(|entry| entry.key.as_deref())
+            .collect();
         let prune_pairs: Vec<(&str, &str)> = trust_prune
             .iter()
+            .filter(|entry| entry.key.is_none())
             .map(|e| (e.name.as_str(), e.version.as_str()))
             .collect();
-        trust_entries_pruned = trust.remove_many(&prune_pairs);
+        trust_entries_pruned =
+            trust.remove_exact_keys(&exact_keys) + trust.remove_many(&prune_pairs);
         if trust_entries_pruned > 0 {
             lpm_global::trusted_deps::write_for(root, &trust)?;
         }
@@ -396,7 +417,7 @@ fn build_uninstall_intent(
         // Uninstall never resolves collisions — it only removes state.
         // the ownership_delta is reserved for install/upgrade.
         ownership_delta: Vec::new(),
-        // M76: host-global trust entries this uninstall will prune,
+        // Host-global trust entries this uninstall will prune,
         // reachable only through this install's tree. Computed by the
         // caller before the Intent write; recovery replays from this
         // field if a crash interrupts the prune step.
@@ -415,17 +436,25 @@ struct UninstallOutcome {
     /// Host-global trust entries pruned from
     /// `~/.lpm/global/trusted-dependencies.json` because they were
     /// reachable only through this install's tree. Surfaced in both
-    /// human and JSON output so the M76 fix is observable. Zero on
+    /// human and JSON output. Zero on
     /// a fresh-machine uninstall (no trust file yet) and on any
     /// conservative fail-safe ("could not read sibling lockfile").
     trust_entries_pruned: usize,
 }
 
-/// Read a per-install `lpm.lock` and return the set of
-/// `(name, version)` pairs it references. `None` on any failure
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstallTrustIdentity {
+    name: String,
+    version: String,
+    source: Option<String>,
+    integrity: Option<String>,
+}
+
+/// Read a per-install `lpm.lock` and return the exact package identities it
+/// references. `None` on any failure
 /// (missing file, over-cap, malformed TOML, unsupported schema) so
 /// the caller can fail safely.
-fn read_install_tree_pkgs(install_root: &Path) -> Option<HashSet<(String, String)>> {
+fn read_install_tree_pkgs(install_root: &Path) -> Option<HashSet<InstallTrustIdentity>> {
     let lockfile_path = install_root.join("lpm.lock");
     let bytes = match lpm_common::read_capped_state_file(
         &lockfile_path,
@@ -461,7 +490,12 @@ fn read_install_tree_pkgs(install_root: &Path) -> Option<HashSet<(String, String
         Ok(lock) => Some(
             lock.packages
                 .into_iter()
-                .map(|p| (p.name, p.version))
+                .map(|package| InstallTrustIdentity {
+                    name: package.name,
+                    version: package.version,
+                    source: package.source,
+                    integrity: package.integrity,
+                })
                 .collect(),
         ),
         Err(e) => {
@@ -475,15 +509,13 @@ fn read_install_tree_pkgs(install_root: &Path) -> Option<HashSet<(String, String
 }
 
 /// Compute the host-global trust entries that should be pruned when
-/// `uninstalling_package` is removed: every `(name, version)` reachable
-/// through `install_root_abs`'s lockfile (PLUS the top-level
-/// `(uninstalling_package, top_level_version)` pair) MINUS every
-/// `(name, version)` reachable through any other remaining global
-/// install's lockfile.
+/// `uninstalling_package` is removed. Current exact trust keys are compared by
+/// `(name, version, source, integrity)` reachability. Coordinate-only legacy
+/// rows are pruned only when no remaining install contains those coordinates.
 ///
 /// Returns a sorted `Vec<TrustPruneEntry>` for deterministic Intent
 /// serialization. Returns an empty vec on ANY failure — fail-safe to
-/// "don't prune," matching the M76 conservative posture documented at
+/// "don't prune," matching the conservative posture documented at
 /// the module-level docstring.
 fn compute_uninstall_trust_prune(
     root: &LpmRoot,
@@ -492,29 +524,20 @@ fn compute_uninstall_trust_prune(
     uninstalling_version: &str,
     install_root_abs: &Path,
 ) -> Vec<TrustPruneEntry> {
-    // 1. Enumerate (name, version) pairs reachable through this
-    //    install's tree. Include the top-level pair itself so a
-    //    trust binding for the uninstalled top-level — rare but
-    //    possible if the top-level itself shipped a postinstall —
-    //    also gets pruned.
-    let Some(mut this_tree) = read_install_tree_pkgs(install_root_abs) else {
+    let Some(this_tree) = read_install_tree_pkgs(install_root_abs) else {
         return Vec::new();
     };
-    this_tree.insert((
-        uninstalling_package.to_string(),
-        uninstalling_version.to_string(),
-    ));
 
-    // 2. Union every OTHER remaining install's lockfile-reachable
-    //    (name, version) pairs into `still_reachable`. ANY failure
+    // Union every OTHER remaining install's lockfile-reachable identities into
+    // `still_reachable`. ANY failure
     //    here collapses to "don't prune": stale-trust is preferable
     //    to lost-trust if a sibling lockfile is corrupt.
-    let mut still_reachable: HashSet<(String, String)> = HashSet::new();
+    let mut still_reachable: HashSet<InstallTrustIdentity> = HashSet::new();
     for (other_pkg, other_entry) in &manifest.packages {
         if other_pkg == uninstalling_package {
             continue;
         }
-        // L47: validate the sibling install root shape before
+        // Validate the sibling install root shape before
         // touching the disk path — same defense-in-depth as the
         // tombstone sweeper and the uninstalling-install validation.
         let other_install_root = match lpm_global::validated_install_root_relative(
@@ -539,15 +562,80 @@ fn compute_uninstall_trust_prune(
         still_reachable.extend(other_tree);
     }
 
-    // 3. Difference. Sort for deterministic on-disk WAL Intent shape
-    //    so round-trip equality tests stay stable.
-    let mut prune: Vec<TrustPruneEntry> = this_tree
-        .into_iter()
-        .filter(|pair| !still_reachable.contains(pair))
-        .map(|(name, version)| TrustPruneEntry { name, version })
+    let trust = match lpm_global::trusted_deps::read_for(root) {
+        Ok(trust) => trust,
+        Err(error) => {
+            tracing::warn!("uninstall trust-prune: trust file read failed: {error}");
+            return Vec::new();
+        }
+    };
+    let mut this_coordinates: HashSet<(String, String)> = this_tree
+        .iter()
+        .map(|identity| (identity.name.clone(), identity.version.clone()))
         .collect();
-    prune.sort_by(|a, b| {
-        (a.name.as_str(), a.version.as_str()).cmp(&(b.name.as_str(), b.version.as_str()))
+    this_coordinates.insert((
+        uninstalling_package.to_string(),
+        uninstalling_version.to_string(),
+    ));
+    let still_coordinates: HashSet<(&str, &str)> = still_reachable
+        .iter()
+        .map(|identity| (identity.name.as_str(), identity.version.as_str()))
+        .collect();
+
+    let mut prune = Vec::new();
+    for (key, binding) in &trust.trusted {
+        let Some((name, version_and_identity)) = key.rsplit_once('@') else {
+            continue;
+        };
+        let (version, token) = version_and_identity
+            .split_once('#')
+            .map_or((version_and_identity, None), |(version, token)| {
+                (version, Some(token))
+            });
+        if token.is_none() {
+            if this_coordinates.contains(&(name.to_string(), version.to_string()))
+                && !still_coordinates.contains(&(name, version))
+            {
+                prune.push(TrustPruneEntry {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    key: None,
+                });
+            }
+            continue;
+        }
+
+        let expected_key = lpm_global::trusted_deps::rich_key_for_identity(
+            name,
+            version,
+            binding.source.as_deref(),
+            binding.integrity.as_deref(),
+            binding.script_hash.as_deref(),
+        );
+        if key != &expected_key {
+            continue;
+        }
+        let identity = InstallTrustIdentity {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: binding.source.clone(),
+            integrity: binding.integrity.clone(),
+        };
+        if this_tree.contains(&identity) && !still_reachable.contains(&identity) {
+            prune.push(TrustPruneEntry {
+                name: name.to_string(),
+                version: version.to_string(),
+                key: Some(key.clone()),
+            });
+        }
+    }
+    prune.sort_by(|left, right| {
+        left.key
+            .as_deref()
+            .unwrap_or_default()
+            .cmp(right.key.as_deref().unwrap_or_default())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.version.cmp(&right.version))
     });
     prune
 }
@@ -562,7 +650,7 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
             "aliases_removed": out.aliases,
             "install_root": out.install_root.display().to_string(),
             "install_root_remaining": out.install_root_remaining,
-            // M76: host-global trust entries pruned by this uninstall.
+            // Host-global trust entries pruned by this uninstall.
             // Zero on fresh-machine uninstalls and on conservative
             // fail-safe paths. Surfacing the count lets automation +
             // tests detect the trust-pruning behavior without parsing
@@ -948,7 +1036,7 @@ mod tests {
             "manifest entry must be preserved when uninstall fails"
         );
 
-        // L50: when restoration ALSO fails (here the 0o555 perm on
+        // When restoration also fails (here the 0o555 permission on
         // bin_dir blocks both `remove_shim` AND `emit_shim`), the
         // transaction is left unresolved so recovery retries on the
         // next `lpm` invocation. Pre-fix the WAL Abort was written
@@ -965,7 +1053,7 @@ mod tests {
             .any(|r| matches!(r, WalRecord::Abort { .. }));
         assert!(
             !has_abort,
-            "L50: when restoration also fails, WAL Abort must be skipped \
+            "when restoration also fails, WAL Abort must be skipped \
              so recovery retries on next invocation"
         );
         let has_intent = scan
@@ -977,10 +1065,10 @@ mod tests {
             "Intent must be on disk so recovery has the cleanup handle"
         );
         // Error message must surface BOTH the original removal failure
-        // and the restoration failure — honest reporting per L50.
+        // and the restoration failure.
         assert!(
             format!("{err}").contains("Restoration of the partially-removed shims ALSO failed"),
-            "L50: error must surface restoration failure, got: {err}"
+            "error must surface restoration failure, got: {err}"
         );
     }
 
@@ -1116,7 +1204,7 @@ mod tests {
         assert!(msg.contains("not globally installed"));
     }
 
-    /// L47: a manifest poisoned with a structurally invalid `active.root`
+    /// A manifest poisoned with a structurally invalid `active.root`
     /// (parent-traversal, absolute path, single segment) must be refused
     /// before any `remove_dir_all` walks outside the global tree. The
     /// existing tombstone sweep's `validated_install_root_relative`
@@ -1158,7 +1246,7 @@ mod tests {
         assert!(after.packages.contains_key("evilpkg"));
     }
 
-    // ── M76: trust-prune reachability tests ───────────────────────
+    // ── Trust-prune reachability tests ─────────────────────────────
 
     /// Write a minimal but parseable `lpm.lock` listing every
     /// `(name, version)` pair into a per-install root. Used by the
@@ -1175,6 +1263,14 @@ mod tests {
         std::fs::write(install_root.join("lpm.lock"), body).unwrap();
     }
 
+    fn write_coordinate_trust(root: &LpmRoot, packages: &[(&str, &str)]) {
+        let mut trust = lpm_global::GlobalTrustedDependencies::default();
+        for (name, version) in packages {
+            trust.insert_strict(name, version, None, None);
+        }
+        lpm_global::trusted_deps::write_for(root, &trust).unwrap();
+    }
+
     /// When `pkgA` is the only global, every entry in its tree
     /// (plus the top-level pair itself) is prunable.
     #[test]
@@ -1183,6 +1279,10 @@ mod tests {
         let root = LpmRoot::from_dir(tmp.path());
         let install_root = seed_active_package(&root, "pkga", &[]);
         write_install_lockfile(&install_root, &[("lodash", "4.17.21"), ("axios", "1.5.0")]);
+        write_coordinate_trust(
+            &root,
+            &[("lodash", "4.17.21"), ("axios", "1.5.0"), ("pkga", "1.0.0")],
+        );
 
         let manifest = read_for(&root).unwrap();
         let prune = compute_uninstall_trust_prune(&root, &manifest, "pkga", "1.0.0", &install_root);
@@ -1227,6 +1327,7 @@ mod tests {
         );
         write_for(&root, &manifest).unwrap();
         write_install_lockfile(&install_b, &[("lodash", "4.17.21")]);
+        write_coordinate_trust(&root, &[("lodash", "4.17.21"), ("pkga", "1.0.0")]);
 
         let manifest = read_for(&root).unwrap();
         let prune = compute_uninstall_trust_prune(&root, &manifest, "pkga", "1.0.0", &install_a);
@@ -1238,6 +1339,79 @@ mod tests {
             names,
             vec![("pkga", "1.0.0")],
             "lodash reachable via pkgb must survive; only the unique top-level is pruned"
+        );
+    }
+
+    #[test]
+    fn compute_uninstall_trust_prune_distinguishes_same_coordinates_from_different_sources() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_a = seed_active_package(&root, "pkga", &[]);
+        std::fs::write(
+            install_a.join("lpm.lock"),
+            r#"[metadata]
+lockfile-version = 6
+
+[[packages]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://registry-a.example"
+integrity = "sha512-registry-a"
+"#,
+        )
+        .unwrap();
+
+        let mut manifest = read_for(&root).unwrap();
+        let install_b = root.install_root_for("pkgb", "1.0.0");
+        std::fs::create_dir_all(install_b.join("node_modules").join(".bin")).unwrap();
+        manifest.packages.insert(
+            "pkgb".into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-b".into(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: "installs/pkgb@1.0.0".into(),
+                commands: vec![],
+            },
+        );
+        write_for(&root, &manifest).unwrap();
+        std::fs::write(
+            install_b.join("lpm.lock"),
+            r#"[metadata]
+lockfile-version = 6
+
+[[packages]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://registry-b.example"
+integrity = "sha512-registry-b"
+"#,
+        )
+        .unwrap();
+        let mut trust = lpm_global::GlobalTrustedDependencies::default();
+        trust.insert_binding_for_identity(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-a.example".into()),
+            lpm_global::TrustedDependencyBinding {
+                source: None,
+                integrity: Some("sha512-registry-a".into()),
+                script_hash: Some("sha256-script".into()),
+                provenance_at_approval: None,
+            },
+        );
+        lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
+
+        let manifest = read_for(&root).unwrap();
+        let prune = compute_uninstall_trust_prune(&root, &manifest, "pkga", "1.0.0", &install_a);
+
+        assert!(
+            prune
+                .iter()
+                .any(|entry| entry.name == "shared" && entry.version == "1.0.0"),
+            "registry A's exact identity is unique even though registry B shares its coordinates"
         );
     }
 
@@ -1307,12 +1481,7 @@ mod tests {
         write_install_lockfile(&install_root, &[("lodash", "4.17.21")]);
 
         let mut trust = lpm_global::GlobalTrustedDependencies::default();
-        trust.insert_strict(
-            "lodash",
-            "4.17.21",
-            Some("sha512-l".into()),
-            Some("sha256-s".into()),
-        );
+        trust.insert_strict("lodash", "4.17.21", None, None);
         lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
 
         let outcome = run_under_lock(&root, "pkga").unwrap();
@@ -1325,5 +1494,20 @@ mod tests {
             "lodash trust entry should be pruned; got {:?}",
             trust_after.trusted
         );
+    }
+
+    #[test]
+    fn uninstall_for_approved_reinstall_preserves_trust_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = seed_active_package(&root, "pkga", &[]);
+        write_install_lockfile(&install_root, &[("lodash", "4.17.21")]);
+        write_coordinate_trust(&root, &[("lodash", "4.17.21")]);
+
+        let outcome = run_under_lock_with_options(&root, "pkga", true).unwrap();
+
+        assert_eq!(outcome.trust_entries_pruned, 0);
+        let trust_after = lpm_global::trusted_deps::read_for(&root).unwrap();
+        assert!(trust_after.trusted.contains_key("lodash@4.17.21"));
     }
 }

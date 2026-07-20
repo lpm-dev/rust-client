@@ -62,11 +62,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// hash) without bumping this constant. See the plan for the
 /// rationale.
 ///
-/// Reader policy (see [`read_build_state`]): accept anything
-/// `<= BUILD_STATE_VERSION`; refuse newer versions (forward-incompatible
-/// bumps signal a meaningful schema change that older readers can't
-/// interpret safely).
-pub const BUILD_STATE_VERSION: u32 = 2;
+/// Reader policy (see [`read_build_state`]): accept only the current version.
+/// A semantic change to lifecycle identity must not leave an older captured
+/// hash available for durable approval.
+pub const BUILD_STATE_VERSION: u32 = 3;
 
 /// Filename inside `<project_dir>/.lpm/`.
 pub const BUILD_STATE_FILENAME: &str = "build-state.json";
@@ -109,15 +108,15 @@ pub struct BuildState {
     /// "N packages blocked" banner — it suppresses iff the fingerprint
     /// matches the previous run.
     pub blocked_set_fingerprint: String,
-    /// RFC 3339 timestamp of when this state file was written. Used by
-    /// future stale-state detection but not by  the     /// suppression logic, which is purely fingerprint-based.
+    /// RFC 3339 timestamp of when this state file was written. The banner
+    /// suppression logic uses only the fingerprint.
     pub captured_at: String,
     /// The packages whose lifecycle scripts were blocked at the time of
     /// the install that wrote this file. Sorted by `(name, version)` for
     /// deterministic fingerprinting.
     pub blocked_packages: Vec<BlockedPackage>,
 
-    /// M3: audit trail for `--ignore-provenance-drift[-all]`. Set to
+    /// Audit trail for `--ignore-provenance-drift[-all]`. Set to
     /// `Some(...)` when the install that wrote this state file had a
     /// drift override active. `None` means drift was enforced normally.
     /// Skipped from on-disk JSON when None to keep the common-case
@@ -284,15 +283,7 @@ pub struct BlockedSetCapture {
 /// Returns `None` if:
 /// - The file is missing
 /// - The file fails to parse as JSON
-/// - The file's `state_version` is **newer** than this binary supports
-///
-/// Older `state_version` values are accepted: the struct's new optional
-/// fields default to `None` via their `#[serde(default)]` attribute,
-/// producing a valid [`BuildState`] with degraded but usable content.
-/// This is the forward-compat side of the no-version-bump policy
-/// documented on [`BUILD_STATE_VERSION`]; the backward-compat side is
-/// that absence of `deny_unknown_fields` lets older readers silently
-/// drop fields written by newer writers.
+/// - The file's `state_version` differs from the current version
 ///
 /// All three failure modes are treated identically by callers: "no
 /// previous state". The caller will write a fresh state on the next
@@ -303,14 +294,10 @@ pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
         .ok()
         .flatten()?;
     let state: BuildState = serde_json::from_slice(&bytes).ok()?;
-    if state.state_version > BUILD_STATE_VERSION {
-        // Newer file written by a future LPM binary. We can't safely
-        // interpret its semantics, so treat as missing and let the
-        // current run write a fresh state. (Next time the newer LPM
-        // runs, it will overwrite with a newer-version file again.)
+    if state.state_version != BUILD_STATE_VERSION {
         tracing::debug!(
-            "build-state.json is newer than this binary supports \
-             (got v{}, max v{}) — treating as missing",
+            "build-state.json uses an incompatible identity schema \
+             (got v{}, current v{}) — treating as missing",
             state.state_version,
             BUILD_STATE_VERSION,
         );
@@ -801,6 +788,7 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                     version,
                     source,
                     integrity.as_deref(),
+                    script_hash.as_deref(),
                 );
                 if requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
                 {
@@ -1422,7 +1410,7 @@ mod tests {
         }
     }
 
-    /// M3: the drift_ignore_override field is omitted from on-disk
+    /// The drift_ignore_override field is omitted from on-disk
     /// JSON when None (forward-compatible with pre-fix readers) and
     /// round-trips faithfully when present.
     #[test]
@@ -2243,6 +2231,26 @@ mod tests {
             "reader must accept files at the current BUILD_STATE_VERSION"
         );
         assert_eq!(read.unwrap().blocked_packages.len(), 1);
+    }
+
+    #[test]
+    fn read_build_state_rejects_older_lifecycle_identity_schema() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let mut state = make_state(vec![make_blocked(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-old-format"),
+        )]);
+        state.state_version = BUILD_STATE_VERSION - 1;
+        std::fs::write(
+            build_state_path(project.path()),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert!(read_build_state(project.path()).is_none());
     }
 
     // ───: metadata plumbing ───────────────────────────

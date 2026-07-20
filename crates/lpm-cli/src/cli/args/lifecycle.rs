@@ -566,6 +566,11 @@ pub(crate) struct UninstallArgs {
     /// route through the same `uninstall_global` implementation.
     #[arg(long, short = 'g')]
     pub(crate) global: bool,
+
+    /// Preserve exact global lifecycle approvals while uninstalling for an
+    /// immediate reinstall. Ordinary global uninstalls prune stale approvals.
+    #[arg(long, requires = "global")]
+    pub(crate) preserve_trust: bool,
 }
 
 #[derive(Args)]

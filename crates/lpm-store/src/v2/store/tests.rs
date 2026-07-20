@@ -729,6 +729,68 @@ fn patched_lifecycle_prepare_restores_pristine_bytes_when_baseline_exists() {
 }
 
 #[test]
+fn patched_lifecycle_prepare_restores_same_name_dependency_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let current_sri = synthetic_sri(b"patched_prepare_same_name/current");
+    let dependency_sri = synthetic_sri(b"patched_prepare_same_name/dependency");
+    let current_object = write_object(
+        &store,
+        &current_sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"shared","version":"2.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let dependency_object = write_object(
+        &store,
+        &dependency_sri,
+        &[("package.json", br#"{"name":"shared","version":"1.0.0"}"#)],
+    );
+    let current_key = arc_key("shared", "2.0.0");
+    let dependency_key = arc_key("shared", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: dependency_key.clone(),
+            source_sri: dependency_sri,
+            object_dir: dependency_object,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: current_key.clone(),
+            source_sri: current_sri,
+            object_dir: current_object,
+            deps: vec![DepLink {
+                local: "shared".into(),
+                target: dependency_key.clone(),
+            }],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&current_key);
+
+    store
+        .prepare_patched_lifecycle_baseline(&package_dir)
+        .unwrap();
+
+    let dependency_link = package_dir.join("node_modules").join("shared");
+    assert_eq!(
+        std::fs::canonicalize(dependency_link).unwrap(),
+        std::fs::canonicalize(store.paths().link_package_dir(&dependency_key)).unwrap()
+    );
+}
+
+#[test]
 fn lifecycle_restore_recreates_scoped_same_name_dependency_link() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());

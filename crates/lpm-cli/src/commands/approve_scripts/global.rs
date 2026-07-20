@@ -353,7 +353,7 @@ pub(super) fn print_global_list(
 // reinstall the affected globals to actually re-execute the lifecycle
 // scripts that were blocked at install time. `lpm rebuild --global`
 // is a planned follow-up; until then, the truthful path is
-// `lpm uninstall -g <origin> && lpm install -g <origin>`.
+// `lpm uninstall -g --preserve-trust <origin> && lpm install -g <origin>`.
 //
 // IMPORTANT: the affected origins are the TOP-LEVEL globally-installed
 // packages whose tree contains the approved blocked row, NOT the
@@ -392,7 +392,7 @@ pub(super) fn emit_rerun_hint_stderr(origins: &[String]) {
     if origins.len() == 1 {
         output::info(&format!(
             "Next step — reinstall to execute approved scripts: \
-             `lpm uninstall -g {0} && lpm install -g {0}`. \
+             `lpm uninstall -g --preserve-trust {0} && lpm install -g {0}`. \
              (`lpm rebuild --global` is a planned follow-up.)",
             origins[0],
         ));
@@ -400,7 +400,7 @@ pub(super) fn emit_rerun_hint_stderr(origins: &[String]) {
     }
     output::info("Next step — reinstall the affected globals to execute approved scripts:");
     for o in origins {
-        eprintln!("    lpm uninstall -g {o} && lpm install -g {o}");
+        eprintln!("    lpm uninstall -g --preserve-trust {o} && lpm install -g {o}");
     }
     eprintln!("(`lpm rebuild --global` is a planned follow-up.)");
 }
@@ -426,7 +426,8 @@ pub(super) fn rerun_next_steps_json(origins: &[String]) -> serde_json::Value {
     let mut steps = Vec::with_capacity(origins.len());
     for origin in origins {
         let description = format!("Reinstall {origin} to run approved scripts");
-        let command = format!("lpm uninstall -g {origin} && lpm install -g {origin}");
+        let command =
+            format!("lpm uninstall -g --preserve-trust {origin} && lpm install -g {origin}");
         steps.push(crate::json_contract::command_next_step(
             &description,
             &command,
@@ -864,6 +865,7 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
                         lpm_global::trusted_deps::rich_identity_token(
                             r.source.as_deref(),
                             r.integrity.as_deref(),
+                            r.script_hash.as_deref(),
                         )
                         .as_deref()
                             == Some(expected)
@@ -916,8 +918,12 @@ pub(super) fn aggregate_identity_selector(
     row: &crate::global_blocked_set::AggregateBlockedRow,
 ) -> String {
     let base = format!("{}@{}", row.name, row.version);
-    lpm_global::trusted_deps::rich_identity_token(row.source.as_deref(), row.integrity.as_deref())
-        .map_or(base.clone(), |identity| format!("{base}#{identity}"))
+    lpm_global::trusted_deps::rich_identity_token(
+        row.source.as_deref(),
+        row.integrity.as_deref(),
+        row.script_hash.as_deref(),
+    )
+    .map_or(base.clone(), |identity| format!("{base}#{identity}"))
 }
 
 pub(super) fn group_remaining_rows_by_origin<'a>(

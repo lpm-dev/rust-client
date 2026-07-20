@@ -874,6 +874,7 @@ pub fn blocked_to_json_with_provenance(
             &blocked.version,
             blocked.source.as_deref(),
             blocked.integrity.as_deref(),
+            blocked.script_hash.as_deref(),
         ),
         "integrity": blocked.integrity,
         "script_hash": blocked.script_hash,
@@ -1889,6 +1890,7 @@ mod tests {
                 "0.25.1",
                 Some("registry+https://registry.npmjs.org"),
                 Some("sha512-esbuild-0.25.1"),
+                Some("sha256-x"),
             ))
         );
     }
@@ -1899,10 +1901,20 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("stable", "2.0.0", Some("sha256-same"));
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-stable-1.0.0";
         let mut map = HashMap::new();
         map.insert(
-            "stable@1.0.0".into(),
+            TrustedDependencies::rich_key_for_identity(
+                "stable",
+                "1.0.0",
+                Some(source),
+                Some(integrity),
+                Some("sha256-same"),
+            ),
             TrustedDependencyBinding {
+                source: Some(source.into()),
+                integrity: Some(integrity.into()),
                 script_hash: Some("sha256-same".into()),
                 ..Default::default()
             },
@@ -1931,10 +1943,20 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("esbuild", "0.25.2", Some("sha256-new"));
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-esbuild-0.25.1";
         let mut map = HashMap::new();
         map.insert(
-            "esbuild@0.25.1".into(),
+            TrustedDependencies::rich_key_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some(source),
+                Some(integrity),
+                Some("sha256-old"),
+            ),
             TrustedDependencyBinding {
+                source: Some(source.into()),
+                integrity: Some(integrity.into()),
                 script_hash: Some("sha256-old".into()),
                 ..Default::default()
             },

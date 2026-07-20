@@ -154,6 +154,7 @@ pub(crate) fn scriptable_package_rows_for_identities(
                         version,
                         identity.source.as_deref(),
                         integrity.as_deref(),
+                        script_hash.as_deref(),
                     )
                 } else {
                     None // scope-trust has no binding to bind a hash to

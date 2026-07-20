@@ -380,7 +380,7 @@ async fn async_main() -> Result<()> {
                 // lpm) must NOT silently let the command proceed
                 // against potentially stale state. Surface and abort.
                 //
-                // L44: in `--json` mode, route through the same
+                // In `--json` mode, route through the same
                 // `{"success": false, "error", "error_code"}` envelope
                 // that wraps dispatch errors below — otherwise the
                 // recovery path emits a human diagnostic on stderr and
@@ -1066,6 +1066,7 @@ async fn async_main() -> Result<()> {
                 fail_if_no_match,
                 yes,
                 global,
+                preserve_trust,
             } = args;
             // `lpm uninstall -g <pkg>` routes to the
             // global uninstall pipeline. Project flags are mutually
@@ -1097,7 +1098,7 @@ async fn async_main() -> Result<()> {
                 ) {
                     Err(error)
                 } else {
-                    commands::uninstall_global::run(&packages[0], cli.json).await
+                    commands::uninstall_global::run(&packages[0], cli.json, preserve_trust).await
                 }
             } else {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;

@@ -10,7 +10,7 @@
 //!
 //! ```json
 //! {
-//!   "schema_version": 2,
+//!   "schema_version": 3,
 //!   "trusted": {
 //!     "esbuild@0.25.1#<identity-token>": {
 //!       "source": "registry+https://registry.npmjs.org",
@@ -104,7 +104,7 @@ pub struct TrustedDependencyBinding {
     pub provenance_at_approval: Option<lpm_common::ProvenanceSnapshot>,
 }
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const FILENAME: &str = "trusted-dependencies.json";
 
 /// Top-level shape of `~/.lpm/global/trusted-dependencies.json`.
@@ -134,18 +134,25 @@ pub fn rich_key(name: &str, version: &str) -> String {
     format!("{name}@{version}")
 }
 
-/// Stable token for an exact source/content identity.
-pub fn rich_identity_token(source: Option<&str>, integrity: Option<&str>) -> Option<String> {
-    if source.is_none() && integrity.is_none() {
+/// Stable token for an exact source, integrity, and lifecycle-content identity.
+pub fn rich_identity_token(
+    source: Option<&str>,
+    integrity: Option<&str>,
+    script_hash: Option<&str>,
+) -> Option<String> {
+    if source.is_none() && integrity.is_none() && script_hash.is_none() {
         return None;
     }
     let source = source.unwrap_or_default().as_bytes();
     let integrity = integrity.unwrap_or_default().as_bytes();
-    let mut identity = Vec::with_capacity(16 + source.len() + integrity.len());
+    let script_hash = script_hash.unwrap_or_default().as_bytes();
+    let mut identity = Vec::with_capacity(24 + source.len() + integrity.len() + script_hash.len());
     identity.extend_from_slice(&(source.len() as u64).to_be_bytes());
     identity.extend_from_slice(source);
     identity.extend_from_slice(&(integrity.len() as u64).to_be_bytes());
     identity.extend_from_slice(integrity);
+    identity.extend_from_slice(&(script_hash.len() as u64).to_be_bytes());
+    identity.extend_from_slice(script_hash);
     let digest = lpm_common::integrity::Integrity::from_bytes(
         lpm_common::integrity::HashAlgorithm::Sha256,
         &identity,
@@ -165,8 +172,9 @@ pub fn rich_key_for_identity(
     version: &str,
     source: Option<&str>,
     integrity: Option<&str>,
+    script_hash: Option<&str>,
 ) -> String {
-    match rich_identity_token(source, integrity) {
+    match rich_identity_token(source, integrity, script_hash) {
         Some(token) => format!("{name}@{version}#{token}"),
         None => rich_key(name, version),
     }
@@ -211,7 +219,7 @@ impl GlobalTrustedDependencies {
         integrity: Option<&str>,
         script_hash: Option<&str>,
     ) -> TrustMatch {
-        let exact_key = rich_key_for_identity(name, version, source, integrity);
+        let exact_key = rich_key_for_identity(name, version, source, integrity, script_hash);
         let binding = self.trusted.get(&exact_key);
         let Some(binding) = binding else {
             let coordinate_key = rich_key(name, version);
@@ -267,7 +275,13 @@ impl GlobalTrustedDependencies {
         script_hash: Option<String>,
     ) {
         self.schema_version = SCHEMA_VERSION;
-        let key = rich_key_for_identity(name, version, None, integrity.as_deref());
+        let key = rich_key_for_identity(
+            name,
+            version,
+            None,
+            integrity.as_deref(),
+            script_hash.as_deref(),
+        );
         self.trusted.insert(
             key,
             TrustedDependencyBinding {
@@ -291,6 +305,7 @@ impl GlobalTrustedDependencies {
             version,
             binding.source.as_deref(),
             binding.integrity.as_deref(),
+            binding.script_hash.as_deref(),
         );
         self.trusted.insert(key, binding);
     }
@@ -315,23 +330,14 @@ impl GlobalTrustedDependencies {
     /// knowing which are actually trusted.
     pub fn remove(&mut self, name: &str, version: &str) -> bool {
         let coordinate_key = rich_key(name, version);
-        let before = self.trusted.len();
-        self.trusted.retain(|key, _| {
-            if key == &coordinate_key {
-                return false;
-            }
-            parse_rich_key(key).is_none_or(|(candidate_name, candidate_version, _)| {
-                candidate_name != name || candidate_version != version
-            })
-        });
-        self.trusted.len() != before
+        self.trusted.remove(&coordinate_key).is_some()
     }
 
     /// Bulk-remove trust bindings. Returns the count of entries that
     /// were actually present and removed (entries that weren't in the
     /// map are silently skipped — idempotent).
     ///
-    /// Used by the uninstall path's M76 trust-prune step + recovery's
+    /// Used by uninstall trust pruning and recovery's
     /// `roll_forward_uninstall` replay. Both consume an
     /// `uninstall_trust_prune: Vec<TrustPruneEntry>` set computed
     /// against the uninstalling install's reachable tree, and apply
@@ -345,6 +351,15 @@ impl GlobalTrustedDependencies {
             }
         }
         removed
+    }
+
+    /// Remove exact persisted trust-map keys. Used by uninstall planning and
+    /// crash recovery after reachability has been evaluated with full source
+    /// identity.
+    pub fn remove_exact_keys(&mut self, keys: &[&str]) -> usize {
+        keys.iter()
+            .filter(|key| self.trusted.remove(**key).is_some())
+            .count()
     }
 }
 
@@ -636,9 +651,9 @@ mod tests {
     #[test]
     fn insert_strict_overwrites_existing_binding() {
         let mut gtd = GlobalTrustedDependencies::default();
-        gtd.insert_strict("x", "1.0.0", Some("same".into()), None);
         gtd.insert_strict("x", "1.0.0", Some("same".into()), Some("s".into()));
-        let key = rich_key_for_identity("x", "1.0.0", None, Some("same"));
+        gtd.insert_strict("x", "1.0.0", Some("same".into()), Some("s".into()));
+        let key = rich_key_for_identity("x", "1.0.0", None, Some("same"), Some("s"));
         let b = gtd.trusted.get(&key).unwrap();
         assert_eq!(b.integrity.as_deref(), Some("same"));
         assert_eq!(b.script_hash.as_deref(), Some("s"));
@@ -736,11 +751,6 @@ mod tests {
         assert!(!gtd.remove("ghost", "1.0.0"));
     }
 
-    /// M76: bulk-prune helper drops only the listed entries and
-    /// returns the count actually removed. Pin both the selectivity
-    /// (other entries survive) and the count contract so the
-    /// uninstall envelope's `trust_entries_pruned` field stays
-    /// honest.
     #[test]
     fn remove_many_drops_only_listed_entries_returns_count() {
         let mut gtd = GlobalTrustedDependencies::default();
@@ -754,10 +764,6 @@ mod tests {
         assert!(!gtd.trusted.contains_key("c@3.0.0"));
     }
 
-    /// M76: recovery may replay the prune after a successful
-    /// in-tx prune; the second invocation must be a no-op (count = 0)
-    /// rather than an error. Same shape as the existing
-    /// [`Self::remove`] idempotency contract.
     #[test]
     fn remove_many_is_idempotent_for_absent_entries() {
         let mut gtd = GlobalTrustedDependencies::default();
@@ -769,9 +775,6 @@ mod tests {
         assert!(gtd.trusted.is_empty());
     }
 
-    /// M76: empty input must be safe (no-op, count = 0). Recovery's
-    /// replay path passes whatever the Intent stored, which is empty
-    /// for installs and upgrades — the common case must not panic.
     #[test]
     fn remove_many_empty_input_returns_zero() {
         let mut gtd = GlobalTrustedDependencies::default();
@@ -878,6 +881,7 @@ mod tests {
             "0.25.1",
             Some("registry+https://registry.npmjs.org"),
             Some("sha512-e"),
+            Some("sha256-s"),
         );
         let snap = read.trusted[&key]
             .provenance_at_approval
@@ -940,8 +944,9 @@ mod tests {
             "0.25.1",
             Some("registry+https://registry.npmjs.org"),
             Some("sha512-same"),
+            Some("sha256-s"),
         );
-        assert_eq!(gtd.trusted.len(), 1);
+        assert_eq!(gtd.trusted.len(), 2);
         assert_eq!(gtd.trusted[&key], new);
     }
 
@@ -1035,5 +1040,64 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .collect();
         assert!(leaks.is_empty(), "tempfile leaked: {leaks:?}");
+    }
+
+    #[test]
+    fn same_source_content_with_different_script_hashes_are_independently_retained() {
+        let mut trusted = GlobalTrustedDependencies::default();
+        for script_hash in ["sha256-script-a", "sha256-script-b"] {
+            trusted.insert_binding_for_identity(
+                "shared",
+                "1.0.0",
+                Some("directory+./shared".into()),
+                TrustedDependencyBinding {
+                    source: None,
+                    integrity: None,
+                    script_hash: Some(script_hash.into()),
+                    provenance_at_approval: None,
+                },
+            );
+        }
+
+        assert_eq!(trusted.trusted.len(), 2);
+    }
+
+    #[test]
+    fn remove_exact_keys_preserves_same_coordinate_sibling_source() {
+        let mut trusted = GlobalTrustedDependencies::default();
+        for (source, integrity) in [
+            ("registry+https://registry-a.example", "sha512-a"),
+            ("registry+https://registry-b.example", "sha512-b"),
+        ] {
+            trusted.insert_binding_for_identity(
+                "shared",
+                "1.0.0",
+                Some(source.into()),
+                TrustedDependencyBinding {
+                    source: None,
+                    integrity: Some(integrity.into()),
+                    script_hash: Some("sha256-script".into()),
+                    provenance_at_approval: None,
+                },
+            );
+        }
+        let registry_a_key = rich_key_for_identity(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-a.example"),
+            Some("sha512-a"),
+            Some("sha256-script"),
+        );
+        let registry_b_key = rich_key_for_identity(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry-b.example"),
+            Some("sha512-b"),
+            Some("sha256-script"),
+        );
+
+        assert_eq!(trusted.remove_exact_keys(&[&registry_a_key]), 1);
+        assert!(!trusted.trusted.contains_key(&registry_a_key));
+        assert!(trusted.trusted.contains_key(&registry_b_key));
     }
 }

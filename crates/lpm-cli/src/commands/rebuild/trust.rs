@@ -355,7 +355,7 @@ pub(crate) fn evaluate_trust_for_identity_with_script_hash(
     // None) and missing bindings both fail this check, collapsing
     // into CapabilityNotApproved — which 6d's UX surfaces as a
     // distinct reason from Untrusted.
-    match policy.get_binding(name, version, source, integrity) {
+    match policy.get_binding(name, version, source, integrity, script_hash) {
         Some(binding) if requested_capabilities.is_approved_by(binding) => after_force,
         _ => TrustReason::CapabilityNotApproved,
     }

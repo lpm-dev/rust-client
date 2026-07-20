@@ -68,6 +68,7 @@ pub fn compute_effective_blocked_set<'a>(
                         &bp.version,
                         bp.source.as_deref(),
                         bp.integrity.as_deref(),
+                        bp.script_hash.as_deref(),
                     );
                     requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
                 }

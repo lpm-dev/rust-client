@@ -229,10 +229,7 @@ pub fn compute_script_hash_with_phase_bodies(
     }
 
     hasher.update([PACKAGE_TREE_SEP]);
-    let manifest_identity = canonical_manifest_identity(&parsed);
-    complete &= manifest_identity
-        .as_deref()
-        .is_some_and(|manifest| hash_package_tree(&mut hasher, store_pkg_dir, manifest));
+    complete &= hash_package_tree(&mut hasher, store_pkg_dir, &content);
 
     Some(ScriptHashWithPhaseBodies {
         hash: complete.then(|| format!("sha256-{}", hex_lower(&hasher.finalize()))),
@@ -344,49 +341,6 @@ fn hash_package_tree_dir(
     true
 }
 
-fn canonical_manifest_identity(manifest: &serde_json::Value) -> Option<Vec<u8>> {
-    let mut output = Vec::new();
-    write_canonical_json(manifest, &mut output).then_some(output)
-}
-
-fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            output.push(b'{');
-            let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                if serde_json::to_writer(&mut *output, key).is_err() {
-                    return false;
-                }
-                output.push(b':');
-                if !write_canonical_json(value, output) {
-                    return false;
-                }
-            }
-            output.push(b'}');
-            true
-        }
-        serde_json::Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                if !write_canonical_json(value, output) {
-                    return false;
-                }
-            }
-            output.push(b']');
-            true
-        }
-        _ => serde_json::to_writer(output, value).is_ok(),
-    }
-}
-
 fn hash_package_file(
     hasher: &mut Sha256,
     relative: &[u8],
@@ -452,8 +406,6 @@ fn is_generated_package_entry(root: &Path, dir: &Path, name: &std::ffi::OsStr) -
                 | ".lpm-object-integrity"
                 | ".lpm-tree-snapshot.json"
                 | ".lpm-built"
-                | ".lpm-build-tmp"
-                | ".lpm-build-complete"
         )
     ) || name.to_str().is_some_and(|name| {
         name.starts_with(".lpm-tree-snapshot.json.tmp.")
@@ -810,17 +762,10 @@ mod tests {
     /// Locked fixture hash for [`compute_script_hash_same_input_same_output_across_machines`].
     /// Includes the delegate-binding annotation for install.js.
     const EXPECTED_FIXTURE_HASH: &str =
-        "sha256-a44ae331ecc66f547414f954845a0acd9b75c538acbbbaa3e85c7876cbc6c312";
+        "sha256-1017225a66600dd8728affaa8bb488a476cdbf4e779862f7f9d35e27db53049a";
 
     #[test]
-    fn compute_script_hash_phase_reorder_in_json_yields_same_hash() {
-        // The input ordering inside `scripts` is JSON-object-key-order
-        // (which is preserved by serde_json::Value as a BTreeMap or
-        // IndexMap depending on features). The hash function reads via
-        // EXECUTED_INSTALL_PHASES in fixed order, NOT via JSON iteration.
-        // So `{"postinstall": "x", "preinstall": "y"}` and
-        // `{"preinstall": "y", "postinstall": "x"}` MUST produce the
-        // same hash.
+    fn compute_script_hash_binds_manifest_key_order() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         // Different key order in the source JSON:
@@ -836,10 +781,9 @@ mod tests {
         .unwrap();
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(
+        assert_ne!(
             h1, h2,
-            "JSON key reorder must NOT affect the hash; \
-             the function reads by fixed phase order"
+            "raw package.json bytes participate in lifecycle identity"
         );
     }
 
@@ -1105,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_script_hash_ignores_dependency_links_and_generated_markers() {
+    fn compute_script_hash_ignores_dependency_links_and_internal_store_markers() {
         let dir = tempdir().unwrap();
         write_pkg_json(
             dir.path(),
@@ -1126,7 +1070,6 @@ mod tests {
             ".lpm-object-integrity",
             ".lpm-tree-snapshot.json",
             ".lpm-built",
-            ".lpm-build-complete",
         ] {
             fs::write(dir.path().join(marker), "generated\n").unwrap();
         }
@@ -1504,6 +1447,51 @@ mod tests {
             compute_script_hash(dir2.path()),
             "present-empty and absent manifest fields are distinct content"
         );
+    }
+
+    #[test]
+    fn compute_script_hash_binds_raw_package_manifest_bytes() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        fs::write(
+            first.path().join("package.json"),
+            br#"{"name":"pkg","scripts":{"install":"node install.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            second.path().join("package.json"),
+            b"{\n  \"scripts\": {\"install\": \"node install.js\"},\n  \"name\": \"pkg\"\n}\n",
+        )
+        .unwrap();
+        fs::write(first.path().join("install.js"), "console.log('safe')").unwrap();
+        fs::write(second.path().join("install.js"), "console.log('safe')").unwrap();
+
+        assert_ne!(
+            compute_script_hash(first.path()),
+            compute_script_hash(second.path())
+        );
+    }
+
+    #[test]
+    fn compute_script_hash_binds_package_owned_build_marker_names() {
+        for entry_name in [".lpm-build-tmp", ".lpm-build-complete"] {
+            let dir = tempdir().unwrap();
+            write_pkg_json(
+                dir.path(),
+                &serde_json::json!({"install": "node install.js"}),
+            );
+            fs::write(dir.path().join("install.js"), "console.log('safe')").unwrap();
+            fs::write(dir.path().join(entry_name), "first").unwrap();
+            let before = compute_script_hash(dir.path()).unwrap();
+
+            fs::write(dir.path().join(entry_name), "second").unwrap();
+
+            assert_ne!(
+                before,
+                compute_script_hash(dir.path()).unwrap(),
+                "package-owned {entry_name} must participate in lifecycle identity"
+            );
+        }
     }
 
     #[test]

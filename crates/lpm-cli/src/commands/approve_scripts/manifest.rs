@@ -25,6 +25,7 @@ pub(super) fn blocked_identity_selector(blocked: &BlockedPackage) -> String {
     match TrustedDependencies::rich_identity_token(
         blocked.source.as_deref(),
         blocked.integrity.as_deref(),
+        blocked.script_hash.as_deref(),
     ) {
         Some(identity) => format!("{base}#{identity}"),
         None => base,
@@ -54,6 +55,7 @@ pub(super) fn lookup_blocked_by_arg<'a>(
                             TrustedDependencies::rich_identity_token(
                                 b.source.as_deref(),
                                 b.integrity.as_deref(),
+                                b.script_hash.as_deref(),
                             )
                             .as_deref()
                                 == Some(expected)

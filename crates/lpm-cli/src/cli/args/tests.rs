@@ -1326,6 +1326,24 @@ fn uninstall_yes_flag_parses() {
 }
 
 #[test]
+fn uninstall_global_preserve_trust_flag_requires_global_mode() {
+    assert!(Cli::try_parse_from(["lpm", "uninstall", "eslint", "--preserve-trust"]).is_err());
+    let cli =
+        Cli::try_parse_from(["lpm", "uninstall", "-g", "--preserve-trust", "eslint"]).unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Uninstall(lifecycle::UninstallArgs {
+            global,
+            preserve_trust,
+            ..
+        }) => {
+            assert!(global);
+            assert!(preserve_trust);
+        }
+        _ => panic!("expected Uninstall command"),
+    }
+}
+
+#[test]
 fn uninstall_visible_alias_un_still_works() {
     // The pre-existing visible alias `un` must continue to parse with
     // the new flags.

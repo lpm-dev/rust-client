@@ -547,6 +547,7 @@ impl Store {
             .is_none_or(|baseline| baseline.source_dir != link_dir.join(LIFECYCLE_SOURCE_DIR));
         let object_dir = self.paths.object_dir(&meta.source_sri)?;
         self.restore_pristine_package(&object_dir, package_dir)?;
+        restore_same_name_dependency_links(package_dir, &meta)?;
         Ok(needs_capture)
     }
 

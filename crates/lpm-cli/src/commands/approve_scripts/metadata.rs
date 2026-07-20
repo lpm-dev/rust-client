@@ -76,6 +76,7 @@ pub(super) fn approval_metadata_preserving_existing_provenance(
             &blocked.version,
             blocked.source.as_deref(),
             blocked.integrity.as_deref(),
+            blocked.script_hash.as_deref(),
         )
         && let Some(prior) = existing.provenance_at_approval.clone()
     {

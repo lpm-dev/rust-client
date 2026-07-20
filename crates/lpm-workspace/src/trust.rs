@@ -46,8 +46,8 @@ pub enum TrustedDependencies {
     /// these as `LegacyNameOnly` migration matches, never executable trust.
     Legacy(Vec<String>),
     /// Rich form: `{"esbuild@0.25.1#<identity-token>": {source,
-    /// integrity, scriptHash}}`. New keys bind the source/content identity;
-    /// legacy `name@version` keys remain readable.
+    /// integrity, scriptHash}}`. New keys bind source, integrity, and lifecycle
+    /// content. Legacy `name@version` keys remain readable for migration.
     Rich(HashMap<String, TrustedDependencyBinding>),
 }
 
@@ -247,17 +247,25 @@ impl TrustedDependencies {
     }
 
     /// Stable identity token for source-qualified Rich entries.
-    pub fn rich_identity_token(source: Option<&str>, integrity: Option<&str>) -> Option<String> {
-        if source.is_none() && integrity.is_none() {
+    pub fn rich_identity_token(
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<String> {
+        if source.is_none() && integrity.is_none() && script_hash.is_none() {
             return None;
         }
         let source = source.unwrap_or_default().as_bytes();
         let integrity = integrity.unwrap_or_default().as_bytes();
-        let mut identity = Vec::with_capacity(16 + source.len() + integrity.len());
+        let script_hash = script_hash.unwrap_or_default().as_bytes();
+        let mut identity =
+            Vec::with_capacity(24 + source.len() + integrity.len() + script_hash.len());
         identity.extend_from_slice(&(source.len() as u64).to_be_bytes());
         identity.extend_from_slice(source);
         identity.extend_from_slice(&(integrity.len() as u64).to_be_bytes());
         identity.extend_from_slice(integrity);
+        identity.extend_from_slice(&(script_hash.len() as u64).to_be_bytes());
+        identity.extend_from_slice(script_hash);
         let digest = lpm_common::integrity::Integrity::from_bytes(
             lpm_common::integrity::HashAlgorithm::Sha256,
             &identity,
@@ -279,8 +287,9 @@ impl TrustedDependencies {
         version: &str,
         source: Option<&str>,
         integrity: Option<&str>,
+        script_hash: Option<&str>,
     ) -> String {
-        match Self::rich_identity_token(source, integrity) {
+        match Self::rich_identity_token(source, integrity, script_hash) {
             Some(token) => format!("{name}@{version}#{token}"),
             None => Self::rich_key(name, version),
         }
@@ -302,8 +311,10 @@ impl TrustedDependencies {
         version: &str,
         source: Option<&str>,
         integrity: Option<&str>,
+        script_hash: Option<&str>,
     ) -> Option<&'a TrustedDependencyBinding> {
-        let identity_key = Self::rich_key_for_identity(name, version, source, integrity);
+        let identity_key =
+            Self::rich_key_for_identity(name, version, source, integrity, script_hash);
         let coordinate_key = Self::rich_key(name, version);
         if let Some(binding) = map.get(&identity_key) {
             return Some(binding);
@@ -314,20 +325,22 @@ impl TrustedDependencies {
         {
             return Some(binding);
         }
-        if source.is_some() {
-            return None;
-        }
 
-        let mut matches = map.iter().filter_map(|(key, binding)| {
-            let (candidate_name, candidate_version, identity) = Self::parse_rich_key(key)?;
-            (candidate_name == name
-                && candidate_version == version
-                && identity.is_some()
-                && binding.integrity.as_deref() == integrity)
-                .then_some(binding)
-        });
-        let binding = matches.next()?;
-        matches.next().is_none().then_some(binding)
+        map.iter()
+            .filter(|(key, binding)| {
+                key.as_str()
+                    == Self::rich_key_for_identity(
+                        name,
+                        version,
+                        binding.source.as_deref(),
+                        binding.integrity.as_deref(),
+                        binding.script_hash.as_deref(),
+                    )
+                    && binding_source_matches(binding.source.as_deref(), source)
+                    && binding.integrity.as_deref() == integrity
+            })
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, binding)| binding)
     }
 
     /// Strict trust query — the default gate for `lpm rebuild`.
@@ -402,7 +415,9 @@ impl TrustedDependencies {
                 // package under the inherited name-only approval. See the
                 // method docstring for the cross-version trust laundering
                 // rationale.
-                if let Some(stored) = Self::binding_for_map(map, name, version, source, integrity) {
+                if let Some(stored) =
+                    Self::binding_for_map(map, name, version, source, integrity, script_hash)
+                {
                     // Integrity may be absent for local sources, where the
                     // source-qualified package key and script hash provide the
                     // reusable identity. A script hash is never optional for a
@@ -465,11 +480,12 @@ impl TrustedDependencies {
         version: &str,
         source: Option<&str>,
         integrity: Option<&str>,
+        script_hash: Option<&str>,
     ) -> Option<&TrustedDependencyBinding> {
         match self {
             TrustedDependencies::Legacy(_) => None,
             TrustedDependencies::Rich(map) => {
-                Self::binding_for_map(map, name, version, source, integrity)
+                Self::binding_for_map(map, name, version, source, integrity, script_hash)
             }
         }
     }
@@ -606,6 +622,7 @@ impl TrustedDependencies {
             version,
             meta.source.as_deref(),
             meta.integrity.as_deref(),
+            meta.script_hash.as_deref(),
         );
         let coordinate_key = Self::rich_key(name, version);
         let migrated_coordinate_binding =
@@ -703,6 +720,7 @@ impl TrustedDependencies {
             candidate_version,
             candidate_source,
             candidate_integrity,
+            None,
         );
         let coordinate_key = Self::rich_key(name, candidate_version);
         let exact = map.get_key_value(&identity_key).or_else(|| {
@@ -807,7 +825,7 @@ impl TrustedDependencies {
         name: &str,
         version: &str,
     ) -> Option<&TrustedDependencyBinding> {
-        self.binding_for_exact_identity(name, version, None, None)
+        self.binding_for_exact_identity(name, version, None, None, None)
     }
 
     /// Look up a source-qualified exact binding with coordinate-only legacy
@@ -818,25 +836,12 @@ impl TrustedDependencies {
         version: &str,
         source: Option<&str>,
         integrity: Option<&str>,
+        script_hash: Option<&str>,
     ) -> Option<&TrustedDependencyBinding> {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
-        let identity_key = Self::rich_key_for_identity(name, version, source, integrity);
-        let coordinate_key = Self::rich_key(name, version);
-        map.get(&identity_key).or_else(|| {
-            if identity_key == coordinate_key {
-                None
-            } else {
-                map.get(&coordinate_key).filter(|binding| {
-                    binding_source_matches(binding.source.as_deref(), source)
-                        && !matches!(
-                            (binding.integrity.as_deref(), integrity),
-                            (Some(stored), Some(candidate)) if stored != candidate
-                        )
-                })
-            }
-        })
+        Self::binding_for_map(map, name, version, source, integrity, script_hash)
     }
 
     /// Remove an approval entry by exact `name@version` key. Returns
@@ -857,10 +862,7 @@ impl TrustedDependencies {
 }
 
 fn binding_source_matches(binding_source: Option<&str>, candidate_source: Option<&str>) -> bool {
-    match (binding_source, candidate_source) {
-        (Some(binding), Some(candidate)) => binding == candidate,
-        _ => true,
-    }
+    binding_source == candidate_source
 }
 
 fn parse_version_for_order(version: &str) -> Option<lpm_semver::Version> {
@@ -971,6 +973,29 @@ mod tests {
         TrustedDependencies::Rich(map)
     }
 
+    fn source_integrity_only_key(
+        name: &str,
+        version: &str,
+        source: &str,
+        integrity: &str,
+    ) -> String {
+        let mut identity = Vec::with_capacity(16 + source.len() + integrity.len());
+        identity.extend_from_slice(&(source.len() as u64).to_be_bytes());
+        identity.extend_from_slice(source.as_bytes());
+        identity.extend_from_slice(&(integrity.len() as u64).to_be_bytes());
+        identity.extend_from_slice(integrity.as_bytes());
+        let digest = lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha256,
+            &identity,
+        );
+        let token = digest
+            .hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{name}@{version}#{token}")
+    }
+
     #[test]
     fn matches_strict_returns_strict_for_full_match() {
         let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
@@ -1004,6 +1029,59 @@ mod tests {
             }
             other => panic!("expected BindingDrift, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn source_qualified_binding_reports_drift_when_script_hash_changes() {
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "esbuild",
+            "0.25.1",
+            ApprovalMetadata {
+                source: Some("registry+https://registry.npmjs.org".into()),
+                integrity: Some("sha512-content".into()),
+                script_hash: Some("sha256-old".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            trusted.matches_strict_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some("registry+https://registry.npmjs.org"),
+                Some("sha512-content"),
+                Some("sha256-new"),
+            ),
+            TrustMatch::BindingDrift { .. }
+        ));
+    }
+
+    #[test]
+    fn source_integrity_only_identity_key_does_not_authorize_execution() {
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-content";
+        let binding = TrustedDependencyBinding {
+            source: Some(source.into()),
+            integrity: Some(integrity.into()),
+            script_hash: Some("sha256-script".into()),
+            ..Default::default()
+        };
+        let trusted = TrustedDependencies::Rich(HashMap::from([(
+            source_integrity_only_key("esbuild", "0.25.1", source, integrity),
+            binding,
+        )]));
+
+        assert_eq!(
+            trusted.matches_strict_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some(source),
+                Some(integrity),
+                Some("sha256-script"),
+            ),
+            TrustMatch::NotTrusted
+        );
     }
 
     #[test]
@@ -1147,8 +1225,13 @@ mod tests {
             panic!("approve must upgrade to Rich");
         };
         assert_eq!(map.len(), 1);
-        let key =
-            TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, Some("sha512-x"));
+        let key = TrustedDependencies::rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
         let binding = map.get(&key).unwrap();
         assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
         assert_eq!(binding.script_hash.as_deref(), Some("sha256-y"));
@@ -1161,23 +1244,28 @@ mod tests {
             "esbuild",
             "0.25.1",
             Some("sha512-x".to_string()),
-            Some("sha256-old".to_string()),
+            Some("sha256-same".to_string()),
         );
         let was_present = td.approve(
             "esbuild",
             "0.25.1",
             Some("sha512-x".to_string()),
-            Some("sha256-new".to_string()),
+            Some("sha256-same".to_string()),
         );
         assert!(was_present);
         let TrustedDependencies::Rich(map) = &td else {
             panic!("expected Rich");
         };
-        let key =
-            TrustedDependencies::rich_key_for_identity("esbuild", "0.25.1", None, Some("sha512-x"));
+        let key = TrustedDependencies::rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-x"),
+            Some("sha256-same"),
+        );
         let binding = map.get(&key).unwrap();
         assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
-        assert_eq!(binding.script_hash.as_deref(), Some("sha256-new"));
+        assert_eq!(binding.script_hash.as_deref(), Some("sha256-same"));
     }
 
     #[test]
@@ -1273,6 +1361,7 @@ mod tests {
                 "19.0.0",
                 Some("registry+https://registry.npmjs.org"),
                 Some("sha512-react"),
+                Some("sha256-new"),
             ))
         );
     }
@@ -1922,5 +2011,52 @@ mod tests {
     fn default_binding_has_no_capability_hash() {
         let b = TrustedDependencyBinding::default();
         assert_eq!(b.capability_hash, None);
+    }
+
+    #[test]
+    fn source_less_rich_binding_does_not_authorize_source_qualified_candidate() {
+        let binding = TrustedDependencyBinding {
+            source: None,
+            integrity: Some("sha512-content".into()),
+            script_hash: Some("sha256-script".into()),
+            ..Default::default()
+        };
+        let trusted = TrustedDependencies::Rich(HashMap::from([(
+            TrustedDependencies::rich_key("shared", "1.0.0"),
+            binding,
+        )]));
+
+        assert_eq!(
+            trusted.matches_strict_for_identity(
+                "shared",
+                "1.0.0",
+                Some("registry+https://registry-b.example"),
+                Some("sha512-content"),
+                Some("sha256-script"),
+            ),
+            TrustMatch::NotTrusted
+        );
+    }
+
+    #[test]
+    fn same_source_content_with_different_script_hashes_are_independently_retained() {
+        let mut trusted = TrustedDependencies::default();
+        for script_hash in ["sha256-script-a", "sha256-script-b"] {
+            trusted.approve_with_metadata(
+                "shared",
+                "1.0.0",
+                ApprovalMetadata {
+                    source: Some("directory+./shared".into()),
+                    integrity: None,
+                    script_hash: Some(script_hash.into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let TrustedDependencies::Rich(bindings) = trusted else {
+            panic!("approval must upgrade storage to rich form");
+        };
+        assert_eq!(bindings.len(), 2);
     }
 }

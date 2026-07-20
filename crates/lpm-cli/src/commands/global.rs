@@ -124,7 +124,7 @@ pub async fn run(
         // for the same operation. Both route through the
         // `uninstall_global` pipeline.
         GlobalCmd::Remove { package } => {
-            crate::commands::uninstall_global::run(&package, json_output).await
+            crate::commands::uninstall_global::run(&package, json_output, false).await
         }
         GlobalCmd::Update { package, dry_run } => {
             crate::commands::update_global::run(client, package.as_deref(), dry_run, json_output)

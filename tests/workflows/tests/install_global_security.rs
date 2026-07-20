@@ -25,7 +25,7 @@
 //!   actual success/block outcomes, not just the validator surface.
 //!
 //! - The shared `--policy` clap help text mentions the global rerun
-//!   caveat (`lpm uninstall -g <pkg> && lpm install -g <pkg>` after
+//!   caveat (`lpm uninstall -g --preserve-trust <pkg> && lpm install -g <pkg>` after
 //!   approval, until `lpm rebuild --global` ships).
 //!
 //! - `approve-scripts --global --yes --dry-run --json` omits
@@ -852,22 +852,11 @@ fn approve_scripts_global_yes_green_tier_requires_security_approval() {
     );
 }
 
-// ── M76: uninstall trust-prune workflow tests ───────────────────────
-//
-// Pre-fix, `~/.lpm/global/trusted-dependencies.json` survived uninstall
-// and `synthesize_pkg_json` re-projected every entry into every new
-// global install. An approval originally made for one top-level global
-// remained after that global was removed and could authorize the same
-// transitive name@version in an unrelated future global install.
-//
-// The fix is reachability-aware: prune trust entries reachable only
-// through the uninstalling install's tree (computed from per-install
-// lockfiles). Workflow tests drive the live binary against seeded
-// fixtures (manifest + install roots + lockfiles + trust file).
+// ── Uninstall trust-prune workflow tests ────────────────────────────
 
 /// Write a `~/.lpm/global/manifest.toml` claiming `pkga@1.0.0` and a
 /// corresponding install root with a minimal but lockfile-parseable
-/// `lpm.lock` containing `(name, version)` pairs the M76 helper will
+/// `lpm.lock` containing `(name, version)` pairs the pruning helper will
 /// see when walking the reachability tree.
 fn seed_global_install_with_lockfile(
     project: &TempProject,
@@ -992,6 +981,40 @@ fn uninstall_prunes_trust_entries_unique_to_this_install() {
     assert!(
         !keys.iter().any(|k| k == "lodash@4.17.21"),
         "lodash trust entry must be pruned; remaining keys: {keys:?}"
+    );
+}
+
+#[test]
+fn uninstall_preserve_trust_keeps_approval_for_immediate_reinstall() {
+    let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
+    append_global_manifest_row(&project, "pkga", "1.0.0");
+    seed_global_install_with_lockfile(&project, "pkga", "1.0.0", &[("lodash", "4.17.21")]);
+    seed_global_trust(&project, &[("lodash", "4.17.21")]);
+
+    let out = lpm(&project)
+        .args(["--json", "uninstall", "-g", "--preserve-trust", "pkga"])
+        .output()
+        .expect("spawn trust-preserving global uninstall");
+
+    assert!(
+        out.status.success(),
+        "uninstall must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON envelope on stdout");
+    assert_eq!(
+        parsed
+            .get("trust_entries_pruned")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert!(
+        read_global_trust_keys(&project)
+            .iter()
+            .any(|key| key == "lodash@4.17.21")
     );
 }
 

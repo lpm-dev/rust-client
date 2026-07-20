@@ -233,9 +233,10 @@ impl SecurityPolicy {
         version: &str,
         source: Option<&str>,
         integrity: Option<&str>,
+        script_hash: Option<&str>,
     ) -> Option<&TrustedDependencyBinding> {
         self.trusted_dependencies
-            .get_binding(name, version, source, integrity)
+            .get_binding(name, version, source, integrity, script_hash)
     }
 
     /// Check if a package was published too recently.

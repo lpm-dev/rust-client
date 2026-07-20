@@ -573,24 +573,23 @@ mod tests {
         let install_root = root.global_root().join("installs/eslint@9.24.0");
         let lpm_dir = install_root.join(".lpm");
         std::fs::create_dir_all(&lpm_dir).unwrap();
+        let body = serde_json::json!({
+            "state_version": crate::build_state::BUILD_STATE_VERSION,
+            "blocked_set_fingerprint": "sha256-fixture",
+            "captured_at": "2026-04-22T00:00:00Z",
+            "blocked_packages": [{
+                "name": "esbuild",
+                "version": "0.25.1",
+                "integrity": "sha512-fixture",
+                "script_hash": "sha256-fixture",
+                "phases_present": ["postinstall"],
+                "binding_drift": false,
+                "static_tier": "amber"
+            }]
+        });
         std::fs::write(
             lpm_dir.join("build-state.json"),
-            br#"{
-    "state_version": 1,
-    "blocked_set_fingerprint": "sha256-fixture",
-    "captured_at": "2026-04-22T00:00:00Z",
-    "blocked_packages": [
-        {
-            "name": "esbuild",
-            "version": "0.25.1",
-            "integrity": "sha512-fixture",
-            "script_hash": "sha256-fixture",
-            "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "amber"
-        }
-    ]
-}"#,
+            serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
         let mut manifest = GlobalManifest::default();
