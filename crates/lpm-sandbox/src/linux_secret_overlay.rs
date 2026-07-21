@@ -104,6 +104,15 @@ fn path_io_error(
     }
 }
 
+// Linked Git worktrees store `.git` as a file, so fixed `.git/*` probes
+// report ENOTDIR even though the requested descendant is simply absent.
+fn fixed_descendant_is_absent(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
 /// Directory names to prune during the project walk. These hold
 /// large amounts of upstream code (`node_modules`, `target`, `.git`)
 /// or generated artifacts (`dist`, `build`, `.next`, `coverage`) —
@@ -162,7 +171,7 @@ pub(crate) fn enumerate_project_secrets(
         match std::fs::symlink_metadata(&abs) {
             Ok(meta) if meta.file_type().is_file() => out.push(abs),
             Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) if fixed_descendant_is_absent(&source) => {}
             Err(source) => return Err(path_io_error("inspect", &abs, source)),
         }
     }
@@ -174,7 +183,7 @@ pub(crate) fn enumerate_project_secrets(
                 collect_files_recursive(&abs, &mut out, &allow_set, WALK_MAX_DEPTH)?;
             }
             Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) if fixed_descendant_is_absent(&source) => {}
             Err(source) => return Err(path_io_error("inspect", &abs, source)),
         }
     }
@@ -546,6 +555,13 @@ mod tests {
 
     fn enumerate(project_dir: &Path, allow_list: &[PathBuf]) -> Vec<PathBuf> {
         enumerate_project_secrets(project_dir, allow_list).expect("enumerate project secrets")
+    }
+
+    #[test]
+    fn permission_denied_is_not_treated_as_an_absent_descendant() {
+        let error = io::Error::from(io::ErrorKind::PermissionDenied);
+
+        assert!(!fixed_descendant_is_absent(&error));
     }
 
     #[cfg(target_os = "linux")]
@@ -1062,6 +1078,23 @@ mod tests {
                 .expect("prepare overlay")
                 .is_none()
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linked_git_worktree_without_secrets_skips_overlay_setup() {
+        let tmp = with_project(|root| {
+            fs::write(root.join("package.json"), "{}").unwrap();
+            fs::write(
+                root.join(".git"),
+                "gitdir: /tmp/main/.git/worktrees/linked\n",
+            )
+            .unwrap();
+        });
+
+        let spec = SecretOverlaySpec::build(tmp.path(), &[]).expect("prepare overlay");
+
+        assert!(spec.is_none());
     }
 
     #[test]
