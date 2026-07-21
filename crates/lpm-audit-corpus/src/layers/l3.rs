@@ -235,7 +235,7 @@ async fn fetch_packument_with_retry(
     let mut delay_ms = 500u64;
     loop {
         match client.get(url).send().await {
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => return Err(lpm_http::display_error(&e).to_string().into()),
             Ok(r) => {
                 let s = r.status();
                 if s.is_success() {
@@ -262,7 +262,12 @@ async fn fetch_attestation_presence(client: &reqwest::Client, url: &str) -> (boo
     let mut delay_ms = 500u64;
     for _ in 0..4 {
         match client.get(url).send().await {
-            Err(e) => return (false, Some(format!("attestations: {e}"))),
+            Err(e) => {
+                return (
+                    false,
+                    Some(format!("attestations: {}", lpm_http::display_error(&e))),
+                );
+            }
             Ok(r) => {
                 let s = r.status();
                 if s.is_success() {

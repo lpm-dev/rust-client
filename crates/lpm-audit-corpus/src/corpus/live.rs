@@ -94,7 +94,7 @@ pub(crate) async fn run(args: &Args) -> Result<(), BoxError> {
         return reclassify_from_cache(args).await;
     }
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(args.timeout_secs))
         .build()?;
@@ -296,7 +296,10 @@ async fn fetch_search_page_with_retry(
     // ~63s which is well within npm's published rate-limit windows.
     let mut delay_ms = 1_000u64;
     for attempt in 1..=6u32 {
-        let resp = client.get(url).send().await?;
+        let resp =
+            client.get(url).send().await.map_err(|error| -> BoxError {
+                lpm_http::display_error(&error).to_string().into()
+            })?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp.json().await?);
@@ -381,20 +384,23 @@ async fn audit_one(
     // recorded, not retried). Cap retries at ~64s total so a single stalled
     // record can't keep the whole audit alive.
     let mut delay_ms = 500u64;
-    let result = loop {
+    let result: Result<LatestManifest, String> = loop {
         match client.get(&manifest_url).send().await {
-            Err(e) => break Err::<LatestManifest, reqwest::Error>(e),
+            Err(e) => break Err(lpm_http::display_error(&e).to_string()),
             Ok(r) => {
                 let s = r.status();
                 if s.is_success() {
-                    break r.json::<LatestManifest>().await;
+                    break r
+                        .json::<LatestManifest>()
+                        .await
+                        .map_err(|e| lpm_http::display_error(&e).to_string());
                 }
                 if (s.as_u16() == 429 || s.is_server_error()) && delay_ms <= 32_000 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     delay_ms = delay_ms.saturating_mul(2);
                     continue;
                 }
-                break Err(r.error_for_status().unwrap_err());
+                break Err(lpm_http::display_error(&r.error_for_status().unwrap_err()).to_string());
             }
         }
     };
@@ -460,7 +466,7 @@ async fn audit_one(
                 .map(|s| classify_script_with_context(s, Some(&ctx)));
             audit.tier = worst_of_phases(&audit);
         }
-        Err(e) => audit.fetch_error = Some(e.to_string()),
+        Err(e) => audit.fetch_error = Some(e),
     }
 
     pb.inc(1);

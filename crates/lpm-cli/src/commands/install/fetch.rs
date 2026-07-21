@@ -1026,7 +1026,9 @@ pub(super) async fn run_online_fetch_phase(
 
         if has_rich_approvals {
             let cache_root = lpm_root.cache_metadata_attestations();
-            let http = reqwest::Client::new();
+            let http = lpm_http::client_builder().build().map_err(|error| {
+                LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
+            })?;
 
             // (name, version, verdict, approved_version, approved_snapshot)
             let mut drifted: Vec<(

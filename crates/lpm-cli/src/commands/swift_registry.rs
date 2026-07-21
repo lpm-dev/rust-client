@@ -444,10 +444,15 @@ async fn install_signing_certificate(
     }
 
     // Download certificate
-    let client = reqwest::Client::new();
+    let client = lpm_http::client_builder().build().map_err(|error| {
+        LpmError::Registry(format!(
+            "could not build signing certificate client: {error}"
+        ))
+    })?;
     let response = client.get(&cert_url).send().await.map_err(|e| {
         LpmError::Registry(format!(
-            "could not download signing certificate from {cert_url}: {e}"
+            "could not download signing certificate: {}",
+            lpm_http::display_error(&e)
         ))
     })?;
 

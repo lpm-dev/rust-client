@@ -56,7 +56,7 @@ pub async fn discover_cli_step_up_policy(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let status = response.status();
     if !status.is_success() {
@@ -119,7 +119,7 @@ pub async fn mint_cli_step_up_proof(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let status = response.status();
     if !status.is_success() {

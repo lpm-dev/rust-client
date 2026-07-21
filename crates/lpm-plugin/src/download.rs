@@ -100,7 +100,7 @@ pub async fn download_plugin(
 
     tracing::debug!("downloading plugin {}@{} from {}", def.name, version, url);
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
@@ -110,7 +110,13 @@ pub async fn download_plugin(
         .header("User-Agent", "lpm-cli")
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to download {}: {e}", def.name)))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to download {}: {}",
+                def.name,
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Http {
@@ -349,7 +355,8 @@ async fn fetch_upstream_checksum(
         .await
         .map_err(|e| {
             LpmError::Network(format!(
-                "failed to fetch upstream checksum from {sidecar_url}: {e}"
+                "failed to fetch upstream checksum: {}",
+                lpm_http::display_error(&e)
             ))
         })?;
 

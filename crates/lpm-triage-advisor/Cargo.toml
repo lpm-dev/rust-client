@@ -8,6 +8,7 @@ description = "Layer-4 triage advisor adapter — claude-cli, codex, ollama."
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-http = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

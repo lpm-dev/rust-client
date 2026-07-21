@@ -230,7 +230,12 @@ impl RemoteCacheClient {
             .get(url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .send()
-            .map_err(|e| format!("remote cache lookup failed: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "remote cache lookup failed: {}",
+                    lpm_http::display_error(&e)
+                )
+            })?;
 
         match response.status() {
             StatusCode::OK => {}
@@ -387,9 +392,12 @@ impl RemoteCacheClient {
             request = request.header(ARTIFACT_TAG_HEADER, tag);
         }
 
-        let response = request
-            .send()
-            .map_err(|e| format!("remote cache upload failed: {e}"))?;
+        let response = request.send().map_err(|e| {
+            format!(
+                "remote cache upload failed: {}",
+                lpm_http::display_error(&e)
+            )
+        })?;
 
         if response.status().is_success() {
             return Ok(());
@@ -577,7 +585,12 @@ impl RemoteCacheClient {
             .get(url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .send()
-            .map_err(|e| format!("remote cache status failed: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "remote cache status failed: {}",
+                    lpm_http::display_error(&e)
+                )
+            })?;
 
         if !response.status().is_success() {
             return Err(format!(
@@ -607,7 +620,7 @@ impl RemoteCacheClient {
 }
 
 fn blocking_http_client() -> Result<Client, String> {
-    Client::builder()
+    lpm_http::blocking_client_builder()
         .timeout(REMOTE_CACHE_TIMEOUT)
         .build()
         .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))

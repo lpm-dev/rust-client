@@ -8,6 +8,7 @@ description = "Plugin management for LPM — lazy-download external tool binarie
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-http = { workspace = true }
 lpm-extractor = { path = "../lpm-extractor" }
 lpm-runtime = { path = "../lpm-runtime" }
 lpm-semver = { workspace = true }

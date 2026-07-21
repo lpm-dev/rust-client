@@ -266,7 +266,9 @@ async fn query_osv_batch_with_warnings(
         return Ok(Vec::new());
     }
 
-    let client = reqwest::Client::new();
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("OSV client build failed: {error}")))?;
 
     let queries: Vec<serde_json::Value> = packages
         .iter()
@@ -288,7 +290,12 @@ async fn query_osv_batch_with_warnings(
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("OSV API error: {e}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "OSV API error: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
 
     if !response.status().is_success() {
         return Err(LpmError::Network(format!(
@@ -377,7 +384,12 @@ async fn fetch_osv_advisory(
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("OSV advisory hydration failed for {id}: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "OSV advisory hydration failed for {id}: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
     if !response.status().is_success() {
         return Err(LpmError::Network(format!(
             "OSV advisory hydration for {id} returned HTTP {}",

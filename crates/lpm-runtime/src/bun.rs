@@ -134,7 +134,12 @@ pub async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<BunRelease>,
         .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to fetch bun releases: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to fetch bun releases: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Http {

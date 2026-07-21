@@ -331,7 +331,9 @@ async fn collect_provenance_metadata(
     let mut out = BTreeMap::new();
 
     if registry {
-        let http = reqwest::Client::new();
+        let http = lpm_http::client_builder().build().map_err(|error| {
+            LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
+        })?;
         for package in packages {
             let key = package_metadata_key(package);
             let attestation_ref = registry_metadata

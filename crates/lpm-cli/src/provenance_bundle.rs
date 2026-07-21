@@ -226,8 +226,7 @@ pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Res
             // the caller degrades the install path to unknown.
             tracing::debug!(
                 target: "lpm_cli::provenance_fetch",
-                url = %url,
-                error = %e,
+                error = %lpm_http::display_error(&e),
                 stage = "send",
                 "attestation fetch send/timeout error",
             );

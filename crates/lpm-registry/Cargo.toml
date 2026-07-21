@@ -12,6 +12,7 @@ experimental-http3 = ["reqwest/http3"]
 [dependencies]
 lpm-common = { workspace = true }
 lpm-auth = { workspace = true }
+lpm-http = { workspace = true }
 lpm-semver = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -86,7 +86,12 @@ pub async fn fetch_npm_web_login_challenge(
         .json(&serde_json::json!({}))
         .send()
         .await
-        .map_err(|e| LpmError::Registry(format!("npm web login request failed: {e}")))?;
+        .map_err(|e| {
+            LpmError::Registry(format!(
+                "npm web login request failed: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
@@ -173,6 +178,12 @@ pub async fn poll_for_web_auth_token(
                 } else {
                     poll_interval
                 }
+            }
+            Err(error) if lpm_http::is_https_downgrade(&error) => {
+                return Err(LpmError::Registry(format!(
+                    "npm web authentication failed: {}",
+                    lpm_http::display_error(&error)
+                )));
             }
             Err(_) => poll_interval,
         };

@@ -786,7 +786,7 @@ async fn install_under_lock_at(
 async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
     validate_fetch_url(url, "engine tarball")?;
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
@@ -796,7 +796,12 @@ async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
         .header("User-Agent", "lpm-cli")
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to download engine tarball: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to download engine tarball: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Http {
@@ -1013,7 +1018,7 @@ fn npm_package_asset(
 }
 
 fn npm_client() -> Result<reqwest::Client, LpmError> {
-    reqwest::Client::builder()
+    lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create npm HTTP client: {e}")))
@@ -1109,7 +1114,12 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to fetch {context}: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to fetch {context}: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
     if !resp.status().is_success() {
         return Err(LpmError::Http {
             status: resp.status().as_u16(),

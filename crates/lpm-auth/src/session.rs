@@ -618,7 +618,7 @@ impl SessionManager {
         let http = self
             .http
             .get_or_try_init(|| async {
-                reqwest::Client::builder()
+                lpm_http::client_builder()
                     .timeout(std::time::Duration::from_secs(10))
                     .build()
                     .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))
@@ -633,7 +633,9 @@ impl SessionManager {
             }))
             .send()
             .await
-            .map_err(|e| LpmError::Network(format!("silent refresh: {e}")))?;
+            .map_err(|e| {
+                LpmError::Network(format!("silent refresh: {}", lpm_http::display_error(&e)))
+            })?;
 
         if !resp.status().is_success() {
             tracing::debug!("silent refresh failed: {}", resp.status());

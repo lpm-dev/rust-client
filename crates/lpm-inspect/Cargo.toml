@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-http = { workspace = true }
 lpm-tunnel = { workspace = true }
 tokio = { workspace = true }
 axum = { version = "0.8", features = ["json"] }

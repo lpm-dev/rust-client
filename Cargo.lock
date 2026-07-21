@@ -3133,6 +3133,7 @@ dependencies = [
  "clap",
  "futures",
  "indicatif 0.17.11",
+ "lpm-http",
  "lpm-security",
  "lpm-triage-advisor",
  "predicates",
@@ -3157,6 +3158,7 @@ dependencies = [
  "hex",
  "keyring",
  "lpm-common",
+ "lpm-http",
  "rand 0.8.6",
  "reqwest",
  "scrypt",
@@ -3231,6 +3233,7 @@ dependencies = [
  "lpm-env",
  "lpm-extractor",
  "lpm-global",
+ "lpm-http",
  "lpm-inspect",
  "lpm-linker",
  "lpm-lockfile",
@@ -3368,6 +3371,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lpm-http"
+version = "0.68.0"
+dependencies = [
+ "reqwest",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "lpm-inspect"
 version = "0.68.0"
 dependencies = [
@@ -3377,6 +3388,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "lpm-common",
+ "lpm-http",
  "lpm-tunnel",
  "mime_guess",
  "rand 0.8.6",
@@ -3479,6 +3491,7 @@ dependencies = [
  "flate2",
  "lpm-common",
  "lpm-extractor",
+ "lpm-http",
  "lpm-runtime",
  "lpm-semver",
  "reqwest",
@@ -3529,6 +3542,7 @@ dependencies = [
  "hmac",
  "lpm-auth",
  "lpm-common",
+ "lpm-http",
  "lpm-semver",
  "p256",
  "pkcs8",
@@ -3619,6 +3633,7 @@ dependencies = [
  "flate2",
  "indicatif 0.17.11",
  "lpm-common",
+ "lpm-http",
  "lpm-semver",
  "reqwest",
  "serde",
@@ -3737,6 +3752,7 @@ dependencies = [
  "async-trait",
  "getrandom 0.3.4",
  "lpm-common",
+ "lpm-http",
  "reqwest",
  "serde",
  "serde_json",
@@ -3758,6 +3774,7 @@ dependencies = [
  "hex",
  "hmac",
  "lpm-common",
+ "lpm-http",
  "rand 0.8.6",
  "reqwest",
  "rustls",
@@ -3787,6 +3804,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "keyring",
+ "lpm-http",
  "p256",
  "rand 0.8.6",
  "reqwest",

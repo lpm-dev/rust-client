@@ -172,7 +172,7 @@ async fn ollama_daemon_reachable() -> bool {
     // (no daemon, port firewalled, daemon hung). We deliberately
     // don't distinguish; the goal is "would classify_amber work right
     // now" and a non-response means no.
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = lpm_http::client_builder()
         .timeout(OLLAMA_PROBE_TIMEOUT)
         .build()
     else {

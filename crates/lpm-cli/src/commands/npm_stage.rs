@@ -195,7 +195,12 @@ pub(crate) async fn fetch_package_metadata(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| LpmError::Registry(format!("npm package metadata request failed: {e}")))?;
+        .map_err(|e| {
+            LpmError::Registry(format!(
+                "npm package metadata request failed: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     let status = response.status();
     let body = response_json_or_empty(response).await;
@@ -281,7 +286,12 @@ async fn stage_publish_impl(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| LpmError::Registry(format!("npm stage publish request failed: {e}")))?;
+        .map_err(|e| {
+            LpmError::Registry(format!(
+                "npm stage publish request failed: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     let status = response.status();
     let body = response_json_or_empty(response).await;
@@ -334,7 +344,12 @@ pub(crate) async fn list_staged_packages(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| LpmError::Registry(format!("npm stage list request failed: {e}")))?;
+        .map_err(|e| {
+            LpmError::Registry(format!(
+                "npm stage list request failed: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
         let status = response.status();
         let body = response_json_or_empty(response).await;
@@ -447,7 +462,12 @@ pub(crate) async fn download_staged_package(
     .bearer_auth(token)
     .send()
     .await
-    .map_err(|e| LpmError::Registry(format!("npm stage download request failed: {e}")))?;
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "npm stage download request failed: {}",
+            lpm_http::display_error(&e)
+        ))
+    })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -502,7 +522,12 @@ async fn stage_json_get(
     .bearer_auth(token)
     .send()
     .await
-    .map_err(|e| LpmError::Registry(format!("{action} request failed: {e}")))?;
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "{action} request failed: {}",
+            lpm_http::display_error(&e)
+        ))
+    })?;
 
     let status = response.status();
     let body = response_json_or_empty(response).await;
@@ -531,7 +556,12 @@ async fn stage_otp_mutation(
     let client = stage_http_client(Duration::from_secs(60))?;
     let response = send_stage_mutation(&client, token, registry_url, route, method.clone(), otp)
         .await
-        .map_err(|e| LpmError::Registry(format!("{action} request failed: {e}")))?;
+        .map_err(|e| {
+            LpmError::Registry(format!(
+                "{action} request failed: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
     let status = response.status();
     let headers = response.headers().clone();
 
@@ -561,7 +591,12 @@ async fn stage_otp_mutation(
             let retry =
                 send_stage_mutation(&client, token, registry_url, route, method, Some(&otp))
                     .await
-                    .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
+                    .map_err(|e| {
+                        LpmError::Registry(format!(
+                            "{action} retry failed: {}",
+                            lpm_http::display_error(&e)
+                        ))
+                    })?;
             return stage_mutation_response(action, retry).await;
         }
 
@@ -580,7 +615,12 @@ async fn stage_otp_mutation(
             let retry =
                 send_stage_mutation(&client, token, registry_url, route, method, Some(&otp))
                     .await
-                    .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
+                    .map_err(|e| {
+                        LpmError::Registry(format!(
+                            "{action} retry failed: {}",
+                            lpm_http::display_error(&e)
+                        ))
+                    })?;
             return stage_mutation_response(action, retry).await;
         }
 
@@ -627,7 +667,7 @@ async fn stage_mutation_response(
 }
 
 fn stage_http_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
-    reqwest::Client::builder()
+    lpm_http::client_builder()
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
         .build()

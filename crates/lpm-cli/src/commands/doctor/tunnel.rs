@@ -197,7 +197,7 @@ enum TunnelReachability {
 /// Quick HTTP HEAD check to see if a tunnel domain is reachable.
 async fn check_tunnel_reachability(domain: &str) -> TunnelReachability {
     let url = format!("https://{domain}");
-    let client = match reqwest::Client::builder()
+    let client = match lpm_http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
     {

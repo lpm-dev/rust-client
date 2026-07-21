@@ -250,7 +250,7 @@ async fn publish_to_npm_impl(
     let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -277,10 +277,12 @@ async fn publish_to_npm_impl(
         req = req.header("npm-otp", code);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LpmError::Registry(format!("npm publish request failed: {e}")))?;
+    let response = req.send().await.map_err(|e| {
+        LpmError::Registry(format!(
+            "npm publish request failed: {}",
+            lpm_http::display_error(&e)
+        ))
+    })?;
 
     let status = response.status();
     let headers = response.headers().clone();
@@ -312,10 +314,12 @@ async fn publish_to_npm_impl(
                     .bearer_auth(token)
                     .header("npm-otp", &otp);
 
-            let retry_response = retry_req
-                .send()
-                .await
-                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
+            let retry_response = retry_req.send().await.map_err(|e| {
+                LpmError::Registry(format!(
+                    "npm publish retry failed: {}",
+                    lpm_http::display_error(&e)
+                ))
+            })?;
 
             return handle_npm_response(retry_response, npm_name, version, start).await;
         }
@@ -342,10 +346,12 @@ async fn publish_to_npm_impl(
                     .bearer_auth(token)
                     .header("npm-otp", &otp);
 
-            let retry_response = retry_req
-                .send()
-                .await
-                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
+            let retry_response = retry_req.send().await.map_err(|e| {
+                LpmError::Registry(format!(
+                    "npm publish retry failed: {}",
+                    lpm_http::display_error(&e)
+                ))
+            })?;
 
             return handle_npm_response(retry_response, npm_name, version, start).await;
         }

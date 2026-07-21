@@ -9,6 +9,7 @@ description = "Authentication, secure token storage, and lazy session management
 [dependencies]
 # Shared error type
 lpm-common = { workspace = true }
+lpm-http = { workspace = true }
 
 # Secure storage primitives
 keyring = { workspace = true }

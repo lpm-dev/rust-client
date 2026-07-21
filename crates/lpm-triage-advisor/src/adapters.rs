@@ -175,7 +175,7 @@ impl Advisor for OllamaAdapter {
         script: &AmberScript<'_>,
     ) -> Result<AdvisorVerdict, AdvisorFailure> {
         let prompt = build_prompt(script);
-        let client = reqwest::Client::builder()
+        let client = lpm_http::client_builder()
             .timeout(self.timeout)
             .build()
             .map_err(|e| AdvisorFailure::IntegrationFailure(format!("ollama client build: {e}")))?;
@@ -192,7 +192,10 @@ impl Advisor for OllamaAdapter {
             .map_err(|e| {
                 // Network-level failure = environment not ready (daemon
                 // hung, model still loading, etc.).
-                AdvisorFailure::EnvironmentNotReady(format!("ollama request: {e}"))
+                AdvisorFailure::EnvironmentNotReady(format!(
+                    "ollama request: {}",
+                    lpm_http::display_error(&e)
+                ))
             })?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {

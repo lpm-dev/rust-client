@@ -29,7 +29,7 @@ pub async fn list_org_vaults(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;
@@ -69,7 +69,7 @@ pub async fn pull_org(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
     if !status.is_success() {
@@ -161,7 +161,7 @@ pub async fn push_org_with_keys(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
     let result: PushResponse =
@@ -291,7 +291,7 @@ pub async fn push_org(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
     let result: PushResponse =

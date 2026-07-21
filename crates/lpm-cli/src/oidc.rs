@@ -318,12 +318,20 @@ pub async fn exchange_oidc_token(
         body["package"] = serde_json::json!(pkg);
     }
 
-    let response = reqwest::Client::new()
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Registry(format!("OIDC client build failed: {error}")))?;
+    let response = client
         .post(&url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| LpmError::Registry(format!("OIDC exchange failed: {e}")))?;
+        .map_err(|error| {
+            LpmError::Registry(format!(
+                "OIDC exchange failed: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();

@@ -105,7 +105,7 @@ pub async fn replay_with_options(
     let modified = apply_modifications(webhook, options);
 
     // Create a reqwest client for this replay
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .no_proxy()
         .build()

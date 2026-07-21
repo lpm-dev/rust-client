@@ -43,7 +43,7 @@ pub async fn get_audit_log(
         .bearer_auth(auth_token)
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let status = response.status();
     let result: AuditResponse = response

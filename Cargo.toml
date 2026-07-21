@@ -20,6 +20,7 @@ members = [
     "crates/lpm-plugin",
     "crates/lpm-vault",
     "crates/lpm-cert",
+    "crates/lpm-http",
     "crates/lpm-network",
     "crates/lpm-proxy",
     "crates/lpm-tunnel",
@@ -64,6 +65,7 @@ lpm-task = { path = "crates/lpm-task" }
 lpm-plugin = { path = "crates/lpm-plugin" }
 lpm-vault = { path = "crates/lpm-vault" }
 lpm-cert = { path = "crates/lpm-cert" }
+lpm-http = { path = "crates/lpm-http" }
 lpm-network = { path = "crates/lpm-network" }
 lpm-proxy = { path = "crates/lpm-proxy" }
 lpm-tunnel = { path = "crates/lpm-tunnel" }
