@@ -224,6 +224,7 @@ pub(super) struct OnlineLifecyclePrepareInput<'a> {
     pub(super) packages: &'a [InstallPackage],
     pub(super) package: &'a lpm_workspace::PackageJson,
     pub(super) store: &'a lpm_store::PackageStore,
+    pub(super) store_version: lpm_store::StoreVersion,
     pub(super) used_lockfile: bool,
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub(super) advisor_override: Option<&'a str>,
@@ -259,6 +260,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         packages,
         package,
         store,
+        store_version,
         used_lockfile,
         script_policy_override,
         advisor_override,
@@ -376,6 +378,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
             auto_build_will_execute,
             advisor_session.as_ref().map(|s| s.approvals()),
         ),
+        store_version,
     )?;
     tracing::debug!(
         "perf.capture_blocked_set pkgs={} ms={}",
@@ -416,6 +419,7 @@ pub(super) struct OnlineAutoBuildPhaseInput<'a> {
     pub(super) package_name: Option<&'a str>,
     pub(super) store: &'a lpm_store::PackageStore,
     pub(super) lpm_root: &'a lpm_common::LpmRoot,
+    pub(super) store_version: lpm_store::StoreVersion,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) compatibility_bin_names: &'a [String],
@@ -448,6 +452,7 @@ pub(super) async fn run_online_auto_build_phase(
         package_name,
         store,
         lpm_root,
+        store_version,
         object_integrity_policy,
         linker_mode,
         compatibility_bin_names,
@@ -524,6 +529,7 @@ pub(super) async fn run_online_auto_build_phase(
                 user_bound,
                 select_approvals_for_capture(true, advisor_session.map(|s| s.approvals())),
                 Some(&execution_exclusions),
+                store_version,
             )?;
     }
 
@@ -538,6 +544,7 @@ pub(super) async fn run_online_auto_build_phase(
                 object_integrity_policy,
                 package_name,
                 compatibility_bin_names,
+                store_version,
             )?)
         } else {
             None

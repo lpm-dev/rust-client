@@ -1,43 +1,21 @@
-//! node_modules layout manager for LPM.
+//! `node_modules` layout manager for LPM.
 //!
-//! Creates pnpm-style isolated node_modules with symlinks:
+//! The default store-v2 linker creates project root symlinks into reusable
+//! graph entries under `~/.lpm/store/v2/links/<graph-key>/`. Both
+//! [`LinkerMode::Hoisted`] (the default) and [`LinkerMode::Isolated`] use
+//! those shared entries while applying their own root-link semantics.
 //!
 //! ```text
-//! <project>/
-//!   .lpm/
-//!     wrappers/                                ← internal store
-//!       express@4.22.1/
-//!         .linked                              ← stamp marker (incremental cache)
-//!         node_modules/
-//!           express/  → <global-store>         ← hardlink/copy from store
-//!           debug/    → ../../debug@2.6.9/node_modules/debug
-//!           send/     → ../../send@0.19.2/node_modules/send
-//!       debug@2.6.9/
-//!         node_modules/
-//!           debug/    → <global-store>
-//!           ms/       → ../../ms@2.0.0/node_modules/ms
-//!       .version                               ← layout schema version
-//!   node_modules/
-//!     express/ → ../.lpm/wrappers/express@4.22.1/node_modules/express  ← direct dep
-//!     .bin/
-//!       <cmd> → ../../.lpm/wrappers/<seg>/node_modules/<pkg>/<bin-script>
+//! <project>/node_modules/<dep>
+//!   -> ~/.lpm/store/v2/links/<graph-key>/node_modules/<dep>
 //! ```
 //!
-//! Properties:
-//! - Only direct dependencies appear in root `node_modules/` as symlinks
-//! - All wrappers live in `<project>/.lpm/wrappers/` (a project-root sibling)
-//! - Strict isolation: phantom dependencies are not importable
-//!
-//! Relocation: wrappers used to live under `node_modules/.lpm/`,
-//! which meant `rm -rf node_modules` wiped the entire incremental cache.
-//! Moving them out of `node_modules` makes the warm-install path actually
-//! incremental.
-//!
-//! Compatibility: hoisted mode supported as opt-in via `LPM_LINKER=hoisted`
-//! (npm v3+ flat layout, ~25% faster on full-wipe workloads, stricter peer-dep
-//! semantics); Windows junctions provide admin-free symlink fallback (not in CI);
-//! self-reference works in both modes.
-//! Performance: incremental linking via `.linked` marker files, `--force` bypasses markers.
+//! The [`link_packages`] and [`link_packages_hoisted`] exports are the v1
+//! implementations retained for `LPM_STORE_VERSION=v1` rollback. They
+//! materialize project-local state under `.lpm/wrappers/` or `.lpm/hoisted/`
+//! and must remain paired with the v1 store writer for the rollback lifetime.
+//! The v2 linker also recognizes and removes that project-local state during
+//! migration; those compatibility readers outlive the rollback writer.
 
 pub mod layout;
 mod materialize;

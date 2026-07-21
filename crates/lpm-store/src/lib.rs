@@ -1,23 +1,25 @@
-//! Content-addressable package store for LPM.
+//! Content-addressable package stores for LPM.
 //!
-//! Global store at `~/.lpm/store/` holds extracted packages keyed by
-//! `name@version` hash. Projects link into this store via hardlinks or
-//! copy-on-write (reflink on APFS/Btrfs).
+//! The default v2 store separates immutable package objects from reusable
+//! dependency-graph link entries. The v1 store and its `(name, version)`
+//! package directories remain available only for the explicit
+//! `LPM_STORE_VERSION=v1` rollback and for upgrade/maintenance readers.
 //!
-//! Layout:
 //! ```text
 //! ~/.lpm/store/
-//!   v1/                          ← store version (for future migrations)
-//!     react@19.2.4/              ← extracted package directory
-//!       package.json
-//!       index.js
-//!       ...
-//!     express@4.22.1/
-//!       ...
+//! ├── v2/                         # default writer
+//! │   ├── objects/<sri>/          # content-addressable extracted bytes
+//! │   ├── links/<graph-key>/      # reusable dependency graph entries
+//! │   ├── compat/                 # cached compatibility islands
+//! │   └── builds/                 # lifecycle build artifacts
+//! └── v1/                         # rollback and migration compatibility
+//!     └── <package>@<version>/    # legacy extracted package directory
 //! ```
 //!
-//! Performance: package-level dedup (skip extraction on store hit), clonefile/reflink on macOS.
-//! Maintenance: GC with age filtering, integrity verification (SRI hashes).
+//! [`StoreVersion`] owns the CLI selection contract: v2 is the default and
+//! only `v1` or `1` explicitly selects the legacy writer. Compatibility
+//! readers can still inspect v1 data while direct upgrades from v1-writing
+//! releases remain supported.
 
 mod baseline;
 mod cas;

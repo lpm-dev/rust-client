@@ -58,7 +58,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
-    pub(super) requested_v2_mode: bool,
+    pub(super) store_version: lpm_store::StoreVersion,
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) requested_add_count: Option<usize>,
     pub(super) json_output: bool,
@@ -92,9 +92,10 @@ pub(super) async fn run_install_freshness_phase(
             input.linker_mode,
             input.object_integrity_policy,
             &dependency_engine_key,
+            input.store_version,
         );
     let setup_install_state_ms = setup_state_t.elapsed().as_millis();
-    let compatibility_bins_ready = !input.requested_v2_mode
+    let compatibility_bins_ready = !input.store_version.is_v2()
         || input.compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(
             input.project_dir,

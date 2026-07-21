@@ -86,7 +86,7 @@ fn read_lockfile_for_patch_selector(project_dir: &Path) -> Result<Lockfile, LpmE
 async fn run_patch_inner(name: String, version: String, json_output: bool) -> Result<(), LpmError> {
     // Lookup goes
     // through `find_installed_package_baseline`, which prefers the
-    // v2 virtual store (defaultb) and falls back to v1.
+    // v2 virtual store (default) and falls back to v1.
     // Pre-fix this called `store.has_package(...)` (v1-only), which
     // always returned false under v2 → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;

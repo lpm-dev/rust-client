@@ -45,6 +45,7 @@ pub async fn run(
     assert_none: bool,
     format: &str,
 ) -> Result<(), LpmError> {
+    let store_version = lpm_store::StoreVersion::from_env();
     // ── Pre-discovery (cheap, no store touch) ─────────────────────────
     //
     // Determine whether this is an LPM-managed project before paying
@@ -76,10 +77,11 @@ pub async fn run(
         let lock_path = lpm_root_outer.store_lock();
         let lpm_root_inner = lpm_root_outer;
         lpm_common::with_shared_lock(lock_path, || {
-            let inv = PackageInventory::from_discovery(pre_discovery);
+            let inv = PackageInventory::from_discovery(pre_discovery, store_version);
             let baseline_index = crate::commands::audit::inventory::build_project_v2_baseline_index(
                 &inv.discovery.project_root,
                 &lpm_root_inner,
+                store_version,
             );
             for pkg in &inv.discovery.packages {
                 let pkg_dir = crate::commands::audit::inventory::find_project_baseline(
@@ -103,7 +105,7 @@ pub async fn run(
             Ok(inv)
         })?
     } else {
-        let inv = PackageInventory::from_discovery(pre_discovery);
+        let inv = PackageInventory::from_discovery(pre_discovery, store_version);
         for pkg in &inv.discovery.packages {
             let pkg_dir = inv.discovery.project_root.join(&pkg.path);
             let key = pkg.path.clone();

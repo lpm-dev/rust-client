@@ -90,10 +90,11 @@ pub async fn run(
     // concurrent `lpm cache prune --apply` could remove an entry
     // mid-walk without this gate.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
+    let store_version = lpm_store::StoreVersion::from_env();
     let lock_path = lpm_root.store_lock();
     lpm_common::with_shared_lock_async(
         lock_path,
-        run_under_store_lock(
+        run_under_store_lock(RunContext {
             project_dir,
             package,
             yes,
@@ -101,16 +102,35 @@ pub async fn run(
             dry_run,
             json_output,
             lpm_root,
-        ),
+            store_version,
+        }),
     )
     .await
 }
 
-async fn run_under_store_lock(
-    project_dir: &Path,
-    package: Option<&str>,
+struct RunContext<'a> {
+    project_dir: &'a Path,
+    package: Option<&'a str>,
     yes: bool,
     list: bool,
+    dry_run: bool,
+    json_output: bool,
+    lpm_root: lpm_common::LpmRoot,
+    store_version: lpm_store::StoreVersion,
+}
+
+async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
+    let RunContext {
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
+        lpm_root,
+        store_version,
+    } = context;
+
     // When true, the review flow runs end-to-end (card rendering,
     // interactive prompts, diff surfaces, outcome accounting) but NO
     // persisted state mutates —
@@ -121,10 +141,6 @@ async fn run_under_store_lock(
     // read-only); the JSON envelope for `--list --dry-run` still
     // carries the `dry_run` flag so agents can distinguish
     // preview-of-listing from plain-listing at parse time.
-    dry_run: bool,
-    json_output: bool,
-    lpm_root: lpm_common::LpmRoot,
-) -> Result<(), LpmError> {
     // ── Argument validation ─────────────────────────────────────────
     //
     // Mutual exclusion: `--yes` and `--list` are contradictory (one mutates,
@@ -255,8 +271,11 @@ async fn run_under_store_lock(
         blocked_packages: effective,
         drift_ignore_override: None,
     };
-    let baseline_index =
-        crate::commands::audit::inventory::build_project_v2_baseline_index(project_dir, &lpm_root);
+    let baseline_index = crate::commands::audit::inventory::build_project_v2_baseline_index(
+        project_dir,
+        &lpm_root,
+        store_version,
+    );
 
     // Resolve the operator's provenance policy before branching. The
     // side-effectful posture check and provenance fetch happen only after a

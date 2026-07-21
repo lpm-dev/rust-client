@@ -14,8 +14,9 @@ use std::path::Path;
 pub(crate) fn build_project_v2_baseline_index(
     project_dir: &Path,
     lpm_root: &lpm_common::LpmRoot,
+    store_version: lpm_store::StoreVersion,
 ) -> Option<lpm_store::V2BaselineIndex> {
-    if lpm_store::StoreVersion::from_env() != lpm_store::StoreVersion::V2 {
+    if store_version != lpm_store::StoreVersion::V2 {
         return Some(lpm_store::V2BaselineIndex::default());
     }
     match lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root) {
@@ -107,7 +108,10 @@ impl PackageInventory {
     /// (`.lpm-security.json` per package dir) — callers must hold the
     /// shared store lock around this call to avoid racing
     /// `lpm cache prune --apply` / `lpm store clean`.
-    pub fn from_discovery(discovery: discovery::DiscoveryResult) -> Self {
+    pub fn from_discovery(
+        discovery: discovery::DiscoveryResult,
+        store_version: lpm_store::StoreVersion,
+    ) -> Self {
         let mut analyses: HashMap<String, PackageAnalysis> = HashMap::new();
 
         // Scannable packages: those with source on disk
@@ -133,9 +137,9 @@ impl PackageInventory {
         let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
         let lpm_root = lpm_common::LpmRoot::from_env().ok();
-        let baseline_index = lpm_root
-            .as_ref()
-            .and_then(|root| build_project_v2_baseline_index(&discovery.project_root, root));
+        let baseline_index = lpm_root.as_ref().and_then(|root| {
+            build_project_v2_baseline_index(&discovery.project_root, root, store_version)
+        });
 
         let project_cache_ref = project_cache.as_ref();
         let loaded: Vec<LoadedAnalysis> = scannable

@@ -6,7 +6,8 @@
 //!   link-entry population (clonefile from objects + sibling symlinks
 //!   + atomic rename + sidecar write).
 //!
-//! v2 writes are gated behind `LPM_STORE_VERSION=v2`.
+//! The install command uses this writer by default. The retained v1 writer
+//! is reached only through the explicit `LPM_STORE_VERSION=v1` rollback.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};

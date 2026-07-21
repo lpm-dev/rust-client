@@ -22,7 +22,8 @@
 //!     .clean.lock                 ← serializes concurrent `cache clean` ops
 //!   engines/                      ← managed engine installs with preserved layouts
 //!   store/
-//!     v1/                         ← content-addressable package store (lpm-store)
+//!     v2/                         ← default virtual store (objects, links, builds)
+//!     v1/                         ← explicit rollback + upgrade compatibility
 //!     .gc.lock                    ← serializes `store gc`
 //!   global/
 //!     manifest.toml               ← [packages.*] active + [pending.*] in-flight + [aliases] + [tombstones]
@@ -122,6 +123,9 @@ impl LpmRoot {
         self.home.join("store")
     }
 
+    /// Legacy v1 store root retained for explicit rollback, migration,
+    /// verification, and cleanup. Do not remove this accessor while direct
+    /// upgrades from a v1-writing release remain supported.
     pub fn store_v1(&self) -> PathBuf {
         self.store_root().join("v1")
     }

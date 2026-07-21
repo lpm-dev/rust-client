@@ -24,6 +24,7 @@ pub(super) fn run_behavioral_analysis(
     lpm_packages: &[(String, String)],
     _json_output: bool,
     level: Option<AuditLevel>,
+    store_version: lpm_store::StoreVersion,
 ) -> BehavioralSummary {
     struct LoadedBehavioralAnalysis {
         name: String,
@@ -77,9 +78,9 @@ pub(super) fn run_behavioral_analysis(
     let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
     let lpm_root = lpm_common::LpmRoot::from_env().ok();
-    let baseline_index = lpm_root
-        .as_ref()
-        .and_then(|root| inventory::build_project_v2_baseline_index(&discovery.project_root, root));
+    let baseline_index = lpm_root.as_ref().and_then(|root| {
+        inventory::build_project_v2_baseline_index(&discovery.project_root, root, store_version)
+    });
 
     let mut scanned = 0usize;
     let mut with_findings = 0usize;
@@ -365,8 +366,14 @@ mod tests {
         };
         let mut results = Vec::new();
 
-        let summary =
-            run_behavioral_analysis(&discovery, &mut results, &[], false, Some(AuditLevel::High));
+        let summary = run_behavioral_analysis(
+            &discovery,
+            &mut results,
+            &[],
+            false,
+            Some(AuditLevel::High),
+            lpm_store::StoreVersion::V2,
+        );
 
         assert_eq!(summary.packages_scanned, 1);
         assert_eq!(summary.packages_with_findings, 0);
