@@ -184,22 +184,13 @@ pub const DEFAULT_RELAY_HOST: &str = "relay.lpm.fyi";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Process-global env mutations are inherently racy across parallel
-    /// tests. Serialize the few tests that touch `LPM_TUNNEL_RELAY` /
-    /// `HOME` under a mutex so they don't trample each other.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     /// `LPM_TUNNEL_RELAY` set → wins over everything else. The test must
     /// also clear `HOME` so a developer's real `~/.lpm/config.toml`
     /// doesn't leak into the resolution path.
     #[test]
     fn env_var_wins_over_config_and_default() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         // Write a config that would otherwise be honored.
         let cfg = home.path().join(".lpm").join("config.toml");
@@ -231,7 +222,7 @@ mod tests {
     /// against scripts that accidentally `export LPM_TUNNEL_RELAY=""`.
     #[test]
     fn empty_env_var_falls_through() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("HOME", home.path());
@@ -248,7 +239,7 @@ mod tests {
     /// No env var, but `~/.lpm/config.toml` has `tunnel.relay-url`.
     #[test]
     fn config_value_wins_over_default() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         let cfg = home.path().join(".lpm").join("config.toml");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
@@ -275,7 +266,7 @@ mod tests {
     /// many readers' keys.
     #[test]
     fn config_value_under_other_top_level_keys() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         let cfg = home.path().join(".lpm").join("config.toml");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
@@ -304,7 +295,7 @@ mod tests {
     /// wedges connectivity.
     #[test]
     fn malformed_config_falls_through_to_default() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         let cfg = home.path().join(".lpm").join("config.toml");
         std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
@@ -325,7 +316,7 @@ mod tests {
     /// No env, no config file → built-in default.
     #[test]
     fn default_when_nothing_set() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::remove_var("LPM_TUNNEL_RELAY");
@@ -343,7 +334,7 @@ mod tests {
     /// hostname rustls verified.
     #[test]
     fn per_host_pin_path_layout() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("HOME", home.path());
@@ -364,7 +355,7 @@ mod tests {
     /// installs keep working.
     #[test]
     fn legacy_pin_path_unchanged() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("HOME", home.path());

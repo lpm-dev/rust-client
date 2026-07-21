@@ -8,6 +8,17 @@ use std::sync::{Arc, Mutex};
 
 type ProxyLeaseSlot = Arc<Mutex<Option<lpm_proxy::RouteLease>>>;
 
+fn show_tunnel_notice(message: &str) {
+    dev_ui::warn(message);
+    if message.contains("not claimed") {
+        dev_ui::hint_line("Run: lpm tunnel claim <domain>");
+    } else if message.contains("Pro plan") || message.contains("plan_required") {
+        dev_ui::hint_line("Upgrade at: https://lpm.dev/pricing");
+    } else if message.contains("concurrent") {
+        dev_ui::hint_line("Close other tunnels first, or upgrade your plan");
+    }
+}
+
 struct DevCertSetup {
     setup: lpm_cert::HttpsSetup,
     inject_env: bool,
@@ -582,8 +593,11 @@ pub async fn run(
         } else {
             None
         };
+        let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
+        let usage_for_connect = latest_usage.clone();
+        let usage_for_notices = latest_usage;
         tunnel_handle = Some(tokio::spawn(async move {
-            let _ = lpm_tunnel::client::connect(
+            let result = lpm_tunnel::client::connect_with_usage(
                 &options_clone,
                 move |session| {
                     if let Some(ref state) = inspector_state_for_connect {
@@ -616,6 +630,15 @@ pub async fn run(
                     {
                         dev_ui::hint_line(&format!("Tunnel limits: {limits}"));
                     }
+                    let usage = usage_for_connect
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(usage) =
+                        crate::commands::tunnel::tunnel_usage_summary(usage.as_ref())
+                    {
+                        dev_ui::hint_line(&format!("Tunnel usage: {usage}"));
+                    }
                     if let Some(ref auth) = tunnel_auth_display {
                         dev_ui::hint_line(&format!(
                             "Auth required: add header X-Tunnel-Auth: {auth}"
@@ -626,19 +649,23 @@ pub async fn run(
                         ));
                     }
                 },
-                |msg| {
-                    dev_ui::warn(msg);
-                    // Provide actionable hints based on Worker error messages
-                    if msg.contains("not claimed") {
-                        dev_ui::hint_line("Run: lpm tunnel claim <domain>");
-                    } else if msg.contains("Pro plan") || msg.contains("plan_required") {
-                        dev_ui::hint_line("Upgrade at: https://lpm.dev/pricing");
-                    } else if msg.contains("concurrent") {
-                        dev_ui::hint_line("Close other tunnels first, or upgrade your plan");
+                show_tunnel_notice,
+                move |usage, initial| {
+                    *usage_for_notices
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage.clone());
+                    if !initial
+                        && let Some(summary) =
+                            crate::commands::tunnel::tunnel_usage_summary(Some(usage))
+                    {
+                        show_tunnel_notice(&format!("Tunnel usage: {summary}"));
                     }
                 },
             )
             .await;
+            if let Err(error) = result {
+                show_tunnel_notice(&format!("Tunnel failed: {error}"));
+            }
         }));
     }
 

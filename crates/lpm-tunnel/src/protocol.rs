@@ -225,7 +225,8 @@ mod tests {
 			"session_max_ms": 3600000,
 			"limits": {
 				"max_concurrent": 1,
-				"request_rate_limit_per_minute": 100,
+				"request_rate_limit_per_minute": 4000,
+				"account_rate_limit_per_minute": 4000,
 				"per_ip_rate_limit_per_minute": 600,
 				"max_request_body_bytes": 10485760,
 				"max_custom_domains": 0,
@@ -252,7 +253,7 @@ mod tests {
                     limits,
                     Some(crate::TunnelLimitMetadata {
                         max_concurrent: Some(1),
-                        request_rate_limit_per_minute: Some(100),
+                        request_rate_limit_per_minute: Some(4_000),
                         per_ip_rate_limit_per_minute: Some(600),
                         max_request_body_bytes: Some(10_485_760),
                         max_custom_domains: Some(0),

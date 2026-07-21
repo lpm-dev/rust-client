@@ -18,6 +18,12 @@ pub mod webhook_replay;
 pub mod webhook_signature;
 pub mod ws_capture;
 
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub use relay::resolve_relay_url;
 
 /// Plan and relay limits advertised by the tunnel service.
@@ -26,10 +32,10 @@ pub struct TunnelLimitMetadata {
     /// Maximum simultaneously open tunnels for the account.
     #[serde(default)]
     pub max_concurrent: Option<u64>,
-    /// Per-session request limit per minute. Zero means unlimited.
+    /// Account-wide request limit per minute across every active tunnel.
     #[serde(default)]
     pub request_rate_limit_per_minute: Option<u64>,
-    /// Global relay request limit per minute per source IP.
+    /// Request limit per minute for one source IP within this account.
     #[serde(default)]
     pub per_ip_rate_limit_per_minute: Option<u64>,
     /// Maximum inbound request body size accepted by the relay.
@@ -41,6 +47,41 @@ pub struct TunnelLimitMetadata {
     /// Whether tunnel-auth headers are available for the account.
     #[serde(default)]
     pub tunnel_auth_available: Option<bool>,
+}
+
+/// Account-wide request usage advertised by the tunnel service.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TunnelUsageMetadata {
+    /// Requests admitted during the current usage period.
+    #[serde(default)]
+    pub accepted_requests: Option<u64>,
+    /// Requests included in the current plan/seat allowance.
+    #[serde(default)]
+    pub included_requests: Option<u64>,
+    /// Requests above the included allowance.
+    #[serde(default)]
+    pub overage_requests: Option<u64>,
+    /// Whether requests continue into proportional overage.
+    #[serde(default)]
+    pub overage_enabled: Option<bool>,
+    /// Whether the allowance is currently a hard stop.
+    #[serde(default)]
+    pub hard_limit: Option<bool>,
+    /// Inclusive ISO-8601 usage-period start.
+    #[serde(default)]
+    pub period_start: Option<String>,
+    /// Exclusive ISO-8601 usage-period end.
+    #[serde(default)]
+    pub period_end: Option<String>,
+    /// Request quantity represented by one advertised overage unit.
+    #[serde(default)]
+    pub overage_unit_requests: Option<u64>,
+    /// Price of one overage unit in cents.
+    #[serde(default)]
+    pub overage_unit_price_cents: Option<u64>,
+    /// Current estimated overage charge in cents.
+    #[serde(default)]
+    pub estimated_overage_cents: Option<f64>,
 }
 
 /// Active tunnel session information.

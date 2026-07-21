@@ -4,6 +4,7 @@ use lpm_registry::RegistryClient;
 use std::fmt::Display;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Run the `lpm tunnel` command.
@@ -248,8 +249,11 @@ async fn run_start(
     let control_inspector_url = inspector_url.clone();
     let inspector_state_for_connect = inspector_state.clone();
     let session_name_owned = session_name.map(|s| s.to_string());
+    let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
+    let usage_for_connect = latest_usage.clone();
+    let usage_for_notices = latest_usage.clone();
 
-    let connect = lpm_tunnel::client::connect(
+    let connect = lpm_tunnel::client::connect_with_usage(
         &options,
         move |session| {
             // Update inspector state with the tunnel URL and start a session
@@ -263,6 +267,11 @@ async fn run_start(
                 state.set_tunnel_url(url).await;
                 state.start_session(session_id, domain, local, name).await;
             });
+
+            let usage = usage_for_connect
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
 
             if json_output {
                 println!(
@@ -279,6 +288,7 @@ async fn run_start(
                         "session_expires_at": session.session_expires_at,
                         "session_max_ms": session.session_max_ms,
                         "limits": session.limits,
+                        "usage": usage,
                         "tunnel_auth": tunnel_auth_display,
                         "inspector_url": inspector_url,
                         "auto_ack": auto_ack,
@@ -298,6 +308,9 @@ async fn run_start(
                 }
                 if let Some(limits) = tunnel_limit_summary(session.limits.as_ref()) {
                     tunnel_detail("limits", limits);
+                }
+                if let Some(usage) = tunnel_usage_summary(usage.as_ref()) {
+                    tunnel_detail("usage", usage);
                 }
                 tunnel_detail("session", &session.session_id);
                 tunnel_detail("local", format!("localhost:{}", session.local_port));
@@ -324,6 +337,17 @@ async fn run_start(
         |msg| {
             if !json_output {
                 install_ui::warn(msg);
+            }
+        },
+        move |usage, initial| {
+            *usage_for_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage.clone());
+            if !initial
+                && !json_output
+                && let Some(summary) = tunnel_usage_summary(Some(usage))
+            {
+                install_ui::warn(&format!("Tunnel usage: {summary}"));
             }
         },
     );
@@ -793,6 +817,27 @@ pub(crate) fn tunnel_limit_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+pub(crate) fn tunnel_usage_summary(
+    usage: Option<&lpm_tunnel::TunnelUsageMetadata>,
+) -> Option<String> {
+    let usage = usage?;
+    let accepted = usage.accepted_requests?;
+    let included = usage.included_requests?;
+    let mut summary = format!("{accepted} / {included} requests");
+    if usage.overage_requests.unwrap_or_default() > 0 {
+        summary.push_str(&format!(
+            " · {} overage",
+            usage.overage_requests.unwrap_or_default()
+        ));
+    }
+    summary.push_str(if usage.overage_enabled.unwrap_or(false) {
+        " · overage on"
+    } else {
+        " · hard stop"
+    });
+    Some(summary)
 }
 
 fn format_tunnel_detail(label: &str, value: impl Display) -> String {
@@ -1390,7 +1435,7 @@ mod tests {
     fn tunnel_limit_summary_includes_account_and_relay_caps() {
         let limits = lpm_tunnel::TunnelLimitMetadata {
             max_concurrent: Some(1),
-            request_rate_limit_per_minute: Some(100),
+            request_rate_limit_per_minute: Some(4_000),
             per_ip_rate_limit_per_minute: Some(600),
             max_request_body_bytes: Some(10 * 1024 * 1024),
             max_custom_domains: Some(0),
@@ -1399,7 +1444,7 @@ mod tests {
 
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
-            Some("1 tunnel · 100/min · 10.0 MB body · 0 custom domains · 600/min/IP")
+            Some("1 tunnel · 4000/min · 10.0 MB body · 0 custom domains · 600/min/IP")
         );
     }
 
@@ -1407,7 +1452,7 @@ mod tests {
     fn tunnel_limit_summary_displays_unlimited_request_rate() {
         let limits = lpm_tunnel::TunnelLimitMetadata {
             max_concurrent: Some(3),
-            request_rate_limit_per_minute: Some(0),
+            request_rate_limit_per_minute: Some(20_000),
             per_ip_rate_limit_per_minute: Some(600),
             max_request_body_bytes: Some(100 * 1024 * 1024),
             max_custom_domains: Some(3),
@@ -1416,7 +1461,22 @@ mod tests {
 
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
-            Some("3 tunnels · requests unlimited · 100.0 MB body · 3 custom domains · 600/min/IP")
+            Some("3 tunnels · 20000/min · 100.0 MB body · 3 custom domains · 600/min/IP")
+        );
+    }
+
+    #[test]
+    fn tunnel_usage_summary_shows_hard_stop_and_overage() {
+        let usage = lpm_tunnel::TunnelUsageMetadata {
+            accepted_requests: Some(100_250),
+            included_requests: Some(100_000),
+            overage_requests: Some(250),
+            overage_enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            tunnel_usage_summary(Some(&usage)).as_deref(),
+            Some("100250 / 100000 requests · 250 overage · overage on")
         );
     }
 

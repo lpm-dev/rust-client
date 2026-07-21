@@ -6,7 +6,10 @@
 use crate::protocol::{ClientMessage, ServerMessage};
 use crate::webhook::CapturedWebhook;
 use crate::ws_capture::{FrameDirection, WsEvent};
-use crate::{DEFAULT_RELAY_URL, TunnelSession, proxy, webhook, webhook_signature};
+use crate::{
+    DEFAULT_RELAY_URL, TunnelLimitMetadata, TunnelSession, TunnelUsageMetadata, proxy, webhook,
+    webhook_signature,
+};
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
 use std::collections::HashMap;
@@ -32,6 +35,156 @@ const PONG_TIMEOUT_SECS: u64 = 90;
 
 /// Maximum time to wait for in-flight tasks during graceful shutdown.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type")]
+enum RelayHandshakeMessage {
+    #[serde(rename = "hello")]
+    Hello {
+        #[serde(rename = "subdomain")]
+        domain: String,
+        tunnel_url: String,
+        session_id: String,
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        base_domain: Option<String>,
+        #[serde(default)]
+        domain_kind: Option<String>,
+        #[serde(default)]
+        session_expires_at: Option<u64>,
+        #[serde(default)]
+        session_max_ms: Option<u64>,
+        #[serde(default)]
+        limits: Option<Box<TunnelLimitMetadata>>,
+        #[serde(default)]
+        usage: Option<Box<TunnelUsageMetadata>>,
+    },
+    #[serde(rename = "error")]
+    Error {
+        message: String,
+        code: Option<String>,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type")]
+enum RelayExtensionMessage {
+    #[serde(rename = "usage_notice")]
+    UsageNotice { usage: TunnelUsageMetadata },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type")]
+enum ClientExtensionMessage {
+    #[serde(rename = "ws_ready")]
+    WebSocketReady { id: String },
+    #[serde(rename = "ws_reject")]
+    WebSocketReject { id: String, error: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryClass {
+    Permanent,
+    Transient,
+}
+
+#[derive(Debug)]
+struct TunnelConnectError {
+    error: LpmError,
+    retry_class: RetryClass,
+}
+
+impl TunnelConnectError {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            error: LpmError::Tunnel(message.into()),
+            retry_class: RetryClass::Permanent,
+        }
+    }
+
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            error: LpmError::Tunnel(message.into()),
+            retry_class: RetryClass::Transient,
+        }
+    }
+}
+
+impl std::fmt::Display for TunnelConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl From<LpmError> for TunnelConnectError {
+    fn from(error: LpmError) -> Self {
+        Self {
+            error,
+            retry_class: RetryClass::Transient,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RelayRejectionBody {
+    error: Option<String>,
+    message: Option<String>,
+    code: Option<String>,
+}
+
+fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
+    match code {
+        "auth_failed"
+        | "plan_required"
+        | "domain_not_owned"
+        | "concurrent_limit"
+        | "billing_inactive"
+        | "monthly_allowance_exhausted" => Some(RetryClass::Permanent),
+        "quota_unavailable"
+        | "account_unavailable"
+        | "usage_unavailable"
+        | "usage_report_unavailable" => Some(RetryClass::Transient),
+        _ => None,
+    }
+}
+
+fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
+    let payload = serde_json::from_slice::<RelayRejectionBody>(body).ok();
+    let code = payload.as_ref().and_then(|value| value.code.as_deref());
+    let detail = payload
+        .as_ref()
+        .and_then(|value| value.error.as_deref().or(value.message.as_deref()))
+        .unwrap_or("relay rejected connection");
+    let message = format!(
+        "relay rejected connection: {detail}{}",
+        code.map(|value| format!(" ({value})")).unwrap_or_default()
+    );
+
+    let retry_class = code.and_then(relay_code_retry_class).unwrap_or({
+        if status >= 500 {
+            RetryClass::Transient
+        } else {
+            RetryClass::Permanent
+        }
+    });
+    match retry_class {
+        RetryClass::Permanent => TunnelConnectError::permanent(message),
+        RetryClass::Transient => TunnelConnectError::transient(message),
+    }
+}
+
+fn classify_websocket_connect_error(
+    error: tokio_tungstenite::tungstenite::Error,
+) -> TunnelConnectError {
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
+        let body = response.body().as_deref().unwrap_or_default();
+        return classify_relay_rejection(response.status().as_u16(), body);
+    }
+    TunnelConnectError::transient(format!("failed to connect to relay: {error}"))
+}
 
 enum LocalWebSocketCommand {
     Frame {
@@ -119,18 +272,34 @@ pub async fn connect(
     on_connected: impl Fn(&TunnelSession),
     on_disconnected: impl Fn(&str),
 ) -> Result<(), LpmError> {
+    connect_with_usage(options, on_connected, on_disconnected, |_, _| {}).await
+}
+
+/// Connect to the relay while receiving initial and threshold usage snapshots.
+///
+/// The final callback receives `true` for the usage included in the initial
+/// handshake and `false` for later allowance/overage threshold notices.
+pub async fn connect_with_usage(
+    options: &TunnelOptions,
+    on_connected: impl Fn(&TunnelSession),
+    on_disconnected: impl Fn(&str),
+    on_usage: impl Fn(&TunnelUsageMetadata, bool),
+) -> Result<(), LpmError> {
     let mut retry_count = 0;
     let max_retries = 10;
 
     loop {
         let connection_start = std::time::Instant::now();
-        match try_connect(options, &on_connected).await {
+        match try_connect(options, &on_connected, &on_usage).await {
             Ok(()) => {
                 // Clean disconnect
                 tracing::info!("tunnel closed");
                 return Ok(());
             }
             Err(e) => {
+                if e.retry_class == RetryClass::Permanent {
+                    return Err(e.error);
+                }
                 // Reset retry counter if the connection was healthy (lasted > 60s).
                 // This prevents a long-running tunnel from accumulating retries
                 // across unrelated transient failures.
@@ -593,9 +762,13 @@ fn is_localhost_relay(url: &str) -> bool {
 async fn try_connect(
     options: &TunnelOptions,
     on_connected: &impl Fn(&TunnelSession),
-) -> Result<(), LpmError> {
+    on_usage: &impl Fn(&TunnelUsageMetadata, bool),
+) -> Result<(), TunnelConnectError> {
     // Build connect URL — non-sensitive params only (token goes in Authorization header)
-    let mut connect_url = format!("{}?port={}", options.relay_url, options.local_port);
+    let mut connect_url = format!(
+        "{}?port={}&protocol=2",
+        options.relay_url, options.local_port
+    );
     if let Some(domain) = options.resolved_domain() {
         let encoded = urlencoding::encode(&domain);
         connect_url.push_str(&format!("&domain={encoded}"));
@@ -656,7 +829,7 @@ async fn try_connect(
         Some(tls_connector),
     )
     .await
-    .map_err(|e| LpmError::Tunnel(format!("failed to connect to relay: {e}")))?;
+    .map_err(classify_websocket_connect_error)?;
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -667,13 +840,13 @@ async fn try_connect(
         .ok_or_else(|| LpmError::Tunnel("relay closed connection before hello".into()))?
         .map_err(|e| LpmError::Tunnel(format!("failed to read server hello: {e}")))?;
 
-    let session = match server_hello {
+    let (session, initial_usage) = match server_hello {
         Message::Text(text) => {
-            let msg: ServerMessage = serde_json::from_str(&text)
+            let msg: RelayHandshakeMessage = serde_json::from_str(&text)
                 .map_err(|e| LpmError::Tunnel(format!("invalid server message: {e}")))?;
 
             match msg {
-                ServerMessage::Hello {
+                RelayHandshakeMessage::Hello {
                     domain: raw_domain,
                     tunnel_url,
                     session_id,
@@ -683,6 +856,7 @@ async fn try_connect(
                     session_expires_at,
                     session_max_ms,
                     limits,
+                    usage,
                 } => {
                     // domain field from relay may be just the subdomain or full domain
                     // tunnel_url is always the full URL
@@ -714,39 +888,48 @@ async fn try_connect(
                         );
                     }
 
-                    TunnelSession {
-                        tunnel_url,
-                        domain,
-                        session_id,
-                        local_port: options.local_port,
-                        plan,
-                        base_domain,
-                        domain_kind,
-                        session_expires_at,
-                        session_max_ms,
-                        limits,
-                    }
+                    (
+                        TunnelSession {
+                            tunnel_url,
+                            domain,
+                            session_id,
+                            local_port: options.local_port,
+                            plan,
+                            base_domain,
+                            domain_kind,
+                            session_expires_at,
+                            session_max_ms,
+                            limits: limits.map(|value| *value),
+                        },
+                        usage.map(|value| *value),
+                    )
                 }
-                ServerMessage::Error { message, code } => {
-                    return Err(LpmError::Tunnel(format!(
+                RelayHandshakeMessage::Error { message, code } => {
+                    let retry_class = code
+                        .as_deref()
+                        .and_then(relay_code_retry_class)
+                        .unwrap_or(RetryClass::Permanent);
+                    let detail = format!(
                         "relay rejected connection: {message}{}",
-                        code.map(|c| format!(" ({c})")).unwrap_or_default()
-                    )));
-                }
-                _ => {
-                    return Err(LpmError::Tunnel(
-                        "unexpected message from relay (expected hello)".into(),
-                    ));
+                        code.map(|value| format!(" ({value})")).unwrap_or_default()
+                    );
+                    return Err(match retry_class {
+                        RetryClass::Permanent => TunnelConnectError::permanent(detail),
+                        RetryClass::Transient => TunnelConnectError::transient(detail),
+                    });
                 }
             }
         }
         _ => {
-            return Err(LpmError::Tunnel(
-                "unexpected message type from relay".into(),
+            return Err(TunnelConnectError::transient(
+                "unexpected message type from relay",
             ));
         }
     };
 
+    if let Some(ref usage) = initial_usage {
+        on_usage(usage, true);
+    }
     on_connected(&session);
 
     // Create HTTP client for local proxying. `Policy::none()` disables
@@ -791,6 +974,12 @@ async fn try_connect(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        if let Ok(RelayExtensionMessage::UsageNotice { usage }) =
+                            serde_json::from_str::<RelayExtensionMessage>(&text)
+                        {
+                            on_usage(&usage, false);
+                            continue;
+                        }
                         let server_msg: ServerMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {
@@ -936,7 +1125,10 @@ async fn try_connect(
                                         "rejected WebSocket upgrade with unsafe URL: {:?}",
                                         url
                                     );
-                                    let error_resp = proxy::bad_gateway_response(&id);
+                                    let error_resp = ClientExtensionMessage::WebSocketReject {
+                                        id,
+                                        error: "Local WebSocket upgrade URL was rejected".to_string(),
+                                    };
                                     let json = match serde_json::to_string(&error_resp) {
                                         Ok(j) => j,
                                         Err(e) => {
@@ -970,24 +1162,41 @@ async fn try_connect(
                                         let id_for_writer = id.clone();
                                         task_handles.spawn(async move {
                                             while let Some(command) = local_rx.recv().await {
-                                        let is_close = matches!(&command, LocalWebSocketCommand::Close { .. });
-                                        let msg = match command {
-                                            LocalWebSocketCommand::Frame { data, is_binary } => {
-                                                if is_binary {
-                                                    tokio_tungstenite::tungstenite::Message::Binary(data)
-                                                } else {
-                                                    let text = String::from_utf8_lossy(&data).into_owned();
-                                                    tokio_tungstenite::tungstenite::Message::Text(text)
-                                                }
-                                            }
-                                            LocalWebSocketCommand::Close { code, reason } => {
-                                                let close_frame = CloseFrame {
-                                                    code: CloseCode::from(code.unwrap_or(1000)),
-                                                    reason: reason.unwrap_or_default().into(),
+                                                let is_close = matches!(
+                                                    &command,
+                                                    LocalWebSocketCommand::Close { .. }
+                                                );
+                                                let msg = match command {
+                                                    LocalWebSocketCommand::Frame {
+                                                        data,
+                                                        is_binary,
+                                                    } => {
+                                                        if is_binary {
+                                                            tokio_tungstenite::tungstenite::Message::Binary(data)
+                                                        } else {
+                                                            let text =
+                                                                String::from_utf8_lossy(&data)
+                                                                    .into_owned();
+                                                            tokio_tungstenite::tungstenite::Message::Text(text)
+                                                        }
+                                                    }
+                                                    LocalWebSocketCommand::Close {
+                                                        code,
+                                                        reason,
+                                                    } => {
+                                                        let close_frame = CloseFrame {
+                                                            code: CloseCode::from(
+                                                                code.unwrap_or(1000),
+                                                            ),
+                                                            reason: reason
+                                                                .unwrap_or_default()
+                                                                .into(),
+                                                        };
+                                                        tokio_tungstenite::tungstenite::Message::Close(
+                                                            Some(close_frame),
+                                                        )
+                                                    }
                                                 };
-                                                tokio_tungstenite::tungstenite::Message::Close(Some(close_frame))
-                                            }
-                                        };
                                                 let mut sink = local_write_clone.lock().await;
                                                 if let Err(e) = sink.send(msg).await {
                                                     tracing::debug!(
@@ -997,9 +1206,9 @@ async fn try_connect(
                                                     break;
                                                 }
 
-                                        if is_close {
-                                            break;
-                                        }
+                                                if is_close {
+                                                    break;
+                                                }
                                             }
                                         });
 
@@ -1024,25 +1233,27 @@ async fn try_connect(
                                                     }
                                                     tokio_tungstenite::tungstenite::Message::Close(reason) => {
                                                         tracing::debug!("local WS closed for {}", id_clone);
-                                                let close_reason = reason
-                                                    .as_ref()
-                                                    .map(|frame| frame.reason.to_string());
-                                                let close_code = reason.as_ref().map(|frame| u16::from(frame.code));
+                                                        let close_reason = reason
+                                                            .as_ref()
+                                                            .map(|frame| frame.reason.to_string());
+                                                        let close_code = reason
+                                                            .as_ref()
+                                                            .map(|frame| u16::from(frame.code));
                                                         if let Some(ref ws_tx) = ws_tx_clone {
                                                             let _ = ws_tx.send(WsEvent::Closed {
                                                                 connection_id: id_clone.clone(),
-                                                        reason: close_reason.clone(),
+                                                                reason: close_reason.clone(),
                                                                 timestamp: chrono::Utc::now().to_rfc3339(),
                                                             });
                                                         }
-                                                let close_msg = ClientMessage::WebSocketClose {
-                                                    id: id_clone.clone(),
-                                                    code: close_code,
-                                                    reason: close_reason,
-                                                };
-                                                if let Ok(json) = serde_json::to_string(&close_msg) {
-                                                    let _ = relay_tx_clone.send(json).await;
-                                                }
+                                                        let close_msg = ClientMessage::WebSocketClose {
+                                                            id: id_clone.clone(),
+                                                            code: close_code,
+                                                            reason: close_reason,
+                                                        };
+                                                        if let Ok(json) = serde_json::to_string(&close_msg) {
+                                                            let _ = relay_tx_clone.send(json).await;
+                                                        }
                                                         break;
                                                     }
                                                     _ => continue,
@@ -1097,6 +1308,25 @@ async fn try_connect(
                                             }
                                         });
 
+                                        let ready = ClientExtensionMessage::WebSocketReady {
+                                            id: id.clone(),
+                                        };
+                                        let json = match serde_json::to_string(&ready) {
+                                            Ok(json) => json,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "failed to serialize WebSocket upgrade confirmation: {e}"
+                                                );
+                                                break;
+                                            }
+                                        };
+                                        if let Err(e) = write.send(Message::Text(json)).await {
+                                            tracing::warn!(
+                                                "failed to confirm WebSocket upgrade to relay: {e}"
+                                            );
+                                            break;
+                                        }
+
                                         tracing::debug!("WebSocket upgrade established for {url}");
 
                                         // Capture WS connection event for inspector
@@ -1111,9 +1341,11 @@ async fn try_connect(
                                     }
                                     Err(e) => {
                                         tracing::warn!("WebSocket upgrade failed for {}: {e}", id);
-                                        // Send error response back to relay so the remote
-                                        // client gets a proper 502 instead of hanging.
-                                        let error_resp = proxy::bad_gateway_response(&id);
+                                        let error_resp = ClientExtensionMessage::WebSocketReject {
+                                            id,
+                                            error: "Local server rejected the WebSocket upgrade"
+                                                .to_string(),
+                                        };
                                         let json = match serde_json::to_string(&error_resp) {
                                             Ok(j) => j,
                                             Err(ser_e) => {
@@ -1193,7 +1425,9 @@ async fn try_connect(
                             }
                             ServerMessage::Error { message, .. } => {
                                 tracing::error!("relay error: {message}");
-                                return Err(LpmError::Tunnel(format!("relay error: {message}")));
+                                return Err(TunnelConnectError::transient(format!(
+                                    "relay error: {message}"
+                                )));
                             }
                             _ => {
                                 tracing::debug!("unhandled message type");
@@ -1205,7 +1439,9 @@ async fn try_connect(
                         break;
                     }
                     Some(Err(e)) => {
-                        return Err(LpmError::Tunnel(format!("WebSocket error: {e}")));
+                        return Err(TunnelConnectError::transient(format!(
+                            "WebSocket error: {e}"
+                        )));
                     }
                     None => {
                         tracing::info!("relay connection ended");
@@ -1265,19 +1501,11 @@ async fn try_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Process-global env mutations (HOME) need serializing across the
-    /// few tests that touch them. Mirrors `relay::tests::env_lock`.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     /// RAII guard that sets `HOME` to the given path and restores it
     /// on drop. Centralises the `unsafe` env mutation behind one
     /// SAFETY justification so individual tests don't need to repeat
-    /// it. Always pair with `env_lock()` because env state is
+    /// it. Always pair with `test_env_lock()` because env state is
     /// process-global.
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
@@ -1285,8 +1513,8 @@ mod tests {
     impl HomeGuard {
         fn set(path: &std::path::Path) -> Self {
             let prev = std::env::var_os("HOME");
-            // SAFETY: callers hold `env_lock()` so no other test in
-            // this module is reading or mutating `HOME` concurrently.
+            // SAFETY: callers hold `test_env_lock()` so no other test in
+            // this crate is reading or mutating `HOME` concurrently.
             // Production code does not race on `HOME` mutation under
             // `cargo test`.
             unsafe {
@@ -1320,12 +1548,93 @@ mod tests {
         assert!(opts.resolved_domain().is_none());
     }
 
+    #[test]
+    fn relay_quota_errors_have_stable_retry_classification() {
+        for code in [
+            "auth_failed",
+            "plan_required",
+            "domain_not_owned",
+            "concurrent_limit",
+            "billing_inactive",
+            "monthly_allowance_exhausted",
+        ] {
+            let body = format!(r#"{{"error":"denied","code":"{code}"}}"#);
+            let error = classify_relay_rejection(429, body.as_bytes());
+            assert_eq!(error.retry_class, RetryClass::Permanent, "code={code}");
+        }
+
+        for code in ["quota_unavailable", "account_unavailable"] {
+            let body = format!(r#"{{"error":"retry","code":"{code}"}}"#);
+            let error = classify_relay_rejection(503, body.as_bytes());
+            assert_eq!(error.retry_class, RetryClass::Transient, "code={code}");
+        }
+    }
+
+    #[test]
+    fn relay_http_status_fallback_does_not_retry_client_errors() {
+        assert_eq!(
+            classify_relay_rejection(401, br#"{"error":"Unauthorized"}"#).retry_class,
+            RetryClass::Permanent
+        );
+        assert_eq!(
+            classify_relay_rejection(
+                403,
+                br#"{"error":"Unknown client error","code":"future_client_error"}"#
+            )
+            .retry_class,
+            RetryClass::Permanent
+        );
+        assert_eq!(
+            classify_relay_rejection(503, br#"{"error":"Unavailable"}"#).retry_class,
+            RetryClass::Transient
+        );
+    }
+
+    #[test]
+    fn private_handshake_preserves_initial_usage_metadata() {
+        let message: RelayHandshakeMessage = serde_json::from_str(
+            r#"{
+                "type":"hello",
+                "subdomain":"demo.lpm.fyi",
+                "tunnel_url":"https://demo.lpm.fyi",
+                "session_id":"session-1",
+                "usage":{"accepted_requests":80000,"included_requests":100000}
+            }"#,
+        )
+        .expect("valid relay handshake");
+        let RelayHandshakeMessage::Hello { usage, .. } = message else {
+            panic!("expected hello");
+        };
+        let usage = usage.expect("initial usage");
+        assert_eq!(usage.accepted_requests, Some(80_000));
+        assert_eq!(usage.included_requests, Some(100_000));
+    }
+
+    #[test]
+    fn private_websocket_upgrade_results_keep_public_enum_exhaustive() {
+        let ready = serde_json::to_string(&ClientExtensionMessage::WebSocketReady {
+            id: "ws-1".to_string(),
+        })
+        .expect("serialize ready");
+        let rejected = serde_json::to_string(&ClientExtensionMessage::WebSocketReject {
+            id: "ws-2".to_string(),
+            error: "local upgrade failed".to_string(),
+        })
+        .expect("serialize rejection");
+
+        assert_eq!(ready, r#"{"type":"ws_ready","id":"ws-1"}"#);
+        assert_eq!(
+            rejected,
+            r#"{"type":"ws_reject","id":"ws-2","error":"local upgrade failed"}"#
+        );
+    }
+
     /// `write_tofu_pin` always lands at `~/.lpm/relay-pins/<host>` —
     /// never the legacy single-file location. Verifies both the
     /// directory layout and that read-back agrees.
     #[test]
     fn write_pin_uses_per_host_layout() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
 
@@ -1351,7 +1660,7 @@ mod tests {
     /// write path always migrates to per-host layout.
     #[test]
     fn read_pin_falls_back_to_legacy_on_default_host() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         // Pre-create legacy single-file pin
         let legacy = home.path().join(".lpm").join("relay-pin");
@@ -1369,7 +1678,7 @@ mod tests {
     /// for a different server's certificate.
     #[test]
     fn read_pin_ignores_legacy_for_non_default_host() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         let legacy = home.path().join(".lpm").join("relay-pin");
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
@@ -1387,7 +1696,7 @@ mod tests {
     /// host — guarantees the post-upgrade migration is sticky.
     #[test]
     fn read_pin_prefers_per_host_over_legacy() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         // Both exist; per-host should win.
         let legacy = home.path().join(".lpm").join("relay-pin");
@@ -1411,7 +1720,7 @@ mod tests {
     /// staging-relay setup to work without pin collisions.
     #[test]
     fn pins_are_isolated_per_host() {
-        let _g = env_lock();
+        let _g = crate::test_env_lock();
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
 
