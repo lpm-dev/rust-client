@@ -209,10 +209,10 @@ const fn acceptance_file_storage_enabled() -> bool {
 }
 
 fn use_fast_test_scrypt() -> bool {
-    // Release binaries must never drop the scrypt N=2^20 KDF cost.
-    // If env contamination flipped this on, the on-disk credential
-    // blob becomes brute-forceable in seconds after the next re-encrypt.
-    if !cfg!(debug_assertions) {
+    // SECURITY: Ordinary release binaries must never drop the scrypt N=2^20
+    // cost. The feature-gated acceptance build may do so only inside its
+    // validated disposable run home.
+    if !cfg!(debug_assertions) && !acceptance_file_storage_enabled() {
         return false;
     }
     matches!(
@@ -2167,6 +2167,38 @@ mod tests {
         ]);
 
         assert!(force_file_auth());
+    }
+
+    #[cfg(all(not(debug_assertions), feature = "acceptance-test-hooks"))]
+    #[test]
+    fn release_acceptance_build_allows_fast_scrypt_inside_isolated_run_home() {
+        let root = tempfile::tempdir().expect("create acceptance root");
+        let run_dir = root.path().join("run");
+        let home = run_dir.join("session-home");
+        std::fs::create_dir_all(&home).expect("create acceptance home");
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
+            ("ACCEPTANCE_RUN_DIR", Some(run_dir.into_os_string())),
+            ("ACCEPTANCE_RUN_ID", Some("release-fast-auth".into())),
+            ("LPM_ACCEPTANCE_FILE_STORAGE", Some("1".into())),
+            ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
+        ]);
+
+        assert!(use_fast_test_scrypt());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_ignores_fast_scrypt_without_acceptance_isolation() {
+        let _env = super::test_env::ScopedEnv::update([
+            ("ACCEPTANCE_RUN_DIR", None),
+            ("ACCEPTANCE_RUN_ID", None),
+            ("LPM_ACCEPTANCE_FILE_STORAGE", None),
+            ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
+        ]);
+
+        assert!(!use_fast_test_scrypt());
     }
 
     #[cfg(not(debug_assertions))]

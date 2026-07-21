@@ -97,7 +97,7 @@ fn debug_native_write_error() -> Option<String> {
 }
 
 fn use_fast_test_scrypt() -> bool {
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
     matches!(
@@ -739,6 +739,45 @@ mod tests {
         }
 
         assert!(!fast_scrypt);
+    }
+
+    #[cfg(all(not(debug_assertions), feature = "acceptance-test-hooks"))]
+    #[test]
+    fn release_acceptance_build_allows_fast_scrypt_inside_isolated_run_home() {
+        let _lock = crate::test_env_lock::acquire_env_lock();
+        let root = tempfile::tempdir().expect("create acceptance root");
+        let run_dir = root.path().join("run");
+        let home = run_dir.join("session-home");
+        std::fs::create_dir_all(&home).expect("create acceptance home");
+        let variables = [
+            ("HOME", home.as_os_str().to_owned()),
+            ("LPM_HOME", home.join(".lpm").into_os_string()),
+            ("ACCEPTANCE_RUN_DIR", run_dir.into_os_string()),
+            ("ACCEPTANCE_RUN_ID", "release-fast-vault".into()),
+            ("LPM_ACCEPTANCE_FILE_STORAGE", "1".into()),
+            ("LPM_TEST_FAST_SCRYPT", "1".into()),
+        ];
+        let previous = variables
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        unsafe {
+            for (name, value) in &variables {
+                std::env::set_var(name, value);
+            }
+        }
+
+        let fast_scrypt = use_fast_test_scrypt();
+
+        unsafe {
+            for (name, value) in previous.into_iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        assert!(fast_scrypt);
     }
 
     #[test]
