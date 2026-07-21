@@ -461,18 +461,17 @@ impl Sandbox for LandlockSandbox {
             None
         };
 
-        // Secret-file overlay: parent-side enumeration of secret
-        // paths under project_dir + pre-formatted uid_map bytes for
-        // the child's user-namespace setup. `None` when the project
-        // has no secrets to overlay (clean project, or every match
-        // is in the user's `secret_read_allow` opt-in list); the
-        // pre_exec closure skips the unshare dance entirely in
-        // that case. Failure to enumerate isn't fatal — overlay
-        // is best-effort containment, not a security floor.
+        // Secret-file overlay preparation is parent-side so path walking,
+        // CString construction, and ID-map formatting never happen after
+        // fork. Preparation uncertainty is fatal: treating an incomplete
+        // protection set as an empty one would expose project secrets.
         let overlay_spec = crate::linux_secret_overlay::SecretOverlaySpec::build(
             &self.spec.project_dir,
             &self.spec.secret_read_allow,
-        );
+        )
+        .map_err(|error| SandboxError::ProfileRenderFailed {
+            reason: format!("secret overlay preparation failed: {error}"),
+        })?;
         if let Some(ref s) = overlay_spec {
             tracing::debug!(
                 count = s.paths.len(),
@@ -504,8 +503,8 @@ impl Sandbox for LandlockSandbox {
         // enum manipulation, or (c) `io::Error::from_raw_os_error`
         // which wraps an integer without allocating.
         //
-        // Captured-state Drop audit (load-bearing — both captures
-        // need explicit handling, neither is trivially AS-safe):
+        // Captured-state Drop audit (load-bearing — all three captures
+        // need explicit handling, none is trivially AS-safe):
         //   - `ruleset_opt` holds an `Option<RulesetCreated>`. We
         //     `take()` it inside the closure; `restrict_self`
         //     consumes the `RulesetCreated` by value, so its
@@ -524,6 +523,10 @@ impl Sandbox for LandlockSandbox {
         //     the inline rationale at the seccomp-install site
         //     below. The post-`take()` `None` in `seccomp_opt`
         //     drops trivially.
+        //   - `overlay_opt` holds an `Option<SecretOverlaySpec>` with
+        //     heap-owning path and ID-map buffers. We `take()` it and
+        //     immediately wrap it in `ManuallyDrop`, so both the success
+        //     and fail-closed paths avoid allocator-backed destruction.
         //
         // install order:
         //   0. prctl(PR_SET_NO_NEW_PRIVS, 1, …) — set BEFORE the
@@ -579,14 +582,10 @@ impl Sandbox for LandlockSandbox {
                 crate::rlimits::apply_resource_limits_as_safe();
 
                 // ── Layer 1: secret-file bind-mount overlay ──
-                // Best-effort: enter a user+mount namespace and
-                // bind-mount /dev/null over every enumerated
-                // project secret file. AS-safe by construction (no
-                // alloc, direct syscalls only). Failure to unshare
-                // (hardened distro, kernel sysctl, AppArmor) silently
-                // no-ops — the macOS-equivalent containment is what
-                // we strive for; Linux falls back to "same as no
-                // overlay", which is the baseline before this layer.
+                // When the parent found protected secrets, every namespace,
+                // mapping, propagation, and bind-mount operation is required.
+                // The returned stage is Copy and maps to static bytes, so this
+                // failure path remains allocation- and lock-free.
                 //
                 // ManuallyDrop wrap mirrors the seccomp Vec handling
                 // below: `SecretOverlaySpec` owns a `Vec<CString>` +
@@ -601,7 +600,13 @@ impl Sandbox for LandlockSandbox {
                     // SAFETY: nested in the outer `unsafe` of the
                     // pre_exec closure; clippy correctly flags an
                     // explicit `unsafe { ... }` here as redundant.
-                    crate::linux_secret_overlay::apply_secret_overlay_in_child(&spec);
+                    match crate::linux_secret_overlay::apply_secret_overlay_in_child(&spec) {
+                        Ok(()) => {}
+                        Err(stage) => {
+                            write_stderr_as_safe(stage.diagnostic());
+                            return Err(std::io::Error::from_raw_os_error(stage.errno()));
+                        }
+                    }
                 }
 
                 // ── Layer 2: seccomp ──
@@ -807,17 +812,29 @@ fn rule_access_bits(access: RuleAccess, abi: ABI, is_file: bool) -> BitFlags<Acc
 /// (which holds a userspace mutex and deadlocks post-fork in
 /// multi-threaded processes) by issuing a direct `write(2)` to fd 2.
 ///
-/// Return value is intentionally ignored — there's no meaningful
-/// recovery at the pre_exec-failure call site, and `write` itself
-/// is AS-safe regardless of outcome.
+/// A short write is retried. Errors are ignored because there is no
+/// meaningful recovery at the pre_exec-failure call site.
 #[inline]
-fn write_stderr_as_safe(msg: &[u8]) {
+fn write_stderr_as_safe(msg: &'static [u8]) {
     // SAFETY: fd 2 is guaranteed open by the stdlib at process
     // start and our Command configuration doesn't close it. `msg`
     // is a static byte slice, so the pointer and length are valid
     // for the duration of the call. `libc::write` is AS-safe.
-    unsafe {
-        let _ = libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+    let mut written = 0usize;
+    while written < msg.len() {
+        // SAFETY: fd 2 remains open, and this suffix points to
+        // `msg.len() - written` valid static bytes.
+        let count = unsafe {
+            libc::write(
+                2,
+                msg[written..].as_ptr() as *const libc::c_void,
+                msg.len() - written,
+            )
+        };
+        if count <= 0 {
+            return;
+        }
+        written += count as usize;
     }
 }
 
@@ -1076,7 +1093,10 @@ mod tests {
 
     #[test]
     fn spawns_a_trivial_benign_command_under_enforce() {
-        let sb = match new_for_platform(realistic_spec(), SandboxMode::Enforce) {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let mut spec = realistic_spec();
+        spec.project_dir = project.path().to_path_buf();
+        let sb = match new_for_platform(spec, SandboxMode::Enforce) {
             Ok(sb) => sb,
             Err(SandboxError::KernelTooOld { .. }) => return,
             Err(e) => panic!("factory failed: {e:?}"),
@@ -1133,6 +1153,8 @@ mod tests {
         let secret = probe_dir.join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").unwrap();
         let mut spec = realistic_spec();
+        let project = tempfile::tempdir().expect("project tempdir");
+        spec.project_dir = project.path().to_path_buf();
         spec.tmpdir = PathBuf::from("/tmp");
         let sb = match new_for_platform(spec, SandboxMode::Enforce) {
             Ok(sb) => sb,

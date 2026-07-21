@@ -210,6 +210,13 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
+      - name: Secret overlay fails closed without user namespaces
+        run: |
+          overlay_original_userns_max=$(sysctl -n user.max_user_namespaces)
+          trap 'sudo sysctl -q -w user.max_user_namespaces="$overlay_original_userns_max" >/dev/null' EXIT
+          sudo sysctl -q -w user.max_user_namespaces=0 >/dev/null
+          cargo test --locked -p lpm-sandbox --test secret_overlay_bind_mount unavailable_secret_overlay_setup_prevents_command_execution -- --nocapture
+
       - name: Native build cache workflow (Linux sandbox)
         run: cargo nextest run --locked -p lpm-workflows --test native_build_cache --no-fail-fast --status-level slow --final-status-level fail
 

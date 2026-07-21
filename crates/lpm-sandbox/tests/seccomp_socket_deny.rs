@@ -127,7 +127,10 @@ fn denies_udp_socket_under_strict() {
         allow_degraded: false,
         build_cache_isolation: false,
     };
-    let sb = match new_for_platform_with_options(realistic_spec(), SandboxMode::Enforce, options) {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let mut spec = realistic_spec();
+    spec.project_dir = project.path().to_path_buf();
+    let sb = match new_for_platform_with_options(spec, SandboxMode::Enforce, options) {
         Ok(sb) => sb,
         // Kernel < 6.7 or landlock LSM disabled: no Strict
         // path available, so the seccomp filter wouldn't

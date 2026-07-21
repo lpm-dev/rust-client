@@ -51,10 +51,7 @@ use std::path::PathBuf;
 ///   the cargo test binary doesn't — different binary identities
 ///   produce different decisions.
 ///
-/// When this returns false the overlay layer is a documented
-/// no-op; skipping the runtime assertion is the correct behavior
-/// — a "shouldn't be empty" pass would mask the overlay's silent-
-/// degrade design.
+/// When this returns false, protected-secret spawns must fail closed.
 fn unshare_userns_supported() -> bool {
     // mount(2) needs a target file that exists on the host fs; the
     // bind-mount itself only takes effect in the new mount
@@ -101,6 +98,16 @@ fn unshare_userns_supported() -> bool {
             if !write_proc_file(b"/proc/self/gid_map\0", &gid_map) {
                 libc::_exit(14);
             }
+            let propagation_rc = libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            );
+            if propagation_rc != 0 {
+                libc::_exit(15);
+            }
             let rc = libc::mount(
                 c"/dev/null".as_ptr(),
                 probe_cstring.as_ptr(),
@@ -108,7 +115,7 @@ fn unshare_userns_supported() -> bool {
                 libc::MS_BIND,
                 std::ptr::null(),
             );
-            libc::_exit(if rc == 0 { 0 } else { 15 });
+            libc::_exit(if rc == 0 { 0 } else { 16 });
         }
         let mut status: libc::c_int = 0;
         if libc::waitpid(pid, &mut status, 0) < 0 {
@@ -173,8 +180,8 @@ fn default_mode_bind_mounts_dotenv_to_empty() {
             "skipping: unprivileged user namespaces unavailable on this host. \
              check `kernel.unprivileged_userns_clone`, AppArmor / SELinux \
              confinement, or container runtime privileges. \
-             The secret overlay is documented to silently no-op when unshare \
-             fails — running this assertion would mask that design."
+             The fail-closed behavior is covered by \
+             unavailable_secret_overlay_setup_prevents_command_execution."
         );
         return;
     }
@@ -217,11 +224,6 @@ fn default_mode_bind_mounts_dotenv_to_empty() {
 /// project files.
 #[test]
 fn default_mode_does_not_overlay_source_files() {
-    if !unshare_userns_supported() {
-        eprintln!("skipping: unprivileged user namespaces unavailable");
-        return;
-    }
-
     let project = tempfile::tempdir().expect("project tempdir");
     let src_path = project.path().join("hello.txt");
     let expected = "hello, world\n";
@@ -250,4 +252,81 @@ fn default_mode_does_not_overlay_source_files() {
         "non-secret file must remain readable; stderr = {:?}",
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// A protected path explicitly authorized through `secret_read_allow`
+/// remains readable and does not require namespace setup.
+#[test]
+fn allowlisted_secret_remains_readable_without_overlay_setup() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let env_path = project.path().join(".env");
+    let expected = "API_KEY=explicitly-allowed\n";
+    std::fs::write(&env_path, expected).expect("write .env");
+
+    let mut spec = fixture_spec(project.path());
+    spec.secret_read_allow.push(env_path.clone());
+    let options = SandboxOptions {
+        allow_degraded: false,
+        deny_outbound_network: false,
+        build_cache_isolation: false,
+    };
+    let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
+        .expect("sandbox construction");
+
+    let mut cmd = SandboxedCommand::new("/bin/cat");
+    cmd.args.push(env_path.into_os_string());
+    cmd.stdout = SandboxStdio::Piped;
+    cmd.stderr = SandboxStdio::Piped;
+
+    let child = sandbox.spawn(cmd).expect("spawn /bin/cat under sandbox");
+    let output = child.wait_with_output().expect("collect /bin/cat output");
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected,
+        "allowlisted secret must remain readable; stderr = {:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// When the host refuses a required namespace or mount operation,
+/// the sandbox must reject the spawn before the command can run.
+#[test]
+fn unavailable_secret_overlay_setup_prevents_command_execution() {
+    if unshare_userns_supported() {
+        eprintln!("skipping: host supports the complete secret overlay sequence");
+        return;
+    }
+
+    let project = tempfile::tempdir().expect("project tempdir");
+    std::fs::write(project.path().join(".env"), "API_KEY=actually-secret\n").expect("write .env");
+    let marker_dir = tempfile::tempdir().expect("marker tempdir");
+    let marker = marker_dir.path().join("command-ran");
+
+    let spec = fixture_spec(project.path());
+    let options = SandboxOptions {
+        allow_degraded: false,
+        deny_outbound_network: false,
+        build_cache_isolation: false,
+    };
+    let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
+        .expect("sandbox construction");
+
+    let mut cmd = SandboxedCommand::new("/usr/bin/touch");
+    cmd.args.push(marker.clone().into_os_string());
+
+    match sandbox.spawn(cmd) {
+        Err(_) => assert!(
+            !marker.exists(),
+            "failed spawn must not execute the command"
+        ),
+        Ok(child) => {
+            let output = child.wait_with_output().expect("collect touch output");
+            panic!(
+                "secret overlay setup failed but the command executed; marker_exists = {}, stderr = {:?}",
+                marker.exists(),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
 }
