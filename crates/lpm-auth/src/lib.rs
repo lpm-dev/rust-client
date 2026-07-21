@@ -164,16 +164,48 @@ struct StoredToken {
 }
 
 fn force_file_auth() -> bool {
-    // Release binaries always use the OS keychain — env contamination
-    // (`.envrc`, CI vars, wrapper script) must not be able to coerce
-    // a shipped lpm into the file-backed auth path.
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !acceptance_file_storage_enabled() {
         return false;
     }
     matches!(
         std::env::var("LPM_FORCE_FILE_AUTH").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
+}
+
+#[cfg(feature = "acceptance-test-hooks")]
+fn acceptance_file_storage_enabled() -> bool {
+    if !matches!(
+        std::env::var("LPM_ACCEPTANCE_FILE_STORAGE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) || std::env::var("ACCEPTANCE_RUN_ID")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+
+    let (Some(run_dir), Some(home), Some(lpm_home)) = (
+        std::env::var_os("ACCEPTANCE_RUN_DIR").map(std::path::PathBuf::from),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        std::env::var_os("LPM_HOME").map(std::path::PathBuf::from),
+    ) else {
+        return false;
+    };
+    if lpm_home != home.join(".lpm") {
+        return false;
+    }
+
+    let (Ok(run_dir), Ok(home)) = (std::fs::canonicalize(run_dir), std::fs::canonicalize(home))
+    else {
+        return false;
+    };
+    home != run_dir && home.starts_with(run_dir)
+}
+
+#[cfg(not(feature = "acceptance-test-hooks"))]
+const fn acceptance_file_storage_enabled() -> bool {
+    false
 }
 
 fn use_fast_test_scrypt() -> bool {
@@ -2116,6 +2148,38 @@ mod tests {
             assert!(!read_token_expiries().contains_key(registry));
             assert!(!legacy_marker.exists());
         });
+    }
+
+    #[cfg(all(not(debug_assertions), feature = "acceptance-test-hooks"))]
+    #[test]
+    fn release_acceptance_build_uses_file_auth_only_inside_isolated_run_home() {
+        let root = tempfile::tempdir().expect("create acceptance root");
+        let run_dir = root.path().join("run");
+        let home = run_dir.join("session-home");
+        std::fs::create_dir_all(&home).expect("create acceptance home");
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
+            ("ACCEPTANCE_RUN_DIR", Some(run_dir.into_os_string())),
+            ("ACCEPTANCE_RUN_ID", Some("release-file-auth".into())),
+            ("LPM_ACCEPTANCE_FILE_STORAGE", Some("1".into())),
+            ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+        ]);
+
+        assert!(force_file_auth());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_ignores_file_auth_without_acceptance_isolation() {
+        let _env = super::test_env::ScopedEnv::update([
+            ("ACCEPTANCE_RUN_DIR", None),
+            ("ACCEPTANCE_RUN_ID", None),
+            ("LPM_ACCEPTANCE_FILE_STORAGE", None),
+            ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+        ]);
+
+        assert!(!force_file_auth());
     }
 
     #[test]

@@ -441,7 +441,7 @@ pub async fn get_org_member_keys(
 /// warning on those targets.
 #[cfg(target_os = "macos")]
 fn force_file_x25519_keypair() -> bool {
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
     matches!(

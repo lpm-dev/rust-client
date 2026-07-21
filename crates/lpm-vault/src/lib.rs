@@ -47,16 +47,48 @@ pub enum VaultStorageBackend {
 }
 
 fn force_file_vault_backend() -> bool {
-    // Release builds always use the OS keychain — env contamination
-    // must not be able to redirect vault writes into a plain-file
-    // fallback that's then brute-forceable under fast-scrypt.
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !acceptance_file_storage_enabled() {
         return false;
     }
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+#[cfg(feature = "acceptance-test-hooks")]
+pub(crate) fn acceptance_file_storage_enabled() -> bool {
+    if !matches!(
+        std::env::var("LPM_ACCEPTANCE_FILE_STORAGE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    ) || std::env::var("ACCEPTANCE_RUN_ID")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+
+    let (Some(run_dir), Some(home), Some(lpm_home)) = (
+        std::env::var_os("ACCEPTANCE_RUN_DIR").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("LPM_HOME").map(PathBuf::from),
+    ) else {
+        return false;
+    };
+    if lpm_home != home.join(".lpm") {
+        return false;
+    }
+
+    let (Ok(run_dir), Ok(home)) = (std::fs::canonicalize(run_dir), std::fs::canonicalize(home))
+    else {
+        return false;
+    };
+    home != run_dir && home.starts_with(run_dir)
+}
+
+#[cfg(not(feature = "acceptance-test-hooks"))]
+pub(crate) const fn acceptance_file_storage_enabled() -> bool {
+    false
 }
 
 pub(crate) fn lpm_home_dir() -> Option<PathBuf> {

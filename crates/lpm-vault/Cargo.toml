@@ -50,5 +50,8 @@ tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
 
+[features]
+acceptance-test-hooks = []
+
 [lints]
 workspace = true

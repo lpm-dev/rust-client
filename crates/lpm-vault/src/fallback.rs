@@ -107,7 +107,7 @@ fn use_fast_test_scrypt() -> bool {
 }
 
 fn force_file_data_key() -> bool {
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
     matches!(
