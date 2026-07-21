@@ -11,7 +11,7 @@
 //! Reading the key unvalidated is a trust-boundary hole: a malicious
 //! repo can ship `package.json > lpm > scripts > sandboxWriteDirs =
 //! ["/"]` or `["/Users/foo/.ssh"]` and those absolute paths were
-//! accepted verbatim without validation. Three checks apply:
+//! accepted verbatim without validation. Four checks apply:
 //!
 //! 1. **Dangerous-root denylist** (unconditional): reject any entry
 //!    that resolves to `/`, `/etc`, `/var/run`, `/run`,
@@ -26,8 +26,14 @@
 //!    relative entries must stay inside `project_dir`. `"../etc"` is
 //!    rejected regardless of the user allowlist state.
 //! 3. **Containment intersection** (unconditional): every entry must
-//!    descend from `project_dir` OR from one of the user-allowlist
-//!    roots (`~/.lpm/config.toml > max-sandbox-write-roots`).
+//!    resolve under the canonical `project_dir` OR one of the
+//!    canonical user-allowlist roots (`~/.lpm/config.toml >
+//!    max-sandbox-write-roots`).
+//! 4. **Filesystem-indirection check** (unconditional): every
+//!    existing component below the authorized root must be a real
+//!    directory, never a symlink, junction, reparse point, or nested
+//!    mount. Missing suffixes are appended only after their nearest
+//!    existing ancestor passes the same check.
 //!
 //! # Empty-allowlist tightening
 //!
@@ -44,12 +50,13 @@
 //! inside `project_dir`).
 
 use crate::SandboxError;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 /// Read `package.json > lpm > scripts > sandboxWriteDirs` and return
-/// the resolved absolute paths, rejecting entries that would escape
-/// project_dir, match a dangerous-root denylist, or fall outside the
-/// caller-supplied user allowlist.
+/// filesystem-resolved effective paths, rejecting entries that would
+/// escape project_dir, match a dangerous-root denylist, fall outside
+/// the caller-supplied user allowlist, or traverse filesystem links.
 ///
 /// # Parameters
 ///
@@ -78,14 +85,18 @@ use std::path::{Component, Path, PathBuf};
 ///   non-string element surfaces as [`SandboxError::InvalidSpec`] so
 ///   the user sees a clear typo-level error rather than a silent
 ///   ignore.
-/// - Each string entry: if absolute, kept verbatim; if relative,
-///   joined onto `project_dir`. The result is always absolute so
-///   downstream backends can render it without further context.
+/// - Each string entry: if relative, joined onto the canonical
+///   `project_dir`; absolute entries are rebased onto the canonical
+///   project or allowlist root that authorizes them. Existing targets
+///   are canonicalized. Missing targets use their canonical nearest
+///   existing ancestor plus a validated normal-component suffix.
+///   Downstream backends receive this effective path, never the
+///   unchecked manifest spelling.
 /// - Empty strings are rejected: they would resolve to `project_dir`
 ///   itself, which is already covered by the read allow-list and
 ///   would silently widen the write set to the entire project tree.
 /// - Entries that fail validation (dangerous denylist, traversal
-///   escape, or containment intersection) surface as
+///   escape, containment intersection, or filesystem indirection) surface as
 ///   [`SandboxError::InvalidSpec`] with an error naming both the
 ///   project file + the user config source, so the user can tell
 ///   which side needs fixing.
@@ -128,14 +139,25 @@ pub fn load_sandbox_write_dirs(
                 entries
             ),
         })?;
+    let Some(first_entry) = arr.first() else {
+        return Ok(Vec::new());
+    };
+    let first_authored = first_entry.as_str().unwrap_or("<non-string>");
 
-    // Pre-normalize the project_dir so descendant checks and
-    // traversal-escape comparisons are against a stable form.
-    let project_dir_canon = logical_normalize(project_dir);
-    let user_allowlist_canon: Vec<PathBuf> = user_allowlist
+    let project_root = AuthorizedRoot::resolve(project_dir).map_err(|failure| {
+        invalid_root_error(package_json, 0, first_authored, "project_dir", failure)
+    })?;
+    let user_roots: Vec<(PathBuf, Result<AuthorizedRoot, PathValidationFailure>)> = user_allowlist
         .iter()
-        .map(|p| logical_normalize(p))
+        .map(|path| (logical_normalize(path), AuthorizedRoot::resolve(path)))
         .collect();
+    let effective_home = home_dir
+        .map(AuthorizedRoot::resolve)
+        .transpose()
+        .map_err(|failure| {
+            invalid_root_error(package_json, 0, first_authored, "home_dir", failure)
+        })?
+        .map(|root| root.effective);
 
     let mut resolved = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
@@ -177,20 +199,48 @@ pub fn load_sandbox_write_dirs(
         } else {
             authored.clone()
         };
-        let canonical = logical_normalize(&joined);
+        let lexical_candidate = logical_normalize(&joined);
 
-        validate_entry(
-            s,
-            &canonical,
-            was_relative,
-            &project_dir_canon,
-            &user_allowlist_canon,
-            home_dir,
-            i,
-            package_json,
-        )?;
+        if let Some(dangerous_reason) = matches_dangerous_root(&lexical_candidate, home_dir) {
+            return Err(dangerous_root_error(package_json, i, s, dangerous_reason));
+        }
 
-        resolved.push(joined);
+        let (authorized_root, suffix) = if was_relative {
+            let suffix = lexical_candidate
+                .strip_prefix(&project_root.configured)
+                .map_err(|_| relative_escape_error(package_json, i, s))?;
+            if suffix.as_os_str().is_empty() {
+                return Err(SandboxError::InvalidSpec {
+                    reason: format!(
+                        "{}: `lpm.scripts.sandboxWriteDirs[{i}]` = {s:?} collapses to the \
+                         project root; this would widen writes to the whole project",
+                        package_json.display()
+                    ),
+                });
+            }
+            (&project_root, suffix)
+        } else {
+            select_authorized_root(
+                &lexical_candidate,
+                &project_root,
+                &user_roots,
+                package_json,
+                i,
+                s,
+            )?
+        };
+
+        let effective = authorized_root
+            .resolve_descendant(suffix)
+            .map_err(|failure| invalid_entry_path_error(package_json, i, s, failure))?;
+
+        if let Some(dangerous_reason) =
+            matches_dangerous_root(&effective, effective_home.as_deref())
+        {
+            return Err(dangerous_root_error(package_json, i, s, dangerous_reason));
+        }
+
+        resolved.push(effective);
     }
 
     Ok(resolved)
@@ -198,112 +248,396 @@ pub fn load_sandbox_write_dirs(
 
 // ── Validation helpers ────────────────────────────────────────────
 
-/// Validate a single resolved entry against the dangerous-root
-/// denylist, the traversal-escape rule, and the containment
-/// intersection. Errors name both the project file and the offending
-/// path so the user knows which side to edit.
-#[allow(clippy::too_many_arguments)]
-fn validate_entry(
-    authored: &str,
-    canonical: &Path,
-    was_relative: bool,
-    project_dir_canon: &Path,
-    user_allowlist_canon: &[PathBuf],
-    home_dir: Option<&Path>,
-    i: usize,
+#[derive(Debug)]
+struct AuthorizedRoot {
+    configured: PathBuf,
+    effective: PathBuf,
+    existing_anchor: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathValidationFailure {
+    Indirection,
+    NotAbsolute,
+    NotDirectory,
+    EscapesRoot,
+    Io(ErrorKind),
+}
+
+impl AuthorizedRoot {
+    fn resolve(path: &Path) -> Result<Self, PathValidationFailure> {
+        let configured = logical_normalize(path);
+        if !configured.is_absolute() {
+            return Err(PathValidationFailure::NotAbsolute);
+        }
+
+        let mut probe = configured.clone();
+        loop {
+            match std::fs::symlink_metadata(&probe) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() && !is_filesystem_indirection(&metadata) {
+                        return Err(PathValidationFailure::NotDirectory);
+                    }
+                    let existing_anchor = std::fs::canonicalize(&probe)
+                        .map_err(|error| PathValidationFailure::Io(error.kind()))?;
+                    if !std::fs::metadata(&existing_anchor)
+                        .map_err(|error| PathValidationFailure::Io(error.kind()))?
+                        .is_dir()
+                    {
+                        return Err(PathValidationFailure::NotDirectory);
+                    }
+                    let suffix = configured
+                        .strip_prefix(&probe)
+                        .map_err(|_| PathValidationFailure::EscapesRoot)?;
+                    validate_relative_suffix(suffix)?;
+                    let mut effective = existing_anchor.clone();
+                    effective.push(suffix);
+                    return Ok(Self {
+                        configured,
+                        effective,
+                        existing_anchor,
+                    });
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+                {
+                    if !probe.pop() {
+                        return Err(PathValidationFailure::Io(error.kind()));
+                    }
+                }
+                Err(error) => return Err(PathValidationFailure::Io(error.kind())),
+            }
+        }
+    }
+
+    fn matched_suffix<'a>(&self, candidate: &'a Path) -> Option<&'a Path> {
+        candidate
+            .strip_prefix(&self.configured)
+            .ok()
+            .or_else(|| candidate.strip_prefix(&self.effective).ok())
+    }
+
+    fn resolve_descendant(&self, suffix: &Path) -> Result<PathBuf, PathValidationFailure> {
+        validate_relative_suffix(suffix)?;
+        let mut candidate = self.effective.clone();
+        candidate.push(suffix);
+        if !is_descendant_of(&candidate, &self.effective)
+            || !is_descendant_of(&candidate, &self.existing_anchor)
+        {
+            return Err(PathValidationFailure::EscapesRoot);
+        }
+
+        inspect_path_below(&self.existing_anchor, &candidate)?;
+        match std::fs::canonicalize(&candidate) {
+            Ok(resolved) => {
+                if !is_descendant_of(&resolved, &self.effective) {
+                    return Err(PathValidationFailure::EscapesRoot);
+                }
+                Ok(resolved)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(candidate),
+            Err(error) => Err(PathValidationFailure::Io(error.kind())),
+        }
+    }
+}
+
+fn select_authorized_root<'roots, 'candidate>(
+    candidate: &'candidate Path,
+    project_root: &'roots AuthorizedRoot,
+    user_roots: &'roots [(PathBuf, Result<AuthorizedRoot, PathValidationFailure>)],
     package_json: &Path,
-) -> Result<(), SandboxError> {
-    // Step 1: dangerous-root denylist (unconditional; has veto over
-    // the allowlist).
-    if let Some(dangerous_reason) = matches_dangerous_root(canonical, home_dir) {
-        return Err(SandboxError::InvalidSpec {
-            reason: format!(
-                "{pj}: `lpm.scripts.sandboxWriteDirs[{i}]` = {authored:?} \
-                 resolves to {path} which {reason}. This path is \
-                 rejected unconditionally — the dangerous-root denylist \
-                 has final veto over ~/.lpm/config.toml > \
-                 max-sandbox-write-roots.",
-                pj = package_json.display(),
-                path = canonical.display(),
-                reason = dangerous_reason,
-            ),
-        });
+    index: usize,
+    authored: &str,
+) -> Result<(&'roots AuthorizedRoot, &'candidate Path), SandboxError> {
+    let mut selected = project_root.matched_suffix(candidate).map(|suffix| {
+        (
+            project_root,
+            suffix,
+            project_root.configured.components().count(),
+        )
+    });
+
+    for (allowlist_index, (configured, resolved)) in user_roots.iter().enumerate() {
+        let configured_suffix = candidate.strip_prefix(configured).ok();
+        if configured_suffix.is_some()
+            && let Err(failure) = resolved
+        {
+            return Err(invalid_root_error(
+                package_json,
+                index,
+                authored,
+                &format!("max-sandbox-write-roots[{allowlist_index}]"),
+                *failure,
+            ));
+        }
+        let Ok(root) = resolved else {
+            continue;
+        };
+        let Some(suffix) = configured_suffix.or_else(|| root.matched_suffix(candidate)) else {
+            continue;
+        };
+        let depth = root.configured.components().count();
+        if selected.is_none_or(|(_, _, selected_depth)| depth > selected_depth) {
+            selected = Some((root, suffix, depth));
+        }
     }
 
-    // Step 2: traversal-escape check (unconditional; applies to
-    // authored-as-relative entries only — absolute entries are
-    // explicit user intent, not traversal).
-    if was_relative && !is_descendant_of(canonical, project_dir_canon) {
-        return Err(SandboxError::InvalidSpec {
-            reason: format!(
-                "{pj}: `lpm.scripts.sandboxWriteDirs[{i}]` = {authored:?} \
-                 uses `..` to escape project_dir = {project}. \
-                 Relative entries must stay inside the project; \
-                 use an absolute path (and add a matching entry to \
-                 ~/.lpm/config.toml > max-sandbox-write-roots if \
-                 you've set one) if you want to write outside.",
-                pj = package_json.display(),
-                project = project_dir_canon.display(),
-            ),
-        });
-    }
+    selected
+        .map(|(root, suffix, _)| (root, suffix))
+        .ok_or_else(|| {
+            outside_authorized_roots_error(
+                package_json,
+                index,
+                authored,
+                candidate,
+                user_roots.is_empty(),
+            )
+        })
+}
 
-    // Step 3: containment intersection (unconditional). Every entry
-    // must descend from `project_dir` OR from a user-allowlist root.
-    //
-    // Empty allowlist means "no opt-in", not "no constraint".
-    // Previously the empty case skipped this check, which let a
-    // malicious or careless `package.json > sandboxWriteDirs` edit
-    // (e.g. `["~/Documents"]`, `["/var/log"]`) widen install-script
-    // write access to user data the dangerous-root denylist does
-    // not cover (`~/.bashrc`, `~/.config`, `~/.local/share`, …).
-    // Install scripts come from untrusted dependencies, so the
-    // union of `sandboxWriteDirs` paths IS the dependency attack
-    // surface — defaulting that union open made the attack a
-    // one-line PR. Absolute paths outside `project_dir` now require
-    // an explicit covering entry in
-    // `~/.lpm/config.toml > max-sandbox-write-roots`.
-    //
-    // Relative entries are already covered by Step 2 (traversal
-    // escape) — they're guaranteed to stay inside `project_dir`, so
-    // this check is a no-op for them.
-    let inside_project = is_descendant_of(canonical, project_dir_canon);
-    let inside_user_root = user_allowlist_canon
-        .iter()
-        .any(|root| is_descendant_of(canonical, root));
-    if !inside_project && !inside_user_root {
-        return Err(SandboxError::InvalidSpec {
-            reason: format!(
-                "{pj}: `lpm.scripts.sandboxWriteDirs[{i}]` = {authored:?} \
-                 resolves to {path} which is outside project_dir = {project} \
-                 and not covered by ~/.lpm/config.toml > max-sandbox-write-roots {allowlist}. \
-                 To opt in, add a covering root to that user-config key; \
-                 to keep the entry project-local, change it to a relative \
-                 or project-internal absolute path.",
-                pj = package_json.display(),
-                path = canonical.display(),
-                project = project_dir_canon.display(),
-                allowlist = if user_allowlist_canon.is_empty() {
-                    "(empty — the key is unset)".to_string()
-                } else {
-                    format!("= {user_allowlist_canon:?}")
-                },
-            ),
-        });
+fn validate_relative_suffix(path: &Path) -> Result<(), PathValidationFailure> {
+    if path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        Ok(())
+    } else {
+        Err(PathValidationFailure::EscapesRoot)
     }
+}
 
+fn inspect_path_below(anchor: &Path, candidate: &Path) -> Result<(), PathValidationFailure> {
+    let suffix = candidate
+        .strip_prefix(anchor)
+        .map_err(|_| PathValidationFailure::EscapesRoot)?;
+    validate_relative_suffix(suffix)?;
+
+    let mut current = anchor.to_path_buf();
+    let mut parent_metadata =
+        std::fs::metadata(anchor).map_err(|error| PathValidationFailure::Io(error.kind()))?;
+    for component in suffix.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if is_filesystem_indirection(&metadata)
+                    || crosses_mount_boundary(&parent_metadata, &metadata)
+                {
+                    return Err(PathValidationFailure::Indirection);
+                }
+                if !metadata.is_dir() {
+                    return Err(PathValidationFailure::NotDirectory);
+                }
+                parent_metadata = metadata;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotADirectory => {
+                return Err(PathValidationFailure::NotDirectory);
+            }
+            Err(error) => return Err(PathValidationFailure::Io(error.kind())),
+        }
+    }
     Ok(())
 }
 
+#[cfg(unix)]
+fn crosses_mount_boundary(parent: &std::fs::Metadata, child: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    parent.dev() != child.dev()
+}
+
+#[cfg(not(unix))]
+fn crosses_mount_boundary(_parent: &std::fs::Metadata, _child: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn is_filesystem_indirection(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_filesystem_indirection(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn dangerous_root_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+    reason: &str,
+) -> SandboxError {
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} {reason}. \
+             This path is rejected unconditionally — the dangerous-root denylist has final \
+             veto over ~/.lpm/config.toml > max-sandbox-write-roots.",
+            pj = package_json.display(),
+        ),
+    }
+}
+
+fn relative_escape_error(package_json: &Path, index: usize, authored: &str) -> SandboxError {
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} uses `..` to escape \
+             project_dir. Relative entries must stay inside the project.",
+            pj = package_json.display(),
+        ),
+    }
+}
+
+fn outside_authorized_roots_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+    candidate: &Path,
+    allowlist_is_empty: bool,
+) -> SandboxError {
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} resolves to {path}, \
+             which is outside project_dir and not covered by ~/.lpm/config.toml > \
+             max-sandbox-write-roots {allowlist_state}. To opt in, add a covering root to that \
+             user-config key.",
+            pj = package_json.display(),
+            path = candidate.display(),
+            allowlist_state = if allowlist_is_empty {
+                "(empty — the key is unset)"
+            } else {
+                ""
+            },
+        ),
+    }
+}
+
+pub(crate) fn revalidate_effective_write_dir(
+    path: &Path,
+    index: usize,
+) -> Result<(), SandboxError> {
+    if let Err(failure) = revalidate_effective_path(path) {
+        let detail = match failure {
+            PathValidationFailure::Indirection => {
+                "the validated effective path now traverses a symlink, junction, reparse point, \
+                 or mount"
+            }
+            PathValidationFailure::NotAbsolute => "the validated effective path is not absolute",
+            PathValidationFailure::NotDirectory => {
+                "an existing effective-path component is not a directory"
+            }
+            PathValidationFailure::EscapesRoot => {
+                "the validated effective path escapes its authorized root"
+            }
+            PathValidationFailure::Io(_) => {
+                "the validated effective path can no longer be securely inspected"
+            }
+        };
+        return Err(SandboxError::InvalidSpec {
+            reason: format!(
+                "`lpm.scripts.sandboxWriteDirs[{index}]` is rejected: {detail}; \
+                 write-directory symlink/reparse traversal is not permitted"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn revalidate_effective_path(path: &Path) -> Result<(), PathValidationFailure> {
+    if !path.is_absolute() {
+        return Err(PathValidationFailure::NotAbsolute);
+    }
+    let mut probe = logical_normalize(path);
+    loop {
+        match std::fs::symlink_metadata(&probe) {
+            Ok(metadata) => {
+                if is_filesystem_indirection(&metadata) {
+                    return Err(PathValidationFailure::Indirection);
+                }
+                if !metadata.is_dir() {
+                    return Err(PathValidationFailure::NotDirectory);
+                }
+                let canonical = std::fs::canonicalize(&probe)
+                    .map_err(|error| PathValidationFailure::Io(error.kind()))?;
+                if canonical != probe {
+                    return Err(PathValidationFailure::Indirection);
+                }
+                return Ok(());
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                if !probe.pop() {
+                    return Err(PathValidationFailure::Io(error.kind()));
+                }
+            }
+            Err(error) => return Err(PathValidationFailure::Io(error.kind())),
+        }
+    }
+}
+
+fn invalid_entry_path_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+    failure: PathValidationFailure,
+) -> SandboxError {
+    let detail = match failure {
+        PathValidationFailure::Indirection => {
+            "write-directory symlink, junction, reparse-point, or mount traversal is not \
+             permitted; replace every path component below the authorized root with a real \
+             directory"
+                .to_string()
+        }
+        PathValidationFailure::NotAbsolute => {
+            "the resolved write directory is not absolute".to_string()
+        }
+        PathValidationFailure::NotDirectory => {
+            "an existing component is not a directory".to_string()
+        }
+        PathValidationFailure::EscapesRoot => {
+            "the resolved write directory escapes its authorized root".to_string()
+        }
+        PathValidationFailure::Io(kind) => format!(
+            "the path could not be securely inspected (filesystem error kind: {kind:?}); \
+             refusing to grant write access"
+        ),
+    };
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} is rejected: {detail}.",
+            pj = package_json.display(),
+        ),
+    }
+}
+
+fn invalid_root_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+    root_name: &str,
+    failure: PathValidationFailure,
+) -> SandboxError {
+    let detail = match failure {
+        PathValidationFailure::Indirection => "contains unresolved filesystem indirection",
+        PathValidationFailure::NotAbsolute => "is not absolute",
+        PathValidationFailure::NotDirectory => "is not a directory",
+        PathValidationFailure::EscapesRoot => "contains an invalid path suffix",
+        PathValidationFailure::Io(_) => "could not be securely resolved",
+    };
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} cannot be validated \
+             because {root_name} {detail}; refusing to grant write access.",
+            pj = package_json.display(),
+        ),
+    }
+}
+
 /// Logical path normalization — collapses `.` and `..` components
-/// without consulting the filesystem. Sufficient for the traversal-
-/// escape and descendant-of checks; does not resolve symlinks.
-///
-/// Symlink-based bypass is consistent with the sandbox's existing
-/// rule-rendering posture (see the seatbelt.rs canonicalization
-/// notes). The dangerous-root denylist + traversal check already
-/// cover the high-frequency attack shapes (`..` escape, authored
-/// `/etc/foo`). A comprehensive symlink-resolving layer is deferred.
+/// before filesystem-backed resolution and component inspection.
 fn logical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -413,6 +747,11 @@ fn matches_dangerous_root(path: &Path, home_dir: Option<&Path>) -> Option<&'stat
         if path == d || path.starts_with(d) {
             return Some(*reason);
         }
+        if let Ok(resolved) = std::fs::canonicalize(d)
+            && (path == resolved || path.starts_with(&resolved))
+        {
+            return Some(*reason);
+        }
     }
 
     if let Some(home) = home_dir {
@@ -435,6 +774,11 @@ fn matches_dangerous_root(path: &Path, home_dir: Option<&Path>) -> Option<&'stat
         for (suffix, reason) in home_denylist {
             let d = home.join(suffix);
             if path == d || path.starts_with(&d) {
+                return Some(*reason);
+            }
+            if let Ok(resolved) = std::fs::canonicalize(&d)
+                && (path == resolved || path.starts_with(&resolved))
+            {
                 return Some(*reason);
             }
         }
@@ -693,11 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_entry_kept_verbatim() {
-        // Absolute path outside project_dir requires a covering
-        // allowlist root. Verbatim-preservation is what this test pins — the loader keeps the authored
-        // path as-is, not joining it onto project_dir or normalizing
-        // away segments.
+    fn absolute_entry_returns_filesystem_resolved_effective_path() {
         let abs = unix_abs_str("/home/u/.cache/ms-playwright");
         let e = fixture(&format!(
             r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{abs}"]}}}}}}"#
@@ -705,7 +1045,8 @@ mod tests {
         let allowlist = [unix_abs_pathbuf("/home/u/.cache")];
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0], unix_abs_pathbuf("/home/u/.cache/ms-playwright"));
+        let root = AuthorizedRoot::resolve(&allowlist[0]).expect("resolve allowlist root");
+        assert_eq!(v[0], root.effective.join("ms-playwright"));
     }
 
     #[test]
@@ -713,7 +1054,12 @@ mod tests {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#);
         let v = load_minimal(&e).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0], e.project.join("build-output"));
+        assert_eq!(
+            v[0],
+            std::fs::canonicalize(&e.project)
+                .expect("canonical project")
+                .join("build-output")
+        );
         assert!(v[0].is_absolute());
     }
 
@@ -730,7 +1076,12 @@ mod tests {
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0], unix_abs_pathbuf("/abs/one"));
-        assert_eq!(v[1], e.project.join("rel-two"));
+        assert_eq!(
+            v[1],
+            std::fs::canonicalize(&e.project)
+                .expect("canonical project")
+                .join("rel-two")
+        );
         assert_eq!(v[2], unix_abs_pathbuf("/abs/three"));
     }
 
@@ -768,6 +1119,18 @@ mod tests {
             }
             other => panic!("expected InvalidSpec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_write_dirs_rejects_relative_path_that_collapses_to_project_root() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["missing/.."]}}}"#);
+
+        let error = load_minimal(&e).expect_err("project-root widening must be rejected");
+
+        assert!(
+            error.to_string().contains("whole project"),
+            "error explains the write-scope widening: {error}"
+        );
     }
 
     #[test]
@@ -827,7 +1190,279 @@ mod tests {
         fs::write(&e.package_json, body).expect("rewrite fixture");
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &[], None).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0], inside);
+        assert_eq!(
+            v[0],
+            std::fs::canonicalize(&e.project)
+                .expect("canonical project")
+                .join("build-output")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_rejects_symlink_to_directory_outside_project() {
+        use std::os::unix::fs::symlink;
+
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#);
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        symlink(outside.path(), e.project.join("build-output")).expect("create symlink");
+
+        match load_minimal(&e) {
+            Err(SandboxError::InvalidSpec { reason }) => {
+                assert!(
+                    reason.contains("sandboxWriteDirs[0]"),
+                    "error identifies the rejected entry: {reason}"
+                );
+                assert!(
+                    reason.contains("symlink") || reason.contains("link traversal"),
+                    "error explains that link traversal is forbidden: {reason}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_rejects_symlink_component_when_leaf_does_not_exist() {
+        use std::os::unix::fs::symlink;
+
+        let e =
+            fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["linked-parent/missing-leaf"]}}}"#);
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        symlink(outside.path(), e.project.join("linked-parent")).expect("create symlink");
+
+        let error = load_minimal(&e).expect_err("symlink component must be rejected");
+        assert!(
+            error.to_string().contains("symlink"),
+            "error explains the forbidden traversal: {error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_accepts_existing_real_directory_inside_project() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#);
+        let build_output = e.project.join("build-output");
+        fs::create_dir(&build_output).expect("create build output");
+
+        let paths = load_minimal(&e).expect("real project directory must be accepted");
+
+        assert_eq!(
+            paths,
+            vec![std::fs::canonicalize(build_output).expect("canonical build output")]
+        );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_accepts_nonexistent_directory_under_real_project_ancestor() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["real-parent/missing/leaf"]}}}"#);
+        fs::create_dir(e.project.join("real-parent")).expect("create real parent");
+
+        let paths = load_minimal(&e).expect("missing suffix under real ancestor must be accepted");
+
+        assert_eq!(
+            paths,
+            vec![
+                std::fs::canonicalize(&e.project)
+                    .expect("canonical project")
+                    .join("real-parent/missing/leaf")
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_preserves_explicit_allowlist_behavior_without_link_escape() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let allow_root = tempfile::tempdir().expect("allowlist tempdir");
+        let target = allow_root.path().join("build-output");
+        fs::create_dir(&target).expect("create allowlisted target");
+        fs::write(
+            &e.package_json,
+            format!(
+                r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+                json_encode_literal(&target.to_string_lossy())
+            ),
+        )
+        .expect("write package.json");
+
+        let paths = load_sandbox_write_dirs(
+            &e.package_json,
+            &e.project,
+            &[allow_root.path().to_path_buf()],
+            None,
+        )
+        .expect("real descendant of explicit allowlist root must be accepted");
+
+        assert_eq!(
+            paths,
+            vec![std::fs::canonicalize(target).expect("canonical target")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_rejects_symlink_inside_explicit_allowlist() {
+        use std::os::unix::fs::symlink;
+
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let allow_root = tempfile::tempdir().expect("allowlist tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let linked = allow_root.path().join("linked");
+        symlink(outside.path(), &linked).expect("create allowlist symlink");
+        let candidate = linked.join("missing-leaf");
+        fs::write(
+            &e.package_json,
+            format!(
+                r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+                json_encode_literal(&candidate.to_string_lossy())
+            ),
+        )
+        .expect("write package.json");
+
+        let error = load_sandbox_write_dirs(
+            &e.package_json,
+            &e.project,
+            &[allow_root.path().to_path_buf()],
+            None,
+        )
+        .expect_err("link traversal below an allowlist root must be rejected");
+
+        assert!(
+            error.to_string().contains("symlink"),
+            "error explains the forbidden traversal: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_accepts_project_root_reached_through_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_project = tmp.path().join("real-project");
+        let project_link = tmp.path().join("project-link");
+        fs::create_dir(&real_project).expect("create real project");
+        fs::create_dir(real_project.join("build-output")).expect("create build output");
+        fs::write(
+            real_project.join("package.json"),
+            r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#,
+        )
+        .expect("write package.json");
+        symlink(&real_project, &project_link).expect("create project symlink");
+
+        let paths =
+            load_sandbox_write_dirs(&project_link.join("package.json"), &project_link, &[], None)
+                .expect("project root symlink itself is permitted");
+
+        assert_eq!(
+            paths,
+            vec![
+                std::fs::canonicalize(real_project.join("build-output"))
+                    .expect("canonical build output")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_rejects_broken_symlink_component() {
+        use std::os::unix::fs::symlink;
+
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["broken-link/missing-leaf"]}}}"#);
+        symlink(
+            e.project.join("missing-target"),
+            e.project.join("broken-link"),
+        )
+        .expect("create broken symlink");
+
+        let error = load_minimal(&e).expect_err("broken symlink component must be rejected");
+        assert!(
+            error.to_string().contains("symlink"),
+            "error explains the forbidden traversal: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_revalidation_rejects_link_inserted_before_backend_use() {
+        use std::os::unix::fs::symlink;
+
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#);
+        let paths = load_minimal(&e).expect("missing real directory is initially valid");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        symlink(outside.path(), &paths[0]).expect("insert symlink after validation");
+
+        let error = revalidate_effective_write_dir(&paths[0], 0)
+            .expect_err("backend revalidation must reject the inserted link");
+
+        assert!(
+            error.to_string().contains("sandboxWriteDirs[0]")
+                && error.to_string().contains("symlink/reparse traversal"),
+            "error identifies the entry and invariant: {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_write_dirs_rejects_windows_junction_to_directory_outside_project() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#);
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let junction = e.project.join("build-output");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(outside.path())
+            .status()
+            .expect("run mklink /J");
+        assert!(status.success(), "mklink /J failed with {status}");
+
+        let error = load_minimal(&e).expect_err("junction must be rejected");
+        assert!(
+            error.to_string().contains("reparse") || error.to_string().contains("junction"),
+            "error explains the forbidden traversal: {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_write_dirs_accepts_project_root_reached_through_windows_junction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_project = tmp.path().join("real-project");
+        let project_junction = tmp.path().join("project-junction");
+        fs::create_dir(&real_project).expect("create real project");
+        fs::create_dir(real_project.join("build-output")).expect("create build output");
+        fs::write(
+            real_project.join("package.json"),
+            r#"{"lpm":{"scripts":{"sandboxWriteDirs":["build-output"]}}}"#,
+        )
+        .expect("write package.json");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&project_junction)
+            .arg(&real_project)
+            .status()
+            .expect("run mklink /J");
+        assert!(status.success(), "mklink /J failed with {status}");
+
+        let paths = load_sandbox_write_dirs(
+            &project_junction.join("package.json"),
+            &project_junction,
+            &[],
+            None,
+        )
+        .expect("project root junction itself is permitted");
+
+        assert_eq!(
+            paths,
+            vec![
+                std::fs::canonicalize(real_project.join("build-output"))
+                    .expect("canonical build output")
+            ]
+        );
     }
 
     /// Descendant path accepted when allowlist is non-empty.
@@ -948,6 +1583,36 @@ mod tests {
             }
             other => panic!("expected InvalidSpec, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangerous_root_veto_applies_after_home_secret_symlink_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let home = tempfile::tempdir().expect("home tempdir");
+        let secret_target = tempfile::tempdir().expect("secret target tempdir");
+        let ssh_link = home.path().join(".ssh");
+        symlink(secret_target.path(), &ssh_link).expect("create .ssh symlink");
+        let candidate = ssh_link.join("generated-key");
+        fs::write(
+            &e.package_json,
+            format!(
+                r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+                json_encode_literal(&candidate.to_string_lossy())
+            ),
+        )
+        .expect("write package.json");
+
+        let error =
+            load_sandbox_write_dirs(&e.package_json, &e.project, &[ssh_link], Some(home.path()))
+                .expect_err("resolved .ssh target must retain dangerous-root veto");
+
+        assert!(
+            error.to_string().contains(".ssh"),
+            "error names the protected home root: {error}"
+        );
     }
 
     /// Every dangerous-root denylist member rejected in isolation.

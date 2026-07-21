@@ -288,6 +288,10 @@ fn strict_not_yet_supported_remediation() -> String {
 
 impl Sandbox for WindowsSandbox {
     fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+        for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
+            crate::config::revalidate_effective_write_dir(path, index)?;
+        }
+
         // Mark every writable directory in the allow-set with a Low
         // IL system mandatory label so the Low IL child can write
         // there. Idempotent — re-running the same install or running
