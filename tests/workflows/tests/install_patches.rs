@@ -18,20 +18,15 @@
 mod support;
 
 use std::path::PathBuf;
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_v1_with_registry};
 
 /// Every test in this file asserts on the
 /// `<project>/.lpm/wrappers/<seg>/...` path shape, which is v1
-/// isolated layout. The 4f default flip moved
-/// `LinkerMode::default()` to Hoisted, so a no-flag install would
-/// land hoisted-flat and break the assertions wholesale. This helper
-/// pins `LPM_LINKER=isolated` on every spawned `lpm` to preserve
-/// the historical contract; the helper takes precedence below
-/// `--linker` and below `~/.lpm/config.toml > linker`, so any test
-/// that explicitly tests env-vs-config precedence still works
-/// (the per-test override comes after this in the env stack).
+/// isolated rollback layout. Keep the writer and linker selections paired so
+/// this file remains a focused rollback gate while normal patch workflows run
+/// against v2 elsewhere.
 fn lpm_isolated(project: &TempProject, url: &str) -> assert_cmd::Command {
-    let mut cmd = lpm_with_registry(project, url);
+    let mut cmd = lpm_v1_with_registry(project, url);
     cmd.env("LPM_LINKER", "isolated");
     cmd
 }

@@ -10,7 +10,10 @@ use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json,
 };
-use support::{TempProject, configure_fake_node, lpm, lpm_with_registry, write_signed_unlock};
+use support::{
+    TempProject, configure_fake_node, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry,
+    write_signed_unlock,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4385,8 +4388,7 @@ async fn install_with_explicit_v1_uses_v1_store_and_isolated_linker() {
     }"#,
     );
 
-    let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_STORE_VERSION", "v1")
+    let output = lpm_v1_with_registry(&project, &mock.url())
         .args([
             "install",
             "--linker",
@@ -6344,7 +6346,7 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
 /// to `packages/<member>`. No registry interaction — workspace deps are
 /// fully local.
 #[test]
-fn install_workspace_star_dep_plants_root_symlink_to_member() {
+fn store_v1_rollback_workspace_star_dep_links_member_source() {
     let project = TempProject::empty(
         r#"{
   "name": "ws-star-root",
@@ -6363,7 +6365,7 @@ fn install_workspace_star_dep_plants_root_symlink_to_member() {
         r#"{"name":"ws-member-a","version":"1.2.3"}"#,
     );
 
-    lpm(&project)
+    lpm_v1(&project)
         .args([
             "install",
             "--no-security-summary",
@@ -6436,7 +6438,7 @@ fn install_workspace_star_dep_accepts_member_without_version() {
 /// locally as a symlink. Pre-fix, install rewrote `workspace:^` into a
 /// registry range and 404'd against the upstream proxy.
 #[test]
-fn install_workspace_caret_dep_resolves_to_local_member() {
+fn store_v1_rollback_workspace_caret_dep_links_member_source() {
     let project = TempProject::empty(
         r#"{
   "name": "ws-caret-root",
@@ -6455,7 +6457,7 @@ fn install_workspace_caret_dep_resolves_to_local_member() {
         r#"{"name":"ws-member-b","version":"2.5.0"}"#,
     );
 
-    lpm(&project)
+    lpm_v1(&project)
         .args([
             "install",
             "--no-security-summary",
@@ -6773,7 +6775,7 @@ exports.peer = require("@smoke/cycle-a").name
 /// every other install test in this file; this one pins the hoisted
 /// surface so a regression in the flatten pass is caught.
 #[tokio::test]
-async fn install_hoisted_mode_places_transitive_dep_at_root() {
+async fn store_v1_rollback_hoisted_mode_places_transitive_dep_at_root() {
     let mock = MockRegistry::start().await;
 
     let leaf_tarball = make_tarball("leaf-pkg", "1.0.0");
@@ -6852,7 +6854,7 @@ async fn install_hoisted_mode_places_transitive_dep_at_root() {
         r#"{"name":"hoist-test","version":"1.0.0","dependencies":{"parent-pkg":"^1.0.0"}}"#,
     );
 
-    lpm_with_registry(&project, &mock.url())
+    lpm_v1_with_registry(&project, &mock.url())
         .args([
             "install",
             "--linker",
@@ -7061,9 +7063,11 @@ async fn run_transitive_dependency_failure_case(resolver: Option<&str>, parent_o
         let node_modules = project.path().join("node_modules");
         assert!(
             node_modules.join("failure-host").exists()
-                && node_modules.join("failure-parent").exists()
-                && !node_modules.join("missing-required-child").exists(),
-            "the optional parent must remain installed while its unavailable child is omitted",
+                && !node_modules.join("missing-required-child").exists()
+                && !node_modules
+                    .join("failure-host/node_modules/missing-required-child")
+                    .exists(),
+            "the required host must remain installed while the failed optional subtree is omitted",
         );
     } else {
         assert!(
@@ -7363,8 +7367,12 @@ async fn strict_install_skips_incompatible_required_descendant_below_optional_pa
     );
     let node_modules = project.path().join("node_modules");
     assert!(node_modules.join("engine-host").exists());
-    assert!(node_modules.join("engine-optional-parent").exists());
-    assert!(!node_modules.join("incompatible-engine").exists());
+    assert!(
+        !node_modules.join("incompatible-engine").exists()
+            && !node_modules
+                .join("engine-host/node_modules/incompatible-engine")
+                .exists()
+    );
 }
 
 #[test]
@@ -7771,10 +7779,9 @@ fn v1_store_rejects_required_workspace_member_with_incompatible_node_engine() {
         }"#,
     );
 
-    let mut command = lpm(&project);
+    let mut command = lpm_v1(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .env("LPM_STORE_VERSION", "v1")
         .args([
             "install",
             "--no-security-summary",
@@ -8378,10 +8385,9 @@ async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
 }
 
 /// End-to-end integrity verification: the SRI claim recorded in the
-/// lockfile, the SRI persisted in the global store's `.integrity` file,
-/// and a fresh recomputation from the original tarball bytes must all
-/// agree byte-for-byte. A regression in any link of that chain — bad
-/// metadata reads, store mis-write, lockfile downgrade — would diverge.
+/// lockfile, the integrity-addressed global v2 object, and a fresh
+/// recomputation from the original tarball bytes must agree. A regression in
+/// any link of that chain would diverge.
 #[tokio::test]
 async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
     let mock = MockRegistry::start().await;
@@ -8439,19 +8445,15 @@ async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
         "lockfile integrity must match SHA-512 of the served tarball bytes"
     );
 
-    // 2. Stored .integrity file
-    let store_integrity_path = project
-        .store_dir()
-        .join("v1")
-        .join("integrity-pkg@1.0.0")
-        .join(".integrity");
-    let stored_integrity = std::fs::read_to_string(&store_integrity_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", store_integrity_path.display()))
-        .trim()
-        .to_string();
-    assert_eq!(
-        stored_integrity, expected_integrity,
-        "store .integrity file must match the lockfile claim and the tarball hash"
+    // 2. Integrity-keyed v2 object
+    let store = lpm_store::v2::Store::at(project.store_dir().join("v2"));
+    let stored_object = store
+        .reusable_object_dir(&expected_integrity)
+        .expect("validate the v2 object")
+        .expect("the expected integrity must address a reusable v2 object");
+    assert!(
+        stored_object.join("package.json").is_file(),
+        "integrity-keyed v2 object must contain the installed package"
     );
 }
 
@@ -8777,8 +8779,6 @@ fn install_workspace_file_dedupe_plants_root_symlink_for_member() {
         "packages/foo/package.json",
         r#"{ "name": "foo", "version": "1.0.0" }"#,
     );
-    let foo_dir = project.path().join("packages").join("foo");
-
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
         .args(["install"])
         .output()
@@ -8790,7 +8790,27 @@ fn install_workspace_file_dedupe_plants_root_symlink_for_member() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    assert_root_symlink_resolves_to(&project, "foo", &foo_dir);
+    let root_link = project.path().join("node_modules/foo");
+    assert!(
+        root_link
+            .symlink_metadata()
+            .expect("file-deduped workspace member must be linked")
+            .file_type()
+            .is_symlink(),
+        "file-deduped workspace member must be a root symlink"
+    );
+    let resolved = root_link
+        .canonicalize()
+        .expect("resolve file-deduped workspace member");
+    let links_root = project
+        .store_dir()
+        .join("v2/links")
+        .canonicalize()
+        .expect("resolve v2 links root");
+    assert!(
+        resolved.starts_with(links_root),
+        "default v2 install must materialize the workspace source graph in the v2 link store; got {resolved:?}"
+    );
 
     // F9 path actually fired — guards against a future fix that plants
     // the symlink via a different path while leaving F9 silently broken.
@@ -8811,7 +8831,7 @@ fn install_workspace_file_dedupe_plants_root_symlink_for_member() {
 /// the BFS continues into linked members rather than stopping at the
 /// top-level extracted set.
 #[test]
-fn install_workspace_transitive_protocol_plants_sibling_root_symlink() {
+fn store_v1_rollback_workspace_transitives_link_member_sources_at_root() {
     let project = TempProject::empty(
         r#"{
   "name": "ws-transitive-root",
@@ -8836,7 +8856,7 @@ fn install_workspace_transitive_protocol_plants_sibling_root_symlink() {
     let foo_dir = project.path().join("packages").join("foo");
     let bar_dir = project.path().join("packages").join("bar");
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_v1_with_registry(&project, "http://127.0.0.1:1")
         .args(["install"])
         .output()
         .expect("spawn lpm install");
@@ -9124,7 +9144,7 @@ fn install_workspace_self_dependency_fails_without_writing_artifacts() {
 /// the deepest link (baz) was lost when the BFS started from the
 /// extracted top-level set rather than from F9-discovered members.
 #[test]
-fn install_workspace_file_dedupe_then_transitive_chain_plants_all_root_symlinks() {
+fn store_v1_rollback_file_dedupe_transitives_link_member_sources_at_root() {
     let project = TempProject::empty(
         r#"{
   "name": "ws-chain-root",
@@ -9159,7 +9179,7 @@ fn install_workspace_file_dedupe_then_transitive_chain_plants_all_root_symlinks(
     let bar_dir = project.path().join("packages").join("bar");
     let baz_dir = project.path().join("packages").join("baz");
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_v1_with_registry(&project, "http://127.0.0.1:1")
         .args(["install"])
         .output()
         .expect("spawn lpm install");
@@ -9553,7 +9573,7 @@ async fn offline_install_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
 /// only by canonical realpath, so the alias seed suppressed the
 /// canonical `node_modules/foo` link.
 #[test]
-fn install_workspace_alias_and_transitive_target_both_get_root_links() {
+fn store_v1_rollback_workspace_alias_and_transitive_target_get_root_links() {
     let project = TempProject::empty(
         r#"{
   "name": "ws-alias-transitive",
@@ -9576,7 +9596,7 @@ fn install_workspace_alias_and_transitive_target_both_get_root_links() {
     );
 
     // Online: all three root links (canonical foo + alias aliasfoo + bar).
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out = lpm_v1_with_registry(&project, "http://127.0.0.1:1")
         .args(WORKSPACE_INSTALL_FLAGS)
         .output()
         .expect("spawn lpm install (online)");
@@ -9591,7 +9611,7 @@ fn install_workspace_alias_and_transitive_target_both_get_root_links() {
 
     // Offline rebuild must produce the same set.
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
-    let out_offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+    let out_offline = lpm_v1_with_registry(&project, "http://127.0.0.1:1")
         .args([
             "install",
             "--offline",

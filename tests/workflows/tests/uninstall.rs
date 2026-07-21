@@ -14,7 +14,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry};
 
 /// Seed `project` with an installed-looking layout for `pkg@version`:
 /// `package.json` deps entry, a minimal `lpm.lock`, and a
@@ -531,7 +531,7 @@ async fn uninstall_after_real_install_removes_isolated_symlink() {
 /// that the next install can see on disk even though the manifest and
 /// lockfile are already clean.
 #[tokio::test]
-async fn uninstall_after_real_install_removes_hoisted_directory() {
+async fn store_v1_rollback_uninstall_removes_hoisted_directory() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("real-hoisted", "1.0.0");
     mock.with_package("real-hoisted", "1.0.0", &tarball).await;
@@ -557,7 +557,7 @@ async fn uninstall_after_real_install_removes_hoisted_directory() {
         r#"{"name":"roundtrip-hoisted","version":"1.0.0","dependencies":{"real-hoisted":"^1.0.0"}}"#,
     );
 
-    lpm_with_registry(&project, &mock.url())
+    lpm_v1_with_registry(&project, &mock.url())
         .args([
             "install",
             "--linker",
@@ -578,7 +578,7 @@ async fn uninstall_after_real_install_removes_hoisted_directory() {
         "hoisted install must materialize a real directory, got metadata: {metadata:?}"
     );
 
-    lpm(&project)
+    lpm_v1(&project)
         .args(["uninstall", "real-hoisted"])
         .assert()
         .success();

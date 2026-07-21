@@ -45,11 +45,11 @@ fn project_with_lockfile(lockfile: &str) -> TempProject {
     project
 }
 
-fn package_store_dir(project: &TempProject, name: &str, version: &str) -> std::path::PathBuf {
-    project
-        .store_dir()
-        .join("v1")
-        .join(format!("{name}@{version}"))
+fn package_object_dir(project: &TempProject, name: &str, version: &str) -> std::path::PathBuf {
+    let integrity = compute_integrity(&make_tarball(name, version));
+    lpm_store::v2::StoreV2Paths::at(project.store_dir().join("v2"))
+        .object_dir(&integrity)
+        .expect("fixture integrity must address a valid v2 object path")
 }
 
 fn rewrite_lockfile_registry_sources_to_public_npm(project: &TempProject) {
@@ -154,7 +154,7 @@ async fn fetch_reads_lockfile_without_manifest_and_enables_offline_frozen_instal
         "lpm fetch must not rewrite lpm.lock"
     );
     assert!(
-        package_store_dir(&project, "ms", "2.1.3")
+        package_object_dir(&project, "ms", "2.1.3")
             .join("package.json")
             .is_file(),
         "lpm fetch must populate the package store"
@@ -259,7 +259,7 @@ async fn fetch_firewall_enforce_blocks_public_npm_lockfile_package_before_tarbal
         "firewall block must happen before fetch downloads tarballs"
     );
     assert!(
-        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        !package_object_dir(&project, "ms", "2.1.3").exists(),
         "blocked fetch must not populate the package store"
     );
 }
@@ -295,7 +295,7 @@ async fn fetch_firewall_enforce_blocks_legacy_public_npm_tarball_before_download
         "error must name the firewall block; got:\n{combined}"
     );
     assert!(
-        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        !package_object_dir(&project, "ms", "2.1.3").exists(),
         "blocked legacy fetch must not populate the package store"
     );
 }
@@ -331,7 +331,7 @@ async fn fetch_firewall_enforce_blocks_canonical_public_npm_tarball_before_downl
         "error must name the firewall block; got:\n{combined}"
     );
     assert!(
-        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        !package_object_dir(&project, "ms", "2.1.3").exists(),
         "blocked canonical npm tarball fetch must not populate the package store"
     );
 }
@@ -366,7 +366,7 @@ async fn fetch_hard_errors_when_locked_integrity_is_missing() {
         "error must name missing integrity, got:\n{stderr}"
     );
     assert!(
-        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        !package_object_dir(&project, "ms", "2.1.3").exists(),
         "failed fetch must not populate the store"
     );
 }
@@ -401,7 +401,7 @@ async fn fetch_rejects_integrity_mismatch_before_storing_bytes() {
         "error must name the integrity mismatch, got:\n{stderr}"
     );
     assert!(
-        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        !package_object_dir(&project, "ms", "2.1.3").exists(),
         "integrity mismatch must not populate the store"
     );
 }
@@ -446,7 +446,7 @@ async fn fetch_platform_option_skips_incompatible_lockfile_entries() {
     assert_eq!(json["counts"]["fetched"], serde_json::json!(1));
     assert_eq!(json["counts"]["skipped"], serde_json::json!(1));
     assert!(
-        !package_store_dir(&project, "native-musl", "1.0.0").exists(),
+        !package_object_dir(&project, "native-musl", "1.0.0").exists(),
         "incompatible platform package must not be fetched"
     );
 }

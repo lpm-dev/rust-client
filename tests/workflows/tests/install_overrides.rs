@@ -22,6 +22,7 @@
 
 mod support;
 
+use support::mock_registry::make_tarball;
 use support::{TempProject, lpm_with_registry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -74,23 +75,27 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
     project.write_file("lpm.lock", &toml);
 }
 
-/// Seed a fake but well-formed entry in `<HOME>/.lpm/store/v1/<safe>@<v>/`.
-/// `lpm install --offline` checks `PackageStore::has_package` for every
-/// locked package; the offline branch demands a `package.json` +
-/// `.integrity` file inside the version directory.
+/// Seed a valid integrity-keyed v2 object and bind the matching lockfile row
+/// to its source integrity.
 fn seed_store_package(project: &TempProject, name: &str, version: &str) {
-    let safe_name = name.replace(['/', '\\'], "+");
-    let dir = project
-        .store_dir()
-        .join("v1")
-        .join(format!("{safe_name}@{version}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("package.json"),
-        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
-    )
-    .unwrap();
-    std::fs::write(dir.join(".integrity"), "sha512-fixture").unwrap();
+    let store = lpm_store::v2::Store::at(project.store_dir().join("v2"));
+    let tarball = make_tarball(name, version);
+    let (_, integrity, _) = store
+        .extract_object_from_bytes(&tarball, None)
+        .expect("seed v2 override fixture object");
+
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read fixture lockfile");
+    let package = lockfile
+        .packages
+        .iter_mut()
+        .find(|package| package.name == name && package.version == version)
+        .expect("fixture lockfile must contain the seeded package");
+    package.integrity = Some(integrity);
+    lockfile
+        .write_all(&lockfile_path)
+        .expect("bind fixture lockfile to seeded v2 object");
 }
 
 /// Write a synthetic `.lpm/overrides-state.json`. `parsed` is the
