@@ -60,10 +60,11 @@ type PortReassignments = HashMap<String, PortReassignment>;
 
 const HOST_ONLY_DEFAULT_PORT_START: u16 = 3000;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct AssignedServicePorts {
     port_map: ServicePortMap,
     reassignments: PortReassignments,
+    leases: Vec<ports::PortLease>,
 }
 
 /// Command sent from the dashboard (or external controller) to the orchestrator.
@@ -315,14 +316,41 @@ fn port_conflict_reason(port: u16, reserved_ports: &HashMap<u16, String>) -> Opt
     }
 }
 
-fn find_available_service_port(start: u16, reserved_ports: &HashMap<u16, String>) -> Option<u16> {
+enum ServicePortReservation {
+    Acquired(ports::PortLease),
+    Conflict(String),
+}
+
+fn reserve_service_port(
+    port: u16,
+    reserved_ports: &HashMap<u16, String>,
+    port_allocation: &ports::PortAllocation,
+) -> Result<ServicePortReservation, LpmError> {
+    if let Some(reason) = port_conflict_reason(port, reserved_ports) {
+        return Ok(ServicePortReservation::Conflict(reason));
+    }
+    match port_allocation.try_acquire_lease(port)? {
+        Some(lease) => Ok(ServicePortReservation::Acquired(lease)),
+        None => Ok(ServicePortReservation::Conflict(
+            "another lpm dev process".to_string(),
+        )),
+    }
+}
+
+fn find_available_service_port(
+    start: u16,
+    reserved_ports: &HashMap<u16, String>,
+    port_allocation: &ports::PortAllocation,
+) -> Result<Option<(u16, ports::PortLease)>, LpmError> {
     let mut candidate = start;
     loop {
-        if port_conflict_reason(candidate, reserved_ports).is_none() {
-            return Some(candidate);
+        if let ServicePortReservation::Acquired(lease) =
+            reserve_service_port(candidate, reserved_ports, port_allocation)?
+        {
+            return Ok(Some((candidate, lease)));
         }
         if candidate == u16::MAX {
-            return None;
+            return Ok(None);
         }
         candidate += 1;
     }
@@ -331,11 +359,13 @@ fn find_available_service_port(start: u16, reserved_ports: &HashMap<u16, String>
 fn assign_service_ports(
     project_dir: &Path,
     active_services: &HashMap<String, ServiceConfig>,
+    port_allocation: &mut ports::PortAllocation,
 ) -> Result<AssignedServicePorts, LpmError> {
-    let port_overrides = ports::read_port_overrides(project_dir);
+    let port_overrides = port_allocation.read_overrides(project_dir);
     let mut port_map: ServicePortMap = HashMap::with_capacity(active_services.len());
     let mut reassignments: PortReassignments = HashMap::new();
     let mut reserved_ports: HashMap<u16, String> = HashMap::with_capacity(active_services.len());
+    let mut leases = Vec::with_capacity(active_services.len());
 
     let mut service_names: Vec<&String> = active_services.keys().collect();
     service_names.sort_unstable();
@@ -348,34 +378,42 @@ fn assign_service_ports(
             continue;
         };
 
-        if let Some(reason) = port_conflict_reason(port, &reserved_ports) {
-            let next = port
-                .checked_add(1)
-                .and_then(|start| find_available_service_port(start, &reserved_ports))
+        match reserve_service_port(port, &reserved_ports, port_allocation)? {
+            ServicePortReservation::Conflict(reason) => {
+                let (next, lease) = match port.checked_add(1) {
+                    Some(start) => {
+                        find_available_service_port(start, &reserved_ports, port_allocation)?
+                    }
+                    None => None,
+                }
                 .ok_or_else(|| {
                     LpmError::Script(format!(
                         "no available port found near {port} for service '{name}'"
                     ))
                 })?;
+                leases.push(lease);
 
-            if requested_port.is_some() {
-                reassignments.insert(
-                    name.clone(),
-                    PortReassignment {
-                        original: port,
-                        new: next,
-                        reason,
-                    },
-                );
+                if requested_port.is_some() {
+                    reassignments.insert(
+                        name.clone(),
+                        PortReassignment {
+                            original: port,
+                            new: next,
+                            reason,
+                        },
+                    );
+                }
+                port_map.insert(name.clone(), next);
+                reserved_ports.insert(next, name.clone());
+                port_allocation.write_override(project_dir, name, next);
             }
-            port_map.insert(name.clone(), next);
-            reserved_ports.insert(next, name.clone());
-            ports::write_port_override(project_dir, name, next);
-        } else {
-            port_map.insert(name.clone(), port);
-            reserved_ports.insert(port, name.clone());
-            if requested_port.is_none() {
-                ports::write_port_override(project_dir, name, port);
+            ServicePortReservation::Acquired(lease) => {
+                leases.push(lease);
+                port_map.insert(name.clone(), port);
+                reserved_ports.insert(port, name.clone());
+                if requested_port.is_none() {
+                    port_allocation.write_override(project_dir, name, port);
+                }
             }
         }
     }
@@ -383,6 +421,7 @@ fn assign_service_ports(
     Ok(AssignedServicePorts {
         port_map,
         reassignments,
+        leases,
     })
 }
 
@@ -453,10 +492,14 @@ pub fn run_services(
     // Topological sort
     let groups = service_graph::topological_sort(&active_services).map_err(LpmError::Script)?;
 
+    let mut port_allocation = ports::acquire_port_allocation()?;
     let AssignedServicePorts {
         port_map,
         reassignments: port_reassignments,
-    } = assign_service_ports(project_dir, &active_services)?;
+        leases: port_leases,
+    } = assign_service_ports(project_dir, &active_services, &mut port_allocation)?;
+    drop(port_allocation);
+    let _port_leases = port_leases;
 
     if let Some(ref callback) = options.on_ports_assigned {
         callback(&port_map)?;
@@ -1519,7 +1562,12 @@ mod tests {
         );
         let dir = tempfile::TempDir::new().unwrap();
 
-        let assigned_ports = assign_service_ports(dir.path(), &services).unwrap();
+        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+            lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
+            dir.path().join("port-leases"),
+        )
+        .unwrap();
+        let assigned_ports = assign_service_ports(dir.path(), &services, &mut allocation).unwrap();
 
         assert_eq!(assigned_ports.port_map.get("web"), Some(&port));
         assert!(assigned_ports.reassignments.is_empty());
@@ -1541,7 +1589,12 @@ mod tests {
         );
         let dir = tempfile::TempDir::new().unwrap();
 
-        let assigned_ports = assign_service_ports(dir.path(), &services).unwrap();
+        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+            lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
+            dir.path().join("port-leases"),
+        )
+        .unwrap();
+        let assigned_ports = assign_service_ports(dir.path(), &services, &mut allocation).unwrap();
 
         let assigned = assigned_ports.port_map["web"];
         assert_ne!(assigned, port);

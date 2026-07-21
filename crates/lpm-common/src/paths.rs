@@ -210,6 +210,11 @@ impl LpmRoot {
         self.home.join("ports.toml")
     }
 
+    /// Cross-process lock covering dev-service port selection and persistence.
+    pub fn ports_lock(&self) -> PathBuf {
+        self.home.join(".ports.lock")
+    }
+
     /// Machine-global local proxy daemon state at `~/.lpm/proxy.json`.
     pub fn proxy_state(&self) -> PathBuf {
         self.home.join("proxy.json")
@@ -1087,6 +1092,7 @@ mod tests {
             root.bin_dir(),
             root.plugins_root(),
             root.ports_toml(),
+            root.ports_lock(),
             root.global_root(),
             root.global_manifest(),
             root.global_installs(),

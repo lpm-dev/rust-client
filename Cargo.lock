@@ -3581,6 +3581,8 @@ dependencies = [
 name = "lpm-runner"
 version = "0.68.0"
 dependencies = [
+ "dirs",
+ "fd-lock",
  "hex",
  "libc",
  "lpm-cert",
