@@ -84,12 +84,13 @@ pub(crate) const SECRET_SUBPATH_DIRS: &[&str] = &[
     "secret",
 ];
 
-/// Filename suffixes denied at any depth under `project_dir`.
+/// Filename suffixes denied under `project_dir` wherever the backend's
+/// documented traversal reaches.
 ///
 /// macOS converts each suffix into an SBPL regex
 /// (`/.*<escaped-ext>$`) anchored at the canonicalized project_dir
-/// prefix. Linux uses the suffixes directly with `str::ends_with`
-/// during the bounded project walk.
+/// prefix. Linux matches the raw encoded filename bytes during its
+/// bounded, pruned project walk.
 ///
 /// Each entry starts with `.` and may contain multiple dots
 /// (`.tfvars.json` is one entry, not `.json`). The macOS regex

@@ -38,14 +38,13 @@
 //!
 //! # Failure mode
 //!
-//! Hardened distros (Debian/Ubuntu's `kernel.unprivileged_userns_clone=0`,
-//! some AppArmor profiles, SELinux confinement, containers without
-//! `--privileged`) block step 1. When `unshare` returns `EPERM` or
-//! `EACCES`, this layer silently no-ops: the script gets the same
-//! access it would have had without the overlay, which is the
-//! Linux baseline before this commit. Failure is transparent
-//! rather than fatal because the broader sandbox (landlock + env
-//! scrub + script policy) still applies.
+//! When at least one protected path needs masking, this layer is a
+//! security boundary. Namespace creation, ID mapping, private mount
+//! propagation, and every bind mount must succeed. Any failure aborts
+//! `pre_exec`, so the lifecycle command never runs with the project's
+//! broad Landlock read grant and an incomplete overlay. Projects with
+//! no protected files, or only explicitly allowlisted files, skip the
+//! namespace setup entirely.
 //!
 //! # Limitations
 //!
@@ -60,19 +59,50 @@
 //!   directory source; we use file-on-file because `/dev/null` is
 //!   a character device. Subpath dirs (`.ssh/`, `.aws/`, …) are
 //!   handled by walking inside and overlaying each regular file.
+//! - Extension discovery is depth-capped and prunes dependency and
+//!   generated-output directories. Literal paths are checked separately.
 //!
 //! # Async-signal safety
 //!
 //! The child-side entry point [`apply_secret_overlay_in_child`] is
 //! AS-safe by construction: no heap allocation, no lock acquisition,
-//! direct `libc::*` syscalls only. All allocating work
-//! (`enumerate_project_secrets`, `SecretOverlaySpec::build`,
-//! `CString` allocation, `uid_map` formatting) happens in the
-//! parent before fork.
+//! direct `libc::*` syscalls only. Failures are represented by a
+//! small `Copy` stage enum and mapped to static diagnostics. All
+//! allocating work (`enumerate_project_secrets`,
+//! `SecretOverlaySpec::build`, `CString` allocation, `uid_map`
+//! formatting) happens in the parent before fork.
 
 use crate::secret_paths::{SECRET_FILE_EXTENSIONS, SECRET_LITERAL_PATHS, SECRET_SUBPATH_DIRS};
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SecretOverlayBuildError {
+    #[error("failed to {operation} protected-secret path {path:?}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[cfg(target_os = "linux")]
+    #[error("protected-secret path contains an interior NUL byte: {path:?}")]
+    InteriorNul { path: PathBuf },
+}
+
+fn path_io_error(
+    operation: &'static str,
+    path: &Path,
+    source: io::Error,
+) -> SecretOverlayBuildError {
+    SecretOverlayBuildError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
 
 /// Directory names to prune during the project walk. These hold
 /// large amounts of upstream code (`node_modules`, `target`, `.git`)
@@ -94,16 +124,16 @@ const WALK_PRUNED_DIRS: &[&str] = &[
     ".yarn",
 ];
 
-/// Maximum walk depth (root counts as depth 0). 4 covers
-/// `project/subdir1/subdir2/subdir3/subdir4` which is enough for
-/// the common cases (`infra/prod/secrets/x.tfstate`, `services/api/.env`).
-/// Deeper-nested secrets escape this layer; document the limitation
-/// in the module preamble.
+/// Exclusive directory-depth bound (root counts as depth 0). A value
+/// of 4 walks directories at depths 1–3 and does not enter depth 4.
+/// This covers common paths such as `infra/prod/secrets.tfvars` while
+/// bounding install-start traversal cost.
 const WALK_MAX_DEPTH: usize = 4;
 
 /// Parent-side helper: enumerate the set of files under
 /// `project_dir` whose `file-read*` should be denied. Returns
-/// canonical absolute paths suitable for `mount(2)` calls.
+/// project-rooted paths suitable for `mount(2)` calls. Callers provide
+/// an absolute `project_dir`, so returned paths are absolute as well.
 ///
 /// `allow_list` carries the user's per-project / per-user
 /// `script-read-allow` entries (resolved to absolute project-rooted
@@ -119,41 +149,41 @@ const WALK_MAX_DEPTH: usize = 4;
 pub(crate) fn enumerate_project_secrets(
     project_dir: &Path,
     allow_list: &[PathBuf],
-) -> Vec<PathBuf> {
-    let allow_set: HashSet<&Path> = allow_list.iter().map(|p| p.as_path()).collect();
+) -> Result<Vec<PathBuf>, SecretOverlayBuildError> {
+    let mut allow_set: HashSet<&Path> = HashSet::with_capacity(allow_list.len());
+    allow_set.extend(allow_list.iter().map(PathBuf::as_path));
     let mut out: Vec<PathBuf> = Vec::new();
 
-    // Literal paths — direct symlink_metadata + regular-file check.
     for rel in SECRET_LITERAL_PATHS {
         let abs = project_dir.join(rel);
         if allow_set.contains(abs.as_path()) {
             continue;
         }
-        if let Ok(meta) = std::fs::symlink_metadata(&abs)
-            && meta.file_type().is_file()
-        {
-            out.push(abs);
+        match std::fs::symlink_metadata(&abs) {
+            Ok(meta) if meta.file_type().is_file() => out.push(abs),
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(path_io_error("inspect", &abs, source)),
         }
     }
 
-    // Subpath dirs — walk inside and overlay every regular file.
     for rel in SECRET_SUBPATH_DIRS {
         let abs = project_dir.join(rel);
-        if let Ok(meta) = std::fs::symlink_metadata(&abs)
-            && meta.file_type().is_dir()
-        {
-            collect_files_recursive(&abs, &mut out, &allow_set, WALK_MAX_DEPTH);
+        match std::fs::symlink_metadata(&abs) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                collect_files_recursive(&abs, &mut out, &allow_set, WALK_MAX_DEPTH)?;
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(path_io_error("inspect", &abs, source)),
         }
     }
 
-    // File-extension matches — bounded walk from project root.
-    walk_for_extensions(project_dir, &mut out, &allow_set);
+    walk_for_extensions(project_dir, &mut out, &allow_set)?;
 
-    // Sort for deterministic output (tests + reproducible mount
-    // ordering).
     out.sort();
     out.dedup();
-    out
+    Ok(out)
 }
 
 /// Recursive walk that adds every regular file under `dir` to
@@ -165,45 +195,52 @@ fn collect_files_recursive(
     out: &mut Vec<PathBuf>,
     allow_set: &HashSet<&Path>,
     remaining_depth: usize,
-) {
+) -> Result<(), SecretOverlayBuildError> {
     if remaining_depth == 0 {
-        return;
+        return Ok(());
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
+    let entries = std::fs::read_dir(dir).map_err(|source| path_io_error("read", dir, source))?;
+    for entry_result in entries {
+        let entry = entry_result.map_err(|source| path_io_error("read entry in", dir, source))?;
         let path = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|source| path_io_error("inspect", &path, source))?;
         if ft.is_dir() {
-            collect_files_recursive(&path, out, allow_set, remaining_depth - 1);
+            collect_files_recursive(&path, out, allow_set, remaining_depth - 1)?;
         } else if ft.is_file() && !allow_set.contains(path.as_path()) {
             out.push(path);
         }
-        // Symlinks intentionally skipped.
     }
+    Ok(())
 }
 
 /// Bounded walk from `root` that pushes any regular file whose
 /// basename ends with one of `SECRET_FILE_EXTENSIONS`. Prunes
 /// `WALK_PRUNED_DIRS` and caps depth at `WALK_MAX_DEPTH`.
-fn walk_for_extensions(root: &Path, out: &mut Vec<PathBuf>, allow_set: &HashSet<&Path>) {
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+fn walk_for_extensions(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    allow_set: &HashSet<&Path>,
+) -> Result<(), SecretOverlayBuildError> {
+    let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(32);
+    stack.push((root.to_path_buf(), 0));
     while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
+        let entries =
+            std::fs::read_dir(&dir).map_err(|source| path_io_error("read", &dir, source))?;
+        for entry_result in entries {
+            let entry =
+                entry_result.map_err(|source| path_io_error("read entry in", &dir, source))?;
             let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|source| path_io_error("inspect", &path, source))?;
             if ft.is_dir() {
                 let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if WALK_PRUNED_DIRS.iter().any(|p| *p == name_str.as_ref()) {
+                if WALK_PRUNED_DIRS
+                    .iter()
+                    .any(|pruned| name.as_os_str() == OsStr::new(pruned))
+                {
                     continue;
                 }
                 if depth + 1 < WALK_MAX_DEPTH {
@@ -214,16 +251,20 @@ fn walk_for_extensions(root: &Path, out: &mut Vec<PathBuf>, allow_set: &HashSet<
                     continue;
                 }
                 let name = entry.file_name();
-                let name_str = name.to_string_lossy();
                 if SECRET_FILE_EXTENSIONS
                     .iter()
-                    .any(|ext| name_str.ends_with(ext))
+                    .any(|ext| path_ends_with(&name, ext))
                 {
                     out.push(path);
                 }
             }
         }
     }
+    Ok(())
+}
+
+fn path_ends_with(name: &OsStr, suffix: &str) -> bool {
+    name.as_encoded_bytes().ends_with(suffix.as_bytes())
 }
 
 /// Parent-side spec describing the bind-mount overlay to apply in
@@ -243,67 +284,199 @@ pub(crate) struct SecretOverlaySpec {
     /// `/dev/null` over. Allocated parent-side; the child only
     /// reads the `.as_ptr()` and never frees (see ManuallyDrop
     /// wrapping in the install site).
-    pub paths: Vec<std::ffi::CString>,
+    pub(crate) paths: Vec<std::ffi::CString>,
     /// Pre-formatted `"0 <uid> 1\n"` bytes for `/proc/self/uid_map`.
-    pub uid_map_bytes: Vec<u8>,
+    pub(crate) uid_map_bytes: Vec<u8>,
     /// Pre-formatted `"0 <gid> 1\n"` bytes for `/proc/self/gid_map`.
-    pub gid_map_bytes: Vec<u8>,
+    pub(crate) gid_map_bytes: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]
 impl SecretOverlaySpec {
-    /// Build the overlay spec for `project_dir`. Returns `None`
-    /// when there are no secret files to mount over — caller
-    /// skips the `unshare` dance entirely in that case.
-    pub(crate) fn build(project_dir: &Path, allow_list: &[PathBuf]) -> Option<Self> {
-        let paths_pb = enumerate_project_secrets(project_dir, allow_list);
+    /// Builds the overlay spec for `project_dir`.
+    ///
+    /// Returns `Ok(None)` when no protected file needs masking. Any
+    /// preparation uncertainty is returned as an error before spawn.
+    pub(crate) fn build(
+        project_dir: &Path,
+        allow_list: &[PathBuf],
+    ) -> Result<Option<Self>, SecretOverlayBuildError> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let paths_pb = enumerate_project_secrets(project_dir, allow_list)?;
         if paths_pb.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut paths = Vec::with_capacity(paths_pb.len());
         for p in paths_pb {
-            // Skip non-UTF-8 paths and paths containing interior NUL
-            // bytes (the latter is impossible on Linux but defended
-            // against). Both are extreme edge cases — losing them
-            // means those specific files stay readable; not a
-            // regression versus the no-overlay baseline.
-            let Some(s) = p.to_str() else {
-                continue;
-            };
-            let Ok(cs) = std::ffi::CString::new(s) else {
-                continue;
-            };
+            let cs = std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|_| SecretOverlayBuildError::InteriorNul { path: p })?;
             paths.push(cs);
         }
-        if paths.is_empty() {
-            return None;
-        }
+        // SAFETY: getuid and getgid have no pointer preconditions and
+        // only return the calling process's real IDs.
         let uid = unsafe { libc::getuid() };
+        // SAFETY: see the getuid call above.
         let gid = unsafe { libc::getgid() };
-        // ITOA-style formatting — no allocation beyond the Vec
-        // capacity needed for the final byte string. `format!` in
-        // the child would NOT be AS-safe; doing the format here
-        // (parent-side) is cheap.
         let uid_map_bytes = format!("0 {uid} 1\n").into_bytes();
         let gid_map_bytes = format!("0 {gid} 1\n").into_bytes();
-        Some(Self {
+        Ok(Some(Self {
             paths,
             uid_map_bytes,
             gid_map_bytes,
-        })
+        }))
     }
 }
 
-/// AS-safe child-side hook: install the secret-file overlay.
-/// Called from the landlock backend's `pre_exec` closure BEFORE
-/// seccomp + landlock are installed (neither restricts `mount(2)`,
-/// but doing overlay first keeps ordering simple).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecretOverlayStage {
+    Unshare,
+    Setgroups,
+    UidMap,
+    GidMap,
+    MountPropagation,
+    BindMount,
+}
+
+#[cfg(target_os = "linux")]
+impl SecretOverlayStage {
+    pub(crate) const fn diagnostic(self) -> &'static [u8] {
+        match self {
+            Self::Unshare => b"lpm-sandbox: secret overlay namespace creation failed\n",
+            Self::Setgroups => b"lpm-sandbox: secret overlay setgroups denial failed\n",
+            Self::UidMap => b"lpm-sandbox: secret overlay uid mapping failed\n",
+            Self::GidMap => b"lpm-sandbox: secret overlay gid mapping failed\n",
+            Self::MountPropagation => {
+                b"lpm-sandbox: secret overlay mount propagation setup failed\n"
+            }
+            Self::BindMount => b"lpm-sandbox: secret overlay bind mount failed\n",
+        }
+    }
+
+    pub(crate) const fn errno(self) -> libc::c_int {
+        libc::EPERM
+    }
+}
+
+#[cfg(target_os = "linux")]
+trait SecretOverlayOperations {
+    fn unshare_user_and_mount_namespaces(&mut self) -> bool;
+    fn deny_setgroups(&mut self) -> bool;
+    fn write_uid_map(&mut self, bytes: &[u8]) -> bool;
+    fn write_gid_map(&mut self, bytes: &[u8]) -> bool;
+    fn make_mounts_private(&mut self) -> bool;
+    fn bind_dev_null(&mut self, target: &std::ffi::CStr) -> bool;
+    fn remount_proc_restricted(&mut self);
+}
+
+#[cfg(target_os = "linux")]
+struct LibcSecretOverlayOperations;
+
+#[cfg(target_os = "linux")]
+impl SecretOverlayOperations for LibcSecretOverlayOperations {
+    fn unshare_user_and_mount_namespaces(&mut self) -> bool {
+        // SAFETY: unshare takes only an integer flag mask. This call creates
+        // process-local namespaces and does not dereference userspace memory.
+        unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) == 0 }
+    }
+
+    fn deny_setgroups(&mut self) -> bool {
+        // SAFETY: the path is static and NUL-terminated; the byte slice is
+        // valid for the duration of the direct open/write/close sequence.
+        unsafe { write_proc_file_assafe(c"/proc/self/setgroups".as_ptr(), b"deny") }
+    }
+
+    fn write_uid_map(&mut self, bytes: &[u8]) -> bool {
+        // SAFETY: the path is static and NUL-terminated; `bytes` is borrowed
+        // from the parent-built spec and remains valid throughout pre_exec.
+        unsafe { write_proc_file_assafe(c"/proc/self/uid_map".as_ptr(), bytes) }
+    }
+
+    fn write_gid_map(&mut self, bytes: &[u8]) -> bool {
+        // SAFETY: the path is static and NUL-terminated; `bytes` is borrowed
+        // from the parent-built spec and remains valid throughout pre_exec.
+        unsafe { write_proc_file_assafe(c"/proc/self/gid_map".as_ptr(), bytes) }
+    }
+
+    fn make_mounts_private(&mut self) -> bool {
+        // SAFETY: target is a static NUL-terminated path. MS_PRIVATE ignores
+        // source, filesystem type, and data, so null pointers are required.
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ) == 0
+        }
+    }
+
+    fn bind_dev_null(&mut self, target: &std::ffi::CStr) -> bool {
+        // SAFETY: all three paths are valid NUL-terminated C strings. MS_BIND
+        // ignores the data pointer, and the target remains alive for the call.
+        unsafe {
+            libc::mount(
+                c"/dev/null".as_ptr(),
+                target.as_ptr(),
+                c"none".as_ptr(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ) == 0
+        }
+    }
+
+    fn remount_proc_restricted(&mut self) {
+        // SAFETY: every pointer refers to a static NUL-terminated byte string.
+        // The optional procfs hardening remains best-effort and is outside the
+        // secret-overlay success contract.
+        unsafe {
+            libc::mount(
+                c"proc".as_ptr(),
+                c"/proc".as_ptr(),
+                c"proc".as_ptr(),
+                libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                c"hidepid=2,subset=pid".as_ptr() as *const libc::c_void,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_secret_overlay<O: SecretOverlayOperations>(
+    spec: &SecretOverlaySpec,
+    operations: &mut O,
+) -> Result<(), SecretOverlayStage> {
+    if !operations.unshare_user_and_mount_namespaces() {
+        return Err(SecretOverlayStage::Unshare);
+    }
+    if !operations.deny_setgroups() {
+        return Err(SecretOverlayStage::Setgroups);
+    }
+    if !operations.write_uid_map(&spec.uid_map_bytes) {
+        return Err(SecretOverlayStage::UidMap);
+    }
+    if !operations.write_gid_map(&spec.gid_map_bytes) {
+        return Err(SecretOverlayStage::GidMap);
+    }
+    if !operations.make_mounts_private() {
+        return Err(SecretOverlayStage::MountPropagation);
+    }
+    for path in &spec.paths {
+        if !operations.bind_dev_null(path) {
+            return Err(SecretOverlayStage::BindMount);
+        }
+    }
+    operations.remount_proc_restricted();
+    Ok(())
+}
+
+/// Installs the secret-file overlay in the forked child.
 ///
-/// Best-effort: any failure (`unshare` blocked by sysctl, write to
-/// uid_map fails, mount EACCES because the target is on a
-/// no-exec filesystem) silently no-ops. The broader sandbox
-/// still applies — degradation is "same as no overlay", not
-/// "weaker than baseline".
+/// Namespace creation, ID mapping, propagation isolation, and every
+/// required bind mount fail closed. The optional procfs remount remains
+/// best-effort defense in depth.
 ///
 /// # Safety
 ///
@@ -314,95 +487,15 @@ impl SecretOverlaySpec {
 ///   site suppresses Drop in the child so the Vec/CString
 ///   allocations are NOT freed here (free() is not AS-safe).
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
-    // Step 1: enter a new user + mount namespace. Failure here is
-    // common on hardened distros (Debian's
-    // `kernel.unprivileged_userns_clone=0`, AppArmor confinement,
-    // containers without --privileged). The lifecycle script will
-    // still see the macOS-equivalent of the deny — sorry, scratch
-    // that, this is Linux: it'll see the same access it had
-    // before this layer existed.
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-        return;
-    }
-
-    // Step 2: write `deny` to /proc/self/setgroups. Required by
-    // the kernel before writing gid_map for unprivileged user-ns
-    // (otherwise setgroups(2) inside the namespace would be a
-    // privilege escalation primitive). The `deny` is permanent
-    // for the namespace.
-    const SETGROUPS_DENY: &[u8] = b"deny";
-    const SETGROUPS_PATH: &[u8] = b"/proc/self/setgroups\0";
-    if !unsafe {
-        write_proc_file_assafe(
-            SETGROUPS_PATH.as_ptr() as *const libc::c_char,
-            SETGROUPS_DENY,
-        )
-    } {
-        return;
-    }
-
-    // Step 3: map our real uid to 0 inside the namespace so we
-    // get CAP_SYS_ADMIN there. gid_map mirrors. The pre-formatted
-    // bytes were built parent-side.
-    const UID_MAP_PATH: &[u8] = b"/proc/self/uid_map\0";
-    const GID_MAP_PATH: &[u8] = b"/proc/self/gid_map\0";
-    if !unsafe {
-        write_proc_file_assafe(
-            UID_MAP_PATH.as_ptr() as *const libc::c_char,
-            &spec.uid_map_bytes,
-        )
-    } {
-        return;
-    }
-    if !unsafe {
-        write_proc_file_assafe(
-            GID_MAP_PATH.as_ptr() as *const libc::c_char,
-            &spec.gid_map_bytes,
-        )
-    } {
-        return;
-    }
-
-    // Step 4: bind-mount /dev/null over each target. Per-path
-    // failures are tolerated (file gone since enumeration, race
-    // with another tool, target on a no-bind filesystem).
-    const DEV_NULL_SRC: &[u8] = b"/dev/null\0";
-    const FS_NONE: &[u8] = b"none\0";
-    for cs in &spec.paths {
-        unsafe {
-            libc::mount(
-                DEV_NULL_SRC.as_ptr() as *const libc::c_char,
-                cs.as_ptr(),
-                FS_NONE.as_ptr() as *const libc::c_char,
-                libc::MS_BIND,
-                std::ptr::null(),
-            );
-        }
-    }
-
-    // Step 5: remount /proc with `hidepid=2,subset=pid` to narrow the
-    // landlock /proc Read grant — blocks cross-UID introspection and
-    // trims system-wide non-pid entries. Best-effort; kernels without
-    // `subset=pid` no-op silently. (Same-UID isolation requires
-    // CLONE_NEWPID + double-fork, which `Command::pre_exec`'s single-
-    // fork-execve shape doesn't support.)
-    const PROC_PATH: &[u8] = b"/proc\0";
-    const PROC_FSTYPE: &[u8] = b"proc\0";
-    const PROC_OPTS: &[u8] = b"hidepid=2,subset=pid\0";
-    unsafe {
-        libc::mount(
-            PROC_FSTYPE.as_ptr() as *const libc::c_char,
-            PROC_PATH.as_ptr() as *const libc::c_char,
-            PROC_FSTYPE.as_ptr() as *const libc::c_char,
-            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            PROC_OPTS.as_ptr() as *const libc::c_void,
-        );
-    }
+pub(crate) unsafe fn apply_secret_overlay_in_child(
+    spec: &SecretOverlaySpec,
+) -> Result<(), SecretOverlayStage> {
+    let mut operations = LibcSecretOverlayOperations;
+    apply_secret_overlay(spec, &mut operations)
 }
 
 /// AS-safe `write_all`-style helper for `/proc/self/*` files.
-/// Returns `true` on full write, `false` on any error.
+/// Returns `true` only when the full write and close succeed.
 ///
 /// # Safety
 ///
@@ -410,13 +503,15 @@ pub(crate) unsafe fn apply_secret_overlay_in_child(spec: &SecretOverlaySpec) {
 /// must outlive the call. No allocations performed.
 #[cfg(target_os = "linux")]
 unsafe fn write_proc_file_assafe(path: *const libc::c_char, bytes: &[u8]) -> bool {
-    let fd = unsafe { libc::open(path, libc::O_WRONLY) };
+    // SAFETY: the caller guarantees `path` is NUL-terminated and valid.
+    let fd = unsafe { libc::open(path, libc::O_WRONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return false;
     }
     let mut written: usize = 0;
     while written < bytes.len() {
         let remaining = bytes.len() - written;
+        // SAFETY: `fd` is open and the slice points to `remaining` valid bytes.
         let n = unsafe {
             libc::write(
                 fd,
@@ -425,13 +520,14 @@ unsafe fn write_proc_file_assafe(path: *const libc::c_char, bytes: &[u8]) -> boo
             )
         };
         if n <= 0 {
+            // SAFETY: `fd` is an open descriptor owned by this function.
             unsafe { libc::close(fd) };
             return false;
         }
         written += n as usize;
     }
-    unsafe { libc::close(fd) };
-    true
+    // SAFETY: `fd` is an open descriptor owned by this function.
+    unsafe { libc::close(fd) == 0 }
 }
 
 #[cfg(test)]
@@ -448,13 +544,260 @@ mod tests {
         tmp
     }
 
+    fn enumerate(project_dir: &Path, allow_list: &[PathBuf]) -> Vec<PathBuf> {
+        enumerate_project_secrets(project_dir, allow_list).expect("enumerate project secrets")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecordedOperation {
+        Unshare,
+        Setgroups,
+        UidMap,
+        GidMap,
+        MountPropagation,
+        BindMount(usize),
+        RemountProc,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct MockOperations {
+        fail_stage: Option<SecretOverlayStage>,
+        fail_bind_index: Option<usize>,
+        bind_index: usize,
+        calls: Vec<RecordedOperation>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl MockOperations {
+        fn failing(stage: SecretOverlayStage) -> Self {
+            Self {
+                fail_stage: Some(stage),
+                fail_bind_index: None,
+                bind_index: 0,
+                calls: Vec::new(),
+            }
+        }
+
+        fn failing_bind(index: usize) -> Self {
+            Self {
+                fail_stage: None,
+                fail_bind_index: Some(index),
+                bind_index: 0,
+                calls: Vec::new(),
+            }
+        }
+
+        fn successful() -> Self {
+            Self {
+                fail_stage: None,
+                fail_bind_index: None,
+                bind_index: 0,
+                calls: Vec::new(),
+            }
+        }
+
+        fn succeeds_at(&self, stage: SecretOverlayStage) -> bool {
+            self.fail_stage != Some(stage)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SecretOverlayOperations for MockOperations {
+        fn unshare_user_and_mount_namespaces(&mut self) -> bool {
+            self.calls.push(RecordedOperation::Unshare);
+            self.succeeds_at(SecretOverlayStage::Unshare)
+        }
+
+        fn deny_setgroups(&mut self) -> bool {
+            self.calls.push(RecordedOperation::Setgroups);
+            self.succeeds_at(SecretOverlayStage::Setgroups)
+        }
+
+        fn write_uid_map(&mut self, _bytes: &[u8]) -> bool {
+            self.calls.push(RecordedOperation::UidMap);
+            self.succeeds_at(SecretOverlayStage::UidMap)
+        }
+
+        fn write_gid_map(&mut self, _bytes: &[u8]) -> bool {
+            self.calls.push(RecordedOperation::GidMap);
+            self.succeeds_at(SecretOverlayStage::GidMap)
+        }
+
+        fn make_mounts_private(&mut self) -> bool {
+            self.calls.push(RecordedOperation::MountPropagation);
+            self.succeeds_at(SecretOverlayStage::MountPropagation)
+        }
+
+        fn bind_dev_null(&mut self, _target: &std::ffi::CStr) -> bool {
+            let index = self.bind_index;
+            self.bind_index += 1;
+            self.calls.push(RecordedOperation::BindMount(index));
+            self.fail_bind_index != Some(index)
+        }
+
+        fn remount_proc_restricted(&mut self) {
+            self.calls.push(RecordedOperation::RemountProc);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mock_spec(path_count: usize) -> SecretOverlaySpec {
+        let paths = (0..path_count)
+            .map(|index| {
+                std::ffi::CString::new(format!("/project/secret-{index}.pem")).expect("mock path")
+            })
+            .collect();
+        SecretOverlaySpec {
+            paths,
+            uid_map_bytes: b"0 1000 1\n".to_vec(),
+            gid_map_bytes: b"0 1000 1\n".to_vec(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_stage_failure(stage: SecretOverlayStage, expected_calls: &[RecordedOperation]) {
+        let spec = mock_spec(2);
+        let mut operations = MockOperations::failing(stage);
+
+        let result = apply_secret_overlay(&spec, &mut operations);
+
+        assert_eq!(result, Err(stage));
+        assert_eq!(operations.calls, expected_calls);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unshare_failure_stops_overlay_before_mapping() {
+        assert_stage_failure(SecretOverlayStage::Unshare, &[RecordedOperation::Unshare]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn setgroups_failure_aborts_overlay_setup() {
+        assert_stage_failure(
+            SecretOverlayStage::Setgroups,
+            &[RecordedOperation::Unshare, RecordedOperation::Setgroups],
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn uid_map_failure_aborts_overlay_setup() {
+        assert_stage_failure(
+            SecretOverlayStage::UidMap,
+            &[
+                RecordedOperation::Unshare,
+                RecordedOperation::Setgroups,
+                RecordedOperation::UidMap,
+            ],
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn gid_map_failure_aborts_overlay_setup() {
+        assert_stage_failure(
+            SecretOverlayStage::GidMap,
+            &[
+                RecordedOperation::Unshare,
+                RecordedOperation::Setgroups,
+                RecordedOperation::UidMap,
+                RecordedOperation::GidMap,
+            ],
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mount_propagation_failure_aborts_overlay_setup() {
+        assert_stage_failure(
+            SecretOverlayStage::MountPropagation,
+            &[
+                RecordedOperation::Unshare,
+                RecordedOperation::Setgroups,
+                RecordedOperation::UidMap,
+                RecordedOperation::GidMap,
+                RecordedOperation::MountPropagation,
+            ],
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn first_bind_mount_failure_aborts_overlay_setup() {
+        let spec = mock_spec(2);
+        let mut operations = MockOperations::failing_bind(0);
+
+        let result = apply_secret_overlay(&spec, &mut operations);
+
+        assert_eq!(result, Err(SecretOverlayStage::BindMount));
+        assert_eq!(
+            operations.calls.last(),
+            Some(&RecordedOperation::BindMount(0))
+        );
+        assert!(!operations.calls.contains(&RecordedOperation::RemountProc));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn later_bind_mount_failure_rejects_partial_masking() {
+        let spec = mock_spec(3);
+        let mut operations = MockOperations::failing_bind(1);
+
+        let result = apply_secret_overlay(&spec, &mut operations);
+
+        assert_eq!(result, Err(SecretOverlayStage::BindMount));
+        assert!(operations.calls.ends_with(&[
+            RecordedOperation::BindMount(0),
+            RecordedOperation::BindMount(1),
+        ]));
+        assert!(!operations.calls.contains(&RecordedOperation::BindMount(2)));
+        assert!(!operations.calls.contains(&RecordedOperation::RemountProc));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn successful_overlay_masks_every_path_before_optional_proc_remount() {
+        let spec = mock_spec(2);
+        let mut operations = MockOperations::successful();
+
+        let result = apply_secret_overlay(&spec, &mut operations);
+
+        assert_eq!(result, Ok(()));
+        assert!(operations.calls.ends_with(&[
+            RecordedOperation::BindMount(0),
+            RecordedOperation::BindMount(1),
+            RecordedOperation::RemountProc,
+        ]));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failure_stages_map_to_static_diagnostics_and_stable_errno() {
+        const STAGES: [SecretOverlayStage; 6] = [
+            SecretOverlayStage::Unshare,
+            SecretOverlayStage::Setgroups,
+            SecretOverlayStage::UidMap,
+            SecretOverlayStage::GidMap,
+            SecretOverlayStage::MountPropagation,
+            SecretOverlayStage::BindMount,
+        ];
+
+        for stage in STAGES {
+            let diagnostic: &'static [u8] = stage.diagnostic();
+            assert!(diagnostic.starts_with(b"lpm-sandbox: secret overlay "));
+            assert_eq!(stage.errno(), libc::EPERM);
+        }
+    }
+
     /// `.env` at project root is enumerated.
     #[test]
     fn enumerates_dotenv_at_project_root() {
         let tmp = with_project(|root| {
             fs::write(root.join(".env"), "API_KEY=secret").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(
             v.contains(&tmp.path().join(".env")),
             "expected .env in {v:?}"
@@ -471,7 +814,7 @@ mod tests {
             fs::write(root.join(".env.production"), "").unwrap();
             fs::write(root.join(".env.custom-suffix"), "").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.contains(&tmp.path().join(".env")));
         assert!(v.contains(&tmp.path().join(".env.local")));
         assert!(v.contains(&tmp.path().join(".env.production")));
@@ -489,7 +832,7 @@ mod tests {
             fs::create_dir(root.join(".aws")).unwrap();
             fs::write(root.join(".aws/credentials"), "").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.contains(&tmp.path().join(".ssh/id_rsa")));
         assert!(v.contains(&tmp.path().join(".ssh/config")));
         assert!(v.contains(&tmp.path().join(".aws/credentials")));
@@ -506,7 +849,7 @@ mod tests {
             fs::create_dir_all(root.join("certs/ca/sub")).unwrap();
             fs::write(root.join("certs/ca/sub/leaf.pem"), "").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.contains(&tmp.path().join("server.pem")));
         assert!(v.contains(&tmp.path().join("infra/prod.pem")));
         assert!(v.contains(&tmp.path().join("certs/ca/sub/leaf.pem")));
@@ -520,7 +863,7 @@ mod tests {
             fs::write(root.join("secrets.tfvars"), "").unwrap();
             fs::write(root.join("secrets.tfvars.json"), "").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.contains(&tmp.path().join("prod.tfstate")));
         assert!(v.contains(&tmp.path().join("secrets.tfvars")));
         assert!(v.contains(&tmp.path().join("secrets.tfvars.json")));
@@ -540,7 +883,7 @@ mod tests {
             fs::create_dir_all(root.join("target/release")).unwrap();
             fs::write(root.join("target/release/build.pem"), "").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         for p in &v {
             let s = p.to_string_lossy();
             assert!(
@@ -566,7 +909,7 @@ mod tests {
             fs::write(root.join(".git/config"), "[user]\n").unwrap();
             fs::write(root.join(".git/credentials"), "https://...").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.contains(&tmp.path().join(".git/config")));
         assert!(v.contains(&tmp.path().join(".git/credentials")));
     }
@@ -588,7 +931,7 @@ mod tests {
             // independent).
             std::mem::forget(outside);
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         // `.env` was a symlink, not a regular file — skipped.
         assert!(
             !v.contains(&tmp.path().join(".env")),
@@ -606,7 +949,7 @@ mod tests {
             fs::write(root.join("cert.pem"), "").unwrap();
         });
         let allow = vec![tmp.path().join(".env")];
-        let v = enumerate_project_secrets(tmp.path(), &allow);
+        let v = enumerate(tmp.path(), &allow);
         assert!(
             !v.contains(&tmp.path().join(".env")),
             "allow-listed .env must be excluded"
@@ -625,7 +968,7 @@ mod tests {
             fs::write(root.join(".env"), "").unwrap();
         });
         let allow = vec![tmp.path().join("does/not/exist")];
-        let v = enumerate_project_secrets(tmp.path(), &allow);
+        let v = enumerate(tmp.path(), &allow);
         assert!(v.contains(&tmp.path().join(".env")));
         assert_eq!(v.len(), 1);
     }
@@ -634,7 +977,7 @@ mod tests {
     #[test]
     fn empty_project_yields_empty_enumeration() {
         let tmp = with_project(|_| {});
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.is_empty());
     }
 
@@ -649,7 +992,7 @@ mod tests {
             fs::write(root.join("package.json"), "{}").unwrap();
             fs::write(root.join("tsconfig.json"), "{}").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         assert!(v.is_empty(), "no secret-like files: {v:?}");
     }
 
@@ -658,7 +1001,7 @@ mod tests {
     #[test]
     fn walk_max_depth_is_respected() {
         let tmp = with_project(|root| {
-            // root, /a, /a/b, /a/b/c, /a/b/c/d — depth 4 reachable.
+            // root, /a, /a/b, /a/b/c, /a/b/c/d — depth 4 exists.
             let mut p = root.to_path_buf();
             for d in ["a", "b", "c", "d"] {
                 p = p.join(d);
@@ -670,11 +1013,11 @@ mod tests {
             fs::create_dir(&too_deep).unwrap();
             fs::write(too_deep.join("at-depth.pem"), "").unwrap();
         });
-        let v = enumerate_project_secrets(tmp.path(), &[]);
+        let v = enumerate(tmp.path(), &[]);
         // The walker enters directories at depths 1-3 (capped by
         // `WALK_MAX_DEPTH = 4` via the `depth + 1 < WALK_MAX_DEPTH`
         // push gate) and enumerates files inside them — so files
-        // up to path-component-depth 4 are reachable.
+        // through directory depth 3 are reachable.
         assert!(v.contains(&tmp.path().join("a/at-depth.pem")));
         assert!(v.contains(&tmp.path().join("a/b/at-depth.pem")));
         assert!(v.contains(&tmp.path().join("a/b/c/at-depth.pem")));
@@ -698,8 +1041,8 @@ mod tests {
             fs::write(root.join(".npmrc"), "").unwrap();
             fs::write(root.join("server.pem"), "").unwrap();
         });
-        let a = enumerate_project_secrets(tmp.path(), &[]);
-        let b = enumerate_project_secrets(tmp.path(), &[]);
+        let a = enumerate(tmp.path(), &[]);
+        let b = enumerate(tmp.path(), &[]);
         assert_eq!(a, b);
         let mut sorted = a.clone();
         sorted.sort();
@@ -714,7 +1057,55 @@ mod tests {
         let tmp = with_project(|root| {
             fs::write(root.join("package.json"), "{}").unwrap();
         });
-        assert!(SecretOverlaySpec::build(tmp.path(), &[]).is_none());
+        assert!(
+            SecretOverlaySpec::build(tmp.path(), &[])
+                .expect("prepare overlay")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn overlay_spec_build_returns_none_when_every_secret_is_allowlisted() {
+        let tmp = with_project(|root| {
+            fs::write(root.join(".env"), "API_KEY=allowed").unwrap();
+        });
+        let allow = vec![tmp.path().join(".env")];
+
+        let spec = SecretOverlaySpec::build(tmp.path(), &allow).expect("prepare overlay");
+
+        assert!(spec.is_none());
+    }
+
+    #[test]
+    fn missing_project_root_returns_preparation_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("missing-project");
+
+        let result = enumerate_project_secrets(&missing, &[]);
+
+        assert!(matches!(result, Err(SecretOverlayBuildError::Io { .. })));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn non_utf8_protected_path_is_preserved_in_overlay_spec() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_name = std::ffi::OsString::from_vec(b"private-\xff.pem".to_vec());
+        let protected_path = tmp.path().join(file_name);
+        fs::write(&protected_path, "private key").expect("write protected file");
+
+        let spec = SecretOverlaySpec::build(tmp.path(), &[])
+            .expect("prepare overlay")
+            .expect("protected path requires overlay");
+
+        assert!(
+            spec.paths
+                .iter()
+                .any(|path| { path.to_bytes() == protected_path.as_os_str().as_bytes() })
+        );
     }
 
     /// SecretOverlaySpec::build returns Some with CStrings + maps
@@ -725,7 +1116,9 @@ mod tests {
         let tmp = with_project(|root| {
             fs::write(root.join(".env"), "").unwrap();
         });
-        let spec = SecretOverlaySpec::build(tmp.path(), &[]).expect("must have spec");
+        let spec = SecretOverlaySpec::build(tmp.path(), &[])
+            .expect("prepare overlay")
+            .expect("must have spec");
         assert!(!spec.paths.is_empty());
         let uid_map_str = std::str::from_utf8(&spec.uid_map_bytes).unwrap();
         assert!(
