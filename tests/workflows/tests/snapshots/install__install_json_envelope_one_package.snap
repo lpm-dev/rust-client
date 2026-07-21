@@ -17,7 +17,7 @@ expression: envelope
   "downloaded": 1,
   "cached": 0,
   "linked": 1,
-  "symlinked": 2,
+  "symlinked": 1,
   "used_lockfile": false,
   "duration_ms": "[DURATION]",
   "security": {

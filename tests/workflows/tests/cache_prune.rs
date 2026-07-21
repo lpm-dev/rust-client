@@ -15,13 +15,10 @@ mod support;
 use serde_json::Value;
 use support::{TempProject, lpm};
 
-/// Default `lpm()` pins `LPM_STORE_VERSION=v1`. Cache prune operates on the
-/// v2 store, so flip it back here. Workflow defaults to v1 so legacy shape
-/// assertions in older tests stay stable; this helper opts back in.
+/// Cache prune operates on the v2 store; the workflow harness exercises the
+/// shipped default and removes inherited store-version overrides.
 fn lpm_v2(project: &TempProject) -> assert_cmd::Command {
-    let mut cmd = lpm(project);
-    cmd.env("LPM_STORE_VERSION", "v2");
-    cmd
+    lpm(project)
 }
 
 fn parse_json(stdout: &[u8]) -> Value {

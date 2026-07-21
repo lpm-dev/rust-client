@@ -1320,7 +1320,7 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
         .await;
     Mock::given(method("GET"))
         .and(path("/doomed-pkg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
         .mount(mock.server())
         .await;
 
@@ -1343,12 +1343,7 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
         })
         .mount(mock.server())
         .await;
-    mock.with_batch_metadata(vec![single_version_batch_metadata(
-        "doomed-pkg",
-        "1.0.0",
-        &mock.url(),
-    )])
-    .await;
+    mock.with_batch_metadata(vec![metadata]).await;
 
     let project = TempProject::empty(r#"{"name":"doom-test","version":"1.0.0"}"#);
     let start = Instant::now();
@@ -1507,7 +1502,7 @@ async fn tarball_connection_dropped_mid_body_fails_or_retries() {
         .await;
     Mock::given(method("GET"))
         .and(path("/truncated-pkg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
         .mount(mock.server())
         .await;
 
@@ -1543,12 +1538,7 @@ async fn tarball_connection_dropped_mid_body_fails_or_retries() {
         .mount(mock.server())
         .await;
 
-    mock.with_batch_metadata(vec![single_version_batch_metadata(
-        "truncated-pkg",
-        "1.0.0",
-        &mock.url(),
-    )])
-    .await;
+    mock.with_batch_metadata(vec![metadata]).await;
 
     let project = TempProject::empty(r#"{"name":"trunc-test","version":"1.0.0"}"#);
     let start = Instant::now();
@@ -2424,9 +2414,8 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
 /// - Cache clean fired DURING the install window (its end-time falls
 ///   within the install's wall-clock range), proving the race window
 ///   was real and not a sequential run.
-/// - Post-state: the `~/.lpm/store/v1/<pkg>@<ver>/` entry exists with
-///   `package.json` AND `.integrity` (the store-side artifacts cache
-///   clean cannot touch).
+/// - Post-state: the integrity-keyed v2 object is reusable and contains
+///   `package.json` (the store-side artifact cache clean cannot touch).
 /// - Post-state: `node_modules/<pkg>/` linked, `package.json` carries
 ///   the dep, `.lpm/install-hash` written — the install's user-visible
 ///   outputs all materialize.
@@ -2440,6 +2429,7 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
 async fn cache_clean_during_slow_tarball_install_does_not_corrupt_install() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("slow-cc-pkg", "1.0.0");
+    let integrity = compute_integrity(&tarball);
     // 1500ms tarball delay — same shape as A.3's serialization probe.
     // Gives cache clean a wide window to fire mid-install.
     let tarball_delay = Duration::from_millis(1500);
@@ -2568,25 +2558,16 @@ async fn cache_clean_during_slow_tarball_install_does_not_corrupt_install() {
     // **LOAD-BEARING #4:** store entry survived. Cache clean must
     // never touch the store, even when running concurrently with
     // an install that's actively writing to it.
-    let store_entry = project.store_dir().join("v1").join("slow-cc-pkg@1.0.0");
-    assert!(
-        store_entry.exists(),
-        "store entry for slow-cc-pkg@1.0.0 missing after concurrent \
-         cache-clean — store/cache boundary violated. expected at: \
-         {store_entry:?}"
-    );
+    let store = lpm_store::v2::Store::at(project.store_dir().join("v2"));
+    let store_entry = store
+        .reusable_object_dir(&integrity)
+        .expect("validate slow-cc-pkg v2 object")
+        .expect("slow-cc-pkg v2 object must remain reusable after cache clean");
     assert!(
         store_entry.join("package.json").exists(),
         "store entry's package.json is missing — partial extraction or \
          cache clean reached into the store. checked: {:?}",
         store_entry.join("package.json")
-    );
-    assert!(
-        store_entry.join(".integrity").exists(),
-        "store entry's .integrity marker is missing — the store-finalize \
-         step never completed AND/OR cache clean reached into the store. \
-         checked: {:?}",
-        store_entry.join(".integrity")
     );
 
     // **LOAD-BEARING #5:** install's user-visible outputs all landed.

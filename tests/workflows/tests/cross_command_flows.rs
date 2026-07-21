@@ -53,31 +53,29 @@ fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &s
     );
 }
 
-/// Seed the per-project store with a package so flows that need a
-/// store-resident package can run without a full mock-registry install
-/// pass. Returns the integrity sentinel the engine reads back.
-fn seed_store(project: &TempProject, name: &str, version: &str, files: &[(&str, &str)]) -> String {
-    let safe = name.replace(['/', '\\'], "+");
-    let dir = project
-        .store_dir()
-        .join("v1")
-        .join(format!("{safe}@{version}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("package.json"),
-        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
-    )
-    .unwrap();
-    for (rel, content) in files {
-        let p = dir.join(rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&p, content).unwrap();
-    }
-    let integrity = format!("sha512-fixture-{name}-{version}");
-    std::fs::write(dir.join(".integrity"), &integrity).unwrap();
+/// Seed an integrity-keyed v2 object without a registry round trip.
+fn seed_store(project: &TempProject, name: &str, version: &str) -> String {
+    let store = lpm_store::v2::Store::at(project.store_dir().join("v2"));
+    let tarball = support::mock_registry::make_tarball(name, version);
+    let (_, integrity, _) = store
+        .extract_object_from_bytes(&tarball, None)
+        .expect("seed cross-command v2 object");
     integrity
+}
+
+fn bind_lockfile_integrity(project: &TempProject, name: &str, version: &str, integrity: String) {
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read fixture lockfile");
+    let package = lockfile
+        .packages
+        .iter_mut()
+        .find(|package| package.name == name && package.version == version)
+        .expect("fixture lockfile must contain seeded package");
+    package.integrity = Some(integrity);
+    lockfile
+        .write_all(&lockfile_path)
+        .expect("bind fixture lockfile to seeded v2 object");
 }
 
 /// Parse a `--json` envelope from stdout, stripping ANSI first.
@@ -231,11 +229,9 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
         String::from_utf8_lossy(&out3.stderr)
     );
 
-    // Step 5: the linked file under the isolated wrapper must contain
-    // the patched bytes — the state-transfer claim this flow makes.
-    let linked = project
-        .path()
-        .join(".lpm/wrappers/ms@2.1.3/node_modules/ms/index.js");
+    // Step 5: the installed package must expose the patched bytes through
+    // the shipped v2 root link.
+    let linked = project.path().join("node_modules/ms/index.js");
     assert!(
         linked.exists(),
         "post-install link must exist at {}",
@@ -284,12 +280,8 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
     // Step 2: seed the store with the package referenced in the
     // migrated lockfile (the `ms@2.1.3` dep), then install --offline.
     // This proves the lockfile's package set is install-readable.
-    seed_store(
-        &project,
-        "ms",
-        "2.1.3",
-        &[("index.js", "module.exports = function() { return 'ms' }\n")],
-    );
+    let integrity = seed_store(&project, "ms", "2.1.3");
+    bind_lockfile_integrity(&project, "ms", "2.1.3", integrity);
     let out_install = lpm_with_registry(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
@@ -498,12 +490,7 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
 #[test]
 fn flow_doctor_fix_install_post_fix_install_is_clean() {
     let project = TempProject::empty(r#"{"name":"flow-doctor-fix","version":"0.0.0"}"#);
-    seed_store(
-        &project,
-        "ms",
-        "2.1.3",
-        &[("index.js", "module.exports = function() {}\n")],
-    );
+    let integrity = seed_store(&project, "ms", "2.1.3");
     project.write_file(
         "package.json",
         r#"{
@@ -516,8 +503,9 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
     // (regenerate lpm.lockb + write .gitattributes).
     let lockfile = format!(
         "[metadata]\nlockfile-version = {}\nresolved-with = \"greedy-fusion\"\n\n\
-         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n",
-        lpm_lockfile::LOCKFILE_VERSION
+         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\nintegrity = \"{}\"\n",
+        lpm_lockfile::LOCKFILE_VERSION,
+        integrity,
     );
     project.write_file("lpm.lock", &lockfile);
     assert!(
@@ -1560,7 +1548,7 @@ async fn flow_install_uninstall_install_graph_round_trip() {
 ///
 /// Pinned hand-offs:
 /// 1. Online install populates BOTH `~/.lpm/cache/` (metadata) AND
-///    `~/.lpm/store/v1/<pkg>@<version>/` (content).
+///    the integrity-keyed v2 object store (content).
 /// 2. `lpm cache clean` removes the cache dirs but the store entry
 ///    survives byte-for-byte.
 /// 3. After deleting `node_modules/<pkg>/` to simulate a fresh
@@ -1577,7 +1565,8 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
     let project = TempProject::empty(r#"{"name":"flow-cc-offline","version":"0.0.0"}"#);
 
     let mock = MockRegistry::start().await;
-    let _ = mount_pkg_full(&mock, "ms", "2.1.3").await;
+    let tarball = mount_pkg_full(&mock, "ms", "2.1.3").await;
+    let integrity = compute_integrity(&tarball);
 
     // ── Step 1: online install — populates cache + store ────────
     let out_install = lpm_with_registry(&project, &mock.url())
@@ -1597,12 +1586,12 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
         String::from_utf8_lossy(&out_install.stderr)
     );
 
-    // Sanity: store entry exists for ms@2.1.3.
-    let store_entry = project.store_dir().join("v1").join("ms@2.1.3");
-    assert!(
-        store_entry.exists(),
-        "step 1: expected store entry at {store_entry:?} after online install"
-    );
+    // Sanity: the v2 object is reusable for ms@2.1.3.
+    let store = lpm_store::v2::Store::at(project.store_dir().join("v2"));
+    let store_entry = store
+        .reusable_object_dir(&integrity)
+        .expect("step 1: validate ms v2 object")
+        .expect("step 1: expected reusable ms v2 object after online install");
     let store_pkg_json_before = std::fs::read(store_entry.join("package.json"))
         .expect("step 1: store entry must contain package.json after online install");
     let pkg_json_before = project.read_file("package.json");
@@ -1629,12 +1618,11 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
 
     // **Critical contract** — store entry is BYTE-IDENTICAL after
     // cache clean. Cache and store are different surfaces.
-    assert!(
-        store_entry.exists(),
-        "step 2: store entry vanished after `cache clean` — \
-         cache/store boundary violated. expected at: {store_entry:?}"
-    );
-    let store_pkg_json_after = std::fs::read(store_entry.join("package.json"))
+    let store_entry_after = store
+        .reusable_object_dir(&integrity)
+        .expect("step 2: validate ms v2 object after cache clean")
+        .expect("step 2: ms v2 object vanished after cache clean");
+    let store_pkg_json_after = std::fs::read(store_entry_after.join("package.json"))
         .expect("step 2: store entry's package.json must survive cache clean");
     assert_eq!(
         store_pkg_json_before, store_pkg_json_after,

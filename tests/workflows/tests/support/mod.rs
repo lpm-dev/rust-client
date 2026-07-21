@@ -364,19 +364,10 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("LPM_LINKER");
     cmd.remove_env("LPM_CONCURRENT_DOWNLOADS");
 
-    // workflow tests assert on v1 layout shape
-    // (e.g., `<project>/.lpm/wrappers/<seg>/`, hoisted-flat
-    // `node_modules/<dep>` real dirs, hardlink-detach behavior). The
-    // The v2 store changes these to symlinks into the global store, which
-    // would break shape assertions wholesale.
-    //
-    // Pin the legacy workflow default to v1 explicitly. v2 regression
-    // coverage lives in explicit workflow tests that opt into or restore
-    // the shipped default, plus the audit-fixture CI matrix (see
-    // `bench/audit-fixtures/run-all.sh` + `.github/workflows/ci.yml`).
-    // Tests that intentionally exercise the v2 shape re-set or remove this
-    // env on their own command builder.
-    cmd.set_env("LPM_STORE_VERSION", OsStr::new("v1"));
+    // Exercise the shipped store default and prevent a developer's shell
+    // override from changing workflow behavior. Rollback-layout tests opt
+    // into v1 through the dedicated helpers below.
+    cmd.remove_env("LPM_STORE_VERSION");
 
     // Disable color for deterministic output in assertions
     cmd.set_env("NO_COLOR", OsStr::new("1"));
@@ -420,6 +411,21 @@ pub fn lpm(project: &TempProject) -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").expect("lpm-rs binary not found");
     cmd.current_dir(project.path());
     apply_lpm_env(&mut cmd, project);
+    cmd
+}
+
+/// Build an isolated command that explicitly exercises the store-v1 rollback
+/// writer and its paired linker.
+pub fn lpm_v1(project: &TempProject) -> assert_cmd::Command {
+    let mut cmd = lpm(project);
+    cmd.env("LPM_STORE_VERSION", "v1");
+    cmd
+}
+
+/// Build a store-v1 rollback command pre-configured to use a mock registry.
+pub fn lpm_v1_with_registry(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
+    let mut cmd = lpm_v1(project);
+    cmd.args(["--registry", registry_url, "--insecure"]);
     cmd
 }
 
