@@ -401,6 +401,10 @@ fn default_mode_probe_failed_remediation() -> String {
 
 impl Sandbox for LandlockSandbox {
     fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+        for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
+            crate::config::revalidate_effective_write_dir(path, index)?;
+        }
+
         let mut command = Command::new(&cmd.program);
         command.args(&cmd.args);
         if cmd.env_clear {

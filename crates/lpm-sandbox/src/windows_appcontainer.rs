@@ -150,6 +150,10 @@ pub(crate) fn decide_appcontainer_posture(
 
 impl Sandbox for AppContainerSandbox {
     fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+        for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
+            crate::config::revalidate_effective_write_dir(path, index)?;
+        }
+
         let mut helper_cmd = Command::new(&self.helper_path);
 
         // Protocol version + container name come first — the helper

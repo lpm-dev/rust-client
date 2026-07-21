@@ -79,6 +79,10 @@ impl SeatbeltSandbox {
 
 impl Sandbox for SeatbeltSandbox {
     fn spawn(&self, cmd: SandboxedCommand) -> Result<std::process::Child, SandboxError> {
+        for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
+            crate::config::revalidate_effective_write_dir(path, index)?;
+        }
+
         // `sandbox-exec -p <profile> <program> <args...>` runs the
         // child under the named profile. `-p` takes the profile body
         // inline, so no temp-file handoff is needed. Env, cwd, and

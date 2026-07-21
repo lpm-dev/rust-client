@@ -75,16 +75,10 @@ pub(crate) fn render_profile_with_isolation(
     let project_husky = quoted_path(&canon_project_dir.join(".husky"), "project_dir/.husky")?;
     let project_lpm = quoted_path(&canon_project_dir.join(".lpm"), "project_dir/.lpm")?;
 
-    // Extra writable dirs come from package.json > lpm > scripts >
-    // sandboxWriteDirs. The loader already resolved them to absolute
-    // paths; we re-assert here because a backend-level invariant
-    // violation should surface as ProfileRenderFailed, not a sandbox
-    // bypass. Paths are canonicalized best-effort so a user-supplied
-    // absolute path under a symlinked prefix (e.g. `/tmp/build-out`
-    // on macOS, which resolves to `/private/tmp/build-out`) matches
-    // the form the kernel uses at enforcement time — same symlink-
-    // resolution fix the built-in base paths get above, applied to
-    // the `sandboxWriteDirs` escape hatch.
+    // Extra writable dirs are already filesystem-resolved effective
+    // paths. Rendering that exact spelling preserves the validator's
+    // containment decision instead of independently resolving the
+    // untrusted manifest spelling again in the backend.
     let mut extras = Vec::with_capacity(spec.extra_write_dirs.len());
     for (i, p) in spec.extra_write_dirs.iter().enumerate() {
         if !p.is_absolute() {
@@ -96,8 +90,7 @@ pub(crate) fn render_profile_with_isolation(
             });
         }
         let field = format!("extra_write_dirs[{i}]");
-        let canon = canonicalize_or_passthrough(p, &field)?;
-        extras.push(quoted_path(&canon, &field)?);
+        extras.push(quoted_path(p, &field)?);
     }
 
     let mut out = String::with_capacity(1024 + 64 * extras.len());

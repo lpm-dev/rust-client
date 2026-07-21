@@ -217,8 +217,8 @@ pub struct SandboxSpec {
     /// `/tmp` itself is already in the writable set.
     pub tmpdir: PathBuf,
     /// Extra writable subpaths from `package.json > lpm > scripts >
-    /// sandboxWriteDirs`. Loader resolves relative paths against
-    /// [`project_dir`](Self::project_dir) before constructing the spec.
+    /// sandboxWriteDirs`. The loader stores canonical/effective paths
+    /// after containment and filesystem-indirection validation.
     pub extra_write_dirs: Vec<PathBuf>,
     /// Project-relative paths the user has explicitly opted in for
     /// lifecycle-script reads despite matching the built-in secret-file
@@ -830,14 +830,17 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
         ensure_writable_dir_exists(p)?;
     }
 
-    // Then user-declared `sandboxWriteDirs`. These have already been
-    // validated by `load_sandbox_write_dirs` — joined-with-project
-    // for relative entries, dangerous-root + allowlist + traversal
-    // checked. Creating them here closes the
+    // Then user-declared `sandboxWriteDirs`. These are the effective
+    // paths returned by `load_sandbox_write_dirs`. Revalidation before
+    // and after creation rejects a link or reparse point introduced
+    // between manifest validation and backend construction. Creating
+    // them here closes the
     // "declared-but-not-yet-on-disk" gap that would otherwise
     // surface as a runtime denial on Windows.
-    for p in &spec.extra_write_dirs {
+    for (index, p) in spec.extra_write_dirs.iter().enumerate() {
+        config::revalidate_effective_write_dir(p, index)?;
         ensure_writable_dir_exists(p)?;
+        config::revalidate_effective_write_dir(p, index)?;
     }
     Ok(())
 }
@@ -974,6 +977,7 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
                 ),
             });
         }
+        config::revalidate_effective_write_dir(p, i)?;
     }
     Ok(())
 }
@@ -1219,21 +1223,22 @@ mod tests {
     #[test]
     fn prepare_writable_dirs_creates_extra_write_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let project = tmp.path().join("proj");
-        let home = tmp.path().join("home");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        let project = root.join("proj");
+        let home = root.join("home");
         let extra_a = project.join("build-output");
-        let extra_b = tmp.path().join("siblings").join("dist");
+        let extra_b = root.join("siblings").join("dist");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
         let spec = SandboxSpec {
-            package_dir: tmp.path().join("pkg"),
+            package_dir: root.join("pkg"),
             project_dir: project.clone(),
             package_name: "p".into(),
             package_version: "1.0.0".into(),
-            store_root: tmp.path().join("store"),
+            store_root: root.join("store"),
             home_dir: home.clone(),
-            tmpdir: tmp.path().join("tmpdir"),
+            tmpdir: root.join("tmpdir"),
             secret_read_allow: Vec::new(),
             extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
         };
