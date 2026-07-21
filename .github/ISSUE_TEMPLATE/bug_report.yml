@@ -1,0 +1,111 @@
+name: Bug report
+description: Report reproducible incorrect behavior in LPM
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve LPM. For security vulnerabilities, use [private vulnerability reporting](https://github.com/lpm-dev/rust-client/security/advisories/new) instead.
+
+        Remove credentials, private registry URLs, private package names, and tokens from everything you share.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this behavior.
+          required: true
+        - label: This report does not describe a security vulnerability.
+          required: true
+        - label: I removed secrets and private project information from the report.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: LPM version
+      description: Paste the output of `lpm --version`.
+      placeholder: lpm 0.68.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Include the OS version and CPU architecture.
+      placeholder: macOS 15.5 arm64
+    validations:
+      required: true
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation method
+      options:
+        - npm
+        - Homebrew
+        - Standalone installer
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Provide the exact command that triggers the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the complete error message when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide a small repository or exact steps that reproduce the behavior from a clean directory.
+    validations:
+      required: true
+  - type: textarea
+    id: project_files
+    attributes:
+      label: Relevant project files
+      description: Paste a minimal `package.json` and only the relevant `lpm.lock` entries, or link to a public reproduction. Redact private data.
+    validations:
+      required: true
+  - type: dropdown
+    id: registry
+    attributes:
+      label: Registry source
+      multiple: true
+      options:
+        - npm
+        - lpm.dev
+        - JSR
+        - Private registry
+        - Offline or cached install
+        - Not registry-related
+    validations:
+      required: true
+  - type: textarea
+    id: execution_context
+    attributes:
+      label: Execution context
+      description: Note whether this occurs in CI, with a frozen lockfile, with a cold or warm cache, and with non-default script, sandbox, Firewall, or provenance settings.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Include relevant output after removing secrets and private project information.
+      render: shell
