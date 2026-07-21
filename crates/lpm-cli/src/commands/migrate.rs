@@ -367,6 +367,7 @@ pub async fn run(
             cwd,
             json,
             false, // not offline — need to download tarballs
+            false, // allow_snapshotless_lockfile
             super::install::FrozenLockfileMode::Never,
             false, // force
             false, // allow_new

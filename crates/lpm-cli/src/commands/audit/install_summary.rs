@@ -23,9 +23,10 @@ use super::types::{AuditCounts, AuditIssue, AuditResult};
 /// catches them and emits a degraded `! Audit skipped` line — they
 /// never fail the install itself, matching the "audit findings are
 /// informational" contract the operator opted into.
-pub async fn run_install_summary(
+pub(crate) async fn run_install_summary(
     client: &RegistryClient,
     project_dir: &Path,
+    store_lock_held: bool,
 ) -> Result<Option<AuditCounts>, LpmError> {
     let started = std::time::Instant::now();
 
@@ -80,7 +81,7 @@ pub async fn run_install_summary(
         .packages
         .iter()
         .any(|p| matches!(p.scan_mode, ScanMode::RegistryAndStore));
-    let behavioral_results = if needs_store_lock {
+    let behavioral_results = if needs_store_lock && !store_lock_held {
         let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
         let mut summary = None;
         lpm_common::with_shared_lock(lock_path, || {

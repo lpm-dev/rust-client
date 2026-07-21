@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn v2_cache_recheck_never_falls_back_to_the_v1_sidecar() {
+    assert!(!super::super::fetch::may_reuse_v1_entry_after_fetch_lock(
+        false, true
+    ));
+    assert!(super::super::fetch::may_reuse_v1_entry_after_fetch_lock(
+        false, false
+    ));
+    assert!(!super::super::fetch::may_reuse_v1_entry_after_fetch_lock(
+        true, false
+    ));
+}
+
+#[test]
 fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
     let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
         "name": "fixture",
@@ -238,14 +251,13 @@ async fn tarball_url_install_v2_extracts_object() {
 }
 
 #[tokio::test]
-async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
+async fn tarball_url_install_v2_preserves_verified_sha256_declaration() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let body = build_test_tarball();
     let declared_sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
-    let canonical_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -274,13 +286,13 @@ async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
     .await
     .expect("v2 tarball install must accept matching sha256 declarations");
 
-    assert_eq!(computed_sri, canonical_sri);
+    assert_eq!(computed_sri, declared_sri);
     assert!(
         store_v2
             .reusable_object_dir(&computed_sri)
             .unwrap()
             .is_some(),
-        "v2 object lookups must use the canonical sha512 SRI"
+        "v2 object lookups must preserve the verified declared SRI"
     );
     assert!(
         fresh_object.is_some(),
@@ -479,9 +491,15 @@ fn registry_speculation_key_matches_install_package_key() {
     package.name = "react".to_string();
     package.version = "19.0.0".to_string();
     package.source = "registry+https://registry.npmjs.org".to_string();
+    package.integrity = Some("sha512-registry-content".to_string());
 
     assert_eq!(
-        registry_install_pkg_key(&package.name, &package.version, &route_table),
+        registry_install_pkg_key(
+            &package.name,
+            &package.version,
+            &route_table,
+            package.integrity.as_deref(),
+        ),
         install_pkg_key(&package)
     );
 }

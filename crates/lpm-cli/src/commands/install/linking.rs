@@ -87,24 +87,79 @@ pub(super) fn local_source_sri_for_target(target: &LinkTarget) -> String {
     lpm_store::compute_sri_hash(seed.as_bytes())
 }
 
+pub(super) fn v2_source_identity(
+    package: &InstallPackage,
+    target: &LinkTarget,
+    source_sri: &str,
+) -> String {
+    let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
+    let mut seed = String::with_capacity(
+        24 + package.name.len()
+            + package.version.len()
+            + package.source.len()
+            + wrapper_id.len()
+            + source_sri.len(),
+    );
+    seed.push_str("lpm-v2-source-identity");
+    for part in [
+        package.name.as_str(),
+        package.version.as_str(),
+        package.source.as_str(),
+        wrapper_id,
+        source_sri,
+    ] {
+        seed.push('\0');
+        seed.push_str(part);
+    }
+    let exact = lpm_store::compute_sri_hash(seed.as_bytes());
+    let package_source_id = package.source_kind().map_or_else(
+        |_| lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+        |source| source.source_id_with_integrity(package.integrity.as_deref()),
+    );
+    let mut identity = String::with_capacity(package_source_id.len() + exact.len() + 1);
+    identity.push_str(&package_source_id);
+    identity.push('\0');
+    identity.push_str(&exact);
+    identity
+}
+
+pub(super) fn v2_target(
+    package: &InstallPackage,
+    target: LinkTarget,
+    source_sri: String,
+) -> lpm_linker::v2::V2Target {
+    let source_identity = v2_source_identity(package, &target, &source_sri);
+    lpm_linker::v2::V2Target {
+        target,
+        source_sri,
+        source_identity,
+        verified_object_integrity: None,
+        fresh_object: None,
+    }
+}
+
 pub(super) fn build_v2_targets(
     packages: &[InstallPackage],
     link_targets: &[LinkTarget],
 ) -> Result<Vec<lpm_linker::v2::V2Target>, LpmError> {
-    let sri_by_pkg: HashMap<String, String> = packages
-        .iter()
-        .filter_map(|p| {
-            p.integrity
-                .clone()
-                .map(|sri| (link_target_lookup_key(&p.name, &p.version), sri))
-        })
-        .collect();
+    if packages.len() != link_targets.len() {
+        return Err(LpmError::Registry(format!(
+            "v2 install: package/target count mismatch ({} packages, {} targets)",
+            packages.len(),
+            link_targets.len()
+        )));
+    }
 
     let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
-    for target in link_targets {
-        let lookup_key = link_target_lookup_key(&target.name, &target.version);
+    for (package, target) in packages.iter().zip(link_targets) {
+        if package.name != target.name || package.version != target.version {
+            return Err(LpmError::Registry(format!(
+                "v2 install: package/target identity mismatch for {}@{}",
+                target.name, target.version
+            )));
+        }
         let sri = match target.materialization {
-            lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
+            lpm_linker::Materialization::CasBacked => package.integrity.clone(),
             lpm_linker::Materialization::DirectorySource => {
                 Some(local_source_sri_for_target(target))
             }
@@ -115,12 +170,7 @@ pub(super) fn build_v2_targets(
                 target.name, target.version
             ))
         })?;
-        v2_targets.push(lpm_linker::v2::V2Target {
-            target: target.clone(),
-            source_sri: sri,
-            verified_object_integrity: None,
-            fresh_object: None,
-        });
+        v2_targets.push(v2_target(package, target.clone(), sri));
     }
 
     Ok(v2_targets)
@@ -507,10 +557,19 @@ pub(super) async fn run_link_and_finish(
 
     // capture the install-time blocked set into
     // build-state.json. Same wiring as the online path — see comment there.
-    let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
+    let installed_with_integrity: Vec<crate::build_state::InstalledPackageIdentity> = packages
         .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+        .map(|p| {
+            crate::build_state::InstalledPackageIdentity::new(
+                p.name.clone(),
+                p.version.clone(),
+                Some(p.source.clone()),
+                p.integrity.clone(),
+            )
+        })
         .collect();
+    let blocked_set_metadata =
+        crate::commands::install::lifecycle::blocked_set_source_metadata(&packages);
     // Parse the project
     // capability request + user bound so the offline / lockfile-
     // fast-path install also catches capability-widening packages.
@@ -522,17 +581,19 @@ pub(super) async fn run_link_and_finish(
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
-    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
-        lpm_root,
-        &installed_with_integrity,
-        &policy,
-        project_dir,
-        effective_policy,
-        force_security_floor,
-        &offline_requested_capabilities,
-        &offline_user_bound,
-        None,
-    );
+    let all_trusted_for_auto_build =
+        crate::commands::rebuild::all_scripted_package_identities_trusted(
+            lpm_root,
+            lpm_store::StoreVersion::from_env(),
+            &installed_with_integrity,
+            &policy,
+            project_dir,
+            effective_policy,
+            force_security_floor,
+            &offline_requested_capabilities,
+            &offline_user_bound,
+            None,
+        );
     let auto_build_attempted = should_auto_build(
         auto_build,
         script_policy_cfg.auto_build,
@@ -540,20 +601,21 @@ pub(super) async fn run_link_and_finish(
         effective_policy,
     );
 
-    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
-        project_dir,
-        &store,
-        &installed_with_integrity,
-        &policy,
-        &crate::build_state::BlockedSetMetadata::default(),
-        &offline_requested_capabilities,
-        &offline_user_bound,
-        None,
-    )?;
+    let mut blocked_capture =
+        crate::build_state::capture_blocked_set_after_install_with_metadata_for_identities(
+            project_dir,
+            &store,
+            &installed_with_integrity,
+            &policy,
+            &blocked_set_metadata,
+            &offline_requested_capabilities,
+            &offline_user_bound,
+            None,
+        )?;
 
     let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
     if auto_build_attempted {
-        match crate::commands::rebuild::run_with_report(
+        match crate::commands::rebuild::run_under_store_lock(
             project_dir,
             &[],
             false,
@@ -589,12 +651,13 @@ pub(super) async fn run_link_and_finish(
             .cloned()
             .collect::<HashSet<_>>();
         blocked_capture =
-            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
+            crate::build_state::capture_blocked_set_after_install_with_metadata_for_identities_and_exclusions(
                 project_dir,
                 &store,
+                lpm_store::StoreVersion::from_env(),
                 &installed_with_integrity,
                 &policy,
-                &crate::build_state::BlockedSetMetadata::default(),
+                &blocked_set_metadata,
                 &offline_requested_capabilities,
                 &offline_user_bound,
                 None,

@@ -27,9 +27,11 @@ pub(super) fn print_version_diff_card_for_blocked(
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
     lpm_root: &lpm_common::LpmRoot,
 ) {
-    let Some((prior_version, binding)) =
-        trusted.latest_binding_for_name(&blocked.name, &blocked.version)
-    else {
+    let Some((prior_version, binding)) = trusted.latest_binding_for_candidate(
+        &blocked.name,
+        &blocked.version,
+        blocked.source.as_deref(),
+    ) else {
         return;
     };
     let diff = crate::version_diff::compute_version_diff(prior_version, binding, blocked);
@@ -37,11 +39,17 @@ pub(super) fn print_version_diff_card_for_blocked(
         return;
     }
     let store_dir_for = |version: &str| -> Option<std::path::PathBuf> {
+        let expected_integrity = if version == blocked.version {
+            blocked.integrity.as_deref()
+        } else {
+            binding.integrity.as_deref()
+        };
         crate::commands::audit::inventory::find_project_baseline(
             baseline_index,
             lpm_root,
             &blocked.name,
             version,
+            expected_integrity,
         )
         .map(|b| b.package_dir)
     };
@@ -108,6 +116,18 @@ pub(super) fn emit_yes_warning_banner(count: usize, json_output: bool) {
 pub(super) fn print_package_card(blocked: &BlockedPackage) {
     println!();
     println!("  {}@{}", blocked.name.bold(), blocked.version.dimmed(),);
+    if let Some(source) = &blocked.source {
+        println!(
+            "    {:<14}{}",
+            "Source:".dimmed(),
+            truncate_for_display(source, 60),
+        );
+    }
+    println!(
+        "    {:<14}{}",
+        "Selector:".dimmed(),
+        blocked_identity_selector(blocked),
+    );
     if let Some(integrity) = &blocked.integrity {
         println!(
             "    {:<14}{}",
@@ -173,6 +193,7 @@ pub(super) fn print_full_script(
         lpm_root,
         &blocked.name,
         &blocked.version,
+        blocked.integrity.as_deref(),
     ) {
         Some(b) => b.package_dir,
         None => {
@@ -307,9 +328,11 @@ pub(super) fn print_summary(
     // surface `provenance.verified` per package. `None` for callers
     // that have no map in scope (the read-only `--list` path bypasses
     // it entirely; the per-package named approval path uses the
-    // single-entry helper directly). When `Some(_)`, the map's keys
-    // are the same `(name, version)` pairs as the blocked set.
-    provenance_by_pkg: Option<&HashMap<(String, String), ProvenanceStatus>>,
+    // single-entry helper directly). When `Some(_)`, the map is keyed
+    // by each blocked package's `(name, version, source)` identity.
+    provenance_by_pkg: Option<
+        &HashMap<crate::provenance_fetch::ApprovalProvenanceKey, ProvenanceStatus>,
+    >,
 ) {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();

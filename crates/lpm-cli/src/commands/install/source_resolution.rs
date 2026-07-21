@@ -343,7 +343,7 @@ pub(super) fn expand_local_source_install_packages(
 pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
     project_dir: &Path,
     deps: &mut HashMap<String, String>,
-    direct_workspace_member_deps: &[WorkspaceMemberLink],
+    direct_workspace_member_deps: &[DirectWorkspaceMemberProvider],
     all_workspace_members: &[WorkspaceMemberLink],
     json_output: bool,
 ) -> Result<V2WorkspaceRootPreResolveResult, LpmError> {
@@ -361,7 +361,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         install_pkgs.push(InstallPackage {
             name: member.name.clone(),
             version: member.version.clone(),
-            source: workspace_member_source(project_dir, &member.source_dir),
+            source: member.source.clone(),
             dependencies: Vec::new(),
             aliases: HashMap::new(),
             root_link_names: Some(vec![member.name.clone()]),
@@ -802,13 +802,14 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         }
 
         // Step 1+2: download (with optional SRI verify) and extract
-        // into the CAS. If the CAS dir already exists for the same
-        // computed SRI, store_tarball_at_cas_path's fast path skips
-        // re-extraction.
+        // into the CAS. A verified declared SRI remains the exact source
+        // identity; trust-on-first-use uses the computed SHA-512 SRI. If the
+        // corresponding CAS dir exists, extraction is skipped.
         let (data, computed_sri) = client
             .download_tarball_with_integrity(&url, declared_integrity.as_deref())
             .await?;
-        let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+        let source_sri = declared_integrity.as_deref().unwrap_or(&computed_sri);
+        let cas_path = store.store_tarball_at_cas_path(source_sri, &data)?;
 
         let (real_name, real_version, node_engine) =
             read_pkg_json_name_version(&cas_path, &format!("tarball at {url}"))?;
@@ -834,7 +835,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             is_direct: true,
             is_lpm: false,
             peers: Vec::new(),
-            integrity: Some(computed_sri),
+            integrity: Some(source_sri.to_string()),
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
@@ -882,10 +883,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 ))
             })?;
 
-        // SHA-256 of the bytes — the CAS key for tarball-local.
-        // (Distinct from the SRI written into `.integrity` by the
-        // shared `store_at_dir` helper, which uses sha512 by default
-        // for parity with the registry/remote-tarball arms.)
+        // SHA-256 of the bytes — the CAS key and persisted source identity
+        // for tarball-local.
         let content_sha256_hex = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();

@@ -240,7 +240,7 @@ async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
     assert_eq!(result.unwrap().name, npm_name);
 
     let cached = client
-        .read_cache_content(&format!("npm:{npm_name}"))
+        .read_cache_content(&client.npm_worker_metadata_cache_key(npm_name))
         .expect("fallback result should be cached");
     let metadata = RegistryClient::deserialize_cached_metadata(&cached.data)
         .expect("cached fallback metadata should deserialize");
@@ -418,7 +418,7 @@ async fn npm_proxy_wrong_package_body_returns_registry_error_without_fallback() 
 
     assert!(
         client
-            .read_cache_content(&format!("npm:{npm_name}"))
+            .read_cache_content(&client.npm_worker_metadata_cache_key(npm_name))
             .is_none(),
         "wrong-package proxy bodies should not be cached"
     );
@@ -591,7 +591,9 @@ async fn batch_metadata_deep_sends_range_aware_package_specs_when_present() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[valid_name].name, valid_name);
     assert!(
-        client.read_metadata_cache("npm:vite").is_none(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("vite"))
+            .is_none(),
         "range-aware batch responses may be pruned and must not populate the full metadata cache"
     );
 }
@@ -657,7 +659,9 @@ async fn batch_metadata_range_aware_stream_does_not_cache_pruned_packuments() {
             .is_none()
     );
     assert!(
-        client.read_metadata_cache("npm:vite").is_none(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("vite"))
+            .is_none(),
         "range-aware streamed responses may be pruned and must not populate the full metadata cache"
     );
 
@@ -723,7 +727,9 @@ async fn batch_metadata_range_aware_ndjson_merges_duplicate_package_entries() {
         Some("5.6.2")
     );
     assert!(
-        client.read_metadata_cache("npm:chalk").is_none(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("chalk"))
+            .is_none(),
         "range-aware duplicate entries are partial and should not populate the full metadata cache"
     );
 
@@ -848,7 +854,7 @@ async fn batch_metadata_json_skips_mismatched_package_identity_and_does_not_cach
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm:{requested_name}"))
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key(requested_name))
             .is_none(),
         "mismatched metadata should not poison the requested package cache"
     );
@@ -979,7 +985,9 @@ async fn batch_metadata_ndjson_parses_line_split_across_http_chunks() {
     assert_eq!(result.len(), 1);
     assert_eq!(result["kleur"].name, "kleur");
     assert!(
-        client.read_metadata_cache("npm:kleur").is_some(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("kleur"))
+            .is_some(),
         "chunk-split NDJSON entries should still warm the metadata cache"
     );
 
@@ -1213,7 +1221,7 @@ async fn batch_metadata_ndjson_skips_mismatched_package_identity_and_does_not_ca
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm:{requested_name}"))
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key(requested_name))
             .is_none(),
         "mismatched metadata should not poison the requested package cache"
     );
@@ -1455,7 +1463,7 @@ async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm-version:{pkg}@{version}"))
+            .read_metadata_cache(&client.npm_direct_version_metadata_cache_key(pkg, version))
             .is_some(),
         "version document should use a cache key separate from npm:{pkg}"
     );
@@ -1567,7 +1575,7 @@ async fn get_npm_version_metadata_direct_refetches_wrong_cached_version_document
         .with_synchronous_cache_writes(true);
     client.cache_dir = Some(tmp.path().to_path_buf());
     client.write_metadata_cache(
-        &format!("npm-version:{pkg}@{version}"),
+        &client.npm_direct_version_metadata_cache_key(pkg, version),
         &test_metadata("some-other-package"),
         None,
     );

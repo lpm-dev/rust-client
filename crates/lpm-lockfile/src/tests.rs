@@ -2009,6 +2009,54 @@ fn package_key_distinguishes_cross_source_same_name_version() {
 }
 
 #[test]
+fn package_key_distinguishes_tarball_integrity_pins_for_the_same_url() {
+    let first = LockedPackage {
+        name: "react".to_string(),
+        version: "19.0.0".to_string(),
+        source: Some("tarball+https://example.com/react.tgz".to_string()),
+        integrity: Some("sha512-AAAAAAAA".to_string()),
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        os: Vec::new(),
+        cpu: Vec::new(),
+        libc: Vec::new(),
+        node_engine: None,
+        optional: false,
+        dependencies: Vec::new(),
+        alias_dependencies: Vec::new(),
+        peers: Vec::new(),
+        tarball: None,
+    };
+    let mut second = first.clone();
+    second.integrity = Some("sha512-BBBBBBBB".to_string());
+
+    assert_ne!(
+        first.package_key(),
+        second.package_key(),
+        "one tarball URL with different content pins must occupy distinct lockfile identities"
+    );
+}
+
+#[test]
+fn package_key_distinguishes_registry_integrity_pins_for_the_same_origin() {
+    let first = LockedPackage {
+        name: "react".to_string(),
+        version: "19.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some("sha512-AAAAAAAA".to_string()),
+        ..Default::default()
+    };
+    let mut second = first.clone();
+    second.integrity = Some("sha512-BBBBBBBB".to_string());
+
+    assert_ne!(
+        first.package_key(),
+        second.package_key(),
+        "registry content pins must participate in exact lockfile identity"
+    );
+}
+
+#[test]
 fn package_key_uses_unknown_sentinel_when_source_missing() {
     let pkg = LockedPackage {
         name: "foo".to_string(),

@@ -13,6 +13,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                 crate::build_state::BlockedPackage {
                     name: "scripted-meta".into(),
                     version: "1.0.0".into(),
+                    source: Some("registry+https://old.registry.example".into()),
                     integrity: Some("sha512-meta".into()),
                     script_hash: Some("sha256-script".into()),
                     phases_present: vec!["postinstall".into()],
@@ -26,6 +27,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                 crate::build_state::BlockedPackage {
                     name: "scripted-empty".into(),
                     version: "1.0.0".into(),
+                    source: None,
                     integrity: Some("sha512-empty".into()),
                     script_hash: Some("sha256-empty".into()),
                     phases_present: vec!["postinstall".into()],
@@ -42,12 +44,19 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
     )
     .unwrap();
 
-    let metadata = blocked_set_metadata_from_previous_state(dir.path());
+    let mut current = fake_pkg("scripted-meta", "1.0.0", false);
+    current.source = "registry+https://current.registry.example".into();
+    current.integrity = Some("sha512-meta".into());
+    let metadata = blocked_set_metadata_from_previous_state(dir.path(), &[current]);
 
     assert_eq!(metadata.by_pkg.len(), 1);
     let entry = metadata
-        .get("scripted-meta", "1.0.0")
+        .get("scripted-meta", "1.0.0", Some("sha512-meta"))
         .expect("metadata replay should include enriched prior rows");
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("registry+https://current.registry.example")
+    );
     assert_eq!(entry.published_at.as_deref(), Some("2026-04-22T00:00:00Z"));
     assert_eq!(entry.behavioral_tags_hash.as_deref(), Some("sha256-tags"));
     let tags = entry
@@ -55,7 +64,116 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
         .as_deref()
         .expect("metadata replay should preserve behavioral tag names");
     assert_eq!(tags, ["network", "eval"]);
-    assert!(metadata.get("scripted-empty", "1.0.0").is_none());
+    assert!(
+        metadata
+            .get("scripted-empty", "1.0.0", Some("sha512-empty"))
+            .is_none()
+    );
+}
+
+#[test]
+fn blocked_set_source_metadata_fails_closed_for_ambiguous_install_identity() {
+    let mut first = fake_pkg("same-coordinates", "1.0.0", false);
+    first.source = "registry+https://registry-a.example".into();
+    first.integrity = Some("sha512-shared".into());
+    let mut second = first.clone();
+    second.source = "registry+https://registry-b.example".into();
+
+    let metadata = blocked_set_source_metadata(&[first, second]);
+    let sources = metadata
+        .by_pkg
+        .values()
+        .filter_map(|entry| entry.source.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(metadata.by_pkg.len(), 2);
+    assert_eq!(
+        sources,
+        std::collections::HashSet::from([
+            "registry+https://registry-a.example",
+            "registry+https://registry-b.example",
+        ])
+    );
+}
+
+#[test]
+fn advisor_package_lookup_selects_the_exact_v1_hoisted_version() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().join("node_modules/shared");
+    let nested = project
+        .path()
+        .join("node_modules/consumer/node_modules/shared");
+    for (directory, version, integrity) in [
+        (&root, "1.0.0", "sha512-root"),
+        (&nested, "2.0.0", "sha512-nested"),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("package.json"),
+            format!(
+                r#"{{"name":"shared","version":"{version}","scripts":{{"install":"node install.js"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(directory.join(".integrity"), integrity).unwrap();
+    }
+    let materialized = vec![
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            destination: root,
+        },
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "2.0.0".into(),
+            destination: nested.clone(),
+        },
+    ];
+    let identity = crate::build_state::InstalledPackageIdentity::new(
+        "shared",
+        "2.0.0",
+        Some("registry+https://registry.npmjs.org".into()),
+        Some("sha512-nested".into()),
+    );
+
+    let resolved = advisor_package_dir(&identity, &materialized, None);
+
+    assert_eq!(resolved.as_deref(), Some(nested.as_path()));
+}
+
+#[test]
+fn advisor_package_lookup_rejects_ambiguous_v1_source_materializations() {
+    let project = tempfile::tempdir().unwrap();
+    let source_a = project.path().join("source-a");
+    let source_b = project.path().join("source-b");
+    for directory in [&source_a, &source_b] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("package.json"),
+            r#"{"name":"shared","version":"1.0.0"}"#,
+        )
+        .unwrap();
+    }
+    let materialized = vec![
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            destination: source_a,
+        },
+        lpm_linker::MaterializedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            destination: source_b,
+        },
+    ];
+    let identity = crate::build_state::InstalledPackageIdentity::new(
+        "shared",
+        "1.0.0",
+        Some("directory+./source-a".into()),
+        None,
+    );
+
+    assert!(advisor_package_dir(&identity, &materialized, None).is_none());
 }
 
 /// The drift gate must appear before the install pipeline hands off to
@@ -87,7 +205,7 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
         "/src/commands/install/fetch.rs"
     ));
     const DRIFT_MARKER: &str = "provenance-drift gate";
-    const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_under_store_lock(";
     const FETCH_HANDOFF: &str = "run_online_fetch_phase(OnlineFetchPhaseInput";
     const AUTO_BUILD_HANDOFF: &str = "run_online_auto_build_phase(OnlineAutoBuildPhaseInput";
 
@@ -190,6 +308,7 @@ fn select_approvals_returns_none_when_auto_build_skipped() {
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-x".to_string()),
         String::new(),
     ));
@@ -206,6 +325,7 @@ fn select_approvals_returns_view_when_auto_build_fires() {
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-x".to_string()),
         String::new(),
     ));
@@ -215,6 +335,7 @@ fn select_approvals_returns_view_when_auto_build_fires() {
     assert!(view.contains(&(
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-x".to_string()),
         String::new(),
     )));
@@ -254,6 +375,7 @@ fn bc_with_tiers(green: usize, amber: usize, red: usize) -> crate::build_state::
     let build_bp = |name: &str, tier: StaticTier| crate::build_state::BlockedPackage {
         name: name.into(),
         version: "1.0.0".into(),
+        source: None,
         integrity: None,
         script_hash: None,
         phases_present: vec!["postinstall".into()],
@@ -457,6 +579,7 @@ fn bp_for_diff(
     crate::build_state::BlockedPackage {
         name: name.into(),
         version: version.into(),
+        source: None,
         integrity: Some(format!("sha512-{name}-{version}")),
         script_hash: script_hash.map(String::from),
         phases_present: vec!["postinstall".into()],

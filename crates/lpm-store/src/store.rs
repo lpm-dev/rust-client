@@ -82,4 +82,17 @@ impl PackageStore {
         let dir = self.package_dir(name, version);
         is_complete_package_dir(&dir)
     }
+
+    /// Check whether the coordinate-keyed v1 entry carries the exact
+    /// integrity selected by the current resolution.
+    pub fn has_package_with_integrity(
+        &self,
+        name: &str,
+        version: &str,
+        expected_integrity: &str,
+    ) -> bool {
+        let dir = self.package_dir(name, version);
+        is_complete_package_dir(&dir)
+            && crate::read_stored_integrity(&dir).as_deref() == Some(expected_integrity)
+    }
 }

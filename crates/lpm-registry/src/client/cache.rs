@@ -15,6 +15,21 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
 const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 
+fn source_scoped_cache_key(kind: &str, source: &str, name: &str) -> String {
+    let source = source.trim_end_matches('/');
+    format!("{kind}:{}:{source}:{name}", source.len())
+}
+
+fn source_chain_scoped_cache_key(kind: &str, primary: &str, fallback: &str, name: &str) -> String {
+    let primary = primary.trim_end_matches('/');
+    let fallback = fallback.trim_end_matches('/');
+    format!(
+        "{kind}:{}:{primary}:{}:{fallback}:{name}",
+        primary.len(),
+        fallback.len()
+    )
+}
+
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
 /// lives at `~/.lpm/cache/metadata/` inside the user's home; if an
@@ -26,14 +41,73 @@ const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 ///
 /// V3 bump: custom-registry support means a single package name can
 /// be served by multiple distinct registries (e.g., `react` from
-/// `registry.npmjs.org` vs an internal mirror). `get_npm_metadata_from`
-/// keys per-host (`npm:<host>:<name>`); the magic bump invalidates
-/// pre-V3 caches in one shot rather than letting two key formats
-/// co-exist with the same magic.
+/// `registry.npmjs.org` vs an internal mirror). Metadata keys are scoped
+/// by source and, for custom registries, by auth principal; the magic bump
+/// invalidates pre-V3 caches rather than mixing formats.
 pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V3\n";
 
 impl RegistryClient {
     // ─── Metadata Cache ──────────────────────────────────────────────
+
+    pub(super) fn lpm_metadata_cache_key(&self, name: &str) -> String {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired);
+        let principal = bearer_principal_fingerprint(
+            bearer.as_deref(),
+            self.http.identity_fp_for_url(&self.base_url),
+        );
+        let source = self.base_url.trim_end_matches('/');
+        format!("lpm:{principal}:{}:{source}:{name}", source.len())
+    }
+
+    pub(super) fn npm_worker_metadata_cache_key(&self, name: &str) -> String {
+        source_chain_scoped_cache_key("npm-worker", &self.base_url, &self.npm_registry_url, name)
+    }
+
+    pub(super) fn npm_proxy_only_metadata_cache_key(&self, name: &str) -> String {
+        source_scoped_cache_key("npm-proxy", &self.base_url, name)
+    }
+
+    pub(super) fn npm_direct_metadata_cache_key(&self, name: &str) -> String {
+        source_scoped_cache_key("npm-direct", &self.npm_registry_url, name)
+    }
+
+    pub(super) fn npm_direct_version_metadata_cache_key(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> String {
+        let source = self.npm_registry_url.trim_end_matches('/');
+        format!(
+            "npm-direct-version:{}:{source}:{name}@{version}",
+            source.len()
+        )
+    }
+
+    pub(super) fn npm_worker_full_metadata_cache_key(&self, name: &str) -> String {
+        source_chain_scoped_cache_key(
+            "npm-worker-full",
+            &self.base_url,
+            &self.npm_registry_url,
+            name,
+        )
+    }
+
+    pub(super) fn npm_direct_full_metadata_cache_key(&self, name: &str) -> String {
+        source_scoped_cache_key("npm-direct-full", &self.npm_registry_url, name)
+    }
+
+    pub(super) fn npm_worker_release_times_cache_key(&self, name: &str) -> String {
+        source_chain_scoped_cache_key(
+            "npm-worker-release-times",
+            &self.base_url,
+            &self.npm_registry_url,
+            name,
+        )
+    }
+
+    pub(super) fn npm_direct_release_times_cache_key(&self, name: &str) -> String {
+        source_scoped_cache_key("npm-direct-release-times", &self.npm_registry_url, name)
+    }
 
     pub(super) fn cache_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = self.cache_dir.as_ref()?;
@@ -44,8 +118,8 @@ impl RegistryClient {
         Some(dir.join(&hash[..16]))
     }
 
-    /// Invalidate a cached metadata entry served by the LPM Worker
-    /// (`@lpm.dev/*`) or by direct npm.org (built-in `npm:{name}`).
+    /// Invalidate cached metadata served by the configured LPM Worker or
+    /// direct npm registry.
     ///
     /// Used when a tarball download returns 404 — the cached metadata
     /// likely references an unpublished version. Deleting the cache
@@ -58,16 +132,22 @@ impl RegistryClient {
     /// cannot invalidate those entries. Callers on the custom-registry
     /// path MUST use [`Self::invalidate_custom_metadata_cache`] instead.
     pub fn invalidate_metadata_cache(&self, package_name: &str) {
-        let cache_key = if package_name.starts_with("@lpm.dev/") {
-            format!("lpm:{package_name}")
+        let cache_keys = if package_name.starts_with("@lpm.dev/") {
+            vec![self.lpm_metadata_cache_key(package_name)]
         } else {
-            format!("npm:{package_name}")
+            vec![
+                self.npm_worker_metadata_cache_key(package_name),
+                self.npm_proxy_only_metadata_cache_key(package_name),
+                self.npm_direct_metadata_cache_key(package_name),
+            ]
         };
-        if let Some(path) = self.cache_path(&cache_key)
-            && path.exists()
-        {
-            let _ = std::fs::remove_file(&path);
-            tracing::debug!("invalidated metadata cache for {package_name}");
+        for cache_key in cache_keys {
+            if let Some(path) = self.cache_path(&cache_key)
+                && path.exists()
+            {
+                let _ = std::fs::remove_file(&path);
+                tracing::debug!("invalidated metadata cache for {package_name}");
+            }
         }
     }
 
@@ -78,7 +158,7 @@ impl RegistryClient {
     /// version that failed and clears this cache alongside the package-level
     /// metadata cache.
     pub fn invalidate_npm_version_metadata_cache(&self, package_name: &str, version: &str) {
-        let cache_key = format!("npm-version:{package_name}@{version}");
+        let cache_key = self.npm_direct_version_metadata_cache_key(package_name, version);
         if let Some(path) = self.cache_path(&cache_key)
             && path.exists()
         {
@@ -120,9 +200,9 @@ impl RegistryClient {
     /// skip HTTP requests for packages already on disk from a prior batch.
     pub fn is_metadata_fresh(&self, package_name: &str) -> bool {
         let cache_key = if package_name.starts_with("@lpm.dev/") {
-            format!("lpm:{package_name}")
+            self.lpm_metadata_cache_key(package_name)
         } else {
-            format!("npm:{package_name}")
+            self.npm_worker_metadata_cache_key(package_name)
         };
         let Some(path) = self.cache_path(&cache_key) else {
             return false;

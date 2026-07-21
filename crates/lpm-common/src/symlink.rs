@@ -49,6 +49,15 @@ pub fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     create_symlink_inner(target, link)
 }
 
+/// Remove a directory symlink or junction without traversing its target.
+///
+/// Unix directory symlinks use file-unlink semantics. Windows directory
+/// symlinks and junctions use directory-removal semantics even though the
+/// target itself remains untouched.
+pub fn remove_dir_symlink_or_junction(link: &Path) -> std::io::Result<()> {
+    remove_dir_symlink_or_junction_inner(link)
+}
+
 #[cfg(unix)]
 fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -57,6 +66,11 @@ fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::
 #[cfg(unix)]
 fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(unix)]
+fn remove_dir_symlink_or_junction_inner(link: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(link)
 }
 
 #[cfg(windows)]
@@ -122,6 +136,11 @@ fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
         Ok(_) => std::os::windows::fs::symlink_file(target, link),
         Err(e) => Err(e),
     }
+}
+
+#[cfg(windows)]
+fn remove_dir_symlink_or_junction_inner(link: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(link)
 }
 
 /// Lexically simplify `..` and `.` segments in a path without touching

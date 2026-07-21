@@ -381,7 +381,7 @@ fn process_edge_inner(
             let key = (edge.canonical.clone(), target_version.clone());
             if !state.children_enqueued.contains(&key) {
                 state.children_enqueued.insert(key);
-                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state);
+                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state)?;
             }
             state.emit_selected_package(&edge.canonical, &target_version, info, incoming_optional);
             new_id

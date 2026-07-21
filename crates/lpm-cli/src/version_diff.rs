@@ -841,17 +841,24 @@ pub fn blocked_to_json(
 /// envelopes stay in lockstep on every new variant.
 ///
 /// When `provenance_by_pkg` is `None` OR the map has no entry for
-/// `(name, version)`, the `provenance` block is omitted entirely —
+/// `(name, version, source)`, the `provenance` block is omitted entirely —
 /// agents see no key rather than `null`, so JSON readers that
 /// don't know about the `provenance` field stay byte-compatible.
 pub fn blocked_to_json_with_provenance(
     blocked: &crate::build_state::BlockedPackage,
     trusted: &lpm_workspace::TrustedDependencies,
     provenance_by_pkg: Option<
-        &std::collections::HashMap<(String, String), lpm_common::ProvenanceStatus>,
+        &std::collections::HashMap<
+            crate::provenance_fetch::ApprovalProvenanceKey,
+            lpm_common::ProvenanceStatus,
+        >,
     >,
 ) -> serde_json::Value {
-    let version_diff = match trusted.latest_binding_for_name(&blocked.name, &blocked.version) {
+    let version_diff = match trusted.latest_binding_for_candidate(
+        &blocked.name,
+        &blocked.version,
+        blocked.source.as_deref(),
+    ) {
         None => serde_json::Value::Null,
         Some((prior_version, binding)) => {
             let diff = compute_version_diff(prior_version, binding, blocked);
@@ -861,6 +868,14 @@ pub fn blocked_to_json_with_provenance(
     let mut entry = serde_json::json!({
         "name": blocked.name,
         "version": blocked.version,
+        "source": blocked.source,
+        "identity_selector": lpm_workspace::TrustedDependencies::rich_key_for_identity(
+            &blocked.name,
+            &blocked.version,
+            blocked.source.as_deref(),
+            blocked.integrity.as_deref(),
+            blocked.script_hash.as_deref(),
+        ),
         "integrity": blocked.integrity,
         "script_hash": blocked.script_hash,
         "phases_present": blocked.phases_present,
@@ -869,7 +884,11 @@ pub fn blocked_to_json_with_provenance(
         "version_diff": version_diff,
     });
     if let Some(map) = provenance_by_pkg
-        && let Some(status) = map.get(&(blocked.name.clone(), blocked.version.clone()))
+        && let Some(status) = map.get(&(
+            blocked.name.clone(),
+            blocked.version.clone(),
+            blocked.source.clone(),
+        ))
     {
         let (verified, rejection_reason) = status.to_json_verified();
         let mut prov = serde_json::Map::new();
@@ -897,6 +916,7 @@ mod tests {
         BlockedPackage {
             name: name.into(),
             version: version.into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some(format!("sha512-{name}-{version}")),
             script_hash: Some(format!("sha256-{name}-{version}")),
             phases_present: vec!["postinstall".into()],
@@ -1834,6 +1854,7 @@ mod tests {
         crate::build_state::BlockedPackage {
             name: name.into(),
             version: version.into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some(format!("sha512-{name}-{version}")),
             script_hash: script_hash.map(String::from),
             phases_present: vec!["postinstall".into()],
@@ -1858,6 +1879,20 @@ mod tests {
         // Existing fields still present.
         assert_eq!(v["name"], serde_json::json!("esbuild"));
         assert_eq!(v["static_tier"], serde_json::json!("green"));
+        assert_eq!(
+            v["source"],
+            serde_json::json!("registry+https://registry.npmjs.org")
+        );
+        assert_eq!(
+            v["identity_selector"],
+            serde_json::json!(lpm_workspace::TrustedDependencies::rich_key_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some("registry+https://registry.npmjs.org"),
+                Some("sha512-esbuild-0.25.1"),
+                Some("sha256-x"),
+            ))
+        );
     }
 
     #[test]
@@ -1866,10 +1901,20 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("stable", "2.0.0", Some("sha256-same"));
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-stable-1.0.0";
         let mut map = HashMap::new();
         map.insert(
-            "stable@1.0.0".into(),
+            TrustedDependencies::rich_key_for_identity(
+                "stable",
+                "1.0.0",
+                Some(source),
+                Some(integrity),
+                Some("sha256-same"),
+            ),
             TrustedDependencyBinding {
+                source: Some(source.into()),
+                integrity: Some(integrity.into()),
                 script_hash: Some("sha256-same".into()),
                 ..Default::default()
             },
@@ -1898,10 +1943,20 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("esbuild", "0.25.2", Some("sha256-new"));
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-esbuild-0.25.1";
         let mut map = HashMap::new();
         map.insert(
-            "esbuild@0.25.1".into(),
+            TrustedDependencies::rich_key_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some(source),
+                Some(integrity),
+                Some("sha256-old"),
+            ),
             TrustedDependencyBinding {
+                source: Some(source.into()),
+                integrity: Some(integrity.into()),
                 script_hash: Some("sha256-old".into()),
                 ..Default::default()
             },
@@ -1947,9 +2002,12 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("esbuild", "0.25.1", Some("sha256-x"));
-        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        let mut map: HashMap<(String, String, Option<String>), ProvenanceStatus> = HashMap::new();
         // A different package's status — not relevant to our entry.
-        map.insert(("axios".into(), "1.14.0".into()), ProvenanceStatus::Absent);
+        map.insert(
+            ("axios".into(), "1.14.0".into(), None),
+            ProvenanceStatus::Absent,
+        );
         let v = blocked_to_json_with_provenance(&bp, &TrustedDependencies::default(), Some(&map));
         assert!(v.get("provenance").is_none());
     }
@@ -1962,9 +2020,13 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("axios", "1.14.0", Some("sha256-x"));
-        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        let mut map: HashMap<(String, String, Option<String>), ProvenanceStatus> = HashMap::new();
         map.insert(
-            ("axios".into(), "1.14.0".into()),
+            (
+                "axios".into(),
+                "1.14.0".into(),
+                Some("registry+https://registry.npmjs.org".into()),
+            ),
             ProvenanceStatus::Verified(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:axios/axios".into()),
@@ -1990,9 +2052,13 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("axios", "1.14.0", Some("sha256-x"));
-        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        let mut map: HashMap<(String, String, Option<String>), ProvenanceStatus> = HashMap::new();
         map.insert(
-            ("axios".into(), "1.14.0".into()),
+            (
+                "axios".into(),
+                "1.14.0".into(),
+                Some("registry+https://registry.npmjs.org".into()),
+            ),
             ProvenanceStatus::Unverified(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:axios/axios".into()),
@@ -2011,9 +2077,13 @@ mod tests {
         use std::collections::HashMap;
 
         let bp = blocked_with("axios", "1.14.1", Some("sha256-x"));
-        let mut map: HashMap<(String, String), ProvenanceStatus> = HashMap::new();
+        let mut map: HashMap<(String, String, Option<String>), ProvenanceStatus> = HashMap::new();
         map.insert(
-            ("axios".into(), "1.14.1".into()),
+            (
+                "axios".into(),
+                "1.14.1".into(),
+                Some("registry+https://registry.npmjs.org".into()),
+            ),
             ProvenanceStatus::VerificationRejected {
                 reason: "Rekor SET verification failed".into(),
             },

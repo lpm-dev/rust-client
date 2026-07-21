@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+pathdiff = { workspace = true }
 ahash = "0.8"
 time = { version = "0.3", features = ["parsing"] }
 

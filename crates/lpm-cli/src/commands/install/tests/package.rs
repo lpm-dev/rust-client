@@ -23,6 +23,24 @@ fn install_package_source_kind_parses_registry() {
     }
 }
 
+#[test]
+fn registry_store_hits_require_the_selected_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(dir.path());
+    let tarball = build_minimal_tarball_with_pkg("registry-hit", "1.0.0");
+    let stored_path = store
+        .store_package("registry-hit", "1.0.0", &tarball)
+        .unwrap();
+    let stored_integrity = lpm_store::read_stored_integrity(&stored_path).unwrap();
+    let mut package = fake_pkg("registry-hit", "1.0.0", true);
+
+    package.integrity = Some("sha512-different".to_string());
+    assert!(!package.store_has_source_aware(&store, dir.path()));
+
+    package.integrity = Some(stored_integrity);
+    assert!(package.store_has_source_aware(&store, dir.path()));
+}
+
 // ── invariant: prevent silent source substitution ───────
 // A registry-CAS hit at (name, version) must not fulfill a
 // Source::Tarball dep with the same name+version. These tests lock the
@@ -741,11 +759,104 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
     assert!(local_wid.starts_with("t-"));
 }
 
+#[test]
+fn tarball_wrapper_id_distinguishes_integrity_pins_for_the_same_url() {
+    let mut first = install_package_for_tarball("https://example.com/react.tgz", None);
+    first.integrity = Some("sha512-AAAAAAAA".to_string());
+    let mut second = first.clone();
+    second.integrity = Some("sha512-BBBBBBBB".to_string());
+
+    assert_ne!(
+        first.wrapper_id_for_source(),
+        second.wrapper_id_for_source(),
+        "declared content pins must split wrapper identity even when the URL is unchanged"
+    );
+}
+
 // ── cross-source collision regression ───────────────────
 // A Source::Tarball pkg and a Source::Registry pkg with the same
 // (name, version) must produce distinct PackageKeys so the install-pipeline's
 // bookkeeping (FetchCoordinator, fresh_urls, integrity_map,
 // root_link_map) can attach state to the right package.
+
+#[test]
+fn install_pkg_key_distinguishes_integrity_pins_for_the_same_url() {
+    let mut first = install_package_for_tarball("https://example.com/react.tgz", None);
+    first.integrity = Some("sha512-AAAAAAAA".to_string());
+    let mut second = first.clone();
+    second.integrity = Some("sha512-BBBBBBBB".to_string());
+
+    assert_ne!(
+        install_pkg_key(&first),
+        install_pkg_key(&second),
+        "fetch bookkeeping must not merge different content pins for one URL"
+    );
+}
+
+#[test]
+fn build_v2_targets_selects_integrity_by_source_wrapper_identity() {
+    let mut first = install_package_for_tarball("https://example.com/react.tgz", None);
+    first.integrity = Some("sha512-AAAAAAAA".to_string());
+    let mut second = first.clone();
+    second.integrity = Some("sha512-BBBBBBBB".to_string());
+
+    let link_target = |package: &InstallPackage| LinkTarget {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        store_path: PathBuf::from("unused"),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: None,
+        wrapper_id: package.wrapper_id_for_source(),
+        materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
+        patch_fingerprint: None,
+    };
+    let targets = build_v2_targets(
+        &[first.clone(), second.clone()],
+        &[link_target(&first), link_target(&second)],
+    )
+    .expect("source-distinct targets must retain their own integrity");
+
+    assert_eq!(targets[0].source_sri, "sha512-AAAAAAAA");
+    assert_eq!(targets[1].source_sri, "sha512-BBBBBBBB");
+}
+
+#[test]
+fn build_v2_targets_preserves_declared_tarball_pins_after_content_hash_writeback() {
+    let mut sha256 = install_package_for_tarball("https://example.com/react.tgz", None);
+    sha256.integrity = Some("sha256-DECLARED".to_string());
+    let mut sha512 = sha256.clone();
+    sha512.integrity = Some("sha512-DECLARED".to_string());
+
+    let link_target = |package: &InstallPackage| LinkTarget {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        store_path: PathBuf::from("unused"),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        is_direct: true,
+        root_link_names: None,
+        wrapper_id: package.wrapper_id_for_source(),
+        materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
+        patch_fingerprint: None,
+    };
+    let link_targets = [link_target(&sha256), link_target(&sha512)];
+
+    sha256.integrity = Some("sha512-COMPUTED".to_string());
+    sha512.integrity = Some("sha512-COMPUTED".to_string());
+    let targets = build_v2_targets(&[sha256, sha512], &link_targets)
+        .expect("content hash writeback must not replace declared tarball identity");
+
+    assert_eq!(targets[0].source_sri, "sha512-COMPUTED");
+    assert_eq!(targets[1].source_sri, "sha512-COMPUTED");
+    assert_ne!(
+        targets[0].source_identity, targets[1].source_identity,
+        "distinct declared pins must remain distinct graph identities for identical bytes"
+    );
+}
 
 #[test]
 fn install_pkg_key_distinguishes_registry_from_tarball_with_same_name_version() {
@@ -816,4 +927,42 @@ fn dedupe_install_packages_by_identity_merges_workspace_reentry_source_graph() {
         Some(&[][..]),
         "merged transitive workspace package must stay off root links"
     );
+}
+
+#[test]
+fn explicit_file_install_package_becomes_typed_peer_provider() {
+    let mut package = install_package_for_tarball("ignored", None);
+    package.name = "react".to_string();
+    package.version = "18.3.1".to_string();
+    package.source = "directory+./packages/react".to_string();
+    package.root_link_names = Some(vec!["react".to_string()]);
+    package.is_direct = true;
+
+    let providers =
+        explicit_peer_providers_from_install_packages([&package], Path::new(".")).unwrap();
+
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].local_name, "react");
+    assert_eq!(providers[0].package_name, "react");
+    assert_eq!(providers[0].version.to_string(), "18.3.1");
+    assert_eq!(
+        providers[0].source,
+        lpm_resolver::PeerProviderSource::File("packages/react".to_string())
+    );
+}
+
+#[test]
+fn non_semver_source_package_can_be_indexed_as_an_explicit_peer_provider() {
+    let mut package = install_package_for_tarball("ignored", None);
+    package.name = "private-react".to_string();
+    package.version = "dev".to_string();
+    package.source = "directory+./packages/private-react".to_string();
+    package.root_link_names = Some(vec!["private-react".to_string()]);
+    package.is_direct = true;
+
+    let providers = explicit_peer_providers_from_install_packages([&package], Path::new("."))
+        .expect("an unrelated private source package must not require a semver version");
+
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].version.to_string(), "dev");
 }

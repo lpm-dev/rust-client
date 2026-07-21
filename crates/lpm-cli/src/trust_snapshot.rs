@@ -75,9 +75,9 @@ pub struct TrustSnapshot {
     /// Used by the `lpm trust diff` command for "added since <date>"
     /// messaging, not by the diff-computation logic itself.
     pub captured_at: String,
-    /// Bindings keyed by `"name@version"` in deterministic
-    /// lexicographic order (thanks to `BTreeMap`), so JSON on-disk
-    /// is diff-stable across installs that don't change the set.
+    /// Bindings keyed by the raw trusted-dependency key in deterministic
+    /// lexicographic order (thanks to `BTreeMap`), so JSON on-disk is
+    /// diff-stable across installs that don't change the set.
     pub bindings: BTreeMap<String, SnapshotEntry>,
 }
 
@@ -86,17 +86,14 @@ impl TrustSnapshot {
     /// into snapshot shape.
     ///
     /// **Keying:** the snapshot uses the raw map key from
-    /// `TrustedDependencies::Rich` (format `"name@version"`, per
-    /// `TrustedDependencies::rich_key`) so the diff is
-    /// version-granular. Legacy bare-name entries use the bare name
-    /// as-is (no `@version`) and project to an empty binding — same
-    /// semantic the strict gate assigns them (`LegacyNameOnly`).
+    /// `TrustedDependencies::Rich`, including an exact identity suffix when
+    /// present. Legacy bare-name entries use the bare name as-is and project
+    /// to an empty binding — the same semantic the strict gate assigns them.
     ///
     /// Note we pattern-match on the enum directly rather than calling
     /// `TrustedDependencies::iter`: the public `iter` normalizes the
-    /// key to the name-portion only (stripping `@version`), which
-    /// would collapse all versions of the same package into one
-    /// snapshot key and defeat version-granular diff.
+    /// key to the name portion only, which would collapse distinct versions
+    /// and source identities into one snapshot key.
     ///
     /// The returned snapshot's `captured_at` is set to NOW. Callers
     /// are expected to persist it via [`write_snapshot`] after a

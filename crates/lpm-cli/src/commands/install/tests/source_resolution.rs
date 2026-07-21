@@ -228,17 +228,16 @@ async fn pre_resolve_extracts_tarball_url_deps_from_manifest() {
 }
 
 #[tokio::test]
-async fn pre_resolve_handles_declared_integrity_correctly() {
-    // SRI declared in the dep specifier (e.g. via a `#sha512-…`
-    // suffix) flows through the verify path. Mismatch errors;
-    // match succeeds.
+async fn pre_resolve_preserves_declared_sha256_integrity() {
+    // A non-SHA-512 SRI declared in the dependency specifier flows through
+    // verification, CAS storage, and InstallPackage identity unchanged.
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     let body = build_test_tarball();
-    let correct_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let correct_sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
 
     Mock::given(method("GET"))
         .and(path("/foo.tgz"))
@@ -251,7 +250,7 @@ async fn pre_resolve_handles_declared_integrity_correctly() {
     let store = PackageStore::at(store_root.path());
     let client = Arc::new(RegistryClient::new());
 
-    // Spec with #sha512-… integrity — Specifier::parse picks it up.
+    // Spec with #sha256-… integrity — Specifier::parse picks it up.
     let mut deps = HashMap::from([("foo".to_string(), format!("{url}#{correct_sri}"))]);
 
     let install_pkgs = pre_resolve_non_registry_deps(
@@ -269,6 +268,11 @@ async fn pre_resolve_handles_declared_integrity_correctly() {
     assert_eq!(install_pkgs.len(), 1);
     assert_eq!(
         install_pkgs[0].integrity.as_deref(),
+        Some(correct_sri.as_str())
+    );
+    let stored = store.tarball_store_path(&correct_sri).unwrap();
+    assert_eq!(
+        lpm_store::read_stored_integrity(&stored).as_deref(),
         Some(correct_sri.as_str())
     );
 }
@@ -1166,12 +1170,18 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         source_dir: bar_dir,
     };
     let mut deps = HashMap::new();
+    let foo_provider = DirectWorkspaceMemberProvider {
+        name: foo.name.clone(),
+        version: foo.version.clone(),
+        source_dir: foo.source_dir.clone(),
+        source: workspace_member_source(project_dir.path(), &foo.source_dir),
+    };
 
     let mut result = pre_resolve_v2_direct_workspace_member_deps(
         project_dir.path(),
         &mut deps,
-        std::slice::from_ref(&foo),
-        &[foo.clone(), bar.clone()],
+        std::slice::from_ref(&foo_provider),
+        &[foo, bar.clone()],
         true,
     )
     .expect("v2 direct workspace pre-resolve should promote workspace child");

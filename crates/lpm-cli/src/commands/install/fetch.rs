@@ -170,8 +170,13 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) publish_ages: HashMap<(String, String), u64>,
     pub(super) min_release_age_secs: u64,
     pub(super) install_provenance_status_map:
-        HashMap<(String, String), lpm_common::ProvenanceStatus>,
+        HashMap<crate::provenance_fetch::ApprovalProvenanceKey, lpm_common::ProvenanceStatus>,
     pub(super) fresh_urls: HashMap<String, String>,
+}
+
+#[inline]
+pub(super) fn may_reuse_v1_entry_after_fetch_lock(force: bool, v2_mode: bool) -> bool {
+    !force && !v2_mode
 }
 
 pub(super) async fn run_online_fetch_phase(
@@ -311,9 +316,12 @@ pub(super) async fn run_online_fetch_phase(
 
     // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
     // CAS-backed target arrives with both
-    // (a) a known SRI (`p.integrity = Some(_)`), and
+    // (a) a known SHA-512 SRI, and
     // (b) resolver-threaded peers (`LinkTarget.peers` populated, or
     // the package declares no peer dependencies).
+    // Verified SHA-256/SHA-1 declarations remain the exact object identity,
+    // but use post-fetch planning so the plan cannot inspect the declared
+    // object path before extraction publishes its integrity sidecar.
     // Otherwise `link_v2_prepare` would silently produce an
     // empty-peer-context graph key for any target whose peers are
     // discovered post-fetch by reading `objects/<sri>/package.json`,
@@ -339,24 +347,16 @@ pub(super) async fn run_online_fetch_phase(
         for (lt, p) in link_targets.iter().zip(packages.iter()) {
             match lt.materialization {
                 lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
-                    Some(sri) => acc.push(lpm_linker::v2::V2Target {
-                        target: lt.clone(),
-                        source_sri: sri.to_string(),
-                        verified_object_integrity: None,
-                        fresh_object: None,
-                    }),
-                    None => {
+                    Some(sri) if sri.starts_with("sha512-") => {
+                        acc.push(v2_target(p, lt.clone(), sri.to_string()));
+                    }
+                    Some(_) | None => {
                         all_have_sri = false;
                         break;
                     }
                 },
                 lpm_linker::Materialization::DirectorySource => {
-                    acc.push(lpm_linker::v2::V2Target {
-                        target: lt.clone(),
-                        source_sri: local_source_sri_for_target(lt),
-                        verified_object_integrity: None,
-                        fresh_object: None,
-                    });
+                    acc.push(v2_target(p, lt.clone(), local_source_sri_for_target(lt)));
                 }
             }
         }
@@ -432,15 +432,7 @@ pub(super) async fn run_online_fetch_phase(
                             local_source_sri_for_target(lt)
                         }
                     };
-                    Some((
-                        install_pkg_key(p),
-                        lpm_linker::v2::V2Target {
-                            target: lt.clone(),
-                            source_sri: sri,
-                            verified_object_integrity: None,
-                            fresh_object: None,
-                        },
-                    ))
+                    Some((install_pkg_key(p), v2_target(p, lt.clone(), sri)))
                 })
                 .collect()
         } else {
@@ -1008,8 +1000,10 @@ pub(super) async fn run_online_fetch_phase(
     // only packages the drift gate fetched for are present; the
     // `blocked_to_json_with_provenance` helper omits the
     // `provenance` block when the key is absent.
-    let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
-        HashMap::new();
+    let mut install_provenance_status_map: HashMap<
+        crate::provenance_fetch::ApprovalProvenanceKey,
+        lpm_common::ProvenanceStatus,
+    > = HashMap::new();
     if !used_lockfile && !drift_ignore_policy.ignores_all() {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
@@ -1038,8 +1032,13 @@ pub(super) async fn run_online_fetch_phase(
             )> = Vec::new();
 
             for p in &packages {
-                let Some((approved_version, reference_binding)) =
-                    trusted.provenance_reference_for_candidate(&p.name, &p.version)
+                let Some((approved_version, reference_binding)) = trusted
+                    .provenance_reference_for_candidate_identity(
+                        &p.name,
+                        &p.version,
+                        Some(&p.source),
+                        p.integrity.as_deref(),
+                    )
                 else {
                     continue;
                 };
@@ -1063,40 +1062,57 @@ pub(super) async fn run_online_fetch_phase(
                 // Extract the candidate version's attestation ref
                 // from the resolver's TTL cache (same pattern as the
                 // cooldown gate above).
-                let attestation_ref = if p.is_lpm {
-                    match lpm_common::PackageName::parse(&p.name) {
-                        Ok(pkg_name) => lpm_registry::timing::with_metadata_purpose(
+                let metadata_route = crate::provenance_fetch::approval_metadata_route(
+                    &arc_client,
+                    &route_table,
+                    &p.name,
+                    Some(&p.source),
+                );
+                let metadata = match metadata_route {
+                    crate::provenance_fetch::ApprovalMetadataRoute::LpmPackage => {
+                        let Ok(pkg_name) = lpm_common::PackageName::parse(&p.name) else {
+                            continue;
+                        };
+                        lpm_registry::timing::with_metadata_purpose(
                             lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
                             arc_client.get_package_metadata(&pkg_name),
                         )
                         .await
                         .ok()
-                        .and_then(|meta| {
-                            meta.versions
-                                .get(&p.version)
-                                .and_then(|v| v.dist.as_ref())
-                                .and_then(|d| d.attestations.clone())
-                        }),
-                        Err(_) => None,
                     }
-                } else {
-                    // follow-up: route via RouteTable so
-                    // the provenance-drift gate doesn't fall through to
-                    // public npm for a custom-registry package.
-                    let route = route_table.route_for_package(&p.name);
-                    lpm_registry::timing::with_metadata_purpose(
-                        lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
-                        arc_client.get_npm_metadata_routed(&p.name, route),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|meta| {
-                        meta.versions
-                            .get(&p.version)
-                            .and_then(|v| v.dist.as_ref())
-                            .and_then(|d| d.attestations.clone())
-                    })
+                    crate::provenance_fetch::ApprovalMetadataRoute::LpmProxyOnly => {
+                        lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_npm_package_metadata_proxy_only(&p.name),
+                        )
+                        .await
+                        .ok()
+                    }
+                    crate::provenance_fetch::ApprovalMetadataRoute::NpmDirect => {
+                        lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_npm_metadata_direct(&p.name),
+                        )
+                        .await
+                        .ok()
+                    }
+                    crate::provenance_fetch::ApprovalMetadataRoute::Custom(route) => {
+                        lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_npm_metadata_routed(&p.name, route),
+                        )
+                        .await
+                        .ok()
+                    }
+                    crate::provenance_fetch::ApprovalMetadataRoute::NonRegistry
+                    | crate::provenance_fetch::ApprovalMetadataRoute::Unavailable => continue,
                 };
+                let attestation_ref = metadata.and_then(|meta| {
+                    meta.versions
+                        .get(&p.version)
+                        .and_then(|v| v.dist.as_ref())
+                        .and_then(|d| d.attestations.clone())
+                });
 
                 // When the operator skip-listed this name (CLI
                 // `--unverified-provenance`) OR set the fleet-wide
@@ -1130,8 +1146,10 @@ pub(super) async fn run_online_fetch_phase(
                     );
                     // Record for the install --json envelope
                     // before consuming for the drift gate.
-                    install_provenance_status_map
-                        .insert((p.name.clone(), p.version.clone()), status.clone());
+                    install_provenance_status_map.insert(
+                        (p.name.clone(), p.version.clone(), Some(p.source.clone())),
+                        status.clone(),
+                    );
                     // Projection: `Unverified(snap)` / `Disabled(snap)`
                     // → Some(snap), `Absent` → Some(present:false),
                     // `TransportDegraded` → None. `VerificationRejected`
@@ -1220,8 +1238,10 @@ pub(super) async fn run_online_fetch_phase(
                                     // returning so a `--json` consumer that
                                     // tees stderr can correlate the failure
                                     // with the per-package envelope.
-                                    install_provenance_status_map
-                                        .insert((p.name.clone(), p.version.clone()), status);
+                                    install_provenance_status_map.insert(
+                                        (p.name.clone(), p.version.clone(), Some(p.source.clone())),
+                                        status,
+                                    );
                                     return Err(LpmError::ProvenanceVerification(reason));
                                 }
                             };
@@ -1229,8 +1249,10 @@ pub(super) async fn run_online_fetch_phase(
                         }
                         Err(other) => return Err(other),
                     };
-                    install_provenance_status_map
-                        .insert((p.name.clone(), p.version.clone()), status_for_map);
+                    install_provenance_status_map.insert(
+                        (p.name.clone(), p.version.clone(), Some(p.source.clone())),
+                        status_for_map,
+                    );
                     snapshot_for_drift
                 };
 
@@ -1543,11 +1565,17 @@ pub(super) async fn run_online_fetch_phase(
                 // Source-aware existence check: a registry-CAS hit must NOT
                 // satisfy a Source::Tarball pkg with the same
                 // (name, version).
-                let store_path_pre_fetch = (!force_flag)
+                let may_reuse_v1 =
+                    may_reuse_v1_entry_after_fetch_lock(force_flag, store_v2_ref.is_some());
+                let store_path_pre_fetch = may_reuse_v1
                     .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
                     .flatten();
-                if !force_flag
-                    && p.store_has_source_aware(&store_ref, &project_dir_buf)
+                if may_reuse_v1
+                    && p.store_has_for_install_layout(
+                        &store_ref,
+                        store_v2_ref.as_deref(),
+                        &project_dir_buf,
+                    )
                     && let Some(existing_path) = store_path_pre_fetch
                 {
                     // A sibling completed the fetch while we waited on the
@@ -1563,28 +1591,6 @@ pub(super) async fn run_online_fetch_phase(
                     // URL value.
                     let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                     let link_h = spawn_link(&p, None)?;
-                    // The v2 object dir was populated by the sibling's fetch
-                    // task. The per-key fetch lock above ensures we observe
-                    // the post-extract state, so dispatch the v2 link entry in
-                    // the same shape as the post-fetch path below.
-                    let v2_link_h: Option<V2LinkHandle> =
-                        if let (Some(plan), Some(target), Some(store_v2)) = (
-                            v2_plan_arc.as_ref(),
-                            v2_target_for_pkg.as_ref(),
-                            store_v2_ref.as_ref(),
-                        ) {
-                            let plan_c = std::sync::Arc::clone(plan);
-                            let target_c = target.clone();
-                            let store_c = std::sync::Arc::clone(store_v2);
-                            Some(spawn_v2_link_task(
-                                plan_c,
-                                target_c,
-                                store_c,
-                                Arc::clone(&v2_link_task_semaphore_c),
-                            ))
-                        } else {
-                            None
-                        };
                     overall.inc(1);
                     spec_tracker_c.mark_consumed_if_completed(&package_key);
                     return Ok::<FetchTaskResult, LpmError>((
@@ -1596,7 +1602,7 @@ pub(super) async fn run_online_fetch_phase(
                             ..Default::default()
                         },
                         link_h,
-                        v2_link_h,
+                        None,
                         None,
                     ));
                 }
@@ -1977,16 +1983,11 @@ pub(super) fn registry_install_pkg_key(
     name: &str,
     version: &str,
     route_table: &RouteTable,
+    integrity: Option<&str>,
 ) -> String {
     let registry_url = registry_source_url_for(name, route_table);
     let source = format!("registry+{registry_url}");
-    let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + source.len());
-    key.push_str(name);
-    key.push('\x00');
-    key.push_str(version);
-    key.push('\x00');
-    key.push_str(&source);
-    key
+    install_pkg_key_parts(name, version, &source, integrity)
 }
 
 /// /: stream metadata AND dispatch speculative
@@ -2223,7 +2224,12 @@ pub(super) fn spawn_speculation_dispatcher(
                 if !already_dispatched.insert(key) {
                     return;
                 }
-                let package_key = registry_install_pkg_key(&name, &version, &route_table_spec);
+                let package_key = registry_install_pkg_key(
+                    &name,
+                    &version,
+                    &route_table_spec,
+                    integrity.as_deref(),
+                );
 
                 let skip_auth_bearing_custom_speculation = matches!(
                     route_table_spec.route_for_package(&name),
@@ -2449,7 +2455,7 @@ pub(super) async fn speculative_download_and_store(
     // package to a private mirror. Tarball-URL packages have a
     // different source_id and naturally don't share locks with
     // speculation — that's correct (speculation never targets them).
-    let speculation_key = registry_install_pkg_key(name, version, route_table);
+    let speculation_key = registry_install_pkg_key(name, version, route_table, integrity);
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
@@ -2995,13 +3001,14 @@ pub(super) async fn fetch_and_store_legacy(
             .extract_object_from_bytes_with_fresh_integrity(&bytes, p.integrity.as_deref())?;
         (timings, Some(object), sri)
     } else {
+        let source_sri = p.integrity.as_deref().unwrap_or(&computed_sri);
         let (_, stage) = store.store_package_from_file_timed(
             &p.name,
             &p.version,
             downloaded.file.path(),
-            &computed_sri,
+            source_sri,
         )?;
-        (stage, None, computed_sri)
+        (stage, None, source_sri.to_string())
     };
 
     Ok((
@@ -3077,13 +3084,15 @@ pub(super) async fn fetch_and_store_tarball_url(
     let (data, computed_sri) = client
         .download_tarball_with_integrity(url, p.integrity.as_deref())
         .await?;
+    let source_sri = p.integrity.as_deref().unwrap_or(&computed_sri);
     let download_ms = download_start.elapsed().as_millis();
     drop(permit);
 
     // download_tarball_with_integrity already verified the SRI when
-    // p.integrity was Some; on trust-on-first-use it returned the
-    // computed SRI we need to record. integrity_ms folds into
-    // download_ms because the verify is a single string compare.
+    // p.integrity was Some. Preserve that declared algorithm and digest as
+    // the source identity; trust-on-first-use uses the computed SHA-512 SRI.
+    // integrity_ms folds into download_ms because verification happened in
+    // the download call.
     let integrity_ms = 0;
 
     let extract_permit_wait_start = std::time::Instant::now();
@@ -3093,22 +3102,21 @@ pub(super) async fn fetch_and_store_tarball_url(
     let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
         // — v2 path. The Source::Tarball case
         // already has bytes + SRI in hand; route them straight into
-        // `extract_object_from_bytes`. The downloader returns the
-        // declaration's algorithm when one was supplied, while v2
-        // objects are keyed by the extractor's canonical sha512 SRI.
+        // `extract_object_from_bytes`. Verified declarations retain their
+        // exact SRI; unpinned content uses the computed SHA-512 identity.
         let (object, sri, stage) =
-            store_v2.extract_object_from_bytes_with_fresh_integrity(&data, Some(&computed_sri))?;
+            store_v2.extract_object_from_bytes_with_fresh_integrity(&data, Some(source_sri))?;
         (stage, Some(object), sri)
     } else {
         let extract_start = std::time::Instant::now();
-        let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+        let _store_path = store.store_tarball_at_cas_path(source_sri, &data)?;
         (
             lpm_store::StageTimings {
                 extract_ms: extract_start.elapsed().as_millis(),
                 ..Default::default()
             },
             None,
-            computed_sri,
+            source_sri.to_string(),
         )
     };
 

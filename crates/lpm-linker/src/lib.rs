@@ -61,5 +61,41 @@ pub use v1_isolated::{
 };
 pub use validation::validate_bin_name;
 
+/// Reconcile project-local linker state against an empty dependency graph.
+pub fn reconcile_empty_install(
+    project_dir: &std::path::Path,
+    use_v2_store: bool,
+    linker_mode: LinkerMode,
+) -> Result<(), lpm_common::LpmError> {
+    if use_v2_store {
+        return v2::reconcile_empty_project(project_dir);
+    }
+
+    match linker_mode {
+        LinkerMode::Isolated => {
+            link_packages(project_dir, &[], false, None)?;
+        }
+        LinkerMode::Hoisted => {
+            v1_hoisted::reconcile_empty_hoisted_root(project_dir)?;
+            link_packages_hoisted(project_dir, &[], false, None)?;
+        }
+    }
+    remove_project_bin_dir(project_dir)
+}
+
+fn remove_project_bin_dir(project_dir: &std::path::Path) -> Result<(), lpm_common::LpmError> {
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    let metadata = match bin_dir.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(lpm_common::LpmError::Io(error)),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(bin_dir).map_err(lpm_common::LpmError::Io)
+    } else {
+        std::fs::remove_file(bin_dir).map_err(lpm_common::LpmError::Io)
+    }
+}
+
 #[cfg(test)]
 mod tests;

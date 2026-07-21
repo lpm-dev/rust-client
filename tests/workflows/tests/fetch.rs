@@ -3,7 +3,9 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
+use support::{
+    TempProject, lpm_spawnable_with_registry, lpm_with_registry, write_npm_firewall_global_config,
+};
 
 const PACKAGE_JSON: &str = r#"{
   "name": "fetch-app",
@@ -14,6 +16,27 @@ const PACKAGE_JSON: &str = r#"{
 async fn mount_ms(mock: &MockRegistry) {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
+}
+
+async fn mount_ms_with_integrity(mock: &MockRegistry, integrity: &str) {
+    let tarball = make_tarball("ms", "2.1.3");
+    let metadata = serde_json::json!({
+        "name": "ms",
+        "dist-tags": {"latest": "2.1.3"},
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": mock.tarball_url("ms", "2.1.3"),
+                    "integrity": integrity,
+                }
+            }
+        }
+    });
+    mock.with_package_metadata("ms", "2.1.3", &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
 }
 
 async fn seed_lockfile(mock: &MockRegistry) -> String {
@@ -179,6 +202,122 @@ async fn fetch_reads_lockfile_without_manifest_and_enables_offline_frozen_instal
         String::from_utf8_lossy(&offline.stdout),
         String::from_utf8_lossy(&offline.stderr)
     );
+}
+
+#[tokio::test]
+async fn fetch_v1_preserves_sha256_for_offline_frozen_replay() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    let declared = Integrity::from_bytes(HashAlgorithm::Sha256, &tarball).to_string();
+    mount_ms_with_integrity(&mock, &declared).await;
+
+    let seed = TempProject::empty(PACKAGE_JSON);
+    lpm_with_registry(&seed, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let project = project_with_lockfile(&seed.read_file("lpm.lock"));
+
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["fetch"])
+        .assert()
+        .success();
+
+    let sidecar =
+        std::fs::read_to_string(package_store_dir(&project, "ms", "2.1.3").join(".integrity"))
+            .expect("fetch must write the v1 identity sidecar");
+    assert_eq!(sidecar, declared);
+
+    project.write_file("package.json", PACKAGE_JSON);
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+}
+
+#[tokio::test]
+async fn fetch_v1_waits_for_the_store_lock_before_downloading_or_replacing_coordinates() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    std::fs::create_dir_all(project.store_dir()).unwrap();
+    let store_lock =
+        lpm_common::acquire_exclusive_lock(project.store_dir().join(".gc.lock")).unwrap();
+    let requests_before = tarball_request_count(&mock, "ms", "2.1.3").await;
+
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env("LPM_STORE_VERSION", "v1").args(["fetch"]);
+    let child = command.spawn().expect("spawn lpm fetch");
+
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert_eq!(
+        tarball_request_count(&mock, "ms", "2.1.3").await,
+        requests_before,
+        "v1 fetch must acquire the exclusive store lock before checking or replacing a coordinate"
+    );
+
+    drop(store_lock);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("fetch should finish after the store lock is released")
+    .expect("join fetch process");
+    assert!(
+        output.status.success(),
+        "fetch failed after the lock was released:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn fetch_v1_rejects_distinct_sources_that_share_package_coordinates() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut parsed =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("lockfile parses");
+    let mut second = parsed.packages[0].clone();
+    second.source = Some("registry+https://registry-b.example".into());
+    second.tarball = Some("https://registry-b.example/ms/-/ms-2.1.3.tgz".into());
+    second.integrity = Some(compute_integrity(b"registry-b bytes"));
+    parsed.packages.push(second);
+    parsed
+        .write_to_file(&lockfile_path)
+        .expect("write conflicting v1 lockfile identities");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("distinct source identities"));
+    assert!(stderr.contains("ms@2.1.3"));
 }
 
 #[tokio::test]

@@ -25,6 +25,15 @@ fn write_store_package(
         ),
     )
     .unwrap();
+    let scripts: serde_json::Value = serde_json::from_str(scripts_json).unwrap();
+    for body in scripts
+        .as_object()
+        .into_iter()
+        .flat_map(|scripts| scripts.values())
+        .filter_map(serde_json::Value::as_str)
+    {
+        write_delegate_fixture(&pkg_dir, body);
+    }
     if built {
         std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
     }
@@ -37,6 +46,17 @@ fn write_store_package(
     std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
 }
 
+fn write_delegate_fixture(pkg_dir: &Path, body: &str) {
+    let Some(relative_path) = lpm_security::static_gate::extract_delegate_path(body) else {
+        return;
+    };
+    let path = pkg_dir.join(relative_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, "module.exports = true\n").unwrap();
+}
+
 // ── live_package_dir tests ─────────────────────────
 //
 // The fix for the esbuild postinstall failure: lifecycle scripts
@@ -45,6 +65,15 @@ fn write_store_package(
 // probe across both linker modes + the pathological fallback so
 // a future linker-layout change doesn't silently break the dep
 // resolution that postinstall scripts rely on.
+
+fn seed_live_package_identity(path: &std::path::Path, name: &str, version: &str) {
+    std::fs::create_dir_all(path).unwrap();
+    std::fs::write(
+        path.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+    )
+    .unwrap();
+}
 
 #[test]
 fn live_package_dir_resolves_isolated_layout() {
@@ -60,14 +89,12 @@ fn live_package_dir_resolves_isolated_layout() {
         .isolated_wrapper_dir("esbuild@0.21.5")
         .join("node_modules")
         .join("esbuild");
-    std::fs::create_dir_all(&live).unwrap();
+    seed_live_package_identity(&live, "esbuild", "0.21.5");
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
     let resolved = live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None, None),
         &store_fallback,
         None,
     );
@@ -88,14 +115,12 @@ fn live_package_dir_resolves_isolated_scoped_name() {
         .join("node_modules")
         .join("@esbuild")
         .join("darwin-arm64");
-    std::fs::create_dir_all(&live).unwrap();
+    seed_live_package_identity(&live, "@esbuild/darwin-arm64", "0.21.5");
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
     let resolved = live_package_dir(
         project.path(),
-        "@esbuild/darwin-arm64",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("@esbuild/darwin-arm64", "0.21.5", None, None, None),
         &store_fallback,
         None,
     );
@@ -110,18 +135,54 @@ fn live_package_dir_resolves_hoisted_layout() {
     // path doesn't exist.
     let project = tempfile::tempdir().unwrap();
     let live = project.path().join("node_modules").join("esbuild");
-    std::fs::create_dir_all(&live).unwrap();
+    seed_live_package_identity(&live, "esbuild", "0.21.5");
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
     let resolved = live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None, None),
         &store_fallback,
         None,
     );
     assert_eq!(resolved, live);
+}
+
+#[test]
+fn live_package_dir_resolves_the_matching_nested_hoisted_identity() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().join("node_modules/shared");
+    let nested = project
+        .path()
+        .join("node_modules/consumer/node_modules/shared");
+    for (directory, version, integrity) in [
+        (&root, "1.0.0", "sha512-root"),
+        (&nested, "2.0.0", "sha512-nested"),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("package.json"),
+            format!(r#"{{"name":"shared","version":"{version}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(directory.join(".integrity"), integrity).unwrap();
+    }
+    let store_path = project.path().join("store/v1/shared@2.0.0");
+
+    let resolved = live_package_dir_with_v2(
+        project.path(),
+        PackageLookupIdentity::new(
+            "shared",
+            "2.0.0",
+            None,
+            Some("npm-exact"),
+            Some("sha512-nested"),
+        ),
+        &store_path,
+        None,
+        None,
+    );
+
+    assert_eq!(resolved, nested);
 }
 
 #[test]
@@ -145,9 +206,7 @@ fn live_package_dir_falls_back_to_store_when_unlinked() {
 
     let resolved = live_package_dir_with_v2(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None, None),
         &store_fallback,
         None,
         None,
@@ -155,39 +214,32 @@ fn live_package_dir_falls_back_to_store_when_unlinked() {
     assert_eq!(resolved, store_fallback);
 }
 
-/// — direct deps under v2: project's `node_modules/<name>`
-/// is a symlink into `~/.lpm/store/v2/links/<key>/.../<name>/`.
-/// The hoisted-probe branch's `is_dir()` follows the symlink and
-/// returns the project-side path, which Node resolves through at
-/// script time.
+/// An unindexed project symlink is not sufficient evidence for lifecycle
+/// execution. Production v2 callers resolve through the exact project-scoped
+/// baseline index; without it, the lookup fails closed instead of following a
+/// replaceable root link.
 #[test]
 #[cfg(unix)]
-fn live_package_dir_resolves_v2_direct_dep_via_project_symlink() {
+fn live_package_dir_rejects_an_unindexed_project_symlink() {
     let project = tempfile::tempdir().unwrap();
     let nm = project.path().join("node_modules");
     std::fs::create_dir_all(&nm).unwrap();
 
-    // Synthesize a v2-shaped link entry and a project-side symlink
-    // pointing at it. The detection doesn't care about the exact
-    // store layout — only that `nm.join(name)` is `is_dir()`.
     let link_entry = project
         .path()
         .join("fake-store/v2/links/express@4.21.0+abc/node_modules/express");
-    std::fs::create_dir_all(&link_entry).unwrap();
+    seed_live_package_identity(&link_entry, "express", "4.21.0");
     std::os::unix::fs::symlink(&link_entry, nm.join("express")).unwrap();
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
-    let resolved = live_package_dir(
+    let resolved = live_package_dir_with_v2(
         project.path(),
-        "express",
-        "4.21.0",
-        None,
+        PackageLookupIdentity::new("express", "4.21.0", None, None, None),
         &store_fallback,
         None,
+        None,
     );
-    // Returns the project-side symlink path; Node follows it at
-    // script time.
-    assert_eq!(resolved, nm.join("express"));
+    assert_eq!(resolved, store_fallback);
 }
 
 /// — transitive deps under v2: no project-side symlink
@@ -239,7 +291,7 @@ fn live_package_dir_resolves_v2_transitive_via_store_walk() {
     let entry = v2_store
         .populate_link_entry(LinkEntryRequest {
             graph_key: std::sync::Arc::new(key),
-            source_sri: sri,
+            source_sri: sri.clone(),
             object_dir,
             deps: vec![],
             platform: std::sync::Arc::new(lpm_store::v2::LinkMetaPlatform {
@@ -254,14 +306,97 @@ fn live_package_dir_resolves_v2_transitive_via_store_walk() {
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
     let resolved = live_package_dir_with_v2(
         project.path(),
-        "deeply-nested",
-        "1.0.0",
-        None,
+        PackageLookupIdentity::new("deeply-nested", "1.0.0", None, None, Some(&sri)),
         &store_fallback,
         Some(&v2_store),
         None,
     );
     assert_eq!(resolved, expected);
+}
+
+#[test]
+#[cfg(unix)]
+fn live_package_dir_uses_exact_v2_identity_before_a_same_name_hoist() {
+    use std::sync::Arc;
+
+    use lpm_store::v2::{
+        GraphKey, GraphKeyInputs, LinkMeta, LinkMetaDep, LinkMetaPlatform, LinkerModeTag,
+        PlatformTuple, Store as V2Store,
+    };
+
+    let project = tempfile::tempdir().unwrap();
+    let node_modules = project.path().join("node_modules");
+    std::fs::create_dir_all(&node_modules).unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(store_dir.path());
+    let store = V2Store::from_lpm_root(&lpm_root);
+    let platform = PlatformTuple::current();
+    let meta_platform = Arc::new(LinkMetaPlatform {
+        os: "darwin".into(),
+        cpu: "arm64".into(),
+        libc: None,
+    });
+
+    let correct_sri = lpm_store::compute_sri_hash(b"approved nested source");
+    let correct_key = GraphKey::derive(
+        &GraphKeyInputs::new("shared", "1.0.0", platform.clone(), LinkerModeTag::Hoisted)
+            .with_source_identity(Some("source-correct\0project-qualified".into())),
+    );
+    let correct_link_dir = store.paths().links_root().join(correct_key.dir_name());
+    let correct_package_dir = correct_link_dir.join("node_modules/shared");
+    std::fs::create_dir_all(&correct_package_dir).unwrap();
+    LinkMeta::new(
+        &correct_key,
+        &correct_sri,
+        "objects/correct",
+        Vec::new(),
+        Arc::clone(&meta_platform),
+    )
+    .write_to(&correct_link_dir)
+    .unwrap();
+
+    let wrong_sri = lpm_store::compute_sri_hash(b"unapproved root source");
+    let wrong_key = GraphKey::derive(
+        &GraphKeyInputs::new("shared", "1.0.0", platform, LinkerModeTag::Hoisted)
+            .with_source_identity(Some("source-wrong\0project-qualified".into())),
+    );
+    let wrong_link_dir = store.paths().links_root().join(wrong_key.dir_name());
+    let wrong_package_dir = wrong_link_dir.join("node_modules/shared");
+    std::fs::create_dir_all(&wrong_package_dir).unwrap();
+    LinkMeta::new(
+        &wrong_key,
+        &wrong_sri,
+        "objects/wrong",
+        vec![LinkMetaDep {
+            local: "nested-shared".into(),
+            target_graph_key: correct_key.digest_hex(),
+            target_name: "shared".into(),
+            target_version: "1.0.0".into(),
+        }],
+        meta_platform,
+    )
+    .write_to(&wrong_link_dir)
+    .unwrap();
+    std::os::unix::fs::symlink(&wrong_package_dir, node_modules.join("shared")).unwrap();
+
+    let index = lpm_store::V2BaselineIndex::for_project(project.path(), &lpm_root).unwrap();
+    let fallback = std::path::PathBuf::from("/store/should-not-be-used");
+
+    let resolved = live_package_dir_with_v2(
+        project.path(),
+        PackageLookupIdentity::new(
+            "shared",
+            "1.0.0",
+            None,
+            Some("source-correct"),
+            Some(&correct_sri),
+        ),
+        &fallback,
+        Some(&store),
+        Some(&index),
+    );
+
+    assert_eq!(resolved, correct_package_dir);
 }
 
 #[test]
@@ -276,16 +411,14 @@ fn live_package_dir_prefers_isolated_when_both_exist() {
         .isolated_wrapper_dir("esbuild@0.21.5")
         .join("node_modules")
         .join("esbuild");
-    std::fs::create_dir_all(&isolated).unwrap();
+    seed_live_package_identity(&isolated, "esbuild", "0.21.5");
     let hoisted = project.path().join("node_modules").join("esbuild");
-    std::fs::create_dir_all(&hoisted).unwrap();
+    seed_live_package_identity(&hoisted, "esbuild", "0.21.5");
     let store_fallback = std::path::PathBuf::from("/store/should-not-be-used");
 
     let resolved = live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None, None),
         &store_fallback,
         None,
     );
@@ -313,13 +446,11 @@ fn prepare_live_package_dir_returns_isolated_path_when_present() {
         .isolated_wrapper_dir("esbuild@0.21.5")
         .join("node_modules")
         .join("esbuild");
-    std::fs::create_dir_all(&live).unwrap();
+    seed_live_package_identity(&live, "esbuild", "0.21.5");
 
     let resolved = prepare_live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None, None),
         &store_pkg,
         store_root.path(),
         None,
@@ -351,9 +482,7 @@ fn prepare_live_package_dir_errors_when_unlinked() {
 
     let err = prepare_live_package_dir(
         project.path(),
-        "missing-pkg",
-        "1.0.0",
-        None,
+        PackageLookupIdentity::new("missing-pkg", "1.0.0", None, None, None),
         &store_pkg,
         store_root.path(),
         None,
@@ -393,7 +522,11 @@ fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
     let store_pkg = store_root.path().join("esbuild@0.21.5");
     std::fs::create_dir_all(&store_pkg).unwrap();
     let store_file = store_pkg.join("package.json");
-    std::fs::write(&store_file, b"{\"name\":\"esbuild\"}").unwrap();
+    std::fs::write(
+        &store_file,
+        b"{\"name\":\"esbuild\",\"version\":\"0.21.5\"}",
+    )
+    .unwrap();
 
     let layout = lpm_linker::LayoutPaths::for_project(project.path());
     let live = layout
@@ -412,9 +545,7 @@ fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
 
     prepare_live_package_dir(
         project.path(),
-        "esbuild",
-        "0.21.5",
-        None,
+        PackageLookupIdentity::new("esbuild", "0.21.5", None, None, None),
         &store_pkg,
         store_root.path(),
         None,
@@ -643,10 +774,12 @@ fn toposort_respects_dependency_order() {
         ScriptablePackage {
             name: "a".into(),
             version: "1.0.0".into(),
+            source: None,
             integrity: None,
             wrapper_id: None,
             store_path: PathBuf::new(),
             pristine_path: PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::new(),
@@ -658,10 +791,12 @@ fn toposort_respects_dependency_order() {
         ScriptablePackage {
             name: "b".into(),
             version: "1.0.0".into(),
+            source: None,
             integrity: None,
             wrapper_id: None,
             store_path: PathBuf::new(),
             pristine_path: PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::new(),
@@ -717,6 +852,126 @@ fn toposort_respects_dependency_order() {
     assert_eq!(names, vec!["a", "b"]);
 }
 
+#[test]
+fn toposort_preserves_multiple_versions_of_the_same_package() {
+    use std::path::PathBuf;
+
+    let package = |version: &str| ScriptablePackage {
+        name: "shared".into(),
+        version: version.into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
+        integrity: Some(format!("sha512-{version}")),
+        wrapper_id: None,
+        store_path: PathBuf::new(),
+        pristine_path: PathBuf::new(),
+        execution_identity: None,
+        source_integrity: format!("sha512-{version}"),
+        graph_key_digest: None,
+        scripts: HashMap::new(),
+        is_built: false,
+        build_marker_key: None,
+        is_trusted: true,
+        trust_reason: TrustReason::StrictBinding,
+    };
+    let packages = [package("1.0.0"), package("2.0.0")];
+    let refs = packages.iter().collect();
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.packages = ["1.0.0", "2.0.0"]
+        .into_iter()
+        .map(|version| lpm_lockfile::LockedPackage {
+            name: "shared".into(),
+            version: version.into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            integrity: Some(format!("sha512-{version}")),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            node_engine: None,
+            optional: false,
+            dependencies: Vec::new(),
+            alias_dependencies: Vec::new(),
+            peers: Vec::new(),
+            tarball: None,
+        })
+        .collect();
+
+    let sorted = toposort_packages(refs, &lockfile);
+    let versions = sorted
+        .iter()
+        .map(|package| package.version.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(sorted.len(), 2);
+    assert_eq!(
+        versions,
+        std::collections::HashSet::from(["1.0.0", "2.0.0"])
+    );
+}
+
+#[test]
+fn toposort_preserves_same_version_packages_from_distinct_sources() {
+    use std::path::PathBuf;
+
+    let source_a = "directory+./fork-a";
+    let source_b = "directory+./fork-b";
+    let package = |source: &str| ScriptablePackage {
+        name: "shared".into(),
+        version: "1.0.0".into(),
+        source: Some(source.into()),
+        integrity: Some("sha512-identical".into()),
+        wrapper_id: lpm_lockfile::Source::parse(source)
+            .ok()
+            .map(|source| source.source_id()),
+        store_path: PathBuf::new(),
+        pristine_path: PathBuf::new(),
+        execution_identity: None,
+        source_integrity: "sha512-identical".into(),
+        graph_key_digest: None,
+        scripts: HashMap::new(),
+        is_built: false,
+        build_marker_key: None,
+        is_trusted: true,
+        trust_reason: TrustReason::StrictBinding,
+    };
+    let packages = [package(source_a), package(source_b)];
+    let refs = packages.iter().collect();
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.packages = [source_a, source_b]
+        .into_iter()
+        .map(|source| lpm_lockfile::LockedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            source: Some(source.into()),
+            integrity: Some("sha512-identical".into()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            node_engine: None,
+            optional: false,
+            dependencies: Vec::new(),
+            alias_dependencies: Vec::new(),
+            peers: Vec::new(),
+            tarball: None,
+        })
+        .collect();
+
+    let sorted = toposort_packages(refs, &lockfile);
+    let sources = sorted
+        .iter()
+        .filter_map(|package| package.source.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(sorted.len(), 2);
+    assert_eq!(
+        sources,
+        std::collections::HashSet::from([source_a, source_b])
+    );
+}
+
 // ── is_scope_trusted tests ──────────────────────────────────
 
 #[test]
@@ -748,12 +1003,6 @@ fn scope_trusted_exact_match() {
 #[test]
 fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"lpm":{"trustedDependencies":["esbuild"]}}"#,
-    )
-    .unwrap();
-
     let store = PackageStore::at(dir.path().join("store"));
     let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     write_store_package(
@@ -763,15 +1012,16 @@ fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
         r#"{"postinstall":"node install.js"}"#,
         false,
     );
+    let script_hash = compute_script_hash(&store.package_dir("esbuild", "1.0.0")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        format!(
+            r#"{{"lpm":{{"trustedDependencies":{{"esbuild@1.0.0":{{"scriptHash":"{script_hash}"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
 
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    // Legacy bare-name `trustedDependencies: ["esbuild"]` matches
-    // as `LegacyNameOnly`, which the strict gate treats as
-    // trusted — same semantic `rebuild::run` uses.
-    //
-    // the policy arg is threaded but not yet
-    // consulted; `ScriptPolicy::Deny` (the default) makes the
-    // default-policy intent explicit. Triage-specific tests cover green-tier promotion separately.
     let trusted = all_scripted_packages_trusted(
         &lpm_root,
         &[("esbuild".to_string(), "1.0.0".to_string(), None)],
@@ -785,6 +1035,40 @@ fn all_scripted_packages_trusted_true_when_unbuilt_scripts_are_trusted() {
     );
 
     assert!(trusted);
+}
+
+#[test]
+fn all_scripted_packages_trusted_rejects_legacy_name_only_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"lpm":{"trustedDependencies":["esbuild"]}}"#,
+    )
+    .unwrap();
+    let store = PackageStore::at(dir.path().join("store"));
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+    write_store_package(
+        &store,
+        "esbuild",
+        "1.0.0",
+        r#"{"postinstall":"node install.js"}"#,
+        false,
+    );
+    let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+    let trusted = all_scripted_packages_trusted(
+        &lpm_root,
+        &[("esbuild".to_string(), "1.0.0".to_string(), None)],
+        &policy,
+        dir.path(),
+        ScriptPolicy::Deny,
+        false,
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
+        None,
+    );
+
+    assert!(!trusted);
 }
 
 #[test]
@@ -821,12 +1105,6 @@ fn all_scripted_packages_trusted_false_when_any_unbuilt_scripted_package_is_untr
 #[test]
 fn all_scripted_packages_trusted_ignores_already_built_untrusted_packages() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("package.json"),
-        r#"{"lpm":{"trustedDependencies":["trusted-pkg"]}}"#,
-    )
-    .unwrap();
-
     let store = PackageStore::at(dir.path().join("store"));
     let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     write_store_package(
@@ -843,6 +1121,14 @@ fn all_scripted_packages_trusted_ignores_already_built_untrusted_packages() {
         r#"{"postinstall":"node blocked.js"}"#,
         true,
     );
+    let script_hash = compute_script_hash(&store.package_dir("trusted-pkg", "1.0.0")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        format!(
+            r#"{{"lpm":{{"trustedDependencies":{{"trusted-pkg@1.0.0":{{"scriptHash":"{script_hash}"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
 
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
     let trusted = all_scripted_packages_trusted(
@@ -1109,10 +1395,12 @@ fn stale_detection_finds_packages_without_scripts() {
         ScriptablePackage {
             name: "sharp".into(),
             version: "0.33.0".into(),
+            source: None,
             integrity: None,
             wrapper_id: None,
             store_path: std::path::PathBuf::new(),
             pristine_path: std::path::PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::from([("postinstall".into(), "node setup".into())]),
@@ -1124,10 +1412,12 @@ fn stale_detection_finds_packages_without_scripts() {
         ScriptablePackage {
             name: "esbuild".into(),
             version: "0.21.0".into(),
+            source: None,
             integrity: None,
             wrapper_id: None,
             store_path: std::path::PathBuf::new(),
             pristine_path: std::path::PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-unused".into(),
             graph_key_digest: None,
             scripts: HashMap::from([("postinstall".into(), "node install.js".into())]),
@@ -1160,7 +1450,7 @@ fn stale_detection_finds_packages_without_scripts() {
 // ── strict gate composition tests ──────────
 //
 // These tests exercise the trust-decision logic in isolation: given a
-// SecurityPolicy and a (name, version, integrity, script_hash) tuple,
+// SecurityPolicy and a (name, version, source, integrity, script_hash) tuple,
 // does the strict gate produce the right TrustMatch and does the
 // composition with `is_scope_trusted` produce the right `is_trusted`?
 //
@@ -1223,7 +1513,7 @@ fn build_strict_gate_unknown_package_blocks_script() {
 }
 
 #[test]
-fn build_strict_gate_legacy_bare_name_runs_with_warning() {
+fn build_strict_gate_reports_legacy_bare_name_as_non_strict_match() {
     let policy = SecurityPolicy {
         trusted_dependencies: TrustedDependencies::Legacy(vec!["esbuild".to_string()]),
         minimum_release_age_secs: 0,
@@ -1251,10 +1541,9 @@ fn build_strict_gate_different_version_blocks_script() {
 /// `lpm approve-scripts`, which writes a `name@version` Rich
 /// entry binding trust to `(integrity, script_hash)`.
 ///
-/// The legacy `Vec<String>` form retains `LegacyNameOnly` because
-/// that is an explicit user-authored shape; the `@*` sentinel is
-/// auto-generated and never represented user consent to wildcard
-/// trust.
+/// Both forms remain migration inputs rather than executable trust. The
+/// distinction lets the review path preserve explicitly authored names while
+/// refusing the generated wildcard sentinel as a concrete match.
 #[test]
 fn build_strict_gate_legacy_upgraded_at_star_does_not_auto_trust() {
     let mut td = TrustedDependencies::Legacy(vec!["esbuild".into()]);
@@ -1361,8 +1650,8 @@ fn auto_build_call_site_threads_effective_policy() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/commands/install/lifecycle.rs"
     ));
-    const TRUST_CALL: &str = "crate::commands::rebuild::all_scripted_packages_trusted(";
-    const REBUILD_CALL: &str = "crate::commands::rebuild::run_with_report(";
+    const TRUST_CALL: &str = "crate::commands::rebuild::all_scripted_package_identities_trusted(";
+    const REBUILD_CALL: &str = "crate::commands::rebuild::run_under_store_lock(";
     const POLICY_ARG: &str = "effective_policy";
 
     let trust_pos = src
@@ -1398,10 +1687,12 @@ fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> Scripta
     ScriptablePackage {
         name: name.into(),
         version: "1.0.0".into(),
+        source: None,
         integrity: None,
         wrapper_id: None,
         store_path: std::path::PathBuf::from("/unused"),
         pristine_path: std::path::PathBuf::from("/unused"),
+        execution_identity: None,
         source_integrity: "sha512-unused".into(),
         graph_key_digest: None,
         scripts: HashMap::from([("postinstall".into(), "node x.js".into())]),
@@ -1510,6 +1801,7 @@ fn write_scripted_pkg(
             ),
         )
         .unwrap();
+    write_delegate_fixture(&pkg_dir, postinstall);
     // see `write_store_package`
     // for why `.integrity` is required for the v1 fallback in
     // `find_installed_package_baseline`.
@@ -1532,7 +1824,6 @@ fn triage_promotes_green_tier_without_manifest_binding() {
     let pkg_dir = write_scripted_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
     let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-
     let reason = evaluate_trust(
         &pkg_dir,
         "some-native-pkg",
@@ -1963,7 +2254,7 @@ fn trust_reason_is_trusted_covers_all_trusted_variants() {
     // forces an explicit decision about whether it counts as
     // trusted. Preferable to a silent default that ships wrong.
     assert!(TrustReason::StrictBinding.is_trusted());
-    assert!(TrustReason::LegacyName.is_trusted());
+    assert!(!TrustReason::LegacyName.is_trusted());
     assert!(TrustReason::ScopedGlob.is_trusted());
     assert!(TrustReason::GreenTierUnderTriage.is_trusted());
     // advisor-approved-this-run grants ephemeral
@@ -2006,13 +2297,15 @@ fn advisor_approval_promotes_amber_under_triage() {
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
     let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+    let reviewed_hash = compute_script_hash(&pkg_dir).unwrap();
 
     let mut approvals = std::collections::HashSet::new();
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
         None,
-        String::new(),
+        None,
+        reviewed_hash,
     ));
 
     let reason = evaluate_trust(
@@ -2031,6 +2324,40 @@ fn advisor_approval_promotes_amber_under_triage() {
     );
     assert_eq!(reason, TrustReason::AdvisorApprovedThisRun);
     assert!(reason.is_trusted());
+}
+
+#[test]
+fn advisor_approval_with_different_script_bundle_hash_stays_untrusted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+    let store = PackageStore::at(dir.path().join("store"));
+    let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+    let approvals = std::collections::HashSet::from([(
+        "amber-pkg".to_string(),
+        "1.0.0".to_string(),
+        None,
+        None,
+        "sha256-reviewed-other-bytes".to_string(),
+    )]);
+
+    let reason = evaluate_trust(
+        &pkg_dir,
+        "amber-pkg",
+        "1.0.0",
+        None,
+        &scripts,
+        &policy,
+        dir.path(),
+        ScriptPolicy::Triage,
+        false,
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
+        Some(&approvals),
+    );
+
+    assert_eq!(reason, TrustReason::Untrusted);
 }
 
 #[test]
@@ -2109,11 +2436,13 @@ fn advisor_approval_for_other_package_does_not_promote_this_one() {
         "OTHER-pkg".to_string(),
         "1.0.0".to_string(),
         None,
+        None,
         String::new(),
     ));
     approvals.insert((
         "amber-pkg".to_string(),
         "2.0.0".to_string(),
+        None,
         None,
         String::new(),
     )); // wrong version
@@ -2151,6 +2480,7 @@ fn advisor_approval_does_not_apply_under_deny() {
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         None,
         String::new(),
     ));
@@ -2190,6 +2520,7 @@ fn advisor_approval_does_not_apply_under_allow() {
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
         None,
+        None,
         String::new(),
     ));
     let reason = evaluate_trust(
@@ -2228,14 +2559,16 @@ fn advisor_approval_does_not_leak_across_sources_with_same_coord() {
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
     let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+    let reviewed_hash = compute_script_hash(&pkg_dir).unwrap();
 
     // Approve ONLY the integrity-bearing variant.
     let mut approvals = std::collections::HashSet::new();
     approvals.insert((
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         Some("sha512-registry-integrity".to_string()),
-        String::new(),
+        reviewed_hash,
     ));
 
     // Querying for the SAME coord but a DIFFERENT integrity must
@@ -2310,6 +2643,7 @@ fn green_under_triage_still_wins_over_advisor() {
     approvals.insert((
         "green-pkg".to_string(),
         "1.0.0".to_string(),
+        None,
         None,
         String::new(),
     ));

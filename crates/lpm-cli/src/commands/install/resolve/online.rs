@@ -140,8 +140,15 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         &v2_workspace_root_pre_resolve.optional_registry_roots,
     )
     .await?;
+    let explicit_peer_providers = explicit_peer_providers_from_install_packages(
+        tarball_url_install_pkgs
+            .iter()
+            .chain(v2_workspace_root_pre_resolve.install_pkgs.iter()),
+        project_dir,
+    )?;
     let resolver_root_dependencies =
-        lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots);
+        lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots)
+            .with_explicit_peer_providers(explicit_peer_providers);
 
     merge_workspace_member_links(
         workspace_member_deps,
@@ -244,7 +251,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     );
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
+                    seed_workspace_resolver_cache(
+                        &shared_cache,
+                        all_workspace_members,
+                        project_dir,
+                    )?;
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
@@ -359,7 +370,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let dep_names: Vec<String> = deps.keys().cloned().collect();
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
+                    seed_workspace_resolver_cache(
+                        &shared_cache,
+                        all_workspace_members,
+                        project_dir,
+                    )?;
                     let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
                     let walker_done: WalkerDone =
                         Arc::new(std::sync::atomic::AtomicBool::new(false));

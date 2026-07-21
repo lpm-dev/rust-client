@@ -909,6 +909,7 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
         project_dir,
         false,
         false,
+        false,
         FrozenLockfileMode::Never,
         false,
         false,

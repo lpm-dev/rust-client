@@ -223,6 +223,7 @@ pub(in crate::commands::install) async fn run(
     workspace_member_deps: &[WorkspaceMemberLink],
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
     current_patches: &HashMap<String, PatchedDependencyEntry>,
     prior_patch_state: &Option<patch_state::PatchState>,
     current_patch_fingerprint: &str,
@@ -243,6 +244,10 @@ pub(in crate::commands::install) async fn run(
     let store = PackageStore::from_root(lpm_root);
     let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
     let gate_stats = Arc::new(GateStats::default());
+    let explicit_peer_providers = explicit_peer_providers_from_install_packages(
+        pre_resolved_install_pkgs.iter(),
+        project_dir,
+    )?;
 
     let setup_ms = start.elapsed().as_millis();
     let resolve_start = Instant::now();
@@ -385,6 +390,7 @@ pub(in crate::commands::install) async fn run(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                &explicit_peer_providers,
             )
             .await?;
             stage_timings.peer_drain_ms = peer_drain_start.elapsed().as_millis();
@@ -407,7 +413,7 @@ pub(in crate::commands::install) async fn run(
                 &mut fetch_handles,
                 &mut stats,
             )?;
-            attach_peer_edges_to_drafts(&mut packages);
+            attach_peer_edges_to_drafts(&mut packages, &explicit_peer_providers)?;
             let mut install_packages: Vec<InstallPackage> =
                 packages.into_values().map(|draft| draft.package).collect();
             install_packages
@@ -440,6 +446,7 @@ pub(in crate::commands::install) async fn run(
             let mut install_packages = load_lockfile_graph_packages(
                 project_dir,
                 deps,
+                current_importer_snapshot,
                 catalog_resolutions,
                 client.as_ref(),
                 gate_stats.as_ref(),
@@ -501,6 +508,7 @@ pub(in crate::commands::install) async fn run(
         optional_registry_roots,
         all_workspace_members,
         catalog_resolutions,
+        current_importer_snapshot,
         pre_resolved_install_pkgs,
         pre_resolved_source_deps,
         project_dir,
@@ -863,6 +871,7 @@ async fn compute_parity_if_requested(
     optional_registry_roots: &HashSet<String>,
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
     pre_resolved_install_pkgs: &[InstallPackage],
     pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
     project_dir: &Path,
@@ -879,7 +888,7 @@ async fn compute_parity_if_requested(
         ExperimentalResolverParityMode::Disabled => unreachable!(),
         ExperimentalResolverParityMode::FreshResolve { .. } => {
             let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-            seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
+            seed_workspace_resolver_cache(&shared_cache, all_workspace_members, project_dir)?;
             let npm_fanout = positive_usize_env_or_default(
                 "LPM_NPM_FANOUT",
                 default_fusion_npm_fanout(false, 0),
@@ -887,6 +896,12 @@ async fn compute_parity_if_requested(
             let root_dependencies = lpm_resolver::RootDependencies::with_optional_names(
                 deps.clone(),
                 optional_registry_roots.clone(),
+            )
+            .with_explicit_peer_providers(
+                explicit_peer_providers_from_install_packages(
+                    pre_resolved_install_pkgs.iter(),
+                    project_dir,
+                )?,
             );
             let resolve_result =
                 lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy_roots(
@@ -933,10 +948,13 @@ async fn compute_parity_if_requested(
             try_lockfile_fast_path(
                 &lockfile_path,
                 deps,
+                Some(current_importer_snapshot),
                 catalog_resolutions,
                 client.as_ref(),
                 &gate_stats,
-                true,
+                LockfileReplayPolicy::Offline {
+                    allow_snapshotless_lockfile: false,
+                },
             )
             .map(|fast| fast.packages)
             .ok_or_else(|| {

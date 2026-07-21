@@ -1947,27 +1947,21 @@ async fn install_with_partial_node_modules_re_links_to_full_state() {
 #[tokio::test]
 async fn install_with_truncated_lockb_falls_back_to_toml() {
     let project = TempProject::empty(r#"{"name":"torn-test","version":"1.0.0","dependencies":{}}"#);
-    let first = lpm(&project)
-        .args(install_args_with(&[]))
-        .output()
-        .expect("run first install");
-    assert!(
-        first.status.success(),
-        "setup: first install failed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-
-    // Truncate lpm.lockb to a few random bytes — not a valid header.
+    let lockfile_path = project.path().join("lpm.lock");
+    lpm_lockfile::Lockfile::default()
+        .write_all(&lockfile_path)
+        .expect("write binary-compatible lockfile");
     let lockb_path = project.path().join("lpm.lockb");
     assert!(
         lockb_path.exists(),
-        "lpm.lockb wasn't written by first install"
+        "binary-compatible setup lockfile must produce lpm.lockb"
     );
+
+    // Truncate lpm.lockb to a few random bytes — not a valid header.
     std::fs::write(&lockb_path, b"corrupt").expect("truncate lpm.lockb");
 
-    // Run install again. Must NOT panic; must produce a coherent end
-    // state (either by re-parsing lpm.lock or by re-resolving from
-    // package.json).
+    // Run install again. It must fall back to TOML and upgrade the
+    // mutable lockfile with the current importer snapshot.
     let second = lpm(&project)
         .args(install_args_with(&[]))
         .output()
@@ -1975,25 +1969,19 @@ async fn install_with_truncated_lockb_falls_back_to_toml() {
     let stderr = String::from_utf8_lossy(&second.stderr);
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
-        "install panicked on truncated lockb:\nstderr:\n{stderr}"
+        second.status.success(),
+        "install did not recover from truncated lockb:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // Even if the install fails on truncated lockb, it must do so
-    // CLEANLY (non-zero exit, no panic). We don't pin success here
-    // — the contract is "no panic, well-formed failure if any."
-    if !second.status.success() {
-        // Failure mode is OK as long as it's well-shaped. Leave as
-        // diagnostic: any actionable noun acceptable.
-        let actionable = stderr.to_lowercase().contains("lockb")
-            || stderr.to_lowercase().contains("lockfile")
-            || stderr.to_lowercase().contains("corrupt")
-            || stderr.to_lowercase().contains("parse");
-        assert!(
-            actionable,
-            "truncated-lockb failure didn't surface an actionable noun:\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path)
+        .expect("recovered TOML lockfile must remain readable");
+    assert!(
+        lockfile.importers.contains_key("."),
+        "mutable recovery must persist the current importer snapshot"
+    );
+    assert!(
+        !lockb_path.exists(),
+        "importer-bearing recovery must remove the unsupported binary companion"
+    );
 }
 
 // ─── Category F — WAL recovery hook ─────────────────────────────────

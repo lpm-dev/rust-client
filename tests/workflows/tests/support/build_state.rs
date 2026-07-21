@@ -83,7 +83,7 @@ pub fn seed_blocked_build_state_with_real_hash(
     let real_hash = stage_minimal_store_entry(&store_dir);
     let body = format!(
         r#"{{
-    "state_version": 1,
+    "state_version": 3,
     "blocked_set_fingerprint": "sha256-fixture-stable",
     "captured_at": "2026-04-22T00:00:00Z",
     "blocked_packages": [
@@ -166,7 +166,7 @@ pub fn seed_global_install_blocked_state_with_tier(
     };
     let body = format!(
         r#"{{
-    "state_version": 1,
+    "state_version": 3,
     "blocked_set_fingerprint": "sha256-fixture-stable",
     "captured_at": "2026-04-22T00:00:00Z",
     "blocked_packages": [

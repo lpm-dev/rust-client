@@ -102,7 +102,7 @@ pub(crate) enum L2Outcome {
     /// No prior strict binding matched — typical first-install case.
     Miss,
     /// (Future) the package matched the user's strict
-    /// `{name,version,integrity,script_hash}` binding → would auto-run.
+    /// `{name,version,source,integrity,script_hash}` binding → would auto-run.
     StrictMatch,
     /// (Future) the package has a binding that drifted from prior
     /// approval (different integrity / script hash) → would block.
@@ -241,8 +241,8 @@ pub(crate) struct AdvisorStamp {
     /// binary doesn't support `--version` or the probe failed.
     #[serde(default)]
     pub(crate) binary_version: Option<String>,
-    /// For Ollama only: the model name passed to `/api/generate`.
-    /// `None` for CLI providers.
+    /// Effective model pinned by LPM. Always present for Ollama and present for
+    /// CLI providers when their corresponding model variable is configured.
     #[serde(default)]
     pub(crate) model: Option<String>,
     /// SHA-256 of the canonical prompt rendering. Changes iff

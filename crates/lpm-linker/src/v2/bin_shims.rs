@@ -33,7 +33,7 @@ enum UnixBinInvocation {
     Shebang(UnixShebangInvocation),
 }
 
-fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
+pub(super) fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
     if bin_dir.symlink_metadata().is_err() {
         return Ok(());
@@ -121,7 +121,7 @@ pub(super) fn create_bin_links_v2(
         if !is_direct(&v2t.target) {
             continue;
         }
-        let key = match key_map.get_for(&v2t.target) {
+        let key = match key_map.get_for(v2t) {
             Some(k) => k,
             None => continue,
         };

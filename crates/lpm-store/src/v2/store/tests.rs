@@ -476,6 +476,392 @@ fn link_entry_content_integrity_recreates_missing_tree_snapshot() {
 }
 
 #[test]
+fn lifecycle_baseline_uses_canonical_script_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_baseline_uses_canonical_script_identity");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let key = arc_key("scripted", "1.0.0");
+    let entry = populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    let baseline = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    let expected = lpm_security::script_hash::compute_script_hash(&baseline.source_dir).unwrap();
+
+    assert_eq!(baseline.content_integrity, expected);
+    assert!(entry.link_dir.join(LIFECYCLE_BASELINE_FILENAME).is_file());
+    assert_eq!(
+        store.lifecycle_entry_lock_path(&package_dir).unwrap(),
+        store
+            .paths()
+            .build_entry_lock_path(&key.digest_hex())
+            .unwrap()
+    );
+}
+
+#[test]
+fn lifecycle_baseline_is_not_persisted_when_tree_exceeds_hash_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_baseline_is_not_persisted_when_tree_exceeds_hash_budget");
+    let mut deep_file = String::new();
+    for depth in 0..=64 {
+        if depth != 0 {
+            deep_file.push('/');
+        }
+        deep_file.push_str("nested");
+    }
+    deep_file.push_str("/payload.js");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"deep-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+            (&deep_file, b"deep"),
+        ],
+    );
+    let key = arc_key("deep-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+
+    let _ = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap();
+
+    assert!(store.lifecycle_baseline(&package_dir).unwrap().is_none());
+}
+
+#[test]
+fn lifecycle_restore_executes_the_authorized_patched_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_restore_executes_the_authorized_patched_baseline");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"patched-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('upstream')"),
+        ],
+    );
+    let key = arc_key("patched-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    assert!(
+        store
+            .prepare_patched_lifecycle_baseline(&package_dir)
+            .unwrap()
+    );
+    std::fs::write(package_dir.join("install.js"), "console.log('patched')").unwrap();
+    let baseline = store
+        .capture_patched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+
+    std::fs::write(package_dir.join("install.js"), "console.log('mutated')").unwrap();
+    std::fs::write(package_dir.join("generated-output.js"), "generated").unwrap();
+    store
+        .restore_lifecycle_package(&package_dir, &baseline.content_integrity)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(package_dir.join("install.js")).unwrap(),
+        "console.log('patched')"
+    );
+    assert!(!package_dir.join("generated-output.js").exists());
+    assert_eq!(
+        lpm_security::script_hash::compute_script_hash(&package_dir).as_deref(),
+        Some(baseline.content_integrity.as_str())
+    );
+}
+
+#[test]
+fn lifecycle_restore_rejects_drifted_baseline_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"lifecycle_restore_rejects_drifted_baseline_source");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"drifted-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let key = arc_key("drifted-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    let baseline = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    std::fs::write(
+        baseline.source_dir.join("install.js"),
+        "console.log('tampered')",
+    )
+    .unwrap();
+
+    let error = store
+        .restore_lifecycle_package(&package_dir, &baseline.content_integrity)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("baseline bytes drifted"));
+}
+
+#[test]
+fn patched_lifecycle_prepare_restores_pristine_bytes_when_baseline_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri =
+        synthetic_sri(b"patched_lifecycle_prepare_restores_pristine_bytes_when_baseline_exists");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"patched-scripted","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('upstream')"),
+        ],
+    );
+    let key = arc_key("patched-scripted", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&key);
+    assert!(
+        store
+            .prepare_patched_lifecycle_baseline(&package_dir)
+            .unwrap()
+    );
+    std::fs::write(package_dir.join("install.js"), "console.log('patched')").unwrap();
+    store
+        .capture_patched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    std::fs::write(
+        package_dir.join("install.js"),
+        "console.log('built-output')",
+    )
+    .unwrap();
+
+    assert!(
+        !store
+            .prepare_patched_lifecycle_baseline(&package_dir)
+            .unwrap()
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(package_dir.join("install.js")).unwrap(),
+        "console.log('upstream')"
+    );
+}
+
+#[test]
+fn patched_lifecycle_prepare_restores_same_name_dependency_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let current_sri = synthetic_sri(b"patched_prepare_same_name/current");
+    let dependency_sri = synthetic_sri(b"patched_prepare_same_name/dependency");
+    let current_object = write_object(
+        &store,
+        &current_sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"shared","version":"2.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let dependency_object = write_object(
+        &store,
+        &dependency_sri,
+        &[("package.json", br#"{"name":"shared","version":"1.0.0"}"#)],
+    );
+    let current_key = arc_key("shared", "2.0.0");
+    let dependency_key = arc_key("shared", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: dependency_key.clone(),
+            source_sri: dependency_sri,
+            object_dir: dependency_object,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: current_key.clone(),
+            source_sri: current_sri,
+            object_dir: current_object,
+            deps: vec![DepLink {
+                local: "shared".into(),
+                target: dependency_key.clone(),
+            }],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&current_key);
+
+    store
+        .prepare_patched_lifecycle_baseline(&package_dir)
+        .unwrap();
+
+    let dependency_link = package_dir.join("node_modules").join("shared");
+    assert_eq!(
+        std::fs::canonicalize(dependency_link).unwrap(),
+        std::fs::canonicalize(store.paths().link_package_dir(&dependency_key)).unwrap()
+    );
+}
+
+#[test]
+fn lifecycle_restore_recreates_scoped_same_name_dependency_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let current_sri = synthetic_sri(b"lifecycle_restore_scoped_same_name/current");
+    let dependency_sri = synthetic_sri(b"lifecycle_restore_scoped_same_name/dependency");
+    let current_object = write_object(
+        &store,
+        &current_sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"@scope/pkg","version":"2.0.0","scripts":{"install":"node install.js"}}"#,
+            ),
+            ("install.js", b"console.log('safe')"),
+        ],
+    );
+    let dependency_object = write_object(
+        &store,
+        &dependency_sri,
+        &[(
+            "package.json",
+            br#"{"name":"@scope/pkg","version":"1.0.0"}"#,
+        )],
+    );
+    let current_key = arc_key("@scope/pkg", "2.0.0");
+    let dependency_key = arc_key("@scope/pkg", "1.0.0");
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: dependency_key.clone(),
+            source_sri: dependency_sri,
+            object_dir: dependency_object,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: current_key.clone(),
+            source_sri: current_sri,
+            object_dir: current_object,
+            deps: vec![DepLink {
+                local: "@scope/pkg".into(),
+                target: dependency_key.clone(),
+            }],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+    let package_dir = store.paths().link_package_dir(&current_key);
+    let baseline = store
+        .ensure_unpatched_lifecycle_baseline(&package_dir)
+        .unwrap()
+        .unwrap();
+    std::fs::write(package_dir.join("generated-output.js"), "generated").unwrap();
+
+    store
+        .restore_lifecycle_package(&package_dir, &baseline.content_integrity)
+        .unwrap();
+
+    let nested_dependency = package_dir.join("node_modules").join("@scope").join("pkg");
+    assert_eq!(
+        std::fs::canonicalize(&nested_dependency).unwrap(),
+        std::fs::canonicalize(store.paths().link_package_dir(&dependency_key)).unwrap()
+    );
+    assert!(!package_dir.join("generated-output.js").exists());
+}
+
+#[test]
 fn paths_for_known_sri() {
     let root = std::env::temp_dir().join(format!(
         "lpm-v2-paths-{}-{:?}",
@@ -1928,7 +2314,7 @@ fn extract_object_from_bytes_accepts_correct_integrity() {
 }
 
 #[test]
-fn extract_object_from_bytes_accepts_correct_sha1_integrity() {
+fn extract_object_from_bytes_uses_verified_sha1_as_object_identity() {
     use base64::Engine;
     use sha1::{Digest, Sha1};
 
@@ -1940,10 +2326,28 @@ fn extract_object_from_bytes_accepts_correct_sha1_integrity() {
         base64::engine::general_purpose::STANDARD.encode(Sha1::digest(&tarball))
     );
 
-    let (_obj_dir, sri, _) = store
+    let (obj_dir, sri, _) = store
         .extract_object_from_bytes(&tarball, Some(&expected))
         .unwrap();
-    assert_eq!(sri, crate::compute_sri_hash(&tarball));
+    assert_eq!(sri, expected);
+    assert_eq!(obj_dir, store.paths().object_dir(&sri).unwrap());
+    assert!(store.reusable_object_dir(&sri).unwrap().is_some());
+}
+
+#[test]
+fn extract_object_from_bytes_uses_verified_sha256_as_object_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let expected = crate::compute_sri_hash_sha256(&tarball);
+
+    let (obj_dir, sri, _) = store
+        .extract_object_from_bytes(&tarball, Some(&expected))
+        .unwrap();
+
+    assert_eq!(sri, expected);
+    assert_eq!(obj_dir, store.paths().object_dir(&sri).unwrap());
+    assert!(store.reusable_object_dir(&sri).unwrap().is_some());
 }
 
 #[test]
@@ -2730,7 +3134,7 @@ fn find_link_package_dir_locates_populated_entry() {
 /// into a v2 object dir atomically, preserving package contents
 /// and `.lpm-security.json` if present.
 #[test]
-fn populate_object_from_v1_copies_extracted_package_dir() {
+fn populate_object_from_v1_copies_extracted_package_dir_when_integrity_matches() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
 
@@ -2750,9 +3154,8 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     std::fs::create_dir_all(v1_pkg_dir.join("src")).unwrap();
     std::fs::write(v1_pkg_dir.join("src/inner.js"), b"// inner").unwrap();
     std::fs::write(v1_pkg_dir.join(".lpm-security.json"), b"{\"tags\":[]}").unwrap();
-    std::fs::write(v1_pkg_dir.join(".integrity"), b"sha512-stale").unwrap();
-
     let sri = synthetic_sri(b"populate_object_from_v1");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert_eq!(object_dir, store.paths().object_dir(&sri).unwrap());
     // Package contents copied through.
@@ -2773,8 +3176,7 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
         std::fs::read(object_dir.join(".lpm-security.json")).unwrap(),
         b"{\"tags\":[]}"
     );
-    // `.integrity` rewritten to the caller-supplied SRI rather
-    // than v1's stale value.
+    // `.integrity` remains bound to the verified caller-supplied SRI.
     assert_eq!(
         std::fs::read(object_dir.join(".integrity")).unwrap(),
         sri.as_bytes()
@@ -2784,6 +3186,70 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     // touching anything.
     let again = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert_eq!(again, object_dir);
+}
+
+#[test]
+fn populate_object_from_v1_rejects_mismatched_integrity_without_publishing_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let v1_pkg_dir = dir.path().join("fake-v1/mismatched/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"mismatched\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    let requested_sri = synthetic_sri(b"requested-content");
+    let stored_sri = synthetic_sri(b"different-v1-content");
+    std::fs::write(v1_pkg_dir.join(".integrity"), stored_sri).unwrap();
+
+    let error = store
+        .populate_object_from_v1(&v1_pkg_dir, &requested_sri)
+        .unwrap_err();
+    assert!(
+        matches!(error, LpmError::IntegrityMismatch { .. }),
+        "mismatched v1 evidence must surface as an integrity mismatch: {error}"
+    );
+    assert!(
+        store
+            .paths()
+            .object_dir(&requested_sri)
+            .unwrap()
+            .symlink_metadata()
+            .is_err(),
+        "rejected v1 bytes must not be published under the requested v2 SRI"
+    );
+}
+
+#[test]
+fn populate_object_from_v1_rejects_missing_integrity_without_publishing_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let v1_pkg_dir = dir.path().join("fake-v1/missing/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"missing\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    let requested_sri = synthetic_sri(b"requested-content");
+
+    let error = store
+        .populate_object_from_v1(&v1_pkg_dir, &requested_sri)
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("missing .integrity"),
+        "missing v1 evidence must fail closed with an actionable error: {error}"
+    );
+    assert!(
+        store
+            .paths()
+            .object_dir(&requested_sri)
+            .unwrap()
+            .symlink_metadata()
+            .is_err(),
+        "unverified v1 bytes must not be published under the requested v2 SRI"
+    );
 }
 
 /// When `.lpm-security.json` is missing in v1 (rare, e.g. a
@@ -2803,6 +3269,7 @@ fn populate_object_from_v1_runs_analysis_when_security_cache_missing() {
     .unwrap();
 
     let sri = synthetic_sri(b"populate_object_from_v1_no_cache");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert!(
         object_dir.join(".lpm-security.json").is_file(),

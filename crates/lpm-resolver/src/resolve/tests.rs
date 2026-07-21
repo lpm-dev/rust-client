@@ -358,7 +358,12 @@ fn make_cached_info(
                 (
                     v.to_string(),
                     d.into_iter()
-                        .map(|(k, r)| (k.to_string(), r.to_string()))
+                        .map(|(k, r)| {
+                            (
+                                k.to_string(),
+                                crate::PeerDependencySpec::new(k, r.to_string()),
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -865,6 +870,60 @@ async fn resolve_with_prefetch_handles_transitive_npm_alias() {
     );
 }
 
+#[tokio::test]
+async fn pubgrub_formats_npm_alias_peer_with_local_slot_and_canonical_target() {
+    let _env = env_lock().lock().await;
+    let _guard = PubgrubEnvGuard::new();
+
+    let mut host =
+        make_version_metadata("alias-peer-host", "1.0.0", vec![], vec![], vec![], vec![]);
+    host.peer_dependencies =
+        HashMap::from([("react-compat".to_string(), "npm:react@^18.0.0".to_string())]);
+    let prefetched = HashMap::from([
+        (
+            "alias-peer-host".to_string(),
+            make_package_metadata("alias-peer-host", vec![host]),
+        ),
+        (
+            "react".to_string(),
+            make_package_metadata(
+                "react",
+                vec![make_version_metadata(
+                    "react",
+                    "18.3.1",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        ),
+    ]);
+
+    let result = resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([
+            ("alias-peer-host".to_string(), "1.0.0".to_string()),
+            ("react".to_string(), "18.3.1".to_string()),
+        ]),
+        OverrideSet::empty(),
+        Some(prefetched),
+    )
+    .await
+    .expect("npm-alias peer must resolve through its canonical target");
+
+    let host = result
+        .packages
+        .iter()
+        .find(|package| package.package.canonical_name() == "alias-peer-host")
+        .expect("peer consumer must be present");
+    assert_eq!(
+        host.peers,
+        vec![("react-compat".to_string(), "18.3.1".to_string())]
+    );
+    assert_eq!(host.aliases.get("react-compat"), Some(&"react".to_string()));
+}
+
 /// Regression: a non-optional dep with no compatible platform version
 /// still resolves so install-time filtering can produce the required
 /// hard platform error instead of hiding the selected package from the
@@ -1328,6 +1387,86 @@ fn peer_check_wrong_version_produces_warning() {
 }
 
 #[test]
+fn peer_check_attached_wrong_version_produces_warning() {
+    let consumer_pkg = ResolverPackage::npm("peer-consumer");
+    let react_pkg = ResolverPackage::npm("react");
+    let resolved = vec![
+        ResolvedPackage {
+            package: consumer_pkg.clone(),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: vec![("react".to_string(), "17.0.2".to_string())],
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            package: react_pkg.clone(),
+            version: NpmVersion::parse("17.0.2").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        },
+    ];
+    let mut cache = HashMap::new();
+    cache.insert(
+        CanonicalKey::from(&consumer_pkg),
+        make_cached_info(
+            &["1.0.0"],
+            vec![],
+            vec![("1.0.0", vec![("react", "^18.0.0")])],
+        ),
+    );
+    cache.insert(
+        CanonicalKey::from(&react_pkg),
+        make_cached_info(&["17.0.2"], vec![], vec![]),
+    );
+
+    let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].peer, "react");
+    assert_eq!(warnings[0].required_range, "^18.0.0");
+    assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
+}
+
+#[test]
+fn source_peer_accepts_matching_local_alias_even_when_package_name_differs() {
+    let consumer = ResolverPackage::npm("source-peer-consumer");
+    let cache = HashMap::from([(
+        CanonicalKey::from(&consumer),
+        make_cached_info(
+            &["1.0.0"],
+            vec![],
+            vec![("1.0.0", vec![("react-compat", "file:../packages/react")])],
+        ),
+    )]);
+    let provider = ExplicitPeerProvider::new(
+        "react-compat",
+        "react",
+        "18.3.1",
+        crate::PeerProviderSource::File("../packages/react".to_string()),
+        "f-react-source",
+    );
+
+    let peers = compute_resolved_peers(&consumer, "1.0.0", &cache, &HashMap::new(), &[provider]);
+
+    assert_eq!(
+        peers,
+        vec![("react-compat".to_string(), "f-react-source".to_string())],
+        "source peers match the declared root slot and exact source, not package.json name"
+    );
+}
+
+#[test]
 fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
     let plugin_pkg = ResolverPackage::npm("esbuild-plugins-node-modules-polyfill");
     let esbuild_nested_a = ResolverPackage::npm("esbuild").with_context("vite");
@@ -1741,7 +1880,7 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             ));
             acc
         });
-    let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates);
+    let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates, &[]);
     assert_eq!(
         bound_peers,
         vec![("react".to_string(), "17.0.2".to_string())],

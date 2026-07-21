@@ -1,5 +1,15 @@
 use super::prelude::*;
 
+struct ProjectApprovalInvocation<'a> {
+    registry: &'a lpm_registry::RegistryClient,
+    project_dir: &'a Path,
+    package: Option<&'a str>,
+    yes: bool,
+    list: bool,
+    dry_run: bool,
+    json_output: bool,
+}
+
 /// Filter the persisted build-state's blocked set against the current
 /// `trustedDependencies` and return only the entries that are STILL
 /// blocked.
@@ -15,9 +25,9 @@ use super::prelude::*;
 /// The filter rule mirrors the install-time blocked-set computation in
 /// [`build_state::compute_blocked_packages`]:
 ///
-/// - [`TrustMatch::Strict`] / [`TrustMatch::LegacyNameOnly`] → REMOVE
-///   from the effective blocked set (the script will run when `lpm rebuild`
-///   eventually executes; the user has nothing to review).
+/// - [`TrustMatch::Strict`] → REMOVE from the effective blocked set.
+/// - [`TrustMatch::LegacyNameOnly`] → KEEP. Coordinate-only entries remain
+///   migration input but cannot authorize lifecycle execution.
 /// - [`TrustMatch::BindingDrift`] → KEEP. Drift is the whole reason we
 ///   re-review. The blocked package's existing `binding_drift` flag is
 ///   already true in this case (set by the install-time capture), so the
@@ -42,24 +52,27 @@ pub fn compute_effective_blocked_set<'a>(
         .blocked_packages
         .iter()
         .filter(|bp| {
-            let trust = trusted.matches_strict(
+            let trust = trusted.matches_strict_for_identity(
                 &bp.name,
                 &bp.version,
+                bp.source.as_deref(),
                 bp.integrity.as_deref(),
                 bp.script_hash.as_deref(),
             );
             match trust {
-                // Strict / LegacyNameOnly MAY still need review if
-                // the capability gate rejects. Drop only when the
-                // gate also passes — i.e., no widening requested
-                // OR the binding's capability_hash covers it.
+                // A strict match may still need review if the capability gate
+                // rejects. Drop only when that gate also passes.
                 TrustMatch::Strict => {
-                    let binding = trusted.get_binding(&bp.name, &bp.version);
+                    let binding = trusted.get_binding(
+                        &bp.name,
+                        &bp.version,
+                        bp.source.as_deref(),
+                        bp.integrity.as_deref(),
+                        bp.script_hash.as_deref(),
+                    );
                     requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
                 }
-                TrustMatch::LegacyNameOnly => {
-                    requested_capabilities.requires_review_despite_strict_match(user_bound, None)
-                }
+                TrustMatch::LegacyNameOnly => true,
                 // BindingDrift / NotTrusted already need review.
                 TrustMatch::BindingDrift { .. } | TrustMatch::NotTrusted => true,
             }
@@ -77,7 +90,8 @@ pub fn compute_effective_blocked_set<'a>(
 ///
 /// `list`: read-only listing of the blocked set. Mutually exclusive with
 /// `yes`. Cannot be combined with `package`.
-pub async fn run(
+pub async fn run_with_client(
+    registry: &lpm_registry::RegistryClient,
     project_dir: &Path,
     package: Option<&str>,
     yes: bool,
@@ -91,40 +105,53 @@ pub async fn run(
     // mid-walk without this gate.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     let lock_path = lpm_root.store_lock();
-    lpm_common::with_shared_lock_async(
-        lock_path,
-        run_under_store_lock(
-            project_dir,
-            package,
-            yes,
-            list,
-            dry_run,
-            json_output,
-            lpm_root,
-        ),
+    let invocation = ProjectApprovalInvocation {
+        registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
+    };
+    lpm_common::with_shared_lock_async(lock_path, run_under_store_lock(invocation, lpm_root)).await
+}
+
+#[cfg(test)]
+pub async fn run(
+    project_dir: &Path,
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let registry = lpm_registry::RegistryClient::new();
+    run_with_client(
+        &registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
     )
     .await
 }
 
 async fn run_under_store_lock(
-    project_dir: &Path,
-    package: Option<&str>,
-    yes: bool,
-    list: bool,
-    // When true, the review flow runs end-to-end (card rendering,
-    // interactive prompts, diff surfaces, outcome accounting) but NO
-    // persisted state mutates —
-    // [`write_back`] short-circuits at each of its three call sites
-    // (direct-approve, `--yes`, interactive walk) and
-    // [`print_summary`] surfaces `"dry_run": true` in the JSON
-    // envelope. No-op when combined with `--list` (already
-    // read-only); the JSON envelope for `--list --dry-run` still
-    // carries the `dry_run` flag so agents can distinguish
-    // preview-of-listing from plain-listing at parse time.
-    dry_run: bool,
-    json_output: bool,
+    invocation: ProjectApprovalInvocation<'_>,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    let ProjectApprovalInvocation {
+        registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
+    } = invocation;
     // ── Argument validation ─────────────────────────────────────────
     //
     // Mutual exclusion: `--yes` and `--list` are contradictory (one mutates,
@@ -302,13 +329,13 @@ async fn run_under_store_lock(
             BlockedLookup::Ambiguous { candidates } => {
                 let mut keys: Vec<String> = candidates
                     .iter()
-                    .map(|blocked| format!("{}@{}", blocked.name, blocked.version))
+                    .map(|blocked| blocked_identity_selector(blocked))
                     .collect();
                 keys.sort();
                 keys.dedup();
                 return Err(LpmError::Script(format!(
                     "package '{arg}' is ambiguous in the blocked set — {} rows match. \
-                     Re-run with `name@version` to disambiguate. Candidates: {}",
+                     Re-run with an exact candidate selector. Candidates: {}",
                     candidates.len(),
                     keys.join(", "),
                 )));
@@ -323,8 +350,19 @@ async fn run_under_store_lock(
                 runtime_sigstore_source,
             )?;
         }
-        let provenance_by_pkg =
-            fetch_provenance_for_effective_set(std::slice::from_ref(target), &verify_policy).await;
+        let routed = crate::commands::registry_reads::prepare_routed_read_context(
+            registry,
+            project_dir,
+            std::slice::from_ref(&target.name),
+            json_output,
+        )?;
+        let provenance_by_pkg = fetch_provenance_for_effective_set(
+            &routed.client,
+            &routed.route_table,
+            std::slice::from_ref(target),
+            &verify_policy,
+        )
+        .await;
 
         let reviewed_by_prompt = !json_output && is_tty();
         let confirmed = if reviewed_by_prompt {
@@ -340,7 +378,11 @@ async fn run_under_store_lock(
                 &lpm_root,
             );
             let prompt = if trusted
-                .latest_binding_for_name(&target.name, &target.version)
+                .latest_binding_for_candidate(
+                    &target.name,
+                    &target.version,
+                    target.source.as_deref(),
+                )
                 .is_some()
             {
                 format!("Accept new {}@{}?", target.name, target.version)
@@ -367,6 +409,7 @@ async fn run_under_store_lock(
                 &provenance_by_pkg,
                 &target.name,
                 &target.version,
+                target.source.as_deref(),
                 runtime_enforce,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
@@ -476,8 +519,24 @@ async fn run_under_store_lock(
             runtime_sigstore_source,
         )?;
     }
-    let provenance_by_pkg =
-        fetch_provenance_for_effective_set(&effective_state.blocked_packages, &verify_policy).await;
+    let route_specs: Vec<String> = effective_state
+        .blocked_packages
+        .iter()
+        .map(|package| package.name.clone())
+        .collect();
+    let routed = crate::commands::registry_reads::prepare_routed_read_context(
+        registry,
+        project_dir,
+        &route_specs,
+        json_output,
+    )?;
+    let provenance_by_pkg = fetch_provenance_for_effective_set(
+        &routed.client,
+        &routed.route_table,
+        &effective_state.blocked_packages,
+        &verify_policy,
+    )
+    .await;
 
     // ── --yes (bulk approve) ────────────────────────────────────────
 
@@ -512,6 +571,7 @@ async fn run_under_store_lock(
                 &provenance_by_pkg,
                 &blocked.name,
                 &blocked.version,
+                blocked.source.as_deref(),
                 runtime_enforce,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
@@ -597,7 +657,11 @@ async fn run_under_store_lock(
         // B(i), `KeepOld` does NOT rewrite a resolver pin or
         // downgrade — it just declines the candidate.
         let is_update = trusted
-            .latest_binding_for_name(&blocked.name, &blocked.version)
+            .latest_binding_for_candidate(
+                &blocked.name,
+                &blocked.version,
+                blocked.source.as_deref(),
+            )
             .is_some();
 
         // The View option re-prints the full script and re-prompts. To
@@ -701,6 +765,7 @@ async fn run_under_store_lock(
             &provenance_by_pkg,
             &blocked.name,
             &blocked.version,
+            blocked.source.as_deref(),
             runtime_enforce,
         )?;
         let meta = approval_metadata_preserving_existing_provenance(

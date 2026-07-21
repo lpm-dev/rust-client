@@ -35,6 +35,7 @@ pub(super) fn approval_metadata_from_blocked(
     provenance_at_approval: Option<ProvenanceSnapshot>,
 ) -> ApprovalMetadata {
     ApprovalMetadata {
+        source: blocked.source.clone(),
         integrity: blocked.integrity.clone(),
         script_hash: blocked.script_hash.clone(),
         provenance_at_approval,
@@ -70,7 +71,13 @@ pub(super) fn approval_metadata_preserving_existing_provenance(
 ) -> ApprovalMetadata {
     let mut meta = approval_metadata_from_blocked(blocked, capability_hash, incoming);
     if meta.provenance_at_approval.is_none()
-        && let Some(existing) = trusted.binding_for_exact_version(&blocked.name, &blocked.version)
+        && let Some(existing) = trusted.binding_for_exact_identity(
+            &blocked.name,
+            &blocked.version,
+            blocked.source.as_deref(),
+            blocked.integrity.as_deref(),
+            blocked.script_hash.as_deref(),
+        )
         && let Some(prior) = existing.provenance_at_approval.clone()
     {
         meta.provenance_at_approval = Some(prior);
@@ -131,14 +138,16 @@ pub(super) fn authorize_project_trust_write(
 /// individual packages to identity-only there would silently strip
 /// a layer of evidence the install path already captured.
 pub(super) async fn fetch_provenance_for_effective_set(
+    registry: &lpm_registry::RegistryClient,
+    route_table: &lpm_registry::RouteTable,
     packages: &[BlockedPackage],
     policy: &crate::provenance_fetch::VerifyPolicy,
-) -> HashMap<(String, String), ProvenanceStatus> {
-    let pkgs: Vec<(String, String)> = packages
+) -> HashMap<crate::provenance_fetch::ApprovalProvenanceKey, ProvenanceStatus> {
+    let pkgs: Vec<crate::provenance_fetch::ApprovalProvenanceKey> = packages
         .iter()
-        .map(|p| (p.name.clone(), p.version.clone()))
+        .map(|p| (p.name.clone(), p.version.clone(), p.source.clone()))
         .collect();
-    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, policy).await
+    crate::provenance_fetch::fetch_provenance_for_pkgs(registry, route_table, &pkgs, policy).await
 }
 
 pub(super) fn runtime_verify_policy_with_source() -> (
@@ -182,24 +191,30 @@ pub(super) fn runtime_verify_policy_with_source() -> (
 /// project identically under both modes — the mode only affects the
 /// rejection arm.
 pub(super) fn snapshot_for_binding(
-    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
+    provenance_by_pkg: &HashMap<crate::provenance_fetch::ApprovalProvenanceKey, ProvenanceStatus>,
     name: &str,
     version: &str,
+    source: Option<&str>,
     mode: crate::provenance_fetch::EnforceMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    snapshot_for_binding_with_mode(provenance_by_pkg, name, version, mode)
+    snapshot_for_binding_with_mode(provenance_by_pkg, name, version, source, mode)
 }
 
 /// Pure variant of [`snapshot_for_binding`] that takes the
 /// [`EnforceMode`] explicitly, for unit tests that don't want to
 /// mutate process-global env state.
 pub(super) fn snapshot_for_binding_with_mode(
-    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
+    provenance_by_pkg: &HashMap<crate::provenance_fetch::ApprovalProvenanceKey, ProvenanceStatus>,
     name: &str,
     version: &str,
+    source: Option<&str>,
     mode: crate::provenance_fetch::EnforceMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    let status = match provenance_by_pkg.get(&(name.to_string(), version.to_string())) {
+    let status = match provenance_by_pkg.get(&(
+        name.to_string(),
+        version.to_string(),
+        source.map(str::to_string),
+    )) {
         Some(s) => s.clone(),
         None => return Ok(None),
     };

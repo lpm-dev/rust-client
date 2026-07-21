@@ -44,7 +44,7 @@ use std::path::PathBuf;
 /// installed packages (top-level) pulled it in transitively.
 ///
 /// `origins` is sorted for deterministic output. The same
-/// `(name, version)` with DIFFERENT `(integrity, script_hash)` pairs
+/// `(name, version)` with different `(source, integrity, script_hash)` tuples
 /// produces distinct rows — e.g., if `esbuild@0.25.1` appears in
 /// `eslint`'s tree with binding A and in `typescript`'s tree with
 /// binding B (tarball swap between installs), the user needs to
@@ -53,6 +53,7 @@ use std::path::PathBuf;
 pub struct AggregateBlockedRow {
     pub name: String,
     pub version: String,
+    pub source: Option<String>,
     pub integrity: Option<String>,
     pub script_hash: Option<String>,
     /// Which lifecycle phases are present (preinstall/install/postinstall).
@@ -69,7 +70,7 @@ pub struct AggregateBlockedRow {
     /// was captured with `script-policy = "deny" | "allow"` (no
     /// classification applied).
     ///
-    /// When the same `(name, version, integrity, script_hash)` aggregate
+    /// When the same `(name, version, source, integrity, script_hash)` aggregate
     /// row is contributed by multiple origins, the strictest tier wins
     /// (see [`merge_static_tier`]) — conservative for the gate that
     /// consumes this field.
@@ -80,7 +81,7 @@ pub struct AggregateBlockedRow {
 }
 
 /// Promote two tier hints to the strictest. Used at dedup-merge time
-/// when the same `(name, version, integrity, script_hash)` is reported
+/// when the same `(name, version, source, integrity, script_hash)` is reported
 /// by more than one origin and the two origins disagree on tier.
 ///
 /// Precedence (most-strict first): `Red > AmberLlm > Amber > Green > None`.
@@ -105,7 +106,7 @@ fn merge_static_tier(a: Option<StaticTier>, b: Option<StaticTier>) -> Option<Sta
 /// Output of [`aggregate_blocked_across_globals`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AggregateBlockedSet {
-    /// Deduped blocked packages, sorted by `(name, version, integrity,
+    /// Deduped blocked packages, sorted by `(name, version, source, integrity,
     /// script_hash)` for deterministic output.
     pub rows: Vec<AggregateBlockedRow>,
     /// Global-manifest entries whose per-install build-state file was
@@ -136,7 +137,7 @@ pub fn aggregate_with_manifest_and_trust(
     manifest: &GlobalManifest,
     trusted: &GlobalTrustedDependencies,
 ) -> AggregateBlockedSet {
-    // Keyed by `(name, version, integrity-or-empty, script_hash-or-empty)`
+    // Keyed by `(name, version, source, integrity-or-empty, script_hash-or-empty)`
     // so DIFFERENT bindings for the same name@version stay separate.
     let mut by_key: BTreeMap<DedupKey, (AggregateBlockedRow, Vec<String>)> = BTreeMap::new();
     let mut unreadable_origins: Vec<String> = Vec::new();
@@ -156,6 +157,7 @@ pub fn aggregate_with_manifest_and_trust(
             let trust_match = trusted.matches_strict(
                 &blocked.name,
                 &blocked.version,
+                blocked.source.as_deref(),
                 blocked.integrity.as_deref(),
                 blocked.script_hash.as_deref(),
             );
@@ -177,6 +179,7 @@ pub fn aggregate_with_manifest_and_trust(
                     AggregateBlockedRow {
                         name: blocked.name.clone(),
                         version: blocked.version.clone(),
+                        source: blocked.source.clone(),
                         integrity: blocked.integrity.clone(),
                         script_hash: blocked.script_hash.clone(),
                         phases_present: blocked.phases_present.clone(),
@@ -214,12 +217,14 @@ pub fn aggregate_with_manifest_and_trust(
         (
             a.name.as_str(),
             a.version.as_str(),
+            &a.source,
             &a.integrity,
             &a.script_hash,
         )
             .cmp(&(
                 b.name.as_str(),
                 b.version.as_str(),
+                &b.source,
                 &b.integrity,
                 &b.script_hash,
             ))
@@ -251,6 +256,7 @@ fn read_global_manifest_or_empty(root: &LpmRoot) -> Result<GlobalManifest, LpmEr
 struct DedupKey {
     name: String,
     version: String,
+    source: String,
     integrity: String, // "" when None
     script_hash: String,
 }
@@ -260,6 +266,7 @@ impl DedupKey {
         Self {
             name: b.name.clone(),
             version: b.version.clone(),
+            source: b.source.clone().unwrap_or_default(),
             integrity: b.integrity.clone().unwrap_or_default(),
             script_hash: b.script_hash.clone().unwrap_or_default(),
         }
@@ -323,6 +330,7 @@ mod tests {
         BlockedPackage {
             name: name.into(),
             version: version.into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: integ.map(String::from),
             script_hash: script.map(String::from),
             phases_present: vec!["postinstall".into()],
@@ -464,7 +472,17 @@ mod tests {
 
         // Approve `esbuild@0.25.1` globally with a matching binding.
         let mut trust = GlobalTrustedDependencies::default();
-        trust.insert_strict("esbuild", "0.25.1", Some("i-T".into()), Some("s-T".into()));
+        trust.insert_binding_for_identity(
+            "esbuild",
+            "0.25.1",
+            Some("registry+https://registry.npmjs.org".into()),
+            lpm_global::TrustedDependencyBinding {
+                source: None,
+                integrity: Some("i-T".into()),
+                script_hash: Some("s-T".into()),
+                provenance_at_approval: None,
+            },
+        );
         lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
 
         let agg = aggregate_blocked_across_globals(&root).unwrap();
@@ -555,24 +573,23 @@ mod tests {
         let install_root = root.global_root().join("installs/eslint@9.24.0");
         let lpm_dir = install_root.join(".lpm");
         std::fs::create_dir_all(&lpm_dir).unwrap();
+        let body = serde_json::json!({
+            "state_version": crate::build_state::BUILD_STATE_VERSION,
+            "blocked_set_fingerprint": "sha256-fixture",
+            "captured_at": "2026-04-22T00:00:00Z",
+            "blocked_packages": [{
+                "name": "esbuild",
+                "version": "0.25.1",
+                "integrity": "sha512-fixture",
+                "script_hash": "sha256-fixture",
+                "phases_present": ["postinstall"],
+                "binding_drift": false,
+                "static_tier": "amber"
+            }]
+        });
         std::fs::write(
             lpm_dir.join("build-state.json"),
-            br#"{
-    "state_version": 1,
-    "blocked_set_fingerprint": "sha256-fixture",
-    "captured_at": "2026-04-22T00:00:00Z",
-    "blocked_packages": [
-        {
-            "name": "esbuild",
-            "version": "0.25.1",
-            "integrity": "sha512-fixture",
-            "script_hash": "sha256-fixture",
-            "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "amber"
-        }
-    ]
-}"#,
+            serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
         let mut manifest = GlobalManifest::default();
@@ -624,7 +641,7 @@ mod tests {
         assert_eq!(agg.rows[0].static_tier, Some(StaticTier::Amber));
     }
 
-    /// Same `(name, version, integrity, script_hash)` reported by two
+    /// Same `(name, version, source, integrity, script_hash)` reported by two
     /// installs with disagreeing tiers must collapse to the strictest:
     /// `Red > AmberLlm > Amber > Green > None`. The gate that consumes
     /// this field treats non-green as refusal, so promoting to strictest

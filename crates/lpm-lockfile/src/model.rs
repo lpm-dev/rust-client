@@ -17,7 +17,7 @@ use crate::source::{Source, SourceParseError};
 /// claims an upstream name + version — the two-tuple key collapses
 /// identity and makes the install attach state to the wrong package.
 ///
-/// `source_id` is [`Source::source_id`] for parsed sources, or
+/// `source_id` is [`Source::source_id_with_integrity`] for parsed sources, or
 /// the literal string `"unknown"` for malformed/missing sources
 /// (the lockfile reader gate already rejects unparseable sources;
 /// this fallback keeps the helper total).
@@ -353,24 +353,22 @@ pub struct LockedPackage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub alias_dependencies: Vec<[String; 2]>,
-    /// Resolved peer dependencies for this
-    /// package. Each entry is `<peer_name>@<resolved_version>` (same
-    /// format as [`Self::dependencies`]) and represents one entry
-    /// from the package's `peerDependencies` map intersected with the
-    /// install set's resolved versions.
+    /// Resolved peer dependencies for this package. Each entry is
+    /// `<peer_name>@<binding>`, where a binding is an exact registry
+    /// version or a non-registry source wrapper ID.
     ///
     /// **Why this is load-bearing for warm-install correctness:** the
-    /// v2 store's [`GraphKey`] derivation hashes peer pinning into
+    /// v2 store's [`GraphKey`] derivation hashes peer bindings into
     /// the link-entry identity (`lpm-store::v2::graph_key.rs`). Two
     /// projects with the same dep tree but different peer ranges
     /// produce DISTINCT `links/<key>/` entries, and the v2 linker
     /// reproduces those keys deterministically per install. If the
-    /// lockfile fast path forgets the peer pinning and reconstructs
+    /// lockfile fast path forgets the peer bindings and reconstructs
     /// the package with empty peers, the warm install computes a
     /// different graph key than the cold install, materializes a
     /// fresh link entry, and silently breaks peer-isolation
     /// invariants (worse: a sibling project sharing the dep tree but
-    /// not the peer pinning could now share the link entry).
+    /// not the peer bindings could now share the link entry).
     ///
     /// Sorted by peer name for deterministic lockfile output, then
     /// skipped from serialization for packages without peer
@@ -423,7 +421,7 @@ impl LockedPackage {
     /// `(name, version)` from clobbering each other's state.
     pub fn package_key(&self) -> PackageKey {
         let source_id = match self.source_kind() {
-            Some(Ok(s)) => s.source_id(),
+            Some(Ok(s)) => s.source_id_with_integrity(self.integrity.as_deref()),
             _ => PackageKey::UNKNOWN_SOURCE_ID.to_string(),
         };
         PackageKey::new(self.name.clone(), self.version.clone(), source_id)

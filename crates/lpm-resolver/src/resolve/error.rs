@@ -150,6 +150,27 @@ pub enum ResolveError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    #[error(
+        "invalid peer dependency specifier {specifier:?} for `{peer}` declared by {consumer}@{version}: {detail}"
+    )]
+    InvalidPeerSpecifier {
+        consumer: String,
+        version: String,
+        peer: String,
+        specifier: String,
+        detail: String,
+    },
+
+    #[error(
+        "cannot auto-install required peer `{peer}` declared by {consumer}: specifier {specifier:?} uses unsupported `{scheme}:` source routing; install a compatible provider explicitly or disable peer auto-installation"
+    )]
+    UnsupportedPeerAutoInstallSource {
+        consumer: String,
+        peer: String,
+        specifier: String,
+        scheme: String,
+    },
+
     /// Two or more consumers in the install set declare
     /// `peerDependencies` for `canonical` whose ranges have no version
     /// in common, AND at least one of those consumers is non-optional.

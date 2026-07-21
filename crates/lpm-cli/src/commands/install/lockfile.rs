@@ -37,6 +37,27 @@ pub(super) struct LockfileFastPath {
 
 pub(super) const MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE: u32 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LockfileReplayPolicy {
+    Online,
+    Offline { allow_snapshotless_lockfile: bool },
+}
+
+impl LockfileReplayPolicy {
+    fn allows_local_sources(self) -> bool {
+        matches!(self, Self::Offline { .. })
+    }
+
+    fn allows_missing_importer(self) -> bool {
+        matches!(
+            self,
+            Self::Offline {
+                allow_snapshotless_lockfile: true
+            }
+        )
+    }
+}
+
 pub(super) fn lockfile_needs_dependency_engine_repair(lockfile: &lpm_lockfile::Lockfile) -> bool {
     lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
 }
@@ -52,6 +73,7 @@ pub(super) fn lockfile_needs_peer_state_repair(
 pub(super) struct LockfileSelectionInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
     pub(super) client: &'a RegistryClient,
     pub(super) gate_stats: &'a GateStats,
@@ -71,10 +93,11 @@ pub(super) fn select_lockfile_install_plan(
         let candidate = try_lockfile_fast_path(
             input.lockfile_path,
             input.deps,
+            Some(input.current_importer_snapshot),
             input.catalog_resolutions,
             input.client,
             input.gate_stats,
-            false,
+            LockfileReplayPolicy::Online,
         )
         .ok_or_else(|| {
             LpmError::Registry(
@@ -106,10 +129,11 @@ pub(super) fn select_lockfile_install_plan(
     let candidate = try_lockfile_fast_path(
         input.lockfile_path,
         input.deps,
+        Some(input.current_importer_snapshot),
         input.catalog_resolutions,
         input.client,
         input.gate_stats,
-        false,
+        LockfileReplayPolicy::Online,
     );
     match candidate {
         Some(fast)
@@ -354,14 +378,12 @@ fn patch_fresh_tarball_urls(
 
 fn locked_package_key(package: &lpm_lockfile::LockedPackage) -> String {
     let source = package.source.as_deref().unwrap_or("");
-    let mut key =
-        String::with_capacity(package.name.len() + 1 + package.version.len() + 1 + source.len());
-    key.push_str(&package.name);
-    key.push('\x00');
-    key.push_str(&package.version);
-    key.push('\x00');
-    key.push_str(source);
-    key
+    install_pkg_key_parts(
+        &package.name,
+        &package.version,
+        source,
+        package.integrity.as_deref(),
+    )
 }
 
 fn write_lockfile_and_measure(
@@ -405,6 +427,7 @@ fn emit_fast_path_lockfile_rewrite_notice(
 
 pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) project_dir: &'a Path,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) cleanup_catalogs_in_pipeline: bool,
     pub(super) json_output: bool,
@@ -417,6 +440,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) force_security_floor: bool,
     pub(super) override_set: &'a OverrideSet,
     pub(super) linker_mode: lpm_linker::LinkerMode,
+    pub(super) requested_v2_mode: bool,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
 }
@@ -426,6 +450,7 @@ pub(super) async fn run_empty_dependency_install_phase(
 ) -> Result<(), LpmError> {
     let EmptyDependencyInstallInput {
         project_dir,
+        current_importer_snapshot,
         policy_extension_configs,
         cleanup_catalogs_in_pipeline,
         json_output,
@@ -438,6 +463,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         force_security_floor,
         override_set,
         linker_mode,
+        requested_v2_mode,
         object_integrity_policy,
         dependency_engine_policy,
     } = input;
@@ -447,8 +473,22 @@ pub(super) async fn run_empty_dependency_install_phase(
     }
     let policy_extension_stats =
         run_policy_extensions(policy_extension_configs, project_dir, &[], json_output).await?;
-    let elapsed = start.elapsed();
-    let total_ms = elapsed.as_millis();
+    if override_set.is_empty()
+        && overrides_state::read_state(project_dir).is_some()
+        && let Err(e) = overrides_state::delete_state(project_dir)
+    {
+        tracing::warn!("failed to delete stale overrides-state.json: {e}");
+    }
+    lpm_linker::reconcile_empty_install(project_dir, requested_v2_mode, linker_mode)?;
+    materialize_empty_install_artifacts(project_dir, current_importer_snapshot)?;
+    write_post_install_hash(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        dependency_engine_policy,
+    );
+
+    let total_ms = start.elapsed().as_millis();
     if json_output {
         let mut json = serde_json::json!({
             "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
@@ -501,19 +541,6 @@ pub(super) async fn run_empty_dependency_install_phase(
         output::success("No dependencies to install");
     }
 
-    if override_set.is_empty()
-        && overrides_state::read_state(project_dir).is_some()
-        && let Err(e) = overrides_state::delete_state(project_dir)
-    {
-        tracing::warn!("failed to delete stale overrides-state.json: {e}");
-    }
-    materialize_empty_install_artifacts(project_dir)?;
-    write_post_install_hash(
-        project_dir,
-        linker_mode,
-        object_integrity_policy,
-        dependency_engine_policy,
-    );
     Ok(())
 }
 
@@ -592,6 +619,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) client: &'a RegistryClient,
     pub(super) project_dir: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
     pub(super) pkg: &'a lpm_workspace::PackageJson,
     pub(super) lockfile_path: &'a Path,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
@@ -632,6 +660,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) strict_sandbox: bool,
     pub(super) emit_timing: bool,
     pub(super) strict_integrity: bool,
+    pub(super) allow_snapshotless_lockfile: bool,
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
 }
@@ -643,6 +672,7 @@ pub(super) async fn run_offline_install_phase(
         client,
         project_dir,
         deps,
+        current_importer_snapshot,
         pkg,
         lockfile_path,
         catalog_resolutions,
@@ -682,6 +712,7 @@ pub(super) async fn run_offline_install_phase(
         strict_sandbox,
         emit_timing,
         strict_integrity,
+        allow_snapshotless_lockfile,
         compatibility_bin_names,
         dependency_engine_policy,
     } = input;
@@ -726,25 +757,34 @@ pub(super) async fn run_offline_install_phase(
         )));
     }
 
-    // Offline replay cannot fresh-resolve, so it trusts lockfile-local source entries.
+    let replay_policy = LockfileReplayPolicy::Offline {
+        allow_snapshotless_lockfile,
+    };
     let fast = try_lockfile_fast_path(
         lockfile_path,
         deps,
+        Some(current_importer_snapshot),
         catalog_resolutions,
         client,
         gate_stats,
-        true,
+        replay_policy,
     )
     .ok_or_else(|| {
         LpmError::Registry(
-            "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
-                     missing — run `lpm install` online first; (2) lpm.lock is corrupted — \
-                     delete it and re-run online; (3) a root dependency in package.json is \
+            "--offline could not load the lockfile. Possible causes: (1) the root importer snapshot is missing — rerun online, or explicitly accept legacy replay risk with --allow-snapshotless-lockfile; (2) lpm.lock is \
+                     missing — run `lpm install` online first; (3) lpm.lock is corrupted — \
+                     delete it and re-run online; (4) a root dependency in package.json is \
                      absent from the lockfile (e.g., declared but never installed online). \
                      Run `lpm install` online to reconcile."
                 .into(),
         )
     })?;
+
+    if allow_snapshotless_lockfile && !fast.lockfile.importers.contains_key(".") && !json_output {
+        output::warn(
+            "Snapshotless lockfile compatibility replay is enabled. The lockfile cannot prove that removed roots or direct-peer-to-ambient transitions are current, so stale packages may remain. Run `lpm install` online to rebuild a safe importer snapshot.",
+        );
+    }
 
     if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) {
         return Err(LpmError::Registry(
@@ -1192,48 +1232,108 @@ pub(crate) fn select_locked_package_for_requested_spec<'a>(
     target: &str,
     requested_spec: &str,
 ) -> Option<&'a lpm_lockfile::LockedPackage> {
-    let requested_range = requested_range_for_locked_lookup(requested_spec)
-        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
-    let mut first_match: Option<&lpm_lockfile::LockedPackage> = None;
-    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> =
-        None;
-    let mut best_any: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
-
     let start = lockfile
         .packages
         .partition_point(|pkg| pkg.name.as_str() < target);
     let end = start + lockfile.packages[start..].partition_point(|pkg| pkg.name.as_str() == target);
+    let candidates = &lockfile.packages[start..end];
+    let specifier = lpm_resolver::Specifier::parse(requested_spec).ok()?;
 
-    for candidate in &lockfile.packages[start..end] {
-        if first_match.is_none() {
-            first_match = Some(candidate);
-        }
-
-        let Ok(version) = lpm_resolver::NpmVersion::parse(&candidate.version) else {
-            continue;
-        };
-
-        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
-        if better_any {
-            best_any = Some((version.clone(), candidate));
-        }
-
-        if let Some(range) = requested_range.as_ref()
-            && range.satisfies(&version)
-        {
-            let better_satisfying = best_satisfying
-                .as_ref()
-                .is_none_or(|(best, _)| version > *best);
-            if better_satisfying {
-                best_satisfying = Some((version, candidate));
+    match specifier {
+        lpm_resolver::Specifier::SemverRange(range)
+        | lpm_resolver::Specifier::NpmAlias { range, .. } => {
+            let range = lpm_resolver::NpmRange::parse(&range).ok()?;
+            let mut best: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
+            let mut ambiguous_best = false;
+            for candidate in candidates {
+                if !matches!(
+                    candidate.source_kind(),
+                    None | Some(Ok(lpm_lockfile::Source::Registry { .. }))
+                ) {
+                    continue;
+                }
+                let Ok(version) = lpm_resolver::NpmVersion::parse(&candidate.version) else {
+                    continue;
+                };
+                if !range.satisfies(&version) {
+                    continue;
+                }
+                match best.as_ref() {
+                    None => {
+                        best = Some((version, candidate));
+                        ambiguous_best = false;
+                    }
+                    Some((best_version, _)) if version > *best_version => {
+                        best = Some((version, candidate));
+                        ambiguous_best = false;
+                    }
+                    Some((best_version, _)) if version == *best_version => {
+                        ambiguous_best = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if ambiguous_best {
+                None
+            } else {
+                best.map(|(_, candidate)| candidate)
             }
         }
+        lpm_resolver::Specifier::Tarball { url, integrity } => {
+            unique_locked_candidate(candidates.iter().filter(|candidate| {
+                matches!(
+                    candidate.source_kind(),
+                    Some(Ok(lpm_lockfile::Source::Tarball { url: candidate_url }))
+                        if candidate_url == url
+                ) && integrity
+                    .as_deref()
+                    .is_none_or(|expected| candidate.integrity.as_deref() == Some(expected))
+            }))
+        }
+        lpm_resolver::Specifier::File { path } => {
+            let file_url = format!("file:{path}");
+            unique_locked_candidate(candidates.iter().filter(|candidate| {
+                matches!(
+                    candidate.source_kind(),
+                    Some(Ok(lpm_lockfile::Source::Directory { path: candidate_path }))
+                        if candidate_path == path
+                ) || matches!(
+                    candidate.source_kind(),
+                    Some(Ok(lpm_lockfile::Source::Tarball { url })) if url == file_url
+                )
+            }))
+        }
+        lpm_resolver::Specifier::Link { path } => {
+            unique_locked_candidate(candidates.iter().filter(|candidate| {
+                matches!(
+                    candidate.source_kind(),
+                    Some(Ok(lpm_lockfile::Source::Link { path: candidate_path }))
+                        if candidate_path == path
+                )
+            }))
+        }
+        lpm_resolver::Specifier::Git { url, .. } => {
+            unique_locked_candidate(candidates.iter().filter(|candidate| {
+                matches!(
+                    candidate.source_kind(),
+                    Some(Ok(lpm_lockfile::Source::Git { url: candidate_url }))
+                        if candidate_url == url
+                )
+            }))
+        }
+        lpm_resolver::Specifier::Workspace(_) => None,
     }
+}
 
-    best_satisfying
-        .map(|(_, candidate)| candidate)
-        .or_else(|| best_any.map(|(_, candidate)| candidate))
-        .or(first_match)
+fn unique_locked_candidate<'a>(
+    mut candidates: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let selected = candidates.next()?;
+    if candidates.next().is_some() {
+        None
+    } else {
+        Some(selected)
+    }
 }
 
 fn select_resolved_package_for_requested_spec<'a>(
@@ -1363,9 +1463,9 @@ pub(super) fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
     keys
 }
 
-fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
+pub(super) fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
     let mut registry_key_to_index = HashMap::with_capacity(packages.len());
-    let mut source_id_to_index = HashMap::with_capacity(packages.len());
+    let mut source_key_to_index = HashMap::with_capacity(packages.len());
     for (idx, package) in packages.iter().enumerate() {
         if matches!(
             package.source_kind(),
@@ -1376,7 +1476,9 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .or_insert(idx);
         }
         if let Some(source_id) = package.wrapper_id_for_source() {
-            source_id_to_index.entry(source_id).or_insert(idx);
+            source_key_to_index
+                .entry(link_target_lookup_key(&package.name, &source_id))
+                .or_insert(idx);
         }
     }
 
@@ -1399,18 +1501,25 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .aliases
                 .get(local_name)
                 .map_or(local_name.as_str(), String::as_str);
-            let next_idx = source_id_to_index
-                .get(version)
-                .or_else(|| registry_key_to_index.get(&link_target_lookup_key(target, version)));
+            let target_key = link_target_lookup_key(target, version);
+            let next_idx = source_key_to_index
+                .get(&target_key)
+                .or_else(|| registry_key_to_index.get(&target_key));
             if let Some(next_idx) = next_idx
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
             }
         }
-        for (peer_name, version) in &package.peers {
-            if let Some(next_idx) =
-                registry_key_to_index.get(&link_target_lookup_key(peer_name, version))
+        for (peer_name, binding) in &package.peers {
+            let target = package
+                .aliases
+                .get(peer_name)
+                .map_or(peer_name.as_str(), String::as_str);
+            let target_key = link_target_lookup_key(target, binding);
+            if let Some(next_idx) = source_key_to_index
+                .get(&target_key)
+                .or_else(|| registry_key_to_index.get(&target_key))
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
@@ -1419,7 +1528,7 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
     }
 
     let mut retained_registry_keys = HashSet::with_capacity(retained.len());
-    let mut retained_source_ids = HashSet::with_capacity(retained.len());
+    let mut retained_source_keys = HashSet::with_capacity(retained.len());
     for idx in &retained {
         let package = &packages[*idx];
         if matches!(
@@ -1429,7 +1538,7 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
             retained_registry_keys.insert(link_target_lookup_key(&package.name, &package.version));
         }
         if let Some(source_id) = package.wrapper_id_for_source() {
-            retained_source_ids.insert(source_id);
+            retained_source_keys.insert(link_target_lookup_key(&package.name, &source_id));
         }
     }
 
@@ -1443,11 +1552,16 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
                 .aliases
                 .get(local_name)
                 .map_or(local_name.as_str(), String::as_str);
-            retained_source_ids.contains(version)
-                || retained_registry_keys.contains(&link_target_lookup_key(target, version))
+            let target_key = link_target_lookup_key(target, version);
+            retained_source_keys.contains(&target_key)
+                || retained_registry_keys.contains(&target_key)
         });
-        package.peers.retain(|(name, version)| {
-            retained_registry_keys.contains(&link_target_lookup_key(name, version))
+        let aliases = &package.aliases;
+        package.peers.retain(|(name, binding)| {
+            let target = aliases.get(name).map_or(name.as_str(), String::as_str);
+            let target_key = link_target_lookup_key(target, binding);
+            retained_source_keys.contains(&target_key)
+                || retained_registry_keys.contains(&target_key)
         });
         kept.push(package);
     }
@@ -1495,7 +1609,11 @@ pub(super) fn filter_dev_packages(
             }
         }
         for (peer_name, version) in &package.peers {
-            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
+            let target = package
+                .aliases
+                .get(peer_name)
+                .map_or(peer_name.as_str(), String::as_str);
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(target, version))
                 && retained.insert(*next_idx)
             {
                 queue.push_back(*next_idx);
@@ -1538,8 +1656,10 @@ pub(super) fn filter_dev_packages(
                 .map_or(local_name.as_str(), String::as_str);
             retained_keys.contains(&link_target_lookup_key(target, version))
         });
+        let aliases = &package.aliases;
         package.peers.retain(|(name, version)| {
-            retained_keys.contains(&link_target_lookup_key(name, version))
+            let target = aliases.get(name).map_or(name.as_str(), String::as_str);
+            retained_keys.contains(&link_target_lookup_key(target, version))
         });
         kept.push(package);
     }
@@ -1561,6 +1681,9 @@ pub(super) fn filter_platform_packages(
         }
         if package.optional {
             skipped.insert((package.name.clone(), package.version.clone()));
+            if let Some(source_id) = package.wrapper_id_for_source() {
+                skipped.insert((package.name.clone(), source_id));
+            }
             continue;
         }
         return Err(LpmError::Registry(format!(
@@ -1578,9 +1701,11 @@ pub(super) fn filter_platform_packages(
                     .map_or(local.as_str(), String::as_str);
                 !skipped.contains(&(target.to_string(), version.clone()))
             });
-            package
-                .peers
-                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
+            let aliases = &package.aliases;
+            package.peers.retain(|(name, binding)| {
+                let target = aliases.get(name).map_or(name.as_str(), String::as_str);
+                !skipped.contains(&(target.to_string(), binding.clone()))
+            });
         }
     }
 
@@ -1618,6 +1743,7 @@ pub(super) fn filter_dependency_engine_packages(
 pub(super) fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
+    current_importer_snapshot: Option<&lpm_lockfile::ImporterSnapshot>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     // — the URL-reuse gate needs the client to check
     // origin (`is_configured_origin`) and the shared `GateStats`
@@ -1625,9 +1751,10 @@ pub(super) fn try_lockfile_fast_path(
     // path runs synchronously so no Arc is needed here.
     client: &RegistryClient,
     gate_stats: &GateStats,
-    // when `true`, the
-    // `is_safe_source` check is downgraded from "skip fast path"
-    // to "warn and accept" for non-registry sources. Online installs
+    // Replay policy controls whether `is_safe_source` is downgraded from
+    // "skip fast path" to "accept" for lockfile-resident non-registry sources
+    // and, independently, whether a missing importer snapshot is admissible.
+    // Online installs
     // MUST keep the safety gate strict because the fast-path bypasses
     // the integrity / URL-reuse re-checks that fresh resolve runs;
     // OFFLINE mode trusts the lockfile by definition, so a
@@ -1637,13 +1764,31 @@ pub(super) fn try_lockfile_fast_path(
     // misleading "—offline requires a lockfile" message even when
     // the lockfile existed and was fresh, because `is_safe_source`
     // unconditionally rejected the lockfile entry.
-    accept_unsafe_sources: bool,
+    replay_policy: LockfileReplayPolicy,
 ) -> Option<LockfileFastPath> {
     if !lpm_lockfile::Lockfile::exists(lockfile_path) {
         return None;
     }
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+
+    if let Some(current_importer_snapshot) = current_importer_snapshot {
+        match lockfile.importers.get(".") {
+            Some(locked) if locked != current_importer_snapshot => {
+                tracing::debug!(
+                    "importer snapshot drift detected — invalidating lockfile fast path"
+                );
+                return None;
+            }
+            None if !replay_policy.allows_missing_importer() => {
+                tracing::debug!(
+                    "importer snapshot missing — mutable/frozen installs must rebuild the graph"
+                );
+                return None;
+            }
+            Some(_) | None => {}
+        }
+    }
 
     let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
 
@@ -1674,8 +1819,8 @@ pub(super) fn try_lockfile_fast_path(
     }
 
     // Validate all package sources are safe (HTTPS registries or
-    // localhost). **Invariant:** in offline mode (`accept_unsafe_sources
-    // = true`) we trust the lockfile and admit non-registry sources —
+    // localhost). **Invariant:** offline replay trusts the lockfile and admits
+    // non-registry sources —
     // the fresh-resolve fallback isn't available offline, so bailing
     // here would surface a misleading "—offline requires a lockfile"
     // error. The link-target construction handles every source kind
@@ -1684,7 +1829,7 @@ pub(super) fn try_lockfile_fast_path(
         if let Some(ref source) = lp.source
             && !lpm_lockfile::is_safe_source(source)
         {
-            if accept_unsafe_sources {
+            if replay_policy.allows_local_sources() {
                 tracing::debug!(
                     "package {}@{} non-registry source {} accepted in offline mode",
                     lp.name,
@@ -1730,29 +1875,9 @@ pub(super) fn try_lockfile_fast_path(
     // the warm-install layout matches the fresh-install layout
     // byte-for-byte.
     //
-    // keyed by PackageKey
-    // (name, version, source_id) to match the fresh-resolve loop's
-    // bookkeeping. This map is defensively future-proofed:
-    // the warm-install path only fires when `is_safe_source` accepts
-    // every package — and `is_safe_source` rejects `tarball+...`
-    // sources today (see [`lpm_lockfile::is_safe_source`] + the
-    // gate at ~line 4488), so any lockfile containing a tarball-URL
-    // entry falls back to fresh-resolve. Once `is_safe_source` is
-    // taught about non-Registry sources, the
-    // PackageKey-based lookups in this loop are already correct.
-    //
-    // Key is "name\x00version" (compound string) to avoid allocating a
-    // PackageKey (SHA-256 source_id + 2 String clones) on every build
-    // AND every lookup — the root symlink slot is unambiguous for
-    // (name, version) since the lockfile rejects same-name-same-version
-    // cross-source collisions during resolution.
-    let root_link_key = |name: &str, version: &str| -> String {
-        let mut k = String::with_capacity(name.len() + 1 + version.len());
-        k.push_str(name);
-        k.push('\x00');
-        k.push_str(version);
-        k
-    };
+    // Root aliases are keyed by the same complete source/content identity as
+    // fetch bookkeeping. Coordinates alone are insufficient when registry,
+    // file/link, or integrity-distinct tarball instances coexist.
     let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
     for (local, requested_spec) in deps {
         let target = lockfile
@@ -1764,7 +1889,7 @@ pub(super) fn try_lockfile_fast_path(
             select_locked_package_for_requested_spec(&lockfile, &target, requested_spec)
         {
             root_link_map
-                .entry(root_link_key(&lp.name, &lp.version))
+                .entry(locked_package_key(lp))
                 .or_default()
                 .push(local.clone());
         }
@@ -1783,10 +1908,12 @@ pub(super) fn try_lockfile_fast_path(
     // if the user later moves the auto-installed peer into their
     // `dependencies`, we don't want a double-link entry.
     for ambient in &lockfile.ambient_peer_installs {
-        if let Some(lp) = lockfile.find_package(ambient) {
-            let entry = root_link_map
-                .entry(root_link_key(&lp.name, &lp.version))
-                .or_default();
+        let target = lockfile
+            .root_aliases
+            .get(ambient)
+            .map_or(ambient.as_str(), String::as_str);
+        if let Some(lp) = select_locked_package_for_requested_spec(&lockfile, target, "*") {
+            let entry = root_link_map.entry(locked_package_key(lp)).or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());
             }
@@ -1823,12 +1950,13 @@ pub(super) fn try_lockfile_fast_path(
                 .map(|pair| (pair[0].clone(), pair[1].clone()))
                 .collect();
 
-            // restore per-package peer pinning from the
+            // Restore per-package peer bindings from the
             // lockfile. Same string shape as `dependencies`:
-            // `<peer_name>@<version>`. Empty for packages without
-            // peer dependencies (most of the tree). Load-bearing for
-            // v2 graph-key reproducibility — the v2 linker hashes
-            // peer pinning into the link-entry identity, so a warm
+            // `<peer_name>@<binding>`, where a binding is an exact
+            // registry version or a non-registry source wrapper ID.
+            // Empty for packages without peer dependencies (most of the tree).
+            // Load-bearing for v2 graph-key reproducibility — the v2 linker
+            // hashes peer bindings into the link-entry identity, so a warm
             // install that forgets peer state computes a different
             // graph key than the cold install and silently
             // materializes a separate link entry (worst case: shares
@@ -1852,9 +1980,7 @@ pub(super) fn try_lockfile_fast_path(
                 })
                 .collect();
 
-            let root_link_names = root_link_map
-                .get(&root_link_key(&lp.name, &lp.version))
-                .cloned();
+            let root_link_names = root_link_map.get(&locked_package_key(lp)).cloned();
             let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
 
             InstallPackage {
@@ -2079,16 +2205,19 @@ pub(super) fn resolved_to_install_packages(
         if deps.contains_key(ambient) {
             continue;
         }
+        let target = root_aliases
+            .get(ambient)
+            .map_or(ambient.as_str(), String::as_str);
         if let Some(package) = resolved
             .iter()
-            .filter(|package| package.package.canonical_name() == *ambient)
+            .filter(|package| package.package.canonical_name() == target)
             .max_by(|a, b| a.version.cmp(&b.version))
         {
             // Avoid duplicate locals if the user ALSO listed the peer
             // in their `dependencies` (in which case `deps.keys()`
             // already covered it; we shouldn't double-link).
             let entry = root_link_map
-                .entry(rlk(ambient, &package.version.to_string()))
+                .entry(rlk(target, &package.version.to_string()))
                 .or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());

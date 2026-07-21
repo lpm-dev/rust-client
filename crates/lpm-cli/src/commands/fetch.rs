@@ -136,6 +136,9 @@ pub async fn run(
     let lpm_root = LpmRoot::from_env()?;
     let store = PackageStore::from_root(&lpm_root);
     let store_v2 = v2_store_for_fetch(&lpm_root)?;
+    if store_v2.is_none() {
+        validate_v1_target_identities(&targets)?;
+    }
 
     let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
     let firewall_preflight = prepare_npm_firewall_materialization_preflight(
@@ -167,24 +170,19 @@ pub async fn run(
     )
     .await?;
 
-    let client = Arc::new(client.clone_with_config());
-    let store = Arc::new(store);
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
-    let mut tasks = JoinSet::new();
-
-    for target in targets {
-        let client = Arc::clone(&client);
-        let store = Arc::clone(&store);
-        let store_v2 = store_v2.clone();
-        let semaphore = Arc::clone(&semaphore);
-        tasks.spawn(async move { fetch_one(client, store, store_v2, semaphore, target).await });
-    }
-
-    while let Some(joined) = tasks.join_next().await {
-        let result = joined
-            .map_err(|e| LpmError::Registry(format!("fetch worker failed to join: {e}")))??;
-        results.push(result);
-    }
+    let v2_enabled = store_v2.is_some();
+    let fetches = fetch_targets_under_store_lock(
+        Arc::new(client.clone_with_config()),
+        Arc::new(store),
+        store_v2,
+        targets,
+    );
+    let mut fetched = if v2_enabled {
+        lpm_common::with_shared_lock_async(lpm_root.store_lock(), fetches).await?
+    } else {
+        lpm_common::with_exclusive_lock_async(lpm_root.store_lock(), fetches).await?
+    };
+    results.append(&mut fetched);
 
     results.sort_by(|a, b| {
         a.name
@@ -222,6 +220,56 @@ pub async fn run(
         ));
     }
 
+    Ok(())
+}
+
+async fn fetch_targets_under_store_lock(
+    client: Arc<RegistryClient>,
+    store: Arc<PackageStore>,
+    store_v2: Option<Arc<lpm_store::v2::Store>>,
+    targets: Vec<FetchTarget>,
+) -> Result<Vec<FetchPackageResult>, LpmError> {
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
+    let mut tasks = JoinSet::new();
+    for target in targets {
+        let client = Arc::clone(&client);
+        let store = Arc::clone(&store);
+        let store_v2 = store_v2.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.spawn(async move { fetch_one(client, store, store_v2, semaphore, target).await });
+    }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    while let Some(joined) = tasks.join_next().await {
+        results.push(
+            joined
+                .map_err(|e| LpmError::Registry(format!("fetch worker failed to join: {e}")))??,
+        );
+    }
+    Ok(results)
+}
+
+fn validate_v1_target_identities(targets: &[FetchTarget]) -> Result<(), LpmError> {
+    let mut identities = std::collections::HashMap::with_capacity(targets.len());
+    for target in targets {
+        let coordinates = (&target.name, &target.version);
+        let source = match &target.source {
+            FetchSource::Registry {
+                registry_url,
+                tarball_url,
+            } => ("registry", registry_url.as_str(), tarball_url.as_str()),
+            FetchSource::RemoteTarball { url } => ("remote_tarball", url.as_str(), url.as_str()),
+        };
+        let identity = (target.integrity.as_str(), source);
+        if let Some(previous) = identities.insert(coordinates, identity)
+            && previous != identity
+        {
+            return Err(LpmError::Store(format!(
+                "lpm fetch cannot cache distinct source identities for {}@{} in store v1; use the default store v2 by unsetting LPM_STORE_VERSION",
+                target.name, target.version
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -265,7 +313,7 @@ async fn fetch_one(
         .acquire_owned()
         .await
         .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
-    let (data, computed_sri) = client
+    let (data, _computed_sri) = client
         .download_tarball_with_integrity(target.source.url(), Some(&target.integrity))
         .await?;
     drop(permit);
@@ -273,18 +321,19 @@ async fn fetch_one(
     let source = target.source.clone();
     let name = target.name.clone();
     let version = target.version.clone();
+    let integrity = target.integrity.clone();
     tokio::task::spawn_blocking(move || -> Result<(), LpmError> {
         if let Some(store_v2) = store_v2 {
-            store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
+            store_v2.extract_object_from_bytes(&data, Some(&integrity))?;
             return Ok(());
         }
 
         match source {
             FetchSource::Registry { .. } => {
-                store.store_package(&name, &version, &data)?;
+                store.store_package_with_integrity(&name, &version, &data, &integrity)?;
             }
             FetchSource::RemoteTarball { .. } => {
-                store.store_tarball_at_cas_path(&computed_sri, &data)?;
+                store.store_tarball_at_cas_path(&integrity, &data)?;
             }
         }
         Ok(())
@@ -381,7 +430,9 @@ fn is_cached(
     }
 
     match &target.source {
-        FetchSource::Registry { .. } => store.has_package(&target.name, &target.version),
+        FetchSource::Registry { .. } => {
+            store.has_package_with_integrity(&target.name, &target.version, &target.integrity)
+        }
         FetchSource::RemoteTarball { .. } => store.has_tarball(&target.integrity),
     }
 }
@@ -717,6 +768,33 @@ mod tests {
     }
 
     #[test]
+    fn v1_fetch_rejects_same_coordinates_with_distinct_source_identities() {
+        let first = FetchTarget {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: "sha512-first".into(),
+            source: FetchSource::Registry {
+                registry_url: "https://registry-a.example".into(),
+                tarball_url: "https://registry-a.example/shared.tgz".into(),
+            },
+        };
+        let second = FetchTarget {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: "sha512-second".into(),
+            source: FetchSource::Registry {
+                registry_url: "https://registry-b.example".into(),
+                tarball_url: "https://registry-b.example/shared.tgz".into(),
+            },
+        };
+
+        let error = validate_v1_target_identities(&[first, second]).unwrap_err();
+
+        assert!(error.to_string().contains("store v2"));
+        assert!(error.to_string().contains("shared@1.0.0"));
+    }
+
+    #[test]
     fn canonical_public_npm_tarball_matches_unscoped_package_url() {
         assert!(is_canonical_public_npm_tarball(
             "ms",
@@ -798,6 +876,34 @@ mod tests {
         assert_eq!(
             target.source.url(),
             "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+        );
+    }
+
+    #[test]
+    fn v1_registry_cache_hit_requires_the_lockfile_integrity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(root.path());
+        let cached_dir = store.package_dir("cached", "1.0.0");
+        std::fs::create_dir_all(&cached_dir).unwrap();
+        std::fs::write(
+            cached_dir.join("package.json"),
+            br#"{"name":"cached","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(cached_dir.join(".integrity"), "sha512-cached-source").unwrap();
+        let target = FetchTarget {
+            name: "cached".into(),
+            version: "1.0.0".into(),
+            integrity: "sha256-different-source".into(),
+            source: FetchSource::Registry {
+                registry_url: "https://registry.example".into(),
+                tarball_url: "https://registry.example/cached.tgz".into(),
+            },
+        };
+
+        assert!(
+            !is_cached(&target, &store, None),
+            "a coordinate-only v1 entry must not satisfy a different lockfile SRI"
         );
     }
 }

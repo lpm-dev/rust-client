@@ -13,6 +13,7 @@ pub(super) async fn run_doctor_install(
         project_dir,
         false, // json_output
         false, // offline
+        false, // allow_snapshotless_lockfile
         crate::commands::install::FrozenLockfileMode::Never,
         false, // force
         false, // allow_new

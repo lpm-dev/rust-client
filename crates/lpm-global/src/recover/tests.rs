@@ -2264,6 +2264,13 @@ fn roll_forward_uninstall_replays_trust_prune() {
         uninstall_trust_prune: vec![TrustPruneEntry {
             name: "lodash".into(),
             version: "4.17.21".into(),
+            key: Some(crate::trusted_deps::rich_key_for_identity(
+                "lodash",
+                "4.17.21",
+                None,
+                Some("sha512-l"),
+                Some("sha256-s"),
+            )),
         }],
     })))
     .unwrap();

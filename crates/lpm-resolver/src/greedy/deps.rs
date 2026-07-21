@@ -13,7 +13,7 @@ pub(super) fn enqueue_child_deps(
     version: &NpmVersion,
     info: &CachedPackageInfo,
     state: &mut ResolveState,
-) {
+) -> Result<(), ResolveError> {
     let ver_str = version.to_string();
     let aliases = info.aliases.get(&ver_str);
     let optional_names = info.optional_dep_names.get(&ver_str);
@@ -120,50 +120,31 @@ pub(super) fn enqueue_child_deps(
     // peerBundle interactions; no real package ships both).
     if let Some(peer_deps) = info.peer_deps.get(&ver_str) {
         let optional_peers = info.optional_peer_names.get(&ver_str);
-        let peer_aliases = info.aliases.get(&ver_str);
-        let mut peer_entries: Vec<(&String, &String)> = peer_deps.iter().collect();
+        let mut peer_entries: Vec<(&String, &crate::PeerDependencySpec)> =
+            peer_deps.iter().collect();
         peer_entries.sort_by_key(|(name, _)| *name);
 
-        for (peer_name, peer_range_str) in peer_entries {
-            // `workspace:` peers from a registry-published package
-            // shouldn't exist (npm rejects them at publish time).
-            // Skip with a specific log rather than letting
-            // `NpmRange::parse` emit an opaque error.
-            if is_workspace_specifier(peer_range_str) {
-                tracing::warn!(
-                    "ignoring `workspace:` peer dep '{}' from {}@{} → {} \
-                     (workspace: must be resolved upstream by lpm-workspace; \
-                     a registry-published package should not declare it)",
-                    peer_range_str,
-                    parent_canonical,
-                    ver_str,
-                    peer_name,
-                );
-                continue;
-            }
-
-            // Alias-aware canonical lookup. Mirrors the regular-deps
-            // loop: a `"peer-local": "npm:target@range"` declaration
-            // (rare on peers, but legal) keys the requirement on
-            // `target` so the resolver consults the correct manifest.
-            let canonical = match peer_aliases.and_then(|a| a.get(peer_name)) {
-                Some(target) => CanonicalKey::from_dep_name(target),
-                None => CanonicalKey::from_dep_name(peer_name),
+        for (peer_name, peer_dependency) in peer_entries {
+            let peer_range_str = peer_dependency.raw();
+            let specifier =
+                peer_dependency
+                    .parsed()
+                    .map_err(|e| ResolveError::InvalidPeerSpecifier {
+                        consumer: parent_canonical.to_string(),
+                        version: ver_str.clone(),
+                        peer: peer_name.clone(),
+                        specifier: peer_range_str.to_string(),
+                        detail: e.to_string(),
+                    })?;
+            let (target, constraint, install_source) = specifier.clone().into_parts();
+            let (range, provider_source) = match constraint {
+                crate::PeerConstraint::Version(range) => (range, None),
+                crate::PeerConstraint::Source(source) => (
+                    NpmRange::parse("*").expect("wildcard peer range is always valid"),
+                    Some(source),
+                ),
             };
-
-            let range = match NpmRange::parse(peer_range_str) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        "invalid peer range '{}' on {}@{} → {}: {e}",
-                        peer_range_str,
-                        parent_canonical,
-                        ver_str,
-                        peer_name,
-                    );
-                    continue;
-                }
-            };
+            let canonical = CanonicalKey::from_dep_name(&target);
 
             let optional = optional_peers.is_some_and(|set| set.contains(peer_name));
 
@@ -172,10 +153,15 @@ pub(super) fn enqueue_child_deps(
                 peer_name: peer_name.clone(),
                 canonical,
                 range,
+                provider_source,
+                raw_specifier: peer_range_str.to_string(),
+                install_source,
                 optional,
             });
             state.work_stats.peer_requirement_count =
                 state.work_stats.peer_requirement_count.saturating_add(1);
         }
     }
+
+    Ok(())
 }

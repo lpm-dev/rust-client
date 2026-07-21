@@ -14,13 +14,17 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 struct PeerRequirement {
+    local_name: String,
     target_name: String,
     range: lpm_resolver::NpmRange,
+    provider_source: Option<lpm_resolver::PeerProviderSource>,
+    install_source: lpm_resolver::PeerInstallSource,
     optional: bool,
 }
 
 #[derive(Debug, Clone)]
 struct AmbientPeerPlan {
+    local_name: String,
     target_name: String,
     version: String,
 }
@@ -46,12 +50,13 @@ pub(super) async fn drain_ambient_peer_installs(
     gate_stats: Arc<GateStats>,
     force: bool,
     fetch_extract_limiter: FetchExtractLimiter,
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
 ) -> Result<(), LpmError> {
     if !auto_install_peers {
         return Ok(());
     }
 
-    let mut ambient_done = HashSet::new();
+    let mut ambient_done: HashSet<(String, String)> = HashSet::new();
     loop {
         let plans = ambient_peer_plans(
             packages,
@@ -62,6 +67,7 @@ pub(super) async fn drain_ambient_peer_installs(
             metadata_stats,
             resolver_policy,
             &ambient_done,
+            explicit_peer_providers,
         )
         .await?;
         if plans.is_empty() {
@@ -71,11 +77,11 @@ pub(super) async fn drain_ambient_peer_installs(
         let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
         for plan in plans {
             stats.peer_requests_enqueued += 1;
-            ambient_done.insert(plan.target_name.clone());
+            ambient_done.insert((plan.local_name.clone(), plan.target_name.clone()));
             pending.push(Box::pin(resolve_node(
                 ResolveRequest {
-                    local_name: plan.target_name.clone(),
-                    root_ancestor: plan.target_name.clone(),
+                    local_name: plan.local_name.clone(),
+                    root_ancestor: plan.local_name,
                     target_name: plan.target_name,
                     range: plan.version,
                     parent: None,
@@ -186,21 +192,54 @@ async fn ambient_peer_plans(
     metadata_queue: &Arc<Semaphore>,
     metadata_stats: &Arc<MetadataStats>,
     resolver_policy: &lpm_resolver::ResolverPolicy,
-    ambient_done: &HashSet<String>,
+    ambient_done: &HashSet<(String, String)>,
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
 ) -> Result<Vec<AmbientPeerPlan>, LpmError> {
-    let mut grouped: BTreeMap<String, Vec<PeerRequirement>> = BTreeMap::new();
-    for requirement in collect_peer_requirements(packages) {
+    let mut grouped: BTreeMap<(String, String), Vec<PeerRequirement>> = BTreeMap::new();
+    for requirement in collect_peer_requirements(packages)? {
         grouped
-            .entry(requirement.target_name.clone())
+            .entry((
+                requirement.local_name.clone(),
+                requirement.target_name.clone(),
+            ))
             .or_default()
             .push(requirement);
     }
 
     let mut plans = Vec::new();
-    for (target_name, reqs) in grouped {
-        if ambient_done.contains(&target_name)
+    for ((local_name, target_name), reqs) in grouped {
+        if ambient_done.contains(&(local_name.clone(), target_name.clone()))
             || reqs.iter().all(|req| req.optional)
-            || peer_group_satisfied_by_existing(packages, &target_name, &reqs)
+            || peer_group_satisfied_by_existing(
+                packages,
+                &target_name,
+                &reqs,
+                explicit_peer_providers,
+            )
+        {
+            continue;
+        }
+        let has_registry_provider = packages.iter().any(|((name, _), draft)| {
+            name == &target_name
+                && draft.package.is_direct
+                && draft
+                    .package
+                    .root_link_names
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| name == &local_name))
+        });
+        if let Some(requirement) = reqs.iter().find(|requirement| {
+            requires_unsupported_peer_auto_install(requirement, has_registry_provider)
+        }) && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
+        {
+            return Err(LpmError::Registry(format!(
+                "cannot auto-install required peer `{}`: specifier {:?} uses unsupported `{}:` source routing; install a compatible provider explicitly",
+                requirement.local_name, specifier, scheme
+            )));
+        }
+        if reqs
+            .iter()
+            .any(|requirement| !requirement.optional && !requirement.install_source.is_registry())
         {
             continue;
         }
@@ -222,6 +261,7 @@ async fn ambient_peer_plans(
             )));
         };
         plans.push(AmbientPeerPlan {
+            local_name,
             target_name,
             version: version.to_string(),
         });
@@ -229,49 +269,88 @@ async fn ambient_peer_plans(
     Ok(plans)
 }
 
+fn requires_unsupported_peer_auto_install(
+    requirement: &PeerRequirement,
+    has_registry_provider: bool,
+) -> bool {
+    !requirement.optional
+        && !requirement.install_source.is_registry()
+        && (requirement.provider_source.is_some() || !has_registry_provider)
+}
+
 fn collect_peer_requirements(
     packages: &HashMap<PackageIdentity, PackageDraft>,
-) -> Vec<PeerRequirement> {
+) -> Result<Vec<PeerRequirement>, LpmError> {
     let mut requirements = Vec::new();
     for draft in packages.values() {
         let version = &draft.package.version;
         let Some(peer_deps) = draft.info.peer_deps.get(version) else {
             continue;
         };
-        let aliases = draft.info.aliases.get(version);
         let optional_peers = draft.info.optional_peer_names.get(version);
-        for (peer_name, peer_range) in peer_deps {
-            let Ok(range) = lpm_resolver::NpmRange::parse(peer_range) else {
-                continue;
+        for (peer_name, peer_dependency) in peer_deps {
+            let specifier = peer_dependency.parsed().map_err(|error| {
+                LpmError::Registry(format!(
+                    "invalid peer dependency {}@{} -> {} {:?}: {error}",
+                    draft.package.name,
+                    draft.package.version,
+                    peer_name,
+                    peer_dependency.raw(),
+                ))
+            })?;
+            let (target_name, constraint, install_source) = specifier.clone().into_parts();
+            let (range, provider_source) = match constraint {
+                lpm_resolver::PeerConstraint::Version(range) => (range, None),
+                lpm_resolver::PeerConstraint::Source(source) => (
+                    lpm_resolver::NpmRange::parse("*")
+                        .expect("wildcard peer range is always valid"),
+                    Some(source),
+                ),
             };
-            let target_name = aliases
-                .and_then(|aliases| aliases.get(peer_name))
-                .cloned()
-                .unwrap_or_else(|| peer_name.clone());
             requirements.push(PeerRequirement {
+                local_name: peer_name.clone(),
                 target_name,
                 range,
+                provider_source,
+                install_source,
                 optional: optional_peers.is_some_and(|peers| peers.contains(peer_name)),
             });
         }
     }
-    requirements
+    Ok(requirements)
 }
 
 fn peer_group_satisfied_by_existing(
     packages: &HashMap<PackageIdentity, PackageDraft>,
     target_name: &str,
     reqs: &[PeerRequirement],
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
 ) -> bool {
-    packages.keys().any(|(name, version)| {
+    let registry_match = packages.keys().any(|(name, version)| {
         if name != target_name {
             return false;
         }
         let Ok(version) = lpm_resolver::NpmVersion::parse(version) else {
             return false;
         };
-        reqs.iter().all(|req| req.range.satisfies(&version))
-    })
+        reqs.iter()
+            .all(|req| req.provider_source.is_none() && req.range.satisfies(&version))
+    });
+    registry_match
+        || explicit_peer_providers.iter().any(|provider| {
+            reqs.iter().all(|requirement| {
+                provider.local_name == requirement.local_name
+                    && requirement.provider_source.as_ref().map_or_else(
+                        || {
+                            provider.package_name == target_name
+                                && provider
+                                    .parsed_version()
+                                    .is_some_and(|version| requirement.range.satisfies(version))
+                        },
+                        |required_source| required_source.matches_provider(&provider.source),
+                    )
+            })
+        })
 }
 
 fn peer_version_satisfying_all(
@@ -281,7 +360,8 @@ fn peer_version_satisfying_all(
     info.versions
         .iter()
         .find(|version| {
-            reqs.iter().all(|req| req.range.satisfies(version))
+            reqs.iter()
+                .all(|req| req.provider_source.is_none() && req.range.satisfies(version))
                 && platform_allows_peer_version(info, version)
         })
         .cloned()
@@ -298,7 +378,9 @@ fn peer_version_satisfying_most(
         }
         let hits = reqs
             .iter()
-            .filter(|req| !req.optional && req.range.satisfies(version))
+            .filter(|req| {
+                !req.optional && req.provider_source.is_none() && req.range.satisfies(version)
+            })
             .count();
         if hits == 0 {
             continue;
@@ -319,7 +401,10 @@ fn platform_allows_peer_version(
         .is_none_or(lpm_resolver::is_platform_compatible)
 }
 
-pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity, PackageDraft>) {
+pub(super) fn attach_peer_edges_to_drafts(
+    packages: &mut HashMap<PackageIdentity, PackageDraft>,
+    explicit_peer_providers: &[lpm_resolver::ExplicitPeerProvider],
+) -> Result<(), LpmError> {
     let available: HashMap<String, Vec<(lpm_resolver::NpmVersion, String)>> = packages
         .values()
         .filter_map(|package| {
@@ -340,22 +425,95 @@ pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity
             continue;
         };
         let mut peers = Vec::with_capacity(peer_deps.len());
-        for (peer_name, peer_range) in peer_deps {
-            let Some(candidates) = available.get(peer_name) else {
-                continue;
-            };
-            let Ok(range) = lpm_resolver::NpmRange::parse(peer_range) else {
-                continue;
-            };
-            if let Some((_, version)) = candidates
-                .iter()
-                .filter(|(version, _)| range.satisfies(version))
-                .max_by(|(left, _), (right, _)| left.cmp(right))
-            {
-                peers.push((peer_name.clone(), version.clone()));
+        for (peer_name, peer_dependency) in peer_deps {
+            let specifier = peer_dependency.parsed().map_err(|error| {
+                LpmError::Registry(format!(
+                    "invalid peer dependency {}@{} -> {} {:?}: {error}",
+                    draft.package.name,
+                    draft.package.version,
+                    peer_name,
+                    peer_dependency.raw(),
+                ))
+            })?;
+            if specifier.target() != peer_name {
+                draft
+                    .package
+                    .aliases
+                    .insert(peer_name.clone(), specifier.target().to_string());
+            }
+            let resolved = specifier.comparable_range().and_then(|range| {
+                available.get(specifier.target()).and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .filter(|(version, _)| range.satisfies(version))
+                        .max_by(|(left, _), (right, _)| left.cmp(right))
+                        .map(|(_, version)| version.clone())
+                })
+            });
+            let resolved = resolved.or_else(|| {
+                explicit_peer_providers
+                    .iter()
+                    .find(|provider| provider.matches_specifier(peer_name, specifier))
+                    .map(|provider| {
+                        if provider.package_name != *peer_name {
+                            draft
+                                .package
+                                .aliases
+                                .insert(peer_name.clone(), provider.package_name.clone());
+                        }
+                        provider.source_id.clone()
+                    })
+            });
+            if let Some(version) = resolved {
+                peers.push((peer_name.clone(), version));
             }
         }
         peers.sort();
         draft.package.peers = peers;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unsupported_requirement(
+        provider_source: Option<lpm_resolver::PeerProviderSource>,
+    ) -> PeerRequirement {
+        PeerRequirement {
+            local_name: "react".to_string(),
+            target_name: "react".to_string(),
+            range: lpm_resolver::NpmRange::parse("^18.0.0").unwrap(),
+            provider_source,
+            install_source: lpm_resolver::PeerInstallSource::UnsupportedOriginal {
+                scheme: "work".to_string(),
+                specifier: "work:^18.0.0".to_string(),
+            },
+            optional: false,
+        }
+    }
+
+    #[test]
+    fn named_registry_peer_defers_to_explicit_registry_provider() {
+        let requirement = unsupported_requirement(None);
+
+        assert!(!requires_unsupported_peer_auto_install(&requirement, true));
+    }
+
+    #[test]
+    fn named_registry_peer_without_explicit_provider_requires_source_routing() {
+        let requirement = unsupported_requirement(None);
+
+        assert!(requires_unsupported_peer_auto_install(&requirement, false));
+    }
+
+    #[test]
+    fn exact_source_peer_does_not_accept_registry_provider() {
+        let requirement = unsupported_requirement(Some(lpm_resolver::PeerProviderSource::File(
+            "../react".to_string(),
+        )));
+
+        assert!(requires_unsupported_peer_auto_install(&requirement, true));
     }
 }

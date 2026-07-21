@@ -45,6 +45,11 @@ pub(crate) struct InstallArgs {
     #[arg(long)]
     pub(crate) offline: bool,
 
+    /// Permit offline replay of a legacy lockfile that has no root importer
+    /// snapshot. This can retain stale roots or peer-role transitions.
+    #[arg(long, requires = "offline")]
+    pub(crate) allow_snapshotless_lockfile: bool,
+
     /// Refuse to update lpm.lock; fail if package.json and lpm.lock differ.
     #[arg(long, conflicts_with = "no_frozen_lockfile")]
     pub(crate) frozen_lockfile: bool,
@@ -561,6 +566,11 @@ pub(crate) struct UninstallArgs {
     /// route through the same `uninstall_global` implementation.
     #[arg(long, short = 'g')]
     pub(crate) global: bool,
+
+    /// Preserve exact global lifecycle approvals while uninstalling for an
+    /// immediate reinstall. Ordinary global uninstalls prune stale approvals.
+    #[arg(long, requires = "global")]
+    pub(crate) preserve_trust: bool,
 }
 
 #[derive(Args)]

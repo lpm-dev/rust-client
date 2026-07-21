@@ -1,34 +1,15 @@
 use super::prelude::*;
 
-/// Intersect a consumer's declared `peerDependencies` against the
-/// install set's resolved-versions lookup. Returns
-/// `(peer_name, resolved_version)` pairs sorted by peer_name (stable
-/// for GraphKey hashing).
-///
-/// **What "resolved" means here.** The pubgrub / greedy arms have
-/// already finished resolution by the time we reach this helper, so
-/// the install set is fixed. Peer resolution at this stage is just a
-/// lookup: for each declared peer, does the install set contain a
-/// version of that package? If yes, that version IS the resolved
-/// peer (peer-dep ranges don't multi-select — a peer is whatever
-/// version of the named package is in scope).
-///
-/// **What's NOT here.** Split-aware peer resolution (consumer in
-/// context X picks peer in context X first, falling back to
-/// unsplit). The upstream `check_unmet_peers` does this for warning
-/// generation. For the v2 GraphKey we use the simpler lookup because
-/// the audit-fixture scope doesn't exercise splits, and a
-/// pessimistic (slightly over-binding) GraphKey is acceptable —
-/// worst case is fewer cross-project sharing hits, never an
-/// incorrect share. When split-aware resolution becomes load-bearing
-/// (once cross-project benchmarks make it load-bearing), this helper grows the
-/// `unsplit_versions` parameter the same way `resolve_peer_version`
-/// already does.
+/// Resolve a consumer's in-scope peer bindings after graph resolution.
+/// Registry peers bind to the selected exact version, preferring the
+/// consumer's split context. Source peers bind to the matching explicit
+/// provider's wrapper ID. Results are sorted by peer name for stable hashing.
 pub(super) fn compute_resolved_peers(
     consumer: &ResolverPackage,
     consumer_version: &str,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     resolved_versions: &HashMap<String, Vec<(Option<String>, String)>>,
+    explicit_peer_providers: &[ExplicitPeerProvider],
 ) -> Vec<(String, String)> {
     let key = CanonicalKey::from(consumer);
     let Some(peer_deps) = cache
@@ -39,16 +20,23 @@ pub(super) fn compute_resolved_peers(
     };
     let mut peers: Vec<(String, String)> = peer_deps
         .iter()
-        .filter_map(|peer_name| {
-            let (peer_name, peer_range) = peer_name;
-            let parsed_range = NpmRange::parse(peer_range).ok();
-            resolve_peer_binding_version(
-                consumer,
-                peer_name,
-                parsed_range.as_ref(),
-                resolved_versions,
-            )
-            .map(|(version, _)| (peer_name.clone(), version.clone()))
+        .filter_map(|(peer_name, peer_dependency)| {
+            let specifier = peer_dependency
+                .parsed()
+                .expect("format_solution validates selected peer specifiers");
+            if let Some(range) = specifier.comparable_range() {
+                return resolve_peer_binding_version(
+                    consumer,
+                    specifier.target(),
+                    Some(range),
+                    resolved_versions,
+                )
+                .map(|(version, _)| (peer_name.clone(), version.clone()));
+            }
+            explicit_peer_providers
+                .iter()
+                .find(|provider| provider.matches_specifier(peer_name, specifier))
+                .map(|provider| (peer_name.clone(), provider.source_id.clone()))
         })
         .collect();
     peers.sort_by(|a, b| a.0.cmp(&b.0));
@@ -746,8 +734,6 @@ pub fn check_unmet_peers(
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     peer_rules: &CompiledPeerRules,
 ) -> Vec<PeerWarning> {
-    use crate::ranges::NpmRange;
-
     // Build lookup: canonical_name → all resolved instances for that package.
     // Split packages may legitimately appear multiple times with different contexts.
     let resolved_versions: HashMap<String, Vec<(Option<String>, String)>> =
@@ -786,14 +772,44 @@ pub fn check_unmet_peers(
         // at an incompatible version).
         let optional_peers = info.and_then(|i| i.optional_peer_names.get(&ver_str));
 
-        for (peer_name, peer_range_str) in peer_deps {
-            let parsed_range = NpmRange::parse(peer_range_str).ok();
-            let resolved_peer_ver = resolve_peer_binding_version(
-                &resolved_pkg.package,
-                peer_name,
-                parsed_range.as_ref(),
-                &resolved_versions,
+        for (peer_name, peer_dependency) in peer_deps {
+            let peer_range_str = peer_dependency.raw();
+            let Ok(specifier) = peer_dependency.parsed() else {
+                warnings.push(PeerWarning {
+                    package: canonical.clone(),
+                    version: ver_str.clone(),
+                    peer: peer_name.clone(),
+                    required_range: peer_range_str.to_string(),
+                    resolved_version: None,
+                });
+                continue;
+            };
+            let required_range = specifier.comparable_range().map_or_else(
+                || peer_range_str.to_string(),
+                |range| range.raw().to_string(),
             );
+            let attached_peer = resolved_pkg
+                .peers
+                .iter()
+                .find(|(attached_name, _)| attached_name == peer_name)
+                .map(|(_, version)| {
+                    let satisfies = specifier.comparable_range().is_none_or(|range| {
+                        NpmVersion::parse(version)
+                            .ok()
+                            .is_some_and(|parsed| range.satisfies(&parsed))
+                    });
+                    (version, satisfies)
+                });
+            let resolved_peer_ver = attached_peer.or_else(|| {
+                specifier.comparable_range().and_then(|range| {
+                    resolve_peer_binding_version(
+                        &resolved_pkg.package,
+                        specifier.target(),
+                        Some(range),
+                        &resolved_versions,
+                    )
+                })
+            });
 
             match resolved_peer_ver {
                 Some((resolved_ver, satisfies)) => {
@@ -825,7 +841,7 @@ pub fn check_unmet_peers(
                             package: canonical.clone(),
                             version: ver_str.clone(),
                             peer: peer_name.clone(),
-                            required_range: peer_range_str.clone(),
+                            required_range: required_range.clone(),
                             resolved_version: Some(resolved_ver.clone()),
                         });
                     }
@@ -850,7 +866,7 @@ pub fn check_unmet_peers(
                         package: canonical.clone(),
                         version: ver_str.clone(),
                         peer: peer_name.clone(),
-                        required_range: peer_range_str.clone(),
+                        required_range,
                         resolved_version: None,
                     });
                 }

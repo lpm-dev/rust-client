@@ -1,11 +1,36 @@
 use lpm_store::V2BaselineIndex;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy)]
+pub(super) struct PackageLookupIdentity<'a> {
+    pub(super) name: &'a str,
+    pub(super) version: &'a str,
+    pub(super) wrapper_id: Option<&'a str>,
+    pub(super) source_id: Option<&'a str>,
+    pub(super) source_integrity: Option<&'a str>,
+}
+
+impl<'a> PackageLookupIdentity<'a> {
+    pub(super) fn new(
+        name: &'a str,
+        version: &'a str,
+        wrapper_id: Option<&'a str>,
+        source_id: Option<&'a str>,
+        source_integrity: Option<&'a str>,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            wrapper_id,
+            source_id,
+            source_integrity,
+        }
+    }
+}
+
 pub(super) fn live_package_dir(
     project_dir: &Path,
-    name: &str,
-    version: &str,
-    wrapper_id: Option<&str>,
+    identity: PackageLookupIdentity<'_>,
     store_path: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
@@ -19,9 +44,7 @@ pub(super) fn live_package_dir(
         .map(|root| lpm_store::v2::Store::from_lpm_root(&root));
     live_package_dir_with_v2(
         project_dir,
-        name,
-        version,
-        wrapper_id,
+        identity,
         store_path,
         v2_store.as_ref(),
         baseline_index,
@@ -42,15 +65,31 @@ pub(super) fn live_package_dir(
 /// disambiguation.
 pub(super) fn live_package_dir_with_v2(
     project_dir: &Path,
-    name: &str,
-    version: &str,
-    wrapper_id: Option<&str>,
+    identity: PackageLookupIdentity<'_>,
     store_path: &Path,
     v2_store: Option<&lpm_store::v2::Store>,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
+    let PackageLookupIdentity {
+        name,
+        version,
+        wrapper_id,
+        source_id,
+        source_integrity,
+    } = identity;
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
     let nm = project_dir.join("node_modules");
+
+    if let Some(index) = baseline_index
+        && let Some(source_id) = source_id
+    {
+        return index
+            .lookup_source_identity(name, version, source_id)
+            .map_or_else(
+                || store_path.to_path_buf(),
+                |baseline| baseline.package_dir.clone(),
+            );
+    }
 
     // Isolated layout (default): `<wrapper-root>/<segment>/node_modules/<name>/`.
     //
@@ -71,7 +110,7 @@ pub(super) fn live_package_dir_with_v2(
         .isolated_wrapper_dir(&segment)
         .join("node_modules")
         .join(name);
-    if isolated.is_dir() {
+    if package_dir_matches(&isolated, identity) {
         return isolated;
     }
 
@@ -84,8 +123,7 @@ pub(super) fn live_package_dir_with_v2(
     // behavior. Lifecycle scripts must mutate the store link entry
     // instead, so compatibility copies fall through to the indexed v2
     // lookup below.
-    let hoisted = nm.join(name);
-    if hoisted.is_dir() {
+    if let Some(hoisted) = find_hoisted_package_dir(project_dir, identity) {
         let compatibility_root = nm.join(".lpm").join("compat");
         if !path_resolves_under(&hoisted, &compatibility_root) {
             return hoisted;
@@ -106,7 +144,7 @@ pub(super) fn live_package_dir_with_v2(
     // coexistence (a sibling project's patched copy can't appear in
     // a project that didn't symlink it).
     if let Some(index) = baseline_index
-        && let Some(b) = index.lookup(name, version)
+        && let Some(b) = index.lookup(name, version, source_integrity)
     {
         return b.package_dir.clone();
     }
@@ -126,6 +164,92 @@ pub(super) fn live_package_dir_with_v2(
     // upstream), but if they do, preserve existing behavior so the
     // failure mode at least matches what users were already seeing.
     store_path.to_path_buf()
+}
+
+fn find_hoisted_package_dir(
+    project_dir: &Path,
+    identity: PackageLookupIdentity<'_>,
+) -> Option<PathBuf> {
+    let node_modules = project_dir.join("node_modules");
+    let mut package_roots = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&node_modules) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if !is_real_directory(&path) {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                    package_roots.extend(
+                        scoped_entries
+                            .flatten()
+                            .map(|entry| entry.path())
+                            .filter(|path| is_real_directory(path)),
+                    );
+                }
+            } else {
+                package_roots.push(path);
+            }
+        }
+    }
+
+    let mut matches = Vec::new();
+    let root_candidate = node_modules.join(identity.name);
+    if package_dir_matches(&root_candidate, identity) {
+        matches.push(root_candidate);
+    }
+    for package_root in package_roots {
+        if package_dir_matches(&package_root, identity) && !matches.contains(&package_root) {
+            matches.push(package_root.clone());
+        }
+        let nested = package_root.join("node_modules").join(identity.name);
+        if package_dir_matches(&nested, identity) && !matches.contains(&nested) {
+            matches.push(nested);
+        }
+    }
+    let fallback = lpm_linker::LayoutPaths::for_project(project_dir)
+        .hoisted_nested_root()
+        .join(identity.name);
+    if package_dir_matches(&fallback, identity) && !matches.contains(&fallback) {
+        matches.push(fallback);
+    }
+
+    match matches.as_slice() {
+        [package_dir] => Some(package_dir.clone()),
+        _ => None,
+    }
+}
+
+fn package_dir_matches(path: &Path, identity: PackageLookupIdentity<'_>) -> bool {
+    if !is_real_directory(path) {
+        return false;
+    }
+    let Ok(manifest) = std::fs::read(path.join("package.json")) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    if manifest.get("name").and_then(serde_json::Value::as_str) != Some(identity.name)
+        || manifest.get("version").and_then(serde_json::Value::as_str) != Some(identity.version)
+    {
+        return false;
+    }
+    identity
+        .source_integrity
+        .is_none_or(|expected| lpm_store::read_stored_integrity(path).as_deref() == Some(expected))
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
 }
 
 /// resolve the live per-package directory AND
@@ -164,33 +288,27 @@ pub(super) fn live_package_dir_with_v2(
 /// function itself stays free of UI concerns.
 pub(super) fn prepare_live_package_dir(
     project_dir: &Path,
-    pkg_name: &str,
-    pkg_version: &str,
-    wrapper_id: Option<&str>,
+    identity: PackageLookupIdentity<'_>,
     store_path: &Path,
     store_root: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> Result<PathBuf, String> {
-    let live = live_package_dir(
-        project_dir,
-        pkg_name,
-        pkg_version,
-        wrapper_id,
-        store_path,
-        baseline_index,
-    );
+    let live = live_package_dir(project_dir, identity, store_path, baseline_index);
 
     let is_v2_link_entry = path_resolves_under(&live, &v2_links_root(store_root));
     if !is_v2_link_entry && path_lives_in_protected_store_area(&live, store_root) {
         return Err(format!(
-            "package {pkg_name}@{pkg_version} not linked into project — \
+            "package {}@{} not linked into project — \
              refusing to run lifecycle script inside the store. \
-             Run `lpm install` to materialize the wrapper tree, then retry."
+             Run `lpm install` to materialize the wrapper tree, then retry.",
+            identity.name, identity.version,
         ));
     }
     if !is_v2_link_entry && path_is_symlink(&live) {
         return Err(format!(
-            "package {pkg_name}@{pkg_version} resolved to a symlinked lifecycle directory at {}",
+            "package {}@{} resolved to a symlinked lifecycle directory at {}",
+            identity.name,
+            identity.version,
             live.display()
         ));
     }

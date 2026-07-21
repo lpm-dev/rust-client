@@ -94,6 +94,10 @@ pub struct LinkMeta {
     pub name: String,
     /// Exact resolved version of that package.
     pub version: String,
+    /// Exact identity input hashed into the graph key. Missing only on
+    /// sidecars written before this field was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
     /// SRI integrity string of the source tarball. Same value persisted
     /// in v1's `.integrity` file. Carries the reverse pointer to the
     /// content-addressable object.
@@ -136,6 +140,7 @@ impl LinkMeta {
             graph_key_digest_hex: graph_key.digest_hex(),
             name: graph_key.name().to_string(),
             version: graph_key.version().to_string(),
+            source_identity: graph_key.source_identity().map(str::to_owned),
             source_sri: source_sri.into(),
             object_path: object_path.into(),
             deps,

@@ -211,6 +211,7 @@ pub(super) struct ResolveState {
     /// each root edge's range when seeding.
     pub(super) root_deps: HashMap<String, String>,
     pub(super) optional_root_names: HashSet<String>,
+    pub(super) explicit_peer_providers: Vec<crate::resolve::ExplicitPeerProvider>,
     /// Edge work queue. Drained by the main loop.
     pub(super) task_queue: VecDeque<Edge>,
     /// Resolved nodes indexed by canonical → list of `(version,
@@ -342,10 +343,12 @@ impl ResolveState {
         let crate::resolve::RootDependencies {
             dependencies: root_deps,
             optional_names: optional_root_names,
+            explicit_peer_providers,
         } = root_dependencies;
         ResolveState {
             root_deps,
             optional_root_names,
+            explicit_peer_providers,
             task_queue: VecDeque::with_capacity(256),
             resolved: AHashMap::with_capacity(512),
             nodes: Vec::with_capacity(512),
@@ -514,6 +517,7 @@ impl ResolveState {
                     .push((None, n.version.to_string()));
                 acc
             });
+        let explicit_peer_providers = self.explicit_peer_providers;
 
         let mut out: Vec<ResolvedPackage> = self
             .nodes
@@ -550,7 +554,7 @@ impl ResolveState {
                 dependencies.sort_by(|a, b| a.0.cmp(&b.0));
 
                 let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
-                let aliases: HashMap<String, String> = cached_aliases
+                let mut aliases: HashMap<String, String> = cached_aliases
                     .iter()
                     .filter(|(local, _)| alive_locals.contains(local))
                     .map(|(l, t)| (l.clone(), t.clone()))
@@ -573,27 +577,47 @@ impl ResolveState {
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
                 // from the same node table.
-                let peers: Vec<(String, String)> = cache
+                let mut peers = Vec::new();
+                if let Some(peer_deps) = cache
                     .get(&n.canonical)
                     .and_then(|info| info.peer_deps.get(&ver_str))
-                    .map(|peer_deps| {
-                        let mut out: Vec<(String, String)> = peer_deps
-                            .iter()
-                            .filter_map(|(peer_name, peer_range)| {
-                                let parsed_range = NpmRange::parse(peer_range).ok();
-                                resolve_peer_binding_version(
-                                    &pkg,
-                                    peer_name,
-                                    parsed_range.as_ref(),
-                                    &resolved_by_canonical,
-                                )
-                                .map(|(ver, _)| (peer_name.clone(), ver.clone()))
-                            })
-                            .collect();
-                        out.sort_by(|a, b| a.0.cmp(&b.0));
-                        out
-                    })
-                    .unwrap_or_default();
+                {
+                    peers.reserve(peer_deps.len());
+                    for (peer_name, peer_dependency) in peer_deps {
+                        let specifier = peer_dependency
+                            .parsed()
+                            .expect("selected peer specifiers are validated while enqueueing deps");
+                        if specifier.target() != peer_name {
+                            aliases.insert(peer_name.clone(), specifier.target().to_string());
+                        }
+                        let resolved = if let Some(range) = specifier.comparable_range() {
+                            resolve_peer_binding_version(
+                                &pkg,
+                                specifier.target(),
+                                Some(range),
+                                &resolved_by_canonical,
+                            )
+                            .map(|(version, _)| version.clone())
+                        } else {
+                            explicit_peer_providers
+                                .iter()
+                                .find(|provider| provider.matches_specifier(peer_name, specifier))
+                                .map(|provider| {
+                                    if provider.package_name != *peer_name {
+                                        aliases.insert(
+                                            peer_name.clone(),
+                                            provider.package_name.clone(),
+                                        );
+                                    }
+                                    provider.source_id.clone()
+                                })
+                        };
+                        if let Some(version) = resolved {
+                            peers.push((peer_name.clone(), version.clone()));
+                        }
+                    }
+                    peers.sort_by(|a, b| a.0.cmp(&b.0));
+                }
 
                 ResolvedPackage {
                     package: pkg,

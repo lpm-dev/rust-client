@@ -1,10 +1,12 @@
-//! Deterministic SHA-256 hash of a package's install-time lifecycle scripts.
+//! Deterministic SHA-256 identity for a package's install-time lifecycle scripts.
 //!
-//! The `script_hash` side of the `{name, version, integrity, script_hash}`
-//! approval binding. The hash covers EXACTLY the scripts the build pipeline
-//! actually runs so an edit to a non-executed script like `prepare` does NOT
-//! invalidate approvals. The hash is deterministic across machines: same
-//! package contents → same hash.
+//! The `script_hash` side of the `{name, version, source, integrity,
+//! script_hash}` approval binding. The hash covers the lifecycle phase bodies
+//! plus the complete package-owned file tree. Hashing the tree is deliberately
+//! conservative: JavaScript and shell can resolve executable files dynamically,
+//! so a static import parser cannot prove that a partial dependency graph is
+//! complete. The hash is deterministic across machines: same package contents
+//! produce the same hash.
 //!
 //! ## Hash format
 //!
@@ -33,6 +35,9 @@
 //!    hash, and a content-blind `StrictBinding` would silently re-use
 //!    the prior approval across a malicious upgrade.
 //! 5. A record separator (`\x1e` — ASCII RS) between phases
+//! 6. Every package-owned regular file, directory, and symlink in sorted path
+//!    order. Dependency-link directories (`node_modules`) and LPM-generated
+//!    store/build sidecars are excluded because they are not source content.
 //!
 //! Empty phases are explicitly hashed as the empty string so removing a
 //! script from one phase and adding a different one in another phase
@@ -67,6 +72,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
+use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -89,13 +95,32 @@ const FIELD_SEP: u8 = 0x00;
 /// from `RECORD_SEP` so the annotation can be distinguished from the
 /// start of the next phase.
 const DELEGATE_SEP: u8 = 0x1f;
-const DELEGATE_GRAPH_SEP: u8 = 0x1d;
+const PACKAGE_TREE_SEP: u8 = 0x1d;
 const MAX_DELEGATE_GRAPH_FILES: usize = 128;
 const MAX_DELEGATE_GRAPH_DEPTH: usize = 16;
+const MAX_DELEGATE_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DELEGATE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PACKAGE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PACKAGE_TREE_ENTRIES: usize = 20_000;
+const MAX_PACKAGE_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PACKAGE_TREE_DEPTH: usize = 64;
+
+#[derive(Default)]
+struct PackageTreeBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+struct PackageTreeContext<'a> {
+    root: &'a Path,
+    canonical_root: &'a Path,
+    manifest_identity: &'a [u8],
+    budget: PackageTreeBudget,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptHashWithPhaseBodies {
-    pub hash: String,
+    pub hash: Option<String>,
     pub phase_bodies: Vec<(String, String)>,
 }
 
@@ -107,25 +132,62 @@ pub struct ScriptHashWithPhaseBodies {
 /// Returns:
 /// - `Some("sha256-<hex>")` if the package's `package.json` contains at
 ///   least one of the [`EXECUTED_INSTALL_PHASES`] entries with a non-empty body
-/// - `None` if the `package.json` is missing, malformed, or contains no
-///   install-time lifecycle scripts at all (callers should treat the
-///   absence as "this package has nothing to approve")
+///   and its delegated executable graph can be read completely
+/// - `None` if the manifest is unavailable, no install-time lifecycle scripts
+///   exist, or the package content and recognized delegate graph cannot be read
+///   completely; callers that know scripts exist must treat an unavailable
+///   hash as untrusted
 ///
-/// The function is pure: it reads disk but writes nothing. It does not
-/// touch any state outside `store_pkg_dir/package.json`.
+/// The function reads the package tree but writes nothing. Symlinks that
+/// resolve outside `store_pkg_dir` make the identity unavailable.
 pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
-    Some(compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash)
+    compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash
+}
+
+/// Read lifecycle phase bodies while reusing an already-verified package
+/// content identity. v2 callers use this to avoid re-hashing the immutable
+/// baseline tree on every trust/advisor pass.
+pub fn script_hash_with_phase_bodies_for_content_identity(
+    package_dir: &Path,
+    content_identity: &str,
+) -> Option<ScriptHashWithPhaseBodies> {
+    let content = lpm_common::read_capped_state_file(
+        &package_dir.join("package.json"),
+        MAX_PACKAGE_MANIFEST_BYTES,
+    )
+    .ok()??;
+    let parsed: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    let scripts = parsed.get("scripts")?.as_object()?;
+    let phase_bodies: Vec<(String, String)> = EXECUTED_INSTALL_PHASES
+        .iter()
+        .filter_map(|phase| {
+            scripts
+                .get(*phase)
+                .and_then(serde_json::Value::as_str)
+                .filter(|body| !body.is_empty())
+                .map(|body| ((*phase).to_string(), body.to_string()))
+        })
+        .collect();
+    if phase_bodies.is_empty() {
+        return None;
+    }
+    Some(ScriptHashWithPhaseBodies {
+        hash: Some(content_identity.to_string()),
+        phase_bodies,
+    })
 }
 
 pub fn compute_script_hash_with_phase_bodies(
     store_pkg_dir: &Path,
 ) -> Option<ScriptHashWithPhaseBodies> {
     let pkg_json_path = store_pkg_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let content =
+        lpm_common::read_capped_state_file(&pkg_json_path, MAX_PACKAGE_MANIFEST_BYTES).ok()??;
+    let parsed: serde_json::Value = serde_json::from_slice(&content).ok()?;
     let scripts = parsed.get("scripts")?.as_object()?;
 
     let mut hasher = Sha256::new();
+    let mut complete = true;
     let mut phase_bodies = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
     for (i, phase) in EXECUTED_INSTALL_PHASES.iter().enumerate() {
         if i > 0 {
@@ -154,14 +216,11 @@ pub fn compute_script_hash_with_phase_bodies(
         // content-digest while changing entry points (rename →
         // different annotation → different hash).
         //
-        // Read errors (file missing, IO failure) hash an explicit
-        // sentinel rather than skipping silently. A package that
-        // declares `node install.js` but ships no `install.js`
-        // either fails at exec time (different problem) or trips
-        // the sentinel as a stable marker. Either way, the hash is
-        // deterministic.
+        // A partial graph cannot safely identify the executable bytes. Keep
+        // the phase bodies for review, but withhold a reusable hash so trust
+        // and advisor approvals fail closed.
         if let Some(rel_path) = extract_delegate_path(body) {
-            hash_delegate_graph(&mut hasher, store_pkg_dir, &rel_path);
+            complete &= hash_delegate_graph(&mut hasher, store_pkg_dir, &rel_path);
         }
     }
 
@@ -169,36 +228,212 @@ pub fn compute_script_hash_with_phase_bodies(
         return None;
     }
 
+    hasher.update([PACKAGE_TREE_SEP]);
+    complete &= hash_package_tree(&mut hasher, store_pkg_dir, &content);
+
     Some(ScriptHashWithPhaseBodies {
-        hash: format!("sha256-{}", hex_lower(&hasher.finalize())),
+        hash: complete.then(|| format!("sha256-{}", hex_lower(&hasher.finalize()))),
         phase_bodies,
     })
 }
 
-fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
+fn hash_package_tree(hasher: &mut Sha256, root: &Path, manifest_identity: &[u8]) -> bool {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    let mut relative = PathBuf::new();
+    let mut context = PackageTreeContext {
+        root,
+        canonical_root: &canonical_root,
+        manifest_identity,
+        budget: PackageTreeBudget::default(),
+    };
+    hash_package_tree_dir(hasher, root, &mut relative, 0, &mut context)
+}
+
+fn hash_package_tree_dir(
+    hasher: &mut Sha256,
+    dir: &Path,
+    relative: &mut PathBuf,
+    depth: usize,
+    context: &mut PackageTreeContext<'_>,
+) -> bool {
+    if depth > MAX_PACKAGE_TREE_DEPTH {
+        return false;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        context.budget.entries = context.budget.entries.saturating_add(1);
+        if context.budget.entries > MAX_PACKAGE_TREE_ENTRIES {
+            return false;
+        }
+        entries.push((entry.file_name(), entry.path(), file_type));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    for (name, path, file_type) in entries {
+        if (dir == context.root && name == "node_modules" && file_type.is_dir())
+            || is_generated_package_entry(context.root, dir, &name)
+        {
+            continue;
+        }
+        relative.push(&name);
+        let Some(relative_display) = stable_relative_path(relative) else {
+            return false;
+        };
+        let complete = if file_type.is_dir() {
+            hash_tree_record(hasher, b"dir", relative_display.as_bytes(), &[]);
+            hash_package_tree_dir(hasher, &path, relative, depth + 1, context)
+        } else if file_type.is_file() {
+            if dir == context.root && name == "package.json" {
+                hash_tree_record(
+                    hasher,
+                    b"manifest",
+                    relative_display.as_bytes(),
+                    context.manifest_identity,
+                );
+                true
+            } else {
+                hash_package_file(
+                    hasher,
+                    relative_display.as_bytes(),
+                    &path,
+                    &mut context.budget,
+                )
+            }
+        } else if file_type.is_symlink() {
+            let Ok(target) = std::fs::read_link(&path) else {
+                return false;
+            };
+            let Ok(canonical_target) = path.canonicalize() else {
+                return false;
+            };
+            if !canonical_target.starts_with(context.canonical_root) {
+                return false;
+            }
+            let Some(target) = target.to_str() else {
+                return false;
+            };
+            hash_tree_record(
+                hasher,
+                b"symlink",
+                relative_display.as_bytes(),
+                target.as_bytes(),
+            );
+            true
+        } else {
+            false
+        };
+        relative.pop();
+        if !complete {
+            return false;
+        }
+    }
+    true
+}
+
+fn hash_package_file(
+    hasher: &mut Sha256,
+    relative: &[u8],
+    path: &Path,
+    budget: &mut PackageTreeBudget,
+) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut content_hasher = Sha256::new();
+    loop {
+        let Ok(read) = reader.read(&mut buffer) else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        budget.bytes = budget.bytes.saturating_add(read as u64);
+        if budget.bytes > MAX_PACKAGE_TREE_BYTES {
+            return false;
+        }
+        content_hasher.update(&buffer[..read]);
+    }
+    hash_tree_record(hasher, b"file", relative, &content_hasher.finalize());
+    true
+}
+
+fn hash_tree_record(hasher: &mut Sha256, kind: &[u8], relative: &[u8], payload: &[u8]) {
+    hasher.update(kind);
+    hasher.update(b"\0");
+    hasher.update(relative);
+    hasher.update(b"\0");
+    hasher.update((payload.len() as u64).to_le_bytes());
+    hasher.update(payload);
+}
+
+fn stable_relative_path(path: &Path) -> Option<String> {
+    let mut output = String::new();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        let part = part.to_str()?;
+        if !output.is_empty() {
+            output.push('/');
+        }
+        output.push_str(part);
+    }
+    Some(output)
+}
+
+fn is_generated_package_entry(root: &Path, dir: &Path, name: &std::ffi::OsStr) -> bool {
+    if dir != root {
+        return false;
+    }
+    matches!(
+        name.to_str(),
+        Some(
+            ".integrity"
+                | ".lpm-security.json"
+                | ".lpm-object-integrity"
+                | ".lpm-tree-snapshot.json"
+                | ".lpm-built"
+        )
+    ) || name.to_str().is_some_and(|name| {
+        name.starts_with(".lpm-tree-snapshot.json.tmp.")
+            || name.starts_with("..lpm-tree-snapshot.json.tmp.")
+            || name.starts_with(".lpm-object-integrity.tmp.")
+            || name.starts_with("..lpm-object-integrity.tmp.")
+    })
+}
+
+fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) -> bool {
     let Some(entry_rel) = normalize_relative_path(rel_path) else {
-        hasher.update([DELEGATE_SEP]);
-        hasher.update(rel_path.as_bytes());
-        hasher.update([FIELD_SEP]);
-        hasher.update(b"<delegate-path-invalid>");
-        return;
+        return false;
     };
 
-    let root = store_pkg_dir
-        .canonicalize()
-        .unwrap_or_else(|_| store_pkg_dir.to_path_buf());
+    let Ok(root) = store_pkg_dir.canonicalize() else {
+        return false;
+    };
     let mut queue = VecDeque::from([(entry_rel, 0usize)]);
     let mut seen = HashSet::new();
     let mut visited = 0usize;
+    let mut total_bytes = 0_u64;
 
     while let Some((rel, depth)) = queue.pop_front() {
-        if visited >= MAX_DELEGATE_GRAPH_FILES {
-            hasher.update([DELEGATE_GRAPH_SEP]);
-            hasher.update(b"<delegate-graph-file-limit>");
-            break;
-        }
         if !seen.insert(rel.clone()) {
             continue;
+        }
+        if visited >= MAX_DELEGATE_GRAPH_FILES {
+            return false;
         }
         visited += 1;
 
@@ -210,45 +445,50 @@ fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str
         let abs = store_pkg_dir.join(&rel);
         let canonical = match abs.canonicalize() {
             Ok(path) => path,
-            Err(_) => {
-                hasher.update(b"<delegate-unreadable>");
-                continue;
-            }
+            Err(_) => return false,
         };
         if !canonical.starts_with(&root) {
-            hasher.update(b"<delegate-outside-package>");
-            continue;
+            return false;
         }
 
-        let bytes = match std::fs::read(&canonical) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                hasher.update(b"<delegate-unreadable>");
-                continue;
-            }
+        let bytes = match lpm_common::read_capped_state_file(&canonical, MAX_DELEGATE_FILE_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => return false,
         };
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        if total_bytes > MAX_DELEGATE_GRAPH_BYTES {
+            return false;
+        }
         let mut inner = Sha256::new();
         inner.update(&bytes);
         hasher.update(inner.finalize());
 
-        if depth >= MAX_DELEGATE_GRAPH_DEPTH {
-            hasher.update([DELEGATE_GRAPH_SEP]);
-            hasher.update(b"<delegate-graph-depth-limit>");
-            continue;
-        }
-
-        let mut next =
-            discover_local_js_dependencies(&bytes, rel.parent().unwrap_or(Path::new("")));
+        let Some(mut next) = discover_local_js_dependencies(
+            &bytes,
+            rel.parent().unwrap_or(Path::new("")),
+            store_pkg_dir,
+        ) else {
+            return false;
+        };
         next.sort();
+        if depth >= MAX_DELEGATE_GRAPH_DEPTH && !next.is_empty() {
+            return false;
+        }
         for candidate in next {
             if !seen.contains(&candidate) {
                 queue.push_back((candidate, depth + 1));
             }
         }
     }
+
+    true
 }
 
-fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf> {
+fn discover_local_js_dependencies(
+    bytes: &[u8],
+    base_dir: &Path,
+    store_pkg_dir: &Path,
+) -> Option<Vec<PathBuf>> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -257,14 +497,16 @@ fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf>
             let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
             };
-            for candidate in resolve_local_js_specifier(base_dir, spec) {
-                if seen.insert(candidate.clone()) {
-                    out.push(candidate);
-                }
+            if !(spec.starts_with("./") || spec.starts_with("../")) {
+                continue;
+            }
+            let candidate = resolve_local_js_specifier(store_pkg_dir, base_dir, spec)?;
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
             }
         }
     }
-    out
+    Some(out)
 }
 
 fn import_regexes() -> &'static [regex::Regex] {
@@ -282,14 +524,17 @@ fn import_regexes() -> &'static [regex::Regex] {
     })
 }
 
-fn resolve_local_js_specifier(base_dir: &Path, specifier: &str) -> Vec<PathBuf> {
-    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
-        return Vec::new();
-    }
-    let Some(path) = normalize_relative_path(base_dir.join(specifier)) else {
-        return Vec::new();
-    };
-    js_resolution_candidates(path)
+fn resolve_local_js_specifier(
+    store_pkg_dir: &Path,
+    base_dir: &Path,
+    specifier: &str,
+) -> Option<PathBuf> {
+    let path = normalize_relative_path(base_dir.join(specifier))?;
+    let candidates = js_resolution_candidates(path);
+    candidates
+        .iter()
+        .find(|candidate| std::fs::symlink_metadata(store_pkg_dir.join(candidate)).is_ok())
+        .cloned()
 }
 
 fn js_resolution_candidates(path: PathBuf) -> Vec<PathBuf> {
@@ -381,6 +626,7 @@ mod tests {
             dir.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
         let hash = compute_script_hash(dir.path()).unwrap();
         assert!(
             hash.starts_with("sha256-"),
@@ -413,11 +659,12 @@ mod tests {
                 "prepare": "ignored",
             }),
         );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
 
         let combined = compute_script_hash_with_phase_bodies(dir.path()).unwrap();
         assert_eq!(
             combined.hash,
-            compute_script_hash(dir.path()).expect("script hash")
+            Some(compute_script_hash(dir.path()).expect("script hash"))
         );
         assert_eq!(
             combined.phase_bodies,
@@ -464,6 +711,7 @@ mod tests {
                 "postinstall": "echo done",
             }),
         );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
         let h1 = compute_script_hash(dir.path()).unwrap();
         let h2 = compute_script_hash(dir.path()).unwrap();
         let h3 = compute_script_hash(dir.path()).unwrap();
@@ -514,17 +762,10 @@ mod tests {
     /// Locked fixture hash for [`compute_script_hash_same_input_same_output_across_machines`].
     /// Includes the delegate-binding annotation for install.js.
     const EXPECTED_FIXTURE_HASH: &str =
-        "sha256-dfa4f083e8c58a8ef7cd4d27d976fdd7740ee519abe0cdd589d7c1245ad9fe01";
+        "sha256-1017225a66600dd8728affaa8bb488a476cdbf4e779862f7f9d35e27db53049a";
 
     #[test]
-    fn compute_script_hash_phase_reorder_in_json_yields_same_hash() {
-        // The input ordering inside `scripts` is JSON-object-key-order
-        // (which is preserved by serde_json::Value as a BTreeMap or
-        // IndexMap depending on features). The hash function reads via
-        // EXECUTED_INSTALL_PHASES in fixed order, NOT via JSON iteration.
-        // So `{"postinstall": "x", "preinstall": "y"}` and
-        // `{"preinstall": "y", "postinstall": "x"}` MUST produce the
-        // same hash.
+    fn compute_script_hash_binds_manifest_key_order() {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         // Different key order in the source JSON:
@@ -540,17 +781,17 @@ mod tests {
         .unwrap();
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(
+        assert_ne!(
             h1, h2,
-            "JSON key reorder must NOT affect the hash; \
-             the function reads by fixed phase order"
+            "raw package.json bytes participate in lifecycle identity"
         );
     }
 
     #[test]
-    fn compute_script_hash_unknown_phase_in_json_is_ignored() {
-        // `prepare` is in BLOCKED_SCRIPTS but NOT in EXECUTED_INSTALL_PHASES.
-        // Adding/removing/changing it MUST NOT affect the hash.
+    fn compute_script_hash_binds_nonexecuted_manifest_scripts_as_package_content() {
+        // The phase-body prefix covers only what LPM executes directly, but a
+        // lifecycle entry point can read and execute other manifest fields at
+        // runtime. The canonical package-content suffix therefore binds them.
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         write_pkg_json(
@@ -566,12 +807,13 @@ mod tests {
                 "test": "vitest",
             }),
         );
+        fs::write(dir1.path().join("install.js"), "module.exports = true\n").unwrap();
+        fs::write(dir2.path().join("install.js"), "module.exports = true\n").unwrap();
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(
+        assert_ne!(
             h1, h2,
-            "non-executed phases must NOT enter the hash; \
-             the contract is 'hash what gets executed'"
+            "manifest script changes must affect the package-content identity"
         );
     }
 
@@ -581,6 +823,8 @@ mod tests {
         let dir2 = tempdir().unwrap();
         write_pkg_json(dir1.path(), &serde_json::json!({"install": "node a.js"}));
         write_pkg_json(dir2.path(), &serde_json::json!({"install": "node b.js"}));
+        fs::write(dir1.path().join("a.js"), "module.exports = true\n").unwrap();
+        fs::write(dir2.path().join("b.js"), "module.exports = true\n").unwrap();
         assert_ne!(
             compute_script_hash(dir1.path()).unwrap(),
             compute_script_hash(dir2.path()).unwrap(),
@@ -778,13 +1022,12 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    /// A script body that does NOT match the delegate shape (e.g.,
-    /// `node-gyp rebuild`, `tsc`, `husky install`) MUST NOT trigger
-    /// delegate-body reads. Existing approvals on tier-Green inline
-    /// commands keep working unchanged — unrelated files in the
-    /// package don't leak into the hash and create false drift.
+    /// Static delegate recognition is not a security boundary. Even when a
+    /// phase body has no recognized delegate, package-content changes must
+    /// invalidate the reusable identity because shell and JavaScript can load
+    /// executable bytes dynamically.
     #[test]
-    fn compute_script_hash_unaffected_by_unrelated_files_when_body_is_not_delegate_shape() {
+    fn compute_script_hash_binds_package_files_when_body_is_not_delegate_shape() {
         let dir = tempdir().unwrap();
         write_pkg_json(
             dir.path(),
@@ -802,26 +1045,168 @@ mod tests {
         )
         .unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(h, h2);
+        assert_ne!(h, h2);
     }
 
-    /// A delegate-shape script body whose target file is missing
-    /// hashes a stable sentinel rather than crashing or skipping.
     #[test]
-    fn compute_script_hash_deterministic_when_delegated_file_is_missing() {
-        let dir1 = tempdir().unwrap();
-        let dir2 = tempdir().unwrap();
+    fn compute_script_hash_ignores_dependency_links_and_internal_store_markers() {
+        let dir = tempdir().unwrap();
         write_pkg_json(
-            dir1.path(),
+            dir.path(),
+            &serde_json::json!({"install": "node-gyp rebuild"}),
+        );
+        fs::write(dir.path().join("binding.gyp"), "{}\n").unwrap();
+        let initial = compute_script_hash(dir.path()).unwrap();
+
+        fs::create_dir_all(dir.path().join("node_modules/dep")).unwrap();
+        fs::write(
+            dir.path().join("node_modules/dep/package.json"),
+            r#"{"name":"dep","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        for marker in [
+            ".integrity",
+            ".lpm-security.json",
+            ".lpm-object-integrity",
+            ".lpm-tree-snapshot.json",
+            ".lpm-built",
+        ] {
+            fs::write(dir.path().join(marker), "generated\n").unwrap();
+        }
+
+        assert_eq!(initial, compute_script_hash(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn compute_script_hash_binds_regular_file_named_node_modules() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"install": "node node_modules --verbose"}),
+        );
+        fs::write(dir.path().join("node_modules"), "benign\n").unwrap();
+        let initial = compute_script_hash(dir.path()).unwrap();
+
+        fs::write(dir.path().join("node_modules"), "malicious\n").unwrap();
+
+        assert_ne!(initial, compute_script_hash(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_package_tree_exceeds_depth_budget() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"install": "node install.js"}),
+        );
+        fs::write(dir.path().join("install.js"), "module.exports = true\n").unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for _ in 0..65 {
+            nested.push("nested");
+            fs::create_dir(&nested).unwrap();
+        }
+        fs::write(nested.join("payload.js"), "module.exports = true\n").unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_delegated_file_is_missing() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_resolves_extensionless_local_dependencies() {
+        let dir = tempdir().unwrap();
         write_pkg_json(
-            dir2.path(),
+            dir.path(),
             &serde_json::json!({"postinstall": "node install.js"}),
         );
-        let h1 = compute_script_hash(dir1.path()).unwrap();
-        let h2 = compute_script_hash(dir2.path()).unwrap();
-        assert_eq!(h1, h2);
+        fs::write(dir.path().join("install.js"), "require('./payload')\n").unwrap();
+        fs::write(dir.path().join("payload.js"), "module.exports = true\n").unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_some());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_transitive_delegate_escapes_package() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        fs::write(dir.path().join("install.js"), "require('../outside.js')\n").unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_delegate_graph_exceeds_depth_limit() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node depth-0.js"}),
+        );
+        for depth in 0..=MAX_DELEGATE_GRAPH_DEPTH {
+            fs::write(
+                dir.path().join(format!("depth-{depth}.js")),
+                format!("require('./depth-{}.js')\n", depth + 1),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.path()
+                .join(format!("depth-{}.js", MAX_DELEGATE_GRAPH_DEPTH + 1)),
+            "module.exports = 'unseen payload'\n",
+        )
+        .unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_returns_none_when_delegate_graph_exceeds_file_limit() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node entry.js"}),
+        );
+        let mut entry = String::with_capacity(MAX_DELEGATE_GRAPH_FILES * 24);
+        for index in 0..MAX_DELEGATE_GRAPH_FILES {
+            entry.push_str(&format!("require('./leaf-{index}.js')\n"));
+            fs::write(
+                dir.path().join(format!("leaf-{index}.js")),
+                "module.exports = true\n",
+            )
+            .unwrap();
+        }
+        fs::write(dir.path().join("entry.js"), entry).unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_script_hash_returns_none_when_delegate_resolves_outside_package() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let external_script = external.path().join("payload.js");
+        fs::write(&external_script, "module.exports = 'outside'\n").unwrap();
+        symlink(external_script, dir.path().join("install.js")).unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
     }
 
     /// The shared recognizer in
@@ -926,6 +1311,113 @@ mod tests {
     }
 
     #[test]
+    fn compute_script_hash_changes_when_dynamic_local_payload_changes() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let scripts = serde_json::json!({"postinstall": "node install.js"});
+        write_pkg_json(dir1.path(), &scripts);
+        write_pkg_json(dir2.path(), &scripts);
+        let entry = "require('./payload-' + process.platform + '.js')\n";
+        fs::write(dir1.path().join("install.js"), entry).unwrap();
+        fs::write(dir2.path().join("install.js"), entry).unwrap();
+        fs::write(dir1.path().join("payload-darwin.js"), "benign\n").unwrap();
+        fs::write(dir2.path().join("payload-darwin.js"), "malicious\n").unwrap();
+
+        assert_ne!(
+            compute_script_hash(dir1.path()),
+            compute_script_hash(dir2.path()),
+            "dynamic local loads must remain bound to the package content"
+        );
+    }
+
+    #[test]
+    fn compute_script_hash_changes_when_node_command_with_args_payload_changes() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let scripts = serde_json::json!({"postinstall": "node install.js --verbose"});
+        write_pkg_json(dir1.path(), &scripts);
+        write_pkg_json(dir2.path(), &scripts);
+        fs::write(dir1.path().join("install.js"), "benign\n").unwrap();
+        fs::write(dir2.path().join("install.js"), "malicious\n").unwrap();
+
+        assert_ne!(
+            compute_script_hash(dir1.path()),
+            compute_script_hash(dir2.path())
+        );
+    }
+
+    #[test]
+    fn compute_script_hash_binds_exact_extensionless_node_target() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let scripts = serde_json::json!({"postinstall": "node install.js"});
+        write_pkg_json(dir1.path(), &scripts);
+        write_pkg_json(dir2.path(), &scripts);
+        fs::write(dir1.path().join("install.js"), "require('./payload')\n").unwrap();
+        fs::write(dir2.path().join("install.js"), "require('./payload')\n").unwrap();
+        fs::write(dir1.path().join("payload.js"), "decoy\n").unwrap();
+        fs::write(dir2.path().join("payload.js"), "decoy\n").unwrap();
+        fs::write(dir1.path().join("payload"), "benign\n").unwrap();
+        fs::write(dir2.path().join("payload"), "malicious\n").unwrap();
+
+        assert_ne!(
+            compute_script_hash(dir1.path()),
+            compute_script_hash(dir2.path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_script_hash_returns_none_when_package_symlink_escapes_package() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        fs::write(
+            dir.path().join("install.js"),
+            "require('./' + 'payload.js')\n",
+        )
+        .unwrap();
+        fs::write(outside.path().join("payload.js"), "mutable\n").unwrap();
+        symlink(
+            outside.path().join("payload.js"),
+            dir.path().join("payload.js"),
+        )
+        .unwrap();
+
+        assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_script_hash_binds_internal_symlink_target_content() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        fs::write(
+            dir.path().join("install.js"),
+            "require('./' + 'payload.js')\n",
+        )
+        .unwrap();
+        let target = dir.path().join("payload-real.js");
+        fs::write(&target, "benign\n").unwrap();
+        symlink("payload-real.js", dir.path().join("payload.js")).unwrap();
+        let before = compute_script_hash(dir.path()).unwrap();
+
+        fs::write(target, "changed\n").unwrap();
+
+        assert_ne!(before, compute_script_hash(dir.path()).unwrap());
+    }
+
+    #[test]
     fn compute_script_hash_empty_string_phase_treated_as_absent() {
         // `{"install": ""}` should be the same as `{"install" missing}` —
         // both are "no install script". The any_present pre-scan returns
@@ -941,18 +1433,8 @@ mod tests {
     #[test]
     fn compute_script_hash_distinguishes_present_empty_from_absent_when_other_phases_have_content()
     {
-        // {"preinstall": "x", "install": ""} is NOT the same as
-        // {"preinstall": "x"} — the second has the install phase as
-        // "absent", the first has it as "present-but-empty". With the
-        // any_present pre-scan, both return Some(...) because preinstall
-        // is non-empty, but the install phase contributes the empty
-        // string in the first case and is also empty in the second case.
-        // In our implementation, both are hashed as empty bytes for the
-        // install phase, so they SHOULD produce the same hash. This is
-        // the documented contract: an empty string IS the same as a
-        // missing entry for hash purposes (the FIELD_SEP byte makes
-        // them indistinguishable, which is fine because both result in
-        // "no script bytes get executed for this phase").
+        // The executed phase-body prefix treats both forms as empty, but the
+        // canonical manifest suffix binds the complete package content.
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
         write_pkg_json(
@@ -960,12 +1442,56 @@ mod tests {
             &serde_json::json!({"preinstall": "x", "install": ""}),
         );
         write_pkg_json(dir2.path(), &serde_json::json!({"preinstall": "x"}));
-        assert_eq!(
+        assert_ne!(
             compute_script_hash(dir1.path()),
             compute_script_hash(dir2.path()),
-            "empty-string phase and absent phase must hash identically \
-             (both result in no script bytes executed)"
+            "present-empty and absent manifest fields are distinct content"
         );
+    }
+
+    #[test]
+    fn compute_script_hash_binds_raw_package_manifest_bytes() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        fs::write(
+            first.path().join("package.json"),
+            br#"{"name":"pkg","scripts":{"install":"node install.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            second.path().join("package.json"),
+            b"{\n  \"scripts\": {\"install\": \"node install.js\"},\n  \"name\": \"pkg\"\n}\n",
+        )
+        .unwrap();
+        fs::write(first.path().join("install.js"), "console.log('safe')").unwrap();
+        fs::write(second.path().join("install.js"), "console.log('safe')").unwrap();
+
+        assert_ne!(
+            compute_script_hash(first.path()),
+            compute_script_hash(second.path())
+        );
+    }
+
+    #[test]
+    fn compute_script_hash_binds_package_owned_build_marker_names() {
+        for entry_name in [".lpm-build-tmp", ".lpm-build-complete"] {
+            let dir = tempdir().unwrap();
+            write_pkg_json(
+                dir.path(),
+                &serde_json::json!({"install": "node install.js"}),
+            );
+            fs::write(dir.path().join("install.js"), "console.log('safe')").unwrap();
+            fs::write(dir.path().join(entry_name), "first").unwrap();
+            let before = compute_script_hash(dir.path()).unwrap();
+
+            fs::write(dir.path().join(entry_name), "second").unwrap();
+
+            assert_ne!(
+                before,
+                compute_script_hash(dir.path()).unwrap(),
+                "package-owned {entry_name} must participate in lifecycle identity"
+            );
+        }
     }
 
     #[test]

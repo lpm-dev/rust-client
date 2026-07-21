@@ -56,7 +56,7 @@ fn write_empty_build_state(project: &TempProject) {
     project.write_file(
         ".lpm/build-state.json",
         r#"{
-    "state_version": 1,
+    "state_version": 3,
     "blocked_set_fingerprint": "sha256-empty",
     "captured_at": "2026-04-22T00:00:00Z",
     "blocked_packages": []
@@ -414,6 +414,14 @@ fn approve_scripts_global_named_dry_run_does_not_mutate_trust_file() {
     assert_eq!(approved.len(), 1);
     assert_eq!(approved[0]["name"].as_str(), Some("some-blocked-pkg"));
     assert_eq!(approved[0]["version"].as_str(), Some("2.0.0"));
+    assert!(approved[0].get("source").is_some());
+    assert!(
+        approved[0]["identity_selector"]
+            .as_str()
+            .is_some_and(|selector| selector.starts_with("some-blocked-pkg@2.0.0#")),
+        "global approval JSON must expose an exact reusable selector: {}",
+        approved[0]
+    );
 }
 
 /// Pre-seeded trust file stays byte-equal under `--dry-run` —
@@ -696,7 +704,7 @@ fn write_blocked_build_state_with_drift(
     };
     let body = format!(
         r#"{{
-            "state_version": 1,
+            "state_version": 3,
             "blocked_set_fingerprint": "sha256-fixture-stable",
             "captured_at": "2026-04-22T00:00:00Z",
             "blocked_packages": [
@@ -1065,6 +1073,82 @@ fn approve_scripts_first_time_review_emits_null_version_diff_and_no_card() {
 
 // ─── End-to-end trust regression tests ──────────────
 //
+#[test]
+fn approve_scripts_list_distinguishes_equal_coordinates_by_source_and_selector() {
+    let project =
+        TempProject::empty(r#"{"name":"approve-scripts-source-identities","version":"0.0.1"}"#);
+    let sources = [
+        "file:packages/source-a",
+        "https://packages.example/source-b.tgz#sha512-same",
+    ];
+    let blocked_packages = sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "name": "shared",
+                "version": "1.0.0",
+                "source": source,
+                "integrity": "sha512-same",
+                "script_hash": "sha256-same-script",
+                "phases_present": ["postinstall"],
+                "binding_drift": false,
+                "static_tier": "green",
+                "published_at": "2026-04-22T00:00:00Z"
+            })
+        })
+        .collect::<Vec<_>>();
+    project.write_file(
+        ".lpm/build-state.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "state_version": 3,
+            "blocked_set_fingerprint": "sha256-source-identities",
+            "captured_at": "2026-04-22T00:00:00Z",
+            "blocked_packages": blocked_packages,
+        }))
+        .unwrap(),
+    );
+
+    let json = lpm(&project)
+        .args(["--json", "approve-scripts", "--list"])
+        .output()
+        .expect("spawn lpm approve-scripts --list --json");
+    assert!(json.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let rows = envelope["blocked"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let selectors = rows
+        .iter()
+        .map(|row| row["identity_selector"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_ne!(selectors[0], selectors[1]);
+    assert!(
+        selectors
+            .iter()
+            .all(|selector| selector.starts_with("shared@1.0.0#"))
+    );
+    assert_eq!(rows[0]["source"], sources[0]);
+    assert_eq!(rows[1]["source"], sources[1]);
+
+    let human = lpm(&project)
+        .args(["approve-scripts", "--list"])
+        .output()
+        .expect("spawn lpm approve-scripts --list");
+    assert!(human.status.success());
+    let stdout = strip_ansi(&String::from_utf8_lossy(&human.stdout));
+    for source in sources {
+        assert!(
+            stdout.contains(source),
+            "missing source `{source}`:\n{stdout}"
+        );
+    }
+    for selector in selectors {
+        assert!(
+            stdout.contains(selector),
+            "missing exact selector `{selector}`:\n{stdout}"
+        );
+    }
+}
+
 // Three trust regression tests, end-to-end:
 //  - **Legacy bare-name upgrade:** legacy `["esbuild"]` upgrades to `esbuild@*` after
 //    `--yes` and stays trusted on the next install (no re-block).
@@ -1095,7 +1179,7 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
         })
         .collect();
     let state = serde_json::json!({
-        "state_version": 1,
+        "state_version": 3,
         "blocked_set_fingerprint": "sha256-cli-audit-fixture",
         "captured_at": "2026-04-11T00:00:00Z",
         "blocked_packages": blocked,

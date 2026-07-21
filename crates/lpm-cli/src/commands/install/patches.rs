@@ -220,11 +220,16 @@ pub(super) fn apply_patches_for_install(
     project_dir: &Path,
     json_output: bool,
 ) -> Result<Vec<patch_engine::AppliedPatch>, LpmError> {
-    if patches.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut results: Vec<patch_engine::AppliedPatch> = Vec::with_capacity(patches.len());
+    let mut patched_coordinates = HashSet::with_capacity(patches.len());
+    let v2_store = lpm_store::StoreVersion::from_env()
+        .is_v2()
+        .then(|| {
+            store
+                .lpm_root()
+                .map(|root| lpm_store::v2::Store::from_lpm_root(&root))
+        })
+        .transpose()?;
 
     // Iterate in a deterministic order so error messages and the
     // applied list are stable across runs (HashMap iteration is
@@ -235,6 +240,7 @@ pub(super) fn apply_patches_for_install(
     for key in sorted_keys {
         let entry = &patches[key];
         let (name, version) = patch_engine::parse_patch_key(key)?;
+        patched_coordinates.insert((name.clone(), version.clone()));
 
         // Resolve the patch file path relative to the project dir.
         let patch_file = project_dir.join(&entry.path);
@@ -256,6 +262,30 @@ pub(super) fn apply_patches_for_install(
             .filter(|m| m.name == name && m.version == version)
             .collect();
 
+        let _lifecycle_locks = if let Some(v2_store) = &v2_store {
+            let mut lock_paths = Vec::with_capacity(locations.len());
+            for location in &locations {
+                lock_paths.push(v2_store.lifecycle_entry_lock_path(&location.destination)?);
+            }
+            lock_paths.sort_unstable();
+            lock_paths.dedup();
+            let mut locks = Vec::with_capacity(lock_paths.len());
+            for lock_path in lock_paths {
+                locks.push(lpm_common::acquire_exclusive_lock(lock_path)?);
+            }
+            locks
+        } else {
+            Vec::new()
+        };
+        let mut baselines_to_capture = Vec::with_capacity(locations.len());
+        if let Some(v2_store) = &v2_store {
+            for location in &locations {
+                if v2_store.prepare_patched_lifecycle_baseline(&location.destination)? {
+                    baselines_to_capture.push(location.destination.clone());
+                }
+            }
+        }
+
         let applied = patch_engine::apply_patch(
             &locations,
             &patch_file,
@@ -264,6 +294,12 @@ pub(super) fn apply_patches_for_install(
             &name,
             &version,
         )?;
+
+        if let Some(v2_store) = &v2_store {
+            for package_dir in baselines_to_capture {
+                v2_store.capture_patched_lifecycle_baseline(&package_dir)?;
+            }
+        }
 
         // Surface a per-package debug breadcrumb so users running with
         // `RUST_LOG=debug` can see the patch pass without parsing JSON.
@@ -275,6 +311,19 @@ pub(super) fn apply_patches_for_install(
         );
         let _ = json_output; // suppress unused — we read it for symmetry only
         results.push(applied);
+    }
+
+    if let Some(v2_store) = &v2_store {
+        for materialized in &link_result.materialized {
+            if patched_coordinates
+                .contains(&(materialized.name.clone(), materialized.version.clone()))
+                || crate::build_state::read_install_phase_bodies(&materialized.destination)
+                    .is_empty()
+            {
+                continue;
+            }
+            v2_store.ensure_unpatched_lifecycle_baseline(&materialized.destination)?;
+        }
     }
 
     Ok(results)

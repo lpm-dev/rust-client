@@ -32,7 +32,8 @@ pub use peers::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent, StageTiming,
+    ExplicitPeerProvider, ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent,
+    StageTiming,
 };
 
 mod prelude {
@@ -63,8 +64,8 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::types::{
-        PubGrubResult, ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent,
-        StageTiming,
+        ExplicitPeerProvider, PubGrubResult, ResolveResult, ResolvedPackage, RootDependencies,
+        SelectedPackageEvent, StageTiming,
     };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;

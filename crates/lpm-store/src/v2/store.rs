@@ -14,12 +14,13 @@ use std::sync::Arc;
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::finalize_permits::v2_finalize_limiter;
 use super::fs_util::{
     copy_dir_recursively, create_dir_symlink, create_tmp_dir_locked, ensure_store_tier_dir_locked,
-    materialize_into, tmp_sibling,
+    materialize_into, materialize_into_inner, tmp_sibling,
 };
 pub use super::integrity::{
     ENV_V2_OBJECT_INTEGRITY, FreshObjectIntegrity, ObjectIntegrityPolicy,
@@ -40,7 +41,8 @@ use super::tree_hash::{
 use crate::StageTimings;
 use crate::v2::graph_key::GraphKey;
 use crate::v2::link_meta::{
-    LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform, validate_name_for_path_join,
+    LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform, is_lower_hex_digest,
+    validate_name_for_path_join,
 };
 
 /// v2 layout version segment under `~/.lpm/store/`. Bumped whenever
@@ -53,6 +55,25 @@ const OBJECTS_DIR: &str = "objects";
 
 /// Subdirectory holding per-graph-key link entries.
 const LINKS_DIR: &str = "links";
+const LIFECYCLE_BASELINE_FILENAME: &str = ".lpm-lifecycle-baseline.json";
+const LIFECYCLE_SOURCE_DIR: &str = ".lpm-lifecycle-source";
+const LIFECYCLE_BASELINE_SCHEMA: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LifecycleBaselineMetadata {
+    schema: u32,
+    graph_key_digest: String,
+    content_integrity: String,
+    materialized_source: bool,
+}
+
+/// Immutable content identity and source tree used for v2 lifecycle review
+/// and execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleBaseline {
+    pub source_dir: PathBuf,
+    pub content_integrity: String,
+}
 
 /// Subdirectory holding cached project-compatibility islands, keyed by the
 /// content hash of the island's entry set. A framework-toolchain island
@@ -517,6 +538,221 @@ impl Store {
         &self.paths
     }
 
+    /// Reset a patched link package to its verified object before applying
+    /// the patch, returning whether a post-patch baseline must be captured.
+    pub fn prepare_patched_lifecycle_baseline(&self, package_dir: &Path) -> Result<bool, LpmError> {
+        let (link_dir, meta) = self.lifecycle_link_context(package_dir)?;
+        let needs_capture = self
+            .read_lifecycle_baseline(&link_dir, &meta)?
+            .is_none_or(|baseline| baseline.source_dir != link_dir.join(LIFECYCLE_SOURCE_DIR));
+        let object_dir = self.paths.object_dir(&meta.source_sri)?;
+        self.restore_pristine_package(&object_dir, package_dir)?;
+        restore_same_name_dependency_links(package_dir, &meta)?;
+        Ok(needs_capture)
+    }
+
+    /// Persist the exact post-patch, pre-build tree for one v2 link entry.
+    pub fn capture_patched_lifecycle_baseline(
+        &self,
+        package_dir: &Path,
+    ) -> Result<Option<LifecycleBaseline>, LpmError> {
+        let (link_dir, meta) = self.lifecycle_link_context(package_dir)?;
+        let Some(content_integrity) = lpm_security::script_hash::compute_script_hash(package_dir)
+        else {
+            return Ok(None);
+        };
+        let final_source = link_dir.join(LIFECYCLE_SOURCE_DIR);
+        let staged_source = link_dir.join(format!(
+            "{LIFECYCLE_SOURCE_DIR}.tmp.{:016x}",
+            rand::random::<u64>()
+        ));
+        materialize_into_inner(package_dir, package_dir, &staged_source, true)?;
+        let staged_content_integrity =
+            lpm_security::script_hash::compute_script_hash(&staged_source);
+        if staged_content_integrity.as_deref() != Some(content_integrity.as_str()) {
+            let _ = std::fs::remove_dir_all(&staged_source);
+            return Err(LpmError::Store(format!(
+                "v2 lifecycle baseline copy for {} changed during capture",
+                package_dir.display()
+            )));
+        }
+        replace_lifecycle_source(&final_source, &staged_source)?;
+        let metadata = LifecycleBaselineMetadata {
+            schema: LIFECYCLE_BASELINE_SCHEMA,
+            graph_key_digest: meta.graph_key_digest_hex,
+            content_integrity: content_integrity.clone(),
+            materialized_source: true,
+        };
+        write_lifecycle_baseline_metadata(&link_dir, &metadata)?;
+        Ok(Some(LifecycleBaseline {
+            source_dir: final_source,
+            content_integrity,
+        }))
+    }
+
+    /// Persist a reusable lifecycle identity for an unpatched v2 package.
+    pub fn ensure_unpatched_lifecycle_baseline(
+        &self,
+        package_dir: &Path,
+    ) -> Result<Option<LifecycleBaseline>, LpmError> {
+        let (link_dir, meta) = self.lifecycle_link_context(package_dir)?;
+        if let Some(baseline) = self.read_lifecycle_baseline(&link_dir, &meta)? {
+            return Ok(Some(baseline));
+        }
+        let object_dir = self.paths.object_dir(&meta.source_sri)?;
+        let Some(content_integrity) = lpm_security::script_hash::compute_script_hash(&object_dir)
+        else {
+            return Ok(None);
+        };
+        let metadata = LifecycleBaselineMetadata {
+            schema: LIFECYCLE_BASELINE_SCHEMA,
+            graph_key_digest: meta.graph_key_digest_hex,
+            content_integrity: content_integrity.clone(),
+            materialized_source: false,
+        };
+        write_lifecycle_baseline_metadata(&link_dir, &metadata)?;
+        Ok(Some(LifecycleBaseline {
+            source_dir: object_dir,
+            content_integrity,
+        }))
+    }
+
+    /// Read the immutable lifecycle baseline for a v2 package.
+    pub fn lifecycle_baseline(
+        &self,
+        package_dir: &Path,
+    ) -> Result<Option<LifecycleBaseline>, LpmError> {
+        let (link_dir, meta) = self.lifecycle_link_context(package_dir)?;
+        self.read_lifecycle_baseline(&link_dir, &meta)
+    }
+
+    /// Advisory lock path serializing patch/build mutation of this package's
+    /// v2 graph entry.
+    pub fn lifecycle_entry_lock_path(&self, package_dir: &Path) -> Result<PathBuf, LpmError> {
+        let (_, meta) = self.lifecycle_link_context(package_dir)?;
+        self.paths.build_entry_lock_path(&meta.graph_key_digest_hex)
+    }
+
+    /// Restore and revalidate the exact tree whose lifecycle identity was
+    /// authorized before any process is spawned.
+    pub fn restore_lifecycle_package(
+        &self,
+        package_dir: &Path,
+        expected_content_integrity: &str,
+    ) -> Result<(), LpmError> {
+        let (link_dir, meta) = self.lifecycle_link_context(package_dir)?;
+        let baseline = self
+            .read_lifecycle_baseline(&link_dir, &meta)?
+            .ok_or_else(|| {
+                LpmError::Store(format!(
+                    "v2 lifecycle baseline is missing for {}",
+                    package_dir.display()
+                ))
+            })?;
+        if baseline.content_integrity != expected_content_integrity {
+            return Err(LpmError::Store(format!(
+                "v2 lifecycle identity drift for {}: expected {}, recorded {}",
+                package_dir.display(),
+                expected_content_integrity,
+                baseline.content_integrity
+            )));
+        }
+        let source_integrity = lpm_security::script_hash::compute_script_hash(&baseline.source_dir);
+        if source_integrity.as_deref() != Some(baseline.content_integrity.as_str()) {
+            return Err(LpmError::Store(format!(
+                "v2 lifecycle baseline bytes drifted at {}",
+                baseline.source_dir.display()
+            )));
+        }
+        self.restore_pristine_package(&baseline.source_dir, package_dir)?;
+        restore_same_name_dependency_links(package_dir, &meta)?;
+        let restored_integrity = lpm_security::script_hash::compute_script_hash(package_dir);
+        if restored_integrity.as_deref() != Some(baseline.content_integrity.as_str()) {
+            return Err(LpmError::Store(format!(
+                "v2 lifecycle package changed during rematerialization at {}",
+                package_dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn lifecycle_link_context(&self, package_dir: &Path) -> Result<(PathBuf, LinkMeta), LpmError> {
+        let canonical_package = std::fs::canonicalize(package_dir).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to resolve v2 lifecycle package {}: {error}",
+                package_dir.display()
+            ))
+        })?;
+        let canonical_links = std::fs::canonicalize(self.paths.links_root()).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to resolve v2 links root {}: {error}",
+                self.paths.links_root().display()
+            ))
+        })?;
+        if !canonical_package.starts_with(&canonical_links) {
+            return Err(LpmError::Store(format!(
+                "package {} is not inside the v2 links store",
+                package_dir.display()
+            )));
+        }
+        for ancestor in package_dir.ancestors() {
+            if !ancestor.join(LINK_META_FILENAME).is_file() {
+                continue;
+            }
+            let meta = LinkMeta::read_from(ancestor)?;
+            if ancestor.join(LINK_NODE_MODULES).join(&meta.name) == package_dir {
+                return Ok((ancestor.to_path_buf(), meta));
+            }
+        }
+        Err(LpmError::Store(format!(
+            "could not locate v2 link metadata for lifecycle package {}",
+            package_dir.display()
+        )))
+    }
+
+    fn read_lifecycle_baseline(
+        &self,
+        link_dir: &Path,
+        meta: &LinkMeta,
+    ) -> Result<Option<LifecycleBaseline>, LpmError> {
+        let path = link_dir.join(LIFECYCLE_BASELINE_FILENAME);
+        let bytes = match lpm_common::read_capped_state_file(&path, 16 * 1024) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(LpmError::Io(error)),
+        };
+        let metadata: LifecycleBaselineMetadata =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                LpmError::Store(format!(
+                    "malformed v2 lifecycle baseline at {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if metadata.schema != LIFECYCLE_BASELINE_SCHEMA
+            || metadata.graph_key_digest != meta.graph_key_digest_hex
+            || !super::integrity::valid_sha256_integrity(&metadata.content_integrity)
+        {
+            return Ok(None);
+        }
+        let source_dir = if metadata.materialized_source {
+            link_dir.join(LIFECYCLE_SOURCE_DIR)
+        } else {
+            self.paths.object_dir(&meta.source_sri)?
+        };
+        let source_metadata = match std::fs::symlink_metadata(&source_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(LpmError::Io(error)),
+        };
+        if !source_metadata.file_type().is_dir() || source_metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        Ok(Some(LifecycleBaseline {
+            source_dir,
+            content_integrity: metadata.content_integrity,
+        }))
+    }
+
     pub fn object_integrity_policy(&self) -> ObjectIntegrityPolicy {
         self.object_integrity_policy
     }
@@ -840,9 +1076,9 @@ impl Store {
         result.map(|object| (object, timings))
     }
 
-    /// Extract from a buffered byte slice when the SRI isn't known
-    /// upfront. Hashes the bytes (SHA-512), verifies against
-    /// `expected_integrity` if provided, then delegates to
+    /// Extract from a buffered byte slice when the SRI may not be known
+    /// upfront. Hashes the bytes, verifies against `expected_integrity`
+    /// if provided, then delegates to
     /// [`Self::extract_object_with_timings`].
     ///
     /// This is the install pipeline's v2 entry point: it pairs with
@@ -850,11 +1086,9 @@ impl Store {
     /// before extracting (the permit is released between download
     /// and extract, so the buffer doesn't pin a network slot).
     ///
-    /// `expected_integrity` is the registry-supplied SRI. If `Some`
-    /// and starts with `sha512-`, mismatch returns
-    /// [`LpmError::IntegrityMismatch`]. Non-sha512 expected values
-    /// are logged + trusted (matches v1's
-    /// `stream_and_store_package` policy at lib.rs:644-658).
+    /// A verified declared SRI remains the object identity, including
+    /// SHA-256 and SHA-1 declarations. Unpinned content uses the computed
+    /// SHA-512 SRI.
     pub fn extract_object_from_bytes(
         &self,
         tarball_data: &[u8],
@@ -919,9 +1153,10 @@ impl Store {
             }
         }
 
+        let source_sri = expected_integrity.unwrap_or(&computed_sri);
         let (object, timings) =
-            self.extract_object_with_timings_and_policy(&computed_sri, tarball_data, policy)?;
-        Ok((object, computed_sri, timings))
+            self.extract_object_with_timings_and_policy(source_sri, tarball_data, policy)?;
+        Ok((object, source_sri.to_string(), timings))
     }
 
     /// Populate `links/<graph-key>/` with the package bytes, sibling
@@ -1417,15 +1652,10 @@ impl Store {
     ///   migrations. If absent, the helper re-runs analysis to
     ///   match `extract_object`'s post-write contract.
     ///
-    /// **Limitation.** This helper trusts the caller to provide a
-    /// `(v1_pkg_dir, sri)` pair where the SRI matches the extracted
-    /// bytes. The install pipeline derives `sri` from the lockfile
-    /// or from the prior install's recorded integrity; both come
-    /// from the same SHA-512 the v1 extract recorded, so the trust
-    /// is sound under normal flows. A pathological `(v1_pkg_dir,
-    /// wrong_sri)` pair would land bytes at the wrong v2 key, but
-    /// that's an upstream programmer error, not a security boundary
-    /// the helper enforces.
+    /// Translation is allowed only when the v1 entry's `.integrity`
+    /// evidence exactly matches `sri`. Coordinate-only v1 lookups can
+    /// otherwise select bytes from another registry that published the
+    /// same package name and version.
     pub fn populate_object_from_v1(
         &self,
         v1_pkg_dir: &Path,
@@ -1448,6 +1678,26 @@ impl Store {
                 "v1 → v2 translation: source dir {} is not readable",
                 v1_pkg_dir.display()
             )));
+        }
+        let stored_sri = crate::read_stored_integrity(v1_pkg_dir).ok_or_else(|| {
+            LpmError::Store(format!(
+                "v1 → v2 translation: source dir {} is missing .integrity evidence",
+                v1_pkg_dir.display()
+            ))
+        })?;
+        let stored_sri = stored_sri.trim();
+        let requested_integrity = Integrity::parse(sri)?;
+        let stored_integrity = Integrity::parse(stored_sri).map_err(|error| {
+            LpmError::Store(format!(
+                "v1 → v2 translation: source dir {} has invalid .integrity evidence: {error}",
+                v1_pkg_dir.display()
+            ))
+        })?;
+        if stored_integrity != requested_integrity {
+            return Err(LpmError::IntegrityMismatch {
+                expected: sri.to_string(),
+                actual: stored_sri.to_string(),
+            });
         }
         if let Some(parent) = object_dir.parent() {
             std::fs::create_dir_all(parent)
@@ -1615,6 +1865,123 @@ impl Store {
         };
         canonical.starts_with(canonical_links_root)
     }
+}
+
+fn restore_same_name_dependency_links(package_dir: &Path, meta: &LinkMeta) -> Result<(), LpmError> {
+    for dep in meta.deps.iter().filter(|dep| dep.local == meta.name) {
+        if let Err(why) = validate_name_for_path_join(&dep.target_name) {
+            return Err(LpmError::Store(format!(
+                "unsafe v2 lifecycle dependency target name {:?}: {why}",
+                dep.target_name
+            )));
+        }
+        if dep.target_version.is_empty()
+            || dep.target_version.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                    )
+            })
+        {
+            return Err(LpmError::Store(format!(
+                "unsafe v2 lifecycle dependency target version {:?}",
+                dep.target_version
+            )));
+        }
+        if !is_lower_hex_digest(&dep.target_graph_key) {
+            return Err(LpmError::Store(format!(
+                "invalid v2 dependency graph digest for {}@{}",
+                dep.target_name, dep.target_version
+            )));
+        }
+        let nested_node_modules = package_dir.join(LINK_NODE_MODULES);
+        ensure_real_dir_or_create(&nested_node_modules, "same-name dependency node_modules")?;
+        let link_path = nested_node_modules.join(&dep.local);
+        ensure_sibling_parent_dir(&nested_node_modules, &link_path, "same-name sibling")?;
+        if std::fs::symlink_metadata(&link_path).is_ok() {
+            lpm_common::remove_dir_symlink_or_junction(&link_path).map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to replace v2 same-name dependency link {}: {error}",
+                    link_path.display()
+                ))
+            })?;
+        }
+        let mut target = PathBuf::new();
+        for _ in 0..(depth_of_local(&meta.name) + depth_of_local(&dep.local) + 4) {
+            target.push("..");
+        }
+        let safe_name = dep.target_name.replace(['/', '\\'], "+");
+        target.push(format!(
+            "{}@{}+{}",
+            safe_name,
+            dep.target_version,
+            &dep.target_graph_key[..GraphKey::SHORT_HEX_LEN]
+        ));
+        target.push(LINK_NODE_MODULES);
+        target.push(&dep.target_name);
+        create_dir_symlink(&target, &link_path).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to restore v2 same-name dependency link {} → {}: {error}",
+                link_path.display(),
+                target.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn write_lifecycle_baseline_metadata(
+    link_dir: &Path,
+    metadata: &LifecycleBaselineMetadata,
+) -> Result<(), LpmError> {
+    let bytes = serde_json::to_vec(metadata).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to serialize v2 lifecycle baseline: {error}"
+        ))
+    })?;
+    let path = link_dir.join(LIFECYCLE_BASELINE_FILENAME);
+    lpm_common::write_file_atomic(&path, bytes).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to persist v2 lifecycle baseline at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn replace_lifecycle_source(destination: &Path, staged: &Path) -> Result<(), LpmError> {
+    let backup = destination.with_extension(format!(
+        "lpm-lifecycle-backup.{:016x}",
+        rand::random::<u64>()
+    ));
+    if destination.exists() {
+        std::fs::rename(destination, &backup).map_err(|error| {
+            let _ = std::fs::remove_dir_all(staged);
+            LpmError::Store(format!(
+                "failed to stage prior v2 lifecycle source at {}: {error}",
+                destination.display()
+            ))
+        })?;
+    }
+    if let Err(error) = std::fs::rename(staged, destination) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, destination);
+        }
+        let _ = std::fs::remove_dir_all(staged);
+        return Err(LpmError::Store(format!(
+            "failed to publish v2 lifecycle source at {}: {error}",
+            destination.display()
+        )));
+    }
+    if backup.exists()
+        && let Err(error) = std::fs::remove_dir_all(&backup)
+    {
+        tracing::debug!(
+            target = %backup.display(),
+            "failed to remove replaced v2 lifecycle source: {error}"
+        );
+    }
+    Ok(())
 }
 
 struct PopulateObject<'a> {

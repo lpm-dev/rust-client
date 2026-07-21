@@ -152,7 +152,7 @@ impl NdjsonBatchEntryStream {
         }
 
         if self.cache_entries {
-            let cache_key = batch_metadata_cache_key(&name);
+            let cache_key = client.batch_metadata_cache_key(&name);
             let write_start = std::time::Instant::now();
             client.write_metadata_cache(&cache_key, &meta, None);
             self.cache_write_ns += write_start.elapsed().as_nanos();
@@ -257,14 +257,6 @@ impl Drop for BatchMetadataEntryStream<'_> {
     }
 }
 
-fn batch_metadata_cache_key(name: &str) -> String {
-    if name.starts_with("@lpm.dev/") {
-        format!("lpm:{name}")
-    } else {
-        format!("npm:{name}")
-    }
-}
-
 fn batch_metadata_entry_matches_name(name: &str, meta: &PackageMetadata) -> bool {
     meta.name == name || meta.versions.values().any(|version| version.name == name)
 }
@@ -310,6 +302,14 @@ fn highest_metadata_version(
 }
 
 impl RegistryClient {
+    fn batch_metadata_cache_key(&self, name: &str) -> String {
+        if name.starts_with("@lpm.dev/") {
+            self.lpm_metadata_cache_key(name)
+        } else {
+            self.npm_worker_metadata_cache_key(name)
+        }
+    }
+
     pub(super) fn apply_worker_metadata_http_version(
         &self,
         req: reqwest::RequestBuilder,
@@ -428,10 +428,10 @@ impl RegistryClient {
     async fn cached_release_times_from_metadata_cache(
         &self,
         name: &str,
+        metadata_cache_key: &str,
     ) -> Option<ReleaseTimeMetadata> {
-        let metadata_cache_key = format!("npm:{name}");
         let (cached, _etag) = self
-            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&metadata_cache_key)
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(metadata_cache_key)
             .await?;
         (cached.matches_package(name) && !cached.time.is_empty()).then_some(cached)
     }
@@ -806,7 +806,7 @@ impl RegistryClient {
                 }
 
                 if cache_entries {
-                    let cache_key = batch_metadata_cache_key(name);
+                    let cache_key = self.batch_metadata_cache_key(name);
                     self.write_metadata_cache(&cache_key, &meta, None);
                 }
                 map.insert(name.clone(), meta);
@@ -855,7 +855,7 @@ impl RegistryClient {
     ) -> Result<PackageMetadata, LpmError> {
         let scoped = name.scoped();
         crate::timing::record_metadata_request(&scoped);
-        let cache_key = format!("lpm:{scoped}");
+        let cache_key = self.lpm_metadata_cache_key(&scoped);
 
         if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
         {
@@ -879,6 +879,7 @@ impl RegistryClient {
         // attempt so the rotated token is used on retry.
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                let cache_key = self.lpm_metadata_cache_key(&scoped);
                 let cache_validator = use_cache
                     .then(|| self.read_cache_validator(&cache_key))
                     .flatten();
@@ -925,7 +926,7 @@ impl RegistryClient {
     /// Supports ETag conditional requests for both proxy and direct npm paths.
     pub async fn get_npm_package_metadata(&self, name: &str) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
+        let cache_key = self.npm_worker_metadata_cache_key(name);
 
         // Tier 1: TTL-based cache hit
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
@@ -1069,7 +1070,7 @@ impl RegistryClient {
     /// previously-seen packages stay cache-fast.
     pub async fn get_npm_metadata_direct(&self, name: &str) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
+        let cache_key = self.npm_direct_metadata_cache_key(name);
 
         // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
@@ -1144,7 +1145,7 @@ impl RegistryClient {
         name: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
+        let cache_key = self.npm_direct_metadata_cache_key(name);
         let mut timings = PackageMetadataFetchTimings::default();
 
         let cache_read_start = std::time::Instant::now();
@@ -1248,7 +1249,7 @@ impl RegistryClient {
         version: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-version:{name}@{version}");
+        let cache_key = self.npm_direct_version_metadata_cache_key(name, version);
         let mut timings = PackageMetadataFetchTimings::default();
 
         let cache_read_start = std::time::Instant::now();
@@ -1369,7 +1370,7 @@ impl RegistryClient {
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-full:{name}");
+        let cache_key = self.npm_worker_full_metadata_cache_key(name);
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: npm-full:{name}");
@@ -1529,7 +1530,7 @@ impl RegistryClient {
         use_cache: bool,
     ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-full:{name}");
+        let cache_key = self.npm_direct_full_metadata_cache_key(name);
         if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
         {
             crate::timing::record_metadata_cache_hit();
@@ -1607,7 +1608,7 @@ impl RegistryClient {
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
+        let cache_key = self.npm_proxy_only_metadata_cache_key(name);
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (proxy-only): npm:{name}");
@@ -1768,7 +1769,7 @@ impl RegistryClient {
         name: &str,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-release-times:{name}");
+        let cache_key = self.npm_worker_release_times_cache_key(name);
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
@@ -1777,7 +1778,7 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
-        let full_cache_key = format!("npm-full:{name}");
+        let full_cache_key = self.npm_worker_full_metadata_cache_key(name);
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
             .await
@@ -1787,7 +1788,11 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
-        if let Some(cached) = self.cached_release_times_from_metadata_cache(name).await {
+        let metadata_cache_key = self.npm_worker_metadata_cache_key(name);
+        if let Some(cached) = self
+            .cached_release_times_from_metadata_cache(name, &metadata_cache_key)
+            .await
+        {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
@@ -1873,7 +1878,7 @@ impl RegistryClient {
         use_cache: bool,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-release-times:{name}");
+        let cache_key = self.npm_direct_release_times_cache_key(name);
         let mut timings = PackageMetadataFetchTimings::default();
         if use_cache {
             let cache_read_start = std::time::Instant::now();
@@ -1890,7 +1895,7 @@ impl RegistryClient {
                     timings,
                 });
             }
-            let full_cache_key = format!("npm-full:{name}");
+            let full_cache_key = self.npm_direct_full_metadata_cache_key(name);
             if let Some((cached, _etag)) = self
                 .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
                 .await
@@ -1905,7 +1910,11 @@ impl RegistryClient {
                     timings,
                 });
             }
-            if let Some(cached) = self.cached_release_times_from_metadata_cache(name).await {
+            let metadata_cache_key = self.npm_direct_metadata_cache_key(name);
+            if let Some(cached) = self
+                .cached_release_times_from_metadata_cache(name, &metadata_cache_key)
+                .await
+            {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
@@ -2132,21 +2141,19 @@ impl RegistryClient {
         route: crate::UpstreamRoute,
     ) -> Option<crate::types::BlockedSetPackageMeta> {
         crate::timing::record_metadata_request(name);
-        // Fast path for standard npm routes whose cache key is `npm:{name}`.
         // Custom routes use a principal-fingerprint key we can't reproduce here.
-        let is_standard_route = matches!(
-            route,
-            crate::UpstreamRoute::LpmWorker | crate::UpstreamRoute::NpmDirect
-        );
-        if is_standard_route {
-            let cache_key = format!("npm:{name}");
-            if let Some((meta, _)) =
+        let cache_key = match &route {
+            crate::UpstreamRoute::LpmWorker => Some(self.npm_worker_metadata_cache_key(name)),
+            crate::UpstreamRoute::NpmDirect => Some(self.npm_direct_metadata_cache_key(name)),
+            crate::UpstreamRoute::Custom { .. } => None,
+        };
+        if let Some(cache_key) = cache_key
+            && let Some((meta, _)) =
                 self.read_metadata_cache_as::<crate::types::BlockedSetPackageMeta>(&cache_key)
-            {
-                crate::timing::record_metadata_cache_hit();
-                tracing::debug!("blocked-set meta cache hit (minimal): {name}");
-                return Some(meta);
-            }
+        {
+            crate::timing::record_metadata_cache_hit();
+            tracing::debug!("blocked-set meta cache hit (minimal): {name}");
+            return Some(meta);
         }
         crate::timing::record_metadata_cache_miss();
 
@@ -2187,19 +2194,16 @@ impl RegistryClient {
     /// pairing auth with the right `target`. Defense-in-depth: this
     /// method **re-verifies** that the auth's origin matches the
     /// destination URL's origin via `OriginKey::from_request_url`
-    /// before sending, returning `LpmError::Internal` on mismatch
+    /// before sending, returning `LpmError::Registry` on mismatch
     /// (which should never trigger in correctly-built calls but
     /// hard-fails rather than leaking a token if it does).
     ///
     /// ## Cache key
     ///
-    /// `npm:<host>:<name>` — host derived from `base_url`. This
-    /// deliberately differs from the bare `npm:<name>` keys used by
-    /// `get_npm_metadata_direct` / `get_npm_package_metadata`, which
-    /// both serve content from the same npm.org logical source. Custom
-    /// registries serve potentially-different content under the same
-    /// name, so they must namespace per origin to avoid cross-
-    /// contamination.
+    /// `npm:<principal-fingerprint>:<full-url>`. Standard Worker and direct
+    /// routes are source-scoped separately. Custom registries also partition
+    /// by auth and mTLS principal because the same URL can return different
+    /// content to different credentials.
     ///
     /// ## What this does NOT do
     ///

@@ -764,7 +764,7 @@ impl<'a> PackageEntryView<'a> {
     /// `to_locked_package` allocation per comparison.
     pub fn package_key(&self) -> crate::PackageKey {
         let source_id = match self.source().map(crate::Source::parse) {
-            Some(Ok(s)) => s.source_id(),
+            Some(Ok(s)) => s.source_id_with_integrity(self.integrity()),
             _ => crate::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
         };
         crate::PackageKey::new(self.name(), self.version(), source_id)
@@ -1050,7 +1050,7 @@ mod tests {
             crate::Source::Registry {
                 url: "https://registry.npmjs.org".into(),
             }
-            .source_id(),
+            .source_id_with_integrity(Some("sha512-registry")),
         );
         let tarball_key = crate::PackageKey::new(
             "react",
@@ -1058,7 +1058,7 @@ mod tests {
             crate::Source::Tarball {
                 url: "https://example.com/react-fork-19.0.0.tgz".into(),
             }
-            .source_id(),
+            .source_id_with_integrity(Some("sha512-fork")),
         );
 
         let registry_entry = reader
@@ -1143,6 +1143,52 @@ mod tests {
                 "binary and TOML find_package_by_key must agree for key {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn binary_find_package_by_key_distinguishes_integrity_pins_for_the_same_url() {
+        let mut lockfile = Lockfile::new();
+        let first = LockedPackage {
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: Some("tarball+https://example.com/react.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAA".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            node_engine: None,
+            optional: false,
+            dependencies: Vec::new(),
+            alias_dependencies: Vec::new(),
+            peers: Vec::new(),
+            tarball: None,
+        };
+        let mut second = first.clone();
+        second.integrity = Some("sha512-BBBBBBBB".to_string());
+        let first_key = first.package_key();
+        let second_key = second.package_key();
+        lockfile.add_package(first);
+        lockfile.add_package(second);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.lockb");
+        write_binary(&lockfile, &path).unwrap();
+        let reader = BinaryLockfileReader::open(&path).unwrap().unwrap();
+
+        assert_eq!(
+            reader
+                .find_package_by_key(&first_key)
+                .and_then(|entry| entry.integrity()),
+            Some("sha512-AAAAAAAA")
+        );
+        assert_eq!(
+            reader
+                .find_package_by_key(&second_key)
+                .and_then(|entry| entry.integrity()),
+            Some("sha512-BBBBBBBB")
+        );
     }
 
     #[test]

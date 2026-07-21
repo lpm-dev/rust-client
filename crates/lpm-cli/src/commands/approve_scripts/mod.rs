@@ -14,7 +14,7 @@
 //! - **Direct approve** (`<pkg>`) — approve a single package by name
 //! - **Read-only listing** (`--list`) — print the blocked set, NO mutations
 //!
-//! All approvals are bound to `{name, version, integrity, script_hash}`
+//! All approvals are bound to `{name, version, source, integrity, script_hash}`
 //! per the trust binding contract (see [`lpm_workspace::TrustedDependencies`]).
 //!
 //! ## Output
@@ -33,12 +33,16 @@ mod project;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub use global::run_global;
 #[allow(unused_imports)]
-pub use global::{GROUP_AUTO_THRESHOLD, run_global};
+pub use global::{GROUP_AUTO_THRESHOLD, run_global_with_client};
 #[allow(unused_imports)]
 pub use metadata::SCHEMA_VERSION;
+#[cfg(test)]
+pub use project::run;
 #[allow(unused_imports)]
-pub use project::{compute_effective_blocked_set, run};
+pub use project::{compute_effective_blocked_set, run_with_client};
 
 mod prelude {
     #[allow(unused_imports)]
@@ -63,7 +67,8 @@ mod prelude {
     pub(super) use super::manifest::find_blocked_by_arg;
     #[allow(unused_imports)]
     pub(super) use super::manifest::{
-        BlockedLookup, extract_trusted_dependencies, lookup_blocked_by_arg, write_back,
+        BlockedLookup, blocked_identity_selector, extract_trusted_dependencies,
+        lookup_blocked_by_arg, write_back,
     };
     #[allow(unused_imports)]
     pub(super) use super::metadata::{
@@ -73,7 +78,7 @@ mod prelude {
         snapshot_for_binding, snapshot_for_binding_with_mode,
     };
     #[allow(unused_imports)]
-    pub(super) use super::project::{InteractiveChoice, compute_effective_blocked_set, run};
+    pub(super) use super::project::{InteractiveChoice, compute_effective_blocked_set};
     #[allow(unused_imports)]
     pub(super) use crate::build_state::{self, BlockedPackage, BuildState};
     #[allow(unused_imports)]

@@ -113,6 +113,7 @@ pub(super) fn emit_post_install_blocked_warning(
                 trust.matches_strict(
                     &b.name,
                     &b.version,
+                    b.source.as_deref(),
                     b.integrity.as_deref(),
                     b.script_hash.as_deref(),
                 ),

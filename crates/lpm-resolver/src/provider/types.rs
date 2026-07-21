@@ -123,9 +123,9 @@ pub struct CachedPackageInfo {
     pub versions: Vec<NpmVersion>,
     /// Regular dependencies for each version: version_string → { dep_name → range_string }.
     pub deps: HashMap<String, HashMap<String, String>>,
-    /// Peer dependencies for each version: version_string → { dep_name → range_string }.
-    /// Checked post-resolution against the actual resolved tree (not during resolution).
-    pub peer_deps: HashMap<String, HashMap<String, String>>,
+    /// Peer dependencies parsed once per version, retaining both the raw declaration and its
+    /// typed parse result so every resolver path applies identical validation and matching.
+    pub peer_deps: HashMap<String, HashMap<String, crate::PeerDependencySpec>>,
     /// Optional dependency names (per version). Included in deps but resolution failure
     /// for these is non-fatal.
     pub optional_dep_names: HashMap<String, HashSet<String>>,

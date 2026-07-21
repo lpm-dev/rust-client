@@ -22,8 +22,8 @@
 //!
 //! # Peer-context
 //!
-//! Each [`LinkTarget`] carries `peers: Vec<(String, String)>`
-//! threaded through from the resolver
+//! Each [`LinkTarget`] carries peer names paired with exact registry
+//! versions or non-registry source wrapper IDs, threaded from the resolver
 //! (`ResolvedPackage.peers` → `InstallPackage.peers` →
 //! `LinkTarget.peers`). The linker uses these to:
 //!
@@ -34,7 +34,7 @@
 //!   reaches the peer.
 //! - Fold the peer-context into [`GraphKey`] via
 //!   `GraphKeyInputs::with_peers`, so two projects sharing the same
-//!   edge graph but different peer pinning produce distinct keys.
+//!   edge graph but different peer bindings produce distinct keys.
 //!   Without this, cross-project sharing of `links/<key>/` would be
 //!   incorrect for any package whose peer resolution depends on
 //!   the consuming project's other packages.
@@ -49,12 +49,10 @@
 //!
 //! # Multi-source disambiguation
 //!
-//! The internal key map keys by `(name, version, wrapper_id)`, not
-//! `(name, version)`. Two `LinkTarget`s with the same `(name,
-//! version)` but different sources (e.g., one `Source::Registry` +
-//! one `Source::Tarball` distinguished by `wrapper_id`) get
-//! distinct GraphKeys via `with_root_link_names` + the dep-edge
-//! disambiguation that flows from each target's own `wrapper_id`.
+//! The internal key map keys every target and edge by exact source identity,
+//! including registry origin/content and project-qualified local sources.
+//! Human-readable wrapper IDs remain layout labels and are not trusted as
+//! globally unique identities.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -76,7 +74,10 @@ mod reconcile;
 
 use self::bin_shims::create_bin_links_v2;
 pub use self::compat_island::project_compatibility_bins_ready;
-use self::compat_island::{create_project_compatibility_links, normalize_compatibility_bin_names};
+use self::compat_island::{
+    create_project_compatibility_links, normalize_compatibility_bin_names,
+    remove_project_compatibility_root,
+};
 pub use self::keymap::KeyMap;
 use self::keymap::derive_graph_keys;
 #[cfg(test)]
@@ -97,12 +98,24 @@ pub struct V2Target {
     /// SRI of the source tarball. Required to locate the object dir
     /// at `<HOME>/.lpm/store/v2/objects/<sri>/`.
     pub source_sri: String,
+    /// Exact source identity used by GraphKey derivation and edge lookup.
+    /// Unlike `LinkTarget.wrapper_id`, this is globally qualified and also
+    /// covers registry packages.
+    pub source_identity: String,
     /// Verified object digest available on warm cache hits.
     pub verified_object_integrity: Option<VerifiedObjectIntegrity>,
     /// Object produced by the extraction path for immediate link-populate.
     /// Warm cache paths cannot construct this value, so they leave it empty
     /// and use populate-time object validation.
     pub fresh_object: Option<ExtractedObject>,
+}
+
+/// Remove project-local links, bins, and compatibility state for an empty graph.
+pub fn reconcile_empty_project(project_dir: &Path) -> Result<(), LpmError> {
+    cleanup_v1_state(project_dir)?;
+    reconcile_project_node_modules(project_dir, &[], None, true)?;
+    bin_shims::clear_bin_dir(project_dir)?;
+    remove_project_compatibility_root(project_dir)
 }
 
 /// Pre-computed plan handed across the three-phase v2 link API
@@ -733,7 +746,12 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             let is_optional = peer_deps_meta
                 .get(peer_name)
                 .is_some_and(|meta| meta.optional);
-            match by_name.get(peer_name) {
+            let target_name = v2t
+                .target
+                .aliases
+                .get(peer_name)
+                .map_or(peer_name.as_str(), String::as_str);
+            match by_name.get(target_name) {
                 Some(ver) => derived.push((peer_name.clone(), ver.clone())),
                 None if !is_optional => {
                     tracing::debug!(
@@ -771,7 +789,7 @@ fn populate_one(
     key_map: &KeyMap,
     meta_platform: &Arc<LinkMetaPlatform>,
 ) -> Result<PopulatedEntry, LpmError> {
-    let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+    let key = key_map.get_for(v2t).cloned().ok_or_else(|| {
         LpmError::Store(format!(
             "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
             v2t.target.name, v2t.target.version
@@ -780,10 +798,8 @@ fn populate_one(
 
     let object_dir = store.paths().object_dir(&v2t.source_sri)?;
 
-    // Dep edges resolve through the alias map (consumer's local name
-    // may differ from the canonical target). Peer edges always use
-    // the canonical name as the local (peers are never npm-aliased
-    // — `peerDependencies` keys ARE the canonical name by spec).
+    // Both dependency and peer edges resolve through the alias map;
+    // the local slot can differ from the canonical registry target.
     let mut deps: Vec<DepLink> =
         Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
     for dep in &v2t.target.dependencies {
@@ -843,8 +859,13 @@ fn populate_one(
                     }
                 })
                 .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
-                .filter_map(|(peer_name, peer_ver)| {
-                    let peer_key = key_map.get_peer(peer_name, peer_ver)?.clone();
+                .filter_map(|(peer_name, peer_binding)| {
+                    let target_name = v2t
+                        .target
+                        .aliases
+                        .get(peer_name)
+                        .map_or(peer_name.as_str(), String::as_str);
+                    let peer_key = key_map.get_peer(target_name, peer_binding)?.clone();
                     Some(DepLink {
                         local: peer_name.clone(),
                         target: peer_key,
@@ -893,7 +914,7 @@ fn existing_link_entry_packages(
 
     let mut materialized = Vec::with_capacity(plan.augmented_targets.len());
     for v2t in &plan.augmented_targets {
-        let key = plan.key_map.get_for(&v2t.target).ok_or_else(|| {
+        let key = plan.key_map.get_for(v2t).ok_or_else(|| {
             LpmError::Store(format!(
                 "v2 linker: missing graph key for {}@{} during existing-link validation",
                 v2t.target.name, v2t.target.version

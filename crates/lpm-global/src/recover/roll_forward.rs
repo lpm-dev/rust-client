@@ -319,12 +319,18 @@ pub(super) fn roll_forward_uninstall(
     // fail-safe at uninstall time; we do not even open the trust file.
     if !intent.uninstall_trust_prune.is_empty() {
         let mut trust = crate::trusted_deps::read_for(root)?;
+        let exact_keys: Vec<&str> = intent
+            .uninstall_trust_prune
+            .iter()
+            .filter_map(|entry| entry.key.as_deref())
+            .collect();
         let prune_pairs: Vec<(&str, &str)> = intent
             .uninstall_trust_prune
             .iter()
+            .filter(|entry| entry.key.is_none())
             .map(|e| (e.name.as_str(), e.version.as_str()))
             .collect();
-        let removed = trust.remove_many(&prune_pairs);
+        let removed = trust.remove_exact_keys(&exact_keys) + trust.remove_many(&prune_pairs);
         if removed > 0 {
             crate::trusted_deps::write_for(root, &trust)?;
             tracing::info!(

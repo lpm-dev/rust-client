@@ -32,7 +32,10 @@
 
 use lpm_common::LpmError;
 use lpm_security::{
-    SecurityPolicy, TrustMatch, script_hash::compute_script_hash_with_phase_bodies,
+    SecurityPolicy, TrustMatch,
+    script_hash::{
+        compute_script_hash_with_phase_bodies, script_hash_with_phase_bodies_for_content_identity,
+    },
     triage::StaticTier,
 };
 use lpm_store::PackageStore;
@@ -59,11 +62,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// hash) without bumping this constant. See the plan for the
 /// rationale.
 ///
-/// Reader policy (see [`read_build_state`]): accept anything
-/// `<= BUILD_STATE_VERSION`; refuse newer versions (forward-incompatible
-/// bumps signal a meaningful schema change that older readers can't
-/// interpret safely).
-pub const BUILD_STATE_VERSION: u32 = 1;
+/// Reader policy (see [`read_build_state`]): accept only the current version.
+/// A semantic change to lifecycle identity must not leave an older captured
+/// hash available for durable approval.
+pub const BUILD_STATE_VERSION: u32 = 3;
 
 /// Filename inside `<project_dir>/.lpm/`.
 pub const BUILD_STATE_FILENAME: &str = "build-state.json";
@@ -106,15 +108,15 @@ pub struct BuildState {
     /// "N packages blocked" banner — it suppresses iff the fingerprint
     /// matches the previous run.
     pub blocked_set_fingerprint: String,
-    /// RFC 3339 timestamp of when this state file was written. Used by
-    /// future stale-state detection but not by  the     /// suppression logic, which is purely fingerprint-based.
+    /// RFC 3339 timestamp of when this state file was written. The banner
+    /// suppression logic uses only the fingerprint.
     pub captured_at: String,
     /// The packages whose lifecycle scripts were blocked at the time of
     /// the install that wrote this file. Sorted by `(name, version)` for
     /// deterministic fingerprinting.
     pub blocked_packages: Vec<BlockedPackage>,
 
-    /// M3: audit trail for `--ignore-provenance-drift[-all]`. Set to
+    /// Audit trail for `--ignore-provenance-drift[-all]`. Set to
     /// `Some(...)` when the install that wrote this state file had a
     /// drift override active. `None` means drift was enforced normally.
     /// Skipped from on-disk JSON when None to keep the common-case
@@ -153,6 +155,9 @@ pub struct DriftIgnoreAuditRecord {
 pub struct BlockedPackage {
     pub name: String,
     pub version: String,
+    /// Exact lockfile source used for installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// SRI integrity hash from the lockfile, if known. binds
     /// approvals to this so a registry-side tarball swap re-opens review.
     pub integrity: Option<String>,
@@ -214,6 +219,43 @@ pub struct BlockedPackage {
     pub behavioral_tags: Option<Vec<String>>,
 }
 
+/// Exact installed package identity used by lifecycle security decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InstalledPackageIdentity {
+    pub name: String,
+    pub version: String,
+    pub source: Option<String>,
+    pub integrity: Option<String>,
+}
+
+impl InstalledPackageIdentity {
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        source: Option<String>,
+        integrity: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            source,
+            integrity,
+        }
+    }
+
+    pub fn package_key(&self) -> lpm_lockfile::PackageKey {
+        let source_id = self
+            .source
+            .as_deref()
+            .and_then(|source| lpm_lockfile::Source::parse(source).ok())
+            .map_or_else(
+                || lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+                |source| source.source_id_with_integrity(self.integrity.as_deref()),
+            );
+        lpm_lockfile::PackageKey::new(&self.name, &self.version, source_id)
+    }
+}
+
 /// Result of [`capture_blocked_set_after_install`] — exposes the new state
 /// AND whether the install pipeline should emit the post-install warning.
 #[derive(Debug, Clone)]
@@ -241,15 +283,7 @@ pub struct BlockedSetCapture {
 /// Returns `None` if:
 /// - The file is missing
 /// - The file fails to parse as JSON
-/// - The file's `state_version` is **newer** than this binary supports
-///
-/// Older `state_version` values are accepted: the struct's new optional
-/// fields default to `None` via their `#[serde(default)]` attribute,
-/// producing a valid [`BuildState`] with degraded but usable content.
-/// This is the forward-compat side of the no-version-bump policy
-/// documented on [`BUILD_STATE_VERSION`]; the backward-compat side is
-/// that absence of `deny_unknown_fields` lets older readers silently
-/// drop fields written by newer writers.
+/// - The file's `state_version` differs from the current version
 ///
 /// All three failure modes are treated identically by callers: "no
 /// previous state". The caller will write a fresh state on the next
@@ -260,14 +294,10 @@ pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
         .ok()
         .flatten()?;
     let state: BuildState = serde_json::from_slice(&bytes).ok()?;
-    if state.state_version > BUILD_STATE_VERSION {
-        // Newer file written by a future LPM binary. We can't safely
-        // interpret its semantics, so treat as missing and let the
-        // current run write a fresh state. (Next time the newer LPM
-        // runs, it will overwrite with a newer-version file again.)
+    if state.state_version != BUILD_STATE_VERSION {
         tracing::debug!(
-            "build-state.json is newer than this binary supports \
-             (got v{}, max v{}) — treating as missing",
+            "build-state.json uses an incompatible identity schema \
+             (got v{}, current v{}) — treating as missing",
             state.state_version,
             BUILD_STATE_VERSION,
         );
@@ -323,17 +353,18 @@ pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), L
 /// - Different versions of `serde_json` (we don't serialize through it)
 ///
 /// The hash input format is one line per package, NUL-terminated:
-///   `<name>@<version>|<integrity-or-empty>|<script_hash-or-empty>\x00`
-/// sorted by `(name, version)` ascending. The output is `sha256-<hex>`
+///   `<name>@<version>|<source-or-empty>|<integrity-or-empty>|<script_hash-or-empty>\x00`
+/// sorted lexicographically. The output is `sha256-<hex>`
 /// to match the script_hash format.
 pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
     let mut keys: Vec<String> = packages
         .iter()
         .map(|p| {
             format!(
-                "{}@{}|{}|{}",
+                "{}@{}|{}|{}|{}",
                 p.name,
                 p.version,
+                p.source.as_deref().unwrap_or(""),
                 p.integrity.as_deref().unwrap_or(""),
                 p.script_hash.as_deref().unwrap_or(""),
             )
@@ -361,17 +392,17 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
 /// behavioral analysis, lockfile fast-path without a metadata fetch
 /// for that version — all work).
 ///
-/// Keyed by `(name, version)` rather than a richer package identity
-/// because the blocked-set capture operates on the `installed` tuple
-/// list, not lockfile rows.
+/// Keyed by the exact lockfile [`lpm_lockfile::PackageKey`].
 #[derive(Debug, Clone, Default)]
 pub struct BlockedSetMetadata {
-    pub by_pkg: std::collections::HashMap<(String, String), BlockedSetMetadataEntry>,
+    pub by_pkg: std::collections::HashMap<lpm_lockfile::PackageKey, BlockedSetMetadataEntry>,
 }
 
 /// One entry in [`BlockedSetMetadata`].
 #[derive(Debug, Clone, Default)]
 pub struct BlockedSetMetadataEntry {
+    /// Exact lockfile source used to install this package.
+    pub source: Option<String>,
     /// RFC 3339 publish timestamp from the registry's `time` map for
     /// this version. `None` for offline, fast-path without a metadata
     /// fetch, or packages whose registry response omits the timestamp.
@@ -411,17 +442,68 @@ pub struct BlockedSetMetadataEntry {
 }
 
 impl BlockedSetMetadata {
-    /// Lookup for `(name, version)`. Returns a reference to the entry
-    /// or `None` if the caller didn't provide metadata for this
-    /// package (graceful degradation — the captured fields just stay
-    /// `None`).
-    pub fn get(&self, name: &str, version: &str) -> Option<&BlockedSetMetadataEntry> {
-        self.by_pkg.get(&(name.to_string(), version.to_string()))
+    /// Compatibility lookup for callers without source identity. Returns a
+    /// value only when the coordinate/content query has one exact match.
+    pub fn get(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+    ) -> Option<&BlockedSetMetadataEntry> {
+        let mut matches = self.by_pkg.iter().filter_map(|(key, entry)| {
+            let candidate = InstalledPackageIdentity::new(
+                name,
+                version,
+                entry.source.clone(),
+                integrity.map(str::to_string),
+            );
+            (key == &candidate.package_key()).then_some(entry)
+        });
+        let entry = matches.next()?;
+        matches.next().is_none().then_some(entry)
     }
 
-    /// Insert / overwrite metadata for `(name, version)`.
-    pub fn insert(&mut self, name: String, version: String, entry: BlockedSetMetadataEntry) {
-        self.by_pkg.insert((name, version), entry);
+    pub fn get_exact(
+        &self,
+        identity: &InstalledPackageIdentity,
+    ) -> Option<&BlockedSetMetadataEntry> {
+        self.by_pkg.get(&identity.package_key())
+    }
+
+    /// Insert or overwrite metadata for one exact package identity.
+    pub fn insert(
+        &mut self,
+        name: String,
+        version: String,
+        integrity: Option<String>,
+        entry: BlockedSetMetadataEntry,
+    ) {
+        let identity =
+            InstalledPackageIdentity::new(name, version, entry.source.clone(), integrity);
+        self.by_pkg.insert(identity.package_key(), entry);
+    }
+
+    /// Merge registry enrichment only when it belongs to the selected source.
+    pub fn merge_enrichment(
+        &mut self,
+        name: String,
+        version: String,
+        integrity: Option<String>,
+        entry: BlockedSetMetadataEntry,
+    ) {
+        use std::collections::hash_map::Entry;
+
+        let identity =
+            InstalledPackageIdentity::new(name, version, entry.source.clone(), integrity);
+        match self.by_pkg.entry(identity.package_key()) {
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            Entry::Occupied(mut slot) if slot.get().source == entry.source => {
+                slot.insert(entry);
+            }
+            Entry::Occupied(_) => {}
+        }
     }
 }
 
@@ -490,9 +572,9 @@ pub fn compute_blocked_packages_with_metadata(
     // short-circuit applies as before.
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    // Ephemeral advisor approval set keyed
-    // by `(name, version, Option<integrity>)`. Packages whose
-    // triple appears here are EXCLUDED from the blocked set so
+    // Ephemeral advisor approval set keyed by exact source, content,
+    // and canonical script identity. Exact matches are excluded from
+    // the blocked set so
     // post-install messaging + `lpm approve-scripts` don't report
     // them as still-blocked after the autoBuild path executed
     // their scripts via the AdvisorApprovedThisRun trust path.
@@ -504,8 +586,36 @@ pub fn compute_blocked_packages_with_metadata(
     // stay reachable via `lpm approve-scripts`. See
     // `select_approvals_for_capture` in `crate::commands::install`.
     //
-    // Standalone callers (no install context) pass `None` →
-    // identical to the pre-slice-1 behavior.
+    // Standalone callers (no install context) pass `None`.
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> Vec<BlockedPackage> {
+    let identities = installed
+        .iter()
+        .map(|(name, version, integrity)| {
+            InstalledPackageIdentity::new(name, version, None, integrity.clone())
+        })
+        .collect::<Vec<_>>();
+    compute_blocked_packages_with_metadata_for_identities(
+        store,
+        &identities,
+        policy,
+        metadata,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_blocked_packages_with_metadata_for_identities(
+    store: &PackageStore,
+    installed: &[InstalledPackageIdentity],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
@@ -534,7 +644,7 @@ struct BlockedPackageComputationExtras<'a> {
 
 fn compute_blocked_packages_with_metadata_and_baseline(
     store: &PackageStore,
-    installed: &[(String, String, Option<String>)],
+    installed: &[InstalledPackageIdentity],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
     requested_capabilities: &crate::capability::CapabilitySet,
@@ -556,171 +666,188 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     // 4-5ms parallel. Savings grow in proportion to the fraction of
     // packages with install-phase scripts (monorepos with many native
     // builds hit this path more heavily).
-    let per_pkg =
-        |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
-            // Advisor-approved packages are
-            // EXCLUDED from the blocked set entirely. They executed
-            // their scripts via the AdvisorApprovedThisRun trust path
-            // during this install's autoBuild, so listing them as
-            // "still blocked" would emit stale UI + JSON. Keyed on
-            // the full triple so two sources of the same coord don't
-            // cross-approve.
-            // M29: the approval key includes a script_bundle_hash
-            // slot. The capture path doesn't carry the bodies here;
-            // today every approved package has exactly one bundle hash
-            // per `(name, version, integrity)` triple (whole-package
-            // classification) so an iter+match-on-three-fields is
-            // unambiguous. A future per-phase classification refactor
-            // would tighten this to a full 4-tuple lookup.
-            if let Some(set) = extras.advisor_approvals
-                && set
-                    .iter()
-                    .any(|(n, v, i, _)| n == name && v == version && i == integrity)
-            {
-                return None;
+    let per_pkg = |identity: &InstalledPackageIdentity| -> Option<BlockedPackage> {
+        let name = &identity.name;
+        let version = &identity.version;
+        let source = identity.source.as_deref();
+        let integrity = &identity.integrity;
+        if let Some(set) = extras.execution_exclusions
+            && set.contains(&(
+                name.clone(),
+                version.clone(),
+                identity.source.clone(),
+                integrity.clone(),
+            ))
+        {
+            return None;
+        }
+
+        let lifecycle = resolve_blocked_package(store, identity, extras.baseline_index)?;
+        let pkg_dir = lifecycle.package_dir;
+
+        let script_data = match (
+            extras.baseline_index.is_some(),
+            lifecycle.content_identity.as_deref(),
+        ) {
+            (_, Some(content_identity)) => {
+                script_hash_with_phase_bodies_for_content_identity(&pkg_dir, content_identity)?
             }
-            if let Some(set) = extras.execution_exclusions
-                && set.contains(&(name.clone(), version.clone(), integrity.clone()))
-            {
-                return None;
+            (true, None) => {
+                let phase_bodies = read_install_phase_bodies(&pkg_dir);
+                if phase_bodies.is_empty() {
+                    return None;
+                }
+                lpm_security::script_hash::ScriptHashWithPhaseBodies {
+                    hash: None,
+                    phase_bodies,
+                }
             }
+            (false, None) => compute_script_hash_with_phase_bodies(&pkg_dir)?,
+        };
+        let script_hash = script_data.hash;
+        let phase_bodies = script_data.phase_bodies;
+        let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
-            let pkg_dir = resolve_blocked_package_dir(store, name, version, extras.baseline_index);
-
-            let script_data = compute_script_hash_with_phase_bodies(&pkg_dir)?;
-            let script_hash = script_data.hash;
-            let phase_bodies = script_data.phase_bodies;
-            let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
-
-            // Classify each present phase and aggregate
-            // worst-wins. Populated unconditionally (not gated on
-            // `script-policy`) — the annotation is
-            // user-visible UX in all three modes.
-            //
-            // Pass identity context so a delegate-to-local-file +
-            // matching identity body surfaces as Green in the UI's
-            // blocked-set annotation, consistent with what the install
-            // pipeline's amber filter at
-            // `collect_amber_classification_requests` sees.
-            //
-            // Option B: `publish_age_secs = None` +
-            // `min_release_age_secs = 0` means the L1 widening fires
-            // independently of cooldown. This is correct here because
-            // `compute_blocked_packages_with_metadata` produces a
-            // UI-annotation tier on the BLOCKED set. Auto-run
-            // packages widened by the install pipeline are already
-            // excluded from the blocked set upstream — so the cooldown
-            // defense was already applied
-            // there. The annotation here only fires for packages
-            // already in the blocked set; widening them to Green at
-            // annotation time has no security impact (they'll still
-            // require `lpm approve-scripts` to run).
-            let repository = read_manifest_repository(&pkg_dir);
-            let ctx = lpm_security::static_gate::ManifestContext {
-                package_name: name.as_str(),
-                repository: repository.as_deref(),
-                bin_names: &[],
-                publish_age_secs: None,
-                min_release_age_secs: 0,
-            };
-            let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
-                .iter()
-                .map(|(_, body)| lpm_security::static_gate::classify_with_context(body, Some(&ctx)))
-                .reduce(lpm_security::triage::StaticTier::worse_of);
-
-            // Strict gate query. binds approvals to
-            // (name, version, integrity, script_hash).
-            let trust = policy.can_run_scripts_strict(
+        if let Some(set) = extras.advisor_approvals
+            && let Some(script_hash) = script_hash.as_deref()
+            && crate::triage_advisor_session::contains_exact_approval(
+                set,
                 name,
                 version,
+                source,
                 integrity.as_deref(),
-                Some(&script_hash),
-            );
+                script_hash,
+            )
+        {
+            return None;
+        }
 
-            let (is_blocked, binding_drift) = match trust {
-                // Strict approval covers this exact tuple — NOT blocked
-                // by the script-hash gate — but also consult the capability gate.
-                // A Strict-matched package with a widened capability
-                // request that the stored binding doesn't cover must
-                // still be blocked so approve-scripts can surface it.
-                // Without this, install-time capture would silently
-                // omit such packages, and `lpm rebuild` would skip them
-                // with CapabilityNotApproved downstream — no remediation
-                // path for the user.
-                TrustMatch::Strict => {
-                    let binding = policy.trusted_dependencies.get_binding(name, version);
-                    if requested_capabilities
-                        .requires_review_despite_strict_match(user_bound, binding)
-                    {
-                        // `binding_drift = true` so approve-scripts's
-                        // existing "previously approved, please re-review"
-                        // wording fires. This is the user-accurate
-                        // framing for a capability-mismatch: the
-                        // previous approval exists but doesn't cover
-                        // the current request.
-                        (true, true)
-                    } else {
-                        (false, false)
-                    }
-                }
-                // Legacy bare-name entry covers it leniently — NOT blocked
-                // (the existing build pipeline will run the script with a
-                // deprecation warning). Legacy entries have no binding to check the capability
-                // hash against; the helper returns true for any widening
-                // request against a Legacy match. That's correct — a
-                // bare-name approval cannot cover a widening capability
-                // request, and surfacing such packages in the blocked set
-                // lets the user upgrade to a rich capability-hash-bearing
-                // approval via `lpm approve-scripts`.
-                TrustMatch::LegacyNameOnly => {
-                    if requested_capabilities.requires_review_despite_strict_match(user_bound, None)
-                    {
-                        (true, false)
-                    } else {
-                        (false, false)
-                    }
-                }
-                // Rich entry exists but the binding doesn't match — BLOCKED
-                // and flagged as drift so approve-scripts can show a special
-                // "previously approved, please re-review" message.
-                TrustMatch::BindingDrift { .. } => (true, true),
-                // No matching entry at all — BLOCKED, first-time review.
-                TrustMatch::NotTrusted => (true, false),
-            };
-
-            if !is_blocked {
-                return None;
-            }
-
-            // metadata forwarding. The caller (install.rs)
-            // populates `metadata` from the same registry responses
-            // the cooldown check already fetched, so this is a
-            // memory-only hash-map lookup per package.
-            let entry = metadata.get(name, version);
-            Some(BlockedPackage {
-                name: name.clone(),
-                version: version.clone(),
-                integrity: integrity.clone(),
-                script_hash: Some(script_hash),
-                phases_present,
-                binding_drift,
-                // populates `static_tier` from the
-                // worst-wins reduction above.
-                static_tier,
-                // forwarded from the install
-                // pipeline's per-package provenance fetch. Populated
-                // for EVERY blocked package that went through the
-                // drift gate, not just those whose drift fired —
-                // prevents the previous "hardcoded None" underfill
-                // and closes the approve-scripts
-                // write-path (binding.provenance_at_approval is
-                // written from this value on approval).
-                provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
-                published_at: entry.and_then(|e| e.published_at.clone()),
-                behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
-                behavioral_tags: entry.and_then(|e| e.behavioral_tags.clone()),
-            })
+        // Classify each present phase and aggregate
+        // worst-wins. Populated unconditionally (not gated on
+        // `script-policy`) — the annotation is
+        // user-visible UX in all three modes.
+        //
+        // Pass identity context so a delegate-to-local-file +
+        // matching identity body surfaces as Green in the UI's
+        // blocked-set annotation, consistent with what the install
+        // pipeline's amber filter at
+        // `collect_amber_classification_requests` sees.
+        //
+        // Option B: `publish_age_secs = None` +
+        // `min_release_age_secs = 0` means the L1 widening fires
+        // independently of cooldown. This is correct here because
+        // `compute_blocked_packages_with_metadata` produces a
+        // UI-annotation tier on the BLOCKED set. Auto-run
+        // packages widened by the install pipeline are already
+        // excluded from the blocked set upstream — so the cooldown
+        // defense was already applied
+        // there. The annotation here only fires for packages
+        // already in the blocked set; widening them to Green at
+        // annotation time has no security impact (they'll still
+        // require `lpm approve-scripts` to run).
+        let repository = read_manifest_repository(&pkg_dir);
+        let ctx = lpm_security::static_gate::ManifestContext {
+            package_name: name.as_str(),
+            repository: repository.as_deref(),
+            bin_names: &[],
+            publish_age_secs: None,
+            min_release_age_secs: 0,
         };
+        let static_tier: Option<lpm_security::triage::StaticTier> = phase_bodies
+            .iter()
+            .map(|(_, body)| lpm_security::static_gate::classify_with_context(body, Some(&ctx)))
+            .reduce(lpm_security::triage::StaticTier::worse_of);
+
+        let entry = metadata
+            .get_exact(identity)
+            .or_else(|| metadata.get(name, version, integrity.as_deref()));
+        let source = source.or_else(|| entry.and_then(|entry| entry.source.as_deref()));
+
+        // Strict approvals bind source and content identity to the script hash.
+        let trust = policy.can_run_scripts_strict_for_identity(
+            name,
+            version,
+            source,
+            integrity.as_deref(),
+            script_hash.as_deref(),
+        );
+
+        let (is_blocked, binding_drift) = match trust {
+            // Strict approval covers this exact tuple — NOT blocked
+            // by the script-hash gate — but also consult the capability gate.
+            // A Strict-matched package with a widened capability
+            // request that the stored binding doesn't cover must
+            // still be blocked so approve-scripts can surface it.
+            // Without this, install-time capture would silently
+            // omit such packages, and `lpm rebuild` would skip them
+            // with CapabilityNotApproved downstream — no remediation
+            // path for the user.
+            TrustMatch::Strict => {
+                let binding = policy.trusted_dependencies.get_binding(
+                    name,
+                    version,
+                    source,
+                    integrity.as_deref(),
+                    script_hash.as_deref(),
+                );
+                if requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
+                {
+                    // `binding_drift = true` so approve-scripts's
+                    // existing "previously approved, please re-review"
+                    // wording fires. This is the user-accurate
+                    // framing for a capability-mismatch: the
+                    // previous approval exists but doesn't cover
+                    // the current request.
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            // Coordinate-only legacy entries carry no reusable content
+            // identity. Keep them readable for migration, but never let them
+            // authorize lifecycle execution.
+            TrustMatch::LegacyNameOnly => (true, false),
+            // Rich entry exists but the binding doesn't match — BLOCKED
+            // and flagged as drift so approve-scripts can show a special
+            // "previously approved, please re-review" message.
+            TrustMatch::BindingDrift { .. } => (true, true),
+            // No matching entry at all — BLOCKED, first-time review.
+            TrustMatch::NotTrusted => (true, false),
+        };
+
+        if !is_blocked {
+            return None;
+        }
+
+        // metadata forwarding. The caller (install.rs)
+        // populates `metadata` from the same registry responses
+        // the cooldown check already fetched, so this is a
+        // memory-only hash-map lookup per package.
+        Some(BlockedPackage {
+            name: name.clone(),
+            version: version.clone(),
+            source: source.map(str::to_string),
+            integrity: integrity.clone(),
+            script_hash,
+            phases_present,
+            binding_drift,
+            // populates `static_tier` from the
+            // worst-wins reduction above.
+            static_tier,
+            // forwarded from the install
+            // pipeline's per-package provenance fetch. Populated
+            // for EVERY blocked package that went through the
+            // drift gate, not just those whose drift fired —
+            // prevents the previous "hardcoded None" underfill
+            // and closes the approve-scripts
+            // write-path (binding.provenance_at_approval is
+            // written from this value on approval).
+            provenance_at_capture: entry.and_then(|e| e.provenance_at_capture.clone()),
+            published_at: entry.and_then(|e| e.published_at.clone()),
+            behavioral_tags_hash: entry.and_then(|e| e.behavioral_tags_hash.clone()),
+            behavioral_tags: entry.and_then(|e| e.behavioral_tags.clone()),
+        })
+    };
 
     let walk_start = std::time::Instant::now();
     let mut blocked: Vec<BlockedPackage> = installed.par_iter().filter_map(per_pkg).collect();
@@ -731,22 +858,43 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     );
 
     // Sort for deterministic fingerprinting.
-    blocked.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    blocked.sort_by(|a, b| {
+        (&a.name, &a.version, &a.source, &a.integrity).cmp(&(
+            &b.name,
+            &b.version,
+            &b.source,
+            &b.integrity,
+        ))
+    });
     blocked
 }
 
-fn resolve_blocked_package_dir(
+struct ResolvedLifecyclePackage {
+    package_dir: PathBuf,
+    content_identity: Option<String>,
+}
+
+fn resolve_blocked_package(
     store: &PackageStore,
-    name: &str,
-    version: &str,
+    identity: &InstalledPackageIdentity,
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
-) -> PathBuf {
-    baseline_index
-        .and_then(|index| index.lookup(name, version))
-        .map_or_else(
-            || store.package_dir(name, version),
-            |baseline| baseline.package_dir.clone(),
-        )
+) -> Option<ResolvedLifecyclePackage> {
+    match baseline_index {
+        Some(index) => index
+            .lookup_source_identity(
+                &identity.name,
+                &identity.version,
+                &identity.package_key().source_id,
+            )
+            .map(|baseline| ResolvedLifecyclePackage {
+                package_dir: baseline.execution_dir.clone(),
+                content_identity: baseline.execution_identity.clone(),
+            }),
+        None => Some(ResolvedLifecyclePackage {
+            package_dir: store.package_dir(&identity.name, &identity.version),
+            content_identity: None,
+        }),
+    }
 }
 
 /// The end-to-end install hook: compute → compare to previous → write →
@@ -806,7 +954,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
     // see `compute_blocked_packages_with_metadata`.
-    // When `Some`, matching triples are removed from the persisted
+    // When `Some`, exact approval identities are removed from the persisted
     // blocked set before fingerprint + write so post-install JSON
     // + the "remain blocked after auto-build" pointer don't report
     // stale state for packages whose scripts already executed via
@@ -819,9 +967,43 @@ pub fn capture_blocked_set_after_install_with_metadata(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<BlockedSetCapture, LpmError> {
-    capture_blocked_set_after_install_with_metadata_and_exclusions(
+    let identities = installed
+        .iter()
+        .map(|(name, version, integrity)| {
+            InstalledPackageIdentity::new(name, version, None, integrity.clone())
+        })
+        .collect::<Vec<_>>();
+    capture_blocked_set_after_install_with_metadata_for_identities_and_exclusions(
         project_dir,
         store,
+        lpm_store::StoreVersion::V1,
+        &identities,
+        policy,
+        metadata,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn capture_blocked_set_after_install_with_metadata_for_identities(
+    project_dir: &Path,
+    store: &PackageStore,
+    installed: &[InstalledPackageIdentity],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> Result<BlockedSetCapture, LpmError> {
+    capture_blocked_set_after_install_with_metadata_for_identities_and_exclusions(
+        project_dir,
+        store,
+        lpm_store::StoreVersion::from_env(),
         installed,
         policy,
         metadata,
@@ -833,10 +1015,11 @@ pub fn capture_blocked_set_after_install_with_metadata(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
+pub fn capture_blocked_set_after_install_with_metadata_for_identities_and_exclusions(
     project_dir: &Path,
     store: &PackageStore,
-    installed: &[(String, String, Option<String>)],
+    store_version: lpm_store::StoreVersion,
+    installed: &[InstalledPackageIdentity],
     policy: &SecurityPolicy,
     metadata: &BlockedSetMetadata,
     requested_capabilities: &crate::capability::CapabilitySet,
@@ -846,7 +1029,7 @@ pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
     >,
     execution_exclusions: Option<&HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let baseline_index = if lpm_store::StoreVersion::from_env() == lpm_store::StoreVersion::V2 {
+    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
         Some(lpm_store::V2BaselineIndex::for_project(
             project_dir,
             &store.lpm_root()?,
@@ -1200,6 +1383,7 @@ mod tests {
         BlockedPackage {
             name: name.to_string(),
             version: version.to_string(),
+            source: None,
             integrity: integrity.map(String::from),
             script_hash: script_hash.map(String::from),
             phases_present: vec!["postinstall".to_string()],
@@ -1226,7 +1410,7 @@ mod tests {
         }
     }
 
-    /// M3: the drift_ignore_override field is omitted from on-disk
+    /// The drift_ignore_override field is omitted from on-disk
     /// JSON when None (forward-compatible with pre-fix readers) and
     /// round-trips faithfully when present.
     #[test]
@@ -1364,6 +1548,7 @@ mod tests {
         let original = make_state(vec![BlockedPackage {
             name: "esbuild".into(),
             version: "0.25.1".into(),
+            source: None,
             integrity: Some("sha512-foo".into()),
             script_hash: Some("sha256-bar".into()),
             phases_present: vec!["preinstall".into(), "postinstall".into()],
@@ -1451,6 +1636,19 @@ mod tests {
     }
 
     #[test]
+    fn compute_blocked_set_fingerprint_changes_on_source_change() {
+        let mut first = make_blocked("shared", "1.0.0", Some("sha512-same"), Some("sha256-same"));
+        first.source = Some("directory+./source-a".into());
+        let mut second = first.clone();
+        second.source = Some("directory+./source-b".into());
+
+        assert_ne!(
+            compute_blocked_set_fingerprint(&[first]),
+            compute_blocked_set_fingerprint(&[second]),
+        );
+    }
+
+    #[test]
     fn compute_blocked_set_fingerprint_changes_when_package_added() {
         let a = vec![make_blocked("esbuild", "0.25.1", None, Some("sha256-x"))];
         let b = vec![
@@ -1505,6 +1703,7 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+        write_delegate_fixtures(&pkg_dir, scripts);
     }
 
     fn fake_store_at(store_root: &Path) -> PackageStore {
@@ -1810,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_legacy_name_only_approval_does_not_block() {
+    fn capture_legacy_name_only_approval_remains_blocked() {
         let project = tempdir().unwrap();
         let store_root = tempdir().unwrap();
         fake_store_with_pkg(
@@ -1821,7 +2020,6 @@ mod tests {
         );
         let store = fake_store_at(store_root.path());
 
-        // Legacy bare-name entry — covers esbuild leniently
         let policy = SecurityPolicy {
             trusted_dependencies: TrustedDependencies::Legacy(vec!["esbuild".to_string()]),
             minimum_release_age_secs: 0,
@@ -1835,11 +2033,8 @@ mod tests {
         )
         .unwrap();
 
-        // Legacy approval is enough to NOT block (rebuild will run the script
-        // with a deprecation warning). The blocked set is for things the
-        // user must REVIEW.
-        assert!(capture.state.blocked_packages.is_empty());
-        assert!(!capture.should_emit_warning);
+        assert_eq!(capture.state.blocked_packages.len(), 1);
+        assert!(capture.should_emit_warning);
     }
 
     #[test]
@@ -1938,6 +2133,7 @@ mod tests {
         let package_with_added_fields = BlockedPackage {
             name: "sharp".into(),
             version: "0.33.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some("sha512-aaa".into()),
             script_hash: Some("sha256-bbb".into()),
             phases_present: vec!["postinstall".into()],
@@ -1968,6 +2164,7 @@ mod tests {
         let original = BlockedPackage {
             name: "puppeteer".into(),
             version: "22.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some("sha512-pp".into()),
             script_hash: Some("sha256-pp".into()),
             phases_present: vec!["postinstall".into()],
@@ -2036,6 +2233,26 @@ mod tests {
         assert_eq!(read.unwrap().blocked_packages.len(), 1);
     }
 
+    #[test]
+    fn read_build_state_rejects_older_lifecycle_identity_schema() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let mut state = make_state(vec![make_blocked(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x"),
+            Some("sha256-old-format"),
+        )]);
+        state.state_version = BUILD_STATE_VERSION - 1;
+        std::fs::write(
+            build_state_path(project.path()),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert!(read_build_state(project.path()).is_none());
+    }
+
     // ───: metadata plumbing ───────────────────────────
     //
     // The `_with_metadata` variants forward `published_at` and
@@ -2069,6 +2286,7 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(pkg_dir.join("install.js"), "module.exports = true\n").unwrap();
     }
 
     #[test]
@@ -2086,6 +2304,7 @@ mod tests {
         metadata.insert(
             "sharp".to_string(),
             "0.33.0".to_string(),
+            None,
             make_metadata(Some("T12:34:56Z"), Some("sha256-tag-hash-abc")),
         );
 
@@ -2162,6 +2381,7 @@ mod tests {
         metadata.insert(
             "some-npm-pkg".to_string(),
             "1.0.0".to_string(),
+            None,
             make_metadata(Some("T00:00:00Z"), None),
         );
 
@@ -2231,6 +2451,7 @@ mod tests {
             m.insert(
                 "sharp".to_string(),
                 "0.33.0".to_string(),
+                None,
                 make_metadata(Some("T00:00:00Z"), Some("sha256-aaa")),
             );
             m
@@ -2240,6 +2461,7 @@ mod tests {
             m.insert(
                 "sharp".to_string(),
                 "0.33.0".to_string(),
+                None,
                 make_metadata(Some("T00:00:00Z"), Some("sha256-bbb")),
             );
             m
@@ -2293,6 +2515,25 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+        write_delegate_fixtures(&pkg_dir, scripts);
+    }
+
+    fn write_delegate_fixtures(pkg_dir: &Path, scripts: &serde_json::Value) {
+        let Some(scripts) = scripts.as_object() else {
+            return;
+        };
+        for body in scripts.values().filter_map(serde_json::Value::as_str) {
+            let Some(relative_path) = lpm_security::static_gate::extract_delegate_path(body) else {
+                continue;
+            };
+            let path = pkg_dir.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            if !path.exists() {
+                std::fs::write(path, "module.exports = true\n").unwrap();
+            }
+        }
     }
 
     #[test]
@@ -2470,7 +2711,7 @@ mod tests {
     //                       from the persisted blocked set ──────────
 
     #[test]
-    fn slice1_advisor_approved_amber_excluded_from_blocked_set() {
+    fn advisor_approved_amber_with_exact_hash_is_excluded_from_blocked_set() {
         // A package the advisor approves this run must NOT appear in the
         // blocked set written to `.lpm/build-state.json`. Without
         // this, post-install JSON + the "remain blocked after auto-
@@ -2490,6 +2731,10 @@ mod tests {
             "1.0.0".to_string(),
             Some("sha512-test-integrity".to_string()),
         )];
+        let reviewed_hash = lpm_security::script_hash::compute_script_hash(
+            &store.package_dir("amber-pkg", "1.0.0"),
+        )
+        .unwrap();
 
         // Baseline: NO approvals → package appears in blocked set.
         let blocked_without_approval = compute_blocked_packages_with_metadata(
@@ -2504,13 +2749,14 @@ mod tests {
         assert_eq!(blocked_without_approval.len(), 1);
         assert_eq!(blocked_without_approval[0].name, "amber-pkg");
 
-        // With the matching triple in the approval set: EXCLUDED.
+        // With the exact approval identity in the set: EXCLUDED.
         let mut approvals = std::collections::HashSet::new();
         approvals.insert((
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
+            None,
             Some("sha512-test-integrity".to_string()),
-            String::new(),
+            reviewed_hash,
         ));
         let blocked_with_approval = compute_blocked_packages_with_metadata(
             &store,
@@ -2532,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn slice1_approval_for_other_integrity_does_not_exclude_blocked() {
+    fn advisor_approval_for_other_integrity_does_not_exclude_blocked() {
         // Counter-test for the source-aware key: an approval that
         // shares (name, version) but has different integrity must
         // NOT remove this install's package from the blocked set.
@@ -2559,6 +2805,7 @@ mod tests {
         approvals.insert((
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
+            None,
             Some("sha512-REGISTRY-source".to_string()),
             String::new(),
         ));
@@ -2576,6 +2823,82 @@ mod tests {
             1,
             "different-integrity approval must not cross-exclude"
         );
+    }
+
+    #[test]
+    fn advisor_approval_with_different_script_bundle_hash_remains_blocked() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "amber-pkg",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node install.js"}),
+        );
+        let installed = vec![(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-test-integrity".to_string()),
+        )];
+        let approvals = std::collections::HashSet::from([(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            None,
+            Some("sha512-test-integrity".to_string()),
+            "sha256-reviewed-other-bytes".to_string(),
+        )]);
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+
+        assert_eq!(blocked.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_delegate_graph_remains_blocked_without_reusable_hash() {
+        let project = tempdir().unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "incomplete-local",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node missing.js"}),
+        );
+        std::fs::remove_file(
+            store
+                .package_dir("incomplete-local", "1.0.0")
+                .join("missing.js"),
+        )
+        .unwrap();
+        let installed = vec![("incomplete-local".to_string(), "1.0.0".to_string(), None)];
+        let approvals = std::collections::HashSet::from([(
+            "incomplete-local".to_string(),
+            "1.0.0".to_string(),
+            None,
+            None,
+            "sha256-stale-approval".to_string(),
+        )]);
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].script_hash, None);
     }
 
     #[test]
@@ -2858,6 +3181,167 @@ mod tests {
             blocked.is_empty(),
             "baseline request + strict match = not blocked"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_capture_uses_immutable_identity_after_build_output_changes() {
+        use lpm_store::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+        use lpm_workspace::{ApprovalMetadata, TrustedDependencies};
+        use std::sync::Arc;
+
+        let root = tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(root.path());
+        let store = PackageStore::from_root(&lpm_root);
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        let links_root = root.path().join("store/v2/links");
+        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+        let integrity = "sha512-identical";
+        let sources = ["directory+./fork-a", "directory+./fork-b"];
+        let mut package_dirs = Vec::new();
+
+        for (index, source) in sources.iter().enumerate() {
+            let suffix = if index == 0 {
+                "aaaaaaaaaaaaaaaa"
+            } else {
+                "bbbbbbbbbbbbbbbb"
+            };
+            let link_dir = links_root.join(format!("shared@1.0.0+{suffix}"));
+            let package_dir = link_dir.join("node_modules/shared");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::write(
+                package_dir.join("package.json"),
+                r#"{"name":"shared","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+            )
+            .unwrap();
+            std::fs::write(package_dir.join("install.js"), "module.exports = true\n").unwrap();
+            let identity = InstalledPackageIdentity::new(
+                "shared",
+                "1.0.0",
+                Some((*source).into()),
+                Some(integrity.into()),
+            );
+            let source_identity = format!("{}\0content-{index}", identity.package_key().source_id);
+            LinkMeta {
+                schema: lpm_store::v2::LINK_META_SCHEMA_VERSION,
+                graph_key: format!("shared@1.0.0+{suffix}"),
+                graph_key_digest_hex: suffix.repeat(4),
+                name: "shared".into(),
+                version: "1.0.0".into(),
+                source_identity: Some(source_identity),
+                source_sri: integrity.into(),
+                object_path: "objects/sha512-identical".into(),
+                deps: Vec::new(),
+                platform: Arc::new(LinkMetaPlatform {
+                    os: "darwin".into(),
+                    cpu: "arm64".into(),
+                    libc: None,
+                }),
+                created_at: chrono::Utc::now(),
+                last_referenced_at: chrono::Utc::now(),
+            }
+            .write_to(&link_dir)
+            .unwrap();
+            v2_store
+                .capture_patched_lifecycle_baseline(&package_dir)
+                .unwrap()
+                .unwrap();
+            std::os::unix::fs::symlink(
+                &package_dir,
+                project.join("node_modules").join(format!("shared-{index}")),
+            )
+            .unwrap();
+            package_dirs.push(package_dir);
+        }
+
+        let script_hash = v2_store
+            .lifecycle_baseline(&package_dirs[0])
+            .unwrap()
+            .unwrap()
+            .content_integrity;
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "shared",
+            "1.0.0",
+            ApprovalMetadata {
+                source: Some(sources[0].into()),
+                integrity: Some(integrity.into()),
+                script_hash: Some(script_hash),
+                ..Default::default()
+            },
+        );
+        let policy = SecurityPolicy {
+            trusted_dependencies: trusted,
+            minimum_release_age_secs: 0,
+        };
+        let installed = sources
+            .iter()
+            .map(|source| {
+                InstalledPackageIdentity::new(
+                    "shared",
+                    "1.0.0",
+                    Some((*source).into()),
+                    Some(integrity.into()),
+                )
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(package_dirs[0].join("generated-output.js"), "generated\n").unwrap();
+        let baseline_index = lpm_store::V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+
+        let blocked = compute_blocked_packages_with_metadata_and_baseline(
+            &store,
+            &installed,
+            &policy,
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            BlockedPackageComputationExtras {
+                advisor_approvals: None,
+                execution_exclusions: None,
+                baseline_index: Some(&baseline_index),
+            },
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].source.as_deref(), Some(sources[1]));
+    }
+
+    #[test]
+    fn blocked_capture_does_not_substitute_v1_coordinates_for_a_missing_v2_identity() {
+        let root = tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(root.path());
+        let store = PackageStore::from_root(&lpm_root);
+        let coordinate_dir = store.package_dir("shared", "1.0.0");
+        std::fs::create_dir_all(&coordinate_dir).unwrap();
+        std::fs::write(
+            coordinate_dir.join("package.json"),
+            r#"{"name":"shared","version":"1.0.0","scripts":{"install":"node install.js"}}"#,
+        )
+        .unwrap();
+        let installed = [InstalledPackageIdentity::new(
+            "shared",
+            "1.0.0",
+            Some("registry+https://registry.example".into()),
+            Some("sha512-exact".into()),
+        )];
+        let baseline_index = lpm_store::V2BaselineIndex::default();
+
+        let blocked = compute_blocked_packages_with_metadata_and_baseline(
+            &store,
+            &installed,
+            &SecurityPolicy::default_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            BlockedPackageComputationExtras {
+                advisor_approvals: None,
+                execution_exclusions: None,
+                baseline_index: Some(&baseline_index),
+            },
+        );
+
+        assert!(blocked.is_empty());
     }
 
     // ── Referenced-script file reader ────────

@@ -334,7 +334,8 @@ pub struct LinkTarget {
     /// Resolved peers in scope for this package's instance in the
     /// install graph.
     ///
-    /// Shape: `(peer_name, resolved_version)`, sorted by peer_name.
+    /// Each binding is an exact registry version or a non-registry source
+    /// wrapper ID. Entries are sorted by peer name.
     /// Empty under any of:
     /// - The package declares no peers in its `package.json`.
     /// - All declared peers are absent from the install set

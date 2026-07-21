@@ -12,14 +12,14 @@
 //! 3. `version`
 //! 4. Platform tuple `(os, cpu, libc)` — libc empty on non-Linux
 //! 5. Linker mode tag (`isolated` | `hoisted`)
-//! 6. Sorted peer-context: `peer_name@peer_version` joined by `,`
+//! 6. Sorted peer-context: `peer_name@binding` joined by `,`
 //!    (always empty in hoisted mode)
 //! 7. Sorted dep edges: `local => target_name@target_version`
 //!    joined by `,`
 //! 8. Sorted aliases: `local => canonical_target_name`
 //!    joined by `,`
 //! 9. Sorted root-link names joined by `,`
-//! 10. Source-identity disambiguator (`wrapper_id`)
+//! 10. Exact source identity (origin plus content/project-qualified identity)
 //! 11. Patch fingerprint — `Some("p-…")` for any package carrying a
 //!     `lpm.patchedDependencies` entry, `None` otherwise. Folded in so
 //!     a project applying a patch gets a distinct link entry: without
@@ -128,16 +128,10 @@ pub struct GraphKeyInputs {
     ///
     /// [`LinkTarget::root_link_names`]: ../../../lpm-linker/src/lib.rs
     pub root_link_names: Option<Vec<String>>,
-    /// Source-identity disambiguator. Mirrors `LinkTarget.wrapper_id`:
-    /// - `None` for `Source::Registry` — registry is the only source
-    ///   that doesn't share `(name, version)` namespace with others.
-    /// - `Some(<source-id>)` for non-Registry sources (Tarball,
-    ///   Directory, Link, Git).
-    ///
-    /// Folded in so `Source::Registry { foo@1.0.0 }` and
-    /// `Source::Tarball { foo@1.0.0 from a custom URL }` produce
-    /// distinct keys and never share `links/<key>/` materializations.
-    pub wrapper_id: Option<String>,
+    /// Exact source identity for this materialization. This includes the
+    /// registry/source origin and the content SRI; local directory/link
+    /// identities are additionally qualified by their resolved project path.
+    pub source_identity: Option<String>,
     /// Patch identity. When the install pipeline detects a
     /// `lpm.patchedDependencies` entry for `(name, version)`, the
     /// caller threads `sha256(patch_bytes || originalIntegrity)`
@@ -166,15 +160,14 @@ impl GraphKeyInputs {
             deps: Vec::new(),
             aliases: BTreeMap::new(),
             root_link_names: None,
-            wrapper_id: None,
+            source_identity: None,
             patch_fingerprint: None,
         }
     }
 
-    /// Replace the source-identity disambiguator. `None` for registry
-    /// packages; `Some(...)` for non-Registry sources.
-    pub fn with_wrapper_id(mut self, wrapper_id: Option<String>) -> Self {
-        self.wrapper_id = wrapper_id;
+    /// Replace the exact source identity.
+    pub fn with_source_identity(mut self, source_identity: Option<String>) -> Self {
+        self.source_identity = source_identity;
         self
     }
 
@@ -231,6 +224,7 @@ impl GraphKeyInputs {
 pub struct GraphKey {
     name: String,
     version: String,
+    source_identity: Option<String>,
     digest: [u8; 32],
     /// Cached, pre-computed result of `<safe_name>@<version>+<short_hex>`.
     /// Computed once at construction; returned as `&str` by `dir_name()`.
@@ -256,7 +250,7 @@ impl std::hash::Hash for GraphKey {
 impl GraphKey {
     /// Schema version tag. Bump if the input layout changes — older
     /// wrappers will produce different keys and naturally GC.
-    const SCHEMA: &'static [u8] = b"v=3";
+    const SCHEMA: &'static [u8] = b"v=4";
 
     /// Length of the directory-name suffix in hex chars (16 = 64 bits
     /// of the BLAKE3 digest, ~10⁻¹⁹ collision probability for 10⁹ keys).
@@ -264,10 +258,10 @@ impl GraphKey {
 
     /// Compute the graph key from a complete [`GraphKeyInputs`] struct.
     ///
-    /// Peer pinning contributes to the key for every linker mode that
+    /// Peer bindings contribute to the key for every linker mode that
     /// materializes peer siblings inside the shared link entry. Without
     /// this, two installs with the same package/dependency graph but
-    /// different peer versions could reuse one link entry and expose
+    /// different peer versions or sources could reuse one link entry and expose
     /// the wrong peer layout.
     pub fn derive(inputs: &GraphKeyInputs) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -298,10 +292,8 @@ impl GraphKey {
         let root_names_str = format_root_link_names(inputs.root_link_names.as_deref());
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
 
-        // Source-identity disambiguation. Empty for registry packages
-        // (the default) so their hash matches the pre-wrapper_id shape.
-        let wrapper_str = inputs.wrapper_id.as_deref().unwrap_or("");
-        write_field(&mut hasher, b"wrapper_id", wrapper_str.as_bytes());
+        let source_identity = inputs.source_identity.as_deref().unwrap_or("");
+        write_field(&mut hasher, b"source_identity", source_identity.as_bytes());
 
         // Patch identity. Empty when unpatched. Non-empty entries
         // carry `sha256(patch_bytes || originalIntegrity)` so two
@@ -316,6 +308,7 @@ impl GraphKey {
         Self {
             name: inputs.name.clone(),
             version: inputs.version.clone(),
+            source_identity: inputs.source_identity.clone(),
             digest,
             dir_name,
         }
@@ -333,8 +326,8 @@ impl GraphKey {
     /// `raw_deps` — `(local, resolved_version)` pairs from
     ///   `LinkTarget::dependencies`. `aliases` maps each `local` to
     ///   its canonical target name (identity if absent — no alias).
-    /// `peers`    — `(canonical_name, resolved_version)` pairs from
-    ///   `LinkTarget::peers`.
+    /// `peers` — `(canonical_name, binding)` pairs from `LinkTarget::peers`.
+    ///   A binding is an exact registry version or source wrapper ID.
     #[allow(clippy::too_many_arguments)]
     pub fn derive_raw(
         name: &str,
@@ -345,7 +338,7 @@ impl GraphKey {
         aliases: &HashMap<String, String>,
         peers: &[(String, String)],
         root_link_names: Option<&[String]>,
-        wrapper_id: Option<&str>,
+        source_identity: Option<&str>,
         patch_fingerprint: Option<&str>,
     ) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -365,8 +358,11 @@ impl GraphKey {
         let root_names_str = format_root_link_names(root_link_names);
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
 
-        let wrapper_str = wrapper_id.unwrap_or("");
-        write_field(&mut hasher, b"wrapper_id", wrapper_str.as_bytes());
+        write_field(
+            &mut hasher,
+            b"source_identity",
+            source_identity.unwrap_or("").as_bytes(),
+        );
 
         let patch_str = patch_fingerprint.unwrap_or("");
         write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
@@ -376,6 +372,7 @@ impl GraphKey {
         Self {
             name: name.to_owned(),
             version: version.to_owned(),
+            source_identity: source_identity.map(str::to_owned),
             digest,
             dir_name,
         }
@@ -396,6 +393,7 @@ impl GraphKey {
         Self {
             name,
             version,
+            source_identity: None,
             digest,
             dir_name,
         }
@@ -414,6 +412,12 @@ impl GraphKey {
     #[inline]
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Exact source identity retained from graph-key derivation.
+    #[inline]
+    pub fn source_identity(&self) -> Option<&str> {
+        self.source_identity.as_deref()
     }
 
     /// Full BLAKE3 digest (256 bits / 32 bytes).
@@ -1025,7 +1029,7 @@ mod tests {
                 version: "18.3.0".into(),
             }])
             .with_root_link_names(Some(vec!["foo".into()]))
-            .with_wrapper_id(Some("tarball+https://example.com/foo.tgz".into()))
+            .with_source_identity(Some("tarball+https://example.com/foo.tgz".into()))
             .with_patch_fingerprint(Some("p-abc123".into()));
         let via_struct = GraphKey::derive(&inputs);
 

@@ -104,6 +104,7 @@ pub(super) fn run_behavioral_analysis(
                                 root,
                                 &pkg.name,
                                 &pkg.version,
+                                pkg.integrity.as_deref(),
                             )
                         })
                         .and_then(|baseline| {

@@ -12,7 +12,10 @@ use super::args::{
     lifecycle as lifecycle_args, network as network_args, registry as registry_args,
     release as release_args, security as security_args,
 };
-use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
+use super::format::{
+    argv_has_global_registry_flag, enforce_startup_sudo_policy_or_exit, exit_with_lpm_error,
+    parse_cli_or_exit,
+};
 use super::helpers::{
     argv_requests_top_level_version, build_install_global_overrides_with_excludes,
     command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
@@ -33,6 +36,7 @@ pub(crate) fn run() -> Result<()> {
     color_policy::init(color_policy::peek_color_choice_from_argv(
         std::env::args_os(),
     ));
+    enforce_startup_sudo_policy_or_exit();
 
     if argv_requests_top_level_version(std::env::args_os()) {
         print_version_with_notice();
@@ -376,7 +380,7 @@ async fn async_main() -> Result<()> {
                 // lpm) must NOT silently let the command proceed
                 // against potentially stale state. Surface and abort.
                 //
-                // L44: in `--json` mode, route through the same
+                // In `--json` mode, route through the same
                 // `{"success": false, "error", "error_code"}` envelope
                 // that wraps dispatch errors below — otherwise the
                 // recovery path emits a human diagnostic on stderr and
@@ -480,6 +484,7 @@ async fn async_main() -> Result<()> {
                 omit,
                 prod,
                 offline,
+                allow_snapshotless_lockfile,
                 frozen_lockfile,
                 no_frozen_lockfile,
                 force,
@@ -899,6 +904,7 @@ async fn async_main() -> Result<()> {
                         &cwd,
                         cli.json,
                         offline,
+                        allow_snapshotless_lockfile,
                         frozen_lockfile_mode,
                         force,
                         eff_allow_new,
@@ -1060,6 +1066,7 @@ async fn async_main() -> Result<()> {
                 fail_if_no_match,
                 yes,
                 global,
+                preserve_trust,
             } = args;
             // `lpm uninstall -g <pkg>` routes to the
             // global uninstall pipeline. Project flags are mutually
@@ -1091,7 +1098,7 @@ async fn async_main() -> Result<()> {
                 ) {
                     Err(error)
                 } else {
-                    commands::uninstall_global::run(&packages[0], cli.json).await
+                    commands::uninstall_global::run(&packages[0], cli.json, preserve_trust).await
                 }
             } else {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -2115,7 +2122,8 @@ async fn async_main() -> Result<()> {
                 // `~/.lpm/global/trusted-dependencies.json`. `--group`
                 // groups list + interactive review by top-level global,
                 // while persisted trust still remains per dependency row.
-                commands::approve_scripts::run_global(
+                commands::approve_scripts::run_global_with_client(
+                    &client,
                     package.as_deref(),
                     yes,
                     list,
@@ -2135,7 +2143,8 @@ async fn async_main() -> Result<()> {
                     ));
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::approve_scripts::run(
+                commands::approve_scripts::run_with_client(
+                    &client,
                     &cwd,
                     package.as_deref(),
                     yes,
@@ -2462,6 +2471,7 @@ async fn async_main() -> Result<()> {
                 omit,
                 prod,
                 offline,
+                allow_snapshotless_lockfile,
                 allow_new,
                 strict_integrity,
                 strict_peer_dependencies,
@@ -2613,6 +2623,7 @@ async fn async_main() -> Result<()> {
                 &cwd,
                 cli.json,
                 offline,
+                allow_snapshotless_lockfile,
                 commands::install::FrozenLockfileMode::Always,
                 false,
                 eff_allow_new,

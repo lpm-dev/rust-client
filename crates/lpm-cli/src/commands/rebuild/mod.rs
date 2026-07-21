@@ -46,9 +46,11 @@ use self::build_cache::{
     marker_requires_key_validation, read_build_marker_key, read_v2_graph_key_digest,
 };
 #[cfg(test)]
+pub use self::hints::all_scripted_packages_trusted;
+#[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
-pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
-use self::package_dir::prepare_live_package_dir;
+pub use self::hints::{all_scripted_package_identities_trusted, show_install_build_hint};
+use self::package_dir::{PackageLookupIdentity, prepare_live_package_dir};
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
 use self::scripts::{
@@ -58,7 +60,11 @@ use self::scripts::{
     warn_stale_trusted_deps, widen_to_build_by_policy,
 };
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
-pub(crate) use self::trust::{TrustReason, evaluate_trust};
+#[cfg(test)]
+pub(crate) use self::trust::evaluate_trust;
+pub(crate) use self::trust::{
+    TrustReason, evaluate_trust_for_identity, evaluate_trust_for_identity_with_script_hash,
+};
 
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
@@ -67,7 +73,7 @@ use lpm_common::color::Painted;
 use lpm_sandbox::SandboxMode;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
 use lpm_store::{PackageBaselineLayout, V2BaselineIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -107,8 +113,8 @@ pub async fn run(
     // → unchanged); adds tier-based auto-trust for greens
     // under [`ScriptPolicy::Triage`].
     effective_policy: ScriptPolicy,
-    // In-memory advisor-approved
-    // `(name, version)` set from this install's
+    // In-memory advisor-approved exact source/content/script identities from
+    // this install's
     // [`crate::triage_advisor_session::AdvisorSession`]. Standalone
     // `lpm rebuild` invocations pass `None` — the trust manifest is
     // the only authority. The install path's autoBuild call passes
@@ -184,7 +190,7 @@ pub(crate) async fn run_with_report(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_under_store_lock(
+pub(crate) async fn run_under_store_lock(
     project_dir: &Path,
     specific_packages: &[String],
     all: bool,
@@ -250,6 +256,11 @@ async fn run_under_store_lock(
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
+    let installed_names: std::collections::BTreeSet<&str> = lockfile
+        .packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
 
     // Read the force-security-floor
     // kill-switch once per invocation and thread it through every
@@ -285,6 +296,7 @@ async fn run_under_store_lock(
     // same-coordinate packages coexist; the project-scoped walk avoids
     // returning a sibling project's patched copy of the same package.
     let baseline_index = V2BaselineIndex::for_project(project_dir, &lpm_root)?;
+    let store_version = lpm_store::StoreVersion::from_env();
 
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
@@ -296,11 +308,15 @@ async fn run_under_store_lock(
         // installs); silent skip preserves the previously
         // `pkg_json_path.exists()` semantic for non-store sources
         // while fixing the v2-installed-and-skipped data-loss bug.
-        let baseline = match lpm_store::find_installed_package_baseline_indexed(
+        let package_key = lp.package_key();
+        let baseline = match lpm_store::find_installed_package_baseline_exact_indexed(
             &baseline_index,
             &lpm_root,
-            &lp.name,
-            &lp.version,
+            store_version,
+            &package_key.name,
+            &package_key.version,
+            &package_key.source_id,
+            lp.integrity.as_deref(),
         ) {
             Some(baseline) => baseline,
             None => continue,
@@ -310,9 +326,12 @@ async fn run_under_store_lock(
         } else {
             None
         };
+        let baseline_layout = baseline.layout;
+        let execution_dir = baseline.execution_dir.clone();
+        let execution_identity = baseline.execution_identity.clone();
         let pkg_dir = baseline.package_dir;
         let pristine_path = baseline.pristine_dir;
-        let pkg_json_path = pkg_dir.join("package.json");
+        let pkg_json_path = execution_dir.join("package.json");
 
         if !pkg_json_path.exists() {
             continue;
@@ -337,20 +356,39 @@ async fn run_under_store_lock(
         // `is_scope_trusted` scope glob AND the green-tier auto-
         // trust path (*active only under
         // [`ScriptPolicy::Triage`]).
-        let trust_reason = evaluate_trust(
-            &pkg_dir,
-            &lp.name,
-            &lp.version,
-            lp.integrity.as_deref(),
-            &scripts,
-            &policy,
-            project_dir,
-            effective_policy,
-            force_security_floor,
-            &requested_capabilities,
-            &user_bound,
-            advisor_approvals,
-        );
+        let trust_reason = if baseline_layout == PackageBaselineLayout::V2 {
+            evaluate_trust_for_identity_with_script_hash(
+                execution_identity.as_deref(),
+                &lp.name,
+                &lp.version,
+                lp.source.as_deref(),
+                lp.integrity.as_deref(),
+                &scripts,
+                &policy,
+                project_dir,
+                effective_policy,
+                force_security_floor,
+                &requested_capabilities,
+                &user_bound,
+                advisor_approvals,
+            )
+        } else {
+            evaluate_trust_for_identity(
+                &execution_dir,
+                &lp.name,
+                &lp.version,
+                lp.source.as_deref(),
+                lp.integrity.as_deref(),
+                &scripts,
+                &policy,
+                project_dir,
+                effective_policy,
+                force_security_floor,
+                &requested_capabilities,
+                &user_bound,
+                advisor_approvals,
+            )
+        };
         let is_trusted = trust_reason.is_trusted();
 
         // Surface drift to the user — even though the script is skipped,
@@ -362,11 +400,8 @@ async fn run_under_store_lock(
                 lp.name, lp.name,
             ));
         }
-        // Surface legacy bare-name entries with a soft deprecation warning,
-        // so users migrate to the strict binding form. Only emit when the
-        // strict gate was the deciding factor (the helper returns
-        // `LegacyName` only when `TrustMatch::LegacyNameOnly` won AND
-        // scope did not).
+        // Surface legacy bare-name entries with a migration warning so users
+        // can replace the blocked, hashless entry with an exact binding.
         if trust_reason == TrustReason::LegacyName && !json_output {
             install_ui::warn(&format!(
                 "{}: legacy bare-name trustedDependencies entry — run \
@@ -394,10 +429,12 @@ async fn run_under_store_lock(
         scriptable_packages.push(ScriptablePackage {
             name: lp.name.clone(),
             version: lp.version.clone(),
+            source: lp.source.clone(),
             integrity: lp.integrity.clone(),
             wrapper_id,
             store_path: pkg_dir,
             pristine_path,
+            execution_identity,
             source_integrity: baseline.integrity,
             graph_key_digest,
             scripts,
@@ -431,6 +468,17 @@ async fn run_under_store_lock(
     }
 
     if scriptable_packages.is_empty() {
+        if !specific_packages.is_empty() {
+            return Err(LpmError::Registry(format!(
+                "requested {} {} have no lifecycle scripts or are not installed",
+                if specific_packages.len() == 1 {
+                    "package"
+                } else {
+                    "packages"
+                },
+                specific_packages.join(", ")
+            )));
+        }
         if json_output {
             let result = if dry_run {
                 rebuild_dry_run_envelope(&[], force_security_floor)
@@ -452,23 +500,70 @@ async fn run_under_store_lock(
 
     // Determine which packages to build
     let selected_for_policy: Vec<&ScriptablePackage> = if !specific_packages.is_empty() {
-        // Build specific packages by name
         let mut selected = Vec::new();
+        let mut selected_identities = HashSet::new();
         let mut missing = Vec::new();
         for name in specific_packages {
-            let found = scriptable_packages
-                .iter()
-                .find(|p| p.name == *name || p.name.ends_with(&format!(".{name}")));
-            match found {
-                Some(pkg) => selected.push(pkg),
-                None => {
-                    let safe_name = lpm_common::sanitize_for_terminal(name);
-                    if !json_output {
-                        install_ui::warn(&format!(
-                            "{safe_name} has no lifecycle scripts or is not installed"
-                        ));
+            let canonical_name = if installed_names.contains(name.as_str()) {
+                Some(name.as_str())
+            } else {
+                let suffix = format!(".{name}");
+                let candidates: std::collections::BTreeSet<&str> = installed_names
+                    .iter()
+                    .copied()
+                    .filter(|installed_name| installed_name.ends_with(&suffix))
+                    .collect();
+                match candidates.len() {
+                    0 => None,
+                    1 => candidates.iter().next().copied(),
+                    _ => {
+                        let safe_name = lpm_common::sanitize_for_terminal(name);
+                        let choices = candidates
+                            .into_iter()
+                            .map(lpm_common::sanitize_for_terminal)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(LpmError::Registry(format!(
+                            "ambiguous package name `{safe_name}`; use one of: {choices}"
+                        )));
                     }
-                    missing.push(safe_name);
+                }
+            };
+            let Some(canonical_name) = canonical_name else {
+                let safe_name = lpm_common::sanitize_for_terminal(name);
+                if !json_output {
+                    install_ui::warn(&format!(
+                        "{safe_name} has no lifecycle scripts or is not installed"
+                    ));
+                }
+                missing.push(safe_name);
+                continue;
+            };
+            if !scriptable_packages
+                .iter()
+                .any(|pkg| pkg.name == canonical_name)
+            {
+                let safe_name = lpm_common::sanitize_for_terminal(name);
+                if !json_output {
+                    install_ui::warn(&format!(
+                        "{safe_name} has no lifecycle scripts or is not installed"
+                    ));
+                }
+                missing.push(safe_name);
+                continue;
+            }
+            for pkg in scriptable_packages
+                .iter()
+                .filter(|pkg| pkg.name == canonical_name)
+            {
+                let identity = (
+                    pkg.name.clone(),
+                    pkg.version.clone(),
+                    pkg.source.clone(),
+                    pkg.integrity.clone(),
+                );
+                if selected_identities.insert(identity) {
+                    selected.push(pkg);
                 }
             }
         }
@@ -489,7 +584,14 @@ async fn run_under_store_lock(
     };
     let covered_packages = selected_for_policy
         .iter()
-        .map(|pkg| (pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()))
+        .map(|pkg| {
+            (
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.source.clone(),
+                pkg.integrity.clone(),
+            )
+        })
         .collect::<Vec<_>>();
 
     // Filter out already-built (unless --force)
@@ -1153,14 +1255,20 @@ async fn run_under_store_lock(
         // a script that mutates its own package files doesn't bleed
         // into the global store. macOS (clonefile, already CoW) and
         // Windows (always copies) get a no-op return.
+        let package_key = pkg.package_key();
+        let exact_v2_index = pkg.graph_key_digest.as_ref().map(|_| &baseline_index);
         let live_pkg_dir = match prepare_live_package_dir(
             project_dir,
-            &pkg.name,
-            &pkg.version,
-            pkg.wrapper_id.as_deref(),
+            PackageLookupIdentity::new(
+                &pkg.name,
+                &pkg.version,
+                pkg.wrapper_id.as_deref(),
+                Some(&package_key.source_id),
+                Some(&pkg.source_integrity),
+            ),
             &pkg.store_path,
             &store_root,
-            Some(&baseline_index),
+            exact_v2_index,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -1249,6 +1357,7 @@ async fn run_under_store_lock(
                             built_packages.push((
                                 pkg.name.clone(),
                                 pkg.version.clone(),
+                                pkg.source.clone(),
                                 pkg.integrity.clone(),
                             ));
                             continue;
@@ -1281,23 +1390,38 @@ async fn run_under_store_lock(
             }
         }
 
-        if build_key.is_some() {
-            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
-            let rematerialize_start = std::time::Instant::now();
-            if let Err(error) = store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
-            {
-                build_cache_metrics.rematerialize_ms +=
-                    elapsed_millis(rematerialize_start.elapsed());
-                if !json_output {
-                    let label = rebuild_package_label(pkg);
-                    install_ui::detail(&format!(
-                        "  {} {label:<package_label_width$}  failed to restore pristine source: {error}",
-                        install_ui::red("✗"),
-                    ));
+        let rematerialize_start = std::time::Instant::now();
+        let rematerialize_result = if pkg.graph_key_digest.is_some() {
+            match pkg.execution_identity.as_deref() {
+                Some(expected_identity) => {
+                    v2_store.restore_lifecycle_package(&pkg.store_path, expected_identity)
                 }
-                failures += 1;
-                continue;
+                None => Err(LpmError::Store(format!(
+                    "v2 lifecycle baseline is unavailable for {}@{}; run `lpm install` to recreate it before rebuilding",
+                    pkg.name, pkg.version
+                ))),
             }
+        } else if build_key.is_some() {
+            v2_store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = rematerialize_result {
+            build_cache_metrics.rematerialize_ms += elapsed_millis(rematerialize_start.elapsed());
+            if !json_output {
+                let label = rebuild_package_label(pkg);
+                install_ui::detail(&format!(
+                    "  {} {label:<package_label_width$}  failed to restore authorized lifecycle baseline: {error}",
+                    install_ui::red("✗"),
+                ));
+            }
+            if json_output {
+                install_ui::failed(&rebuild_package_failure_message(pkg, &error));
+            }
+            failures += 1;
+            continue;
+        }
+        if pkg.graph_key_digest.is_some() || build_key.is_some() {
             build_cache_metrics.rematerialize_ms += elapsed_millis(rematerialize_start.elapsed());
         }
 
@@ -1404,7 +1528,12 @@ async fn run_under_store_lock(
                 tracing::warn!("failed to write build marker for {}: {e}", pkg.name);
             }
             successes += 1;
-            built_packages.push((pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()));
+            built_packages.push((
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.source.clone(),
+                pkg.integrity.clone(),
+            ));
         } else {
             failures += 1;
         }

@@ -1,26 +1,27 @@
 //! L4 verdict cache.
 //!
-//! Persists `{cache-key → (verdict, cached_at)}` mappings so the second
-//! and subsequent installs of any amber-classified package on a given
-//! machine skip the LLM round-trip entirely.
+//! Persists `{cache-key → (verdict, cached_at)}` mappings so later installs
+//! with the same complete review identity can skip the LLM round-trip.
 //!
 //! # Cache identity
 //!
-//! Cache key = SHA-256 over the four axes a cached verdict implicitly
+//! Cache key = SHA-256 over the six axes a cached verdict implicitly
 //! depends on:
 //!
-//! 1. **Script identity** — `(name, version, phase, body)` for every
-//!    amber phase the advisor would classify. Same package contents
-//!    → same hash, regardless of which workspace called.
-//! 2. **Prompt template hash** — rotates on any prompt-template change
+//! 1. **Install identity** — `(name, version, source, integrity)` keeps
+//!    registry, file, workspace, and content-pin verdicts independent.
+//! 2. **Executable identity** — the canonical script-bundle hash binds the
+//!    verdict to every executable lifecycle phase and reachable local file.
+//! 3. **Prompt evidence** — `(phase, body)` for every amber phase, every
+//!    referenced file embedded in the prompt, and the repository hint.
+//! 4. **Prompt template hash** — rotates on any prompt-template change
 //!    via [`crate::prompt_template_hash`]. A calibration bump
 //!    auto-invalidates every cached verdict the old template produced.
-//! 3. **Provider slug** — `claude-cli`, `codex`, `ollama`. Different
+//! 5. **Provider slug** — `claude-cli`, `codex`, `ollama`. Different
 //!    providers produce different verdicts on the same script; their
 //!    cache namespaces never collide.
-//! 4. **Model version** — captures provider-version drift the slug
-//!    doesn't (e.g. `claude-3-5-sonnet-20241022` vs
-//!    `claude-3-5-sonnet-20250101`).
+//! 6. **Model identity** — captures provider-version drift the slug does not
+//!    and includes the effective model selected for the advisor.
 //!
 //! Any one of these changing produces a different key; the affected
 //! entries are skipped on lookup and overwritten on the next classify.
@@ -67,7 +68,7 @@ use crate::AdvisorVerdict;
 /// Schema version for the on-disk cache file. Bump when the layout
 /// changes in a backward-incompatible way; older files are then
 /// silently discarded on load.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Default verdict TTL. 30 days. After this, even an exact-key hit is
 /// treated as stale and the advisor is re-invoked.
@@ -360,9 +361,8 @@ fn resolve_default_path() -> io::Result<PathBuf> {
 }
 
 /// Inputs to the cache key for one package's classification. Mirrors
-/// the install pipeline's `AmberPackageRequest` shape minus the
-/// integrity slot (which doesn't affect the verdict) and plus the
-/// advisor identity (which does).
+/// the install pipeline's `AmberPackageRequest` shape plus the advisor
+/// identity.
 ///
 /// Phases must be passed in a canonical order; the cache key folds
 /// each `(phase, body)` pair into the hash, so re-ordering the
@@ -373,6 +373,15 @@ fn resolve_default_path() -> io::Result<PathBuf> {
 pub struct CacheKeyInputs<'a> {
     pub package_name: &'a str,
     pub package_version: &'a str,
+    /// Exact declared source identity. `None` is distinct from an empty
+    /// source string.
+    pub source: Option<&'a str>,
+    /// Exact content integrity when available. Integrity-less local sources
+    /// remain partitioned by `source`.
+    pub integrity: Option<&'a str>,
+    /// Canonical hash of every executable lifecycle phase and the
+    /// package-owned content tree.
+    pub script_bundle_hash: &'a str,
     /// `(phase, body)` pairs in canonical order. Filter to amber-only
     /// before passing — green/red phases never reach L4 and would
     /// pollute the key.
@@ -402,8 +411,9 @@ pub struct CacheKeyInputs<'a> {
 /// inputs → same output across machines and runs.
 ///
 /// The hash folds every input axis the verdict depends on:
-/// package_name, package_version, each `(phase, body)` pair,
-/// prompt_template_hash, provider_slug, model_version.
+/// package_name, package_version, source, integrity, canonical script hash,
+/// each `(phase, body)` pair, referenced files, prompt_template_hash,
+/// provider_slug, and model_version.
 /// Distinct separators between fields prevent the
 /// `name="ab" version="cd"` / `name="abc" version="d"` ambiguity that
 /// a naive concatenation would have.
@@ -425,6 +435,12 @@ pub fn build_cache_key(inputs: &CacheKeyInputs<'_>) -> String {
     h.update(inputs.package_name.as_bytes());
     h.update([FIELD_SEP]);
     h.update(inputs.package_version.as_bytes());
+    h.update([FIELD_SEP]);
+    hash_optional_field(&mut h, inputs.source);
+    h.update([FIELD_SEP]);
+    hash_optional_field(&mut h, inputs.integrity);
+    h.update([FIELD_SEP]);
+    h.update(inputs.script_bundle_hash.as_bytes());
     h.update([FIELD_SEP]);
     for (phase, body) in inputs.amber_phases {
         h.update(phase.as_bytes());
@@ -458,6 +474,16 @@ pub fn build_cache_key(inputs: &CacheKeyInputs<'_>) -> String {
     format!("sha256-{}", hex_lower(&h.finalize()))
 }
 
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([0x01]);
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([0x02]),
+    }
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -484,6 +510,9 @@ mod tests {
         build_cache_key(&CacheKeyInputs {
             package_name: name,
             package_version: version,
+            source: None,
+            integrity: None,
+            script_bundle_hash: "sha256-test-script",
             amber_phases: phases,
             repository: None,
             referenced_scripts: &[],
@@ -505,6 +534,9 @@ mod tests {
         build_cache_key(&CacheKeyInputs {
             package_name: name,
             package_version: version,
+            source: None,
+            integrity: None,
+            script_bundle_hash: "sha256-test-script",
             amber_phases: phases,
             repository,
             referenced_scripts: &[],
@@ -526,6 +558,9 @@ mod tests {
         build_cache_key(&CacheKeyInputs {
             package_name: name,
             package_version: version,
+            source: None,
+            integrity: None,
+            script_bundle_hash: "sha256-test-script",
             amber_phases: phases,
             repository: None,
             referenced_scripts,
@@ -684,6 +719,60 @@ mod tests {
             none, empty,
             "None vs Some(\"\") must differ — the sentinel byte separates them"
         );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_source_and_integrity_axes() {
+        let key = |source: Option<&str>, integrity: Option<&str>| {
+            build_cache_key(&CacheKeyInputs {
+                package_name: "shared",
+                package_version: "1.0.0",
+                source,
+                integrity,
+                script_bundle_hash: "sha256-test-script",
+                amber_phases: &[("postinstall", "node install.js")],
+                repository: None,
+                referenced_scripts: &[],
+                prompt_template_hash: "template",
+                provider_slug: "provider",
+                model_version: "model",
+            })
+        };
+        let registry = key(
+            Some("registry+https://registry.example"),
+            Some("sha512-registry"),
+        );
+
+        assert_ne!(registry, key(Some("file:./shared"), None));
+        assert_ne!(
+            registry,
+            key(
+                Some("registry+https://registry.example"),
+                Some("sha512-other"),
+            )
+        );
+        assert_ne!(key(None, None), key(Some(""), Some("")));
+    }
+
+    #[test]
+    fn cache_key_distinguishes_canonical_script_hash() {
+        let key = |script_bundle_hash: &str| {
+            build_cache_key(&CacheKeyInputs {
+                package_name: "mutable-local",
+                package_version: "1.0.0",
+                source: Some("file:./mutable-local"),
+                integrity: None,
+                script_bundle_hash,
+                amber_phases: &[("postinstall", "node install.js")],
+                repository: None,
+                referenced_scripts: &[("install.js", "truncated prompt bytes")],
+                prompt_template_hash: "template",
+                provider_slug: "provider",
+                model_version: "model",
+            })
+        };
+
+        assert_ne!(key("sha256-first"), key("sha256-changed"));
     }
 
     #[test]

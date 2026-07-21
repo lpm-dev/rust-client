@@ -154,6 +154,7 @@ pub async fn run_with_options(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    allow_snapshotless_lockfile: bool,
     frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
@@ -281,6 +282,7 @@ pub async fn run_with_options(
         project_dir,
         json_output,
         offline,
+        allow_snapshotless_lockfile,
         frozen_lockfile,
         force,
         allow_new,
@@ -324,6 +326,7 @@ pub(crate) async fn run_silent_for_audit_fix(
         project_dir,
         true,
         false,
+        false,
         FrozenLockfileMode::Never,
         false,
         false,
@@ -363,6 +366,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    allow_snapshotless_lockfile: bool,
     frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
@@ -409,45 +413,48 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
-    lpm_common::with_shared_lock_async(
-        store_lock_path,
-        run_with_options_under_store_lock(
-            client,
-            project_dir,
-            json_output,
-            offline,
-            frozen_lockfile,
-            force,
-            allow_new,
-            strict_integrity,
-            dependency_engine_policy,
-            strict_peer_dependencies_override,
-            linker_override,
-            lpm_skills_preference,
-            no_editor_setup,
-            no_security_summary,
-            auto_build,
-            target_set,
-            direct_versions_out,
-            requested_add_count,
-            script_policy_override,
-            advisor_override,
-            min_release_age_override,
-            min_release_age_exclude,
-            drift_ignore_policy,
-            verify_policy,
-            omit_policy,
-            strict_sandbox,
-            no_sandbox,
-            verbose,
-            audit_after_install,
-            timing,
-            compatibility_bin_names,
-            emit_install_report,
-            &lpm_root,
-        ),
-    )
-    .await
+    let store_version = lpm_store::StoreVersion::from_env();
+    let install = run_with_options_under_store_lock(
+        client,
+        project_dir,
+        json_output,
+        offline,
+        allow_snapshotless_lockfile,
+        frozen_lockfile,
+        force,
+        allow_new,
+        strict_integrity,
+        dependency_engine_policy,
+        strict_peer_dependencies_override,
+        linker_override,
+        lpm_skills_preference,
+        no_editor_setup,
+        no_security_summary,
+        auto_build,
+        target_set,
+        direct_versions_out,
+        requested_add_count,
+        script_policy_override,
+        advisor_override,
+        min_release_age_override,
+        min_release_age_exclude,
+        drift_ignore_policy,
+        verify_policy,
+        omit_policy,
+        strict_sandbox,
+        no_sandbox,
+        verbose,
+        audit_after_install,
+        timing,
+        compatibility_bin_names,
+        emit_install_report,
+        &lpm_root,
+    );
+    if store_version.is_v2() {
+        lpm_common::with_shared_lock_async(store_lock_path, install).await
+    } else {
+        lpm_common::with_exclusive_lock_async(store_lock_path, install).await
+    }
 }
 
 /// Body of [`run_with_options`] — the actual install pipeline. Lives
@@ -459,6 +466,7 @@ async fn run_with_options_under_store_lock(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    allow_snapshotless_lockfile: bool,
     frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
@@ -738,28 +746,6 @@ async fn run_with_options_under_store_lock(
         force,
     })?;
 
-    if deps.is_empty() && workspace_member_deps.is_empty() {
-        run_empty_dependency_install_phase(EmptyDependencyInstallInput {
-            project_dir,
-            policy_extension_configs: &policy_extension_configs,
-            cleanup_catalogs_in_pipeline,
-            json_output,
-            start,
-            timing_detail_mode,
-            setup_install_state_ms: wf_setup_install_state_ms,
-            setup_route_table_ms: wf_setup_route_table_ms,
-            emit_timing,
-            target_set,
-            force_security_floor,
-            override_set: &override_set,
-            linker_mode,
-            object_integrity_policy,
-            dependency_engine_policy: dependency_engine_policy.as_ref(),
-        })
-        .await?;
-        return Ok(());
-    }
-
     let LockfileDriftState {
         prior_overrides_state,
         overrides_changed,
@@ -781,17 +767,13 @@ async fn run_with_options_under_store_lock(
 
     let arc_client = Arc::new(client.clone_with_config());
 
-    let v2_workspace_root_pre_resolve = if requested_v2_mode {
-        pre_resolve_v2_direct_workspace_member_deps(
-            project_dir,
-            &mut deps,
-            &direct_workspace_member_deps,
-            &all_workspace_members,
-            json_output,
-        )?
-    } else {
-        V2WorkspaceRootPreResolveResult::default()
-    };
+    let v2_workspace_root_pre_resolve = pre_resolve_v2_direct_workspace_member_deps(
+        project_dir,
+        &mut deps,
+        &direct_workspace_member_deps,
+        &all_workspace_members,
+        json_output,
+    )?;
     if requested_v2_mode {
         workspace_member_deps.clear();
     }
@@ -801,6 +783,7 @@ async fn run_with_options_under_store_lock(
             client,
             project_dir,
             deps: &deps,
+            current_importer_snapshot: &current_importer_snapshot,
             pkg: &pkg,
             lockfile_path: &lockfile_path,
             catalog_resolutions: &catalog_resolutions,
@@ -840,15 +823,47 @@ async fn run_with_options_under_store_lock(
             emit_timing,
             global_config: &global_config,
             strict_integrity,
+            allow_snapshotless_lockfile,
             compatibility_bin_names,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
         })
         .await;
     }
 
+    if deps.is_empty()
+        && workspace_member_deps.is_empty()
+        && v2_workspace_root_pre_resolve.install_pkgs.is_empty()
+        && v2_workspace_root_pre_resolve
+            .additional_workspace_links
+            .is_empty()
+    {
+        run_empty_dependency_install_phase(EmptyDependencyInstallInput {
+            project_dir,
+            current_importer_snapshot: &current_importer_snapshot,
+            policy_extension_configs: &policy_extension_configs,
+            cleanup_catalogs_in_pipeline,
+            json_output,
+            start,
+            timing_detail_mode,
+            setup_install_state_ms: wf_setup_install_state_ms,
+            setup_route_table_ms: wf_setup_route_table_ms,
+            emit_timing,
+            target_set,
+            force_security_floor,
+            override_set: &override_set,
+            linker_mode,
+            requested_v2_mode,
+            object_integrity_policy,
+            dependency_engine_policy: dependency_engine_policy.as_ref(),
+        })
+        .await?;
+        return Ok(());
+    }
+
     let lockfile_result = select_lockfile_install_plan(LockfileSelectionInput {
         lockfile_path: &lockfile_path,
         deps: &deps,
+        current_importer_snapshot: &current_importer_snapshot,
         catalog_resolutions: &catalog_resolutions,
         client,
         gate_stats: &gate_stats,
@@ -1057,6 +1072,7 @@ async fn run_with_options_under_store_lock(
             &workspace_member_deps,
             &all_workspace_members,
             &catalog_resolutions,
+            &current_importer_snapshot,
             &current_patches,
             &prior_patch_state,
             &current_patch_fingerprint,
@@ -1342,6 +1358,7 @@ async fn run_with_options_under_store_lock(
         route_table: &route_table,
         project_dir,
         packages: &packages,
+        materialized_packages: &link_result.materialized,
         package: &pkg,
         store: &store,
         used_lockfile,
@@ -1624,7 +1641,7 @@ async fn run_with_options_under_store_lock(
                 );
                 None
             } else {
-                match crate::commands::audit::run_install_summary(client, project_dir).await {
+                match crate::commands::audit::run_install_summary(client, project_dir, true).await {
                     Ok(opt) => opt,
                     Err(e) => {
                         tracing::warn!("audit-after-install failed: {e}");

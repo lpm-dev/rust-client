@@ -3,17 +3,33 @@ use super::*;
 /// Source-string compound key for fetch-phase bookkeeping maps
 /// (`FetchCoordinator`, `v2_target_by_key`, `integrity_map`, `fresh_urls`).
 ///
-/// Encodes `"name\x00version\x00source"` — unique across all source kinds
-/// without the SHA-256 computation that [`lpm_lockfile::PackageKey`] requires.
-/// `name`, `version`, and `source` strings cannot contain `\x00`.
+/// Encodes `"name\x00version\x00source\x00integrity"` — unique across all
+/// source kinds and content pins without the SHA-256 computation that
+/// [`lpm_lockfile::PackageKey`] requires.
+/// The component strings cannot contain `\x00`.
 #[inline]
 pub(super) fn install_pkg_key(p: &InstallPackage) -> String {
-    let mut k = String::with_capacity(p.name.len() + 1 + p.version.len() + 1 + p.source.len());
-    k.push_str(&p.name);
+    install_pkg_key_parts(&p.name, &p.version, &p.source, p.integrity.as_deref())
+}
+
+#[inline]
+pub(super) fn install_pkg_key_parts(
+    name: &str,
+    version: &str,
+    source: &str,
+    integrity: Option<&str>,
+) -> String {
+    let integrity = integrity.unwrap_or("");
+    let mut k = String::with_capacity(
+        name.len() + 1 + version.len() + 1 + source.len() + 1 + integrity.len(),
+    );
+    k.push_str(name);
     k.push('\x00');
-    k.push_str(&p.version);
+    k.push_str(version);
     k.push('\x00');
-    k.push_str(&p.source);
+    k.push_str(source);
+    k.push('\x00');
+    k.push_str(integrity);
     k
 }
 
@@ -100,6 +116,69 @@ pub(super) fn dedupe_install_packages_by_identity(packages: &mut Vec<InstallPack
     *packages = deduped;
 }
 
+pub(super) fn explicit_peer_providers_from_install_packages<'a>(
+    packages: impl IntoIterator<Item = &'a InstallPackage>,
+    project_dir: &Path,
+) -> Result<Vec<lpm_resolver::ExplicitPeerProvider>, LpmError> {
+    let packages = packages.into_iter();
+    let (lower_bound, _) = packages.size_hint();
+    let mut providers = Vec::with_capacity(lower_bound);
+    let mut seen = HashSet::with_capacity(lower_bound);
+
+    for package in packages {
+        if package.source.starts_with("registry+") {
+            continue;
+        }
+        let source = lpm_resolver::PeerProviderSource::from_install_source_at(
+            &package.source,
+            package.integrity.as_deref(),
+            project_dir,
+        )
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "cannot classify explicit peer provider source {:?}",
+                package.source
+            ))
+        })?;
+        let root_link_names = package.root_link_names.clone().unwrap_or_else(|| {
+            if package.is_direct {
+                vec![package.name.clone()]
+            } else {
+                Vec::new()
+            }
+        });
+        let source_id = package.wrapper_id_for_source().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "explicit peer provider {} has no source identity for {:?}",
+                package.name, package.source
+            ))
+        })?;
+        for local_name in root_link_names {
+            let mut identity = String::with_capacity(
+                local_name.len() + 1 + package.name.len() + 1 + source_id.len(),
+            );
+            identity.push_str(&local_name);
+            identity.push('\0');
+            identity.push_str(&package.name);
+            identity.push('\0');
+            identity.push_str(&source_id);
+            if !seen.insert(identity) {
+                continue;
+            }
+            let provider = lpm_resolver::ExplicitPeerProvider::new(
+                local_name,
+                package.name.clone(),
+                package.version.clone(),
+                source.clone(),
+                source_id.clone(),
+            );
+            providers.push(provider);
+        }
+    }
+
+    Ok(providers)
+}
+
 /// Lightweight representation of a resolved package for the install pipeline.
 /// Used both for fresh resolution results and lockfile-restored packages.
 #[derive(Debug, Clone)]
@@ -118,8 +197,8 @@ pub(super) struct InstallPackage {
     pub(super) is_direct: bool,
     /// Whether this is an LPM package (for tarball fetching)
     pub(super) is_lpm: bool,
-    /// resolved peers in scope for THIS package's
-    /// instance in this install graph: `(peer_name, resolved_version)`.
+    /// Resolved peers in scope for this package instance. Each binding
+    /// is an exact registry version or a non-registry source wrapper ID.
     /// Sorted by peer_name for deterministic GraphKey hashing.
     ///
     /// Carried verbatim from the resolver's
@@ -127,7 +206,7 @@ pub(super) struct InstallPackage {
     /// uses this to (a) synthesize peer-edge siblings inside each
     /// link entry without re-reading package.json, and (b) fold the
     /// peer-context into [`lpm_store::v2::GraphKey`] so two projects
-    /// with the same edge graph but different peer pinning produce
+    /// with the same edge graph but different peer bindings produce
     /// distinct keys (design cross-project sharing
     /// invariant). v1 ignores this field — its relative-symlink
     /// wrappers walk up to the project root for peers, so threading
@@ -172,12 +251,9 @@ impl InstallPackage {
         lpm_lockfile::Source::parse(&self.source)
     }
 
-    /// source-
-    /// aware existence check. For `Source::Tarball` packages,
-    /// checks the integrity-keyed CAS layout
-    /// ([`PackageStore::has_tarball`]); everything else falls back
-    /// to the legacy `(name, version)`-keyed
-    /// [`PackageStore::has_package`].
+    /// Source-aware existence check. Tarballs use their integrity-keyed CAS
+    /// layout, while registry entries require the exact selected integrity in
+    /// the coordinate-keyed v1 slot.
     ///
     /// Trust-on-first-use `Source::Tarball` (integrity = None)
     /// returns `false` even when a coincidentally-named registry
@@ -206,6 +282,11 @@ impl InstallPackage {
                 // path.
                 let abs = project_dir.join(&path);
                 abs.is_dir() && abs.join("package.json").is_file()
+            }
+            Ok(lpm_lockfile::Source::Registry { .. }) => {
+                self.integrity.as_deref().is_some_and(|expected| {
+                    store.has_package_with_integrity(&self.name, &self.version, expected)
+                })
             }
             _ => store.has_package(&self.name, &self.version),
         }
@@ -411,7 +492,10 @@ impl InstallPackage {
         match self.source_kind() {
             Ok(s @ lpm_lockfile::Source::Directory { .. })
             | Ok(s @ lpm_lockfile::Source::Link { .. })
-            | Ok(s @ lpm_lockfile::Source::Tarball { .. }) => Some(s.source_id()),
+            | Ok(s @ lpm_lockfile::Source::Git { .. }) => Some(s.source_id()),
+            Ok(s @ lpm_lockfile::Source::Tarball { .. }) => {
+                Some(s.source_id_with_integrity(self.integrity.as_deref()))
+            }
             _ => None,
         }
     }

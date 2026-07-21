@@ -2,20 +2,10 @@ use super::trust::TrustReason;
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
-use lpm_store::{V2BaselineIndex, find_installed_package_baseline_indexed};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 pub(super) const BUILD_MARKER: &str = ".lpm-built";
-
-pub(super) fn package_baseline_dir_indexed(
-    index: &V2BaselineIndex,
-    lpm_root: &lpm_common::LpmRoot,
-    name: &str,
-    version: &str,
-) -> Option<std::path::PathBuf> {
-    find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
-}
 
 pub(super) fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String>> {
     let content = std::fs::read(pkg_json_path).ok()?;
@@ -51,6 +41,7 @@ pub(super) fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<Str
 pub(super) struct ScriptablePackage {
     pub(super) name: String,
     pub(super) version: String,
+    pub(super) source: Option<String>,
     pub(super) integrity: Option<String>,
     /// Wrapper-id for non-Registry sources. `None` for Registry deps
     /// (canonical CAS-backed wrapper segment shape `<safe>@<version>`);
@@ -66,6 +57,7 @@ pub(super) struct ScriptablePackage {
     pub(super) wrapper_id: Option<String>,
     pub(super) store_path: std::path::PathBuf,
     pub(super) pristine_path: std::path::PathBuf,
+    pub(super) execution_identity: Option<String>,
     pub(super) source_integrity: String,
     pub(super) graph_key_digest: Option<String>,
     pub(super) scripts: HashMap<String, String>,
@@ -81,6 +73,20 @@ pub(super) struct ScriptablePackage {
     /// most call sites only care about the boolean and splitting the
     /// read avoids threading [`TrustReason`] through downstream code.
     pub(super) trust_reason: TrustReason,
+}
+
+impl ScriptablePackage {
+    pub(super) fn package_key(&self) -> lpm_lockfile::PackageKey {
+        let source_id = self
+            .source
+            .as_deref()
+            .and_then(|source| lpm_lockfile::Source::parse(source).ok())
+            .map_or_else(
+                || lpm_lockfile::PackageKey::UNKNOWN_SOURCE_ID.to_string(),
+                |source| source.source_id_with_integrity(self.integrity.as_deref()),
+            );
+        lpm_lockfile::PackageKey::new(&self.name, &self.version, source_id)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,7 +130,7 @@ impl BuildCacheMetrics {
     }
 }
 
-pub(crate) type RebuildPackageIdentity = (String, String, Option<String>);
+pub(crate) type RebuildPackageIdentity = (String, String, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RebuildRunReport {
@@ -249,80 +255,124 @@ pub(super) fn toposort_packages<'a>(
         return packages;
     }
 
-    // Build a set of names we're building
-    let build_set: HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
-
-    // Build adjacency: for each package, which of the other build-set packages depend on it?
-    // Edge: dep_name → pkg_name (dep must be built before pkg)
-    let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
-
-    for name in &build_set {
-        in_degree.insert(name, 0);
-    }
-
-    for lp in &lockfile.packages {
-        if !build_set.contains(lp.name.as_str()) {
-            continue;
-        }
-        for dep_ref in &lp.dependencies {
-            if let Some(at) = dep_ref.rfind('@') {
-                let dep_name = &dep_ref[..at];
-                if build_set.contains(dep_name) {
-                    // lp.name depends on dep_name → dep_name must come first
-                    *in_degree.entry(lp.name.as_str()).or_insert(0) += 1;
-                    dependents
-                        .entry(dep_name)
-                        .or_default()
-                        .push(lp.name.as_str());
-                }
-            }
-        }
-    }
-
-    // Kahn's algorithm
-    let mut queue: VecDeque<&str> = in_degree
+    let package_keys: Vec<lpm_lockfile::PackageKey> = packages
         .iter()
-        .filter(|(_, deg)| **deg == 0)
-        .map(|(&name, _)| name)
+        .map(|package| package.package_key())
+        .collect();
+    let selected_by_key: HashMap<lpm_lockfile::PackageKey, usize> = package_keys
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect();
+    let locked_by_key: HashMap<lpm_lockfile::PackageKey, &lpm_lockfile::LockedPackage> = lockfile
+        .packages
+        .iter()
+        .map(|package| (package.package_key(), package))
         .collect();
 
-    // Sort the initial queue for deterministic output
-    let mut q_vec: Vec<&str> = queue.drain(..).collect();
-    q_vec.sort();
-    queue.extend(q_vec);
+    let mut reference_targets: HashMap<String, Option<lpm_lockfile::PackageKey>> =
+        HashMap::with_capacity(lockfile.packages.len());
+    for locked in &lockfile.packages {
+        let binding = match locked.source_kind() {
+            Some(Ok(lpm_lockfile::Source::Registry { .. })) | None => locked.version.clone(),
+            Some(Ok(source)) => source.source_id_with_integrity(locked.integrity.as_deref()),
+            Some(Err(_)) => continue,
+        };
+        let mut reference = String::with_capacity(locked.name.len() + binding.len() + 1);
+        reference.push_str(&locked.name);
+        reference.push('\0');
+        reference.push_str(&binding);
+        let package_key = locked.package_key();
+        match reference_targets.entry(reference) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(package_key));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if entry.get().as_ref() != Some(&package_key) =>
+            {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
 
-    let mut sorted_names: Vec<&str> = Vec::with_capacity(packages.len());
-
-    while let Some(name) = queue.pop_front() {
-        sorted_names.push(name);
-        if let Some(deps) = dependents.get(name) {
-            for &dep in deps {
-                if let Some(deg) = in_degree.get_mut(dep) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(dep);
-                    }
-                }
+    let mut in_degree = vec![0usize; packages.len()];
+    let mut dependents = vec![Vec::<usize>::new(); packages.len()];
+    let mut edges = HashSet::new();
+    for (consumer_index, consumer_key) in package_keys.iter().enumerate() {
+        let Some(locked) = locked_by_key.get(consumer_key) else {
+            continue;
+        };
+        for dependency in &locked.dependencies {
+            let Some(at) = dependency.rfind('@') else {
+                continue;
+            };
+            let local = &dependency[..at];
+            let binding = &dependency[at + 1..];
+            let canonical = locked
+                .alias_dependencies
+                .iter()
+                .find(|alias| alias[0] == local)
+                .map_or(local, |alias| alias[1].as_str());
+            let mut reference = String::with_capacity(canonical.len() + binding.len() + 1);
+            reference.push_str(canonical);
+            reference.push('\0');
+            reference.push_str(binding);
+            let Some(Some(dependency_key)) = reference_targets.get(&reference) else {
+                continue;
+            };
+            let Some(&dependency_index) = selected_by_key.get(dependency_key) else {
+                continue;
+            };
+            if dependency_index != consumer_index
+                && edges.insert((dependency_index, consumer_index))
+            {
+                in_degree[consumer_index] += 1;
+                dependents[dependency_index].push(consumer_index);
             }
         }
     }
 
-    // Any remaining packages (cycles or not in lockfile) — append at the end
-    for name in &build_set {
-        if !sorted_names.contains(name) {
-            sorted_names.push(name);
+    let compare_indices = |left: &usize, right: &usize| {
+        let left = &package_keys[*left];
+        let right = &package_keys[*right];
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.version.cmp(&right.version))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    };
+    let mut initial: Vec<usize> = in_degree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    initial.sort_by(compare_indices);
+    let mut queue: VecDeque<usize> = initial.into();
+    let mut sorted = Vec::with_capacity(packages.len());
+    let mut emitted = HashSet::with_capacity(packages.len());
+    while let Some(index) = queue.pop_front() {
+        if !emitted.insert(index) {
+            continue;
         }
+        sorted.push(packages[index]);
+        let mut newly_ready = Vec::new();
+        for dependent in &dependents[index] {
+            in_degree[*dependent] -= 1;
+            if in_degree[*dependent] == 0 {
+                newly_ready.push(*dependent);
+            }
+        }
+        newly_ready.sort_by(compare_indices);
+        queue.extend(newly_ready);
     }
 
-    // Map sorted names back to package references
-    let pkg_by_name: HashMap<&str, &ScriptablePackage> =
-        packages.iter().map(|p| (p.name.as_str(), *p)).collect();
-
-    sorted_names
-        .iter()
-        .filter_map(|name| pkg_by_name.get(name).copied())
-        .collect()
+    let mut remaining: Vec<usize> = (0..packages.len())
+        .filter(|index| !emitted.contains(index))
+        .collect();
+    remaining.sort_by(compare_indices);
+    sorted.extend(remaining.into_iter().map(|index| packages[index]));
+    sorted
 }
 
 /// Warn if any entries in `trustedDependencies` don't actually have lifecycle scripts.

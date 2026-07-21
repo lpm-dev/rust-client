@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use lpm_common::LpmError;
-use lpm_common::symlink::create_dir_symlink_or_junction;
+use lpm_common::symlink::{create_dir_symlink_or_junction, remove_dir_symlink_or_junction};
 use lpm_store::v2::Store;
 
 use super::V2Target;
@@ -44,8 +44,19 @@ pub(super) fn reconcile_project_node_modules(
     preserve_internal_lpm_dir: bool,
 ) -> Result<(), LpmError> {
     let nm = project_dir.join("node_modules");
-    if !nm.exists() {
-        return Ok(());
+    match nm.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            remove_dir_symlink_or_junction(&nm).map_err(|error| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to remove symlinked project node_modules at {}: {error}",
+                    nm.display()
+                ))
+            })?;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
     }
 
     let mut desired = HashSet::new();
@@ -126,6 +137,8 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
     };
     let result = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
         std::fs::remove_dir_all(path)
+    } else if metadata.file_type().is_symlink() {
+        remove_node_modules_link(path)
     } else {
         std::fs::remove_file(path)
     };
@@ -135,6 +148,26 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
             path.display()
         ))
     })
+}
+
+#[cfg(windows)]
+fn remove_node_modules_link(path: &Path) -> std::io::Result<()> {
+    match remove_dir_symlink_or_junction(path) {
+        Ok(()) => Ok(()),
+        Err(directory_error) => std::fs::remove_file(path).map_err(|file_error| {
+            std::io::Error::new(
+                file_error.kind(),
+                format!(
+                    "directory-link removal failed ({directory_error}); file-link removal failed ({file_error})"
+                ),
+            )
+        }),
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_node_modules_link(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 /// Create `<project>/node_modules/<root_link_name>` symlinks pointing
@@ -158,7 +191,7 @@ pub(super) fn create_root_symlinks(
         if names.is_empty() {
             continue;
         }
-        let key = key_map.get_for(&v2t.target).ok_or_else(|| {
+        let key = key_map.get_for(v2t).ok_or_else(|| {
             LpmError::Store(format!(
                 "v2 linker: missing graph key for {}@{} during root-symlink pass",
                 v2t.target.name, v2t.target.version
@@ -346,4 +379,41 @@ pub(super) fn ensure_link_parent_dir(
 
 pub(super) fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> {
     ensure_real_dir_with_prefix(path, label, "v2 linker: ")
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn project_reconcile_removes_a_node_modules_junction_without_touching_its_target() {
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sentinel = external.path().join("must-survive");
+        std::fs::write(&sentinel, b"external data").unwrap();
+        create_dir_symlink_or_junction(external.path(), &project.path().join("node_modules"))
+            .unwrap();
+
+        reconcile_project_node_modules(project.path(), &[], None, false).unwrap();
+
+        assert!(sentinel.exists());
+        assert!(!project.path().join("node_modules").exists());
+    }
+
+    #[test]
+    fn entry_reconcile_removes_a_package_junction_without_touching_its_target() {
+        let project = tempfile::tempdir().unwrap();
+        let node_modules = project.path().join("node_modules");
+        std::fs::create_dir(&node_modules).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sentinel = external.path().join("must-survive");
+        std::fs::write(&sentinel, b"external data").unwrap();
+        let package_link = node_modules.join("old-package");
+        create_dir_symlink_or_junction(external.path(), &package_link).unwrap();
+
+        remove_node_modules_entry(&package_link, "stale package junction").unwrap();
+
+        assert!(sentinel.exists());
+        assert!(!package_link.exists());
+    }
 }

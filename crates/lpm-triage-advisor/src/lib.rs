@@ -52,7 +52,7 @@ mod verdict;
 pub use adapters::{ClaudeCliAdapter, CodexAdapter, OllamaAdapter};
 pub use detection::{ProbeReport, detect, probe_all};
 pub use l4_cache::{CacheKeyInputs, DEFAULT_TTL as L4_CACHE_DEFAULT_TTL, L4Cache, build_cache_key};
-pub use metadata::{binary_path, prompt_template_hash, provider_version};
+pub use metadata::{binary_path, cache_model_identity, prompt_template_hash, provider_version};
 pub use prompt::build_prompt;
 pub use verdict::parse_verdict;
 

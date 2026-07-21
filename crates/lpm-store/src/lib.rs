@@ -35,7 +35,8 @@ pub mod v2;
 
 pub use baseline::{
     InstalledPackageBaseline, PackageBaselineLayout, V2BaselineIndex,
-    find_installed_package_baseline, find_installed_package_baseline_indexed,
+    find_installed_package_baseline, find_installed_package_baseline_exact_indexed,
+    find_installed_package_baseline_indexed,
 };
 pub use gc::{GcPreview, GcResult};
 pub use integrity::{

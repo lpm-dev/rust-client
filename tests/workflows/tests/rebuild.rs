@@ -90,6 +90,21 @@ fn seed_scripted_package(
     dir
 }
 
+fn seed_package_without_scripts(project: &TempProject, name: &str, version: &str) {
+    let safe = name.replace(['/', '\\'], "+");
+    let dir = project
+        .store_dir()
+        .join("v1")
+        .join(format!("{safe}@{version}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(dir.join(".integrity"), "sha512-fixture-skip-verify").unwrap();
+}
+
 /// Materialize a per-package wrapper at
 /// `<project>/.lpm/wrappers/<safe>@<v>/node_modules/<name>/` by copying
 /// the store entry. A prior fix closed the silent store-fallback
@@ -647,6 +662,122 @@ fn rebuild_named_missing_package_fails_in_json_mode() {
     assert!(
         error.contains("missing-pkg") && error.contains("lifecycle scripts"),
         "JSON error must name the requested package and why it was not rebuildable: {envelope}",
+    );
+}
+
+#[test]
+fn rebuild_named_package_selects_every_installed_version() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-named-versions", None, &[]);
+    seed_scripted_package(&project, "shared", "1.0.0", "echo first");
+    seed_scripted_package(&project, "shared", "2.0.0", "echo second");
+    write_lockfile_for_packages(&project, &[("shared", "1.0.0"), ("shared", "2.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "shared", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild shared --dry-run --json");
+    assert!(
+        out.status.success(),
+        "named rebuild should accept every matching installed identity\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope = assertions::parse_json_output(&out.stdout);
+    let packages = envelope["packages"]
+        .as_array()
+        .expect("dry-run packages array");
+    let versions = packages
+        .iter()
+        .map(|package| package["version"].as_str().expect("package version"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(packages.len(), 2, "named rebuild dropped an identity");
+    assert_eq!(
+        versions,
+        std::collections::HashSet::from(["1.0.0", "2.0.0"]),
+    );
+}
+
+#[test]
+fn rebuild_exact_name_does_not_select_unrelated_suffix_names() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-exact-name", None, &[]);
+    seed_scripted_package(&project, "foo", "1.0.0", "echo exact");
+    seed_scripted_package(&project, "alice.foo", "1.0.0", "echo alice");
+    seed_scripted_package(&project, "bob.foo", "1.0.0", "echo bob");
+    write_lockfile_for_packages(
+        &project,
+        &[
+            ("foo", "1.0.0"),
+            ("alice.foo", "1.0.0"),
+            ("bob.foo", "1.0.0"),
+        ],
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "foo", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild foo --dry-run --json");
+    assert!(
+        out.status.success(),
+        "exact named rebuild failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope = assertions::parse_json_output(&out.stdout);
+    let packages = envelope["packages"]
+        .as_array()
+        .expect("dry-run packages array");
+    assert_eq!(packages.len(), 1, "exact name selected suffix packages");
+    assert_eq!(packages[0]["name"], "foo");
+}
+
+#[test]
+fn rebuild_exact_installed_name_without_scripts_does_not_select_suffix_package() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-exact-no-scripts", None, &[]);
+    seed_package_without_scripts(&project, "foo", "1.0.0");
+    seed_scripted_package(&project, "alice.foo", "1.0.0", "echo alice");
+    write_lockfile_for_packages(&project, &[("foo", "1.0.0"), ("alice.foo", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "foo", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild foo --dry-run --json");
+
+    assert!(
+        !out.status.success(),
+        "installed exact package without scripts must not select alice.foo\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn rebuild_short_name_rejects_multiple_canonical_matches() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-ambiguous-name", None, &[]);
+    seed_scripted_package(&project, "alice.foo", "1.0.0", "echo alice");
+    seed_scripted_package(&project, "bob.foo", "1.0.0", "echo bob");
+    write_lockfile_for_packages(&project, &[("alice.foo", "1.0.0"), ("bob.foo", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "foo", "--dry-run"])
+        .output()
+        .expect("spawn ambiguous lpm rebuild foo --dry-run --json");
+    assert!(
+        !out.status.success(),
+        "ambiguous short name must not rebuild multiple packages\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope = assertions::parse_json_output(&out.stdout);
+    let error = envelope["error"].to_string();
+    assert!(
+        error.contains("alice.foo") && error.contains("bob.foo") && error.contains("ambiguous"),
+        "ambiguity error must list the canonical choices: {envelope}",
     );
 }
 

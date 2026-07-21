@@ -94,7 +94,8 @@ thiserror = "2"
 sha2 = "0.10"
 # BLAKE3 is used for v2 store graph-key derivation. It is much faster than
 # SHA-256 on common hardware and runs once per resolved package per install.
-# Content integrity remains SHA-512 SRI per the registry contract.
+# Registry and trust-on-first-use content defaults to SHA-512; verified
+# source declarations retain their exact SRI algorithm and digest.
 blake3 = "1"
 base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

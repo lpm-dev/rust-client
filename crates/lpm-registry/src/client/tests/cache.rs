@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn lpm_metadata_cache_keys_are_partitioned_by_bearer_principal() {
+    let client_a = RegistryClient::new().with_token("principal-a");
+    let client_b = RegistryClient::new().with_token("principal-b");
+
+    assert_ne!(
+        client_a.lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        client_b.lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        "private LPM metadata must not cross authenticated principals"
+    );
+    assert_ne!(
+        client_a.lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        RegistryClient::new().lpm_metadata_cache_key("@lpm.dev/private.pkg"),
+        "logged-out reads must not reuse an authenticated principal's metadata"
+    );
+}
+
+#[tokio::test]
+async fn lpm_private_metadata_cache_never_crosses_bearer_principals() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let package = lpm_common::PackageName::parse("@lpm.dev/private.pkg").unwrap();
+    for (token, description) in [("TOKEN-A", "principal-a"), ("TOKEN-B", "principal-b")] {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/@lpm.dev/private.pkg"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "@lpm.dev/private.pkg",
+                "description": description,
+                "versions": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let make_client = |token: &str| {
+        let mut client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token(token)
+            .with_synchronous_cache_writes(true);
+        client.cache_dir = Some(cache.path().to_path_buf());
+        client
+    };
+
+    let metadata_a = make_client("TOKEN-A")
+        .get_package_metadata(&package)
+        .await
+        .unwrap();
+    let metadata_b = make_client("TOKEN-B")
+        .get_package_metadata(&package)
+        .await
+        .unwrap();
+
+    assert_eq!(metadata_a.description.as_deref(), Some("principal-a"));
+    assert_eq!(metadata_b.description.as_deref(), Some("principal-b"));
+}
+
+#[test]
 fn cache_roundtrip_with_etag() {
     let (client, _tmp) = client_with_temp_cache();
     let meta = test_metadata("@lpm.dev/test.pkg");
@@ -239,7 +299,7 @@ async fn etag_304_revalidation_lpm_metadata() {
     assert_eq!(meta.name, pkg_name);
 
     // Expire the cache by setting mtime to 10 minutes ago
-    if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -269,7 +329,7 @@ async fn etag_304_revalidation_lpm_metadata() {
     assert_eq!(meta2.name, pkg_name, "should return cached metadata on 304");
     assert!(
         client
-            .read_metadata_cache(&format!("lpm:{pkg_name}"))
+            .read_metadata_cache(&client.lpm_metadata_cache_key(pkg_name))
             .is_some(),
         "304 should refresh LPM metadata cache freshness"
     );
@@ -339,7 +399,7 @@ async fn etag_updated_on_new_response() {
     client.get_package_metadata(&name).await.unwrap();
 
     // Expire cache
-    if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -393,7 +453,7 @@ async fn etag_updated_on_new_response() {
     );
 
     // Verify cache now has v2 ETag
-    let content = client.read_cache_content(&format!("lpm:{pkg_name}"));
+    let content = client.read_cache_content(&client.lpm_metadata_cache_key(pkg_name));
     assert!(content.is_some());
     assert_eq!(
         content.unwrap().etag.as_deref(),
@@ -461,7 +521,7 @@ async fn npm_metadata_etag_304_revalidation() {
     assert!(result.is_ok());
 
     // Expire cache
-    if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.npm_worker_metadata_cache_key(npm_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -514,7 +574,7 @@ async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
         .await;
 
     client.get_npm_metadata_direct(npm_name).await.unwrap();
-    expire_cache_entry(&client, &format!("npm:{npm_name}"));
+    expire_cache_entry(&client, &client.npm_direct_metadata_cache_key(npm_name));
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -529,7 +589,7 @@ async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
     assert_eq!(revalidated.name, npm_name);
     assert!(
         client
-            .read_metadata_cache(&format!("npm:{npm_name}"))
+            .read_metadata_cache(&client.npm_direct_metadata_cache_key(npm_name))
             .is_some(),
         "304 should refresh cache freshness for the next TTL read"
     );
@@ -560,7 +620,10 @@ async fn direct_npm_full_metadata_etag_304_revalidation_refreshes_cache() {
         .await;
 
     client.get_npm_metadata_direct_full(npm_name).await.unwrap();
-    expire_cache_entry(&client, &format!("npm-full:{npm_name}"));
+    expire_cache_entry(
+        &client,
+        &client.npm_direct_full_metadata_cache_key(npm_name),
+    );
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -575,7 +638,7 @@ async fn direct_npm_full_metadata_etag_304_revalidation_refreshes_cache() {
     assert_eq!(revalidated.name, npm_name);
     assert!(
         client
-            .read_metadata_cache(&format!("npm-full:{npm_name}"))
+            .read_metadata_cache(&client.npm_direct_full_metadata_cache_key(npm_name))
             .is_some(),
         "304 should refresh the full-metadata cache freshness"
     );
@@ -703,7 +766,11 @@ async fn worker_release_times_use_time_from_batch_metadata_cache() {
     metadata
         .time
         .insert("1.0.0".to_string(), "2025-01-01T00:00:00.000Z".to_string());
-    client.write_metadata_cache(&format!("npm:{npm_name}"), &metadata, None);
+    client.write_metadata_cache(
+        &client.npm_worker_metadata_cache_key(npm_name),
+        &metadata,
+        None,
+    );
 
     Mock::given(method("GET"))
         .and(path("/api/registry/vite"))
@@ -754,7 +821,10 @@ async fn direct_npm_release_times_etag_304_revalidation_refreshes_cache() {
         .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
         .await
         .unwrap();
-    expire_cache_entry(&client, &format!("npm-release-times:{npm_name}"));
+    expire_cache_entry(
+        &client,
+        &client.npm_direct_release_times_cache_key(npm_name),
+    );
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -775,7 +845,9 @@ async fn direct_npm_release_times_etag_304_revalidation_refreshes_cache() {
     );
     assert!(
         client
-            .read_metadata_cache_as::<ReleaseTimeMetadata>(&format!("npm-release-times:{npm_name}"))
+            .read_metadata_cache_as::<ReleaseTimeMetadata>(
+                &client.npm_direct_release_times_cache_key(npm_name),
+            )
             .is_some(),
         "304 should refresh the release-time cache freshness"
     );
@@ -824,7 +896,7 @@ async fn direct_npm_full_refetch_ignores_fresh_cache_and_overwrites_it() {
     assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
     assert_eq!(
         client
-            .read_metadata_cache(&format!("npm-full:{npm_name}"))
+            .read_metadata_cache(&client.npm_direct_full_metadata_cache_key(npm_name))
             .and_then(|(metadata, _etag)| metadata.latest_version),
         Some("2.0.0".to_string())
     );
@@ -860,7 +932,7 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
 
     client.get_npm_metadata_direct(npm_name).await.unwrap();
     let cache_path = client
-        .cache_path(&format!("npm:{npm_name}"))
+        .cache_path(&client.npm_direct_metadata_cache_key(npm_name))
         .expect("cache path should exist");
     let mut corrupted_content = Vec::new();
     corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
@@ -868,7 +940,7 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
     corrupted_content.push(b'\n');
     corrupted_content.extend_from_slice(b"not-valid-metadata");
     std::fs::write(&cache_path, corrupted_content).unwrap();
-    expire_cache_entry(&client, &format!("npm:{npm_name}"));
+    expire_cache_entry(&client, &client.npm_direct_metadata_cache_key(npm_name));
 
     server.reset().await;
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -902,7 +974,7 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         client
-            .read_cache_content(&format!("npm:{npm_name}"))
+            .read_cache_content(&client.npm_direct_metadata_cache_key(npm_name))
             .unwrap()
             .etag
             .as_deref(),
@@ -934,7 +1006,7 @@ async fn proxy_only_metadata_etag_304_revalidation_refreshes_cache() {
         .get_npm_package_metadata_proxy_only(npm_name)
         .await
         .unwrap();
-    expire_cache_entry(&client, &format!("npm:{npm_name}"));
+    expire_cache_entry(&client, &client.npm_proxy_only_metadata_cache_key(npm_name));
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -1128,7 +1200,7 @@ async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
     client.get_package_metadata(&name).await.unwrap();
 
     let cache_path = client
-        .cache_path(&format!("lpm:{pkg_name}"))
+        .cache_path(&client.lpm_metadata_cache_key(pkg_name))
         .expect("cache path should exist");
     // Synthesize a magic-valid but undeserializable cache entry.
     // Magic passes → ETag extracted → payload fails msgpack/JSON decode
@@ -1203,7 +1275,7 @@ async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         client
-            .read_cache_content(&format!("lpm:{pkg_name}"))
+            .read_cache_content(&client.lpm_metadata_cache_key(pkg_name))
             .unwrap()
             .etag
             .as_deref(),
@@ -1239,7 +1311,7 @@ async fn npm_etag_304_with_undecodable_cached_payload_refetches_proxy_metadata()
     client.get_npm_package_metadata(npm_name).await.unwrap();
 
     let cache_path = client
-        .cache_path(&format!("npm:{npm_name}"))
+        .cache_path(&client.npm_worker_metadata_cache_key(npm_name))
         .expect("npm cache path should exist");
     // Same shape as the matching synthesizer above (magic + ETag +
     // undeserializable bytes) applied to the npm proxy path.
@@ -1312,7 +1384,7 @@ async fn npm_etag_304_with_undecodable_cached_payload_refetches_proxy_metadata()
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         client
-            .read_cache_content(&format!("npm:{npm_name}"))
+            .read_cache_content(&client.npm_worker_metadata_cache_key(npm_name))
             .unwrap()
             .etag
             .as_deref(),
@@ -1348,7 +1420,7 @@ async fn etag_revalidation_retries_429_and_keeps_conditional_header() {
 
     client.get_package_metadata(&name).await.unwrap();
 
-    if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1439,7 +1511,7 @@ async fn npm_etag_revalidation_retries_503_and_keeps_conditional_header() {
 
     client.get_npm_package_metadata(npm_name).await.unwrap();
 
-    if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.npm_worker_metadata_cache_key(npm_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1529,7 +1601,7 @@ async fn npm_etag_revalidation_exhausts_429_and_returns_rate_limited() {
 
     client.get_npm_package_metadata(npm_name).await.unwrap();
 
-    if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.npm_worker_metadata_cache_key(npm_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1604,7 +1676,7 @@ async fn npm_etag_revalidation_exhausts_503_and_returns_http_error() {
 
     client.get_npm_package_metadata(npm_name).await.unwrap();
 
-    if let Some(cache_path) = client.cache_path(&format!("npm:{npm_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.npm_worker_metadata_cache_key(npm_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1681,7 +1753,7 @@ async fn etag_revalidation_exhausts_429_and_returns_rate_limited() {
 
     client.get_package_metadata(&name).await.unwrap();
 
-    if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1757,7 +1829,7 @@ async fn etag_revalidation_exhausts_503_and_returns_http_error() {
 
     client.get_package_metadata(&name).await.unwrap();
 
-    if let Some(cache_path) = client.cache_path(&format!("lpm:{pkg_name}")) {
+    if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name)) {
         let past = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2042,9 +2114,13 @@ fn invalidate_npm_version_metadata_cache_removes_exact_doc_entry() {
     let metadata: PackageMetadata =
         serde_json::from_str(&test_metadata_json(package_name)).expect("parse test metadata");
 
-    client.write_metadata_cache(&format!("npm:{package_name}"), &metadata, None);
     client.write_metadata_cache(
-        &format!("npm-version:{package_name}@{version}"),
+        &client.npm_direct_metadata_cache_key(package_name),
+        &metadata,
+        None,
+    );
+    client.write_metadata_cache(
+        &client.npm_direct_version_metadata_cache_key(package_name, version),
         &metadata,
         None,
     );
@@ -2053,13 +2129,15 @@ fn invalidate_npm_version_metadata_cache_removes_exact_doc_entry() {
 
     assert!(
         client
-            .read_metadata_cache(&format!("npm-version:{package_name}@{version}"))
+            .read_metadata_cache(
+                &client.npm_direct_version_metadata_cache_key(package_name, version),
+            )
             .is_none(),
         "exact version metadata cache entry should be removed"
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm:{package_name}"))
+            .read_metadata_cache(&client.npm_direct_metadata_cache_key(package_name))
             .is_some(),
         "package metadata cache entry should remain separate"
     );

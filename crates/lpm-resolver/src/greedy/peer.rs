@@ -114,7 +114,9 @@ fn find_version_satisfying_all(
 ) -> Option<NpmVersion> {
     for v in &info.versions {
         // Every requirement's range must accept this version.
-        if !reqs.iter().all(|r| r.range.satisfies(v)) {
+        if !reqs.iter().all(|requirement| {
+            requirement.provider_source.is_none() && requirement.range.satisfies(v)
+        }) {
             continue;
         }
         // Platform filter — same gate the regular dep path uses, so
@@ -180,7 +182,7 @@ fn find_version_satisfying_most<'a>(
         let mut hits = 0usize;
         let mut misses: Vec<usize> = Vec::new();
         for &i in &required_indices {
-            if reqs[i].range.satisfies(v) {
+            if reqs[i].provider_source.is_none() && reqs[i].range.satisfies(v) {
                 hits += 1;
             } else {
                 misses.push(i);
@@ -211,12 +213,31 @@ fn group_satisfied_by_existing(
     canonical: &CanonicalKey,
     reqs: &[&PeerRequirement],
 ) -> bool {
-    let Some(nodes) = state.resolved.get(canonical) else {
-        return false;
-    };
-    nodes
-        .iter()
-        .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+    let canonical_name = canonical.to_string();
+    if state.explicit_peer_providers.iter().any(|provider| {
+        reqs.iter().all(|requirement| {
+            provider.local_name == requirement.peer_name
+                && requirement.provider_source.as_ref().map_or_else(
+                    || {
+                        provider.package_name == canonical_name
+                            && provider
+                                .parsed_version()
+                                .is_some_and(|version| requirement.range.satisfies(version))
+                    },
+                    |required_source| required_source.matches_provider(&provider.source),
+                )
+        })
+    }) {
+        return true;
+    }
+
+    state.resolved.get(canonical).is_some_and(|nodes| {
+        nodes.iter().any(|(version, _)| {
+            reqs.iter().all(|requirement| {
+                requirement.provider_source.is_none() && requirement.range.satisfies(version)
+            })
+        })
+    })
 }
 
 pub(super) fn peer_resolution_cache_key(
@@ -225,7 +246,11 @@ pub(super) fn peer_resolution_cache_key(
 ) -> PeerResolutionCacheKey {
     let mut parent_peers: Vec<(String, String, bool)> = Vec::with_capacity(reqs.len());
     for req in reqs {
-        parent_peers.push((req.peer_name.clone(), req.range.to_string(), req.optional));
+        parent_peers.push((
+            req.peer_name.clone(),
+            req.raw_specifier.clone(),
+            req.optional,
+        ));
     }
     parent_peers.sort();
 
@@ -258,7 +283,9 @@ fn unsatisfied_required_consumers(
     chosen: &NpmVersion,
 ) -> Vec<(String, String)> {
     reqs.iter()
-        .filter(|req| !req.optional && !req.range.satisfies(chosen))
+        .filter(|req| {
+            !req.optional && (req.provider_source.is_some() || !req.range.satisfies(chosen))
+        })
         .map(|req| peer_conflict_consumer_entry(state, req))
         .collect()
 }
@@ -279,7 +306,7 @@ fn peer_conflict_consumer_entry(state: &ResolveState, req: &PeerRequirement) -> 
         .nodes
         .get(req.consumer as usize)
         .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
-    (consumer_canonical, req.range.to_string())
+    (consumer_canonical, req.raw_specifier.clone())
 }
 
 /// One peer-drain pass.
@@ -341,12 +368,14 @@ pub(super) fn pick_peer_prefetch_candidates(
         if reqs.iter().all(|r| r.optional) {
             continue;
         }
-        // Already satisfied by an existing node in the resolved tree.
-        if let Some(nodes) = state.resolved.get(canonical)
-            && nodes
-                .iter()
-                .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+        if reqs
+            .iter()
+            .any(|r| !r.optional && !r.install_source.is_registry())
         {
+            continue;
+        }
+        // Already satisfied by an existing node in the resolved tree.
+        if group_satisfied_by_existing(state, canonical, &reqs) {
             continue;
         }
         // Manifest already in cache — drain pass will hit the fast
@@ -394,19 +423,26 @@ where
         return Ok(Vec::new());
     }
 
-    // Group by canonical, deterministically. The HashMap walk would
+    // Group by local peer slot and canonical target, deterministically. The HashMap walk would
     // produce non-reproducible synthesis order; collect-then-sort
     // gives byte-identical lockfile output across runs.
-    let mut grouped: HashMap<CanonicalKey, Vec<PeerRequirement>> = HashMap::new();
+    let mut grouped: HashMap<(String, CanonicalKey), Vec<PeerRequirement>> = HashMap::new();
     for req in pending {
-        grouped.entry(req.canonical.clone()).or_default().push(req);
+        grouped
+            .entry((req.peer_name.clone(), req.canonical.clone()))
+            .or_default()
+            .push(req);
     }
-    let mut canonicals: Vec<CanonicalKey> = grouped.keys().cloned().collect();
-    canonicals.sort_by_key(|c| c.to_string());
+    let mut group_keys: Vec<(String, CanonicalKey)> = grouped.keys().cloned().collect();
+    group_keys.sort_by(|left, right| {
+        (left.0.as_str(), left.1.to_string()).cmp(&(right.0.as_str(), right.1.to_string()))
+    });
 
     let mut synthesized: Vec<Edge> = Vec::new();
-    for canonical in canonicals {
-        let reqs_owned = grouped.remove(&canonical).expect("just collected key");
+    for (peer_name, canonical) in group_keys {
+        let reqs_owned = grouped
+            .remove(&(peer_name.clone(), canonical.clone()))
+            .expect("just collected key");
         let reqs: Vec<&PeerRequirement> = reqs_owned.iter().collect();
 
         let outcome = classify_peer_group(
@@ -424,6 +460,7 @@ where
             PeerDrainOutcome::Synthesize { chosen } => {
                 synthesize_ambient_edge(
                     state,
+                    &peer_name,
                     &canonical,
                     &chosen,
                     reqs_owned.len(),
@@ -436,6 +473,7 @@ where
             } => {
                 synthesize_ambient_edge(
                     state,
+                    &peer_name,
                     &canonical,
                     &chosen,
                     reqs_owned.len(),
@@ -479,6 +517,7 @@ where
 /// satisfies-most fallback so both paths produce byte-identical edges.
 fn synthesize_ambient_edge(
     state: &mut ResolveState,
+    peer_name: &str,
     canonical: &CanonicalKey,
     chosen: &NpmVersion,
     consumer_count: usize,
@@ -493,7 +532,7 @@ fn synthesize_ambient_edge(
     let canonical_name = canonical.to_string();
     out.push(Edge {
         parent: 0,
-        local_name: canonical_name.clone(),
+        local_name: peer_name.to_string(),
         canonical: canonical.clone(),
         range: exact_range,
         behavior: DepBehavior {
@@ -502,7 +541,12 @@ fn synthesize_ambient_edge(
             optional: false,
         },
     });
-    state.ambient_peer_installs.push(canonical_name);
+    if peer_name != canonical_name {
+        state
+            .root_aliases
+            .insert(peer_name.to_string(), canonical_name);
+    }
+    state.ambient_peer_installs.push(peer_name.to_string());
     tracing::debug!(
         "ambient-install: {} @ {} (consumers: {})",
         canonical,
@@ -536,6 +580,42 @@ where
     // `auto_install_peers = false`.
     let any_required = reqs.iter().any(|r| !r.optional);
     if !any_required || !auto_install_peers {
+        return Ok(PeerDrainOutcome::SkippedOptOut);
+    }
+
+    let canonical_name = canonical.to_string();
+    let has_explicit_root_registry_provider = state
+        .resolved
+        .get(canonical)
+        .is_some_and(|versions| !versions.is_empty())
+        && reqs.first().is_some_and(|requirement| {
+            state.root_deps.contains_key(&requirement.peer_name)
+                && state
+                    .root_aliases
+                    .get(&requirement.peer_name)
+                    .is_none_or(|target| target == &canonical_name)
+        });
+    if let Some(requirement) = reqs.iter().find(|requirement| {
+        !requirement.optional
+            && !requirement.install_source.is_registry()
+            && (requirement.provider_source.is_some() || !has_explicit_root_registry_provider)
+    }) && let Some((scheme, specifier)) = requirement.install_source.unsupported_details()
+    {
+        let consumer = state.nodes.get(requirement.consumer as usize).map_or_else(
+            || "<unknown>".to_string(),
+            |node| format!("{}@{}", node.canonical, node.version),
+        );
+        return Err(ResolveError::UnsupportedPeerAutoInstallSource {
+            consumer,
+            peer: requirement.peer_name.clone(),
+            specifier: specifier.to_string(),
+            scheme: scheme.to_string(),
+        });
+    }
+    if reqs
+        .iter()
+        .any(|requirement| !requirement.optional && !requirement.install_source.is_registry())
+    {
         return Ok(PeerDrainOutcome::SkippedOptOut);
     }
 
@@ -586,7 +666,7 @@ where
                     .nodes
                     .get(r.consumer as usize)
                     .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
-                (consumer_canonical, r.range.to_string(), r.optional)
+                (consumer_canonical, r.raw_specifier.clone(), r.optional)
             })
             .collect(),
     })

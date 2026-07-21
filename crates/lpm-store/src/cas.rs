@@ -107,17 +107,15 @@ impl PackageStore {
             "tarball:{}",
             integrity_sri.chars().take(24).collect::<String>()
         );
-        self.store_at_dir(dir, &label, tarball_data)
+        self.store_at_dir_with_integrity(dir, &label, tarball_data, integrity_sri)
     }
 
     /// Extract a local-file tarball into the content-addressable
     /// `tarball-local` CAS path keyed by content SHA-256.
     ///
     /// Mirrors [`Self::store_tarball_at_cas_path`] but routes through
-    /// [`Self::tarball_local_store_path`]. All TOCTOU + integrity +
-    /// behavioral-analysis machinery is shared via [`Self::store_at_dir`]
-    /// — `.integrity` and `.lpm-security.json` are written in the same
-    /// atomic-rename window.
+    /// [`Self::tarball_local_store_path`]. The `.integrity` sidecar retains
+    /// the SHA-256 identity used by the local CAS key and lockfile.
     ///
     /// `content_sha256_hex` MUST be the lowercase-hex SHA-256 of
     /// `tarball_data` — caller's responsibility (same contract as
@@ -139,7 +137,8 @@ impl PackageStore {
             "local-tarball:sha256-{}",
             &content_sha256_hex[..16.min(content_sha256_hex.len())]
         );
-        self.store_at_dir(dir, &label, tarball_data)
+        let integrity = Integrity::from_bytes(HashAlgorithm::Sha256, tarball_data).to_string();
+        self.store_at_dir_with_integrity(dir, &label, tarball_data, &integrity)
     }
 }
 
@@ -307,9 +306,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PackageStore::at(dir.path());
         let tarball = create_test_tarball(&[("package.json", b"{}")]);
-        let sri = sha512_sri(&tarball);
+        let sri = sha256_sri(&tarball);
         let path = store.store_tarball_at_cas_path(&sri, &tarball).unwrap();
-        assert!(path.join(".integrity").exists());
+        assert_eq!(
+            std::fs::read_to_string(path.join(".integrity")).unwrap(),
+            sri
+        );
     }
 
     #[test]
@@ -603,7 +605,10 @@ mod tests {
         let path = store
             .store_local_tarball_at_cas_path(&hex, &tarball)
             .unwrap();
-        assert!(path.join(".integrity").exists());
+        assert_eq!(
+            std::fs::read_to_string(path.join(".integrity")).unwrap(),
+            sha256_sri(&tarball)
+        );
         assert!(path.join(".lpm-security.json").exists());
     }
 

@@ -12,11 +12,12 @@ use std::collections::HashMap;
 /// "trustedDependencies": ["esbuild", "sharp"]
 /// ```
 ///
-/// **Rich** (version-bound map):
+/// **Rich** (source/content-bound map):
 ///
 /// ```json
 /// "trustedDependencies": {
-///   "esbuild@0.25.1": {
+///   "esbuild@0.25.1#<identity-token>": {
+///     "source": "registry+https://registry.npmjs.org",
 ///     "integrity": "sha512-...",
 ///     "scriptHash": "sha256-..."
 ///   }
@@ -29,8 +30,8 @@ use std::collections::HashMap;
 ///   matters — the array form is tried first because it's strictly more
 ///   restrictive (an array can never be confused for a map).
 /// - **Write:** `lpm approve-scripts` upgrades any Legacy variant to Rich on
-///   the first new approval. The `lpm rebuild` strict gate accepts both forms;
-///   legacy bare-name entries match by name only and produce a deprecation warning.
+///   the first new approval. Legacy bare-name entries remain readable and
+///   reviewable, but cannot authorize lifecycle execution without an exact hash.
 /// - **Coexistence:** a manifest stays in the Legacy form until the first
 ///   approval is made through `lpm approve-scripts`, at which point it
 ///   migrates to the Rich form and stays there. There is no downgrade path.
@@ -41,12 +42,12 @@ use std::collections::HashMap;
 #[serde(untagged)]
 pub enum TrustedDependencies {
     /// Legacy form: `["esbuild", "sharp"]`. Bare package names with no
-    /// version, integrity, or script hash binding. The strict gate accepts
-    /// these as `LegacyNameOnly` matches with a deprecation warning.
+    /// version, integrity, or script hash binding. The strict gate surfaces
+    /// these as `LegacyNameOnly` migration matches, never executable trust.
     Legacy(Vec<String>),
-    /// Rich form: `{"esbuild@0.25.1": {integrity, scriptHash}}`. The key
-    /// is `name@version`; the value is the integrity + scriptHash binding
-    /// metadata.
+    /// Rich form: `{"esbuild@0.25.1#<identity-token>": {source,
+    /// integrity, scriptHash}}`. New keys bind source, integrity, and lifecycle
+    /// content. Legacy `name@version` keys remain readable for migration.
     Rich(HashMap<String, TrustedDependencyBinding>),
 }
 
@@ -58,12 +59,14 @@ pub use lpm_common::{ProvenanceSnapshot, ProvenanceStatus};
 
 /// Binding metadata for one entry in a Rich `trustedDependencies` map.
 ///
-/// Both fields are `Option<String>` because approvals from the legacy upgrade
-/// path carry no integrity or script hash (the user approved by name only).
-/// When `lpm approve-scripts` writes a new approval, both fields are populated
-/// from the install-time blocked-set in `<project_dir>/.lpm/build-state.json`.
+/// Source, integrity, and script hash are optional because approvals from the
+/// legacy upgrade path may carry no binding metadata. New approvals populate
+/// every available field from `<project_dir>/.lpm/build-state.json`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrustedDependencyBinding {
+    /// Exact lockfile source used for the approved installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// SRI integrity hash from the lockfile (e.g., `"sha512-..."`).
     /// Mirrors `LockedPackage::integrity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,13 +179,15 @@ impl Default for TrustedDependencies {
 /// persists onto a [`TrustedDependencyBinding`] via
 /// [`TrustedDependencies::approve_with_metadata`].
 ///
-/// All fields are `Option` because each degrades independently to "not
-/// captured" under offline or fetch-error conditions; downstream gates
-/// treat `None` as "no signal, don't claim drift."
+/// Fields are optional because capture can run offline or encounter an
+/// unreadable package. Missing advisory metadata is treated as no signal, but
+/// a missing script hash can never produce durable strict trust.
 ///
 /// All fields are sourced from the matching candidate `BlockedPackage`.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalMetadata {
+    /// Exact lockfile source used for installation.
+    pub source: Option<String>,
     /// SRI integrity hash from the lockfile.
     pub integrity: Option<String>,
     /// Deterministic script hash from
@@ -214,14 +219,14 @@ pub struct ApprovalMetadata {
 /// See [`TrustedDependencies::matches_strict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustMatch {
-    /// Rich entry with all four fields equal to the queried values.
+    /// Rich entry with the exact source/content key and matching binding.
     /// `lpm rebuild` runs the script.
     Strict,
     /// Name appears in a Legacy `Vec<String>` entry. `lpm rebuild` runs the
     /// script with a deprecation warning suggesting `lpm approve-scripts` to
     /// upgrade to a strict binding.
     LegacyNameOnly,
-    /// Rich entry exists for this `name@version` but at least one of
+    /// Rich entry exists for this identity but at least one of
     /// `integrity` / `script_hash` differs from the queried values.
     /// `lpm rebuild` SKIPS the script and surfaces the drift to the user.
     BindingDrift {
@@ -236,27 +241,121 @@ pub enum TrustMatch {
 }
 
 impl TrustedDependencies {
-    /// Trust-store key format used by the Rich variant: `"name@version"`.
-    /// Centralized so any new code path produces the same key without
-    /// re-implementing the format.
+    /// Backward-compatible coordinate-only Rich key format.
     pub fn rich_key(name: &str, version: &str) -> String {
         format!("{name}@{version}")
+    }
+
+    /// Stable identity token for source-qualified Rich entries.
+    pub fn rich_identity_token(
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<String> {
+        if source.is_none() && integrity.is_none() && script_hash.is_none() {
+            return None;
+        }
+        let source = source.unwrap_or_default().as_bytes();
+        let integrity = integrity.unwrap_or_default().as_bytes();
+        let script_hash = script_hash.unwrap_or_default().as_bytes();
+        let mut identity =
+            Vec::with_capacity(24 + source.len() + integrity.len() + script_hash.len());
+        identity.extend_from_slice(&(source.len() as u64).to_be_bytes());
+        identity.extend_from_slice(source);
+        identity.extend_from_slice(&(integrity.len() as u64).to_be_bytes());
+        identity.extend_from_slice(integrity);
+        identity.extend_from_slice(&(script_hash.len() as u64).to_be_bytes());
+        identity.extend_from_slice(script_hash);
+        let digest = lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha256,
+            &identity,
+        );
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut token = String::with_capacity(digest.hash.len() * 2);
+        for byte in digest.hash {
+            token.push(HEX[(byte >> 4) as usize] as char);
+            token.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Some(token)
+    }
+
+    /// Rich key for one exact install identity. Coordinate-only keys remain
+    /// the backward-compatible representation when no source or integrity is
+    /// available.
+    pub fn rich_key_for_identity(
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> String {
+        match Self::rich_identity_token(source, integrity, script_hash) {
+            Some(token) => format!("{name}@{version}#{token}"),
+            None => Self::rich_key(name, version),
+        }
+    }
+
+    fn parse_rich_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
+        let (name, version_and_identity) = key.rsplit_once('@')?;
+        let (version, identity) = version_and_identity
+            .split_once('#')
+            .map_or((version_and_identity, None), |(version, identity)| {
+                (version, Some(identity))
+            });
+        Some((name, version, identity))
+    }
+
+    fn binding_for_map<'a>(
+        map: &'a HashMap<String, TrustedDependencyBinding>,
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<&'a TrustedDependencyBinding> {
+        let identity_key =
+            Self::rich_key_for_identity(name, version, source, integrity, script_hash);
+        let coordinate_key = Self::rich_key(name, version);
+        if let Some(binding) = map.get(&identity_key) {
+            return Some(binding);
+        }
+        if identity_key != coordinate_key
+            && let Some(binding) = map.get(&coordinate_key)
+            && binding_source_matches(binding.source.as_deref(), source)
+        {
+            return Some(binding);
+        }
+
+        map.iter()
+            .filter(|(key, binding)| {
+                key.as_str()
+                    == Self::rich_key_for_identity(
+                        name,
+                        version,
+                        binding.source.as_deref(),
+                        binding.integrity.as_deref(),
+                        binding.script_hash.as_deref(),
+                    )
+                    && binding_source_matches(binding.source.as_deref(), source)
+                    && binding.integrity.as_deref() == integrity
+            })
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, binding)| binding)
     }
 
     /// Strict trust query — the default gate for `lpm rebuild`.
     ///
     /// Returns:
     /// - [`TrustMatch::Strict`] if the Rich variant has a `name@version`
-    ///   entry whose stored `integrity` and `script_hash` BOTH equal the
-    ///   queried values. `None` on either side counts as "no constraint" —
-    ///   intentional for the legacy-upgrade path where a Rich entry was
-    ///   inserted before the binding fields were known.
+    ///   entry whose stored integrity, when present, matches the queried
+    ///   integrity and whose concrete `script_hash` equals the queried hash.
+    ///   A missing script hash can never grant durable trust.
     /// - [`TrustMatch::BindingDrift`] if a Rich entry exists for the
     ///   `name@version` key but at least one binding field is set on BOTH
     ///   sides and they differ.
     /// - [`TrustMatch::LegacyNameOnly`] if and only if the Legacy
     ///   `Vec<String>` variant contains the bare `name` string. Caller
-    ///   should warn about deprecation.
+    ///   should keep the package blocked and offer migration.
     /// - [`TrustMatch::NotTrusted`] otherwise.
     ///
     /// **`<name>@*` Rich-form sentinels are NOT honored by this strict
@@ -272,9 +371,8 @@ impl TrustedDependencies {
     /// script_hash checks. The user is forced through `lpm approve-scripts`
     /// on each new version, which writes a concrete `name@version`
     /// entry that closes the loop. `Vec<String>` legacy form is
-    /// preserved as `LegacyNameOnly` because that shape is an explicit
-    /// user-authored decision in the manifest, distinct from the
-    /// auto-generated `@*` sentinel.
+    /// preserved as `LegacyNameOnly` so it can be migrated without granting
+    /// executable trust.
     ///
     /// **Lookup precedence:** concrete `name@version` Rich keys are the
     /// only Rich-form keys that participate in the strict trust decision.
@@ -284,6 +382,20 @@ impl TrustedDependencies {
         &self,
         name: &str,
         version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> TrustMatch {
+        self.matches_strict_for_identity(name, version, None, integrity, script_hash)
+    }
+
+    /// Source-qualified strict trust query used by install and lifecycle
+    /// enforcement. Exact identity entries win; legacy coordinate-only Rich
+    /// entries remain readable as a compatibility fallback.
+    pub fn matches_strict_for_identity(
+        &self,
+        name: &str,
+        version: &str,
+        source: Option<&str>,
         integrity: Option<&str>,
         script_hash: Option<&str>,
     ) -> TrustMatch {
@@ -303,19 +415,23 @@ impl TrustedDependencies {
                 // package under the inherited name-only approval. See the
                 // method docstring for the cross-version trust laundering
                 // rationale.
-                let concrete_key = Self::rich_key(name, version);
-                if let Some(stored) = map.get(&concrete_key) {
-                    // Field-by-field check. A None field on either side is
-                    // a wildcard — only mismatches between two SET values
-                    // count as drift. Legacy-upgrade-friendly contract.
+                if let Some(stored) =
+                    Self::binding_for_map(map, name, version, source, integrity, script_hash)
+                {
+                    // Integrity may be absent for local sources, where the
+                    // source-qualified package key and script hash provide the
+                    // reusable identity. A script hash is never optional for a
+                    // durable grant: without one, changed executable content
+                    // cannot be distinguished from the approved bytes.
                     let integrity_drift = matches!(
                         (stored.integrity.as_deref(), integrity),
                         (Some(s), Some(q)) if s != q
                     );
-                    let script_hash_drift = matches!(
-                        (stored.script_hash.as_deref(), script_hash),
-                        (Some(s), Some(q)) if s != q
-                    );
+                    let script_hash_drift = stored
+                        .script_hash
+                        .as_deref()
+                        .zip(script_hash)
+                        .is_none_or(|(stored_hash, current_hash)| stored_hash != current_hash);
 
                     if integrity_drift || script_hash_drift {
                         return TrustMatch::BindingDrift {
@@ -337,12 +453,9 @@ impl TrustedDependencies {
     pub fn contains_name_lenient(&self, name: &str) -> bool {
         match self {
             TrustedDependencies::Legacy(names) => names.iter().any(|n| n == name),
-            TrustedDependencies::Rich(map) => map.keys().any(|k| {
-                // Match the part before `@version`, handling scoped
-                // packages (`@scope/name@version`) by finding the LAST `@`.
-                k.rfind('@')
-                    .map_or_else(|| k == name, |at| &k[..at] == name)
-            }),
+            TrustedDependencies::Rich(map) => map
+                .keys()
+                .any(|key| Self::parse_rich_key(key).is_some_and(|(n, _, _)| n == name)),
         }
     }
 
@@ -361,10 +474,19 @@ impl TrustedDependencies {
     /// - Legacy entries: returns `None` — the legacy form has no binding.
     ///   Callers treat `None` as "legacy approval, no capability hash stored,"
     ///   which collapses via `is_approved_by` to the baseline-only semantic.
-    pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
+    pub fn get_binding(
+        &self,
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<&TrustedDependencyBinding> {
         match self {
             TrustedDependencies::Legacy(_) => None,
-            TrustedDependencies::Rich(map) => map.get(&Self::rich_key(name, version)),
+            TrustedDependencies::Rich(map) => {
+                Self::binding_for_map(map, name, version, source, integrity, script_hash)
+            }
         }
     }
 
@@ -377,11 +499,8 @@ impl TrustedDependencies {
         match self {
             TrustedDependencies::Legacy(names) => Box::new(names.iter().map(|n| (n.clone(), None))),
             TrustedDependencies::Rich(map) => Box::new(map.iter().map(|(k, v)| {
-                // For Rich entries, the user-facing "name" is the part
-                // BEFORE the `@version` so callers can group by package.
-                let name = k
-                    .rfind('@')
-                    .map_or_else(|| k.clone(), |at| k[..at].to_string());
+                let name = Self::parse_rich_key(k)
+                    .map_or_else(|| k.clone(), |(name, _, _)| name.to_string());
                 (name, Some(v))
             })),
         }
@@ -430,6 +549,7 @@ impl TrustedDependencies {
             map.insert(
                 key,
                 TrustedDependencyBinding {
+                    source: None,
                     integrity: None,
                     script_hash: None,
                     provenance_at_approval: None,
@@ -445,9 +565,10 @@ impl TrustedDependencies {
     }
 
     /// Insert a new approval entry, upgrading the variant to Rich if
-    /// needed. The key is `name@version`; an existing entry for the same
-    /// key is OVERWRITTEN (the new binding wins). Returns whether the
-    /// previous entry existed.
+    /// needed. Exact identities use `name@version#identity`; metadata-free
+    /// compatibility entries retain `name@version`. An existing entry for
+    /// the same identity is overwritten. Returns whether the previous entry
+    /// existed.
     ///
     /// Metadata-agnostic variant — persists `provenance_at_approval`,
     /// `behavioral_tags_hash`, and `behavioral_tags` as `None`. Production
@@ -465,6 +586,7 @@ impl TrustedDependencies {
             name,
             version,
             ApprovalMetadata {
+                source: None,
                 integrity,
                 script_hash,
                 provenance_at_approval: None,
@@ -495,21 +617,33 @@ impl TrustedDependencies {
         let TrustedDependencies::Rich(map) = self else {
             unreachable!("upgrade_to_rich left us in Rich state")
         };
-        let key = Self::rich_key(name, version);
-        map.insert(
-            key,
-            TrustedDependencyBinding {
-                integrity: meta.integrity,
-                script_hash: meta.script_hash,
-                provenance_at_approval: meta.provenance_at_approval,
-                behavioral_tags_hash: meta.behavioral_tags_hash,
-                behavioral_tags: meta.behavioral_tags,
-                // `None` is valid: baseline approval with no extras requested.
-                // The match rule interprets `None` as "approved baseline only."
-                capability_hash: meta.capability_hash,
-            },
-        )
-        .is_some()
+        let key = Self::rich_key_for_identity(
+            name,
+            version,
+            meta.source.as_deref(),
+            meta.integrity.as_deref(),
+            meta.script_hash.as_deref(),
+        );
+        let coordinate_key = Self::rich_key(name, version);
+        let migrated_coordinate_binding =
+            key != coordinate_key && map.remove(&coordinate_key).is_some();
+        let replaced_identity_binding = map
+            .insert(
+                key,
+                TrustedDependencyBinding {
+                    source: meta.source,
+                    integrity: meta.integrity,
+                    script_hash: meta.script_hash,
+                    provenance_at_approval: meta.provenance_at_approval,
+                    behavioral_tags_hash: meta.behavioral_tags_hash,
+                    behavioral_tags: meta.behavioral_tags,
+                    // `None` is valid: baseline approval with no extras requested.
+                    // The match rule interprets `None` as "approved baseline only."
+                    capability_hash: meta.capability_hash,
+                },
+            )
+            .is_some();
+        migrated_coordinate_binding || replaced_identity_binding
     }
 
     /// Find the provenance-bearing approval entry for this package name whose
@@ -542,7 +676,7 @@ impl TrustedDependencies {
         };
         map.iter()
             .filter_map(|(key, binding)| {
-                let (n, v) = key.rsplit_once('@')?;
+                let (n, v, _) = Self::parse_rich_key(key)?;
                 if n == name && binding.provenance_at_approval.is_some() {
                     Some((v, binding))
                 } else {
@@ -566,33 +700,54 @@ impl TrustedDependencies {
         name: &str,
         candidate_version: &str,
     ) -> Option<(&str, &TrustedDependencyBinding)> {
+        self.provenance_reference_for_candidate_identity(name, candidate_version, None, None)
+    }
+
+    /// Source-qualified provenance reference selection.
+    pub fn provenance_reference_for_candidate_identity(
+        &self,
+        name: &str,
+        candidate_version: &str,
+        candidate_source: Option<&str>,
+        candidate_integrity: Option<&str>,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
 
-        let mut has_exact_binding = false;
-        for (key, binding) in map {
-            let Some((n, v)) = key.rsplit_once('@') else {
-                continue;
-            };
-            if n == name && v == candidate_version {
-                has_exact_binding = true;
-                if binding.provenance_at_approval.is_some() {
-                    return Some((v, binding));
-                }
+        let identity_key = Self::rich_key_for_identity(
+            name,
+            candidate_version,
+            candidate_source,
+            candidate_integrity,
+            None,
+        );
+        let coordinate_key = Self::rich_key(name, candidate_version);
+        let exact = map.get_key_value(&identity_key).or_else(|| {
+            if identity_key == coordinate_key {
+                None
+            } else {
+                map.get_key_value(&coordinate_key).filter(|(_, binding)| {
+                    binding_source_matches(binding.source.as_deref(), candidate_source)
+                })
             }
-        }
-        if has_exact_binding {
-            return None;
+        });
+        if let Some((key, binding)) = exact {
+            let (_, version, _) = Self::parse_rich_key(key)?;
+            return binding
+                .provenance_at_approval
+                .as_ref()
+                .map(|_| (version, binding));
         }
 
         map.iter()
             .filter_map(|(key, binding)| {
-                let (n, v) = key.rsplit_once('@')?;
+                let (n, v, _) = Self::parse_rich_key(key)?;
                 if n == name
                     && v != "*"
                     && version_string_precedes(v, candidate_version)
                     && binding.provenance_at_approval.is_some()
+                    && binding_source_matches(binding.source.as_deref(), candidate_source)
                 {
                     Some((v, binding))
                 } else {
@@ -623,18 +778,32 @@ impl TrustedDependencies {
         name: &str,
         candidate_version: &str,
     ) -> Option<(&str, &TrustedDependencyBinding)> {
+        self.latest_binding_for_candidate(name, candidate_version, None)
+    }
+
+    /// Source-qualified prior binding selection for version-diff rendering.
+    pub fn latest_binding_for_candidate(
+        &self,
+        name: &str,
+        candidate_version: &str,
+        candidate_source: Option<&str>,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
         map.iter()
             .filter_map(|(key, binding)| {
-                let (n, v) = key.rsplit_once('@')?;
+                let (n, v, _) = Self::parse_rich_key(key)?;
                 // Skip the `@*` legacy preserve key: it's a migration
                 // sentinel, not a real approval, and `*` would out-sort
                 // every concrete version under lex-max (`*` > any
                 // digit). Pre-filter so the preserve key can't poison
                 // the reduction.
-                if n == name && v != "*" && version_string_precedes(v, candidate_version) {
+                if n == name
+                    && v != "*"
+                    && version_string_precedes(v, candidate_version)
+                    && binding_source_matches(binding.source.as_deref(), candidate_source)
+                {
                     Some((v, binding))
                 } else {
                     None
@@ -656,11 +825,23 @@ impl TrustedDependencies {
         name: &str,
         version: &str,
     ) -> Option<&TrustedDependencyBinding> {
+        self.binding_for_exact_identity(name, version, None, None, None)
+    }
+
+    /// Look up a source-qualified exact binding with coordinate-only legacy
+    /// fallback.
+    pub fn binding_for_exact_identity(
+        &self,
+        name: &str,
+        version: &str,
+        source: Option<&str>,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<&TrustedDependencyBinding> {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
-        let key = Self::rich_key(name, version);
-        map.get(&key)
+        Self::binding_for_map(map, name, version, source, integrity, script_hash)
     }
 
     /// Remove an approval entry by exact `name@version` key. Returns
@@ -678,6 +859,10 @@ impl TrustedDependencies {
             }
         }
     }
+}
+
+fn binding_source_matches(binding_source: Option<&str>, candidate_source: Option<&str>) -> bool {
+    binding_source == candidate_source
 }
 
 fn parse_version_for_order(version: &str) -> Option<lpm_semver::Version> {
@@ -788,6 +973,29 @@ mod tests {
         TrustedDependencies::Rich(map)
     }
 
+    fn source_integrity_only_key(
+        name: &str,
+        version: &str,
+        source: &str,
+        integrity: &str,
+    ) -> String {
+        let mut identity = Vec::with_capacity(16 + source.len() + integrity.len());
+        identity.extend_from_slice(&(source.len() as u64).to_be_bytes());
+        identity.extend_from_slice(source.as_bytes());
+        identity.extend_from_slice(&(integrity.len() as u64).to_be_bytes());
+        identity.extend_from_slice(integrity.as_bytes());
+        let digest = lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha256,
+            &identity,
+        );
+        let token = digest
+            .hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{name}@{version}#{token}")
+    }
+
     #[test]
     fn matches_strict_returns_strict_for_full_match() {
         let td = rich_with("esbuild@0.25.1", Some("sha512-x"), Some("sha256-y"));
@@ -824,6 +1032,59 @@ mod tests {
     }
 
     #[test]
+    fn source_qualified_binding_reports_drift_when_script_hash_changes() {
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve_with_metadata(
+            "esbuild",
+            "0.25.1",
+            ApprovalMetadata {
+                source: Some("registry+https://registry.npmjs.org".into()),
+                integrity: Some("sha512-content".into()),
+                script_hash: Some("sha256-old".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            trusted.matches_strict_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some("registry+https://registry.npmjs.org"),
+                Some("sha512-content"),
+                Some("sha256-new"),
+            ),
+            TrustMatch::BindingDrift { .. }
+        ));
+    }
+
+    #[test]
+    fn source_integrity_only_identity_key_does_not_authorize_execution() {
+        let source = "registry+https://registry.npmjs.org";
+        let integrity = "sha512-content";
+        let binding = TrustedDependencyBinding {
+            source: Some(source.into()),
+            integrity: Some(integrity.into()),
+            script_hash: Some("sha256-script".into()),
+            ..Default::default()
+        };
+        let trusted = TrustedDependencies::Rich(HashMap::from([(
+            source_integrity_only_key("esbuild", "0.25.1", source, integrity),
+            binding,
+        )]));
+
+        assert_eq!(
+            trusted.matches_strict_for_identity(
+                "esbuild",
+                "0.25.1",
+                Some(source),
+                Some(integrity),
+                Some("sha256-script"),
+            ),
+            TrustMatch::NotTrusted
+        );
+    }
+
+    #[test]
     fn matches_strict_returns_binding_drift_when_integrity_differs() {
         let td = rich_with("esbuild@0.25.1", Some("sha512-old"), Some("sha256-y"));
         let result = td.matches_strict("esbuild", "0.25.1", Some("sha512-new"), Some("sha256-y"));
@@ -851,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_strict_none_query_field_is_wildcard_against_set_stored_field() {
+    fn matches_strict_none_query_integrity_is_wildcard_against_stored_integrity() {
         // If the caller doesn't know the query value (None), and the stored
         // value is set, that's NOT drift — it's "no constraint on the
         // caller side". This is the legacy-upgrade-friendly contract.
@@ -865,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_strict_none_stored_field_is_wildcard_against_set_query_field() {
+    fn matches_strict_none_stored_integrity_is_wildcard_against_query_integrity() {
         // Mirror image: stored binding has no integrity (legacy-upgrade
         // case), caller queries with a concrete integrity. This should
         // be Strict, not Drift, because there's no stored value to drift
@@ -964,27 +1225,145 @@ mod tests {
             panic!("approve must upgrade to Rich");
         };
         assert_eq!(map.len(), 1);
-        let binding = map.get("esbuild@0.25.1").unwrap();
+        let key = TrustedDependencies::rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-x"),
+            Some("sha256-y"),
+        );
+        let binding = map.get(&key).unwrap();
         assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
         assert_eq!(binding.script_hash.as_deref(), Some("sha256-y"));
     }
 
     #[test]
     fn approve_overwrites_existing_entry_with_same_key() {
-        let mut td = rich_with("esbuild@0.25.1", Some("sha512-old"), Some("sha256-old"));
+        let mut td = TrustedDependencies::Legacy(Vec::new());
+        td.approve(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-x".to_string()),
+            Some("sha256-same".to_string()),
+        );
         let was_present = td.approve(
             "esbuild",
             "0.25.1",
-            Some("sha512-new".to_string()),
-            Some("sha256-new".to_string()),
+            Some("sha512-x".to_string()),
+            Some("sha256-same".to_string()),
         );
         assert!(was_present);
         let TrustedDependencies::Rich(map) = &td else {
             panic!("expected Rich");
         };
-        let binding = map.get("esbuild@0.25.1").unwrap();
-        assert_eq!(binding.integrity.as_deref(), Some("sha512-new"));
-        assert_eq!(binding.script_hash.as_deref(), Some("sha256-new"));
+        let key = TrustedDependencies::rich_key_for_identity(
+            "esbuild",
+            "0.25.1",
+            None,
+            Some("sha512-x"),
+            Some("sha256-same"),
+        );
+        let binding = map.get(&key).unwrap();
+        assert_eq!(binding.integrity.as_deref(), Some("sha512-x"));
+        assert_eq!(binding.script_hash.as_deref(), Some("sha256-same"));
+    }
+
+    #[test]
+    fn approve_preserves_distinct_same_coordinate_content_identities() {
+        let mut td = TrustedDependencies::Legacy(vec![]);
+        td.approve(
+            "react",
+            "19.0.0",
+            Some("sha512-source-a".to_string()),
+            Some("sha256-script-a".to_string()),
+        );
+        td.approve(
+            "react",
+            "19.0.0",
+            Some("sha512-source-b".to_string()),
+            Some("sha256-script-b".to_string()),
+        );
+
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("approve must upgrade to Rich");
+        };
+        assert_eq!(
+            map.len(),
+            2,
+            "same-coordinate packages with distinct content identities need independent approvals"
+        );
+    }
+
+    #[test]
+    fn approve_preserves_distinct_sources_with_identical_coordinates_and_integrity() {
+        let mut td = TrustedDependencies::Legacy(Vec::new());
+        for source in ["directory+./fork-a", "directory+./fork-b"] {
+            td.approve_with_metadata(
+                "react",
+                "19.0.0",
+                ApprovalMetadata {
+                    source: Some(source.to_string()),
+                    integrity: Some("sha512-identical".to_string()),
+                    script_hash: Some("sha256-script".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("approve must upgrade to Rich");
+        };
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            td.matches_strict_for_identity(
+                "react",
+                "19.0.0",
+                Some("directory+./fork-a"),
+                Some("sha512-identical"),
+                Some("sha256-script"),
+            ),
+            TrustMatch::Strict,
+        );
+        assert_eq!(
+            td.matches_strict_for_identity(
+                "react",
+                "19.0.0",
+                Some("directory+./unapproved"),
+                Some("sha512-identical"),
+                Some("sha256-script"),
+            ),
+            TrustMatch::NotTrusted,
+        );
+    }
+
+    #[test]
+    fn approve_migrates_legacy_coordinate_binding_to_exact_identity() {
+        let mut td = rich_with("react@19.0.0", Some("sha512-react"), Some("sha256-old"));
+        let was_present = td.approve_with_metadata(
+            "react",
+            "19.0.0",
+            ApprovalMetadata {
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                integrity: Some("sha512-react".to_string()),
+                script_hash: Some("sha256-new".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let TrustedDependencies::Rich(map) = &td else {
+            panic!("expected Rich");
+        };
+        assert!(was_present);
+        assert!(!map.contains_key("react@19.0.0"));
+        assert!(
+            map.contains_key(&TrustedDependencies::rich_key_for_identity(
+                "react",
+                "19.0.0",
+                Some("registry+https://registry.npmjs.org"),
+                Some("sha512-react"),
+                Some("sha256-new"),
+            ))
+        );
     }
 
     /// Legacy `@*` preserve keys remain visible to lenient lookup but do
@@ -1057,6 +1436,21 @@ mod tests {
         // contains_name_lenient still walks the sentinel — used by
         // non-trust-decision surfaces like the deprecation warning.
         assert!(td.contains_name_lenient("esbuild"));
+    }
+
+    #[test]
+    fn matches_strict_rejects_concrete_binding_without_reusable_script_hash() {
+        let mut map = HashMap::new();
+        map.insert(
+            "mutable-local@1.0.0".to_string(),
+            TrustedDependencyBinding::default(),
+        );
+        let td = TrustedDependencies::Rich(map);
+
+        assert!(matches!(
+            td.matches_strict("mutable-local", "1.0.0", None, None),
+            TrustMatch::BindingDrift { .. }
+        ));
     }
 
     /// A scoped package whose only Rich entry is the `@scope/pkg@*`
@@ -1617,5 +2011,52 @@ mod tests {
     fn default_binding_has_no_capability_hash() {
         let b = TrustedDependencyBinding::default();
         assert_eq!(b.capability_hash, None);
+    }
+
+    #[test]
+    fn source_less_rich_binding_does_not_authorize_source_qualified_candidate() {
+        let binding = TrustedDependencyBinding {
+            source: None,
+            integrity: Some("sha512-content".into()),
+            script_hash: Some("sha256-script".into()),
+            ..Default::default()
+        };
+        let trusted = TrustedDependencies::Rich(HashMap::from([(
+            TrustedDependencies::rich_key("shared", "1.0.0"),
+            binding,
+        )]));
+
+        assert_eq!(
+            trusted.matches_strict_for_identity(
+                "shared",
+                "1.0.0",
+                Some("registry+https://registry-b.example"),
+                Some("sha512-content"),
+                Some("sha256-script"),
+            ),
+            TrustMatch::NotTrusted
+        );
+    }
+
+    #[test]
+    fn same_source_content_with_different_script_hashes_are_independently_retained() {
+        let mut trusted = TrustedDependencies::default();
+        for script_hash in ["sha256-script-a", "sha256-script-b"] {
+            trusted.approve_with_metadata(
+                "shared",
+                "1.0.0",
+                ApprovalMetadata {
+                    source: Some("directory+./shared".into()),
+                    integrity: None,
+                    script_hash: Some(script_hash.into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let TrustedDependencies::Rich(bindings) = trusted else {
+            panic!("approval must upgrade storage to rich form");
+        };
+        assert_eq!(bindings.len(), 2);
     }
 }

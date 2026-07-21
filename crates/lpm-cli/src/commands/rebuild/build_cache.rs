@@ -1332,10 +1332,12 @@ mod tests {
         ScriptablePackage {
             name: name.into(),
             version: "1.0.0".into(),
+            source: None,
             integrity: None,
             wrapper_id: None,
             store_path: PathBuf::new(),
             pristine_path: PathBuf::new(),
+            execution_identity: None,
             source_integrity: "sha512-source".into(),
             graph_key_digest: Some("a".repeat(64)),
             scripts: [("postinstall".into(), command.into())]

@@ -33,7 +33,7 @@ fn lpm_isolated() -> (Command, TempDir, TempDir) {
     let lpm_dir = project.path().join(".lpm");
     std::fs::create_dir_all(&lpm_dir).expect("mkdir .lpm");
     let build_state = serde_json::json!({
-        "state_version": 1,
+        "state_version": 3,
         "blocked_set_fingerprint": "sha256-fixture",
         "captured_at": "2026-05-01T00:00:00Z",
         "blocked_packages": [

@@ -26,6 +26,19 @@ impl PackageStore {
         self.store_at_dir(dir, &label, tarball_data)
     }
 
+    /// Extract a registry tarball while preserving its verified declared SRI.
+    pub fn store_package_with_integrity(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_data: &[u8],
+        integrity_sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        let dir = self.package_dir(name, version);
+        let label = format!("{name}@{version}");
+        self.store_at_dir_with_integrity(dir, &label, tarball_data, integrity_sri)
+    }
+
     /// Shared inner extraction logic used by [`Self::store_package`]
     /// and [`Self::store_tarball_at_cas_path`].
     ///
@@ -39,9 +52,22 @@ impl PackageStore {
         label: &str,
         tarball_data: &[u8],
     ) -> Result<PathBuf, LpmError> {
+        let sri = compute_sri_hash(tarball_data);
+        self.store_at_dir_with_integrity(dir, label, tarball_data, &sri)
+    }
+
+    pub(crate) fn store_at_dir_with_integrity(
+        &self,
+        dir: PathBuf,
+        label: &str,
+        tarball_data: &[u8],
+        integrity_sri: &str,
+    ) -> Result<PathBuf, LpmError> {
         // Fast path: already stored
         if dir.exists() {
-            if is_complete_package_dir(&dir) {
+            if is_complete_package_dir(&dir)
+                && crate::read_stored_integrity(&dir).as_deref() == Some(integrity_sri)
+            {
                 tracing::debug!("store hit: {label}");
                 return Ok(dir);
             }
@@ -86,8 +112,7 @@ impl PackageStore {
         // leaves the `.integrity` marker untouched goes undetected. A
         // byte-integrity recompute would need a Merkle digest of the
         // extracted directory + a place to store it; not implemented.
-        let sri = compute_sri_hash(tarball_data);
-        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &sri) {
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), integrity_sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
         }
@@ -107,13 +132,19 @@ impl PackageStore {
             );
         }
 
-        // Atomic rename — if another thread already completed, rename fails (that's OK)
+        // Atomic rename — a concurrent winner is valid only when it published
+        // the same verified source identity.
         match std::fs::rename(&tmp_dir, &dir) {
             Ok(()) => Ok(dir),
             Err(_) if dir.exists() => {
-                // Another thread/process beat us — clean up our temp dir and use theirs
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok(dir)
+                if crate::read_stored_integrity(&dir).as_deref() == Some(integrity_sri) {
+                    Ok(dir)
+                } else {
+                    Err(LpmError::Store(format!(
+                        "concurrent store write for {label} published different integrity"
+                    )))
+                }
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -166,26 +197,21 @@ impl PackageStore {
     /// ```
     ///
     /// ## Integrity contract
-    /// The SHA-512 hash is computed on the raw compressed bytes as they
-    /// flow through — same byte domain the existing
+    /// SHA-512, SHA-256, and SHA-1 are computed on the raw compressed bytes
+    /// as they flow through — the same byte domain the existing
     /// `download_tarball_to_file` path uses. If `expected_integrity` is
-    /// `Some`, the computed SRI string is compared post-extract:
+    /// `Some`, its declared algorithm is compared post-extract:
     /// - Match → atomic rename into the visible store path.
     /// - Mismatch → staging dir is removed, returns `LpmError::Registry`.
     ///
-    /// Unlike `store_package_from_file_timed`, this path does NOT support
-    /// non-sha512 expected-integrity algorithms (e.g. sha256) — we've
-    /// consumed the stream by the time we'd need to re-hash. Callers
-    /// that receive non-sha512 integrity from the registry must use the
-    /// legacy `download_tarball_to_file` + `store_package_from_file_timed`
-    /// path (currently all LPM registry packages publish sha512 SRIs).
-    ///
     /// ## Failure semantics
     /// Any error after staging-dir creation cleans up the staging dir
-    /// before returning. Same atomic rename fallback as the legacy paths:
-    /// a concurrent winner is accepted silently.
+    /// before returning. A concurrent winner is accepted only when its
+    /// integrity sidecar matches the verified source identity.
     ///
-    /// Returns `(store_path, computed_sri, timings)` where `timings`
+    /// Returns `(store_path, source_sri, timings)` where `source_sri` retains
+    /// the verified declared algorithm, or the computed SHA-512 SRI when the
+    /// source did not declare one. `timings`
     /// measures the in-blocking-thread portion only — `download_ms` and
     /// `queue_wait_ms` are owned by the async caller.
     pub fn stream_and_store_package(
@@ -199,23 +225,19 @@ impl PackageStore {
         let dir = self.package_dir(name, version);
         let mut timings = StageTimings::default();
 
-        // Fast path: already stored.
+        // Fast path: already stored with the selected source identity.
         if dir.exists() {
-            if is_complete_package_dir(&dir) {
+            let stored_integrity = crate::read_stored_integrity(&dir);
+            if is_complete_package_dir(&dir)
+                && expected_integrity
+                    .is_some_and(|expected| stored_integrity.as_deref() == Some(expected))
+            {
                 tracing::debug!("store hit: {name}@{version}");
-                // We didn't actually touch the stream — caller must have
-                // pre-checked via `has_package()` to avoid wasted network.
-                // Return the existing on-disk SRI so the caller can still
-                // write a lockfile.
-                let sri = std::fs::read_to_string(dir.join(".integrity"))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                return Ok((dir, sri, timings));
+                return Ok((dir, stored_integrity.unwrap_or_default(), timings));
             }
             std::fs::remove_dir_all(&dir).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                    "failed to remove stale store entry for {name}@{version}: {e}"
                 ))
             })?;
         }
@@ -359,6 +381,7 @@ impl PackageStore {
                 )));
             }
         }
+        let source_sri = expected_integrity.unwrap_or(&computed_sri).to_string();
 
         // Security analysis was fused into the tar walk above. What
         // remains is finalize — read `package.json` from staging (one
@@ -376,7 +399,7 @@ impl PackageStore {
         // Finalize: write integrity, atomic rename.
         let finalize_start = std::time::Instant::now();
         let integrity_write_start = std::time::Instant::now();
-        let integrity_result = std::fs::write(tmp_dir.join(".integrity"), &computed_sri);
+        let integrity_result = std::fs::write(tmp_dir.join(".integrity"), &source_sri);
         timings.finalize_integrity_write_ms = integrity_write_start.elapsed().as_millis();
         if let Err(e) = integrity_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -388,10 +411,16 @@ impl PackageStore {
         timings.finalize_ms = finalize_start.elapsed().as_millis();
 
         match rename_result {
-            Ok(()) => Ok((dir, computed_sri, timings)),
+            Ok(()) => Ok((dir, source_sri, timings)),
             Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok((dir, computed_sri, timings))
+                if crate::read_stored_integrity(&dir).as_deref() == Some(source_sri.as_str()) {
+                    Ok((dir, source_sri, timings))
+                } else {
+                    Err(LpmError::Store(format!(
+                        "concurrent store write for {name}@{version} published different integrity"
+                    )))
+                }
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -419,18 +448,18 @@ impl PackageStore {
         let dir = self.package_dir(name, version);
         let mut timings = StageTimings::default();
 
-        // Fast path: already stored. Callers on the install hot path pre-filter
-        // against `has_package()` so this should never hit; we keep it for the
-        // general-purpose API contract.
+        // Fast path: already stored with the selected source identity.
         if dir.exists() {
-            if is_complete_package_dir(&dir) {
+            if is_complete_package_dir(&dir)
+                && crate::read_stored_integrity(&dir).as_deref() == Some(sri)
+            {
                 tracing::debug!("store hit: {name}@{version}");
                 return Ok((dir, timings));
             }
 
             std::fs::remove_dir_all(&dir).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                    "failed to remove stale store entry for {name}@{version}: {e}"
                 ))
             })?;
         }
@@ -498,7 +527,13 @@ impl PackageStore {
             Ok(()) => Ok((dir, timings)),
             Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok((dir, timings))
+                if crate::read_stored_integrity(&dir).as_deref() == Some(sri) {
+                    Ok((dir, timings))
+                } else {
+                    Err(LpmError::Store(format!(
+                        "concurrent store write for {name}@{version} published different integrity"
+                    )))
+                }
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -989,11 +1024,13 @@ mod tests {
 
         store.store_package("cached", "1.0.0", &tgz).unwrap();
         assert!(store.has_package("cached", "1.0.0"));
+        let stored_integrity =
+            read_stored_integrity(&store.package_dir("cached", "1.0.0")).unwrap();
 
         let mut temp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut temp, &tgz).unwrap();
         let path = store
-            .store_package_from_file("cached", "1.0.0", temp.path(), "sha512-x")
+            .store_package_from_file("cached", "1.0.0", temp.path(), &stored_integrity)
             .unwrap();
 
         assert!(path.join("package.json").exists());

@@ -51,11 +51,17 @@ fn peer_deps_stored_per_version() {
     let mut peer_deps = HashMap::new();
 
     let mut v1_peers = HashMap::new();
-    v1_peers.insert("react".to_string(), "^16".to_string());
+    v1_peers.insert(
+        "react".to_string(),
+        crate::PeerDependencySpec::new("react", "^16"),
+    );
     peer_deps.insert("1.0.0".to_string(), v1_peers);
 
     let mut v2_peers = HashMap::new();
-    v2_peers.insert("react".to_string(), "^18".to_string());
+    v2_peers.insert(
+        "react".to_string(),
+        crate::PeerDependencySpec::new("react", "^18"),
+    );
     peer_deps.insert("2.0.0".to_string(), v2_peers);
 
     let info = CachedPackageInfo {
@@ -82,16 +88,16 @@ fn peer_deps_stored_per_version() {
 
     // Version 1.0.0 peers on react@^16
     let v1_peers = info.peer_deps.get("1.0.0").unwrap();
-    assert_eq!(v1_peers.get("react").unwrap(), "^16");
+    assert_eq!(v1_peers.get("react").unwrap().raw(), "^16");
 
     // Version 2.0.0 peers on react@^18
     let v2_peers = info.peer_deps.get("2.0.0").unwrap();
-    assert_eq!(v2_peers.get("react").unwrap(), "^18");
+    assert_eq!(v2_peers.get("react").unwrap().raw(), "^18");
 
     // They are independent — no union, no aggregation
     assert_ne!(
-        v1_peers.get("react").unwrap(),
-        v2_peers.get("react").unwrap(),
+        v1_peers.get("react").unwrap().raw(),
+        v2_peers.get("react").unwrap().raw(),
         "per-version peers must not be merged"
     );
 }
@@ -605,9 +611,45 @@ fn parse_metadata_keeps_peer_dependencies_when_regular_dependency_cache_is_spars
         info.peer_deps
             .get("1.0.0")
             .and_then(|deps| deps.get("react"))
-            .map(String::as_str),
+            .map(crate::PeerDependencySpec::raw),
         Some("^18.0.0")
     );
+}
+
+#[test]
+fn parse_metadata_preserves_malformed_peer_as_typed_parse_error() {
+    let value = serde_json::json!({
+        "name": "malformed-peer",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "malformed-peer",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/malformed-peer-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                },
+                "peerDependencies": {
+                    "react": "magic:whatever"
+                }
+            }
+        },
+    });
+    let metadata: lpm_registry::PackageMetadata =
+        serde_json::from_value(value).expect("valid package metadata envelope");
+
+    let info = parse_metadata_to_cache_info(&metadata);
+    let peer = info
+        .peer_deps
+        .get("1.0.0")
+        .and_then(|dependencies| dependencies.get("react"))
+        .expect("peer dependency must be retained");
+
+    assert_eq!(peer.raw(), "magic:whatever");
+    assert!(matches!(
+        peer.parsed(),
+        Err(crate::PeerSpecifierError::Invalid { .. })
+    ));
 }
 
 /// Regression test for the prerelease-stripping bug found in the

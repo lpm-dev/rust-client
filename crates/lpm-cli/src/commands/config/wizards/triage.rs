@@ -135,8 +135,8 @@ async fn test_invoke_provider(
 ) -> Result<lpm_triage_advisor::AdvisorVerdict, lpm_triage_advisor::AdvisorFailure> {
     use lpm_triage_advisor::{Advisor, ClaudeCliAdapter, CodexAdapter, OllamaAdapter};
     let adapter: Box<dyn Advisor> = match provider {
-        lpm_triage_advisor::Provider::ClaudeCli => Box::new(ClaudeCliAdapter),
-        lpm_triage_advisor::Provider::Codex => Box::new(CodexAdapter),
+        lpm_triage_advisor::Provider::ClaudeCli => Box::new(ClaudeCliAdapter::default()),
+        lpm_triage_advisor::Provider::Codex => Box::new(CodexAdapter::default()),
         lpm_triage_advisor::Provider::Ollama => Box::new(OllamaAdapter::default()),
     };
     adapter.test_invoke().await

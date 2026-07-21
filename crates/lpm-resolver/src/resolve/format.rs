@@ -9,6 +9,28 @@ pub(super) fn format_solution(
     root_aliases: &HashMap<String, String>,
     skipped_dependencies: Vec<SkippedDependency>,
 ) -> Result<(Vec<ResolvedPackage>, usize), ResolveError> {
+    for (package, version) in solution.iter().filter(|(package, _)| !package.is_root()) {
+        let version = version.to_string();
+        let key = CanonicalKey::from(package);
+        let Some(peer_dependencies) = cache
+            .get(&key)
+            .and_then(|info| info.peer_deps.get(&version))
+        else {
+            continue;
+        };
+        for (peer_name, peer_dependency) in peer_dependencies {
+            if let Err(error) = peer_dependency.parsed() {
+                return Err(ResolveError::InvalidPeerSpecifier {
+                    consumer: package.canonical_name(),
+                    version: version.clone(),
+                    peer: peer_name.clone(),
+                    specifier: peer_dependency.raw().to_string(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+    }
+
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
         .iter()
@@ -74,7 +96,7 @@ pub(super) fn format_solution(
             // not in `dependencies`, so carrying its alias entry would
             // be dead weight for the linker.
             let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
-            let aliases: HashMap<String, String> = cached_aliases
+            let mut aliases: HashMap<String, String> = cached_aliases
                 .iter()
                 .filter(|(local, _)| alive_locals.contains(local))
                 .map(|(l, t)| (l.clone(), t.clone()))
@@ -102,7 +124,37 @@ pub(super) fn format_solution(
             // versions lookup. Missing peers simply don't appear in
             // the output Vec — the linker / GraphKey only cares about
             // peers that ARE present.
-            let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions);
+            let peers = compute_resolved_peers(
+                &package,
+                &ver_str,
+                cache,
+                &resolved_peer_versions,
+                &root_dependencies.explicit_peer_providers,
+            );
+            if let Some(peer_deps) = cache
+                .get(&key)
+                .and_then(|info| info.peer_deps.get(&ver_str))
+            {
+                for (peer_name, _) in &peers {
+                    let Some(peer_dependency) = peer_deps.get(peer_name) else {
+                        continue;
+                    };
+                    let specifier = peer_dependency
+                        .parsed()
+                        .expect("selected peer specifiers were validated before formatting");
+                    let target = root_dependencies
+                        .explicit_peer_providers
+                        .iter()
+                        .find(|provider| provider.matches_specifier(peer_name, specifier))
+                        .map_or_else(
+                            || specifier.target(),
+                            |provider| provider.package_name.as_str(),
+                        );
+                    if target != peer_name {
+                        aliases.insert(peer_name.clone(), target.to_string());
+                    }
+                }
+            }
 
             ResolvedPackage {
                 package,
