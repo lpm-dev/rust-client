@@ -24,10 +24,7 @@ pub async fn run(
             Ok(())
         }
         PortsCommand::Kill(target) => run_kill(target, json_output, yes),
-        PortsCommand::Reset => {
-            run_reset(project_dir, json_output);
-            Ok(())
-        }
+        PortsCommand::Reset => run_reset(project_dir, json_output),
     }
 }
 
@@ -696,14 +693,15 @@ fn owner_display(pid: Option<u32>, process_name: Option<&str>) -> String {
     }
 }
 
-fn run_reset(project_dir: &Path, json_output: bool) {
-    ports::clear_port_overrides(project_dir);
+fn run_reset(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+    ports::clear_port_overrides(project_dir)?;
 
     if json_output {
         println!("{}", serde_json::json!({ "success": true, "reset": true }));
     } else {
         install_ui::done("Port overrides cleared for this project");
     }
+    Ok(())
 }
 
 #[cfg(test)]

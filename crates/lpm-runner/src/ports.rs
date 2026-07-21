@@ -3,14 +3,143 @@
 //! Before starting services, checks all declared ports for conflicts
 //! and builds cross-service environment variables ({SERVICE}_URL, {SERVICE}_PORT).
 
+use lpm_common::{ExclusiveLockHandle, LpmError, LpmRoot};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::net::TcpListener;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
+
+pub(crate) struct PortAllocation {
+    root: LpmRoot,
+    lease_dir: PathBuf,
+    _lock: ExclusiveLockHandle,
+}
+
+pub(crate) struct PortLease {
+    _lock: fd_lock::RwLock<std::fs::File>,
+}
+
+impl PortAllocation {
+    fn acquire() -> Result<Self, LpmError> {
+        Self::acquire_for_root(LpmRoot::from_env()?)
+    }
+
+    pub(crate) fn acquire_for_root(root: LpmRoot) -> Result<Self, LpmError> {
+        Self::acquire_for_paths(root, global_port_lease_dir())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_for_root_and_lease_dir(
+        root: LpmRoot,
+        lease_dir: PathBuf,
+    ) -> Result<Self, LpmError> {
+        Self::acquire_for_paths(root, lease_dir)
+    }
+
+    fn acquire_for_paths(root: LpmRoot, lease_dir: PathBuf) -> Result<Self, LpmError> {
+        ensure_private_lease_dir(&lease_dir)?;
+        let lock = lpm_common::acquire_exclusive_lock(root.ports_lock())?;
+        Ok(Self {
+            root,
+            lease_dir,
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn read_overrides(&self, project_dir: &std::path::Path) -> HashMap<String, u16> {
+        read_port_overrides_from(&self.root.ports_toml(), project_dir)
+    }
+
+    pub(crate) fn write_override(
+        &mut self,
+        project_dir: &std::path::Path,
+        service_name: &str,
+        port: u16,
+    ) {
+        write_port_override_to(&self.root.ports_toml(), project_dir, service_name, port);
+    }
+
+    fn clear_overrides(&mut self, project_dir: &std::path::Path) {
+        clear_port_overrides_from(&self.root.ports_toml(), project_dir);
+    }
+
+    pub(crate) fn try_acquire_lease(&self, port: u16) -> Result<Option<PortLease>, LpmError> {
+        let path = self.lease_dir.join(format!("{port}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        let mut lock = fd_lock::RwLock::new(file);
+        let acquired = match lock.try_write() {
+            Ok(guard) => {
+                std::mem::forget(guard);
+                true
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(err) => return Err(LpmError::Io(err)),
+        };
+        if acquired {
+            Ok(Some(PortLease { _lock: lock }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn global_port_lease_dir() -> PathBuf {
+    PathBuf::from("/tmp").join(format!("lpm-{}-port-leases", current_effective_uid()))
+}
+
+#[cfg(windows)]
+fn global_port_lease_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("LPM")
+        .join("runtime")
+        .join("port-leases")
+}
+
+fn ensure_private_lease_dir(path: &Path) -> Result<(), LpmError> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != current_effective_uid()
+        {
+            return Err(LpmError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "port lease directory {} must be a directory owned by the current user",
+                    path.display()
+                ),
+            )));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() as u32 }
+}
+
+pub(crate) fn acquire_port_allocation() -> Result<PortAllocation, LpmError> {
+    PortAllocation::acquire()
+}
 
 /// Status of a port.
 #[derive(Debug)]
@@ -1503,8 +1632,14 @@ pub fn read_port_overrides(project_dir: &std::path::Path) -> HashMap<String, u16
         Some(p) => p,
         None => return HashMap::new(),
     };
+    read_port_overrides_from(&path, project_dir)
+}
 
-    let content = match std::fs::read_to_string(&path) {
+fn read_port_overrides_from(
+    path: &std::path::Path,
+    project_dir: &std::path::Path,
+) -> HashMap<String, u16> {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return HashMap::new(),
     };
@@ -1528,17 +1663,13 @@ pub fn read_port_overrides(project_dir: &std::path::Path) -> HashMap<String, u16
     result
 }
 
-/// Write a port override for a project service.
-///
-/// Uses atomic write (tempfile + rename) to prevent corruption from
-/// concurrent `lpm dev` instances writing to the same file.
-pub fn write_port_override(project_dir: &std::path::Path, service_name: &str, port: u16) {
-    let path = match ports_toml_path() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+fn write_port_override_to(
+    path: &std::path::Path,
+    project_dir: &std::path::Path,
+    service_name: &str,
+    port: u16,
+) {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: toml::value::Table = content
         .parse::<toml::Value>()
         .ok()
@@ -1554,19 +1685,21 @@ pub fn write_port_override(project_dir: &std::path::Path, service_name: &str, po
         table.insert(service_name.to_string(), toml::Value::Integer(port as i64));
     }
 
-    atomic_write_toml(&path, &doc);
+    atomic_write_toml(path, &doc);
 }
 
 /// Clear all port overrides for a project.
 ///
-/// Uses atomic write to prevent corruption from concurrent access.
-pub fn clear_port_overrides(project_dir: &std::path::Path) {
-    let path = match ports_toml_path() {
-        Some(p) => p,
-        None => return,
-    };
+/// Serializes with active `lpm dev` startup so it cannot lose another
+/// project's concurrent override update.
+pub fn clear_port_overrides(project_dir: &std::path::Path) -> Result<(), LpmError> {
+    let mut allocation = PortAllocation::acquire()?;
+    allocation.clear_overrides(project_dir);
+    Ok(())
+}
 
-    let content = match std::fs::read_to_string(&path) {
+fn clear_port_overrides_from(path: &std::path::Path, project_dir: &std::path::Path) {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -1579,7 +1712,7 @@ pub fn clear_port_overrides(project_dir: &std::path::Path) {
     let project_key = project_hash(project_dir);
     doc.remove(&project_key);
 
-    atomic_write_toml(&path, &doc);
+    atomic_write_toml(path, &doc);
 }
 
 /// Atomically write a TOML table to a file via tempfile + rename.
@@ -1977,70 +2110,117 @@ nTCP 127.0.0.1:6379 (LISTEN)
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("my-project");
         std::fs::create_dir_all(&project_dir).unwrap();
+        let root = LpmRoot::from_dir(tmp.path().join(".lpm"));
+        let mut allocation =
+            PortAllocation::acquire_for_root_and_lease_dir(root, tmp.path().join("leases"))
+                .unwrap();
 
-        // Override HOME so ports.toml is written to a temp location
-        let fake_home = tmp.path().join("home");
-        std::fs::create_dir_all(fake_home.join(".lpm")).unwrap();
-        let toml_path = fake_home.join(".lpm").join("ports.toml");
+        allocation.write_override(&project_dir, "web", 4001);
 
-        // Write override directly to the temp path
-        let project_key = project_hash(&project_dir);
-        let mut doc = toml::value::Table::new();
-        let mut project_table = toml::value::Table::new();
-        project_table.insert("web".to_string(), toml::Value::Integer(4001));
-        doc.insert(project_key, toml::Value::Table(project_table));
-        std::fs::write(&toml_path, toml::to_string_pretty(&doc).unwrap()).unwrap();
-
-        // Verify it was written
-        let content = std::fs::read_to_string(&toml_path).unwrap();
-        assert!(content.contains("4001"), "should contain port override");
+        assert_eq!(allocation.read_overrides(&project_dir)["web"], 4001);
     }
 
     #[test]
     fn clear_port_overrides_removes_project_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("my-project");
+        let other_project_dir = tmp.path().join("other-project");
         std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&other_project_dir).unwrap();
+        let root = LpmRoot::from_dir(tmp.path().join(".lpm"));
+        let mut allocation =
+            PortAllocation::acquire_for_root_and_lease_dir(root, tmp.path().join("leases"))
+                .unwrap();
+        allocation.write_override(&project_dir, "web", 4001);
+        allocation.write_override(&other_project_dir, "api", 5000);
 
-        // Manually create a ports.toml with this project's entry
-        let lpm_dir = tmp.path().join(".lpm");
-        std::fs::create_dir_all(&lpm_dir).unwrap();
-        let toml_path = lpm_dir.join("ports.toml");
+        allocation.clear_overrides(&project_dir);
 
-        let project_key = project_hash(&project_dir);
-        let mut doc = toml::value::Table::new();
-        let mut project_table = toml::value::Table::new();
-        project_table.insert("web".to_string(), toml::Value::Integer(4001));
-        doc.insert(project_key.clone(), toml::Value::Table(project_table));
-        // Also add another project's entry to verify it's preserved
-        let mut other = toml::value::Table::new();
-        other.insert("api".to_string(), toml::Value::Integer(5000));
-        doc.insert("project_other".to_string(), toml::Value::Table(other));
-        std::fs::write(&toml_path, toml::to_string_pretty(&doc).unwrap()).unwrap();
-
-        // Clear via the function (uses real HOME, so we test the logic directly)
-        // We can't easily override HOME, so test the TOML manipulation directly
-        let content = std::fs::read_to_string(&toml_path).unwrap();
-        let mut parsed: toml::value::Table =
-            content.parse::<toml::Value>().unwrap().try_into().unwrap();
-        parsed.remove(&project_key);
-        std::fs::write(&toml_path, toml::to_string_pretty(&parsed).unwrap()).unwrap();
-
-        // Verify: project entry gone, other entry preserved
-        let result = std::fs::read_to_string(&toml_path).unwrap();
-        assert!(!result.contains("4001"), "project entry should be removed");
-        assert!(
-            result.contains("5000"),
-            "other project entry should be preserved"
-        );
+        assert!(allocation.read_overrides(&project_dir).is_empty());
+        assert_eq!(allocation.read_overrides(&other_project_dir)["api"], 5000);
     }
 
     #[test]
     fn clear_nonexistent_project_is_harmless() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("nonexistent");
-        // clear_port_overrides should not panic or fail
-        clear_port_overrides(&project_dir);
+        let root = LpmRoot::from_dir(tmp.path().join(".lpm"));
+        let mut allocation =
+            PortAllocation::acquire_for_root_and_lease_dir(root.clone(), tmp.path().join("leases"))
+                .unwrap();
+
+        allocation.clear_overrides(&project_dir);
+
+        assert!(!root.ports_toml().exists());
+    }
+
+    #[test]
+    fn port_lease_blocks_reuse_across_different_lpm_homes_until_owner_drops() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lease_dir = tmp.path().join("leases");
+        let first_allocation = PortAllocation::acquire_for_root_and_lease_dir(
+            LpmRoot::from_dir(tmp.path().join("first-home")),
+            lease_dir.clone(),
+        )
+        .unwrap();
+        let first_lease = first_allocation
+            .try_acquire_lease(3000)
+            .unwrap()
+            .expect("first lease should be available");
+        drop(first_allocation);
+        let second_allocation = PortAllocation::acquire_for_root_and_lease_dir(
+            LpmRoot::from_dir(tmp.path().join("second-home")),
+            lease_dir,
+        )
+        .unwrap();
+
+        assert!(second_allocation.try_acquire_lease(3000).unwrap().is_none());
+        drop(first_lease);
+        assert!(second_allocation.try_acquire_lease(3000).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn port_lease_directory_is_restricted_to_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lease_dir = tmp.path().join("leases");
+        std::fs::create_dir_all(&lease_dir).unwrap();
+        std::fs::set_permissions(&lease_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _allocation = PortAllocation::acquire_for_root_and_lease_dir(
+            LpmRoot::from_dir(tmp.path().join("home")),
+            lease_dir.clone(),
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(lease_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn port_lease_directory_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        let lease_dir = tmp.path().join("leases");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(target, &lease_dir).unwrap();
+
+        let error = PortAllocation::acquire_for_root_and_lease_dir(
+            LpmRoot::from_dir(tmp.path().join("home")),
+            lease_dir,
+        )
+        .err()
+        .expect("symlinked lease directory should be rejected");
+
+        assert!(
+            matches!(error, LpmError::Io(ref io_error) if io_error.kind() == std::io::ErrorKind::PermissionDenied),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

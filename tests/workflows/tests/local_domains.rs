@@ -322,8 +322,12 @@ fn concurrent_dev_projects_share_one_https_proxy_daemon() {
         .stdin(Stdio::null());
     let dev_b = dev_b_command.spawn().expect("spawn second lpm dev");
 
-    wait_for_proxy_route(&project_a, "alpha.localhost");
-    wait_for_proxy_route(&project_a, "beta.localhost");
+    let alpha_route = wait_for_proxy_route(&project_a, "alpha.localhost");
+    let beta_route = wait_for_proxy_route(&project_a, "beta.localhost");
+    assert_ne!(
+        alpha_route["upstreamPort"], beta_route["upstreamPort"],
+        "concurrent projects must receive distinct upstream ports"
+    );
     assert_proxy_tls_routes_to_service(&project_a, "alpha.localhost");
     assert_proxy_tls_routes_to_service(&project_a, "beta.localhost");
 
@@ -696,6 +700,10 @@ fn wait_for_proxy_route_absent(project: &TempProject, host: &str) {
 
 #[cfg(unix)]
 fn assert_proxy_tls_routes_to_service(project: &TempProject, host: &str) {
+    let route = wait_for_proxy_route(project, host);
+    let upstream_port = route["upstreamPort"]
+        .as_u64()
+        .expect("proxy route should expose an upstream port");
     let tls_port = proxy_tls_port(project);
     let client = reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -711,7 +719,11 @@ fn assert_proxy_tls_routes_to_service(project: &TempProject, host: &str) {
     while Instant::now() < deadline {
         match client.get(&url).send() {
             Ok(response) if response.status() == reqwest::StatusCode::OK => {
-                assert_eq!(response.text().expect("read TLS proxy response"), "ok");
+                let body = response.text().expect("read TLS proxy response");
+                assert_eq!(
+                    body, "ok",
+                    "TLS proxy route {host} forwarded to unexpected service on localhost:{upstream_port}"
+                );
                 return;
             }
             Ok(response) => {

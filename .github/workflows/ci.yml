@@ -207,6 +207,11 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
 
+      - name: Install Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
       - name: Build workspace
         run: cargo build --workspace --locked
 
