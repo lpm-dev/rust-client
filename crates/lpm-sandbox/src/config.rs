@@ -31,8 +31,8 @@
 //!    max-sandbox-write-roots`).
 //! 4. **Filesystem-indirection check** (unconditional): every
 //!    existing component below the authorized root must be a real
-//!    directory, never a symlink, junction, reparse point, or nested
-//!    mount. Missing suffixes are appended only after their nearest
+//!    directory, never a symlink, junction, or reparse point. Missing
+//!    suffixes are appended only after their nearest
 //!    existing ancestor passes the same check.
 //!
 //! # Empty-allowlist tightening
@@ -205,20 +205,11 @@ pub fn load_sandbox_write_dirs(
             return Err(dangerous_root_error(package_json, i, s, dangerous_reason));
         }
 
-        let (authorized_root, suffix) = if was_relative {
+        let (authorized_root, suffix, root_kind) = if was_relative {
             let suffix = lexical_candidate
                 .strip_prefix(&project_root.configured)
                 .map_err(|_| relative_escape_error(package_json, i, s))?;
-            if suffix.as_os_str().is_empty() {
-                return Err(SandboxError::InvalidSpec {
-                    reason: format!(
-                        "{}: `lpm.scripts.sandboxWriteDirs[{i}]` = {s:?} collapses to the \
-                         project root; this would widen writes to the whole project",
-                        package_json.display()
-                    ),
-                });
-            }
-            (&project_root, suffix)
+            (&project_root, suffix, AuthorizedRootKind::Project)
         } else {
             select_authorized_root(
                 &lexical_candidate,
@@ -229,6 +220,15 @@ pub fn load_sandbox_write_dirs(
                 s,
             )?
         };
+        if root_kind == AuthorizedRootKind::Project && suffix.as_os_str().is_empty() {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!(
+                    "{}: `lpm.scripts.sandboxWriteDirs[{i}]` = {s:?} resolves to the \
+                     project root; this would widen writes to the whole project",
+                    package_json.display()
+                ),
+            });
+        }
 
         let effective = authorized_root
             .resolve_descendant(suffix)
@@ -262,6 +262,12 @@ enum PathValidationFailure {
     NotDirectory,
     EscapesRoot,
     Io(ErrorKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorizedRootKind {
+    Project,
+    User,
 }
 
 impl AuthorizedRoot {
@@ -348,12 +354,13 @@ fn select_authorized_root<'roots, 'candidate>(
     package_json: &Path,
     index: usize,
     authored: &str,
-) -> Result<(&'roots AuthorizedRoot, &'candidate Path), SandboxError> {
+) -> Result<(&'roots AuthorizedRoot, &'candidate Path, AuthorizedRootKind), SandboxError> {
     let mut selected = project_root.matched_suffix(candidate).map(|suffix| {
         (
             project_root,
             suffix,
             project_root.configured.components().count(),
+            AuthorizedRootKind::Project,
         )
     });
 
@@ -377,13 +384,13 @@ fn select_authorized_root<'roots, 'candidate>(
             continue;
         };
         let depth = root.configured.components().count();
-        if selected.is_none_or(|(_, _, selected_depth)| depth > selected_depth) {
-            selected = Some((root, suffix, depth));
+        if selected.is_none_or(|(_, _, selected_depth, _)| depth > selected_depth) {
+            selected = Some((root, suffix, depth, AuthorizedRootKind::User));
         }
     }
 
     selected
-        .map(|(root, suffix, _)| (root, suffix))
+        .map(|(root, suffix, _, kind)| (root, suffix, kind))
         .ok_or_else(|| {
             outside_authorized_roots_error(
                 package_json,
@@ -413,21 +420,16 @@ fn inspect_path_below(anchor: &Path, candidate: &Path) -> Result<(), PathValidat
     validate_relative_suffix(suffix)?;
 
     let mut current = anchor.to_path_buf();
-    let mut parent_metadata =
-        std::fs::metadata(anchor).map_err(|error| PathValidationFailure::Io(error.kind()))?;
     for component in suffix.components() {
         current.push(component.as_os_str());
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                if is_filesystem_indirection(&metadata)
-                    || crosses_mount_boundary(&parent_metadata, &metadata)
-                {
+                if is_filesystem_indirection(&metadata) {
                     return Err(PathValidationFailure::Indirection);
                 }
                 if !metadata.is_dir() {
                     return Err(PathValidationFailure::NotDirectory);
                 }
-                parent_metadata = metadata;
             }
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) if error.kind() == ErrorKind::NotADirectory => {
@@ -437,18 +439,6 @@ fn inspect_path_below(anchor: &Path, candidate: &Path) -> Result<(), PathValidat
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn crosses_mount_boundary(parent: &std::fs::Metadata, child: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    parent.dev() != child.dev()
-}
-
-#[cfg(not(unix))]
-fn crosses_mount_boundary(_parent: &std::fs::Metadata, _child: &std::fs::Metadata) -> bool {
-    false
 }
 
 #[cfg(windows)]
@@ -521,8 +511,7 @@ pub(crate) fn revalidate_effective_write_dir(
     if let Err(failure) = revalidate_effective_path(path) {
         let detail = match failure {
             PathValidationFailure::Indirection => {
-                "the validated effective path now traverses a symlink, junction, reparse point, \
-                 or mount"
+                "the validated effective path now traverses a symlink, junction, or reparse point"
             }
             PathValidationFailure::NotAbsolute => "the validated effective path is not absolute",
             PathValidationFailure::NotDirectory => {
@@ -586,9 +575,8 @@ fn invalid_entry_path_error(
 ) -> SandboxError {
     let detail = match failure {
         PathValidationFailure::Indirection => {
-            "write-directory symlink, junction, reparse-point, or mount traversal is not \
-             permitted; replace every path component below the authorized root with a real \
-             directory"
+            "write-directory symlink, junction, or reparse-point traversal is not permitted; \
+             replace every path component below the authorized root with a real directory"
                 .to_string()
         }
         PathValidationFailure::NotAbsolute => {
@@ -974,6 +962,17 @@ mod tests {
         load_sandbox_write_dirs(&env.package_json, &env.project, &[], None)
     }
 
+    fn write_single_sandbox_write_dir(package_json: &Path, path: &Path) {
+        fs::write(
+            package_json,
+            format!(
+                r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":[{}]}}}}}}"#,
+                json_encode_literal(&path.to_string_lossy())
+            ),
+        )
+        .expect("write package.json");
+    }
+
     /// Maps a Unix-shaped path literal to a platform-absolute form
     /// suitable for embedding in a sandboxWriteDirs JSON array.
     /// `/opt/local/share` stays `/opt/local/share` on Unix; on
@@ -1126,6 +1125,80 @@ mod tests {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":["missing/.."]}}}"#);
 
         let error = load_minimal(&e).expect_err("project-root widening must be rejected");
+
+        assert!(
+            error.to_string().contains("whole project"),
+            "error explains the write-scope widening: {error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_rejects_absolute_configured_project_root() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        write_single_sandbox_write_dir(&e.package_json, &e.project);
+
+        let error = load_minimal(&e).expect_err("configured project root must be rejected");
+
+        assert!(
+            error.to_string().contains("whole project"),
+            "error explains the write-scope widening: {error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_rejects_absolute_canonical_project_root() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let canonical_project = std::fs::canonicalize(&e.project).expect("canonical project");
+        write_single_sandbox_write_dir(&e.package_json, &canonical_project);
+
+        let error = load_minimal(&e).expect_err("canonical project root must be rejected");
+
+        assert!(
+            error.to_string().contains("whole project"),
+            "error explains the write-scope widening: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_rejects_absolute_configured_symlinked_project_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_project = tmp.path().join("real-project");
+        let project_link = tmp.path().join("project-link");
+        fs::create_dir(&real_project).expect("create real project");
+        symlink(&real_project, &project_link).expect("create project symlink");
+        let package_json = real_project.join("package.json");
+        write_single_sandbox_write_dir(&package_json, &project_link);
+
+        let error =
+            load_sandbox_write_dirs(&project_link.join("package.json"), &project_link, &[], None)
+                .expect_err("configured symlinked project root must be rejected");
+
+        assert!(
+            error.to_string().contains("whole project"),
+            "error explains the write-scope widening: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_write_dirs_rejects_absolute_canonical_symlinked_project_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_project = tmp.path().join("real-project");
+        let project_link = tmp.path().join("project-link");
+        fs::create_dir(&real_project).expect("create real project");
+        symlink(&real_project, &project_link).expect("create project symlink");
+        let package_json = real_project.join("package.json");
+        let canonical_project = std::fs::canonicalize(&real_project).expect("canonical project");
+        write_single_sandbox_write_dir(&package_json, &canonical_project);
+
+        let error =
+            load_sandbox_write_dirs(&project_link.join("package.json"), &project_link, &[], None)
+                .expect_err("canonical symlinked project root must be rejected");
 
         assert!(
             error.to_string().contains("whole project"),
@@ -1296,6 +1369,26 @@ mod tests {
         assert_eq!(
             paths,
             vec![std::fs::canonicalize(target).expect("canonical target")]
+        );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_accepts_explicit_user_authorized_root_itself() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let allow_root = tempfile::tempdir().expect("allowlist tempdir");
+        write_single_sandbox_write_dir(&e.package_json, allow_root.path());
+
+        let paths = load_sandbox_write_dirs(
+            &e.package_json,
+            &e.project,
+            &[allow_root.path().to_path_buf()],
+            None,
+        )
+        .expect("explicit user-authorized root remains permitted");
+
+        assert_eq!(
+            paths,
+            vec![std::fs::canonicalize(allow_root.path()).expect("canonical allowlist root")]
         );
     }
 
