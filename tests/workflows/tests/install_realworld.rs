@@ -370,12 +370,9 @@ async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
     // test. It still cleanly fails on the "dropped half the tree"
     // class of regression.
     //
-    // **The lockfile check is the load-bearing one** — the
-    // node_modules top-level count below is smaller because the
-    // isolated linker (the workflow-tier default per `LpmRoot`
-    // setup) hoists only some packages to the root and parks the
-    // rest in `node_modules/.lpm/`. The exact split depends on the
-    // linker's heuristics, not the resolver's output.
+    // **The lockfile check is the load-bearing one** — the v2 linker
+    // exposes only direct dependencies in project `node_modules` and
+    // materializes the full closure in store graph entries.
     let lockfile_path = project.path().join("lpm.lock");
     assert!(
         lockfile_path.exists(),
@@ -392,27 +389,28 @@ async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
          regression in the resolver is the likely culprit."
     );
 
-    // Secondary sanity: node_modules top-level entries. With the
-    // isolated linker the count is smaller than the lockfile total
-    // (rest live under `node_modules/.lpm/`). Empirically ~24 entries
-    // Counts for this fixture. The 18-entry floor protects
-    // against a regression that dropped the LINKER half of the
-    // pipeline (lockfile correct, link tree empty).
-    let nm_count = std::fs::read_dir(project.path().join("node_modules"))
-        .expect("node_modules must be readable after install")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            // Skip `.lpm`, `.bin`, etc. — only real package dirs.
-            e.file_name().to_str().is_some_and(|s| !s.starts_with('.'))
+    // Secondary sanity: the v2 linker must materialize the resolved
+    // closure as complete graph entries. The floor stays below the
+    // expected installed count because platform-incompatible optional
+    // packages remain in the lockfile but are not linked on this host.
+    let store = lpm_store::v2::Store::at(project.store_dir().join("v2"));
+    let linked_pkg_count = store
+        .iter_link_entries()
+        .expect("v2 links root must be readable after install")
+        .filter(|(link_dir, meta)| {
+            link_dir
+                .join("node_modules")
+                .join(&meta.name)
+                .join("package.json")
+                .is_file()
         })
         .count();
     assert!(
-        nm_count >= 18,
-        "node_modules has only {nm_count} top-level package entries after \
-         realworld install — expected ~24 (isolated-linker shape) for this \
-         fixture's resolved tree. The lockfile size was {lockfile_pkg_count} \
-         packages, so the resolver succeeded — the linker is the likely \
-         regression site."
+        linked_pkg_count >= 25,
+        "v2 store has only {linked_pkg_count} complete link entries after \
+         realworld install — expected about 28 materialized packages for this \
+         fixture. The lockfile size was {lockfile_pkg_count} packages, so the \
+         resolver succeeded but the linker dropped part of the install set."
     );
 
     // Install-hash landed. Proves the post-install fast-path cache
