@@ -1007,18 +1007,46 @@ impl MockRegistry {
         self
     }
 
-    pub async fn with_platform_status_success(
+    pub async fn with_platform_credentials_success(
         &self,
         bearer_token: &str,
         vault_id: &str,
         response: serde_json::Value,
     ) -> &Self {
+        let body = serde_json::to_string(&response).expect("platform credentials should serialize");
+        let signature = lpm_vault::signature::sign_body(body.as_bytes(), bearer_token);
         Mock::given(method("POST"))
-            .and(path("/api/vault/platforms/status"))
+            .and(path("/api/vault/platforms/credentials"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+                    .set_body_string(body),
+            )
             .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_vercel_env_list(
+        &self,
+        token: &str,
+        project_id: &str,
+        envs: serde_json::Value,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/v10/projects/{project_id}/env")))
+            .and(query_param("decrypt", "true"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "envs": envs,
+                "pagination": { "next": null },
+            })))
+            .expect(expected_calls)
             .mount(&self.server)
             .await;
         self

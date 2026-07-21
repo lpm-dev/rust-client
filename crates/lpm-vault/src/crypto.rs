@@ -88,7 +88,7 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
 }
 
 fn force_file_wrapping_key() -> bool {
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
     matches!(
@@ -633,6 +633,45 @@ mod tests {
         }
 
         assert!(!forced);
+    }
+
+    #[cfg(all(not(debug_assertions), feature = "acceptance-test-hooks"))]
+    #[test]
+    fn release_acceptance_build_uses_file_wrapping_key_only_inside_isolated_run_home() {
+        let _guard = crate::test_env_lock::acquire_env_lock();
+        let root = tempfile::tempdir().expect("create acceptance root");
+        let run_dir = root.path().join("run");
+        let home = run_dir.join("session-home");
+        std::fs::create_dir_all(&home).expect("create acceptance home");
+        let variables = [
+            ("HOME", home.as_os_str().to_owned()),
+            ("LPM_HOME", home.join(".lpm").into_os_string()),
+            ("ACCEPTANCE_RUN_DIR", run_dir.into_os_string()),
+            ("ACCEPTANCE_RUN_ID", "release-file-vault".into()),
+            ("LPM_ACCEPTANCE_FILE_STORAGE", "1".into()),
+            ("LPM_FORCE_FILE_VAULT", "1".into()),
+        ];
+        let previous = variables
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        unsafe {
+            for (name, value) in &variables {
+                std::env::set_var(name, value);
+            }
+        }
+
+        let forced = force_file_wrapping_key();
+
+        unsafe {
+            for (name, value) in previous.into_iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        assert!(forced);
     }
 
     #[test]

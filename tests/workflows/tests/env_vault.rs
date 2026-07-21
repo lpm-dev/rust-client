@@ -2790,25 +2790,30 @@ async fn env_platform_json_success_paths_emit_success_envelopes() {
         }),
     )
     .await;
-    mock.with_platform_status_success(
+    mock.with_platform_credentials_success(
         bearer_token,
         vault_id,
         serde_json::json!({
-            "platforms": [
+            "connections": [
                 {
+                    "id": "connection-1",
                     "platform": "vercel",
+                    "token": "vercel-token",
+                    "connectionConfig": { "projectId": "project-123" },
                     "label": "production",
-                    "env": "default",
-                    "status": "synced",
                     "lastPushAt": "2030-01-01T00:00:00Z"
                 }
             ]
         }),
     )
     .await;
+    mock.with_vercel_env_list("vercel-token", "project-123", serde_json::json!([]), 2)
+        .await;
 
     let connect = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-direct")
+        .env("LPM_ACCEPTANCE_VERCEL_API_BASE_URL", mock.url())
         .args([
             "--json",
             "env",
@@ -2836,6 +2841,8 @@ async fn env_platform_json_success_paths_emit_success_envelopes() {
 
     let status = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-direct")
+        .env("LPM_ACCEPTANCE_VERCEL_API_BASE_URL", mock.url())
         .args(["--json", "env", "status"])
         .output()
         .expect("failed to run lpm env status --json");

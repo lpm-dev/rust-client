@@ -194,6 +194,11 @@ tracy = ["dep:tracing-tracy"]
 experimental-http3 = ["lpm-registry/experimental-http3"]
 # Internal loopback-only Sigstore seam for workflow tests.
 internal-test-sigstore-mock = []
+# Compile release-only storage isolation hooks for the acceptance harness.
+acceptance-test-hooks = [
+	"lpm-auth/acceptance-test-hooks",
+	"lpm-vault/acceptance-test-hooks",
+]
 
 [dependencies.dhat]
 version = "0.3"
