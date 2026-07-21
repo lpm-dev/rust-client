@@ -165,6 +165,12 @@ Dev command benchmarks measure already-installed local scripts, local bins, and 
 > **⁴ Built-in tool benchmarks** — Generated with `RUNS=10 LPM_BIN=target/release/lpm-rs BENCH_WORK_DIR=/tmp/lpm-readme-builtin-tools-work-20260711T205110Z ./bench/run.sh builtin-tools` on `bench/project`. The `npm / npx / tsx` column is `npx oxlint` or `npx @biomejs/biome`. Raw artifact: [`readme-builtin-tools-20260711T205110Z.md`](bench/perf-results/readme-builtin-tools-20260711T205110Z.md).
 </details>
 
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing expectations, and the pull request workflow.
+
+Report suspected vulnerabilities privately according to [SECURITY.md](SECURITY.md). Do not open a public issue for a security report.
+
 ## License
 
 Dual-licensed under MIT OR Apache-2.0.

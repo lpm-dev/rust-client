@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a concrete improvement to an LPM workflow
+title: "Feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: Describe the user problem first. A proposed implementation is useful, but it should not substitute for the workflow or outcome the feature needs to improve.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this request.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: Who encounters the problem, and what are they trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe the CLI, configuration, or workflow behavior from the user's perspective.
+    validations:
+      required: true
+  - type: textarea
+    id: precedent
+    attributes:
+      label: Ecosystem precedent
+      description: Explain how npm, pnpm, Yarn, Bun, Cargo, or another relevant tool handles this problem.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe current workarounds and why they are insufficient.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Contract and impact
+      description: Note expected compatibility, security, performance, JSON-output, migration, and documentation implications.
+    validations:
+      required: true

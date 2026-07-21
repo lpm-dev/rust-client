@@ -1,0 +1,85 @@
+name: Ecosystem compatibility difference
+description: Report behavior that differs from npm, pnpm, Yarn, Bun, or an ecosystem contract
+title: "Compatibility: "
+labels:
+  - compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for migration blockers and command, manifest, workspace, or lockfile behavior that differs from the established JavaScript package-manager ecosystem.
+
+        Remove credentials, private registry URLs, private package names, and tokens from everything you share.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this compatibility difference.
+          required: true
+        - label: I removed secrets and private project information from the report.
+          required: true
+  - type: dropdown
+    id: source_manager
+    attributes:
+      label: Source package manager
+      options:
+        - npm
+        - pnpm
+        - Yarn Classic
+        - Yarn Berry
+        - Bun
+        - Other ecosystem contract
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Include both the source package-manager version and the LPM version.
+      placeholder: pnpm 11.3.0; lpm 0.68.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 x64
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands compared
+      description: Show the equivalent source-manager and LPM commands.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: difference
+    attributes:
+      label: Behavior difference
+      description: Explain what the source manager does and what LPM does instead.
+    validations:
+      required: true
+  - type: textarea
+    id: expected_contract
+    attributes:
+      label: Expected ecosystem behavior
+      description: Link to relevant documentation, specifications, or widely adopted behavior where available.
+    validations:
+      required: true
+  - type: textarea
+    id: project_files
+    attributes:
+      label: Relevant package and lock files
+      description: Provide a minimal `package.json`, workspace configuration, and relevant source lockfile or `lpm.lock` excerpts. Redact private data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Link to a small public repository or provide exact steps from a clean directory.
+    validations:
+      required: true

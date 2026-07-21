@@ -1,0 +1,88 @@
+name: Performance regression
+description: Report a reproducible slowdown between LPM versions or configurations
+title: "Performance: "
+labels:
+  - bug
+  - performance
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance reports need comparable measurements. Separate cold, warm, and up-to-date runs, and remove credentials or private project information before sharing data.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I measured the regression more than once under comparable conditions.
+          required: true
+        - label: I searched existing issues for this regression.
+          required: true
+        - label: I removed secrets and private project information from the report.
+          required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Baseline and regressed versions
+      placeholder: "lpm 0.67.0: 410ms; lpm 0.68.0: 620ms"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command measured
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: cache_state
+    attributes:
+      label: Cache state
+      multiple: true
+      options:
+        - Cold install
+        - Warm install
+        - Up-to-date install
+        - Not an install command
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements and method
+      description: Include warmups, sample count, individual results or median, and how caches and network conditions were controlled.
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System and filesystem
+      description: Include OS, CPU architecture, available memory, storage type, and filesystem such as APFS, ext4, or NTFS.
+    validations:
+      required: true
+  - type: textarea
+    id: project_size
+    attributes:
+      label: Project shape
+      description: Include workspace count and approximate direct, total, and script-bearing package counts.
+    validations:
+      required: true
+  - type: textarea
+    id: execution_context
+    attributes:
+      label: Execution context
+      description: Describe registry/network conditions and any non-default lifecycle-script, sandbox, Firewall, frozen-lockfile, or provenance settings.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproducible project or fixture
+      description: Link to a public project or provide steps to generate an equivalent fixture.
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Optional profile or sanitized logs
+      description: Attach Tracy, `dhat`, hyperfine, or equivalent evidence if available.
