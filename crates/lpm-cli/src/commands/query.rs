@@ -675,7 +675,9 @@ async fn query_osv_vulnerable_by_nv(packages: &[(String, String)]) -> HashSet<St
         }
     }
 
-    let client = reqwest::Client::new();
+    let Ok(client) = lpm_http::client_builder().build() else {
+        return HashSet::new();
+    };
 
     let queries: Vec<serde_json::Value> = deduped
         .iter()

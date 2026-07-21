@@ -83,7 +83,7 @@ pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<Rem
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;
@@ -177,7 +177,7 @@ pub async fn push_raw(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
     if !status.is_success() {
@@ -219,7 +219,7 @@ pub async fn pull(
         .bearer_auth(auth_token)
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
     let result: PullResponse =
@@ -283,7 +283,7 @@ pub async fn pull_raw(
         .bearer_auth(auth_token)
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
     let result: PullResponse =
@@ -386,8 +386,9 @@ async fn attempt_legacy_reencrypt_push(
         }
         Err(e) => {
             tracing::warn!(
-                "legacy vault migration: re-push failed for vault {vault_id}: {e} \
-                 (will retry on next successful pull)"
+                "legacy vault migration: re-push failed for vault {vault_id}: {} \
+                 (will retry on next successful pull)",
+                lpm_http::display_error(&e)
             );
         }
     }

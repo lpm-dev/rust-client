@@ -83,7 +83,7 @@ pub async fn replay_webhook(
     let resp = builder
         .send()
         .await
-        .map_err(|e| LpmError::Tunnel(format!("replay failed: {e}")))?;
+        .map_err(|e| LpmError::Tunnel(format!("replay failed: {}", lpm_http::display_error(&e))))?;
 
     let status = resp.status().as_u16();
     let body = read_capped_replay_body(resp).await?;

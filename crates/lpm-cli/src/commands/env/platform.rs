@@ -101,8 +101,7 @@ struct VercelClient {
 
 impl VercelClient {
     fn new(token: String, config: VercelConnectionConfig) -> Result<Self, LpmError> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(5))
+        let http = lpm_http::client_builder_with_redirect_limit(5)
             .timeout(PLATFORM_TIMEOUT)
             .build()
             .map_err(|error| {
@@ -178,7 +177,12 @@ impl VercelClient {
                 .query(&params)
                 .send()
                 .await
-                .map_err(|error| LpmError::Network(format!("Vercel list failed: {error}")))?;
+                .map_err(|error| {
+                    LpmError::Network(format!(
+                        "Vercel list failed: {}",
+                        lpm_http::display_error(&error)
+                    ))
+                })?;
             let (status, body) = read_platform_response(response).await?;
             if !status.is_success() {
                 return Err(vercel_api_error("list", status, &body));
@@ -362,10 +366,12 @@ impl VercelClient {
             ),
         };
 
-        let response = request
-            .send()
-            .await
-            .map_err(|error| LpmError::Network(format!("Vercel {operation} failed: {error}")))?;
+        let response = request.send().await.map_err(|error| {
+            LpmError::Network(format!(
+                "Vercel {operation} failed: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
         let (status, body) = read_platform_response(response).await?;
         if !status.is_success() {
             return Err(vercel_api_error(operation, status, &body));
@@ -526,14 +532,22 @@ async fn fetch_connections(
     if let Some(platform) = platform {
         request_body["platform"] = serde_json::Value::String(platform.to_owned());
     }
-    let response = reqwest::Client::new()
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
+    let response = client
         .post(format!("{registry_url}/api/vault/platforms/credentials"))
         .bearer_auth(auth_token)
         .json(&request_body)
         .timeout(PLATFORM_TIMEOUT)
         .send()
         .await
-        .map_err(|error| LpmError::Network(format!("failed to reach LPM: {error}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to reach LPM: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
     let (status, body) = read_signed_lpm_response(response, auth_token).await?;
     if !status.is_success() {
         return Err(response_error(
@@ -552,14 +566,22 @@ async fn record_platform_audit(
     auth_token: &str,
     body: serde_json::Value,
 ) -> Result<(), LpmError> {
-    let response = reqwest::Client::new()
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
+    let response = client
         .post(format!("{registry_url}/api/vault/platforms/audit"))
         .bearer_auth(auth_token)
         .json(&body)
         .timeout(PLATFORM_TIMEOUT)
         .send()
         .await
-        .map_err(|error| LpmError::Network(format!("failed to record env audit: {error}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to record env audit: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
     let (status, body) = read_signed_lpm_response(response, auth_token).await?;
     if !status.is_success() {
         return Err(response_error(status, &body, "failed to record env audit"));
@@ -670,7 +692,10 @@ pub(super) async fn vars_connect(
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
     let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
-    let response = reqwest::Client::new()
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
+    let response = client
         .post(format!("{registry_url}/api/vault/platforms/connect"))
         .bearer_auth(&auth_token)
         .json(&serde_json::json!({
@@ -683,7 +708,12 @@ pub(super) async fn vars_connect(
         .timeout(PLATFORM_TIMEOUT)
         .send()
         .await
-        .map_err(|error| LpmError::Network(format!("failed to save connection: {error}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to save connection: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
     let (status, body) = read_platform_response(response).await?;
     if !status.is_success() {
         return Err(response_error(status, &body, "connection failed"));

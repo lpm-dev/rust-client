@@ -88,7 +88,7 @@ impl RuntimeInstallContext {
             return None;
         }
         if self.http_client.is_none() {
-            match reqwest::Client::builder()
+            match lpm_http::client_builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
             {

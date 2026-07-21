@@ -222,7 +222,7 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
     let (owner, repo) = parse_github_owner_repo(def)?;
     let tag_prefix = tag_prefix_for_plugin(def);
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("http client error: {e}"))?;
@@ -236,7 +236,7 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
         let resp = build_github_request(&client, &api_url)
             .send()
             .await
-            .map_err(|e| format!("github request failed: {e}"))?;
+            .map_err(|e| format!("github request failed: {}", lpm_http::display_error(&e)))?;
 
         if let Some(rate_err) = check_rate_limit(&resp) {
             return Err(rate_err);
@@ -264,7 +264,7 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
         let resp = build_github_request(&client, &api_url)
             .send()
             .await
-            .map_err(|e| format!("github request failed: {e}"))?;
+            .map_err(|e| format!("github request failed: {}", lpm_http::display_error(&e)))?;
 
         if let Some(rate_err) = check_rate_limit(&resp) {
             return Err(rate_err);

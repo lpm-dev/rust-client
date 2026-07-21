@@ -37,7 +37,7 @@ pub async fn ci_pull(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let status = response.status();
     let result: CiPullResponse = response
@@ -84,7 +84,7 @@ pub async fn upload_escrow_key(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;

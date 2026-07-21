@@ -174,7 +174,12 @@ pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, L
         .get("https://nodejs.org/dist/index.json")
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to fetch node index: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to fetch node index: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Http {

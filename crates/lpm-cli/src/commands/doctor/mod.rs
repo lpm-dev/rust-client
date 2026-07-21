@@ -698,7 +698,7 @@ pub async fn run(
                         if !json_output {
                             install_ui::phase(&format!("fixing: lpm use node@{spec}"));
                         }
-                        let http_client = reqwest::Client::builder()
+                        let http_client = lpm_http::client_builder()
                             .timeout(std::time::Duration::from_secs(60))
                             .build()
                             .map_err(|e| LpmError::Network(format!("{e}")))?;

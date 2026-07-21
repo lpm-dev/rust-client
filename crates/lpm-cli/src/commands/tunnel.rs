@@ -682,7 +682,7 @@ async fn run_replay(
         lpm_common::sanitize_for_terminal(&entry.summary)
     ));
 
-    let replay_client = reqwest::Client::builder()
+    let replay_client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .no_proxy()
         .build()

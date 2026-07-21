@@ -291,7 +291,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
     let (runtime, version_spec) = parse_runtime_spec(spec)?;
     validate_runtime_spec(runtime, &version_spec)?;
 
-    let http_client = reqwest::Client::builder()
+    let http_client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;

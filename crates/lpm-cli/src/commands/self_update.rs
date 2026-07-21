@@ -608,7 +608,12 @@ async fn fetch_bounded(
         .header("User-Agent", "lpm-cli")
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("fetch {url} failed: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "release asset fetch failed: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     let status = resp.status();
     if status.as_u16() == 404 {
@@ -803,7 +808,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
     let bundle_url = github_release_download_url(version, "SHA256SUMS.txt.sigstore");
     let asset_url = github_release_download_url(version, &binary_name);
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;

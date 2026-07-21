@@ -138,7 +138,9 @@ pub(super) async fn vars_oidc_allow(
 
     let subject = format!("repo:{repo}");
 
-    let client = reqwest::Client::new();
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let response = client
         .post(format!("{registry_url}/api/vault/oidc/policies"))
         .bearer_auth(&auth_token)
@@ -155,7 +157,12 @@ pub(super) async fn vars_oidc_allow(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to reach server: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
 
     if !response.status().is_success() {
         let body: serde_json::Value =
@@ -241,7 +248,9 @@ pub(super) async fn vars_oidc_list(
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
     let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
 
-    let client = reqwest::Client::new();
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let response = client
         .get(format!(
             "{registry_url}/api/vault/oidc/policies?vaultId={vault_id}"
@@ -250,7 +259,12 @@ pub(super) async fn vars_oidc_list(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to reach server: {e}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to reach server: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
 
     if !response.status().is_success() {
         let body: serde_json::Value =
@@ -357,7 +371,9 @@ pub(super) async fn vars_oidc_pull(
     let oidc_token = get_ci_oidc_token().await?;
 
     // Exchange OIDC token for short-lived LPM token
-    let client = reqwest::Client::new();
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let exchange_response = client
         .post(format!("{registry_url}/api/vault/oidc"))
         .json(&serde_json::json!({
@@ -368,7 +384,12 @@ pub(super) async fn vars_oidc_pull(
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("OIDC exchange failed: {e}")))?;
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "OIDC exchange failed: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
 
     if !exchange_response.status().is_success() {
         let body: serde_json::Value =

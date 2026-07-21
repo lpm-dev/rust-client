@@ -488,7 +488,7 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
         .unwrap_or_default()
         .as_secs();
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| {
@@ -528,7 +528,9 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
         Ok(r) => r,
         Err(e) => {
             cache.last_failure_check = now;
-            return Err(LookupError::Transport(e.to_string()));
+            return Err(LookupError::Transport(
+                lpm_http::display_error(&e).to_string(),
+            ));
         }
     };
 
@@ -657,7 +659,7 @@ pub async fn fetch_github_release_published_at(
 ) -> Result<chrono::DateTime<chrono::Utc>, LookupError> {
     let url = github_release_by_tag_url(version);
 
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| LookupError::Transport(format!("failed to build HTTP client: {e}")))?;
@@ -673,7 +675,7 @@ pub async fn fetch_github_release_published_at(
     let resp = req
         .send()
         .await
-        .map_err(|e| LookupError::Transport(e.to_string()))?;
+        .map_err(|e| LookupError::Transport(lpm_http::display_error(&e).to_string()))?;
 
     let status = resp.status();
 

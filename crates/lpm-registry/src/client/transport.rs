@@ -9,13 +9,6 @@ pub(super) const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum backoff delay (10 seconds).
 pub(super) const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 
-fn reqwest_error_chain(error: &reqwest::Error) -> String {
-    std::iter::successors(Some(error as &dyn std::error::Error), |err| err.source())
-        .map(|err| err.to_string())
-        .collect::<Vec<_>>()
-        .join(" <- ")
-}
-
 impl RegistryClient {
     // ─── Internal: HTTP transport with retry ────────────────────────
 
@@ -345,8 +338,11 @@ impl RegistryClient {
                     }
                 }
                 Err(e) => {
+                    if lpm_http::is_https_downgrade(&e) {
+                        return Err(LpmError::Network(lpm_http::error_chain(&e)));
+                    }
                     // Network-level errors are retryable
-                    last_error = Some(LpmError::Network(e.to_string()));
+                    last_error = Some(LpmError::Network(lpm_http::display_error(&e).to_string()));
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;
@@ -458,8 +454,11 @@ impl RegistryClient {
                     }
                 }
                 Err(e) => {
+                    if lpm_http::is_https_downgrade(&e) {
+                        return Err(LpmError::Network(lpm_http::error_chain(&e)));
+                    }
                     // Network-level errors (DNS, connection refused, timeout) are retryable
-                    last_error = Some(LpmError::Network(reqwest_error_chain(&e)));
+                    last_error = Some(LpmError::Network(lpm_http::error_chain(&e)));
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;

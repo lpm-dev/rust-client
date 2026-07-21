@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 lpm-security = { workspace = true }
+lpm-http = { workspace = true }
 lpm-triage-advisor = { path = "../lpm-triage-advisor" }
 tokio = { workspace = true }
 reqwest = { workspace = true }

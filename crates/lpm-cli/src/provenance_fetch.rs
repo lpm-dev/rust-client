@@ -774,7 +774,15 @@ pub async fn fetch_provenance_for_pkgs(
                 .collect();
         }
     };
-    let http = reqwest::Client::new();
+    let http = match lpm_http::client_builder().build() {
+        Ok(client) => client,
+        Err(_) => {
+            return pkgs
+                .iter()
+                .map(|package| (package.clone(), ProvenanceStatus::TransportDegraded))
+                .collect();
+        }
+    };
     let registry = lpm_registry::RegistryClient::new();
 
     let cache_root_ref = &cache_root;

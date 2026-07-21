@@ -37,7 +37,7 @@ pub async fn get_pairing_session(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;
@@ -75,7 +75,7 @@ pub async fn approve_pairing(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;
@@ -100,7 +100,7 @@ pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), Stri
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;

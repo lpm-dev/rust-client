@@ -61,10 +61,7 @@ pub async fn upload_public_key(
         request = request.header(CLI_STEP_UP_HEADER_NAME, proof);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("network error: {e}"))?;
+    let response = request.send().await.map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;
@@ -113,7 +110,7 @@ pub async fn get_my_public_key(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     let status = response.status();
     if !status.is_success() {
@@ -421,7 +418,7 @@ pub async fn get_org_member_keys(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("network error: {e}"))?;
+        .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;

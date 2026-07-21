@@ -91,15 +91,12 @@ pub(super) fn sync_request_timeout(default: std::time::Duration) -> std::time::D
     }
 }
 
-/// Build the lpm-vault HTTP client with an explicit redirect policy
-/// pinned. reqwest's `Policy::limited` strips `Authorization` on
-/// cross-origin redirects by default; pinning it here documents the
-/// contract so a future builder edit can't drop the strip implicitly.
-/// The bearer-leak shape — a malicious or misconfigured registry
-/// 30x'ing to `attacker.example` and having our bearer follow — is the
-/// class this helper guards alongside the `bearer_auth` call sites.
 pub(super) fn sync_http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10))
+    lpm_http::client_builder()
+}
+
+pub(super) fn network_error(error: reqwest::Error) -> String {
+    format!("network error: {}", lpm_http::display_error(&error))
 }
 
 /// Percent-encode a URL path segment.

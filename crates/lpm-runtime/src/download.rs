@@ -66,11 +66,12 @@ pub async fn install_node_with_report(
     tracing::debug!("downloading node {version} from {url}");
 
     // Download
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to download node {version}: {e}")))?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        LpmError::Network(format!(
+            "failed to download node {version}: {}",
+            lpm_http::display_error(&e)
+        ))
+    })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Http {
@@ -172,7 +173,12 @@ pub async fn install_bun_with_report(
         .header(reqwest::header::USER_AGENT, "lpm-runtime")
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to download bun {version}: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to download bun {version}: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Http {
@@ -581,7 +587,12 @@ async fn verify_checksum(
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| LpmError::Network(format!("failed to fetch SHASUMS256: {e}")))?;
+        .map_err(|e| {
+            LpmError::Network(format!(
+                "failed to fetch SHASUMS256: {}",
+                lpm_http::display_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(LpmError::Network(format!(
@@ -660,7 +671,12 @@ async fn verify_bun_checksum(
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| LpmError::Network(format!("failed to fetch Bun SHASUMS256: {e}")))?;
+            .map_err(|e| {
+                LpmError::Network(format!(
+                    "failed to fetch Bun SHASUMS256: {}",
+                    lpm_http::display_error(&e)
+                ))
+            })?;
 
         if !resp.status().is_success() {
             return Err(LpmError::Network(format!(

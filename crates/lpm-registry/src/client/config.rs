@@ -140,21 +140,9 @@ impl RegistryClient {
         identity: Option<reqwest::Identity>,
         transport: HttpTransportMode,
     ) -> Result<reqwest::Client, LpmError> {
-        let mut b = reqwest::Client::builder()
+        let mut b = lpm_http::client_builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
-            // Cap redirect chains explicitly. reqwest's default is also
-            // `Policy::limited(10)` plus per-redirect cross-origin
-            // sensitive-header stripping (`Authorization`, `Cookie`,
-            // `Proxy-Authorization`). Setting the policy here pins the
-            // contract in code: a future builder edit that swaps in a
-            // `Policy::none()` or a custom non-stripping policy is
-            // visible in review, not implicit via "whichever default
-            // reqwest ships this week". The cross-origin strip closes
-            // the leak window where a compromised registry could
-            // 30x to `attacker.example` and have the npmrc bearer
-            // follow.
-            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
         if transport == HttpTransportMode::WorkerMetadataHttp3 {
             b = Self::apply_http3_prior_knowledge(b);

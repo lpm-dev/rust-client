@@ -314,7 +314,7 @@ fn print_success_json(
 }
 
 fn npm_web_auth_client() -> Result<reqwest::Client, LpmError> {
-    reqwest::Client::builder()
+    lpm_http::client_builder()
         .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))

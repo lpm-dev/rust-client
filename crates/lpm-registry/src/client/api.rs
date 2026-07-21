@@ -240,13 +240,8 @@ impl RegistryClient {
         // S3: Scale timeout based on tarball size
         let tarball_mb = tarball_size_bytes as u64 / (1024 * 1024);
         let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
-        let publish_client = reqwest::Client::builder()
+        let publish_client = lpm_http::client_builder()
             .timeout(Duration::from_secs(timeout_secs))
-            // Same redirect-policy pin as the main client builder:
-            // explicit Policy::limited so a future edit can't silently
-            // expand the chain or drop the cross-origin Authorization
-            // strip that reqwest applies by default.
-            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;

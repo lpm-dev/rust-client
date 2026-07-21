@@ -39,7 +39,7 @@ use rcgen::{
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -199,14 +199,47 @@ pub fn ensure_crypto_provider() {
 /// kernel-assigned port + a `JoinHandle` for the accept loop.
 ///
 /// Server presents `[leaf, root_ca]`. Static 200 OK after handshake.
+#[allow(dead_code)]
 pub async fn spawn_tls_server(leaf: LeafCert, ca: &TestCa) -> (u16, JoinHandle<()>) {
+    spawn_tls_server_with_response(
+        leaf,
+        ca,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    )
+    .await
+}
+
+#[allow(dead_code)]
+pub async fn spawn_tls_server_with_response(
+    leaf: LeafCert,
+    ca: &TestCa,
+    response: Vec<u8>,
+) -> (u16, JoinHandle<()>) {
     ensure_crypto_provider();
     let chain = vec![leaf.cert_der.clone(), ca.cert_der.clone()];
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain, leaf.key_der)
         .expect("rustls ServerConfig");
-    spawn_with_config(config).await
+    spawn_with_config(config, response.into(), None).await
+}
+
+#[allow(dead_code)]
+pub async fn spawn_tls_server_with_response_capture(
+    leaf: LeafCert,
+    ca: &TestCa,
+    response: Vec<u8>,
+) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, JoinHandle<()>) {
+    ensure_crypto_provider();
+    let chain = vec![leaf.cert_der.clone(), ca.cert_der.clone()];
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, leaf.key_der)
+        .expect("rustls ServerConfig");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (port, handle) =
+        spawn_with_config(config, response.into(), Some(Arc::clone(&requests))).await;
+    (port, requests, handle)
 }
 
 /// Spawn a TLS listener that REQUIRES client certs verified against
@@ -239,23 +272,42 @@ pub async fn spawn_tls_server_mutual(
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, leaf.key_der)
         .expect("rustls ServerConfig (mTLS)");
-    spawn_with_config(config).await
+    spawn_with_config(
+        config,
+        Arc::from(&b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..]),
+        None,
+    )
+    .await
 }
 
-async fn spawn_with_config(config: ServerConfig) -> (u16, JoinHandle<()>) {
+async fn spawn_with_config(
+    config: ServerConfig,
+    response: Arc<[u8]>,
+    captured_requests: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+) -> (u16, JoinHandle<()>) {
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
-            tokio::spawn(handle_one_connection(acceptor, stream));
+            tokio::spawn(handle_one_connection(
+                acceptor,
+                stream,
+                Arc::clone(&response),
+                captured_requests.clone(),
+            ));
         }
     });
     (port, handle)
 }
 
-async fn handle_one_connection(acceptor: TlsAcceptor, stream: TcpStream) {
+async fn handle_one_connection(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    response: Arc<[u8]>,
+    captured_requests: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+) {
     let Ok(mut tls) = acceptor.accept(stream).await else {
         return; // handshake failed; drop the connection
     };
@@ -273,9 +325,10 @@ async fn handle_one_connection(acceptor: TlsAcceptor, stream: TcpStream) {
             Ok(Err(_)) => break,
         }
     }
-    let _ = tls
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await;
+    if let Some(requests) = captured_requests {
+        requests.lock().expect("capture request lock").push(total);
+    }
+    let _ = tls.write_all(&response).await;
     let _ = tls.shutdown().await;
 }
 
@@ -288,6 +341,7 @@ async fn handle_one_connection(acceptor: TlsAcceptor, stream: TcpStream) {
 ///
 /// Returns `Err(message)` if classification says handshake failed,
 /// `Ok(())` if it says handshake succeeded (body parse irrelevant).
+#[allow(dead_code)]
 pub fn classify_request_error(msg: String) -> Result<(), String> {
     let lower = msg.to_lowercase();
     let handshake_keywords = [

@@ -106,13 +106,20 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
             install_ui::phase("Exchanging authorization code");
         }
         let exchange_url = format!("{registry_url}/api/cli/exchange");
-        let http_client = reqwest::Client::new();
+        let http_client = lpm_http::client_builder().build().map_err(|error| {
+            LpmError::Registry(format!("exchange client build failed: {error}"))
+        })?;
         let resp = http_client
             .post(&exchange_url)
             .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
             .send()
             .await
-            .map_err(|e| LpmError::Registry(format!("exchange request failed: {e}")))?;
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "exchange request failed: {}",
+                    lpm_http::display_error(&error)
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
