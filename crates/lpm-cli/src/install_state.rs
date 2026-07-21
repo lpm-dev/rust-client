@@ -756,6 +756,7 @@ pub fn check_install_state_with_linker_and_integrity(
         linker_mode,
         object_integrity_policy,
         "none",
+        lpm_store::StoreVersion::from_env(),
     )
 }
 
@@ -765,6 +766,7 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: ObjectIntegrityPolicy,
     dependency_engine_key: &str,
+    store_version: lpm_store::StoreVersion,
 ) -> InstallState {
     let platform = PlatformTuple::current();
     // mtime short-circuit also applies here. The caller may have
@@ -777,6 +779,7 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
         object_integrity_policy,
         &platform,
         dependency_engine_key,
+        store_version,
     ) {
         return state;
     }
@@ -862,7 +865,7 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
     // install_state would create a cyclic-ish coupling for one
     // two-line predicate, and the predicate is small enough that
     // drift won't realistically diverge.
-    if lpm_store::StoreVersion::from_env().is_v2() {
+    if store_version.is_v2() {
         let legacy_isolated = project_dir.join(".lpm").join("wrappers");
         let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
         if legacy_isolated.exists() || legacy_hoisted.exists() {
@@ -934,6 +937,7 @@ fn try_mtime_fast_path(
     object_integrity_policy: ObjectIntegrityPolicy,
     platform: &PlatformTuple,
     dependency_engine_key: &str,
+    store_version: lpm_store::StoreVersion,
 ) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
@@ -969,7 +973,7 @@ fn try_mtime_fast_path(
     // package.json + lpm.lock mtimes haven't changed would
     // permanently short-circuit at "up to date" and never run the
     // v1 → v2 wipe-and-rebuild sequence.
-    if lpm_store::StoreVersion::from_env().is_v2() {
+    if store_version.is_v2() {
         let legacy_isolated = project_dir.join(".lpm").join("wrappers");
         let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
         if legacy_isolated.exists() || legacy_hoisted.exists() {
@@ -2121,6 +2125,7 @@ mod tests {
             ObjectIntegrityPolicy::Source,
             &platform,
             "none",
+            lpm_store::StoreVersion::V2,
         );
         assert!(
             same.is_some_and(|s| s.up_to_date),
@@ -2134,6 +2139,7 @@ mod tests {
             ObjectIntegrityPolicy::Source,
             &platform,
             "none",
+            lpm_store::StoreVersion::V2,
         );
         assert!(
             flipped.is_none(),
@@ -2167,6 +2173,7 @@ mod tests {
             ObjectIntegrityPolicy::Source,
             &PlatformTuple::current(),
             "none",
+            lpm_store::StoreVersion::V2,
         );
         assert!(
             fast.is_none(),
@@ -2201,6 +2208,7 @@ mod tests {
             ObjectIntegrityPolicy::Source,
             &platform,
             "1:20.0.0",
+            lpm_store::StoreVersion::V2,
         );
 
         assert!(fast.is_none());
@@ -2769,5 +2777,39 @@ mod tests {
             !state.up_to_date,
             "v1 wrappers under post-4d v2 default must trigger migration"
         );
+    }
+
+    #[test]
+    fn selected_store_version_controls_v1_layout_migration_without_rereading_environment() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+        fs::write(p.join("package.json"), pkg_json).unwrap();
+        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        fs::create_dir_all(p.join(".lpm/hoisted")).unwrap();
+        let hash = compute_install_hash(pkg_json, "lock-content");
+        fs::write(p.join(".lpm/install-hash"), &hash).unwrap();
+
+        let v1 = check_install_state_with_linker_integrity_and_dependency_engine(
+            p,
+            pkg_json,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            "none",
+            lpm_store::StoreVersion::V1,
+        );
+        let v2 = check_install_state_with_linker_integrity_and_dependency_engine(
+            p,
+            pkg_json,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            "none",
+            lpm_store::StoreVersion::V2,
+        );
+
+        assert_eq!(v1.hash.as_deref(), Some(hash.as_str()));
+        assert!(v1.up_to_date, "explicit v1 keeps its rollback layout valid");
+        assert!(!v2.up_to_date, "v2 must migrate the same rollback layout");
     }
 }

@@ -786,6 +786,7 @@ pub fn capture_blocked_set_after_install(
         &crate::capability::CapabilitySet::default(),
         &crate::capability::UserBound::default(),
         None,
+        lpm_store::StoreVersion::from_env(),
     )
 }
 
@@ -818,6 +819,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
+    store_version: lpm_store::StoreVersion,
 ) -> Result<BlockedSetCapture, LpmError> {
     capture_blocked_set_after_install_with_metadata_and_exclusions(
         project_dir,
@@ -829,6 +831,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
         user_bound,
         advisor_approvals,
         None,
+        store_version,
     )
 }
 
@@ -845,8 +848,9 @@ pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
     execution_exclusions: Option<&HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
+    store_version: lpm_store::StoreVersion,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let baseline_index = if lpm_store::StoreVersion::from_env() == lpm_store::StoreVersion::V2 {
+    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
         Some(lpm_store::V2BaselineIndex::for_project(
             project_dir,
             &store.lpm_root()?,

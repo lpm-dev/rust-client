@@ -527,7 +527,7 @@ pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Fast,
     description: "`node_modules/` symlinks point into the virtual store at `~/.lpm/store/v2/links/`.",
-    when_fires: "User opted into `LPM_STORE_VERSION=v2` (dev-only flag) and the virtual-store layout is intact.",
+    when_fires: "The active store version is v2 (the default) and the virtual-store layout is intact.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,

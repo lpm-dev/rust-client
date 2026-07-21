@@ -527,7 +527,7 @@ async fn run_with_options_under_store_lock(
         peer_conflict_auto_isolation_allowed,
         auto_isolated_peer_conflicts,
         linker_mode,
-        requested_v2_mode,
+        store_version,
         manifest_deps,
         production_dependency_names,
     } = prepare_install_setup_context(InstallSetupInput {
@@ -541,6 +541,7 @@ async fn run_with_options_under_store_lock(
         min_release_age_exclude,
         timing,
     })?;
+    let requested_v2_mode = store_version.is_v2();
     let no_skills = !lpm_skills_preference.resolve(&global_config)?;
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_audit_after_install_ms = 0u128;
@@ -565,7 +566,7 @@ async fn run_with_options_under_store_lock(
         linker_mode,
         object_integrity_policy,
         dependency_engine_policy: dependency_engine_policy.as_ref(),
-        requested_v2_mode,
+        store_version,
         compatibility_bin_names,
         requested_add_count,
         json_output,
@@ -815,7 +816,7 @@ async fn run_with_options_under_store_lock(
             auto_install_peers,
             omit_policy,
             production_dependency_names: &production_dependency_names,
-            requested_v2_mode,
+            store_version,
             object_integrity_policy,
             lpm_root,
             json_output,
@@ -880,17 +881,12 @@ async fn run_with_options_under_store_lock(
     // the v2 store via `find_installed_package_baseline`. Those helpers need
     // the actual install root to find v2-installed scripted packages for
     // auto-build and build-hint decisions.
-    // — read the store-version flag once per
-    // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
-    // pipeline; everything else (unset, "v1", typos) takes the v1
-    // path that's been shipping.
-    //
-    // The v2 store handle is constructed eagerly when the flag is
+    // The store-version flag was resolved once during install setup.
+    // The v2 store handle is constructed eagerly when that selection is
     // active, then wrapped in `Arc` so per-package spawn tasks can
     // capture a cheap clone alongside the v1 `store_ref`. Holding
-    // it as `Option<Arc<…>>` keeps the v1-default code path
+    // it as `Option<Arc<…>>` keeps the v1 rollback path
     // allocation-free.
-    let store_version = lpm_store::StoreVersion::from_env();
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
         Some(std::sync::Arc::new(
             lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
@@ -902,10 +898,7 @@ async fn run_with_options_under_store_lock(
         None
     };
     if store_v2_handle.is_some() {
-        tracing::info!(
-            "{}=v2 — install pipeline routing object extracts to ~/.lpm/store/v2/",
-            lpm_store::StoreVersion::ENV_VAR
-        );
+        tracing::info!("store version v2 — routing object extracts to ~/.lpm/store/v2/");
     }
 
     // — silent v1 → v2 layout migration on first
@@ -1344,6 +1337,7 @@ async fn run_with_options_under_store_lock(
         packages: &packages,
         package: &pkg,
         store: &store,
+        store_version,
         used_lockfile,
         script_policy_override,
         advisor_override: advisor_override.as_deref(),
@@ -1535,6 +1529,7 @@ async fn run_with_options_under_store_lock(
         package_name: pkg.name.as_deref(),
         store: &store,
         lpm_root,
+        store_version,
         object_integrity_policy,
         linker_mode,
         compatibility_bin_names,
@@ -1624,7 +1619,13 @@ async fn run_with_options_under_store_lock(
                 );
                 None
             } else {
-                match crate::commands::audit::run_install_summary(client, project_dir).await {
+                match crate::commands::audit::run_install_summary(
+                    client,
+                    project_dir,
+                    store_version,
+                )
+                .await
+                {
                     Ok(opt) => opt,
                     Err(e) => {
                         tracing::warn!("audit-after-install failed: {e}");

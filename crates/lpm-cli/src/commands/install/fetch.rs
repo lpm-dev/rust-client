@@ -2797,7 +2797,7 @@ pub(super) async fn fetch_and_store_legacy(
     route_table: &RouteTable,
     store: &PackageStore,
     // — see [`fetch_and_store_streaming`] for the
-    // contract. None → v1 (default + every release).
+    // contract. None → the explicitly selected v1 rollback path.
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -3046,7 +3046,7 @@ pub(super) async fn fetch_and_store_tarball_url(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
     // — see [`fetch_and_store_streaming`] for the
-    // contract. None → v1 (default + every release).
+    // contract. None → the explicitly selected v1 rollback path.
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
@@ -3139,10 +3139,9 @@ pub(super) async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
-    // — when `Some`, the install pipeline is running
-    // under `LPM_STORE_VERSION=v2`. Bytes flow into the v2
-    // `objects/<sri>/` path instead of v1's `<name>@<version>/`. None
-    // → v1 path (today's default + every release).
+    // — when `Some`, the selected store version is v2.
+    // Bytes flow into `objects/<sri>/` instead of v1's
+    // `<name>@<version>/`. None means the explicit v1 rollback path.
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,

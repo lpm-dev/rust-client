@@ -3920,7 +3920,7 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
     );
 
     let online = lpm_with_registry(&project, &mock.url())
-        .env("LPM_STORE_VERSION", "v2")
+        .env_remove("LPM_STORE_VERSION")
         .args([
             "install",
             "--no-security-summary",
@@ -3942,7 +3942,7 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
     }
 
     let offline = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .env("LPM_STORE_VERSION", "v2")
+        .env_remove("LPM_STORE_VERSION")
         .args([
             "install",
             "--offline",
@@ -3960,6 +3960,10 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
         String::from_utf8_lossy(&offline.stderr)
     );
     assertions::assert_in_node_modules(project.path(), "is-number");
+    assert!(
+        !project.home().join(".lpm/store/v1").exists(),
+        "default online and offline installs must not write the v1 store"
+    );
 }
 
 #[tokio::test]
@@ -4354,6 +4358,65 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
     assert!(
         !project.path().join(".lpm/wrappers").exists(),
         "shipped v2 layout should not create project-local v1 wrappers"
+    );
+    assert!(
+        !project.path().join(".lpm/hoisted").exists(),
+        "shipped v2 layout should not create project-local v1 hoisted state"
+    );
+    assert!(
+        !project.home().join(".lpm/store/v1").exists(),
+        "shipped v2 layout should not populate the v1 store"
+    );
+}
+
+#[tokio::test]
+async fn install_with_explicit_v1_uses_v1_store_and_isolated_linker() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "explicit-v1-layout",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args([
+            "install",
+            "--linker",
+            "isolated",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run explicit v1 install");
+
+    assert!(
+        output.status.success(),
+        "explicit v1 install should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project
+            .home()
+            .join(".lpm/store/v1/is-number@7.0.0/package.json")
+            .is_file(),
+        "explicit v1 install must populate the v1 package store"
+    );
+    assert!(
+        project
+            .path()
+            .join(".lpm/wrappers/is-number@7.0.0/node_modules/is-number/package.json")
+            .is_file(),
+        "explicit v1 isolated install must populate the matching wrapper layout"
     );
 }
 

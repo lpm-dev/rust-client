@@ -1,6 +1,7 @@
 //! v2 store layout primitives — on-disk shape and identity helpers
-//! for the virtual-store rewrite. Writes are gated behind
-//! `LPM_STORE_VERSION=v2` until the default flip lands.
+//! for LPM's default virtual store. The CLI selects this layout when
+//! `LPM_STORE_VERSION` is unset, empty, `v2`, or `2`; only explicit
+//! `LPM_STORE_VERSION=v1` (or `1`) selects the rollback writer.
 //!
 //! # Layout
 //!

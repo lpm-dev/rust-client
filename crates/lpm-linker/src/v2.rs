@@ -1,8 +1,9 @@
 //! Virtual-store-aware linker.
 //!
-//! Sits next to v1's [`crate::link_packages`] /
-//! [`crate::link_packages_hoisted`] and is selected via
-//! `LPM_STORE_VERSION=v2`. Instead of materializing per-project
+//! Sits next to the rollback-only v1 [`crate::link_packages`] /
+//! [`crate::link_packages_hoisted`] paths and is selected by default.
+//! Explicit `LPM_STORE_VERSION=v1` keeps the v1 linker paired with the
+//! v1 store writer for rollback. Instead of materializing per-project
 //! wrappers under `<project>/.lpm/wrappers/<segment>/node_modules/<pkg>/`,
 //! the v2 linker:
 //!

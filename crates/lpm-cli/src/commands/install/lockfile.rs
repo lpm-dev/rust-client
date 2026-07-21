@@ -606,7 +606,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) auto_install_peers: bool,
     pub(super) omit_policy: InstallOmitPolicy,
     pub(super) production_dependency_names: &'a HashSet<String>,
-    pub(super) requested_v2_mode: bool,
+    pub(super) store_version: lpm_store::StoreVersion,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) lpm_root: &'a lpm_common::LpmRoot,
     pub(super) json_output: bool,
@@ -657,7 +657,7 @@ pub(super) async fn run_offline_install_phase(
         auto_install_peers,
         omit_policy,
         production_dependency_names,
-        requested_v2_mode,
+        store_version,
         object_integrity_policy,
         lpm_root,
         json_output,
@@ -780,6 +780,7 @@ pub(super) async fn run_offline_install_phase(
     }
 
     let store = PackageStore::from_root(lpm_root);
+    let requested_v2_mode = store_version.is_v2();
     let store_v2 = requested_v2_mode.then(|| {
         lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
             lpm_root,
@@ -865,6 +866,7 @@ pub(super) async fn run_offline_install_phase(
         strict_sandbox,
         emit_timing,
         compatibility_bin_names,
+        store_version,
     )
     .await
 }

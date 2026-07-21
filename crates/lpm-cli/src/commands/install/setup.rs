@@ -43,7 +43,7 @@ pub(super) struct InstallSetupContext {
     pub(super) peer_conflict_auto_isolation_allowed: bool,
     pub(super) auto_isolated_peer_conflicts: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
-    pub(super) requested_v2_mode: bool,
+    pub(super) store_version: lpm_store::StoreVersion,
     pub(super) manifest_deps: HashMap<String, String>,
     pub(super) production_dependency_names: HashSet<String>,
 }
@@ -182,7 +182,7 @@ pub(super) fn prepare_install_setup_context(
     } else {
         configured_linker_mode
     };
-    let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
+    let store_version = lpm_store::StoreVersion::from_env();
     let mut manifest_deps = manifest_install_deps(&pkg);
     normalize_jsr_manifest_deps(&mut manifest_deps)?;
     let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
@@ -221,7 +221,7 @@ pub(super) fn prepare_install_setup_context(
         peer_conflict_auto_isolation_allowed,
         auto_isolated_peer_conflicts,
         linker_mode,
-        requested_v2_mode,
+        store_version,
         manifest_deps,
         production_dependency_names,
     })

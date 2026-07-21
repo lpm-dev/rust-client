@@ -26,6 +26,7 @@ use super::types::{AuditCounts, AuditIssue, AuditResult};
 pub async fn run_install_summary(
     client: &RegistryClient,
     project_dir: &Path,
+    store_version: lpm_store::StoreVersion,
 ) -> Result<Option<AuditCounts>, LpmError> {
     let started = std::time::Instant::now();
 
@@ -90,6 +91,7 @@ pub async fn run_install_summary(
                 &lpm_packages,
                 /* json_output */ true,
                 /* level */ None,
+                store_version,
             ));
             Ok(())
         })?;
@@ -101,6 +103,7 @@ pub async fn run_install_summary(
             &lpm_packages,
             /* json_output */ true,
             /* level */ None,
+            store_version,
         )
     };
 

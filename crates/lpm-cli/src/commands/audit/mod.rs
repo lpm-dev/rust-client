@@ -185,6 +185,7 @@ pub async fn run(
     level: Option<AuditLevel>,
     fail_on: Option<&str>,
 ) -> Result<(), LpmError> {
+    let store_version = lpm_store::StoreVersion::from_env();
     let fail_policy = match fail_on {
         Some(s) => FailPolicy::parse(s)?,
         None => FailPolicy::All,
@@ -284,12 +285,20 @@ pub async fn run(
                 &lpm_packages,
                 json_output,
                 level,
+                store_version,
             ));
             Ok(())
         })?;
         summary.expect("set inside the closure body")
     } else {
-        run_behavioral_analysis(&discovery, &mut results, &lpm_packages, json_output, level)
+        run_behavioral_analysis(
+            &discovery,
+            &mut results,
+            &lpm_packages,
+            json_output,
+            level,
+            store_version,
+        )
     };
 
     // ── OSV vulnerability scan (non-@lpm.dev packages) ──────────

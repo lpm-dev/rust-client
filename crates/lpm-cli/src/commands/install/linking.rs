@@ -136,8 +136,9 @@ pub(super) fn relink_bins_after_lifecycle_build(
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     self_package_name: Option<&str>,
     compatibility_bin_names: &[String],
+    store_version: lpm_store::StoreVersion,
 ) -> Result<usize, LpmError> {
-    let result = if lpm_store::StoreVersion::from_env().is_v2() {
+    let result = if store_version.is_v2() {
         let store_v2 = lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
             lpm_root,
             object_integrity_policy,
@@ -378,6 +379,7 @@ pub(super) async fn run_link_and_finish(
     strict_sandbox: bool,
     emit_timing: bool,
     compatibility_bin_names: &[String],
+    store_version: lpm_store::StoreVersion,
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
     let force_security_floor = crate::security_floor::force_security_floor_enabled(global_config);
@@ -430,7 +432,7 @@ pub(super) async fn run_link_and_finish(
         .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
-    let mut link_result = if lpm_store::StoreVersion::from_env().is_v2() {
+    let mut link_result = if store_version.is_v2() {
         let store_v2 = lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
             lpm_root,
             object_integrity_policy,
@@ -549,6 +551,7 @@ pub(super) async fn run_link_and_finish(
         &offline_requested_capabilities,
         &offline_user_bound,
         None,
+        store_version,
     )?;
 
     let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
@@ -599,6 +602,7 @@ pub(super) async fn run_link_and_finish(
                 &offline_user_bound,
                 None,
                 Some(&execution_exclusions),
+                store_version,
             )?;
 
         let relinked_bins = relink_bins_after_lifecycle_build(
@@ -610,6 +614,7 @@ pub(super) async fn run_link_and_finish(
             object_integrity_policy,
             pkg.name.as_deref(),
             compatibility_bin_names,
+            store_version,
         )?;
         link_result.bin_linked = relinked_bins;
     }
