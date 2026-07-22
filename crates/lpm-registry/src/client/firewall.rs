@@ -120,6 +120,8 @@ pub struct NpmFirewallDecision {
     pub policy: Option<NpmFirewallDecisionPolicy>,
     #[serde(default)]
     pub authority: Option<NpmFirewallDecisionAuthority>,
+    #[serde(default)]
+    pub display: Option<NpmFirewallDecisionDisplay>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -157,6 +159,13 @@ pub struct NpmFirewallDecisionAuthority {
     pub external_intel: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmFirewallDecisionDisplay {
+    pub summary: Option<String>,
+    pub report_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NpmFirewallPolicyAction {
@@ -190,8 +199,8 @@ pub struct NpmFirewallPolicyProfile {
     pub trusted_public_malicious_advisories: NpmFirewallPolicyAction,
     pub lpm_ai_confirmed_malware: NpmFirewallPolicyAction,
     pub lpm_ai_agent_control_surface: NpmFirewallPolicyAction,
+    pub lpm_ai_suspicious: NpmFirewallPolicyAction,
     pub critical_vulnerability: NpmFirewallPolicyAction,
-    pub static_only_suspicious: NpmFirewallPolicyAction,
 }
 
 impl Default for NpmFirewallPolicyProfile {
@@ -200,8 +209,8 @@ impl Default for NpmFirewallPolicyProfile {
             trusted_public_malicious_advisories: NpmFirewallPolicyAction::Block,
             lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Block,
             lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Warn,
+            lpm_ai_suspicious: NpmFirewallPolicyAction::Warn,
             critical_vulnerability: NpmFirewallPolicyAction::Warn,
-            static_only_suspicious: NpmFirewallPolicyAction::Warn,
         }
     }
 }

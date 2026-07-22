@@ -547,7 +547,7 @@ fn firewall_policy_profile_persistence_writes_nested_policy_table() {
         &mut cfg,
         lpm_registry::client::NpmFirewallPolicyProfile {
             lpm_ai_agent_control_surface: lpm_registry::client::NpmFirewallPolicyAction::Warn,
-            static_only_suspicious: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            lpm_ai_suspicious: lpm_registry::client::NpmFirewallPolicyAction::Allow,
             ..lpm_registry::client::NpmFirewallPolicyProfile::default()
         },
     )
@@ -571,9 +571,13 @@ fn firewall_policy_profile_persistence_writes_nested_policy_table() {
     );
     assert_eq!(
         policies
-            .get(crate::npm_firewall_config::STATIC_ONLY_SUSPICIOUS_POLICY_KEY)
+            .get(crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY)
             .and_then(|value| value.as_str()),
         Some("allow")
+    );
+    assert!(
+        !policies
+            .contains_key(crate::npm_firewall_config::LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY)
     );
 }
 
