@@ -1274,6 +1274,31 @@ mod tests {
         NpmFirewallDecisionAuthority, NpmFirewallDecisionDisplay, NpmFirewallDecisionPolicy,
     };
 
+    fn firewall_decision_with_display(summary: &str, report_url: &str) -> NpmFirewallDecision {
+        NpmFirewallDecision {
+            decision_id: "decision-1".to_string(),
+            name: "moi-computer".to_string(),
+            version: "0.1.0".to_string(),
+            action: NpmFirewallAction::Warn,
+            verdict: "suspicious".to_string(),
+            reason: "client policy maps lpm_ai_suspicious to warn".to_string(),
+            match_source: "package".to_string(),
+            matched_key: None,
+            policy_mode: "product_default".to_string(),
+            enqueue_scan: false,
+            scanned_at: None,
+            scan_run_id: None,
+            report_path: None,
+            confidence: None,
+            policy: None,
+            authority: None,
+            display: Some(NpmFirewallDecisionDisplay {
+                summary: Some(summary.to_string()),
+                report_url: Some(report_url.to_string()),
+            }),
+        }
+    }
+
     #[test]
     fn firewall_decision_context_renders_legacy_static_only_group_as_ai_suspicious() {
         let decision = NpmFirewallDecision {
@@ -1313,37 +1338,32 @@ mod tests {
 
     #[test]
     fn firewall_decision_lines_prefer_display_summary_and_report_url() {
-        let decision = NpmFirewallDecision {
-            decision_id: "decision-1".to_string(),
-            name: "moi-computer".to_string(),
-            version: "0.1.0".to_string(),
-            action: NpmFirewallAction::Warn,
-            verdict: "suspicious".to_string(),
-            reason: "client policy maps lpm_ai_suspicious to warn".to_string(),
-            match_source: "package".to_string(),
-            matched_key: None,
-            policy_mode: "product_default".to_string(),
-            enqueue_scan: false,
-            scanned_at: None,
-            scan_run_id: None,
-            report_path: None,
-            confidence: None,
-            policy: None,
-            authority: None,
-            display: Some(NpmFirewallDecisionDisplay {
-                summary: Some(
-                    "May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces."
-                        .to_string(),
-                ),
-                report_url: Some("https://firewall.lpm.dev/npm/moi-computer/v/0.1.0".to_string()),
-            }),
-        };
+        let decision = firewall_decision_with_display(
+            "May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces.",
+            "https://firewall.lpm.dev/npm/moi-computer/v/0.1.0",
+        );
 
         assert_eq!(
             firewall_decision_lines(&decision),
             vec![
                 "    moi-computer@0.1.0 - warn: May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces.".to_string(),
                 "    report: https://firewall.lpm.dev/npm/moi-computer/v/0.1.0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn firewall_decision_lines_neutralize_terminal_controls_in_display_fields() {
+        let decision = firewall_decision_with_display(
+            "summary\x1b]52;c;c3VtbWFyeQ==\x07bell\x07line\nreturn\rback\x08end",
+            "https://firewall.lpm.dev/\x1b]52;c;cmVwb3J0\x07bell\x07line\nreturn\rback\x08end",
+        );
+
+        assert_eq!(
+            firewall_decision_lines(&decision),
+            vec![
+                "    moi-computer@0.1.0 - warn: summarybell?line?return?back?end".to_string(),
+                "    report: https://firewall.lpm.dev/bell?line?return?back?end".to_string(),
             ]
         );
     }
