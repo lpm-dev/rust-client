@@ -9,6 +9,24 @@ mod support;
 
 use support::{TempProject, lpm};
 
+const HOSTILE_SERVER_NAME: &str =
+    "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+
+fn assert_hostile_server_name_is_inline_safe(context: &str, rendered: &str) {
+    assert!(
+        rendered.contains("safe?FORGED?rewritten?end"),
+        "{context} must preserve readable server text without forged rows, got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "{context} retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
+}
+
 // ─── status (read-only) ───────────────────────────────────────────────
 
 #[test]
@@ -75,6 +93,57 @@ fn mcp_remove_without_name_fails_with_helpful_message() {
         stderr.contains("specify server name") || stderr.contains("name"),
         "stderr must guide the user, got:\n{stderr}",
     );
+}
+
+#[test]
+fn mcp_remove_server_argument_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["mcp", "remove", HOSTILE_SERVER_NAME])
+        .output()
+        .expect("failed to run lpm mcp remove with terminal controls in the server name");
+
+    assert!(
+        output.status.success(),
+        "mcp remove of an unknown server succeeds"
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_hostile_server_name_is_inline_safe("mcp remove output", &rendered);
+}
+
+#[test]
+fn mcp_status_configured_server_name_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let config = serde_json::json!({
+        "mcpServers": {
+            HOSTILE_SERVER_NAME: {
+                "command": "node"
+            }
+        }
+    });
+    std::fs::write(
+        project.home().join(".claude.json"),
+        serde_json::to_vec(&config).expect("serialize hostile MCP config"),
+    )
+    .expect("write hostile MCP config");
+
+    let output = lpm(&project)
+        .args(["mcp", "status"])
+        .output()
+        .expect("failed to run lpm mcp status with a hostile configured server name");
+
+    assert!(output.status.success(), "mcp status must succeed");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_hostile_server_name_is_inline_safe("mcp status output", &rendered);
 }
 
 #[test]
