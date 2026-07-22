@@ -139,12 +139,12 @@ async fn run_start(
         && !d.contains('.')
     {
         install_ui::warn("Missing base domain.");
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("Available:"),
             install_ui::yellow("lpm.fyi, lpm.llc")
         ));
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("Example:"),
             install_ui::yellow(&format!("lpm tunnel start --domain {d}.lpm.llc"))
@@ -169,7 +169,9 @@ async fn run_start(
         Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
         Err(e) => {
             if !json_output {
-                install_ui::warn(&format!("inspector db failed: {e} — using in-memory only"));
+                install_ui::warn_untrusted(&format!(
+                    "inspector db failed: {e} — using in-memory only"
+                ));
             }
             lpm_inspect::state::InspectorState::new(port)
         }
@@ -190,7 +192,7 @@ async fn run_start(
             Err(e) if strict => return Err(e),
             Err(e) => {
                 if !json_output {
-                    install_ui::warn(&format!("inspector failed to start: {e}"));
+                    install_ui::warn_untrusted(&format!("inspector failed to start: {e}"));
                 }
                 None
             }
@@ -238,7 +240,7 @@ async fn run_start(
     };
 
     if !json_output {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Opening tunnel for {}",
             install_ui::yellow(&format!("localhost:{port}"))
         ));
@@ -328,15 +330,15 @@ async fn run_start(
                 install_ui::detail("");
                 install_ui::done("Listening for requests");
                 if inspector_url.is_some() {
-                    install_ui::detail(&format_tunnel_footer(true));
+                    install_ui::detail_line(format_tunnel_footer(true));
                 } else {
-                    install_ui::detail(&format_tunnel_footer(false));
+                    install_ui::detail_line(format_tunnel_footer(false));
                 }
             }
         },
         |msg| {
             if !json_output {
-                install_ui::warn(msg);
+                install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(msg));
             }
         },
         move |usage, initial| {
@@ -347,7 +349,7 @@ async fn run_start(
                 && !json_output
                 && let Some(summary) = tunnel_usage_summary(Some(usage))
             {
-                install_ui::warn(&format!("Tunnel usage: {summary}"));
+                install_ui::warn_untrusted(&format!("Tunnel usage: {summary}"));
             }
         },
     );
@@ -402,7 +404,10 @@ async fn run_claim(
         println!("{result}");
     } else {
         let url = result["url"].as_str().unwrap_or("");
-        install_ui::done(&format!("claimed {url}"));
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "claimed {}",
+            install_ui::url(url)
+        ));
         if let Some(org_name) = org {
             tunnel_detail("org", org_name);
         }
@@ -430,7 +435,10 @@ async fn run_unclaim(
             serde_json::json!({ "success": true, "released": true, "domain": domain })
         );
     } else {
-        install_ui::done(&format!("released {domain}"));
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "released {}",
+            install_ui::yellow(domain)
+        ));
     }
 
     Ok(())
@@ -455,9 +463,9 @@ async fn run_list(
 
     let heading = org.map_or_else(
         || "Tunnel Domains".to_string(),
-        |org_name| format!("Tunnel Domains · {org_name}"),
+        |org_name| format!("Tunnel Domains · {}", install_ui::cyan(org_name)),
     );
-    install_ui::phase(&heading);
+    install_ui::phase_untrusted(&heading);
 
     tunnel_detail("used", format!("{used} of {limit}"));
 
@@ -467,7 +475,7 @@ async fn run_list(
                 let _domain = d["domain"].as_str().unwrap_or("?");
                 let url = d["url"].as_str().unwrap_or("?");
                 let base = d["baseDomain"].as_str().unwrap_or("?");
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "    {} {}",
                     install_ui::url(url),
                     install_ui::dim(&format!("({base})"))
@@ -475,8 +483,11 @@ async fn run_list(
             }
         }
         _ => {
-            install_ui::detail(&format!("    {}", install_ui::dim("No domains claimed")));
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "    {}",
+                install_ui::dim("No domains claimed")
+            ));
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "    {} {}",
                 install_ui::dim("Claim one with:"),
                 install_ui::yellow("lpm tunnel claim <name>.lpm.llc")
@@ -507,7 +518,7 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
             } else {
                 install_ui::cyan("pro")
             };
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "    {:<15} {}",
                 install_ui::yellow(domain),
                 plan_badge
@@ -531,8 +542,14 @@ async fn run_inspect_ui(_project_dir: &Path, inspect_port: Option<u16>) -> Resul
     let state = lpm_inspect::state::InspectorState::new(0);
     let handle = lpm_inspect::start(state, inspect_port.unwrap_or(0)).await?;
 
-    install_ui::done(&format!("Inspector: {}", handle.url));
-    install_ui::detail(&format!("  {}", install_ui::dim("Press Ctrl+C to stop")));
+    install_ui::done_line(crate::install_ui::terminal_line!(
+        "Inspector: {}",
+        install_ui::url(&handle.url)
+    ));
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "  {}",
+        install_ui::dim("Press Ctrl+C to stop")
+    ));
 
     // Block until Ctrl+C
     tokio::signal::ctrl_c()
@@ -578,7 +595,7 @@ async fn run_inspect(
                 install_ui::warn("Webhook body data not found (may have been rotated)");
             }
         } else {
-            install_ui::warn(&format!("Webhook #{idx} not found"));
+            install_ui::warn_untrusted(&format!("Webhook #{idx} not found"));
         }
         return Ok(());
     }
@@ -600,15 +617,18 @@ async fn run_inspect(
         return Ok(());
     }
 
-    install_ui::phase(&format!("Last {} webhooks", entries.len()));
+    install_ui::phase_untrusted(&format!("Last {} webhooks", entries.len()));
     for (i, entry) in entries.iter().enumerate() {
-        install_ui::detail(&format_tunnel_log_entry(Some(i + 1), entry, false));
+        install_ui::detail_line(format_tunnel_log_entry(Some(i + 1), entry, false));
         if !entry.summary.is_empty() {
-            install_ui::detail(&format!("        {}", install_ui::dim(&entry.summary)));
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "        {}",
+                install_ui::dim(&entry.summary)
+            ));
         }
     }
     install_ui::detail("");
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::status_ok(&entries.len().to_string()),
         install_ui::dim("webhooks. Use --detail N for full request/response.")
@@ -653,12 +673,12 @@ async fn run_replay(
         entries.get(n.saturating_sub(1))
     } else {
         install_ui::warn("Specify a webhook number or use --last");
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("Usage:"),
             install_ui::yellow("lpm tunnel replay 3")
         ));
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "         {}",
             install_ui::yellow("lpm tunnel replay --last")
         ));
@@ -671,13 +691,13 @@ async fn run_replay(
         .ok_or_else(|| LpmError::Tunnel("Webhook body data not found".into()))?;
 
     let idx = number.unwrap_or(1);
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Replaying #{}",
         install_ui::yellow(&idx.to_string())
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {} — {}",
-        style_http_method(&webhook.method),
+        style_http_method_fragment(&webhook.method),
         install_ui::cyan(&webhook.path),
         lpm_common::sanitize_for_terminal(&entry.summary)
     ));
@@ -689,9 +709,9 @@ async fn run_replay(
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
     let result = lpm_tunnel::webhook_replay::replay_webhook(&replay_client, &webhook, port).await?;
 
-    let status = style_http_status(result.status);
+    let status = style_http_status_fragment(result.status);
     let ok_suffix = if result.status < 300 { " OK" } else { "" };
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}{} {}",
         install_ui::dim("->"),
         status,
@@ -701,7 +721,7 @@ async fn run_replay(
 
     // Compare with original response to give actionable feedback
     if result.status < 400 && webhook.response_status >= 400 {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Fixed! Was {}, now {}.",
             webhook.response_status, result.status
         ));
@@ -752,9 +772,9 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
         return Ok(());
     }
 
-    install_ui::phase(&format!("{} webhooks", entries.len()));
+    install_ui::phase_untrusted(&format!("{} webhooks", entries.len()));
     for entry in &entries {
-        install_ui::detail(&format_tunnel_log_entry(None, entry, true));
+        install_ui::detail_line(format_tunnel_log_entry(None, entry, true));
     }
 
     Ok(())
@@ -762,8 +782,8 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 
 // ── Helper functions ────────────────────────────────────────────────
 
-fn tunnel_detail(label: &str, value: impl Display) {
-    install_ui::detail(&format_tunnel_detail(label, value));
+fn tunnel_detail(label: &'static str, value: impl Display) {
+    install_ui::detail_line(format_tunnel_detail(label, value));
 }
 
 pub(crate) fn tunnel_session_expiry_summary(session: &lpm_tunnel::TunnelSession) -> Option<String> {
@@ -840,16 +860,16 @@ pub(crate) fn tunnel_usage_summary(
     Some(summary)
 }
 
-fn format_tunnel_detail(label: &str, value: impl Display) -> String {
+fn format_tunnel_detail(label: &'static str, value: impl Display) -> install_ui::TerminalLine {
     let value = style_tunnel_detail_value(label, &value.to_string());
-    format!("    {} {value}", install_ui::dim(&format!("{label:<11}")))
+    crate::install_ui::terminal_line!("    {} {}", install_ui::dim(&format!("{label:<11}")), value)
 }
 
-fn style_tunnel_detail_value(label: &str, value: &str) -> String {
+fn style_tunnel_detail_value(label: &str, value: &str) -> install_ui::TerminalFragment {
     match label {
         "public URL" | "inspector" | "browser" => install_ui::url(value),
         "local" => install_ui::yellow(value),
-        _ => value.to_string(),
+        _ => install_ui::field(value),
     }
 }
 
@@ -901,15 +921,15 @@ fn plural(count: u64, singular: &str) -> String {
     }
 }
 
-fn format_tunnel_footer(has_inspector: bool) -> String {
+fn format_tunnel_footer(has_inspector: bool) -> install_ui::TerminalLine {
     if has_inspector {
-        format!(
+        crate::install_ui::terminal_line!(
             "  press {} to open inspector, {} to quit",
             install_ui::yellow("o"),
             install_ui::yellow("q")
         )
     } else {
-        format!("  press {} to quit", install_ui::yellow("q"))
+        crate::install_ui::terminal_line!("  press {} to quit", install_ui::yellow("q"))
     }
 }
 
@@ -935,7 +955,7 @@ async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), L
                         if let Some(url) = inspector_url.as_deref()
                             && let Err(e) = open::that(url)
                         {
-                            install_ui::warn(&format!("failed to open inspector: {e}"));
+                            install_ui::warn_untrusted(&format!("failed to open inspector: {e}"));
                         }
                     }
                     TunnelControl::Ignore => {}
@@ -1005,16 +1025,18 @@ fn tunnel_control_from_key(event: crossterm::event::KeyEvent) -> TunnelControl {
 }
 
 fn print_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) {
-    install_ui::detail(&format_tunnel_request(webhook));
+    install_ui::detail_line(format_tunnel_request(webhook));
 }
 
-fn format_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) -> String {
-    format!(
+fn format_tunnel_request(
+    webhook: &lpm_tunnel::webhook::CapturedWebhook,
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "  {} {} {} {} {}",
         install_ui::dim("→"),
-        style_http_method(&webhook.method),
+        style_http_method_fragment(&webhook.method),
         install_ui::cyan(&webhook.path),
-        style_http_status(webhook.response_status),
+        style_http_status_fragment(webhook.response_status),
         install_ui::dim(&format!("{}ms", webhook.duration_ms)),
     )
 }
@@ -1023,22 +1045,23 @@ fn format_tunnel_log_entry(
     index: Option<usize>,
     entry: &lpm_tunnel::webhook_log::WebhookLogEntry,
     include_summary: bool,
-) -> String {
+) -> install_ui::TerminalLine {
     let time = tunnel_entry_time(&entry.ts);
     let prefix = index.map_or_else(
-        || format!("  {} ", install_ui::dim(time)),
-        |idx| format!("  #{idx:<3}"),
+        || crate::install_ui::terminal_line!("  {} ", install_ui::dim(time)),
+        |idx| crate::install_ui::terminal_line!("  #{:<3}", idx),
     );
     let summary = if include_summary {
-        format!("  {}", lpm_common::sanitize_for_terminal(&entry.summary))
+        crate::install_ui::terminal_line!("  {}", lpm_common::sanitize_for_terminal(&entry.summary))
     } else {
-        String::new()
+        install_ui::TerminalLine::new("")
     };
-    format!(
-        "{prefix} {} {:<35} {}  {}{}",
-        style_http_method(&entry.method),
+    crate::install_ui::terminal_line!(
+        "{} {} {:<35} {}  {}{}",
+        prefix,
+        style_http_method_fragment(&entry.method),
         install_ui::cyan(&entry.path),
-        style_http_status(entry.status),
+        style_http_status_fragment(entry.status),
         install_ui::dim(&format!("{}ms", entry.ms)),
         summary
     )
@@ -1048,15 +1071,23 @@ fn tunnel_entry_time(ts: &str) -> &str {
     if ts.len() >= 19 { &ts[11..19] } else { ts }
 }
 
-fn style_http_method(method: &str) -> String {
+fn style_http_method_fragment(method: &str) -> install_ui::TerminalFragment {
     match method {
         "GET" => install_ui::url(method),
         "POST" => install_ui::yellow(method),
-        _ => method.to_string(),
+        _ => install_ui::field(method),
     }
 }
 
+fn format_untrusted_block_line(indent: &str, line: &str) -> String {
+    format!("{indent}{}", lpm_common::sanitize_terminal_inline(line))
+}
+
 fn style_http_status(status: u16) -> String {
+    style_http_status_fragment(status).to_string()
+}
+
+fn style_http_status_fragment(status: u16) -> install_ui::TerminalFragment {
     let status = status.to_string();
     match status.as_bytes().first() {
         Some(b'2') | Some(b'3') => install_ui::status_ok(&status),
@@ -1148,32 +1179,32 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
         .map_or_else(|| "unknown".to_string(), |p| p.to_string());
 
     install_ui::detail("");
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Webhook #{}",
         install_ui::yellow(&index.to_string())
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {} {}",
         install_ui::section("Request:"),
-        style_http_method(&webhook.method),
+        style_http_method_fragment(&webhook.method),
         install_ui::cyan(&webhook.path),
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::dim("Provider:"),
         install_ui::yellow(&provider_display)
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::section("Response:"),
         status,
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::dim("Duration:"),
         install_ui::dim(&format!("{}ms", webhook.duration_ms))
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::dim("Time:"),
         install_ui::dim(&webhook.timestamp.to_string())
@@ -1182,7 +1213,10 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
     // Request headers
     if !webhook.request_headers.is_empty() {
         install_ui::detail("");
-        install_ui::detail(&format!("  {}", install_ui::section("Request Headers:")));
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {}",
+            install_ui::section("Request Headers:")
+        ));
         for (key, value) in &webhook.request_headers {
             // Mask sensitive values (auth tokens, signatures)
             let lower_key = key.to_lowercase();
@@ -1192,7 +1226,7 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
                 } else {
                     value.clone()
                 };
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "    {}: {}",
                 install_ui::dim(key),
                 lpm_common::sanitize_for_terminal(&display_value)
@@ -1203,7 +1237,10 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
     // Request body (truncated for large payloads)
     if !webhook.request_body.is_empty() {
         install_ui::detail("");
-        install_ui::detail(&format!("  {}", install_ui::section("Request Body:")));
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {}",
+            install_ui::section("Request Body:")
+        ));
         // Try interpreting as UTF-8 for display
         let body_str = String::from_utf8_lossy(&webhook.request_body);
         // Try pretty-printing JSON
@@ -1217,29 +1254,40 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
                 &lines
             };
             for line in display_lines {
-                install_ui::detail(&format!("    {line}"));
+                install_ui::detail_untrusted(&format_untrusted_block_line("    ", line));
             }
             if lines.len() > 40 {
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "    {}",
                     install_ui::dim(&format!("... ({} more lines)", lines.len() - 40))
                 ));
             }
         } else if body_str.len() > 2000 {
-            install_ui::detail(&format!("    {}", &body_str[..2000]));
-            install_ui::detail(&format!(
+            let preview_end = body_str
+                .char_indices()
+                .nth(2000)
+                .map_or(body_str.len(), |(index, _)| index);
+            for line in body_str[..preview_end].lines() {
+                install_ui::detail_untrusted(&format_untrusted_block_line("    ", line));
+            }
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "    {}",
                 install_ui::dim(&format!("... ({} bytes total)", webhook.request_body.len()))
             ));
         } else {
-            install_ui::detail(&format!("    {body_str}"));
+            for line in body_str.lines() {
+                install_ui::detail_untrusted(&format_untrusted_block_line("    ", line));
+            }
         }
     }
 
     // Signature diagnostic
     if let Some(ref diag) = webhook.signature_diagnostic {
         install_ui::detail("");
-        install_ui::warn(&format!("Signature issue: {diag}"));
+        install_ui::warn_untrusted(&format!(
+            "Signature issue: {}",
+            lpm_common::sanitize_terminal_inline(diag)
+        ));
     }
 
     install_ui::detail("");
@@ -1315,7 +1363,7 @@ mod tests {
         };
 
         assert_eq!(
-            format_tunnel_request(&webhook),
+            format_tunnel_request(&webhook).to_string(),
             "  → POST /hooks/stripe 201 42ms"
         );
     }
@@ -1353,7 +1401,8 @@ mod tests {
         };
 
         assert_eq!(
-            console::strip_ansi_codes(&format_tunnel_log_entry(Some(2), &entry, true)).into_owned(),
+            console::strip_ansi_codes(format_tunnel_log_entry(Some(2), &entry, true).as_ref())
+                .into_owned(),
             "  #2   POST /hooks                              500  37ms  Stripe: payment"
         );
     }
@@ -1363,10 +1412,10 @@ mod tests {
         lpm_common::color::set_enabled(false);
 
         assert_eq!(
-            format_tunnel_footer(true),
+            format_tunnel_footer(true).to_string(),
             "  press o to open inspector, q to quit"
         );
-        assert_eq!(format_tunnel_footer(false), "  press q to quit");
+        assert_eq!(format_tunnel_footer(false).to_string(), "  press q to quit");
     }
 
     #[test]
@@ -1418,16 +1467,35 @@ mod tests {
         lpm_common::color::set_enabled(false);
 
         assert_eq!(
-            format_tunnel_detail("public URL", "https://acme-api.lpm.fyi"),
+            format_tunnel_detail("public URL", "https://acme-api.lpm.fyi").to_string(),
             "    public URL  https://acme-api.lpm.fyi"
         );
         assert_eq!(
-            format_tunnel_detail("inspector", "http://127.0.0.1:4512"),
+            format_tunnel_detail("inspector", "http://127.0.0.1:4512").to_string(),
             "    inspector   http://127.0.0.1:4512"
         );
         assert_eq!(
-            format_tunnel_detail("session", "stripe-test"),
+            format_tunnel_detail("session", "stripe-test").to_string(),
             "    session     stripe-test"
+        );
+    }
+
+    #[test]
+    fn tunnel_fields_and_multiline_blocks_cannot_inject_terminal_controls() {
+        lpm_common::color::set_enabled(false);
+        let malicious = "safe\nforged\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}end";
+
+        assert_eq!(
+            format_tunnel_detail("session", malicious).to_string(),
+            "    session     safe?forged?rewritten?end"
+        );
+        assert_eq!(
+            format_untrusted_block_line("    ", malicious),
+            "    safe?forged?rewritten?end"
+        );
+        assert_eq!(
+            style_http_method_fragment(malicious).to_string(),
+            "safe?forged?rewritten?end"
         );
     }
 

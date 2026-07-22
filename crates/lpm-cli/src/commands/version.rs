@@ -54,12 +54,17 @@ pub(crate) fn run(
         });
         println!("{}", output::format_json_answer(&json)?);
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "{} {} -> {}",
-            package.name, package.old_version, package.new_version
+            install_ui::yellow(&package.name),
+            install_ui::dim(&package.old_version),
+            install_ui::yellow(&package.new_version)
         ));
         if git_tag_version {
-            install_ui::detail(&format!("tag: {tag}"));
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "tag: {}",
+                install_ui::cyan(&tag)
+            ));
         }
     }
     Ok(())

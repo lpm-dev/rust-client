@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use reqwest::header::HeaderMap;
 #[cfg(test)]
 use reqwest::header::HeaderValue;
@@ -117,15 +116,18 @@ pub async fn complete_web_auth_challenge(
     poll_interval: Duration,
 ) -> Result<String, LpmError> {
     if !json_output {
-        install_ui::phase(&format!("Authenticate with npm to {action}"));
-        println!("  {}", challenge.auth_url.bold());
+        install_ui::phase_untrusted(&format!("Authenticate with npm to {action}"));
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!("  {}", install_ui::bold(&challenge.auth_url))
+        );
     }
 
     if open_browser
         && let Err(e) = open::that(&challenge.auth_url)
         && !json_output
     {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Could not open browser automatically: {e}. Open the URL above manually."
         ));
     }

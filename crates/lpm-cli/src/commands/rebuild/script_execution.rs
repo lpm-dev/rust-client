@@ -1,5 +1,5 @@
 use super::process_tree::wait_with_timeout;
-use lpm_common::sanitize_for_terminal;
+use lpm_common::sanitize_terminal_multiline;
 use lpm_sandbox::SandboxMode;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -241,7 +241,7 @@ where
             Err(_) => break,
         };
         let lossy = String::from_utf8_lossy(&buf[..read]);
-        let safe = sanitize_for_terminal(&lossy);
+        let safe = sanitize_terminal_multiline(&lossy);
         if writer.write_all(safe.as_bytes()).is_err() {
             break;
         }

@@ -156,13 +156,13 @@ fn emit_clean_human(cleaned: &[CleanedEntry]) {
     }
     if cleaned.len() == 1 {
         let entry = &cleaned[0];
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Cleared {} cache · freed {}",
             entry.category,
             format_bytes(total)
         ));
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Cleared {} cache directories · freed {}",
             cleaned.len(),
             format_bytes(total)
@@ -191,7 +191,10 @@ fn run_path(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Res
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        println!("{}", path.display());
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!("{}", path.display().to_string())
+        );
     }
     Ok(())
 }
@@ -251,22 +254,22 @@ fn maybe_show_semantic_change_notice(root: &LpmRoot) {
 fn emit_semantic_change_notice() {
     install_ui::warn("cache clean left the package store untouched");
     for line in semantic_change_notice_details() {
-        install_ui::detail(&line);
+        install_ui::detail_line(line);
     }
 }
 
-fn semantic_change_notice_details() -> Vec<String> {
+fn semantic_change_notice_details() -> Vec<install_ui::TerminalLine> {
     vec![
-        format!(
+        crate::install_ui::terminal_line!(
             "  {} `lpm cache clean` now cleans metadata, task, and dlx caches only.",
             install_ui::dim("note")
         ),
-        format!(
+        crate::install_ui::terminal_line!(
             "  {} Use {} for reference-aware cleanup.",
             install_ui::dim("command"),
             install_ui::yellow("lpm cache prune --apply")
         ),
-        format!(
+        crate::install_ui::terminal_line!(
             "  {} Use {} to wipe the store.",
             install_ui::dim("command"),
             install_ui::yellow("lpm store clean")
@@ -345,7 +348,11 @@ mod tests {
     #[test]
     fn semantic_change_notice_details_use_slim_body_roles() {
         let details = semantic_change_notice_details();
-        let joined = details.join("\n");
+        let joined = details
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         let joined = console::strip_ansi_codes(&joined).into_owned();
 
         assert!(

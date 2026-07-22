@@ -23,8 +23,8 @@ pub async fn run(
     if let Some(score) = report.score {
         let max = report.max_score.unwrap_or(100);
         let tier = report.tier.as_deref().unwrap_or("—");
-        print_field("score", &score_colored(score, max));
-        print_field("tier", &tier_colored(tier));
+        print_field("score", score_colored(score, max));
+        print_field("tier", tier_colored(tier));
     }
 
     if let Some(eco) = &report.ecosystem {
@@ -57,7 +57,11 @@ pub async fn run(
             } else {
                 install_ui::dim(&points)
             };
-            println!("  {icon} {label:<label_width$}  {points}");
+            let label = format!("{label:<label_width$}");
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!("  {} {}  {}", icon, label, points)
+            );
 
             if let Some(detail) = &check.detail
                 && !detail.is_empty()
@@ -73,15 +77,22 @@ pub async fn run(
     Ok(())
 }
 
-fn print_field(label: &str, value: &str) {
-    println!("  {} {value}", install_ui::dim(&format!("{label:<10}")));
+fn print_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim(&format!("{label:<10}")),
+            value
+        )
+    );
 }
 
-fn score_colored(score: u32, max: u32) -> String {
+fn score_colored(score: u32, max: u32) -> install_ui::TerminalFragment {
     install_ui::status_ok(&format!("{score}/{max}"))
 }
 
-fn tier_colored(tier: &str) -> String {
+fn tier_colored(tier: &str) -> install_ui::TerminalFragment {
     install_ui::status_ok(tier)
 }
 

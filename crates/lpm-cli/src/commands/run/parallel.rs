@@ -3,7 +3,8 @@ use super::cache::{
 };
 use super::format::{
     TaskResult, format_failed_task_output_footer, format_failed_task_output_header,
-    format_run_failure_detail, print_json_summary, print_results_summary, print_task_result,
+    format_run_failure_detail, print_captured_stderr, print_captured_stdout, print_json_summary,
+    print_results_summary, print_task_result,
 };
 use super::task::{is_meta_task, run_task, run_task_captured};
 use crate::install_ui;
@@ -56,7 +57,7 @@ pub(super) async fn run_tasks_parallel(
     // Show execution plan when there's parallelism
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
     if levels.len() > 1 || levels.first().map_or(0, |l| l.len()) > 1 {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Running {} tasks {}",
             install_ui::yellow(&total_tasks.to_string()),
             install_ui::dim(&format!("({} parallel groups)", levels.len()))
@@ -135,10 +136,10 @@ pub(super) async fn run_tasks_parallel(
                     try_cache_hit_with_config(project_dir, task_name, env_mode, lpm_config)
             {
                 if !hit.stdout.is_empty() {
-                    print!("{}", hit.stdout);
+                    print_captured_stdout(&hit.stdout);
                 }
                 if !hit.stderr.is_empty() {
-                    eprint!("{}", hit.stderr);
+                    print_captured_stderr(&hit.stderr);
                 }
                 all_results.push(TaskResult {
                     name: task_name.clone(),
@@ -151,7 +152,10 @@ pub(super) async fn run_tasks_parallel(
                 continue;
             }
 
-            install_ui::phase(&format!("Running {task_name}"));
+            install_ui::phase_untrusted(&format!(
+                "Running {}",
+                lpm_common::sanitize_terminal_inline(task_name)
+            ));
 
             // Use captured execution when caching is enabled.
             let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
@@ -412,10 +416,10 @@ pub(super) async fn run_tasks_parallel(
                             if !stream {
                                 // Buffered mode: print captured output now
                                 if !stdout.is_empty() {
-                                    print!("{}", stdout);
+                                    print_captured_stdout(&stdout);
                                 }
                                 if !stderr.is_empty() && result.success {
-                                    eprint!("{}", stderr);
+                                    print_captured_stderr(&stderr);
                                 }
                             }
                             // Streaming mode: output was already printed with prefixes
@@ -431,7 +435,7 @@ pub(super) async fn run_tasks_parallel(
                         }
                         Err(_) => {
                             let name = chunk_names[i].clone();
-                            install_ui::detail(&format_run_failure_detail(
+                            install_ui::detail_line(format_run_failure_detail(
                                 &name,
                                 "thread panicked",
                             ));
@@ -450,9 +454,9 @@ pub(super) async fn run_tasks_parallel(
                 // Dump failed task output after the level completes
                 for (name, stderr) in &failed_outputs {
                     install_ui::detail("");
-                    install_ui::detail(&format_failed_task_output_header(name));
-                    eprint!("{stderr}");
-                    install_ui::detail(&format_failed_task_output_footer());
+                    install_ui::detail_line(format_failed_task_output_header(name));
+                    print_captured_stderr(stderr);
+                    install_ui::detail_line(format_failed_task_output_footer());
                 }
             }
         }

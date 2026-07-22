@@ -11,7 +11,6 @@
 
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_task::filter::{FilterEngine, FilterExpr, MatchKind, TraceReason};
 use lpm_task::graph::WorkspaceGraph;
 use std::collections::HashSet;
@@ -297,12 +296,18 @@ fn topologically_sorted_selection(graph: &WorkspaceGraph, selected: &HashSet<usi
 fn render_no_match(explain: &lpm_task::filter::FilterExplain) {
     install_ui::warn("Filter set produced no matches");
     for note in &explain.notes {
-        eprintln!("  {}", note.dimmed());
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {}",
+            install_ui::dim(note)
+        ));
     }
     if let Some(hint) = format_no_match_hint(&explain.input) {
         eprintln!();
         for line in hint.lines() {
-            eprintln!("  {}", line.dimmed());
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {}",
+                install_ui::dim(line)
+            ));
         }
     }
 }
@@ -325,7 +330,7 @@ fn render_human_terse(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filter
     } else {
         "members"
     };
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "{} workspace {member_word} matched",
         explain.selected.len()
     ));
@@ -357,23 +362,38 @@ fn render_human_explain(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filt
 
         let reason = trace_for(id).map(|t| describe_reason(graph, &t.reason));
         match reason {
-            Some(r) => println!("  {}  {}  {}", name.bold(), path.dimmed(), r.dimmed()),
-            None => println!("  {}  {}", name.bold(), path.dimmed()),
+            Some(r) => println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {}  {}  {}",
+                    install_ui::bold(name),
+                    install_ui::dim(&path),
+                    install_ui::dim(&r)
+                )
+            ),
+            None => println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {}  {}",
+                    install_ui::bold(name),
+                    install_ui::dim(&path)
+                )
+            ),
         }
     }
     println!();
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Selected {} of {} workspace packages",
         install_ui::bold(&explain.selected.len().to_string()),
         graph.len()
     ));
 }
 
-fn format_terse_member_line(name: &str, show_bullet: bool) -> String {
+fn format_terse_member_line(name: &str, show_bullet: bool) -> install_ui::TerminalLine {
     if show_bullet {
-        format!("{} {name}", install_ui::bullet(true))
+        crate::install_ui::terminal_line!("{} {}", install_ui::bullet(true), name)
     } else {
-        name.to_string()
+        crate::install_ui::terminal_line!("{}", name)
     }
 }
 
@@ -438,7 +458,10 @@ mod tests {
 
     #[test]
     fn terse_member_line_stays_bare_for_non_tty_stdout() {
-        assert_eq!(format_terse_member_line("@test/app", false), "@test/app");
+        assert_eq!(
+            format_terse_member_line("@test/app", false).to_string(),
+            "@test/app"
+        );
     }
 
     #[test]

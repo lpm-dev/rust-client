@@ -2,56 +2,6 @@
 
 use std::collections::VecDeque;
 
-/// Strip ANSI escape sequences and dangerous control characters from a string.
-///
-/// Removes CSI (`ESC[...letter`), OSC (`ESC]...BEL/ST`), and raw control characters
-/// (except tab) to prevent terminal escape injection from malicious process output.
-fn strip_ansi(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // ESC sequence
-            match chars.peek() {
-                Some('[') => {
-                    // CSI: skip until ASCII letter
-                    chars.next();
-                    while let Some(&ch) = chars.peek() {
-                        chars.next();
-                        if ch.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    // OSC: skip until BEL (\x07) or ST (ESC \)
-                    chars.next();
-                    while let Some(&ch) = chars.peek() {
-                        chars.next();
-                        if ch == '\x07' {
-                            break;
-                        }
-                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    // Unknown ESC sequence, skip the next char too
-                    chars.next();
-                }
-            }
-        } else if c.is_control() && c != '\t' {
-            // Skip control chars except tab
-            continue;
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 /// A bounded buffer that drops oldest entries when full.
 pub struct LogBuffer {
     lines: VecDeque<String>,
@@ -67,7 +17,7 @@ impl LogBuffer {
     }
 
     pub fn push(&mut self, line: String) {
-        let clean = strip_ansi(&line);
+        let clean = lpm_common::sanitize_terminal_inline(&line).into_owned();
         if self.lines.len() >= self.capacity {
             self.lines.pop_front();
         }
@@ -141,29 +91,43 @@ mod tests {
     }
 
     #[test]
-    fn strip_ansi_removes_csi_sequences() {
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    fn shared_policy_removes_csi_sequences() {
+        assert_eq!(
+            lpm_common::sanitize_terminal_inline("\x1b[31mred\x1b[0m"),
+            "red"
+        );
     }
 
     #[test]
-    fn strip_ansi_preserves_normal_text() {
-        assert_eq!(strip_ansi("normal text"), "normal text");
+    fn shared_policy_preserves_normal_text() {
+        assert_eq!(
+            lpm_common::sanitize_terminal_inline("normal text"),
+            "normal text"
+        );
     }
 
     #[test]
-    fn strip_ansi_removes_osc_sequences() {
-        assert_eq!(strip_ansi("\x1b]0;evil title\x07visible"), "visible");
+    fn shared_policy_removes_osc_sequences() {
+        assert_eq!(
+            lpm_common::sanitize_terminal_inline("\x1b]0;evil title\x07visible"),
+            "visible"
+        );
     }
 
     #[test]
-    fn strip_ansi_removes_osc_with_st_terminator() {
-        assert_eq!(strip_ansi("\x1b]0;title\x1b\\visible"), "visible");
+    fn shared_policy_removes_osc_with_st_terminator() {
+        assert_eq!(
+            lpm_common::sanitize_terminal_inline("\x1b]0;title\x1b\\visible"),
+            "visible"
+        );
     }
 
     #[test]
-    fn strip_ansi_removes_control_chars() {
-        // \x01 (SOH) should be stripped, but \t should be kept
-        assert_eq!(strip_ansi("hello\x01\tworld"), "hello\tworld");
+    fn shared_inline_policy_neutralizes_control_chars_and_tabs() {
+        assert_eq!(
+            lpm_common::sanitize_terminal_inline("hello\x01\tworld"),
+            "hello??world"
+        );
     }
 
     #[test]
@@ -172,5 +136,14 @@ mod tests {
         buf.push("\x1b[31mred text\x1b[0m".into());
         let lines: Vec<&str> = buf.lines().collect();
         assert_eq!(lines, vec!["red text"]);
+    }
+
+    #[test]
+    fn push_removes_terminal_string_controls_with_shared_policy() {
+        let mut buf = LogBuffer::new(10);
+        buf.push("safe\x1bP1;2|dcs payload\x1b\\ tail\u{009d}0;title\u{009c} end".into());
+
+        let lines: Vec<&str> = buf.lines().collect();
+        assert_eq!(lines, vec!["safe tail end"]);
     }
 }

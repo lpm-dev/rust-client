@@ -199,9 +199,9 @@ pub(in crate::commands::config) fn announce_typosquat_guard_set(
             .unwrap()
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Set typosquat-guard = {}",
-            format_current_typosquat_guard(Some(selection)).bold()
+            install_ui::bold(&format_current_typosquat_guard(Some(selection))),
         ));
     }
 }

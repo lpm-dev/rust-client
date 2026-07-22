@@ -1295,9 +1295,9 @@ async fn run_with_options_under_store_lock(
     // Re-creating them here every time keeps the layout consistent.
     let workspace_links_created = link_workspace_members(project_dir, &workspace_member_deps)?;
     if workspace_links_created > 0 && !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Linked {} workspace member(s)",
-            workspace_links_created.to_string().bold()
+            install_ui::bold(&workspace_links_created.to_string())
         ));
     }
 
@@ -1368,7 +1368,7 @@ async fn run_with_options_under_store_lock(
 
         if !phantom_result.phantom_imports.is_empty() {
             eprintln!();
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{} phantom dependency import(s) detected:",
                 phantom_result.phantom_imports.len()
             ));
@@ -1378,17 +1378,26 @@ async fn run_with_options_under_store_lock(
                     .strip_prefix(project_dir)
                     .unwrap_or(&phantom.file);
                 eprintln!(
-                    "    {} ({}:{})",
-                    phantom.package_name.bold(),
-                    rel_file.display().to_string().dimmed(),
-                    phantom.line,
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "    {} ({}:{})",
+                        install_ui::bold(&phantom.package_name),
+                        install_ui::dim(&rel_file.display().to_string()),
+                        phantom.line,
+                    )
                 );
                 if let Some(via) = &phantom.available_via {
-                    eprintln!("      {}", via.dimmed());
+                    eprintln!(
+                        "{}",
+                        crate::install_ui::terminal_line!("      {}", install_ui::dim(via))
+                    );
                 }
                 eprintln!(
-                    "      Fix: {}",
-                    format!("lpm install {}", phantom.package_name).dimmed()
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "      Fix: {}",
+                        install_ui::dim(&format!("lpm install {}", phantom.package_name))
+                    )
                 );
             }
             if phantom_result.phantom_imports.len() > 5 {
@@ -1405,7 +1414,7 @@ async fn run_with_options_under_store_lock(
                 crate::intelligence::verify_imports(project_dir, &installed_names, &deps);
             if !verification.unresolved.is_empty() {
                 eprintln!();
-                install_ui::warn(&format!(
+                install_ui::warn_untrusted(&format!(
                     "{} import(s) will fail at runtime:",
                     verification.unresolved.len()
                 ));
@@ -1415,12 +1424,21 @@ async fn run_with_options_under_store_lock(
                         .strip_prefix(project_dir)
                         .unwrap_or(&unresolved.file);
                     eprintln!(
-                        "    {}:{} → {}",
-                        rel_file.display().to_string().dimmed(),
-                        unresolved.line,
-                        format!("import \"{}\"", unresolved.specifier).bold(),
+                        "{}",
+                        crate::install_ui::terminal_line!(
+                            "    {}:{} → {}",
+                            install_ui::dim(&rel_file.display().to_string()),
+                            unresolved.line,
+                            install_ui::bold(&format!("import \"{}\"", unresolved.specifier)),
+                        )
                     );
-                    eprintln!("      {}", unresolved.suggestion.dimmed());
+                    eprintln!(
+                        "{}",
+                        crate::install_ui::terminal_line!(
+                            "      {}",
+                            install_ui::dim(&unresolved.suggestion)
+                        )
+                    );
                 }
             }
         }
@@ -1456,7 +1474,9 @@ async fn run_with_options_under_store_lock(
                 };
                 println!(
                     "  {icon} {}@{}: {}",
-                    warning.package_name, warning.version, warning.message
+                    lpm_common::sanitize_terminal_inline(&warning.package_name),
+                    lpm_common::sanitize_terminal_inline(&warning.version),
+                    lpm_common::sanitize_terminal_inline(&warning.message)
                 );
             }
 

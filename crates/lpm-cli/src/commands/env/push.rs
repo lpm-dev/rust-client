@@ -97,9 +97,9 @@ pub(super) async fn vars_push(
             "version": result.version,
         }));
     } else {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "vault synced (version {})",
-            result.version.unwrap_or(0).to_string().bold()
+            install_ui::bold(&result.version.unwrap_or(0).to_string())
         ));
     }
     Ok(())

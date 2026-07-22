@@ -179,14 +179,23 @@ pub(super) fn rebuild_summary_envelope(
 }
 
 pub(super) fn rebuild_package_label(pkg: &ScriptablePackage) -> String {
-    format!("{}@{}", pkg.name, pkg.version)
+    format!(
+        "{}@{}",
+        lpm_common::sanitize_terminal_inline(&pkg.name),
+        lpm_common::sanitize_terminal_inline(&pkg.version)
+    )
 }
 
 pub(super) fn rebuild_package_failure_message(
     pkg: &ScriptablePackage,
     error: &impl std::fmt::Display,
 ) -> String {
-    format!("{} failed: {error}", rebuild_package_label(pkg))
+    let error = error.to_string();
+    format!(
+        "{} failed: {}",
+        rebuild_package_label(pkg),
+        lpm_common::sanitize_terminal_inline(&error)
+    )
 }
 
 pub(super) fn scripts_word(count: usize) -> &'static str {
@@ -354,7 +363,7 @@ pub(super) fn warn_stale_trusted_deps(
 
     if !stale.is_empty() {
         stale.sort();
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Stale trustedDependencies (no lifecycle scripts): {}",
             stale.join(", ")
         ));

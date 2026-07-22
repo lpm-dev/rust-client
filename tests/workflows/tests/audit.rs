@@ -182,6 +182,37 @@ async fn install_one_with_pkg_json(
         .success();
 }
 
+async fn mount_registry_advisory(mock: &MockRegistry, package: &str, summary: &str) {
+    let ndjson = format!(
+        "{}\n",
+        serde_json::json!({
+            "name": package,
+            "metadata": {
+                "name": package,
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {
+                    "1.0.0": {
+                        "name": package,
+                        "version": "1.0.0",
+                        "dependencies": {},
+                        "_vulnerabilities": [{
+                            "id": "REGISTRY-ESCAPE",
+                            "summary": summary,
+                            "severity": "high"
+                        }]
+                    }
+                }
+            }
+        })
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ndjson, "application/x-ndjson"))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+}
+
 async fn install_signature_fixture_project(
     project: &TempProject,
     mock: &MockRegistry,
@@ -545,6 +576,69 @@ async fn audit_clean_dep_with_empty_osv_response_exits_zero() {
             && !stderr.contains("lockfile")
             && !stderr.contains("Run lpm audit --json"),
         "clean audit must not render the old verbose body, got:\n{stderr}",
+    );
+}
+
+#[tokio::test]
+async fn audit_registry_advisory_sanitizes_human_output_and_preserves_json_value() {
+    let package = "@lpm.dev/test.audit-terminal-boundary";
+    let summary = "safe advisory\nFORGED-LINE\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"audit-terminal-boundary","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, package).await;
+    mount_registry_advisory(&mock, package, summary).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+    let mut human_command = lpm_with_registry(&project, &mock.url());
+    human_command
+        .env("LPM_OSV_URL", &osv_url)
+        .env_remove("NO_COLOR")
+        .env("FORCE_COLOR", "1")
+        .arg("audit");
+    let human = human_command
+        .output()
+        .expect("failed to spawn colored lpm audit");
+    assert!(!human.status.success(), "high advisory must fail audit");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        rendered.contains("safe advisory?FORGED-LINE?rewritten?end"),
+        "safe advisory text must remain visible without injected lines; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("\u{1b}["),
+        "forced LPM styling must remain present; got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\u{1b}[2J",
+        "\u{1b}]52;c;AAAA",
+        "\u{7}",
+        "\u{8}",
+        "\r",
+        "\u{0090}",
+        "\u{009c}",
+        "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "human output retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
+
+    let json = run_audit_json(&project, &mock, &[]);
+    assert!(!json.status.success(), "high advisory must fail JSON audit");
+    assert!(json.stderr.is_empty(), "JSON audit must not write stderr");
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .unwrap_or_else(|error| panic!("audit JSON must parse: {error}"));
+    assert_eq!(
+        envelope["packages"][0]["issues"][0]["message"],
+        format!("REGISTRY-ESCAPE — {summary}")
     );
 }
 

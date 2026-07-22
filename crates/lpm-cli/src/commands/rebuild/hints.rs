@@ -199,24 +199,29 @@ pub fn show_install_build_hint(
     }
 
     println!();
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "{} package(s) have install scripts:",
         unbuilt.len()
     ));
 
     for row in &unbuilt {
         let trust_label = if row.is_trusted {
-            "trusted ✓".green().to_string()
+            install_ui::green("trusted ✓")
         } else {
-            "not trusted".yellow().to_string()
+            install_ui::yellow("not trusted")
         };
 
         let script_names: Vec<&str> = row.scripts.keys().map(|s| s.as_str()).collect();
+        let package = format!("{}@{}", row.name, row.version);
+        let scripts = script_names.join(", ");
         println!(
-            "  {:<30} {:<30} ({})",
-            format!("{}@{}", row.name, row.version).bold(),
-            script_names.join(", ").dimmed(),
-            trust_label,
+            "{}",
+            crate::install_ui::terminal_line!(
+                "  {:<30} {:<30} ({})",
+                install_ui::bold(&package),
+                install_ui::dim(&scripts),
+                trust_label,
+            )
         );
     }
 

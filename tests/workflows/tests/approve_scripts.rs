@@ -64,6 +64,42 @@ fn write_empty_build_state(project: &TempProject) {
     );
 }
 
+#[test]
+fn approve_scripts_blocked_package_fields_cannot_inject_terminal_rows() {
+    let project = TempProject::empty("");
+    write_project_no_trusted_deps(&project);
+    let hostile_json_escaped =
+        r#"safe\nFORGED\rrewritten\b\u001b]52;c;AAAA\u0007\u0090hidden\u009cend"#;
+    seed_blocked_build_state_with_real_hash(&project, hostile_json_escaped, "1.0.0");
+
+    let output = lpm(&project)
+        .args(["approve-scripts", "--list"])
+        .output()
+        .expect("spawn lpm approve-scripts --list");
+
+    assert!(
+        output.status.success(),
+        "approve-scripts failed: {output:?}"
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        rendered.contains("safe?FORGED?rewritten?end"),
+        "hostile blocked-package fields must remain visible as one sanitized field: {rendered:?}",
+    );
+    for attacker_fragment in [
+        "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "approve-scripts output retained {attacker_fragment:?}: {rendered:?}",
+        );
+    }
+}
+
 // ─── Global-mode fixture helpers ────────────────────────────────────────
 
 /// Write a minimal `<home>/.lpm/global/manifest.toml` with one

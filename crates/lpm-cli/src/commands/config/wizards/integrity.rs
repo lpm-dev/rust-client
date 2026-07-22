@@ -107,6 +107,10 @@ pub(in crate::commands::config) fn announce_integrity_policy_set(
             .unwrap()
         );
     } else {
-        install_ui::done(&format!("Set {INTEGRITY_KEY} = {}", policy.as_str().bold()));
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Set {} = {}",
+            INTEGRITY_KEY,
+            install_ui::bold(policy.as_str()),
+        ));
     }
 }

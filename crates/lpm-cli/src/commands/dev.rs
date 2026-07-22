@@ -80,12 +80,12 @@ fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
     }))
 }
 
-fn print_cert_prompt_field(label: &str, value: &str) {
+fn print_cert_prompt_field(label: &'static str, value: &str) {
     println!("{}", format_cert_prompt_field(label, value));
 }
 
-fn format_cert_prompt_field(label: &str, value: &str) -> String {
-    format!("    {} {value}", install_ui::dim(&format!("{label:<12}")))
+fn format_cert_prompt_field(label: &'static str, value: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!("    {} {}", install_ui::dim(&format!("{label:<12}")), value,)
 }
 
 /// Run the `lpm dev` command with zero-config detection.
@@ -313,7 +313,7 @@ pub async fn run(
                 format!("{scheme}://{}:{port}", primary.ip)
             };
             dev_ui::blank_line();
-            dev_ui::detail_with_hint(
+            dev_ui::trusted_detail_with_hint(
                 "Network",
                 &install_ui::url(&url),
                 &format!("({})", primary.interface_type),
@@ -327,10 +327,10 @@ pub async fn run(
                     } else {
                         format!("{scheme}://{}:{port}", addr.ip)
                     };
-                    dev_ui::hint_line(&format!(
+                    dev_ui::trusted_hint_line(install_ui::terminal_line!(
                         "{} {}",
                         install_ui::url(&url),
-                        install_ui::dim(&format!("({})", addr.interface_type))
+                        install_ui::dim(&format!("({})", addr.interface_type)),
                     ));
                 }
             }
@@ -341,7 +341,7 @@ pub async fn run(
         // QR code
         if !net_info.qr_code.is_empty() {
             dev_ui::blank_line();
-            dev_ui::raw_block(&net_info.qr_code);
+            dev_ui::untrusted_block(&net_info.qr_code);
         }
 
         // Warnings
@@ -363,22 +363,22 @@ pub async fn run(
                     let ca_port = port + 1;
                     tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
                     dev_ui::blank_line();
-                    dev_ui::detail(
+                    dev_ui::trusted_detail_line(
                         "Mobile",
-                        &format!(
+                        install_ui::terminal_line!(
                             "First time on mobile? Visit {} to install the CA certificate",
-                            install_ui::url(&format!("http://{}:{ca_port}", primary.ip))
+                            install_ui::url(&format!("http://{}:{ca_port}", primary.ip)),
                         ),
                     );
                 }
             } else {
                 dev_ui::blank_line();
-                dev_ui::detail(
+                dev_ui::trusted_detail_line(
                     "Mobile",
-                    &format!(
+                    install_ui::terminal_line!(
                         "enable with {} or copy {} to the device manually",
                         install_ui::cyan("--allow-ca-bootstrap"),
-                        install_ui::cyan("rootCA.pem")
+                        install_ui::cyan("rootCA.pem"),
                     ),
                 );
             }
@@ -423,7 +423,7 @@ pub async fn run(
         if let Some(domain) = tunnel_domain
             && !quiet
         {
-            dev_ui::detail("Tunnel domain", domain);
+            dev_ui::trusted_detail("Tunnel domain", &install_ui::cyan(domain));
         }
 
         // ── Inspector startup (paired with tunnel) ──────────────────
@@ -566,7 +566,7 @@ pub async fn run(
                     continue;
                 }
 
-                install_ui::detail(&format_dev_webhook_line(
+                install_ui::detail_line(format_dev_webhook_line(
                     &webhook.method,
                     &webhook.path,
                     webhook.response_status,
@@ -576,7 +576,7 @@ pub async fn run(
 
                 // Show signature diagnostic if present
                 if let Some(ref diag) = webhook.signature_diagnostic {
-                    install_ui::detail(&format!(
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
                         "           {} {}",
                         install_ui::yellow("!"),
                         lpm_common::sanitize_for_terminal(diag)
@@ -615,9 +615,9 @@ pub async fn run(
                         });
                     }
 
-                    dev_ui::detail(
+                    dev_ui::trusted_detail_line(
                         "Tunnel",
-                        &format!(
+                        install_ui::terminal_line!(
                             "{} → localhost:{}",
                             install_ui::url(&session.tunnel_url),
                             session.local_port,
@@ -885,7 +885,7 @@ pub async fn run(
 
     let scheme = if https { "https" } else { "http" };
     let url = format!("{scheme}://localhost:{port}");
-    dev_ui::detail("Local", &install_ui::url(&url));
+    dev_ui::trusted_detail("Local", &install_ui::url(&url));
     dev_ui::blank_line();
 
     // Start readiness check + browser open in background thread (non-blocking)
@@ -1260,7 +1260,7 @@ fn map_proxy_register_error(err: lpm_proxy::ProxyError) -> LpmError {
 }
 
 fn local_proxy_https_start_command() -> String {
-    install_ui::yellow("lpm proxy start --tls-port 9443")
+    install_ui::yellow("lpm proxy start --tls-port 9443").to_string()
 }
 
 async fn release_proxy_lease_after(
@@ -1325,9 +1325,9 @@ fn print_registered_proxy_routes(routes: &[lpm_proxy::Route]) {
     for route in routes {
         let target = format!("{} -> localhost:{}", route.host, route.upstream_port);
         if let Some(ref service) = route.service {
-            dev_ui::detail_with_hint("Proxy", &install_ui::yellow(&target), service);
+            dev_ui::trusted_detail_with_hint("Proxy", &install_ui::yellow(&target), service);
         } else {
-            dev_ui::detail("Proxy", &install_ui::yellow(&target));
+            dev_ui::trusted_detail("Proxy", &install_ui::yellow(&target));
         }
     }
     dev_ui::blank_line();
@@ -1755,9 +1755,9 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
             }
             dev_ui::warn("No .env file found. Created from .env.example");
             dev_ui::hint_line("Review .env and fill in missing values");
-            dev_ui::hint_line(&format!(
+            dev_ui::trusted_hint_line(install_ui::terminal_line!(
                 "Or use {} to store secrets in the vault",
-                install_ui::yellow("lpm env vars set")
+                install_ui::yellow("lpm env vars set"),
             ));
             Some("created from .env.example".to_string())
         }
@@ -1783,7 +1783,7 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
-fn format_dev_webhook_status(status: u16) -> String {
+fn format_dev_webhook_status(status: u16) -> install_ui::TerminalFragment {
     let status_label = status.to_string();
     if status >= 500 {
         install_ui::red(&status_label)
@@ -1800,21 +1800,21 @@ fn format_dev_webhook_line(
     response_status: u16,
     duration_ms: u64,
     summary: &str,
-) -> String {
+) -> install_ui::TerminalLine {
     let method = method.to_uppercase();
     let warning = if response_status >= 400 {
-        format!(" {}", install_ui::yellow("!"))
+        crate::install_ui::terminal_line!(" {}", install_ui::yellow("!"))
     } else {
-        String::new()
+        install_ui::TerminalLine::new("")
     };
-    format!(
+    crate::install_ui::terminal_line!(
         "  {} {} {} -> {} {} — {}{}",
         install_ui::dim("tunnel"),
         install_ui::yellow(&method),
         install_ui::cyan(path),
         format_dev_webhook_status(response_status),
         install_ui::dim(&format!("({duration_ms}ms)")),
-        lpm_common::sanitize_for_terminal(summary),
+        summary,
         warning
     )
 }

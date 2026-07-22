@@ -724,7 +724,11 @@ pub(super) async fn vars_connect(
         super::response::print_json_value(&super::response::success_envelope(result));
     } else {
         let status = result["status"].as_str().unwrap_or("connected");
-        output::success(&format!("Vercel {} (project: {project_id})", status.bold()));
+        output::success_line(crate::install_ui::terminal_line!(
+            "Vercel {} (project: {})",
+            install_ui::bold(status),
+            project_id
+        ));
     }
     Ok(())
 }
@@ -793,17 +797,36 @@ pub(super) async fn vars_platform_push(
     if !json_output {
         println!();
         for key in &diff.added {
-            println!("  {} {} {}", "+".green(), key.bold(), "(new)".dimmed());
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::green("+"),
+                    install_ui::bold(key),
+                    install_ui::dim("(new)"),
+                )
+            );
         }
         for key in &diff.changed {
-            println!("  {} {} {}", "~".yellow(), key.bold(), "(changed)".dimmed());
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::yellow("~"),
+                    install_ui::bold(key),
+                    install_ui::dim("(changed)"),
+                )
+            );
         }
         for key in &diff.removed {
             println!(
-                "  {} {} {}",
-                "-".red(),
-                key.bold(),
-                "(will be removed)".dimmed()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::red("-"),
+                    install_ui::bold(key),
+                    install_ui::dim("(will be removed)"),
+                )
             );
         }
         if !diff.unchanged.is_empty() {
@@ -979,28 +1002,37 @@ pub(super) async fn vars_platform_status(
         let state = status["status"].as_str().unwrap_or("error");
         match state {
             "synced" => println!(
-                "  {} {} [{}]  {}",
-                "✓".green(),
-                platform.bold(),
-                env,
-                "synced".green()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} [{}]  {}",
+                    install_ui::green("✓"),
+                    install_ui::bold(platform),
+                    env,
+                    install_ui::green("synced"),
+                )
             ),
             "drifted" => println!(
-                "  {} {} [{}]  {} — +{} ~{} -{}",
-                "!".yellow(),
-                platform.bold(),
-                env,
-                "drifted".yellow(),
-                status["added"].as_u64().unwrap_or(0),
-                status["changed"].as_u64().unwrap_or(0),
-                status["removed"].as_u64().unwrap_or(0),
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} [{}]  {} — +{} ~{} -{}",
+                    install_ui::yellow("!"),
+                    install_ui::bold(platform),
+                    env,
+                    install_ui::yellow("drifted"),
+                    status["added"].as_u64().unwrap_or(0),
+                    status["changed"].as_u64().unwrap_or(0),
+                    status["removed"].as_u64().unwrap_or(0),
+                )
             ),
             _ => println!(
-                "  {} {} [{}]  {}",
-                "✗".red(),
-                platform.bold(),
-                env,
-                status["error"].as_str().unwrap_or("unknown error").red()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} [{}]  {}",
+                    install_ui::red("✗"),
+                    install_ui::bold(platform),
+                    env,
+                    install_ui::red(status["error"].as_str().unwrap_or("unknown error")),
+                )
             ),
         }
     }
@@ -1061,15 +1093,18 @@ pub(super) async fn vars_platform_pull(
     if !json_output {
         println!();
         for (key, _) in &values {
-            println!("    {}", key.bold());
+            println!(
+                "{}",
+                install_ui::terminal_line!("    {}", install_ui::bold(key))
+            );
         }
         println!();
     }
     if !yes && !json_output {
-        let confirmed = cliclack::confirm(format!(
+        let confirmed = cliclack::confirm(crate::prompt::untrusted(format!(
             "Import {} value(s) from Vercel into {env_name}?",
             values.len()
-        ))
+        )))
         .initial_value(true)
         .interact()
         .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;

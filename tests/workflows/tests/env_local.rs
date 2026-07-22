@@ -344,6 +344,40 @@ fn env_init_under_json_emits_envelope_with_environments_and_results_arrays() {
     );
 }
 
+#[test]
+fn env_init_configured_alias_and_path_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"env-init-test","version":"1.0.0"}"#);
+    let hostile = "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({ "env": { "dev": format!(".env.{hostile}") } }).to_string(),
+    );
+
+    let output = lpm(&project)
+        .args(["env", "init"])
+        .output()
+        .expect("failed to run lpm env init");
+
+    assert!(output.status.success(), "env init failed: {output:?}");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        rendered.contains("safe?FORGED?rewritten?end"),
+        "hostile env fields must remain visible as one sanitized field: {rendered:?}",
+    );
+    for attacker_fragment in [
+        "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "env init output retained {attacker_fragment:?}: {rendered:?}",
+        );
+    }
+}
+
 // ─── pair / unpair (auth-error envelope path only) ─────────────────────
 
 /// `lpm env pair` requires a session-backed login. On an isolated HOME

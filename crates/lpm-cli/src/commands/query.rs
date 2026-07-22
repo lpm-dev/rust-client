@@ -345,7 +345,7 @@ pub async fn run(
             serde_json::to_string_pretty(&json_results).unwrap_or_else(|_| "[]".into())
         );
     } else if matched.is_empty() {
-        install_ui::warn(&format!("No packages match {selector_str}"));
+        install_ui::warn_untrusted(&format!("No packages match {selector_str}"));
     } else {
         for pkg in &matched {
             let mut state_labels = Vec::new();
@@ -358,19 +358,28 @@ pub async fn run(
             }
 
             let state_str = if state_labels.is_empty() {
-                String::new()
+                install_ui::field("")
             } else {
-                format!(" {}", format!("({})", state_labels.join(", ")).dimmed())
+                install_ui::dim(&format!(" ({})", state_labels.join(", ")))
             };
 
             // Show path when it differs from the default (indicates a nested instance)
             let path_suffix =
                 if !pkg.path.is_empty() && pkg.path != format!("node_modules/{}", pkg.name) {
-                    format!(" {}", pkg.path.dimmed())
+                    install_ui::dim(&format!(" {}", pkg.path))
                 } else {
-                    String::new()
+                    install_ui::field("")
                 };
-            println!("    {}@{}{state_str}{path_suffix}", pkg.name, pkg.version);
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "    {}@{}{}{}",
+                    &pkg.name,
+                    &pkg.version,
+                    state_str,
+                    path_suffix
+                )
+            );
 
             let tags = pkg.analysis.map(collect_active_tags).unwrap_or_default();
             if !tags.is_empty() {
@@ -382,7 +391,7 @@ pub async fn run(
             }
         }
         println!();
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "{} {} matched {selector_str}",
             matched.len(),
             if matched.len() == 1 {

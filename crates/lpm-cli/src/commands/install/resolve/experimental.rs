@@ -634,9 +634,9 @@ pub(in crate::commands::install) async fn run(
     let link_result = link_outcome.result;
     let workspace_links_created = link_workspace_members(project_dir, workspace_member_deps)?;
     if workspace_links_created > 0 && !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Linked {} workspace member(s)",
-            workspace_links_created.to_string().bold()
+            install_ui::bold(&workspace_links_created.to_string())
         ));
     }
     let applied_patches = apply_patches_for_install(
@@ -743,10 +743,10 @@ pub(in crate::commands::install) async fn run(
         crate::security_floor::attach_security_posture(&mut json, false);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        output::success(&format!(
-            "{} packages installed in {:.1}s",
-            install_packages.len().to_string().bold(),
-            total_ms as f64 / 1000.0
+        output::success_line(crate::install_ui::terminal_line!(
+            "{} packages installed in {}s",
+            install_ui::bold(&install_packages.len().to_string()),
+            format!("{:.1}", total_ms as f64 / 1000.0)
         ));
     }
 

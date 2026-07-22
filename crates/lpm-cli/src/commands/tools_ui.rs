@@ -16,14 +16,14 @@ pub fn plugin_version_label(bin: &Path, configured_version: Option<&str>) -> Str
 }
 
 pub fn using_tool(name: &str, version: &str) {
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Using {}",
         install_ui::yellow(&format!("{name} {version}"))
     ));
 }
 
 pub fn using_check_engine(binary: &str) {
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Using {}",
         install_ui::yellow(&format!("{binary} --noEmit"))
     ));
@@ -32,7 +32,7 @@ pub fn using_check_engine(binary: &str) {
 pub fn detected_test_runner(runner_name: &str) {
     match runner_name {
         "scripts.test" => install_ui::phase("Using package.json test script"),
-        _ => install_ui::phase(&format!(
+        _ => install_ui::phase_line(crate::install_ui::terminal_line!(
             "Auto-detected {}",
             install_ui::yellow(&runner_display_name(runner_name))
         )),
@@ -41,12 +41,12 @@ pub fn detected_test_runner(runner_name: &str) {
 
 pub fn detected_bench_runner(runner_name: &str) {
     match runner_name {
-        "vitest" => install_ui::phase(&format!(
+        "vitest" => install_ui::phase_line(crate::install_ui::terminal_line!(
             "Auto-detected {}",
             install_ui::yellow("Vitest bench runner")
         )),
         "scripts.bench" => install_ui::phase("Using package.json bench script"),
-        _ => install_ui::phase(&format!(
+        _ => install_ui::phase_line(crate::install_ui::terminal_line!(
             "Auto-detected {}",
             install_ui::yellow(&format!(
                 "{} bench runner",
@@ -58,7 +58,7 @@ pub fn detected_bench_runner(runner_name: &str) {
 
 pub fn done_fmt_write_elapsed(elapsed: Duration) {
     let duration = install_ui::format_duration(elapsed);
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · codebase is now formatted in {}",
         install_ui::green(&duration)
     ));
@@ -78,7 +78,7 @@ pub fn done_typecheck(elapsed: Duration) {
 
 pub fn done_test(elapsed: Duration) {
     let duration = install_ui::format_duration(elapsed);
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Tests complete in {}",
         install_ui::green(&duration)
     ));
@@ -86,14 +86,14 @@ pub fn done_test(elapsed: Duration) {
 
 pub fn done_bench(elapsed: Duration) {
     let duration = install_ui::format_duration(elapsed);
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Benchmarks complete in {}",
         install_ui::green(&duration)
     ));
 }
 
 pub fn done_no_packages_affected(tool: &str, base_ref: &str) {
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "no packages affected vs {base_ref} — nothing to {tool}"
     ));
 }
@@ -104,8 +104,9 @@ pub fn warn_no_packages_matched() {
 
 pub fn done_workspace(tool: &str, total: usize, elapsed: Duration) {
     let duration = install_ui::format_duration(elapsed);
-    install_ui::done(&format!(
-        "{tool} passed in {} {} in {}",
+    install_ui::done_line(crate::install_ui::terminal_line!(
+        "{} passed in {} {} in {}",
+        tool,
         install_ui::bold(&total.to_string()),
         install_ui::packages_word(total),
         install_ui::green(&duration)
@@ -120,19 +121,20 @@ pub fn failed_workspace(
     elapsed: Duration,
 ) {
     let duration = install_ui::format_duration(elapsed);
-    install_ui::failed(&format!(
+    install_ui::failed_untrusted(&format!(
         "{tool}: {succeeded} passed, {failed} failed out of {total} packages in {duration}"
     ));
 }
 
 pub fn failed(label: &str, code: i32) {
-    install_ui::failed(&format!("{label} failed · exit code {code}"));
+    install_ui::failed_untrusted(&format!("{label} failed · exit code {code}"));
 }
 
 fn done_passed(label: &str, elapsed: Duration) {
     let duration = install_ui::format_duration(elapsed);
-    install_ui::done(&format!(
-        "{label} passed in {}",
+    install_ui::done_line(crate::install_ui::terminal_line!(
+        "{} passed in {}",
+        label,
         install_ui::green(&duration)
     ));
 }

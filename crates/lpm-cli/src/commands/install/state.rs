@@ -237,7 +237,7 @@ pub(super) async fn run_install_freshness_phase(
             crate::security_floor::attach_security_posture(&mut json, input.force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            install_ui::done(&format!("Up to date · {total_ms}ms"));
+            install_ui::done_untrusted(&format!("Up to date · {total_ms}ms"));
         }
         return Ok(InstallFreshnessResult {
             setup_install_state_ms,

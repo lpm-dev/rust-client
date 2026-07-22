@@ -29,14 +29,14 @@ pub async fn run(
             }
             Ok(false) => {
                 print_health_table(registry_url, false, elapsed_ms);
-                install_ui::warn(&format!("Registry at {} is unreachable", registry_url));
+                install_ui::warn_untrusted(&format!("Registry at {} is unreachable", registry_url));
                 return Err(LpmError::Network(format!(
                     "registry at {registry_url} is unreachable"
                 )));
             }
             Err(error) => {
                 print_health_table(registry_url, false, elapsed_ms);
-                install_ui::warn(&format!("Registry at {} is unreachable", registry_url));
+                install_ui::warn_untrusted(&format!("Registry at {} is unreachable", registry_url));
                 return Err(error);
             }
         }

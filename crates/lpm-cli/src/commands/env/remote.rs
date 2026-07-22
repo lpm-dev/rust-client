@@ -31,10 +31,13 @@ pub(super) async fn env_log(
         output::info(&format!("Vault audit log ({} entries)", entries.len()));
         for entry in &entries {
             println!(
-                "  {} {} {}",
-                entry.created_at.dimmed(),
-                entry.action.bold(),
-                entry.user_id.as_deref().unwrap_or("").dimmed()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::dim(&entry.created_at),
+                    install_ui::bold(&entry.action),
+                    install_ui::dim(entry.user_id.as_deref().unwrap_or("")),
+                )
             );
         }
     }
@@ -100,11 +103,11 @@ pub(super) async fn env_share(
     };
 
     if !json_output {
-        output::info(&format!(
+        output::info_line(install_ui::terminal_line!(
             "sharing vault with org {} ({} keys across {} environments)...",
-            org_slug.bold(),
+            install_ui::bold(org_slug),
             total_keys,
-            all_envs.len()
+            all_envs.len(),
         ));
     }
 
@@ -133,10 +136,10 @@ pub(super) async fn env_share(
             "version": result.version,
         }));
     } else {
-        output::success(&format!(
+        output::success_line(install_ui::terminal_line!(
             "vault shared with org {} (version {})",
-            org_slug.bold(),
-            result.version.unwrap_or(0).to_string().bold()
+            install_ui::bold(org_slug),
+            install_ui::bold(&result.version.unwrap_or(0).to_string()),
         ));
     }
     Ok(())
@@ -171,30 +174,46 @@ pub(super) async fn vars_list_remote(
         }
 
         if vaults.is_empty() {
-            output::info(&format!("no shared vaults in org {}", slug.bold()));
+            output::info_line(install_ui::terminal_line!(
+                "no shared vaults in org {}",
+                install_ui::bold(slug),
+            ));
             println!(
-                "  Share a vault: {}",
-                format!("lpm env share --org {slug}").cyan()
+                "{}",
+                install_ui::terminal_line!(
+                    "  Share a vault: {}",
+                    install_ui::cyan(&format!("lpm env share --org {slug}")),
+                )
             );
             return Ok(());
         }
 
-        output::info(&format!("Org {} vaults ({})", slug.bold(), vaults.len()));
+        output::info_line(install_ui::terminal_line!(
+            "Org {} vaults ({})",
+            install_ui::bold(slug),
+            vaults.len(),
+        ));
         for v in &vaults {
             let version = v.version.map_or_else(|| "v?".into(), |v| format!("v{v}"));
             let updated = v.updated_at.as_deref().unwrap_or("?");
             println!(
-                "  {} {} {} {}",
-                "·".cyan(),
-                v.vault_id.bold(),
-                version.dimmed(),
-                format!("(updated {updated})").dimmed()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {} {}",
+                    install_ui::cyan("·"),
+                    install_ui::bold(&v.vault_id),
+                    install_ui::dim(&version),
+                    install_ui::dim(&format!("(updated {updated})")),
+                )
             );
         }
         println!();
         println!(
-            "  Pull: {}",
-            format!("cd <project-dir> && lpm env pull --org {slug}").cyan()
+            "{}",
+            install_ui::terminal_line!(
+                "  Pull: {}",
+                install_ui::cyan(&format!("cd <project-dir> && lpm env pull --org {slug}")),
+            )
         );
         return Ok(());
     }
@@ -234,11 +253,14 @@ pub(super) async fn vars_list_remote(
         let version = v.version.map_or_else(|| "v?".into(), |v| format!("v{v}"));
         let updated = v.updated_at.as_deref().unwrap_or("?");
         println!(
-            "  {} {} {} {}",
-            "·".cyan(),
-            v.vault_id.bold(),
-            version.dimmed(),
-            format!("(updated {updated})").dimmed()
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {} {}",
+                install_ui::cyan("·"),
+                install_ui::bold(&v.vault_id),
+                install_ui::dim(&version),
+                install_ui::dim(&format!("(updated {updated})")),
+            )
         );
     }
     println!();
@@ -369,9 +391,12 @@ pub(super) async fn vars_diff(
 
     println!();
     println!(
-        "  Comparing {} vs {}",
-        left_label.bold(),
-        right_label.bold()
+        "{}",
+        install_ui::terminal_line!(
+            "  Comparing {} vs {}",
+            install_ui::bold(&left_label),
+            install_ui::bold(&right_label),
+        )
     );
     println!();
 
@@ -382,22 +407,36 @@ pub(super) async fn vars_diff(
 
     for key in &added {
         println!(
-            "  {} {} {}",
-            "+".green(),
-            key.bold(),
-            "(only in left)".dimmed()
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {}",
+                install_ui::green("+"),
+                install_ui::bold(key),
+                install_ui::dim("(only in left)"),
+            )
         );
     }
     for key in &removed {
         println!(
-            "  {} {} {}",
-            "-".red(),
-            key.bold(),
-            "(only in right)".dimmed()
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {}",
+                install_ui::red("-"),
+                install_ui::bold(key),
+                install_ui::dim("(only in right)"),
+            )
         );
     }
     for key in &changed {
-        println!("  {} {} {}", "~".yellow(), key.bold(), "(changed)".dimmed());
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {}",
+                install_ui::yellow("~"),
+                install_ui::bold(key),
+                install_ui::dim("(changed)"),
+            )
+        );
     }
     if same > 0 {
         println!("  {} {same} unchanged", "=".dimmed());
@@ -405,11 +444,14 @@ pub(super) async fn vars_diff(
 
     println!();
     println!(
-        "  Summary: {} added, {} removed, {} changed, {} unchanged",
-        added.len().to_string().green(),
-        removed.len().to_string().red(),
-        changed.len().to_string().yellow(),
-        same.to_string().dimmed()
+        "{}",
+        install_ui::terminal_line!(
+            "  Summary: {} added, {} removed, {} changed, {} unchanged",
+            install_ui::green(&added.len().to_string()),
+            install_ui::red(&removed.len().to_string()),
+            install_ui::yellow(&changed.len().to_string()),
+            install_ui::dim(&same.to_string()),
+        )
     );
 
     Ok(())

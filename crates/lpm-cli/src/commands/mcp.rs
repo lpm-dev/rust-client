@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -348,13 +347,18 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
         for result in &setup_results {
             let name = format!("{:<editor_name_width$}", result.name);
             match result.state {
-                EditorSetupState::Configured => {
-                    install_ui::done(&format!("{name} {}", install_ui::status_ok("configured")))
-                }
-                EditorSetupState::SkippedConfigNotFound => install_ui::skipped(&format!(
-                    "{name} {}",
-                    install_ui::yellow("skipped (config not found)")
-                )),
+                EditorSetupState::Configured => install_ui::done_line(
+                    install_ui::TerminalLine::new("")
+                        .field(&name)
+                        .text(" ")
+                        .green("configured"),
+                ),
+                EditorSetupState::SkippedConfigNotFound => install_ui::skipped_line(
+                    install_ui::TerminalLine::new("")
+                        .field(&name)
+                        .text(" ")
+                        .yellow("skipped (config not found)"),
+                ),
             }
         }
 
@@ -363,7 +367,7 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
             return Ok(());
         }
 
-        install_ui::done(&format!("Server name: {}", install_ui::yellow(name)));
+        install_ui::done_line(install_ui::TerminalLine::new("Server name: ").yellow(name));
         install_ui::warn(
             "autostart resolves `@lpm.dev/lpm-mcp-server` from npm on every editor start. \
              Pin a version by editing the written config (replace the package spec with `@x.y.z`) \
@@ -390,20 +394,31 @@ async fn remove(name: &str, json_output: bool) -> Result<(), LpmError> {
             .unwrap()
         );
     } else if removed_from.is_empty() {
-        install_ui::warn(&format!("Server \"{name}\" not found in any editor config"));
+        install_ui::warn_line(
+            install_ui::TerminalLine::new("Server \"")
+                .field(name)
+                .text("\" not found in any editor config"),
+        );
     } else {
         for editor in &removed_from {
-            install_ui::done(&format!("Removed \"{name}\" from {editor}"));
+            install_ui::done_line(
+                install_ui::TerminalLine::new("Removed \"")
+                    .field(name)
+                    .text("\" from ")
+                    .field(editor),
+            );
         }
-        install_ui::done(&format!(
-            "Removed \"{name}\" from {} {}",
-            removed_from.len(),
-            if removed_from.len() == 1 {
-                "editor"
-            } else {
-                "editors"
-            }
-        ));
+        install_ui::done_line(
+            install_ui::TerminalLine::new("Removed \"")
+                .field(name)
+                .text("\" from ")
+                .field(&removed_from.len().to_string())
+                .text(if removed_from.len() == 1 {
+                    " editor"
+                } else {
+                    " editors"
+                }),
+        );
     }
 
     Ok(())
@@ -425,22 +440,30 @@ async fn status(json_output: bool) -> Result<(), LpmError> {
             let editor = r["editor"].as_str().unwrap_or("");
             let servers = r["servers"].as_array().map_or(0, |a| a.len());
             let icon = if servers > 0 {
-                "✓".green().to_string()
+                install_ui::green("✓")
             } else {
-                "·".dimmed().to_string()
+                install_ui::dim("·")
             };
-            print!("  {icon} {} ", editor.bold());
-            if servers > 0 {
-                let names: Vec<&str> = r["servers"]
+            let names = if servers > 0 {
+                let names = r["servers"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .filter_map(|v| v.as_str())
-                    .collect();
-                println!("{}", names.join(", ").dimmed());
+                    .collect::<Vec<_>>();
+                names.join(", ")
             } else {
-                println!("{}", "no servers".dimmed());
-            }
+                "no servers".to_string()
+            };
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {} {} {}",
+                    icon,
+                    install_ui::bold(editor),
+                    install_ui::dim(&names)
+                )
+            );
         }
         println!();
         install_ui::done("MCP status loaded");

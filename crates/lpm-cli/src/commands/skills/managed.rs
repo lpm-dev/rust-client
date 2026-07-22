@@ -1379,45 +1379,75 @@ pub fn view(
                     .unwrap()
                 );
             } else {
-                println!("{}", super::install_ui::yellow(&record.name));
-                println!("  {} managed", super::install_ui::dim("kind:"));
                 println!(
-                    "  {} {}",
-                    super::install_ui::dim("source:"),
-                    super::install_ui::cyan(&record.source.display())
+                    "{}",
+                    super::install_ui::terminal_line!(
+                        "{}",
+                        super::install_ui::yellow(&record.name)
+                    )
                 );
                 println!(
-                    "  {} {}",
-                    super::install_ui::dim("context:"),
-                    super::install_ui::status_ok(&format!("~{} tokens", record.context_tokens))
+                    "{}",
+                    super::install_ui::terminal_line!(
+                        "  {} managed",
+                        super::install_ui::dim("kind:")
+                    )
                 );
                 println!(
-                    "  {} {}",
-                    super::install_ui::dim("security:"),
-                    security_summary(&security_findings)
+                    "{}",
+                    super::install_ui::terminal_line!(
+                        "  {} {}",
+                        super::install_ui::dim("source:"),
+                        super::install_ui::cyan(&record.source.display())
+                    )
+                );
+                println!(
+                    "{}",
+                    super::install_ui::terminal_line!(
+                        "  {} {}",
+                        super::install_ui::dim("context:"),
+                        super::install_ui::status_ok(&format!("~{} tokens", record.context_tokens))
+                    )
+                );
+                println!(
+                    "{}",
+                    super::install_ui::terminal_line!(
+                        "  {} {}",
+                        super::install_ui::dim("security:"),
+                        security_summary(&security_findings)
+                    )
                 );
                 for finding in &security_findings {
                     println!(
-                        "    {} {} · {}:{}",
-                        styled_security_severity(finding.severity),
-                        super::install_ui::cyan(&finding.rule_id),
-                        finding.path,
-                        finding.line
+                        "{}",
+                        super::install_ui::terminal_line!(
+                            "    {} {} · {}:{}",
+                            styled_security_severity(finding.severity),
+                            super::install_ui::cyan(&finding.rule_id),
+                            &finding.path,
+                            finding.line
+                        )
                     );
                 }
                 println!(
-                    "  {} {} {}",
-                    super::install_ui::dim(&format!("{:<13}", "agent")),
-                    super::install_ui::dim(&format!("{:<25}", "status")),
-                    super::install_ui::dim("path")
+                    "{}",
+                    super::install_ui::terminal_line!(
+                        "  {} {} {}",
+                        super::install_ui::dim(&format!("{:<13}", "agent")),
+                        super::install_ui::dim(&format!("{:<25}", "status")),
+                        super::install_ui::dim("path")
+                    )
                 );
                 for (agent, target) in &record.targets {
                     let diagnosis = diagnose_target(&store, target, &canonical);
                     println!(
-                        "  {:<13} {} {}",
-                        agent_slug(*agent),
-                        styled_target_status(diagnosis.status, 25),
-                        super::install_ui::cyan(&diagnosis.path.display().to_string())
+                        "{}",
+                        super::install_ui::terminal_line!(
+                            "  {} {} {}",
+                            &format!("{:<13}", agent_slug(*agent)),
+                            styled_target_status(diagnosis.status, 25),
+                            super::install_ui::cyan(&diagnosis.path.display().to_string())
+                        )
                     );
                 }
             }
@@ -1461,22 +1491,37 @@ fn print_external_view(skill: &ExternalInventory, json_output: bool) -> Result<(
                 .unwrap()
             );
         } else {
-            println!("{}", super::install_ui::yellow(&skill.name));
-            println!("  {} external", super::install_ui::dim("kind:"));
             println!(
-                "  {} {}",
-                super::install_ui::dim("path:"),
-                super::install_ui::cyan(&skill.path)
+                "{}",
+                super::install_ui::terminal_line!("{}", super::install_ui::yellow(&skill.name))
             );
             println!(
-                "  {} {}",
-                super::install_ui::dim("agent:"),
-                agent_slug(skill.agent)
+                "{}",
+                super::install_ui::terminal_line!("  {} external", super::install_ui::dim("kind:"))
             );
             println!(
-                "  {} {}",
-                super::install_ui::dim("status:"),
-                super::install_ui::red("broken link")
+                "{}",
+                super::install_ui::terminal_line!(
+                    "  {} {}",
+                    super::install_ui::dim("path:"),
+                    super::install_ui::cyan(&skill.path)
+                )
+            );
+            println!(
+                "{}",
+                super::install_ui::terminal_line!(
+                    "  {} {}",
+                    super::install_ui::dim("agent:"),
+                    agent_slug(skill.agent)
+                )
+            );
+            println!(
+                "{}",
+                super::install_ui::terminal_line!(
+                    "  {} {}",
+                    super::install_ui::dim("status:"),
+                    super::install_ui::red("broken link")
+                )
             );
         }
         return Ok(());
@@ -1513,36 +1558,58 @@ fn print_external_view(skill: &ExternalInventory, json_output: bool) -> Result<(
             .unwrap()
         );
     } else {
-        println!("{}", super::install_ui::yellow(&skill.name));
-        println!("  {} external", super::install_ui::dim("kind:"));
         println!(
-            "  {} {}",
-            super::install_ui::dim("path:"),
-            super::install_ui::cyan(&skill.path)
+            "{}",
+            super::install_ui::terminal_line!("{}", super::install_ui::yellow(&skill.name))
         );
         println!(
-            "  {} {}",
-            super::install_ui::dim("agent:"),
-            agent_slug(skill.agent)
+            "{}",
+            super::install_ui::terminal_line!("  {} external", super::install_ui::dim("kind:"))
         );
         println!(
-            "  {} {}",
-            super::install_ui::dim("scope:"),
-            super::install_ui::cyan(&skill.scope)
+            "{}",
+            super::install_ui::terminal_line!(
+                "  {} {}",
+                super::install_ui::dim("path:"),
+                super::install_ui::cyan(&skill.path)
+            )
         );
         println!(
-            "  {} {}",
-            super::install_ui::dim("context:"),
-            super::install_ui::status_ok(&format!("~{context_tokens} tokens"))
+            "{}",
+            super::install_ui::terminal_line!(
+                "  {} {}",
+                super::install_ui::dim("agent:"),
+                agent_slug(skill.agent)
+            )
         );
         println!(
-            "  {} {}",
-            super::install_ui::dim("security findings:"),
-            if findings.is_empty() {
-                super::install_ui::status_ok("none")
-            } else {
-                super::install_ui::section(&findings.len().to_string())
-            }
+            "{}",
+            super::install_ui::terminal_line!(
+                "  {} {}",
+                super::install_ui::dim("scope:"),
+                super::install_ui::cyan(&skill.scope)
+            )
+        );
+        println!(
+            "{}",
+            super::install_ui::terminal_line!(
+                "  {} {}",
+                super::install_ui::dim("context:"),
+                super::install_ui::status_ok(&format!("~{context_tokens} tokens"))
+            )
+        );
+        let findings_status = if findings.is_empty() {
+            super::install_ui::status_ok("none")
+        } else {
+            super::install_ui::section(&findings.len().to_string())
+        };
+        println!(
+            "{}",
+            super::install_ui::terminal_line!(
+                "  {} {}",
+                super::install_ui::dim("security findings:"),
+                findings_status
+            )
         );
     }
     Ok(())
@@ -1598,28 +1665,37 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
         );
     } else {
         println!(
-            "{} {} {} {}",
-            super::install_ui::section(&format!("{:<24}", "managed skill")),
-            super::install_ui::dim(&format!("{:<13}", "agent")),
-            super::install_ui::dim(&format!("{:<25}", "status")),
-            super::install_ui::dim("path")
+            "{}",
+            super::install_ui::terminal_line!(
+                "{} {} {} {}",
+                super::install_ui::section(&format!("{:<24}", "managed skill")),
+                super::install_ui::dim(&format!("{:<13}", "agent")),
+                super::install_ui::dim(&format!("{:<25}", "status")),
+                super::install_ui::dim("path")
+            )
         );
         for (name, agent, diagnosis) in &rows {
             println!(
-                "{:<24} {:<13} {} {}",
-                name,
-                agent_slug(*agent),
-                styled_target_status(diagnosis.status, 25),
-                super::install_ui::cyan(&diagnosis.path.display().to_string())
+                "{}",
+                super::install_ui::terminal_line!(
+                    "{} {} {} {}",
+                    &format!("{name:<24}"),
+                    &format!("{:<13}", agent_slug(*agent)),
+                    styled_target_status(diagnosis.status, 25),
+                    super::install_ui::cyan(&diagnosis.path.display().to_string())
+                )
             );
         }
         for skill in &external_broken {
             println!(
-                "{:<24} {:<13} {} {}",
-                skill.name,
-                agent_slug(skill.agent),
-                super::install_ui::red(&format!("{:<25}", "external broken link")),
-                super::install_ui::cyan(&skill.path)
+                "{}",
+                super::install_ui::terminal_line!(
+                    "{} {} {} {}",
+                    &format!("{:<24}", skill.name),
+                    &format!("{:<13}", agent_slug(skill.agent)),
+                    super::install_ui::red(&format!("{:<25}", "external broken link")),
+                    super::install_ui::cyan(&skill.path)
+                )
             );
         }
     }
@@ -2316,26 +2392,37 @@ fn print_update_preview(updates: &[PendingUpdate], changes: &[PlannedChange], js
     }
     super::install_ui::phase("Managed skill update preview:");
     for update in updates {
-        println!("  {}", update.skill.name);
         println!(
-            "    security findings: {} -> {} ({} new)",
-            update.previous_findings.len(),
-            update.candidate_findings.len(),
-            update.new_findings.len()
+            "{}",
+            super::install_ui::terminal_line!("  {}", &update.skill.name)
+        );
+        println!(
+            "{}",
+            super::install_ui::terminal_line!(
+                "    security findings: {} -> {} ({} new)",
+                update.previous_findings.len(),
+                update.candidate_findings.len(),
+                update.new_findings.len()
+            )
         );
         for finding in &update.new_findings {
             println!(
-                "    {} {} · {}:{}",
-                styled_security_severity(finding.severity),
-                super::install_ui::cyan(&finding.rule_id),
-                finding.path,
-                finding.line
+                "{}",
+                super::install_ui::terminal_line!(
+                    "    {} {} · {}:{}",
+                    styled_security_severity(finding.severity),
+                    super::install_ui::cyan(&finding.rule_id),
+                    &finding.path,
+                    finding.line
+                )
             );
         }
         if update.diff.is_empty() {
             println!("    no content changes");
         } else {
-            println!("{}", update.diff);
+            for line in update.diff.lines() {
+                println!("{}", super::install_ui::terminal_line!("    {}", line));
+            }
         }
     }
     print_changes(changes, false);
@@ -2616,7 +2703,14 @@ fn print_changes(changes: &[PlannedChange], json_output: bool) {
     } else {
         super::install_ui::phase("Planned filesystem changes:");
         for change in changes {
-            println!("  {} {}", change.action, change.path.display());
+            println!(
+                "{}",
+                super::install_ui::terminal_line!(
+                    "  {} {}",
+                    &change.action,
+                    change.path.display().to_string()
+                )
+            );
         }
     }
 }
@@ -2641,7 +2735,7 @@ fn require_confirmation(yes: bool, json_output: bool, prompt: &str) -> Result<()
                 .into(),
         ));
     }
-    if cliclack::confirm(prompt)
+    if cliclack::confirm(crate::prompt::untrusted(prompt))
         .initial_value(false)
         .interact()
         .map_err(crate::prompt::prompt_err)?
@@ -2940,7 +3034,7 @@ fn agent_slug(agent: AgentTarget) -> &'static str {
     }
 }
 
-fn styled_target_status(status: TargetStatus, width: usize) -> String {
+fn styled_target_status(status: TargetStatus, width: usize) -> super::install_ui::TerminalFragment {
     let label = format!("{:<width$}", status.as_str());
     match status {
         TargetStatus::Healthy => super::install_ui::status_ok(&label),
@@ -2963,7 +3057,7 @@ fn security_severity(
 
 fn styled_security_severity(
     severity: lpm_security::skill_security::SkillSecuritySeverity,
-) -> String {
+) -> super::install_ui::TerminalFragment {
     match severity {
         lpm_security::skill_security::SkillSecuritySeverity::Warning => {
             super::install_ui::section(security_severity(severity))
@@ -2974,7 +3068,7 @@ fn styled_security_severity(
     }
 }
 
-fn security_summary(findings: &BTreeSet<FindingIdentity>) -> String {
+fn security_summary(findings: &BTreeSet<FindingIdentity>) -> super::install_ui::TerminalFragment {
     if findings.is_empty() {
         super::install_ui::status_ok("none")
     } else {

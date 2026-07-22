@@ -29,7 +29,10 @@ pub(in crate::commands::config) async fn run_scripts_wizard(
     let current =
         read_string_value(config_path, SCRIPT_POLICY_KEY)?.unwrap_or_else(|| "deny".to_string());
     println!();
-    println!("  current: {}", current.cyan());
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "  current: {}",
+        install_ui::cyan(&current)
+    ));
     let new_value: &str = cliclack::select("How should lpm treat package lifecycle scripts?")
         .item(
             "deny",

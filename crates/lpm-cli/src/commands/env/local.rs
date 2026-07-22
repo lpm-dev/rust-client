@@ -37,7 +37,11 @@ pub(super) fn env_set(
         );
     } else {
         for (key, _) in &pairs {
-            output::success(&format!("stored {} ({})", key.bold(), env_label));
+            output::success_line(install_ui::terminal_line!(
+                "stored {} ({})",
+                install_ui::bold(key),
+                env_label,
+            ));
         }
     }
     Ok(())
@@ -76,7 +80,14 @@ pub(super) fn env_get(
             } else if reveal {
                 println!("{value}");
             } else {
-                println!("{} = {}", key.bold(), "••••••••".dimmed());
+                println!(
+                    "{}",
+                    install_ui::terminal_line!(
+                        "{} = {}",
+                        install_ui::bold(key),
+                        install_ui::dim("••••••••"),
+                    )
+                );
             }
         }
         None => {
@@ -131,7 +142,11 @@ pub(super) fn env_delete(
         );
     } else {
         for key in &keys {
-            output::success(&format!("deleted {} ({})", key.bold(), env_label));
+            output::success_line(install_ui::terminal_line!(
+                "deleted {} ({})",
+                install_ui::bold(key),
+                env_label,
+            ));
         }
     }
     Ok(())
@@ -169,12 +184,12 @@ pub(super) fn env_import(
             serde_json::json!({"success": true, "imported": count, "from": *file, "env": env_label})
         );
     } else {
-        output::success(&format!(
+        output::success_line(install_ui::terminal_line!(
             "imported {} secret{} from {} ({})",
-            count.to_string().bold(),
+            install_ui::bold(&count.to_string()),
             if count == 1 { "" } else { "s" },
-            file.cyan(),
-            env_label
+            install_ui::cyan(file),
+            env_label,
         ));
     }
     Ok(())
@@ -215,12 +230,12 @@ pub(super) fn env_export(
             serde_json::json!({"success": true, "exported": count, "to": *file, "env": env_label})
         );
     } else {
-        output::success(&format!(
+        output::success_line(install_ui::terminal_line!(
             "exported {} secret{} to {} ({})",
-            count.to_string().bold(),
+            install_ui::bold(&count.to_string()),
             if count == 1 { "" } else { "s" },
-            file.cyan(),
-            env_label
+            install_ui::cyan(file),
+            env_label,
         ));
     }
     Ok(())
@@ -316,9 +331,19 @@ pub(super) fn vars_list(
         output::info(&format!("Vault secrets — {} ({})", env_label, keys.len()));
         for key in keys {
             if reveal {
-                println!("  {} = {}", key.bold(), &secrets[key]);
+                println!(
+                    "{}",
+                    install_ui::terminal_line!("  {} = {}", install_ui::bold(key), &secrets[key],)
+                );
             } else {
-                println!("  {} = {}", key.bold(), "••••••••".dimmed());
+                println!(
+                    "{}",
+                    install_ui::terminal_line!(
+                        "  {} = {}",
+                        install_ui::bold(key),
+                        install_ui::dim("••••••••"),
+                    )
+                );
             }
         }
     }

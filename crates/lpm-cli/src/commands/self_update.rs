@@ -132,13 +132,13 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if latest == current {
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Done · already on {} version {}",
                 install_ui::status_ok("latest"),
                 install_ui::yellow(current)
             ));
         } else {
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Done · current version {} is newer than {} release {}",
                 install_ui::yellow(current),
                 install_ui::status_ok("latest"),
@@ -257,7 +257,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · LPM updated to {}",
             install_ui::yellow(&latest)
         ));
@@ -813,7 +813,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 
-    install_ui::phase(&format!("Fetching signed checksums for v{version}"));
+    install_ui::phase_untrusted(&format!("Fetching signed checksums for v{version}"));
 
     let manifest_bytes = fetch_bounded(&client, &manifest_url, MANIFEST_MAX_BYTES)
         .await?
@@ -868,7 +868,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
         published_at,
     )?;
 
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "Verified Sigstore attestation for {} ({}, integratedTime {})",
         binary_name,
         format_bytes(asset_vec.len()),

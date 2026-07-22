@@ -42,7 +42,10 @@ pub(super) async fn vars_pull(
         .await?;
 
         if !json_output {
-            output::info(&format!("pulling vault from org {}...", org_slug.bold()));
+            output::info_line(crate::install_ui::terminal_line!(
+                "pulling vault from org {}...",
+                install_ui::bold(org_slug)
+            ));
         }
 
         let (raw_json, version) = lpm_vault::sync::pull_org(
@@ -106,12 +109,12 @@ pub(super) async fn vars_pull(
                 "count": total_keys,
             }));
         } else {
-            output::success(&format!(
+            output::success_line(crate::install_ui::terminal_line!(
                 "pulled {} key{} from org {} (version {})",
-                total_keys.to_string().bold(),
+                install_ui::bold(&total_keys.to_string()),
                 if total_keys == 1 { "" } else { "s" },
-                org_slug.bold(),
-                version.to_string().bold()
+                install_ui::bold(org_slug),
+                install_ui::bold(&version.to_string())
             ));
         }
         return Ok(());
@@ -162,11 +165,11 @@ pub(super) async fn vars_pull(
             "count": total_keys,
         }));
     } else {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "pulled {} key{} (version {})",
-            total_keys.to_string().bold(),
+            install_ui::bold(&total_keys.to_string()),
             if total_keys == 1 { "" } else { "s" },
-            version.to_string().bold()
+            install_ui::bold(&version.to_string())
         ));
     }
     Ok(())

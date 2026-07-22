@@ -39,12 +39,11 @@ pub use collision_ux::CollisionResolution;
 pub use inner::InstallGlobalOverrides;
 
 use super::global_util::{discover_materialized_bin_commands, mk_tx_id};
-use crate::output;
+use crate::{install_ui, output};
 use collision_ux::maybe_prompt_for_collisions;
 use commit::commit_locked;
 use display::{emit_post_install_blocked_warning, print_success};
 use inner::do_install;
-use lpm_common::color::Painted;
 use lpm_common::{
     LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock, with_exclusive_lock_async,
 };
@@ -85,10 +84,10 @@ pub async fn run(
     if !json_output {
         let name_safe = sanitize_for_terminal(&resolved.name);
         let version_safe = sanitize_for_terminal(&resolved.version.to_string());
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "{} resolved to {}",
-            name_safe.bold(),
-            version_safe.dimmed()
+            install_ui::bold(&name_safe),
+            install_ui::dim(&version_safe)
         ));
     }
 
@@ -103,7 +102,10 @@ pub async fn run(
         // ─── Step 2: slow install (no global tx lock) ──────────────────
         if !json_output {
             let spec_safe = sanitize_for_terminal(spec);
-            output::info(&format!("installing {}...", spec_safe.bold()));
+            output::info_line(crate::install_ui::terminal_line!(
+                "installing {}...",
+                install_ui::bold(&spec_safe)
+            ));
         }
         // Step 2 failures (network, resolution, extract, link) are
         // intentionally NOT cleaned up here: recovery's roll-back path on

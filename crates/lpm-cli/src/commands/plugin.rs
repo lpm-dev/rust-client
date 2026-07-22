@@ -48,7 +48,7 @@ async fn list(json_output: bool) -> Result<(), LpmError> {
     }
 
     print_plugin_table(&rows);
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "{} managed {}",
         rows.len(),
         if rows.len() == 1 { "plugin" } else { "plugins" }
@@ -93,7 +93,7 @@ async fn outdated(json_output: bool) -> Result<(), LpmError> {
         "  {}",
         install_ui::dim("tsdown is project-owned; use `lpm outdated` or `lpm upgrade`")
     );
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "Checked {} managed {}",
         rows.len(),
         if rows.len() == 1 { "plugin" } else { "plugins" }
@@ -135,14 +135,14 @@ fn print_plugin_table(rows: &[ManagedToolRow]) {
         let latest_col = if status == "update available" {
             install_ui::yellow(&format!("{latest:<latest_width$}"))
         } else {
-            format!("{latest:<latest_width$}")
+            install_ui::field(&format!("{latest:<latest_width$}"))
         };
         let status_col = match status.as_str() {
             "current" => install_ui::status_ok(status),
             "update available" => install_ui::yellow(status),
             "not installed" => install_ui::dim(status),
             "check failed" => install_ui::red(status),
-            _ => status.clone(),
+            _ => install_ui::field(status),
         };
         println!("{name:<plugin_width$}  {current_col}  {latest_col}  {status_col}");
         if let Some(error) = &row.error {
@@ -347,9 +347,9 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if removed {
-            install_ui::done(&format!("Removed {plugin}@{ver}"));
+            install_ui::done_untrusted(&format!("Removed {plugin}@{ver}"));
         } else {
-            install_ui::warn(&format!("{plugin}@{ver} not installed"));
+            install_ui::warn_untrusted(&format!("{plugin}@{ver} not installed"));
         }
     } else {
         let count = lpm_plugin::store::remove_all(plugin)?;
@@ -361,12 +361,12 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if count > 0 {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Removed {plugin} ({count} {})",
                 if count == 1 { "version" } else { "versions" }
             ));
         } else {
-            install_ui::warn(&format!("{plugin} not installed"));
+            install_ui::warn_untrusted(&format!("{plugin} not installed"));
         }
     }
 
@@ -389,9 +389,9 @@ fn remove_engine_plugin(
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if removed {
-            install_ui::done(&format!("Removed {plugin}@{ver}"));
+            install_ui::done_untrusted(&format!("Removed {plugin}@{ver}"));
         } else {
-            install_ui::warn(&format!("{plugin}@{ver} not installed"));
+            install_ui::warn_untrusted(&format!("{plugin}@{ver} not installed"));
         }
     } else {
         let count = lpm_plugin::remove_all_engine_versions(plugin)?;
@@ -403,12 +403,12 @@ fn remove_engine_plugin(
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if count > 0 {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Removed {plugin} ({count} {})",
                 if count == 1 { "version" } else { "versions" }
             ));
         } else {
-            install_ui::warn(&format!("{plugin} not installed"));
+            install_ui::warn_untrusted(&format!("{plugin} not installed"));
         }
     }
 
@@ -448,7 +448,7 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            install_ui::done(&format_update_message(name, previous.as_deref(), &version));
+            install_ui::done_line(format_update_message(name, previous.as_deref(), &version));
         }
     } else {
         // Update all managed tools that are installed.
@@ -467,7 +467,7 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
                 lpm_plugin::update_plugin_with_observer(def.name, &mut observer).await?
             };
             if !json_output {
-                install_ui::done(&format_update_message(def.name, previous, &version));
+                install_ui::done_line(format_update_message(def.name, previous, &version));
             }
             updated.push(serde_json::json!({
                 "plugin": def.name,
@@ -485,7 +485,7 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
                 lpm_plugin::update_engine_with_observer("rolldown", &mut observer).await?
             };
             if !json_output {
-                install_ui::done(&format_update_message("rolldown", previous, &version));
+                install_ui::done_line(format_update_message("rolldown", previous, &version));
             }
             updated.push(serde_json::json!({
                 "plugin": "rolldown",
@@ -526,8 +526,9 @@ fn latest_installed_version(plugin_name: &str) -> Result<Option<String>, LpmErro
 fn render_plugin_update_event(event: lpm_plugin::PluginInstallEvent) {
     match event {
         lpm_plugin::PluginInstallEvent::Downloading { plugin, version } => {
-            install_ui::phase(&format!(
-                "Downloading {plugin} {}",
+            install_ui::phase_line(crate::install_ui::terminal_line!(
+                "Downloading {} {}",
+                plugin,
                 install_ui::yellow(&version)
             ));
         }
@@ -540,11 +541,12 @@ fn render_plugin_update_event(event: lpm_plugin::PluginInstallEvent) {
 fn render_engine_update_event(event: lpm_plugin::EngineInstallEvent) {
     match event {
         lpm_plugin::EngineInstallEvent::ResolvingLatest { engine } => {
-            install_ui::phase(&format!("Checking {engine} releases"));
+            install_ui::phase_untrusted(&format!("Checking {engine} releases"));
         }
         lpm_plugin::EngineInstallEvent::Downloading { engine, version } => {
-            install_ui::phase(&format!(
-                "Downloading {engine} {}",
+            install_ui::phase_line(crate::install_ui::terminal_line!(
+                "Downloading {} {}",
+                engine,
                 install_ui::yellow(&version)
             ));
         }
@@ -554,17 +556,24 @@ fn render_engine_update_event(event: lpm_plugin::EngineInstallEvent) {
     }
 }
 
-fn format_update_message(plugin_name: &str, previous: Option<&str>, version: &str) -> String {
+fn format_update_message(
+    plugin_name: &str,
+    previous: Option<&str>,
+    version: &str,
+) -> install_ui::TerminalLine {
     match previous {
-        Some(previous) if previous != version => {
-            format!(
-                "Updated {plugin_name} {} {} {}",
-                install_ui::yellow(previous),
-                install_ui::dim("→"),
-                install_ui::yellow(version),
-            )
-        }
-        _ => format!("Updated {plugin_name} to {}", install_ui::yellow(version)),
+        Some(previous) if previous != version => crate::install_ui::terminal_line!(
+            "Updated {} {} {} {}",
+            plugin_name,
+            install_ui::yellow(previous),
+            install_ui::dim("→"),
+            install_ui::yellow(version),
+        ),
+        _ => crate::install_ui::terminal_line!(
+            "Updated {} to {}",
+            plugin_name,
+            install_ui::yellow(version)
+        ),
     }
 }
 

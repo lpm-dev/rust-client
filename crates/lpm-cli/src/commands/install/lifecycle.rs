@@ -505,7 +505,10 @@ pub(super) async fn run_online_auto_build_phase(
             }
             Err(e) => {
                 if !json_output {
-                    output::warn(&format!("Auto-build failed: {e}"));
+                    output::warn(&format!(
+                        "Auto-build failed: {}",
+                        lpm_common::sanitize_terminal_inline(&e.to_string())
+                    ));
                 }
                 return Err(e);
             }

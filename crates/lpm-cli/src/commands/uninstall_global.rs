@@ -590,7 +590,7 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
     }
     if out.install_root_remaining {
         let root_safe = sanitize_for_terminal(&out.install_root.display().to_string());
-        crate::install_ui::warn(&format!(
+        crate::install_ui::warn_untrusted(&format!(
             "Install root could not be removed (locked or permission). Queued as tombstone for `lpm cache prune --apply` to retry: {root_safe}"
         ));
     }

@@ -9,7 +9,7 @@ pub fn attach(session: lpm_auth::SessionManager, json_output: bool) -> lpm_auth:
 #[cfg(target_os = "macos")]
 fn attach_for_human(session: lpm_auth::SessionManager) -> lpm_auth::SessionManager {
     session.with_auth_storage_access_notice(|kind| {
-        crate::install_ui::phase(kind.macos_notice_message());
+        crate::install_ui::phase_untrusted(kind.macos_notice_message());
     })
 }
 

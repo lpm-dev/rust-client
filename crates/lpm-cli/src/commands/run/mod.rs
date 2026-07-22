@@ -177,7 +177,10 @@ pub async fn run_external_shortcut(
     }
 
     let bin_hint = ensure_runtime(project_dir).await?;
-    install_ui::phase(&format!("Executing {}", install_ui::yellow(command_name)));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Executing {}",
+        install_ui::yellow(command_name)
+    ));
     let start = std::time::Instant::now();
     lpm_runner::script::run_local_bin(
         project_dir,
@@ -187,7 +190,7 @@ pub async fn run_external_shortcut(
         false,
         &bin_hint,
     )?;
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · exited 0 in {}",
         install_ui::green(&install_ui::format_duration(start.elapsed())),
     ));

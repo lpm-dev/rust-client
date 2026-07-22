@@ -1,7 +1,6 @@
 use super::super::global_util::short_name;
 use super::prepare::PrepResult;
-use crate::output;
-use lpm_common::color::Painted;
+use crate::{install_ui, output};
 use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal};
 use lpm_global::{
     CommandCollision, InstallRootStatus, find_command_collisions, read_for, validate_install_root,
@@ -298,9 +297,9 @@ fn prompt_collisions(
 
     eprintln!();
     let installing_pkg_safe = sanitize_for_terminal(installing_pkg);
-    output::warn(&format!(
+    output::warn_line(crate::install_ui::terminal_line!(
         "'{}' would expose {} command{} that {} already taken on this host.",
-        installing_pkg_safe.bold(),
+        install_ui::bold(&installing_pkg_safe),
         collisions.len(),
         if collisions.len() == 1 { "" } else { "s" },
         if collisions.len() == 1 { "is" } else { "are" },

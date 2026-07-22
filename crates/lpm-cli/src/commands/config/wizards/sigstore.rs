@@ -150,6 +150,9 @@ pub(in crate::commands::config) fn announce_sigstore_set(value: &str, json_outpu
             .unwrap()
         );
     } else {
-        install_ui::done(&format!("Set [sigstore] verify = {}", value.bold()));
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Set [sigstore] verify = {}",
+            install_ui::bold(value),
+        ));
     }
 }

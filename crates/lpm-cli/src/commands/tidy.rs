@@ -1042,7 +1042,7 @@ fn print_human_report(report: &TidyReport) {
         if report.removed.is_empty() {
             install_ui::done("package.json is tidy");
         } else {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Removed {} unused dependency declaration(s)",
                 report.removed.len()
             ));
@@ -1051,12 +1051,12 @@ fn print_human_report(report: &TidyReport) {
     }
 
     if !report.removed.is_empty() {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Removed {} unused dependency declaration(s)",
             report.removed.len()
         ));
         for removed in &report.removed {
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "  - {} {}",
                 install_ui::cyan(&removed.name),
                 install_ui::dim(&format!("{} {}", removed.section, removed.spec))
@@ -1065,7 +1065,7 @@ fn print_human_report(report: &TidyReport) {
     }
 
     if !report.unused.is_empty() {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "{} unused dependency declaration(s)",
             report.unused.len()
         ));
@@ -1075,7 +1075,7 @@ fn print_human_report(report: &TidyReport) {
             } else {
                 "report-only"
             };
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "  - {} {}",
                 install_ui::cyan(&dependency.name),
                 install_ui::dim(&format!("{} {} {fix}", dependency.section, dependency.spec))
@@ -1084,21 +1084,24 @@ fn print_human_report(report: &TidyReport) {
     }
 
     if !report.phantoms.is_empty() {
-        install_ui::warn(&format!("{} phantom import(s)", report.phantoms.len()));
+        install_ui::warn_untrusted(&format!("{} phantom import(s)", report.phantoms.len()));
         for phantom in &report.phantoms {
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "  - {} {}",
                 install_ui::cyan(&phantom.name),
                 install_ui::dim(&format!("{}:{}", phantom.file, phantom.line))
             ));
             if let Some(via) = &phantom.available_via {
-                install_ui::detail(&format!("    {}", install_ui::dim(via)));
+                install_ui::detail_line(crate::install_ui::terminal_line!(
+                    "    {}",
+                    install_ui::dim(via)
+                ));
             }
         }
     }
 
     if !report.ignored.is_empty() {
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} ignored by lpm.toml [tidy]",
             install_ui::dim(&report.ignored.len().to_string())
         ));

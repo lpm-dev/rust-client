@@ -75,10 +75,10 @@ pub(super) async fn run_swift_install_spm(
     let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
 
     if !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Installing {} via SE-0292 registry → {}",
-            name.scoped().bold(),
-            se0292_id.dimmed(),
+            install_ui::bold(&name.scoped()),
+            install_ui::dim(se0292_id),
         ));
     }
 
@@ -89,7 +89,11 @@ pub(super) async fn run_swift_install_spm(
     } else if targets.len() > 1 {
         let mut sel = cliclack::select("Which target should use this dependency?");
         for (i, target) in targets.iter().enumerate() {
-            sel = sel.item(target.clone(), target, "");
+            sel = sel.item(
+                target.clone(),
+                lpm_common::sanitize_terminal_inline(target).into_owned(),
+                "",
+            );
             if i == 0 {
                 sel = sel.initial_value(target.clone());
             }
@@ -113,20 +117,21 @@ pub(super) async fn run_swift_install_spm(
 
     if edit.already_exists {
         if !json_output {
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "{} is already in Package.swift",
-                se0292_id.dimmed()
+                install_ui::dim(se0292_id)
             ));
         }
     } else if !json_output {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Added .package(id: \"{}\", from: \"{}\")",
-            se0292_id, version
+            se0292_id,
+            version
         ));
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Added .product(name: \"{}\") to target {}",
             product_name,
-            target_name.bold()
+            install_ui::bold(&target_name)
         ));
     }
 
@@ -156,12 +161,15 @@ pub(super) async fn run_swift_install_spm(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
         println!();
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Installed {}@{} via SE-0292 registry",
-            name.scoped().bold(),
+            install_ui::bold(&name.scoped()),
             version,
         ));
-        println!("  import {} // in your Swift code", product_name.bold());
+        println!(
+            "  import {} // in your Swift code",
+            install_ui::bold(product_name)
+        );
     }
 
     // Security check
@@ -196,10 +204,10 @@ pub(super) async fn run_swift_install_xcode(
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
 
     if !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Installing {} via SE-0292 registry → {} (Xcode project)",
-            name.scoped().bold(),
-            se0292_id.dimmed(),
+            install_ui::bold(&name.scoped()),
+            install_ui::dim(se0292_id),
         ));
     }
 
@@ -219,12 +227,16 @@ pub(super) async fn run_swift_install_xcode(
 
     if edit.already_exists {
         if !json_output {
-            output::info(&format!("{} is already installed", se0292_id.dimmed()));
+            output::info_line(crate::install_ui::terminal_line!(
+                "{} is already installed",
+                install_ui::dim(se0292_id)
+            ));
         }
     } else if !json_output {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Added .package(id: \"{}\", from: \"{}\")",
-            se0292_id, version,
+            se0292_id,
+            version,
         ));
     }
 
@@ -236,9 +248,9 @@ pub(super) async fn run_swift_install_xcode(
     )?;
 
     if link_result.package_ref_added && !json_output {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Linked LPMDependencies to Xcode target {}",
-            link_result.target_name.bold(),
+            install_ui::bold(&link_result.target_name),
         ));
     }
 
@@ -271,12 +283,15 @@ pub(super) async fn run_swift_install_xcode(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
         println!();
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Installed {}@{} via SE-0292 registry",
-            name.scoped().bold(),
+            install_ui::bold(&name.scoped()),
             version,
         ));
-        println!("  import {} // in your Swift code", product_name.bold());
+        println!(
+            "  import {} // in your Swift code",
+            install_ui::bold(product_name)
+        );
     }
 
     // Security check

@@ -16,6 +16,7 @@ pub mod paths;
 pub mod platform;
 pub mod provenance;
 pub mod symlink;
+pub mod terminal;
 
 pub use atomic_write::write_file_atomic;
 pub use bounded_read::{
@@ -36,6 +37,7 @@ pub use paths::{
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
 pub use symlink::{create_dir_symlink_or_junction, create_symlink};
+pub use terminal::{sanitize_for_terminal, sanitize_terminal_inline, sanitize_terminal_multiline};
 
 /// The LPM scope prefix. All LPM packages live under this scope.
 pub const LPM_SCOPE: &str = "@lpm.dev";
@@ -221,34 +223,6 @@ pub fn is_loopback_host(host: &str) -> bool {
     false
 }
 
-/// Render a registry- or lockfile-supplied string safely on a TTY.
-///
-/// Strips the byte ranges that carry terminal semantics — control
-/// characters in `0x00-0x08`, `0x0b-0x1f`, `0x7f`, and the ESC / BEL
-/// codepoints used to begin CSI / OSC / DCS sequences. A package name
-/// like `\x1b]8;;file:///etc/passwd\x07evil-pkg\x1b]8;;\x07` no longer
-/// reaches the terminal as a clickable OSC 8 hyperlink; a name
-/// containing `\x1b]52;c;<data>\x07` no longer mutates the system
-/// clipboard via OSC 52.
-///
-/// Tab (`\x09`), newline (`\x0a`), and carriage return (`\x0d`) are
-/// preserved — install/audit progress lines legitimately contain them.
-/// Each replaced character becomes a literal `?` so the operator
-/// still sees something rather than silently-vanishing bytes.
-pub fn sanitize_for_terminal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        let code = c as u32;
-        let safe = matches!(code, 0x09 | 0x0a | 0x0d) || (code >= 0x20 && code != 0x7f);
-        if safe {
-            out.push(c);
-        } else {
-            out.push('?');
-        }
-    }
-    out
-}
-
 /// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -393,15 +367,18 @@ mod tests {
         assert!(!cleaned.contains('\x1b'));
     }
 
-    /// M71: tab / newline / carriage return are preserved — progress
-    /// lines and multi-line audit output legitimately carry them.
     #[test]
-    fn terminal_sanitizer_preserves_whitespace_and_unicode() {
-        let cleaned = sanitize_for_terminal("line 1\nline 2\r\n\tindented\tcell");
-        assert_eq!(cleaned, "line 1\nline 2\r\n\tindented\tcell");
-        // Non-ASCII codepoints (CJK, emoji) pass through.
-        let cleaned = sanitize_for_terminal("パッケージ-🌀");
-        assert_eq!(cleaned, "パッケージ-🌀");
+    fn terminal_multiline_sanitizer_preserves_lf_tabs_and_unicode_but_normalizes_crlf() {
+        let cleaned = sanitize_terminal_multiline("line 1\nline 2\r\n\tパッケージ-🌀");
+
+        assert_eq!(cleaned, "line 1\nline 2\n\tパッケージ-🌀");
+    }
+
+    #[test]
+    fn terminal_multiline_sanitizer_neutralizes_lone_carriage_returns_and_escapes() {
+        let cleaned = sanitize_terminal_multiline("one\rtwo\n\x1b[31mthree\x1b[0m");
+
+        assert_eq!(cleaned, "one?two\nthree");
     }
 
     /// M71: DEL (0x7f) and lone BEL are stripped.
@@ -409,6 +386,124 @@ mod tests {
     fn terminal_sanitizer_strips_del_and_bel() {
         assert_eq!(sanitize_for_terminal("a\x7fb"), "a?b");
         assert_eq!(sanitize_for_terminal("ring\x07bell"), "ring?bell");
+    }
+
+    #[test]
+    fn terminal_sanitizer_removes_complete_escape_sequences_without_leaking_payloads() {
+        let input = concat!(
+            "before",
+            "\x1b[31mred\x1b[0m",
+            "\x1b]0;forged title\x07after-osc",
+            "\x1bP1;2|dcs payload\x1b\\after-dcs",
+            "\x1b_apc payload\x1b\\after-apc",
+            "\x1b^pm payload\x1b\\after-pm",
+            "\x1bXsos payload\x1b\\after-sos",
+            "\x1b7after-esc",
+        );
+
+        assert_eq!(
+            sanitize_for_terminal(input),
+            "beforeredafter-oscafter-dcsafter-apcafter-pmafter-sosafter-esc"
+        );
+    }
+
+    #[test]
+    fn terminal_sanitizer_removes_c1_sequences_and_controls() {
+        let input = concat!(
+            "a\u{009b}31mred\u{009b}0m",
+            "\u{009d}0;title\u{009c}b",
+            "\u{0090}dcs\u{009c}c",
+            "\u{0098}sos\u{009c}d",
+            "\u{009e}pm\u{009c}e",
+            "\u{009f}apc\u{009c}f",
+            "\u{0085}g",
+        );
+
+        assert_eq!(sanitize_for_terminal(input), "aredbcdef?g");
+    }
+
+    #[test]
+    fn terminal_sanitizer_neutralizes_every_raw_c1_control() {
+        let mut input = String::new();
+        for codepoint in 0x80..=0x9f {
+            if !matches!(codepoint, 0x90 | 0x98 | 0x9b | 0x9d..=0x9f) {
+                input.push(char::from_u32(codepoint).expect("C1 codepoint is valid"));
+            }
+        }
+
+        assert_eq!(
+            sanitize_terminal_inline(&input),
+            "?".repeat(input.chars().count())
+        );
+    }
+
+    #[test]
+    fn terminal_sanitizer_neutralizes_all_inline_whitespace_and_raw_controls() {
+        let input = "nul\0tab\tline\nreturn\rbel\x07back\x08delete\x7funit\x1fend";
+
+        assert_eq!(
+            sanitize_for_terminal(input),
+            "nul?tab?line?return?bel?back?delete?unit?end"
+        );
+    }
+
+    #[test]
+    fn terminal_sanitizer_fails_safe_for_nested_and_unterminated_sequences() {
+        let input = concat!(
+            "visible",
+            "\x1b]52;c;clipboard\x1b[2Jstill-terminal-payload",
+        );
+
+        assert_eq!(sanitize_for_terminal(input), "visible");
+    }
+
+    #[test]
+    fn terminal_sanitizer_is_idempotent_and_preserves_printable_unicode() {
+        let input = "パッケージ🌀\x1b[31m café\x1b[0m";
+        let once = sanitize_for_terminal(input);
+
+        assert_eq!(sanitize_for_terminal(&once), once);
+        assert_eq!(once, "パッケージ🌀 café");
+    }
+
+    #[test]
+    fn terminal_sanitizer_bounds_output_for_long_hostile_input() {
+        let input = "\x1b[31m\x07\x08\r\x7f".repeat(100_000);
+
+        assert!(sanitize_for_terminal(&input).len() <= input.len());
+    }
+
+    #[test]
+    fn terminal_sanitizer_returns_borrowed_input_when_unchanged() {
+        assert!(matches!(
+            sanitize_terminal_inline("ordinary Unicode パッケージ 🌀"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            sanitize_terminal_multiline("line one\n\tline two"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn terminal_sanitizer_drops_truncated_escape_families() {
+        for input in [
+            "safe\x1b",
+            "safe\x1b[31",
+            "safe\x1b]unterminated",
+            "safe\x1bPunterminated",
+            "safe\x1b_unterminated",
+            "safe\x1b^unterminated",
+            "safe\x1bXunterminated",
+            "safe\u{009b}31",
+            "safe\u{009d}unterminated",
+            "safe\u{0090}unterminated",
+            "safe\u{0098}unterminated",
+            "safe\u{009e}unterminated",
+            "safe\u{009f}unterminated",
+        ] {
+            assert_eq!(sanitize_terminal_inline(input), "safe", "input: {input:?}");
+        }
     }
 
     // ── lpm_registry_url_is_accepted (H16) ────────────────────────────

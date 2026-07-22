@@ -102,7 +102,7 @@ pub(crate) async fn publish(
                 "reason": "already_published",
             }));
             if !json_output {
-                install_ui::detail(&format!("skip {name}@{version}: already published"));
+                install_ui::detail_untrusted(&format!("skip {name}@{version}: already published"));
             }
             continue;
         }
@@ -154,7 +154,7 @@ pub(crate) async fn publish(
     if json_output {
         println!("{}", output::format_json_answer(&json)?);
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "release publish processed {} packages",
             results.len()
         ));
@@ -374,12 +374,12 @@ fn emit_plan(plan: &ReleasePlan, dry_run: bool, json_output: bool) -> Result<(),
         return Ok(());
     }
     for package in &plan.packages {
-        install_ui::detail(&format!(
+        install_ui::detail_untrusted(&format!(
             "{} {} -> {}",
             package.name, package.old_version, package.new_version
         ));
     }
-    install_ui::done(&format!("planned {} packages", plan.packages.len()));
+    install_ui::done_untrusted(&format!("planned {} packages", plan.packages.len()));
     Ok(())
 }
 

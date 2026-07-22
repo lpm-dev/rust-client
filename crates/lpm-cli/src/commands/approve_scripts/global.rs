@@ -260,9 +260,9 @@ pub(super) fn print_global_list(
         return;
     }
     println!();
-    output::info(&format!(
+    output::info_line(install_ui::terminal_line!(
         "{} package{} blocked pending review:",
-        aggregate.rows.len().to_string().bold(),
+        install_ui::bold(&aggregate.rows.len().to_string()),
         if aggregate.rows.len() == 1 { "" } else { "s" },
     ));
     println!();
@@ -282,37 +282,48 @@ pub(super) fn print_global_list(
         }
         for (origin, rows) in by_origin {
             println!(
-                "  {} ({} blocked dep{}):",
-                origin.bold(),
-                rows.len(),
-                if rows.len() == 1 { "" } else { "s" },
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} ({} blocked dep{}):",
+                    install_ui::bold(origin),
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" },
+                )
             );
             for r in rows {
+                let drift = if r.binding_drift {
+                    install_ui::terminal_line!("  {}", install_ui::yellow("[binding drift]"))
+                } else {
+                    install_ui::TerminalLine::new("")
+                };
                 println!(
-                    "    {} @ {}{}",
-                    r.name,
-                    r.version.dimmed(),
-                    if r.binding_drift {
-                        "  [binding drift]".yellow().to_string()
-                    } else {
-                        String::new()
-                    }
+                    "{}",
+                    install_ui::terminal_line!(
+                        "    {} @ {}{}",
+                        &r.name,
+                        install_ui::dim(&r.version),
+                        drift,
+                    )
                 );
             }
             println!();
         }
     } else {
         for r in &aggregate.rows {
+            let drift = if r.binding_drift {
+                install_ui::terminal_line!("  {}", install_ui::yellow("[binding drift]"))
+            } else {
+                install_ui::TerminalLine::new("")
+            };
             println!(
-                "  {} @ {} — used by {}{}",
-                r.name.bold(),
-                r.version.dimmed(),
-                r.origins.join(", "),
-                if r.binding_drift {
-                    "  [binding drift]".yellow().to_string()
-                } else {
-                    String::new()
-                }
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} @ {} — used by {}{}",
+                    install_ui::bold(&r.name),
+                    install_ui::dim(&r.version),
+                    r.origins.join(", "),
+                    drift,
+                )
             );
         }
     }
@@ -381,7 +392,10 @@ pub(super) fn emit_rerun_hint_stderr(origins: &[String]) {
     }
     output::info("Next step — reinstall the affected globals to execute approved scripts:");
     for o in origins {
-        eprintln!("    lpm uninstall -g {o} && lpm install -g {o}");
+        eprintln!(
+            "{}",
+            install_ui::terminal_line!("    lpm uninstall -g {} && lpm install -g {}", o, o)
+        );
     }
     eprintln!("(`lpm rebuild --global` is a planned follow-up.)");
 }
@@ -738,16 +752,16 @@ pub(super) async fn run_global_named(
         }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if dry_run {
-        output::info(&format!(
+        output::info_line(install_ui::terminal_line!(
             "DRY RUN — would approve {} @ {} globally. No changes written.",
-            row.name.bold(),
-            row.version.dimmed()
+            install_ui::bold(&row.name),
+            install_ui::dim(&row.version),
         ));
     } else {
-        output::success(&format!(
+        output::success_line(install_ui::terminal_line!(
             "Approved {} @ {} globally.",
-            row.name.bold(),
-            row.version.dimmed()
+            install_ui::bold(&row.name),
+            install_ui::dim(&row.version),
         ));
         emit_rerun_hint_stderr(&origins);
     }
@@ -861,21 +875,28 @@ pub(super) fn print_origin_group_card(
 ) {
     println!();
     println!(
-        "  {} ({} blocked dep{}):",
-        origin.bold(),
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
+        "{}",
+        install_ui::terminal_line!(
+            "  {} ({} blocked dep{}):",
+            install_ui::bold(origin),
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+        )
     );
     for row in rows.iter().take(8) {
+        let drift = if row.binding_drift {
+            install_ui::terminal_line!("  {}", install_ui::yellow("[binding drift]"))
+        } else {
+            install_ui::TerminalLine::new("")
+        };
         println!(
-            "    {} @ {}{}",
-            row.name,
-            row.version.dimmed(),
-            if row.binding_drift {
-                "  [binding drift]".yellow().to_string()
-            } else {
-                String::new()
-            }
+            "{}",
+            install_ui::terminal_line!(
+                "    {} @ {}{}",
+                &row.name,
+                install_ui::dim(&row.version),
+                drift,
+            )
         );
     }
     if rows.len() > 8 {
@@ -965,9 +986,9 @@ pub(super) async fn run_global_interactive(
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
 
     println!();
-    output::info(&format!(
+    output::info_line(install_ui::terminal_line!(
         "Reviewing {} globally-blocked package{}. Ctrl+C to stop.",
-        aggregate.rows.len().to_string().bold(),
+        install_ui::bold(&aggregate.rows.len().to_string()),
         if aggregate.rows.len() == 1 { "" } else { "s" },
     ));
     println!();
@@ -984,17 +1005,19 @@ pub(super) async fn run_global_interactive(
             };
 
             print_origin_group_card(&origin, &rows);
-            let choice: &str = cliclack::select(format!(
+            let prompt = install_ui::terminal_line!(
                 "How would you like to review blocked deps for {}?",
-                origin
-            ))
-            .item("approve_all", "Approve all for this global", "")
-            .item("review", "Review individually", "")
-            .item("skip_all", "Skip all for now", "")
-            .item("quit", "Quit — stop here; approved rows kept", "")
-            .initial_value("review")
-            .interact()
-            .map_err(prompt_err)?;
+                &origin,
+            )
+            .to_string();
+            let choice: &str = cliclack::select(prompt)
+                .item("approve_all", "Approve all for this global", "")
+                .item("review", "Review individually", "")
+                .item("skip_all", "Skip all for now", "")
+                .item("quit", "Quit — stop here; approved rows kept", "")
+                .initial_value("review")
+                .interact()
+                .map_err(prompt_err)?;
 
             match choice {
                 "approve_all" => {
@@ -1049,14 +1072,19 @@ pub(super) async fn run_global_interactive(
                         }
 
                         print_aggregate_card(row);
-                        let row_choice: &str =
-                            cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
-                                .item("approve", "Approve", "")
-                                .item("skip", "Skip", "")
-                                .item("quit", "Quit — stop here; approved rows kept", "")
-                                .initial_value("approve")
-                                .interact()
-                                .map_err(prompt_err)?;
+                        let prompt = install_ui::terminal_line!(
+                            "{} @ {} — approve?",
+                            &row.name,
+                            &row.version,
+                        )
+                        .to_string();
+                        let row_choice: &str = cliclack::select(prompt)
+                            .item("approve", "Approve", "")
+                            .item("skip", "Skip", "")
+                            .item("quit", "Quit — stop here; approved rows kept", "")
+                            .initial_value("approve")
+                            .interact()
+                            .map_err(prompt_err)?;
 
                         match row_choice {
                             "approve" => {
@@ -1136,7 +1164,9 @@ pub(super) async fn run_global_interactive(
     // interactive walk which is also per-row).
     for row in &aggregate.rows {
         print_aggregate_card(row);
-        let choice: &str = cliclack::select(format!("{} @ {} — approve?", row.name, row.version))
+        let prompt =
+            install_ui::terminal_line!("{} @ {} — approve?", &row.name, &row.version).to_string();
+        let choice: &str = cliclack::select(prompt)
             .item("approve", "Approve", "")
             .item("skip", "Skip", "")
             .item("quit", "Quit — stop here; approved rows kept", "")
@@ -1196,23 +1226,42 @@ pub(super) async fn run_global_interactive(
 }
 
 pub(super) fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
+    let drift = if row.binding_drift {
+        install_ui::terminal_line!("  {}", install_ui::yellow("[binding drift]"))
+    } else {
+        install_ui::TerminalLine::new("")
+    };
     println!(
-        "  {} @ {}{}",
-        row.name.bold(),
-        row.version.dimmed(),
-        if row.binding_drift {
-            "  [binding drift]".yellow()
-        } else {
-            String::new()
-        }
+        "{}",
+        install_ui::terminal_line!(
+            "  {} @ {}{}",
+            install_ui::bold(&row.name),
+            install_ui::dim(&row.version),
+            drift,
+        )
     );
-    println!("    phases: {}", row.phases_present.join(", ").dimmed());
-    println!("    origins: {}", row.origins.join(", ").dimmed());
+    println!(
+        "{}",
+        install_ui::terminal_line!(
+            "    phases: {}",
+            install_ui::dim(&row.phases_present.join(", ")),
+        )
+    );
+    println!(
+        "{}",
+        install_ui::terminal_line!("    origins: {}", install_ui::dim(&row.origins.join(", ")),)
+    );
     if let Some(integ) = &row.integrity {
-        println!("    integrity: {}", integ.dimmed());
+        println!(
+            "{}",
+            install_ui::terminal_line!("    integrity: {}", install_ui::dim(integ))
+        );
     }
     if let Some(sh) = &row.script_hash {
-        println!("    script_hash: {}", sh.dimmed());
+        println!(
+            "{}",
+            install_ui::terminal_line!("    script_hash: {}", install_ui::dim(sh))
+        );
     }
     println!();
 }

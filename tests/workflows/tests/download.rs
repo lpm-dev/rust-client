@@ -8,6 +8,42 @@ use support::{
     TempProject, lpm_with_registry, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
 
+const HOSTILE_PACKAGE_ARGUMENT: &str =
+    "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+
+fn assert_hostile_package_argument_is_inline_safe(rendered: &str) {
+    assert!(
+        rendered.contains("safe?FORGED?rewritten?end"),
+        "download must preserve readable package text without forged rows, got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "download output retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn download_package_argument_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"download-controls","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["download", HOSTILE_PACKAGE_ARGUMENT])
+        .output()
+        .expect("failed to run lpm download with terminal controls in the package argument");
+
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_hostile_package_argument_is_inline_safe(&rendered);
+}
+
 /// `lpm download` must accept its subcommand-local `--version` flag
 /// without colliding with the global `--version` bool, and the JSON
 /// envelope must report the canonicalized absolute extraction path.

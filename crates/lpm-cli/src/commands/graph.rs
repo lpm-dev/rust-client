@@ -103,7 +103,7 @@ pub async fn run(
         // Check for empty result after pruning
         if graph.stats.total_packages == 0 {
             let dep_type = if prod_only { "production" } else { "dev" };
-            install_ui::warn(&format!("No {dep_type} dependencies found"));
+            install_ui::warn_untrusted(&format!("No {dep_type} dependencies found"));
             return Ok(());
         }
     }
@@ -130,7 +130,7 @@ pub async fn run(
             .values()
             .any(|n| !n.is_root && n.name.contains(f));
         if !has_match {
-            install_ui::warn(&format!("No packages matching '{f}' in dependency tree"));
+            install_ui::warn_untrusted(&format!("No packages matching '{f}' in dependency tree"));
             return Ok(());
         }
         graph_render::filter_graph(&mut graph, f);
@@ -194,7 +194,9 @@ pub async fn run(
             if !json_output {
                 match max_depth {
                     Some(depth) => {
-                        install_ui::done(&format!("Rendered dependency tree (depth {depth})"));
+                        install_ui::done_untrusted(&format!(
+                            "Rendered dependency tree (depth {depth})"
+                        ));
                     }
                     None => install_ui::done("Rendered dependency tree"),
                 }
@@ -224,16 +226,22 @@ pub async fn run(
             std::fs::write(&out_path, &html)
                 .map_err(|e| LpmError::Script(format!("failed to write graph.html: {e}")))?;
 
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Generated {} ({})",
-                out_path.display(),
+                out_path.display().to_string(),
                 format_byte_size(html.len()),
             ));
 
             // Open in browser unless suppressed (headless / CI).
             if !no_open && open::that(&out_path).is_err() && !json_output {
                 install_ui::warn("Could not open browser automatically");
-                println!("  Open this file manually: {}", out_path.display());
+                println!(
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "  Open this file manually: {}",
+                        out_path.display().to_string()
+                    )
+                );
             }
         }
         _ => {

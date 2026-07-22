@@ -363,9 +363,11 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 .latest_binding_for_name(&target.name, &target.version)
                 .is_some()
             {
-                format!("Accept new {}@{}?", target.name, target.version)
+                install_ui::terminal_line!("Accept new {}@{}?", &target.name, &target.version,)
+                    .to_string()
             } else {
-                format!("Approve {}@{}?", target.name, target.version)
+                install_ui::terminal_line!("Approve {}@{}?", &target.name, &target.version)
+                    .to_string()
             };
             cliclack::confirm(prompt)
                 .interact()
@@ -625,10 +627,12 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         // build a fresh Select on each iteration.
         let mut decision: Option<bool> = None;
         loop {
-            let prompt = format!(
+            let prompt = install_ui::terminal_line!(
                 "What would you like to do with {}@{}?",
-                blocked.name, blocked.version
-            );
+                &blocked.name,
+                &blocked.version,
+            )
+            .to_string();
             let choice = if is_update {
                 // Default to KeepOld: when the diff card is sitting
                 // RIGHT ABOVE this prompt showing what changed, the

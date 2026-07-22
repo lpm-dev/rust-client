@@ -166,17 +166,17 @@ pub(crate) async fn run(
     } else {
         install_ui::done("Wrote package.json");
         if lpm_json_status != FileWriteStatus::Skipped {
-            install_ui::done(&format!("{} lpm.json", lpm_json_status.human_verb()));
+            install_ui::done_untrusted(&format!("{} lpm.json", lpm_json_status.human_verb()));
         }
         if agents_status != FileWriteStatus::Skipped {
-            install_ui::done(&format!("{} AGENTS.md", agents_status.human_verb()));
+            install_ui::done_untrusted(&format!("{} AGENTS.md", agents_status.human_verb()));
         }
         if gitattributes_ready {
             install_ui::done("Added lpm.lockb binary to .gitattributes");
         } else {
             install_ui::warn("Could not update .gitattributes");
         }
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · initialized {}",
             install_ui::cyan(pkg["name"].as_str().unwrap_or(DEFAULT_PACKAGE_NAME))
         ));
@@ -356,12 +356,12 @@ fn prompt_string(
     placeholder: Option<&str>,
     required: bool,
 ) -> Result<String, LpmError> {
-    let mut prompt = cliclack::input(label);
+    let mut prompt = cliclack::input(crate::prompt::untrusted(label));
     if let Some(default) = default {
-        prompt = prompt.default_input(default);
+        prompt = prompt.default_input(&crate::prompt::untrusted(default));
     }
     if let Some(placeholder) = placeholder {
-        prompt = prompt.placeholder(placeholder);
+        prompt = prompt.placeholder(&crate::prompt::untrusted(placeholder));
     }
     if !required {
         prompt = prompt.required(false);

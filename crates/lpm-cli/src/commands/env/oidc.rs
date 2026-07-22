@@ -175,9 +175,10 @@ pub(super) async fn vars_oidc_allow(
     let result: serde_json::Value = super::response::parse_capped_platform_json(response).await?;
 
     if !json_output {
-        output::success(&format!(
-            "OIDC policy set: {provider} {} on branches [{}] for envs [{}] via workflows [{}] events [{}]",
-            repo.bold(),
+        output::success_line(install_ui::terminal_line!(
+            "OIDC policy set: {} {} on branches [{}] for envs [{}] via workflows [{}] events [{}]",
+            provider,
+            install_ui::bold(repo),
             branches.join(", "),
             if envs.is_empty() {
                 "all".to_string()
@@ -211,9 +212,9 @@ pub(super) async fn vars_oidc_allow(
                 }
                 Err(e) => {
                     if !json_output {
-                        output::warn(&format!(
+                        output::warn_line(install_ui::terminal_line!(
                             "Failed to escrow wrapping key (CI pull may not work): {}",
-                            e.dimmed()
+                            install_ui::dim(&e),
                         ));
                     }
                 }
@@ -221,9 +222,9 @@ pub(super) async fn vars_oidc_allow(
         }
         Err(e) => {
             if !json_output {
-                output::warn(&format!(
+                output::warn_line(install_ui::terminal_line!(
                     "Could not read wrapping key for CI escrow: {}",
-                    e.dimmed()
+                    install_ui::dim(&e),
                 ));
             }
         }
@@ -324,14 +325,21 @@ pub(super) async fn vars_oidc_list(
         };
         let ev = if events.is_empty() { "-" } else { &events };
         println!(
-            "  {} {}\n      branches:  [{bb}]\n      envs:      [{ee}]\n      workflows: [{ww}]\n      events:    [{ev}]{}",
-            provider.bold(),
-            subject,
-            if forks {
-                "\n      forks:     allowed"
-            } else {
-                ""
-            },
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {}\n      branches:  [{}]\n      envs:      [{}]\n      workflows: [{}]\n      events:    [{}]{}",
+                install_ui::bold(provider),
+                subject,
+                bb,
+                ee,
+                ww,
+                ev,
+                if forks {
+                    "\n      forks:     allowed"
+                } else {
+                    ""
+                },
+            )
         );
     }
     println!();
@@ -460,9 +468,9 @@ pub(super) async fn vars_oidc_pull(
         }
 
         if !json_output {
-            output::success(&format!(
+            output::success_line(install_ui::terminal_line!(
                 "wrote {} secret{} to {} (env: {})",
-                keys.len().to_string().bold(),
+                install_ui::bold(&keys.len().to_string()),
                 if keys.len() == 1 { "" } else { "s" },
                 file,
                 env_name,
@@ -474,9 +482,9 @@ pub(super) async fn vars_oidc_pull(
             serde_json::json!({ "env": env_name, "vars": vars, "count": vars.len() })
         );
     } else {
-        output::success(&format!(
+        output::success_line(install_ui::terminal_line!(
             "pulled {} secret{} via OIDC (env: {})",
-            vars.len().to_string().bold(),
+            install_ui::bold(&vars.len().to_string()),
             if vars.len() == 1 { "" } else { "s" },
             env_name,
         ));

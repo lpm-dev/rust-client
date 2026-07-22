@@ -215,6 +215,45 @@ fn run_script_output_reaches_stdout() {
 }
 
 #[test]
+fn run_manifest_task_name_cannot_forge_terminal_rows() {
+    let task_name = "safe-task\nFORGED-TASK\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+    let manifest = serde_json::json!({
+        "name": "terminal-task-name",
+        "version": "1.0.0",
+        "scripts": {task_name: "node -e \"\""}
+    });
+    let project = TempProject::empty(&manifest.to_string());
+
+    let output = lpm(&project)
+        .args(["run", task_name])
+        .output()
+        .expect("failed to run task with terminal controls in its name");
+    assert!(
+        output.status.success(),
+        "task must still run; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("safe-task?FORGED-TASK?rewritten?end"),
+        "task name must remain recognizable without injected rows; got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "task output retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn run_human_output_uses_slim_status_lines() {
     let project = TempProject::from_fixture("with-scripts");
 
@@ -1032,6 +1071,56 @@ fn run_cache_hit_replays_output() {
 }
 
 #[test]
+fn run_cached_output_is_sanitized_during_capture_and_replay() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "terminal-cache-output",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "node -e \"process.stdout.write('safe\\x1b]52;c;AAAA\\x07end\\u0090hidden\\u009c\\b\\rrewritten\\n')\""
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+
+    for run_number in 1..=2 {
+        let output = lpm(&project)
+            .args(["run", "build"])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run cached build {run_number}: {error}"));
+        assert!(
+            output.status.success(),
+            "cached build {run_number} must pass"
+        );
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            rendered.contains("safeend??rewritten"),
+            "captured output must remain visible after sanitization on run {run_number}; got:\n{rendered}"
+        );
+        for attacker_fragment in ["\u{1b}", "\u{7}", "\u{8}", "\r", "\u{0090}", "\u{009c}"] {
+            assert!(
+                !rendered.contains(attacker_fragment),
+                "cached output retained attacker fragment {attacker_fragment:?} on run {run_number}:\n{rendered}"
+            );
+        }
+    }
+}
+
+#[test]
 fn run_no_cache_flag_skips_cache() {
     let project = TempProject::empty(
         r#"{
@@ -1447,6 +1536,53 @@ fn run_parallel_executes_independent_tasks() {
         combined.contains("checked") || combined.contains("check"),
         "check should have run in parallel, got:\n{combined}"
     );
+}
+
+#[test]
+fn run_parallel_stream_sanitizes_child_output_before_prefixing() {
+    let manifest = serde_json::json!({
+        "name": "terminal-prefixed-output",
+        "version": "1.0.0",
+        "scripts": {
+            "hostile": r#"node -e "process.stdout.write('safe\x1b]52;c;AAAA\x07end\u0090hidden\u009c\b\rrewritten\n')""#,
+            "clean": "node -e \"process.stdout.write('clean\\n')\""
+        }
+    });
+    let project = TempProject::empty(&manifest.to_string());
+
+    let output = lpm(&project)
+        .args(["run", "hostile", "clean", "--parallel", "--stream"])
+        .output()
+        .expect("failed to run streamed parallel tasks");
+    assert!(
+        output.status.success(),
+        "parallel streamed tasks must pass; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("safeend??rewritten"),
+        "prefixed child output must remain visible after sanitization; got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\u{1b}]52;c;AAAA",
+        "\u{7}",
+        "\u{8}",
+        "\r",
+        "\u{0090}",
+        "\u{009c}",
+        "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "prefixed child output retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
 }
 
 // ─── Workspace dispatch: --filter / --all / --affected ─────────────

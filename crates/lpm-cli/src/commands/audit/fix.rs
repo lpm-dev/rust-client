@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{PackageMetadata, RegistryClient};
 use lpm_semver::Version;
@@ -762,44 +761,41 @@ fn emit_audit_fix_report(
         } else {
             install_ui::warn("No direct dependency fixes could be applied");
             for skip in skipped {
-                eprintln!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {} {}",
-                    sanitize_audit_fix_name(&skip.name).bold(),
-                    sanitize_audit_fix_name(&skip.reason).dimmed(),
-                );
+                    install_ui::bold(&skip.name),
+                    install_ui::dim(&skip.reason),
+                ));
             }
         }
         return;
     }
 
     let verb = if dry_run { "Would fix" } else { "Fixed" };
-    install_ui::done(&format!(
-        "{verb} {} vulnerable direct {} in {}",
+    install_ui::done_line(crate::install_ui::terminal_line!(
+        "{} {} vulnerable direct {} in {}",
+        verb,
         fixes.len(),
         install_ui::packages_word(fixes.len()),
         install_ui::format_duration(elapsed),
     ));
     for fix in fixes {
-        eprintln!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {} {} {}  {}",
-            sanitize_audit_fix_name(&fix.name).bold(),
-            sanitize_audit_fix_name(&fix.from).dimmed(),
-            "→".dimmed(),
-            sanitize_audit_fix_name(&fix.to).yellow(),
-            sanitize_audit_fix_name(&fix.vulnerability_ids.join(", ")).dimmed(),
-        );
+            install_ui::bold(&fix.name),
+            install_ui::dim(&fix.from),
+            install_ui::dim("→"),
+            install_ui::yellow(&fix.to),
+            install_ui::dim(&fix.vulnerability_ids.join(", ")),
+        ));
     }
     if !skipped.is_empty() {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "{} vulnerable direct {} could not be fixed automatically",
             skipped.len(),
             install_ui::packages_word(skipped.len()),
         ));
     }
-}
-
-fn sanitize_audit_fix_name(value: &str) -> String {
-    lpm_common::sanitize_for_terminal(value)
 }
 
 fn audit_fix_remove_optional_file(path: &Path) -> Result<(), LpmError> {

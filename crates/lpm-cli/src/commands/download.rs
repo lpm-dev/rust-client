@@ -9,7 +9,6 @@ use crate::commands::registry_reads::{
 };
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +29,7 @@ pub async fn run(
     let start = Instant::now();
 
     if !json_output {
-        install_ui::phase(&format!("Resolving {package}"));
+        install_ui::phase_line(install_ui::TerminalLine::new("Resolving ").field(package));
     }
 
     let (package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
@@ -80,8 +79,11 @@ pub async fn run(
     )?;
 
     if !json_output {
-        let download_message = format!("Downloading {package_name}@{version_key}");
-        install_ui::phase(&install_ui::with_firewall_badge(
+        let download_message = install_ui::TerminalLine::new("Downloading ")
+            .field(&package_name)
+            .text("@")
+            .field(&version_key);
+        install_ui::phase_line(install_ui::with_firewall_badge(
             download_message,
             firewall_preflight.is_active(),
         ));
@@ -120,7 +122,9 @@ pub async fn run(
         lpm_extractor::verify_integrity(&tarball_data, sri.as_ref())?;
 
         if !json_output {
-            install_ui::done(&format!("Verified integrity {}", short_integrity(sri)));
+            install_ui::done_line(
+                install_ui::TerminalLine::new("Verified integrity ").field(&short_integrity(sri)),
+            );
         }
         true
     } else {
@@ -163,43 +167,66 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         eprintln!(
-            "    {} {}",
-            format!("{:<16}", "output:").dimmed(),
-            install_ui::yellow(&target_dir.display().to_string())
+            "{}",
+            crate::install_ui::terminal_line!(
+                "    {} {}",
+                install_ui::dim(&format!("{:<16}", "output:")),
+                install_ui::yellow(&target_dir.display().to_string())
+            )
         );
         eprintln!(
-            "    {} {}",
-            format!("{:<16}", "files extracted:").dimmed(),
-            files.len()
+            "{}",
+            crate::install_ui::terminal_line!(
+                "    {} {}",
+                install_ui::dim(&format!("{:<16}", "files extracted:")),
+                files.len()
+            )
         );
         eprintln!(
-            "    {} {}",
-            format!("{:<16}", "size:").dimmed(),
-            format_bytes(size)
+            "{}",
+            crate::install_ui::terminal_line!(
+                "    {} {}",
+                install_ui::dim(&format!("{:<16}", "size:")),
+                format_bytes(size)
+            )
         );
         eprintln!();
 
         // Show extracted files summary
         if files.len() <= 20 {
             for f in &files {
-                eprintln!("    {}", f.display().to_string().dimmed());
+                eprintln!(
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "    {}",
+                        install_ui::dim(&f.display().to_string())
+                    )
+                );
             }
         } else {
             for f in files.iter().take(15) {
-                eprintln!("    {}", f.display().to_string().dimmed());
+                eprintln!(
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "    {}",
+                        install_ui::dim(&f.display().to_string())
+                    )
+                );
             }
             eprintln!(
-                "    {}",
-                format!("… and {} more files", files.len() - 15).dimmed()
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "    {}",
+                    install_ui::dim(&format!("… and {} more files", files.len() - 15))
+                )
             );
         }
 
         eprintln!();
         let duration = install_ui::format_duration(elapsed);
-        install_ui::done(&format!(
-            "Done · tarball extracted in {}",
-            install_ui::green(&duration)
-        ));
+        install_ui::done_line(
+            install_ui::TerminalLine::new("Done · tarball extracted in ").green(&duration),
+        );
     }
 
     Ok(())

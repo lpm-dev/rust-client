@@ -1,5 +1,13 @@
 use crate::install_ui;
 
+pub(super) fn print_captured_stdout(output: &str) {
+    print!("{}", lpm_common::sanitize_terminal_multiline(output));
+}
+
+pub(super) fn print_captured_stderr(output: &str) {
+    eprint!("{}", lpm_common::sanitize_terminal_multiline(output));
+}
+
 pub(super) struct TaskResult {
     pub(super) name: String,
     pub(super) success: bool,
@@ -9,46 +17,50 @@ pub(super) struct TaskResult {
 }
 
 pub(super) fn print_task_result(result: &TaskResult) {
+    let name = lpm_common::sanitize_terminal_inline(&result.name);
     if result.skipped {
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}   {}",
             install_ui::dim("⊘"),
-            install_ui::dim(&result.name),
+            install_ui::dim(&name),
             install_ui::dim("skipped"),
         ));
     } else if result.success {
         let timing = format_duration(result.duration);
         let cache_label = if result.cached { ", cached" } else { "" };
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}   passed ({}{})",
             install_ui::status_ok("✓"),
-            install_ui::yellow(&result.name),
+            install_ui::yellow(&name),
             timing,
             cache_label,
         ));
     } else {
         let timing = format_duration(result.duration);
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}   failed (exit 1, {})",
             install_ui::red("✗"),
-            install_ui::yellow(&result.name),
+            install_ui::yellow(&name),
             timing,
         ));
     }
 }
 
-pub(super) fn format_run_failure_detail(subject: &str, reason: impl std::fmt::Display) -> String {
+pub(super) fn format_run_failure_detail(
+    subject: &str,
+    reason: impl std::fmt::Display,
+) -> install_ui::TerminalLine {
     let reason = reason.to_string();
-    format!(
+    crate::install_ui::terminal_line!(
         "  {} {}: {}",
         install_ui::red("✗"),
         install_ui::yellow(subject),
-        lpm_common::sanitize_for_terminal(&reason)
+        reason
     )
 }
 
-pub(super) fn format_failed_task_output_header(name: &str) -> String {
-    format!(
+pub(super) fn format_failed_task_output_header(name: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "  {} {} output {}",
         install_ui::dim("──"),
         install_ui::yellow(name),
@@ -56,12 +68,12 @@ pub(super) fn format_failed_task_output_header(name: &str) -> String {
     )
 }
 
-pub(super) fn format_failed_task_output_footer() -> String {
-    format!("  {}", install_ui::dim(&"─".repeat(50)))
+pub(super) fn format_failed_task_output_footer() -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!("  {}", install_ui::dim(&"─".repeat(50)))
 }
 
-pub(super) fn format_cache_summary(cached: usize, missed: usize) -> String {
-    format!(
+pub(super) fn format_cache_summary(cached: usize, missed: usize) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "  {} {} hit, {} miss",
         install_ui::dim("Cache:"),
         install_ui::status_ok(&cached.to_string()),
@@ -72,8 +84,8 @@ pub(super) fn format_cache_summary(cached: usize, missed: usize) -> String {
 pub(super) fn format_workspace_member_scripts_header(
     member_name: &str,
     scripts: &[String],
-) -> String {
-    format!(
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::cyan(&format!("[{member_name}]")),
         install_ui::yellow(&scripts.join(", "))
@@ -113,7 +125,7 @@ pub(super) fn print_results_summary(results: &[TaskResult], total_elapsed: std::
         };
         // use ran count (excludes skipped) in summary
         let ran_count = results.iter().filter(|r| !r.skipped).count();
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "{} completed in {}{}",
             ran_count,
             format_duration(total_elapsed),
@@ -127,14 +139,14 @@ pub(super) fn print_results_summary(results: &[TaskResult], total_elapsed: std::
         } else {
             String::new()
         };
-        install_ui::failed(&format!("{failed} of {ran} tasks failed.{skip_note}"));
+        install_ui::failed_untrusted(&format!("{failed} of {ran} tasks failed.{skip_note}"));
     }
 
     if skipped > 0 {
-        install_ui::detail(&format!("  {} skipped (dependency failed)", skipped));
+        install_ui::detail_untrusted(&format!("  {} skipped (dependency failed)", skipped));
     }
     if cached > 0 {
-        install_ui::detail(&format_cache_summary(
+        install_ui::detail_line(format_cache_summary(
             cached,
             results.len() - cached - skipped,
         ));

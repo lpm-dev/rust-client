@@ -145,15 +145,14 @@ pub async fn run(
     )?;
 
     if !json_output {
-        let fetch_message = format!(
-            "Fetching {} package(s) from lpm.lock",
-            install_ui::yellow(&targets.len().to_string())
-        );
-        install_ui::phase(&install_ui::with_firewall_badge(
+        let fetch_message = install_ui::TerminalLine::new("Fetching ")
+            .yellow(&targets.len().to_string())
+            .text(" package(s) from lpm.lock");
+        install_ui::phase_line(install_ui::with_firewall_badge(
             fetch_message,
             firewall_preflight.is_active(),
         ));
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "    {} {}",
             install_ui::dim(&format!("{:<12}", "platform:")),
             render_platform(&target_platform)
@@ -207,13 +206,13 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&summary).unwrap());
     } else {
         if counts.skipped > 0 {
-            install_ui::skipped(&format!(
+            install_ui::skipped_untrusted(&format!(
                 "Skipped {} local/platform package(s)",
                 counts.skipped
             ));
         }
         let elapsed = install_ui::format_duration(started.elapsed());
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · fetched {}, cached {}, skipped {} in {}",
             install_ui::green(&counts.fetched.to_string()),
             install_ui::green(&counts.cached.to_string()),

@@ -2,6 +2,24 @@ mod support;
 
 use support::{TempProject, lpm};
 
+const HOSTILE_ENV_NAME: &str =
+    "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+
+fn assert_hostile_env_name_is_inline_safe(context: &str, rendered: &str) {
+    assert!(
+        rendered.matches("safe?FORGED?rewritten?end").count() >= 2,
+        "{context} must preserve the readable env name in both generated commands, got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\nFORGED", "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "{context} retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
+}
+
 #[test]
 fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
     let project = TempProject::empty(r#"{"name":"ci-test","version":"1.0.0"}"#);
@@ -163,6 +181,29 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
     );
 }
 
+#[test]
+fn ci_setup_github_actions_env_name_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"ci-controls","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "setup",
+            "ci",
+            "github-actions",
+            &format!("--env={HOSTILE_ENV_NAME}"),
+        ])
+        .output()
+        .expect("failed to run GitHub Actions setup with terminal controls");
+
+    assert!(output.status.success(), "GitHub Actions setup must succeed");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_hostile_env_name_is_inline_safe("GitHub Actions setup output", &rendered);
+}
+
 // ─── setup ci gitlab ──────────────────────────────────────────────────
 
 #[test]
@@ -212,6 +253,29 @@ fn ci_setup_gitlab_with_env_flag_threads_the_env_name() {
         stdout.contains("--env=staging"),
         "setup output must thread the requested env name into the pull step + authorization command, got:\n{stdout}"
     );
+}
+
+#[test]
+fn ci_setup_gitlab_env_name_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"ci-controls","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "setup",
+            "ci",
+            "gitlab",
+            &format!("--env={HOSTILE_ENV_NAME}"),
+        ])
+        .output()
+        .expect("failed to run GitLab setup with terminal controls");
+
+    assert!(output.status.success(), "GitLab setup must succeed");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_hostile_env_name_is_inline_safe("GitLab setup output", &rendered);
 }
 
 #[test]

@@ -26,7 +26,7 @@ pub(super) fn emit_project_env_for_ci(
     match destination {
         CiEnvDestination::Stdout => {
             println!("{output}");
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Emitted {} environment variables for {}",
                 env_vars.len(),
                 ci_format_label(format)
@@ -48,7 +48,7 @@ pub(super) fn emit_project_env_for_ci(
                     );
                 }
             }
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Wrote {} vars to {}",
                 install_ui::status_ok(&env_vars.len().to_string()),
                 install_ui::cyan(file)

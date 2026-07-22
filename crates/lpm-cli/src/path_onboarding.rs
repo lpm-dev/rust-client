@@ -38,9 +38,8 @@
 //! `maybe_show_path_hint`, which composes them with env reads and
 //! marker I/O. The pure functions get the bulk of the test coverage.
 
-use crate::output;
+use crate::{install_ui, output};
 use lpm_common::LpmRoot;
-use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
 
 /// Per-platform PATH separator. Compile-time constant — `cfg`-gated
@@ -267,14 +266,17 @@ pub fn maybe_show_path_hint(root: &LpmRoot, json_output: bool) -> PathHintReport
 
 fn print_banner(bin_dir: &Path, shell: ShellKind) {
     println!();
-    output::warn(&format!(
+    output::warn_line(install_ui::terminal_line!(
         "{} is not on your PATH.",
-        bin_dir.display().to_string().bold()
+        install_ui::bold(&bin_dir.display().to_string()),
     ));
     output::info("Globally-installed command shims live there. Add it to your shell init:");
 
     println!();
-    println!("    {}", shell.export_line(bin_dir).bold());
+    println!(
+        "{}",
+        install_ui::terminal_line!("    {}", install_ui::bold(&shell.export_line(bin_dir)),)
+    );
     println!();
 
     match shell.rc_filename() {

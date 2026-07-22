@@ -30,7 +30,7 @@ pub(in crate::commands::audit) fn print_discovery_summary(discovery: &DiscoveryR
         message.push_str(&install_ui::dim("node_modules"));
     }
 
-    install_ui::done(&message);
+    install_ui::done_untrusted(&message);
 
     if discovery.lockfile_path.is_none() {
         install_ui::warn("No lockfile found; scanning node_modules directly");
@@ -42,13 +42,17 @@ pub(in crate::commands::audit) fn print_discovery_summary(discovery: &DiscoveryR
 
 pub(in crate::commands::audit) fn print_osv_status(osv_degraded_reason: Option<&str>) {
     if let Some(reason) = osv_degraded_reason {
-        install_ui::warn(&format!(
+        install_ui::warn_line(crate::install_ui::terminal_line!(
             "{} database unavailable; vulnerability scan incomplete",
             install_ui::yellow("OSV")
         ));
-        eprintln!("  {} {reason}", install_ui::dim("reason:"));
+        eprintln!(
+            "  {} {}",
+            install_ui::dim("reason:"),
+            lpm_common::sanitize_terminal_inline(reason)
+        );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Checked against {} database",
             install_ui::yellow("OSV")
         ));
@@ -83,19 +87,23 @@ pub(in crate::commands::audit) fn print_lpm_results(
             .collect();
 
         if registry_issues.is_empty() {
+            let name = lpm_common::sanitize_terminal_inline(&result.name);
+            let version = lpm_common::sanitize_terminal_inline(&result.version);
             eprintln!(
                 "  {} {}{}",
                 "✓".green(),
-                format!("{}@{}", result.name, result.version).dimmed(),
+                format!("{name}@{version}").dimmed(),
                 score_str.dimmed(),
             );
             continue;
         }
 
+        let name = lpm_common::sanitize_terminal_inline(&result.name);
+        let version = lpm_common::sanitize_terminal_inline(&result.version);
         eprintln!(
             "\n  {} {}",
-            install_ui::yellow(&result.name),
-            format!("({}){}", result.version, score_str).dimmed(),
+            install_ui::yellow(&name),
+            format!("({version}){score_str}").dimmed(),
         );
 
         for issue in registry_issues {
@@ -107,8 +115,8 @@ pub(in crate::commands::audit) fn print_lpm_results(
             eprintln!(
                 "    {icon} {} {} {}",
                 format_severity(&issue.severity),
-                issue.message,
-                format!("[{}]", issue.source).dimmed()
+                lpm_common::sanitize_terminal_inline(&issue.message),
+                format!("[{}]", lpm_common::sanitize_terminal_inline(&issue.source)).dimmed()
             );
         }
     }
@@ -189,7 +197,12 @@ pub(in crate::commands::audit) fn print_behavioral_results(
         let mut sorted: Vec<(&String, &Vec<String>)> = critical_tags.iter().collect();
         sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
         for (message, packages) in sorted {
-            eprintln!("  {} {}  {}", "✗".red(), "CRITICAL".red().bold(), message,);
+            eprintln!(
+                "  {} {}  {}",
+                "✗".red(),
+                "CRITICAL".red().bold(),
+                lpm_common::sanitize_terminal_inline(message),
+            );
             eprintln!("              {}", preview_versioned_packages(packages, 4),);
         }
         eprintln!();
@@ -264,7 +277,7 @@ pub(in crate::commands::audit) fn print_summary(
         .sum();
 
     if osv_degraded {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Audit incomplete · {total_scanned} {} scanned",
             install_ui::packages_word(total_scanned)
         ));
@@ -276,7 +289,7 @@ pub(in crate::commands::audit) fn print_summary(
         if behavioral.packages_scanned > 0 {
             parts.push(format!("{} analyzed", behavioral.packages_scanned));
         }
-        install_ui::done(&format!("No issues found · {}", parts.join(" · ")));
+        install_ui::done_untrusted(&format!("No issues found · {}", parts.join(" · ")));
     } else {
         let mut parts = Vec::new();
         if vuln_count > 0 {
@@ -294,6 +307,6 @@ pub(in crate::commands::audit) fn print_summary(
         }
         parts.push(format!("{total_scanned} scanned"));
 
-        install_ui::warn(&parts.join(" · "));
+        install_ui::warn_untrusted(&parts.join(" · "));
     }
 }

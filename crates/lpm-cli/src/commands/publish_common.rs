@@ -3,8 +3,8 @@
 //! Contains tarball creation, file collection, README reading, and hash
 //! computation. Used by both `publish.rs` (LPM) and `publish_npm.rs` (npm).
 
+use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use std::path::Path;
 
 /// A file entry in the tarball.
@@ -192,20 +192,22 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                eprintln!(
-                    "  {} skipping symlink: {}",
-                    "!".yellow(),
-                    path.strip_prefix(canonical_root).unwrap_or(path).display()
-                );
+                install_ui::warn_line(crate::install_ui::terminal_line!(
+                    "skipping symlink: {}",
+                    path.strip_prefix(canonical_root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                ));
                 return false;
             }
         }
         Err(e) => {
-            eprintln!(
-                "  {} skipping {} (cannot read metadata: {e})",
-                "!".yellow(),
-                path.display()
-            );
+            install_ui::warn_line(crate::install_ui::terminal_line!(
+                "skipping {} (cannot read metadata: {})",
+                path.display().to_string(),
+                e.to_string()
+            ));
             return false;
         }
     }
@@ -214,20 +216,22 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
     match path.canonicalize() {
         Ok(canonical) => {
             if !canonical.starts_with(canonical_root) {
-                eprintln!(
-                    "  {} skipping {} (resolves outside project directory)",
-                    "!".yellow(),
-                    path.strip_prefix(canonical_root).unwrap_or(path).display()
-                );
+                install_ui::warn_line(crate::install_ui::terminal_line!(
+                    "skipping {} (resolves outside project directory)",
+                    path.strip_prefix(canonical_root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                ));
                 return false;
             }
         }
         Err(e) => {
-            eprintln!(
-                "  {} skipping {} (cannot canonicalize: {e})",
-                "!".yellow(),
-                path.display()
-            );
+            install_ui::warn_line(crate::install_ui::terminal_line!(
+                "skipping {} (cannot canonicalize: {})",
+                path.display().to_string(),
+                e.to_string()
+            ));
             return false;
         }
     }

@@ -697,7 +697,10 @@ pub async fn run(
                 "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
                     if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
                         if !json_output {
-                            install_ui::phase(&format!("fixing: lpm use node@{spec}"));
+                            install_ui::phase_untrusted(&format!(
+                                "fixing: lpm use node@{}",
+                                lpm_common::sanitize_terminal_inline(&spec)
+                            ));
                         }
                         let http_client = lpm_http::client_builder()
                             .timeout(std::time::Duration::from_secs(60))
@@ -781,7 +784,10 @@ pub async fn run(
                     if let Some(domain) = check.detail.split(" —").next() {
                         let domain = domain.trim();
                         if !json_output {
-                            install_ui::phase(&format!("fixing: lpm tunnel claim {domain}"));
+                            install_ui::phase_untrusted(&format!(
+                                "fixing: lpm tunnel claim {}",
+                                lpm_common::sanitize_terminal_inline(domain)
+                            ));
                         }
                         match client.tunnel_claim(domain, None).await {
                             Ok(_) => {
@@ -799,12 +805,12 @@ pub async fn run(
             if fixes_applied.is_empty() {
                 install_ui::phase("no auto-fixable issues found");
             } else {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "applied {} fix(es): {}",
                     fixes_applied.len(),
                     fixes_applied.join(", ")
                 ));
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {} Run {} to verify fixes.",
                     install_ui::dim("hint"),
                     install_ui::yellow("lpm doctor")
@@ -917,7 +923,7 @@ pub async fn run(
             println!(
                 "  {icon} {:<name_width$} {}",
                 check.name(),
-                check.detail.dimmed()
+                install_ui::dim(&check.detail)
             );
         }
         println!();
@@ -961,5 +967,10 @@ pub async fn run(
 }
 
 fn render_autofix_failed(action: &str, error: &impl std::fmt::Display) {
-    install_ui::failed(&format!("{action} failed: {error}"));
+    let error = error.to_string();
+    install_ui::failed_untrusted(&format!(
+        "{} failed: {}",
+        lpm_common::sanitize_terminal_inline(action),
+        lpm_common::sanitize_terminal_inline(&error)
+    ));
 }

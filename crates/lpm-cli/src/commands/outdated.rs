@@ -240,29 +240,41 @@ pub async fn run(
             } else {
                 "All checked LPM dependency entries are up to date"
             };
-            install_ui::done(message);
+            install_ui::done_untrusted(message);
         } else {
+            let rendered = outdated
+                .iter()
+                .map(|result| {
+                    let wanted = result.wanted.as_deref().unwrap_or("?");
+                    (
+                        *result,
+                        lpm_common::sanitize_terminal_inline(&result.name),
+                        lpm_common::sanitize_terminal_inline(&result.current),
+                        lpm_common::sanitize_terminal_inline(wanted),
+                    )
+                })
+                .collect::<Vec<_>>();
             let section_width = outdated
                 .iter()
                 .map(|result| result.section.len())
                 .max()
                 .unwrap_or(0)
                 .max("Section".len());
-            let package_width = outdated
+            let package_width = rendered
                 .iter()
-                .map(|result| result.name.len())
+                .map(|(_, name, _, _)| name.len())
                 .max()
                 .unwrap_or(0)
                 .max("Package".len());
-            let current_width = outdated
+            let current_width = rendered
                 .iter()
-                .map(|result| result.current.len())
+                .map(|(_, _, current, _)| current.len())
                 .max()
                 .unwrap_or(0)
                 .max("Current".len());
-            let wanted_width = outdated
+            let wanted_width = rendered
                 .iter()
-                .map(|result| result.wanted.as_deref().unwrap_or("?").len())
+                .map(|(_, _, _, wanted)| wanted.len())
                 .max()
                 .unwrap_or(0)
                 .max("Wanted".len());
@@ -275,27 +287,29 @@ pub async fn run(
                 "Wanted".dimmed(),
                 "Latest".dimmed()
             );
-            for result in &outdated {
-                let wanted = result.wanted.as_deref().unwrap_or("?");
+            for (result, name, current, wanted) in rendered {
                 println!(
                     "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
                     result.section.dimmed(),
-                    result.name,
-                    result.current.dimmed(),
-                    install_ui::status_ok(wanted),
-                    style_latest_version(&result.latest, wanted),
+                    name,
+                    current.dimmed(),
+                    install_ui::status_ok(&wanted),
+                    style_latest_version(&result.latest, &wanted),
                 );
             }
             println!();
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Found {} outdated {}",
                 outdated.len(),
                 install_ui::packages_word(outdated.len()),
             ));
         }
         if !skipped_private.is_empty() {
-            let skipped_private_list = skipped_private.iter().cloned().collect::<Vec<_>>();
-            install_ui::warn(&format!(
+            let skipped_private_list = skipped_private
+                .iter()
+                .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
+                .collect::<Vec<_>>();
+            install_ui::warn_untrusted(&format!(
                 "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
                 skipped_private.len(),
                 skipped_private_list.join(", "),
@@ -303,16 +317,16 @@ pub async fn run(
             install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run");
         }
         if !lookup_failures.is_empty() {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "could not check {} package(s) due to registry lookup failures",
                 lookup_failures.len(),
             ));
             for failure in &lookup_failures {
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {} {}: {}",
-                    failure.section.dimmed(),
-                    failure.name,
-                    lpm_common::sanitize_for_terminal(&failure.reason),
+                    install_ui::dim(failure.section),
+                    lpm_common::sanitize_terminal_inline(&failure.name),
+                    lpm_common::sanitize_terminal_inline(&failure.reason),
                 ));
             }
             return Err(LpmError::ExitCode(1));
@@ -325,6 +339,7 @@ pub async fn run(
 fn style_latest_version(latest: &str, wanted: &str) -> String {
     let latest_major = lpm_semver::Version::parse(latest).ok().map(|v| v.major());
     let wanted_major = lpm_semver::Version::parse(wanted).ok().map(|v| v.major());
+    let latest = lpm_common::sanitize_terminal_inline(latest);
     if matches!((wanted_major, latest_major), (Some(wanted), Some(latest)) if latest > wanted) {
         latest.red()
     } else {

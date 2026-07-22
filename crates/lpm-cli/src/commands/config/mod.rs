@@ -10,7 +10,6 @@ use crate::lpm_skills_config::{AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY
 use crate::npm_firewall_config::{FIREWALL_CONFIG_SECTION, NpmFirewallMode};
 use crate::prompt::prompt_err;
 use crate::sandbox_config::ResolvedSandboxMode;
-use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot};
 use std::io::IsTerminal;
 
@@ -139,12 +138,12 @@ pub async fn run(
                         .unwrap()
                     );
                 } else if let Some(raw) = val.as_str() {
-                    println!("{raw}");
+                    println!("{}", lpm_common::sanitize_terminal_inline(raw));
                 } else {
                     println!("{}", config_value_for_display(val));
                 }
             } else if !json_output {
-                install_ui::warn(&format!("{key} is not set"));
+                install_ui::warn_untrusted(&format!("{key} is not set"));
             }
         }
         "set" => {
@@ -300,8 +299,9 @@ pub async fn run(
                     })
                 );
             } else {
-                install_ui::done(&format!(
-                    "Done · {key} = {}",
+                install_ui::done_line(crate::install_ui::terminal_line!(
+                    "Done · {} = {}",
+                    key,
                     install_ui::section(&format!("\"{value}\""))
                 ));
             }
@@ -370,7 +370,10 @@ pub async fn run(
                     })
                 );
             } else {
-                install_ui::done(&format!("Deleted {}", key.bold()));
+                install_ui::done_line(crate::install_ui::terminal_line!(
+                    "Deleted {}",
+                    install_ui::bold(key)
+                ));
             }
         }
         "list" | "ls" => {
@@ -387,7 +390,10 @@ pub async fn run(
                         install_ui::warn("No configuration set");
                     } else {
                         for (k, v) in table {
-                            println!("  {k:<24} {v}");
+                            println!(
+                                "{}",
+                                crate::install_ui::terminal_line!("  {:<24} {}", k, v.to_string())
+                            );
                         }
                     }
                 }

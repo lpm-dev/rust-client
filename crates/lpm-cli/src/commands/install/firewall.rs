@@ -870,7 +870,7 @@ pub(super) fn finish_npm_firewall_preflight(
     let stats = result.stats;
     if let Some(error) = result.report_error {
         if !json_output {
-            output::warn(&error);
+            output::warn(&lpm_common::sanitize_terminal_inline(&error));
         }
         return Ok(stats);
     }

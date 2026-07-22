@@ -23,7 +23,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
                 .or(info.username.as_deref())
                 .unwrap_or("unknown");
             if !json_output {
-                install_ui::done(&format!(
+                install_ui::done_line(crate::install_ui::terminal_line!(
                     "Already logged in as {}. Use {} to log out first.",
                     install_ui::cyan(name),
                     install_ui::dim("lpm logout")
@@ -75,11 +75,11 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
     );
     if open::that(&login_url).is_err() && !json_output {
         install_ui::warn("Could not open browser automatically");
-        install_ui::detail(&login_detail_row("url:", &install_ui::url(&login_url)));
+        install_ui::detail_line(login_detail_row("url:", &install_ui::url(&login_url)));
     }
 
     if !json_output {
-        install_ui::detail(&login_detail_row("browser:", &install_ui::url(&login_url)));
+        install_ui::detail_line(login_detail_row("browser:", &install_ui::url(&login_url)));
     }
 
     // Handle the callback
@@ -224,16 +224,19 @@ fn emit_browser_login_success(
     storage_status: auth::AuthStorageStatus,
 ) {
     install_ui::done("Browser authentication complete");
-    install_ui::detail(&login_detail_row(
+    install_ui::detail_line(login_detail_row(
         "user:",
         &login_user_value(username, email),
     ));
-    install_ui::detail(&login_detail_row(
+    install_ui::detail_line(login_detail_row(
         "registry:",
         &install_ui::yellow(&install_ui::short_registry_host(registry_url)),
     ));
     if let Some(label) = storage_status.human_label() {
-        install_ui::detail(&login_detail_row("secure storage backend:", label));
+        install_ui::detail_line(login_detail_row(
+            "secure storage backend:",
+            &install_ui::field(label),
+        ));
     }
     if storage_status.degraded {
         install_ui::warn(
@@ -242,15 +245,18 @@ fn emit_browser_login_success(
     }
 }
 
-fn login_user_value(username: &str, email: &str) -> String {
+fn login_user_value(username: &str, email: &str) -> install_ui::TerminalLine {
     if email.is_empty() || email == username {
-        return install_ui::cyan(username);
+        return install_ui::terminal_line!("{}", install_ui::cyan(username));
     }
-    format!("{} {}", install_ui::cyan(username), install_ui::dim(email))
+    install_ui::terminal_line!("{} {}", install_ui::cyan(username), install_ui::dim(email),)
 }
 
-fn login_detail_row(label: &str, value: &str) -> String {
-    format!("    {} {}", install_ui::dim(&format!("{label:<9}")), value)
+fn login_detail_row<T: install_ui::TerminalValue + ?Sized>(
+    label: &'static str,
+    value: &T,
+) -> install_ui::TerminalLine {
+    install_ui::terminal_line!("    {:<9} {}", install_ui::dim(label), value)
 }
 
 /// Handle the OAuth callback HTTP request.
@@ -682,7 +688,7 @@ mod tests {
 
     #[test]
     fn login_detail_row_keeps_aligned_label_and_value() {
-        let row = login_detail_row("registry:", "lpm.dev");
+        let row = login_detail_row("registry:", &install_ui::field("lpm.dev"));
         assert!(row.contains("registry:"));
         assert!(row.ends_with("lpm.dev"));
     }

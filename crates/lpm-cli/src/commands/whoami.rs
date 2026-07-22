@@ -1,15 +1,17 @@
 use super::whoami_ui;
 use crate::{auth, install_ui};
-use lpm_common::color::Painted;
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError};
 use lpm_registry::RegistryClient;
 
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
     if !json_output && !has_local_whoami_auth(client.base_url()) {
-        whoami_ui::phase(&format!("Not logged in to {}.", client.base_url().bold()));
-        whoami_ui::phase(&format!(
+        whoami_ui::phase_line(crate::install_ui::terminal_line!(
+            "Not logged in to {}.",
+            install_ui::url(client.base_url())
+        ));
+        whoami_ui::phase_line(crate::install_ui::terminal_line!(
             "Run {} to authenticate.",
-            login_command_for_registry(client.base_url()).dimmed()
+            install_ui::dim(&login_command_for_registry(client.base_url()))
         ));
         return Ok(());
     }
@@ -58,18 +60,18 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         return Ok(());
     }
 
-    whoami_ui::detail("username", display_name);
+    whoami_ui::detail("username", install_ui::yellow(display_name));
     if let Some(email_str) = email {
         let masked_email = mask_email_for_display(email_str);
-        whoami_ui::detail("email", &masked_email);
+        whoami_ui::detail("email", install_ui::dim(&masked_email));
     }
 
     // Plan & Pool
     if let Some(tier) = &user.plan_tier {
-        whoami_ui::detail("plan", &format_plan_tier(tier));
+        whoami_ui::detail("plan", install_ui::yellow(&format_plan_tier(tier)));
 
         if user.has_pool_access == Some(true) {
-            whoami_ui::detail("pool access", &install_ui::status_ok("yes"));
+            whoami_ui::detail("pool access", install_ui::status_ok("yes"));
         } else {
             whoami_ui::detail("pool access", "no");
         }
@@ -110,12 +112,15 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     limit_bytes,
                 );
                 if usage.storage_bytes > limit_bytes {
-                    whoami_ui::warn(&format!("Storage: {} (OVER LIMIT)", storage_msg));
+                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                        "Storage: {} (OVER LIMIT)",
+                        storage_msg
+                    ));
                 } else {
-                    whoami_ui::detail("storage", &storage_msg);
+                    whoami_ui::detail("storage", storage_msg);
                 }
             } else {
-                whoami_ui::detail("storage", &format!("{:.2}MB", storage_mb));
+                whoami_ui::detail("storage", format!("{:.2}MB", storage_mb));
             }
 
             // Package count
@@ -123,7 +128,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 if limit_pkgs == 0 || limit_pkgs == u32::MAX {
                     whoami_ui::detail(
                         "private pkgs",
-                        &format!("{} (Unlimited)", usage.private_packages),
+                        format!("{} (Unlimited)", usage.private_packages),
                     );
                 } else {
                     let pkg_msg = with_usage_bar(
@@ -132,13 +137,16 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                         limit_pkgs.into(),
                     );
                     if usage.private_packages > limit_pkgs {
-                        whoami_ui::warn(&format!("Private Packages: {} (OVER LIMIT)", pkg_msg));
+                        whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                            "Private Packages: {} (OVER LIMIT)",
+                            pkg_msg
+                        ));
                     } else {
-                        whoami_ui::detail("private pkgs", &pkg_msg);
+                        whoami_ui::detail("private pkgs", pkg_msg);
                     }
                 }
             } else {
-                whoami_ui::detail("private pkgs", &format!("{}", usage.private_packages));
+                whoami_ui::detail("private pkgs", format!("{}", usage.private_packages));
             }
 
             // Over-limit warning
@@ -155,8 +163,8 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {
-            whoami_ui::detail("storage", &format!("{:.2}MB", storage_mb));
-            whoami_ui::detail("private pkgs", &format!("{}", usage.private_packages));
+            whoami_ui::detail("storage", format!("{:.2}MB", storage_mb));
+            whoami_ui::detail("private pkgs", format!("{}", usage.private_packages));
         }
     }
 
@@ -164,26 +172,26 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     whoami_ui::blank_line();
     whoami_ui::section("scopes");
     if let Some(profile) = &user.profile_username {
-        whoami_ui::list_item(&format!(
+        whoami_ui::list_item(crate::install_ui::terminal_line!(
             "personal {}",
-            format!("@lpm.dev/{profile}.*").cyan()
+            install_ui::cyan(&format!("@lpm.dev/{profile}.*"))
         ));
     } else {
         whoami_ui::warn("personal scope not set (https://lpm.dev/dashboard/settings)");
     }
 
     if !user.organizations.is_empty() {
-        whoami_ui::list_item("organizations");
+        whoami_ui::list_item(install_ui::TerminalLine::new("organizations"));
         for org in &user.organizations {
             let role = org.role.as_deref().unwrap_or("member");
             let role_label = if role.eq_ignore_ascii_case("admin") {
                 install_ui::yellow_badge(role)
             } else {
-                role.dimmed()
+                install_ui::dim(role)
             };
-            whoami_ui::list_item(&format!(
+            whoami_ui::list_item(crate::install_ui::terminal_line!(
                 "  {} {}",
-                format!("@lpm.dev/{}.*", org.slug).cyan(),
+                install_ui::cyan(&format!("@lpm.dev/{}.*", org.slug)),
                 role_label
             ));
         }
@@ -201,7 +209,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     // Show token expiry warnings
     let expiry_warnings = auth::check_token_expiry_warnings();
     for warning in &expiry_warnings {
-        whoami_ui::warn(warning);
+        whoami_ui::warn_untrusted(warning);
     }
     whoami_ui::done("Identity loaded");
     Ok(())
@@ -277,13 +285,13 @@ fn mask_email_for_display(email: &str) -> String {
     }
 }
 
-fn with_usage_bar(mut message: String, used: u64, limit: u64) -> String {
+fn with_usage_bar(message: String, used: u64, limit: u64) -> install_ui::TerminalLine {
     let bar = install_ui::usage_bar(used, limit, 10);
-    if !bar.is_empty() {
-        message.push_str("  ");
-        message.push_str(&bar);
+    if bar.is_empty() {
+        crate::install_ui::terminal_line!("{}", message)
+    } else {
+        crate::install_ui::terminal_line!("{}  {}", message, bar)
     }
-    message
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 
 use crate::lpm_json::ServiceConfig;
 use crate::{ports, ready, service_graph};
-use lpm_common::LpmError;
+use lpm_common::{LpmError, sanitize_terminal_inline};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
@@ -136,10 +136,12 @@ fn ui_warn(msg: &str) {
 }
 
 fn ui_service_prefix(color: &str, name: &str) -> String {
+    let name = sanitize_terminal_inline(name);
     format!("{color}[{name}]{RESET}")
 }
 
 fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, msg: &str) {
+    let msg = sanitize_terminal_inline(msg);
     eprintln!(
         "  {} {} {msg}",
         ui_paint(status_color, glyph),
@@ -148,6 +150,7 @@ fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, m
 }
 
 fn ui_service_note(color: &str, name: &str, msg: &str) {
+    let msg = sanitize_terminal_inline(msg);
     eprintln!("  {} {msg}", ui_service_prefix(color, name));
 }
 
@@ -529,15 +532,13 @@ pub fn run_services(
         let color = color_map[name];
 
         let port_info = if let Some(reassignment) = port_reassignments.get(name) {
+            let reason = sanitize_terminal_inline(&reassignment.reason);
             format!(
                 " -> :{} {}",
                 reassignment.new,
                 ui_paint(
                     YELLOW,
-                    &format!(
-                        "(port {} in use by {})",
-                        reassignment.original, reassignment.reason
-                    ),
+                    &format!("(port {} in use by {})", reassignment.original, reason),
                 )
             )
         } else {
@@ -550,12 +551,18 @@ pub fn run_services(
         let dep_info = if config.depends_on.is_empty() {
             String::new()
         } else {
-            format!(" (after {})", config.depends_on.join(", "))
+            let dependencies = config
+                .depends_on
+                .iter()
+                .map(|dependency| sanitize_terminal_inline(dependency))
+                .collect::<Vec<_>>();
+            format!(" (after {})", dependencies.join(", "))
         };
+        let command = sanitize_terminal_inline(&config.command);
         ui_phase(&format!(
             "{} {}{port_info}{dep_info}",
             ui_service_prefix(color, name),
-            config.command,
+            command,
         ));
     }
     eprintln!();
@@ -715,7 +722,13 @@ pub fn run_services(
                     // The service process is still running — it may just be slow.
                     // Print the error but continue so the browser opens and the
                     // user can see the actual state in their browser.
-                    ui_service_status(RESET, &name, YELLOW, "!", &format!("not ready - {e}"));
+                    ui_service_status(
+                        RESET,
+                        &name,
+                        YELLOW,
+                        "!",
+                        &format!("not ready - {}", sanitize_terminal_inline(&e)),
+                    );
                     // Still mark as Ready — the service is running, just slow to respond.
                     // Timeout is a warning, not a state change to Crashed.
                     send_status(
@@ -840,7 +853,10 @@ pub fn run_services(
                             &name,
                             RED,
                             "✗",
-                            &format!("stopped (depends on crashed {crashed_name})"),
+                            &format!(
+                                "stopped (depends on crashed {})",
+                                sanitize_terminal_inline(crashed_name)
+                            ),
                         );
                         send_status(
                             &options.event_tx,
@@ -909,7 +925,10 @@ pub fn run_services(
                                 &dname,
                                 RED,
                                 "✗",
-                                &format!("stopped (depends on permanently failed {name})"),
+                                &format!(
+                                    "stopped (depends on permanently failed {})",
+                                    sanitize_terminal_inline(&name)
+                                ),
                             );
                             send_status(
                                 &options.event_tx,
@@ -973,12 +992,13 @@ pub fn run_services(
                     match safe_resolve_cwd(project_dir, sub) {
                         Ok(p) => p,
                         Err(e) => {
+                            let error = e.to_string();
                             ui_service_status(
                                 RESET,
                                 &name,
                                 RED,
                                 "✗",
-                                &format!("failed to restart: {e}"),
+                                &format!("failed to restart: {}", sanitize_terminal_inline(&error)),
                             );
                             continue;
                         }
@@ -1067,7 +1087,10 @@ pub fn run_services(
                                     &name,
                                     YELLOW,
                                     "!",
-                                    &format!("restarted but not ready - {error}"),
+                                    &format!(
+                                        "restarted but not ready - {}",
+                                        sanitize_terminal_inline(&error)
+                                    ),
                                 );
                                 send_status(
                                     &options.event_tx,
@@ -1079,12 +1102,13 @@ pub fn run_services(
                         }
                     }
                     Err(e) => {
+                        let error = e.to_string();
                         ui_service_status(
                             RESET,
                             &name,
                             RED,
                             "✗",
-                            &format!("failed to restart: {e}"),
+                            &format!("failed to restart: {}", sanitize_terminal_inline(&error)),
                         );
                     }
                 }
@@ -1209,7 +1233,9 @@ fn spawn_output_readers(
                         break;
                     }
                     if let Ok(line) = line {
-                        println!("  {color}[{name}]{RESET} {line}");
+                        let safe_name = sanitize_terminal_inline(&name);
+                        let safe_line = sanitize_terminal_inline(&line);
+                        println!("  {color}[{safe_name}]{RESET} {safe_line}");
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(OrchestratorEvent::ServiceLog {
                                 service_index,
@@ -1248,7 +1274,9 @@ fn spawn_output_readers(
                         break;
                     }
                     if let Ok(line) = line {
-                        eprintln!("  {color}[{name}]{RESET} {line}");
+                        let safe_name = sanitize_terminal_inline(&name);
+                        let safe_line = sanitize_terminal_inline(&line);
+                        eprintln!("  {color}[{safe_name}]{RESET} {safe_line}");
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(OrchestratorEvent::ServiceLog {
                                 service_index,

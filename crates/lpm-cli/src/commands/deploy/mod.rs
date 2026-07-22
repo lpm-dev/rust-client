@@ -130,7 +130,7 @@ pub async fn run(
         force,
     )?;
     let member_name = read_member_name(&plan.member_manifest);
-    let materialize_message = format!(
+    let materialize_message = crate::install_ui::terminal_line!(
         "Materializing {} closure for {}",
         dependency_mode.label(),
         install_ui::yellow(&member_name)
@@ -154,7 +154,7 @@ pub async fn run(
                 serde_json::to_string_pretty(&payload).unwrap_or_default()
             );
         } else {
-            install_ui::phase(&materialize_message);
+            install_ui::phase_line(materialize_message);
             deploy_detail_colored(
                 "output:",
                 install_ui::yellow(&plan.output_dir.display().to_string()),
@@ -177,7 +177,7 @@ pub async fn run(
         return Ok(());
     }
 
-    let deploy_progress = (!json_output).then(|| install_ui::spin(&materialize_message));
+    let deploy_progress = (!json_output).then(|| install_ui::spin_line(materialize_message));
 
     // validate_output_dir has already proven this path is outside the source
     // workspace, so force-clearing here preserves a clean snapshot without
@@ -347,11 +347,11 @@ pub async fn run(
             install_ui::status_ok(&internal_symlinks_retargeted.to_string()),
         );
         deploy_detail_colored("node_modules installed:", install_ui::status_ok("yes"));
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Copied source, lockfile, and {} dependencies",
             install_ui::status_ok(dependency_mode.label())
         ));
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · deploy tree ready at {}",
             install_ui::yellow(&plan.output_dir.display().to_string())
         ));
@@ -360,6 +360,10 @@ pub async fn run(
     Ok(())
 }
 
-fn deploy_detail_colored(label: &str, value: String) {
-    eprintln!("    {} {value}", install_ui::dim(&format!("{label:<25}")));
+fn deploy_detail_colored(label: &'static str, value: install_ui::TerminalFragment) {
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "    {} {}",
+        install_ui::dim(&format!("{label:<25}")),
+        value
+    ));
 }

@@ -65,10 +65,10 @@ pub(super) fn vars_example(
     std::fs::write(&example_path, &content)
         .map_err(|e| LpmError::Script(format!("failed to write {example_filename}: {e}")))?;
 
-    output::success(&format!(
+    output::success_line(install_ui::terminal_line!(
         "generated {} ({} variables)",
-        example_filename.bold(),
-        schema.len()
+        install_ui::bold(&example_filename),
+        schema.len(),
     ));
 
     Ok(())
@@ -249,21 +249,27 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
         let valid = total - errors.len();
         if errors.is_empty() {
             println!(
-                "  {}  {}  {}/{} valid",
-                name.bold(),
-                "✓".green(),
-                valid,
-                total
+                "{}",
+                install_ui::terminal_line!(
+                    "  {}  {}  {}/{} valid",
+                    install_ui::bold(name),
+                    install_ui::green("✓"),
+                    valid,
+                    total,
+                )
             );
         } else {
             let missing: Vec<&str> = errors.iter().map(|e| e.key.as_str()).collect();
             println!(
-                "  {}  {}  {}/{} — missing: {}",
-                name.bold(),
-                "✗".red(),
-                valid,
-                total,
-                missing.join(", ").red()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {}  {}  {}/{} — missing: {}",
+                    install_ui::bold(name),
+                    install_ui::red("✗"),
+                    valid,
+                    total,
+                    install_ui::red(&missing.join(", ")),
+                )
             );
         }
     }
@@ -353,17 +359,36 @@ pub(super) fn vars_validate(
     println!();
 
     for key in &present {
-        println!("  {} {} {}", "✓".green(), key.bold(), "set".green());
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {}",
+                install_ui::green("✓"),
+                install_ui::bold(key),
+                install_ui::green("set"),
+            )
+        );
     }
     for key in &missing {
-        println!("  {} {} {}", "✗".red(), key.bold(), "missing".red());
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {}",
+                install_ui::red("✗"),
+                install_ui::bold(key),
+                install_ui::red("missing"),
+            )
+        );
     }
     for key in &extra {
         println!(
-            "  {} {} {}",
-            "!".yellow(),
-            key.bold(),
-            "not in .env.example (extra)".yellow()
+            "{}",
+            install_ui::terminal_line!(
+                "  {} {} {}",
+                install_ui::yellow("!"),
+                install_ui::bold(key),
+                install_ui::yellow("not in .env.example (extra)"),
+            )
         );
     }
 
@@ -376,13 +401,19 @@ pub(super) fn vars_validate(
     } else {
         let missing_list = missing.join(" ");
         println!(
-            "  {} of {} required variables are missing",
-            missing.len().to_string().red().bold(),
-            required_keys.len()
+            "{}",
+            install_ui::terminal_line!(
+                "  {} of {} required variables are missing",
+                install_ui::red(&missing.len().to_string()),
+                required_keys.len(),
+            )
         );
         println!(
-            "  Fix: {}",
-            format!("lpm env set {missing_list}=...").cyan()
+            "{}",
+            install_ui::terminal_line!(
+                "  Fix: {}",
+                install_ui::cyan(&format!("lpm env set {missing_list}=...")),
+            )
         );
     }
 

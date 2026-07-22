@@ -5,9 +5,9 @@ use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum SecretScanLine {
-    Warn(String),
-    Failed(String),
-    Detail(String),
+    Warn(install_ui::TerminalLine),
+    Failed(install_ui::TerminalLine),
+    Detail(install_ui::TerminalLine),
 }
 
 pub(crate) fn run_publish_secret_scan(
@@ -59,16 +59,16 @@ pub(super) fn secret_scan_json(scan: &SecretScanResult) -> serde_json::Value {
 pub(super) fn emit_secret_scan_human(scan: &SecretScanResult) {
     for line in format_secret_scan_human(scan) {
         match line {
-            SecretScanLine::Warn(message) => install_ui::warn(&message),
-            SecretScanLine::Failed(message) => install_ui::failed(&message),
-            SecretScanLine::Detail(message) => install_ui::detail(&message),
+            SecretScanLine::Warn(message) => install_ui::warn_line(message),
+            SecretScanLine::Failed(message) => install_ui::failed_line(message),
+            SecretScanLine::Detail(message) => install_ui::detail_line(message),
         }
     }
 }
 
 pub(super) fn format_secret_scan_human(scan: &SecretScanResult) -> Vec<SecretScanLine> {
     let mut lines = Vec::with_capacity(scan.matches.len() + 3);
-    lines.push(SecretScanLine::Warn(format!(
+    lines.push(SecretScanLine::Warn(crate::install_ui::terminal_line!(
         "Secret scan found {} potential {}",
         install_ui::status_ok(&scan.matches.len().to_string()),
         if scan.matches.len() == 1 {
@@ -82,10 +82,10 @@ pub(super) fn format_secret_scan_human(scan: &SecretScanResult) -> Vec<SecretSca
         lines.push(SecretScanLine::Detail(format_secret_match(secret_match)));
     }
 
-    lines.push(SecretScanLine::Failed(
-        "Publish blocked. Remove secrets before publishing.".to_string(),
-    ));
-    lines.push(SecretScanLine::Detail(format!(
+    lines.push(SecretScanLine::Failed(install_ui::TerminalLine::new(
+        "Publish blocked. Remove secrets before publishing.",
+    )));
+    lines.push(SecretScanLine::Detail(crate::install_ui::terminal_line!(
         "  {} If these are false positives, use {}.",
         install_ui::dim("hint"),
         install_ui::yellow("--allow-secrets")
@@ -95,27 +95,24 @@ pub(super) fn format_secret_scan_human(scan: &SecretScanResult) -> Vec<SecretSca
 
 pub(super) fn format_secret_match(
     secret_match: &lpm_security::behavioral::secrets::SecretMatch,
-) -> String {
-    let matched_text = lpm_common::sanitize_for_terminal(&secret_match.matched_text);
-    let pattern_name = lpm_common::sanitize_for_terminal(&secret_match.pattern_name);
-    let description = lpm_common::sanitize_for_terminal(&secret_match.description);
+) -> install_ui::TerminalLine {
     let location = if secret_match.line > 0 {
         install_ui::dim(&format!(":{}", secret_match.line))
     } else {
-        String::new()
+        install_ui::field("")
     };
 
-    format!(
+    crate::install_ui::terminal_line!(
         "  {} {}{}  {}  {}",
         format_secret_severity(&secret_match.severity),
-        install_ui::red(&matched_text),
+        install_ui::red(&secret_match.matched_text),
         location,
-        install_ui::cyan(&pattern_name),
-        description
+        install_ui::cyan(&secret_match.pattern_name),
+        &secret_match.description
     )
 }
 
-pub(super) fn format_secret_severity(severity: &str) -> String {
+pub(super) fn format_secret_severity(severity: &str) -> install_ui::TerminalFragment {
     match severity {
         "critical" => install_ui::red("critical"),
         "high" => install_ui::yellow("high"),

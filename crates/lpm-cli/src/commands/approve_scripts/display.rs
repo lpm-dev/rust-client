@@ -107,26 +107,42 @@ pub(super) fn emit_yes_warning_banner(count: usize, json_output: bool) {
 
 pub(super) fn print_package_card(blocked: &BlockedPackage) {
     println!();
-    println!("  {}@{}", blocked.name.bold(), blocked.version.dimmed(),);
+    println!(
+        "{}",
+        install_ui::terminal_line!(
+            "  {}@{}",
+            install_ui::bold(&blocked.name),
+            install_ui::dim(&blocked.version),
+        )
+    );
     if let Some(integrity) = &blocked.integrity {
         println!(
-            "    {:<14}{}",
-            "Integrity:".dimmed(),
-            truncate_for_display(integrity, 60),
+            "{}",
+            install_ui::terminal_line!(
+                "    {:<14}{}",
+                install_ui::dim("Integrity:"),
+                truncate_for_display(integrity, 60),
+            )
         );
     }
     if let Some(script_hash) = &blocked.script_hash {
         println!(
-            "    {:<14}{}",
-            "Script hash:".dimmed(),
-            truncate_for_display(script_hash, 60),
+            "{}",
+            install_ui::terminal_line!(
+                "    {:<14}{}",
+                install_ui::dim("Script hash:"),
+                truncate_for_display(script_hash, 60),
+            )
         );
     }
     if !blocked.phases_present.is_empty() {
         println!(
-            "    {:<14}{}",
-            "Phases:".dimmed(),
-            blocked.phases_present.join(", "),
+            "{}",
+            install_ui::terminal_line!(
+                "    {:<14}{}",
+                install_ui::dim("Phases:"),
+                blocked.phases_present.join(", "),
+            )
         );
     }
     // — static-gate tier annotation for the
@@ -135,9 +151,12 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
     // misleading "unknown".
     if let Some(tier) = blocked.static_tier {
         println!(
-            "    {:<14}{}",
-            "Static tier:".dimmed(),
-            colored_tier_label(tier),
+            "{}",
+            install_ui::terminal_line!(
+                "    {:<14}{}",
+                install_ui::dim("Static tier:"),
+                colored_tier_label(tier),
+            )
         );
     }
     if blocked.binding_drift {
@@ -151,11 +170,14 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
 }
 
 pub(super) fn truncate_for_display(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
+    let safe = lpm_common::sanitize_terminal_inline(s);
+    let Some((end, _)) = safe.char_indices().nth(max) else {
+        return safe.into_owned();
+    };
+    let mut truncated = String::with_capacity(end + '…'.len_utf8());
+    truncated.push_str(&safe[..end]);
+    truncated.push('…');
+    truncated
 }
 
 /// Read the package's `package.json` from the GLOBAL STORE and print every
@@ -215,10 +237,24 @@ pub(super) fn print_full_script(
             .filter(|s| !s.is_empty());
         match body {
             Some(b) => {
-                println!("  {}: {}", phase.bold(), b);
+                println!(
+                    "{}",
+                    install_ui::terminal_line!(
+                        "  {}: {}",
+                        install_ui::bold(phase),
+                        install_ui::multiline(b),
+                    )
+                );
             }
             None => {
-                println!("  {}: {}", phase.dimmed(), "(none)".dimmed());
+                println!(
+                    "{}",
+                    install_ui::terminal_line!(
+                        "  {}: {}",
+                        install_ui::dim(phase),
+                        install_ui::dim("(none)"),
+                    )
+                );
             }
         }
     }

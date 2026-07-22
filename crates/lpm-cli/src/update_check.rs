@@ -88,6 +88,8 @@ pub async fn refresh_cache_now() {
 }
 
 fn format_notice(current: &str, latest: &str) -> String {
+    let current = lpm_common::sanitize_terminal_inline(current);
+    let latest = lpm_common::sanitize_terminal_inline(latest);
     format!(
         "\n  {} Update available: {} → {} — run {}\n",
         "⬆".yellow(),
@@ -106,6 +108,17 @@ mod tests {
     #[test]
     fn disabled_update_checks_never_spawn_a_background_child() {
         assert!(!should_spawn_background_check_for(true, true));
+    }
+
+    #[test]
+    fn update_notice_versions_cannot_inject_terminal_rows_or_controls() {
+        let hostile = "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let notice = format_notice(hostile, hostile);
+
+        assert_eq!(notice.matches('\n').count(), 2, "{notice:?}");
+        assert!(!notice.contains("\u{1b}]52"), "{notice:?}");
+        assert!(!notice.contains(['\r', '\u{8}', '\u{7}']), "{notice:?}");
+        assert!(!notice.contains("hidden"), "{notice:?}");
     }
 
     #[test]

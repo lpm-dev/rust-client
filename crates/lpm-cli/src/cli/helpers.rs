@@ -450,7 +450,7 @@ pub(super) fn resolve_install_project_dir(
     }
     if let Some(ancestor) = lpm_workspace::find_project_root(cwd) {
         if !json_output {
-            crate::install_ui::phase(&format!(
+            crate::install_ui::phase_untrusted(&format!(
                 "No package.json in {}; using {} (nearest ancestor manifest).",
                 cwd.display(),
                 ancestor.display(),
@@ -477,7 +477,7 @@ pub(super) fn resolve_install_project_dir(
             f.write_all(MINIMAL_PACKAGE_JSON.as_bytes())
                 .map_err(lpm_common::LpmError::Io)?;
             if !json_output {
-                crate::install_ui::phase(&format!(
+                crate::install_ui::phase_untrusted(&format!(
                     "No package.json found in {}. Created a new one.",
                     cwd.display(),
                 ));

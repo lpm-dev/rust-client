@@ -650,9 +650,9 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // applied them).
         if !applied_overrides.is_empty() {
             println!();
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "Applied {} override{}:",
-                applied_overrides.len().to_string().bold(),
+                install_ui::bold(&applied_overrides.len().to_string()),
                 if applied_overrides.len() == 1 {
                     ""
                 } else {
@@ -661,18 +661,24 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             ));
             for hit in applied_overrides {
                 let source_ref = hit.source_display();
-                let parent_suffix = match &hit.via_parent {
-                    Some(p) => format!(", reached through {}", p.bold()),
-                    None => String::new(),
+                let line = match &hit.via_parent {
+                    Some(parent) => crate::install_ui::terminal_line!(
+                        "   {} {} → {} (via {}, reached through {})",
+                        install_ui::bold(&hit.package),
+                        install_ui::dim(&hit.from_version),
+                        install_ui::bold(&hit.to_version),
+                        &source_ref,
+                        install_ui::bold(parent),
+                    ),
+                    None => crate::install_ui::terminal_line!(
+                        "   {} {} → {} (via {})",
+                        install_ui::bold(&hit.package),
+                        install_ui::dim(&hit.from_version),
+                        install_ui::bold(&hit.to_version),
+                        &source_ref,
+                    ),
                 };
-                println!(
-                    "   {} {} → {} (via {}{})",
-                    hit.package.bold(),
-                    hit.from_version.dimmed(),
-                    hit.to_version.bold(),
-                    source_ref,
-                    parent_suffix,
-                );
+                println!("{line}");
             }
         }
 
@@ -689,9 +695,9 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             .collect();
         if !applied_patches_summary.is_empty() {
             println!();
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "Applied {} patch{}:",
-                applied_patches_summary.len().to_string().bold(),
+                install_ui::bold(&applied_patches_summary.len().to_string()),
                 if applied_patches_summary.len() == 1 {
                     ""
                 } else {
@@ -705,12 +711,15 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                     .unwrap_or(&a.patch_path);
                 let total = a.files_modified + a.files_added + a.files_deleted;
                 println!(
-                    "   {}@{} ({}, {} file{})",
-                    a.name.bold(),
-                    a.version.dimmed(),
-                    rel_patch.display(),
-                    total,
-                    if total == 1 { "" } else { "s" },
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "   {}@{} ({}, {} file{})",
+                        install_ui::bold(&a.name),
+                        install_ui::dim(&a.version),
+                        install_ui::dim(&rel_patch.display().to_string()),
+                        total,
+                        if total == 1 { "" } else { "s" },
+                    )
                 );
             }
         }
@@ -791,13 +800,15 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         let duration_str = install_ui::format_duration(elapsed);
         let pkg_word = install_ui::packages_word(reported_count);
         eprintln!();
-        install_ui::done(&format!(
-            "Done · {action} {} {pkg_word} in {}",
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Done · {} {} {} in {}",
+            action,
             install_ui::bold(&reported_count.to_string()),
+            pkg_word,
             install_ui::green(&duration_str),
         ));
         if verified_count > 0 {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "{verified_count} of {} {} verified via Sigstore",
                 packages.len(),
                 install_ui::packages_word(packages.len()),
@@ -808,7 +819,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // count goes red when non-zero. Computed above before the
         // human/JSON branch split so both surfaces agree.
         if let Some(counts) = audit_summary_for_envelope {
-            install_ui::warn(&install_ui::format_audit_advisory(
+            install_ui::warn_line(install_ui::format_audit_advisory(
                 counts.packages_audited,
                 counts.vulnerabilities,
                 counts.suspicious,

@@ -36,8 +36,8 @@ struct TagIssue {
 
 #[derive(Debug, Eq, PartialEq)]
 enum SecuritySummaryLine {
-    Warn(String),
-    Detail(String),
+    Warn(install_ui::TerminalLine),
+    Detail(install_ui::TerminalLine),
 }
 
 /// Run the full post-install security summary.
@@ -60,14 +60,14 @@ pub async fn post_install_security_summary(
 
     let show_progress = !json_output && packages.len() > 50;
     if show_progress {
-        install_ui::phase(&format!("Analyzing {} packages", packages.len()));
+        install_ui::phase_untrusted(&format!("Analyzing {} packages", packages.len()));
     }
 
     let mut tag_counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
 
     for (i, (name, version, _is_lpm)) in packages.iter().enumerate() {
         if show_progress && i % 50 == 0 && i > 0 {
-            install_ui::phase(&format!("Analyzed {i}/{} packages", packages.len()));
+            install_ui::phase_untrusted(&format!("Analyzed {i}/{} packages", packages.len()));
         }
 
         let pkg_dir = store.package_dir(name, version);
@@ -81,7 +81,7 @@ pub async fn post_install_security_summary(
     }
 
     if show_progress {
-        install_ui::done(&format!("Analyzed {} packages", packages.len()));
+        install_ui::done_untrusted(&format!("Analyzed {} packages", packages.len()));
     }
 
     // ── Registry-side enrichment (@lpm.dev only) ─────
@@ -160,8 +160,8 @@ fn emit_human_security_summary(
 ) {
     for line in format_human_security_summary(package_count, finding_count, issues, quiet) {
         match line {
-            SecuritySummaryLine::Warn(message) => install_ui::warn(&message),
-            SecuritySummaryLine::Detail(message) => install_ui::detail(&message),
+            SecuritySummaryLine::Warn(message) => install_ui::warn_line(message),
+            SecuritySummaryLine::Detail(message) => install_ui::detail_line(message),
         }
     }
 }
@@ -173,7 +173,7 @@ fn format_human_security_summary(
     quiet: bool,
 ) -> Vec<SecuritySummaryLine> {
     let mut lines = Vec::new();
-    lines.push(SecuritySummaryLine::Warn(format!(
+    lines.push(SecuritySummaryLine::Warn(install_ui::terminal_line!(
         "Security summary · {} · {}",
         install_ui::status_ok(&format!(
             "{} {}",
@@ -187,7 +187,7 @@ fn format_human_security_summary(
             } else {
                 "findings"
             }
-        ))
+        )),
     )));
 
     for severity in [
@@ -212,7 +212,7 @@ fn format_human_security_summary(
             continue;
         }
 
-        lines.push(SecuritySummaryLine::Detail(format!(
+        lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
             "  {}",
             format_security_severity(severity)
         )));
@@ -223,10 +223,10 @@ fn format_human_security_summary(
             let suffix = if count > 3 {
                 install_ui::dim(&format!(", ... (+{})", count - 3))
             } else {
-                String::new()
+                install_ui::dim("")
             };
 
-            lines.push(SecuritySummaryLine::Detail(format!(
+            lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
                 "    {} {:<20} {} {}{}",
                 install_ui::status_ok(&count.to_string()),
                 install_ui::cyan(issue.tag_label),
@@ -237,20 +237,20 @@ fn format_human_security_summary(
         }
     }
 
-    lines.push(SecuritySummaryLine::Detail(format!(
+    lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
         "  {} Run {} for full details.",
         install_ui::dim("hint"),
-        install_ui::yellow("lpm audit")
+        install_ui::yellow("lpm audit"),
     )));
-    lines.push(SecuritySummaryLine::Detail(format!(
+    lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
         "  {} Run {} to inspect specific tags.",
         install_ui::dim("hint"),
-        install_ui::yellow("lpm query \":critical\"")
+        install_ui::yellow("lpm query \":critical\""),
     )));
     lines
 }
 
-fn format_security_severity(severity: Severity) -> String {
+fn format_security_severity(severity: Severity) -> install_ui::TerminalFragment {
     match severity {
         Severity::Critical => install_ui::red("Critical"),
         Severity::High => install_ui::yellow("High"),
@@ -766,7 +766,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 SecuritySummaryLine::Warn(message) | SecuritySummaryLine::Detail(message) => {
-                    message.as_str()
+                    message.as_ref()
                 }
             })
             .collect::<Vec<_>>()
@@ -811,7 +811,7 @@ mod tests {
             .iter()
             .map(|line| match line {
                 SecuritySummaryLine::Warn(message) | SecuritySummaryLine::Detail(message) => {
-                    message.as_str()
+                    message.as_ref()
                 }
             })
             .collect::<Vec<_>>()

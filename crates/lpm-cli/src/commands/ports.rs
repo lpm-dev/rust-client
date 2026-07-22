@@ -1,8 +1,8 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_runner::lpm_json;
 use lpm_runner::ports::{self, ListeningPort};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
@@ -216,24 +216,22 @@ fn run_declared_service_list(
         .filter_map(|(name, config)| {
             service_list_port(name, config, &port_overrides).map(|port| {
                 let status = match ports::check_port(port) {
-                    ports::PortStatus::Free => {
-                        format!(
-                            "{} {}",
-                            install_ui::bullet(true),
-                            install_ui::status_ok("ready")
-                        )
-                    }
+                    ports::PortStatus::Free => crate::install_ui::terminal_line!(
+                        "{} {}",
+                        install_ui::bullet(true),
+                        install_ui::status_ok("ready")
+                    ),
                     ports::PortStatus::InUse { pid, process_name } => {
                         let owner = match (&pid, &process_name) {
                             (Some(p), Some(n)) => format!("{n} (PID {p})"),
                             (Some(p), None) => format!("PID {p}"),
                             _ => "unknown".to_string(),
                         };
-                        format!(
+                        crate::install_ui::terminal_line!(
                             "{} {} ({})",
                             install_ui::bullet(true),
                             install_ui::status_ok("listening"),
-                            owner.dimmed()
+                            install_ui::dim(&owner)
                         )
                     }
                 };
@@ -261,13 +259,19 @@ fn run_declared_service_list(
         install_ui::dim("Status")
     );
     for (name, port, status) in &rows {
+        let name = format!("{name:<service_width$}");
         println!(
-            "{name:<service_width$}  {}  {status}",
-            install_ui::yellow(&format!("{port:<5}"))
+            "{}",
+            crate::install_ui::terminal_line!(
+                "{}  {}  {}",
+                name,
+                install_ui::yellow(&format!("{port:<5}")),
+                status
+            )
         );
     }
     println!();
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "{} declared service {}",
         rows.len(),
         if rows.len() == 1 { "port" } else { "ports" }
@@ -315,7 +319,7 @@ fn render_listening_ports(scope: &str, rows: &[ListeningPort], json_output: bool
     }
 
     if rows.is_empty() {
-        install_ui::warn(match scope {
+        install_ui::warn_untrusted(match scope {
             "all" => "No listening TCP ports found",
             _ => "No listening TCP ports found for this project",
         });
@@ -324,7 +328,7 @@ fn render_listening_ports(scope: &str, rows: &[ListeningPort], json_output: bool
 
     print_listening_port_table(rows);
     println!();
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "{} listening {}",
         rows.len(),
         if rows.len() == 1 { "port" } else { "ports" }
@@ -332,22 +336,14 @@ fn render_listening_ports(scope: &str, rows: &[ListeningPort], json_output: bool
 }
 
 fn print_listening_port_table(rows: &[ListeningPort]) {
-    let process_width = bounded_width(
-        rows.iter()
-            .map(|row| display_or_dash(row.process.as_deref()).chars().count()),
-        "Process".len(),
-        28,
-    );
-    let project_width = bounded_width(
-        rows.iter()
-            .map(|row| display_or_dash(row.project.as_deref()).chars().count()),
-        "Project".len(),
-        28,
-    );
-    let framework_width = bounded_width(
-        rows.iter()
-            .map(|row| display_or_dash(row.framework.as_deref()).chars().count()),
-        "Framework".len(),
+    let rows = terminal_listening_port_rows(rows);
+    let process_width =
+        listening_port_cell_width(rows.iter().map(|row| row.process.as_ref()), "Process", 28);
+    let project_width =
+        listening_port_cell_width(rows.iter().map(|row| row.project.as_ref()), "Project", 28);
+    let framework_width = listening_port_cell_width(
+        rows.iter().map(|row| row.framework.as_ref()),
+        "Framework",
         22,
     );
 
@@ -361,10 +357,10 @@ fn print_listening_port_table(rows: &[ListeningPort]) {
         install_ui::dim("Status")
     );
 
-    for row in rows {
-        let process = fit_cell(display_or_dash(row.process.as_deref()), process_width);
-        let project = fit_cell(display_or_dash(row.project.as_deref()), project_width);
-        let framework = fit_cell(display_or_dash(row.framework.as_deref()), framework_width);
+    for row in &rows {
+        let process = fit_cell(&row.process, process_width);
+        let project = fit_cell(&row.project, project_width);
+        let framework = fit_cell(&row.framework, framework_width);
         let pid = row
             .pid
             .map_or_else(|| "-".to_string(), |pid| pid.to_string());
@@ -379,6 +375,38 @@ fn print_listening_port_table(rows: &[ListeningPort]) {
             install_ui::yellow(&format!("{project:<project_width$}")),
         );
     }
+}
+
+struct TerminalListeningPortRow<'a> {
+    port: u16,
+    pid: Option<u32>,
+    process: Cow<'a, str>,
+    project: Cow<'a, str>,
+    framework: Cow<'a, str>,
+}
+
+fn terminal_listening_port_rows(rows: &[ListeningPort]) -> Vec<TerminalListeningPortRow<'_>> {
+    let mut terminal_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        terminal_rows.push(TerminalListeningPortRow {
+            port: row.port,
+            pid: row.pid,
+            process: lpm_common::sanitize_terminal_inline(display_or_dash(row.process.as_deref())),
+            project: lpm_common::sanitize_terminal_inline(display_or_dash(row.project.as_deref())),
+            framework: lpm_common::sanitize_terminal_inline(display_or_dash(
+                row.framework.as_deref(),
+            )),
+        });
+    }
+    terminal_rows
+}
+
+fn listening_port_cell_width<'a>(
+    cells: impl Iterator<Item = &'a str>,
+    header: &str,
+    max: usize,
+) -> usize {
+    bounded_width(cells.map(|cell| cell.chars().count()), header.len(), max)
 }
 
 fn bounded_width(widths: impl Iterator<Item = usize>, header: usize, max: usize) -> usize {
@@ -456,7 +484,7 @@ fn run_inspect(port: u16, json_output: bool) {
 
     print_listening_port_table(&matches);
     println!();
-    install_ui::done(&format!("Port {port} is listening"));
+    install_ui::done_untrusted(&format!("Port {port} is listening"));
 }
 
 fn render_empty_inspect(port: u16, json_output: bool) {
@@ -468,7 +496,7 @@ fn render_empty_inspect(port: u16, json_output: bool) {
                     serde_json::json!({ "success": true, "port": port, "status": "free", "listeners": [] })
                 );
             } else {
-                install_ui::done(&format!("Port {port} is not in use"));
+                install_ui::done_untrusted(&format!("Port {port} is not in use"));
             }
         }
         ports::PortStatus::InUse { pid, process_name } => {
@@ -489,7 +517,7 @@ fn render_empty_inspect(port: u16, json_output: bool) {
                 );
             } else {
                 let owner = owner_display(pid, process_name.as_deref());
-                install_ui::done(&format!("Port {port} is in use by {owner}"));
+                install_ui::done_untrusted(&format!("Port {port} is in use by {owner}"));
             }
         }
     }
@@ -512,7 +540,7 @@ fn run_kill_port(port: u16, json_output: bool) -> Result<(), LpmError> {
                     serde_json::json!({ "success": true, "port": port, "status": "already_free" })
                 );
             } else {
-                install_ui::done(&format!("Port {port} is not in use"));
+                install_ui::done_untrusted(&format!("Port {port} is not in use"));
             }
         }
         ports::PortStatus::InUse { pid, process_name } => {
@@ -525,7 +553,7 @@ fn run_kill_port(port: u16, json_output: bool) -> Result<(), LpmError> {
                     serde_json::json!({ "success": true, "port": port, "killed": owner })
                 );
             } else {
-                install_ui::done(&format!("Killed {owner} on port {port}"));
+                install_ui::done_untrusted(&format!("Killed {owner} on port {port}"));
             }
         }
     }
@@ -558,7 +586,7 @@ fn run_kill_pid(pid: u32, json_output: bool) -> Result<(), LpmError> {
         );
     } else {
         let owner = owner_display(Some(pid), process.as_deref());
-        install_ui::done(&format!("Killed {owner}"));
+        install_ui::done_untrusted(&format!("Killed {owner}"));
     }
     Ok(())
 }
@@ -577,7 +605,7 @@ fn run_kill_range(start: u16, end: u16, json_output: bool, yes: bool) -> Result<
                 })
             );
         } else {
-            install_ui::done(&format!("No listening ports found in {start}-{end}"));
+            install_ui::done_untrusted(&format!("No listening ports found in {start}-{end}"));
         }
         return Ok(());
     }
@@ -609,7 +637,7 @@ fn run_kill_range(start: u16, end: u16, json_output: bool, yes: bool) -> Result<
             })
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Killed {} {} in {start}-{end}",
             killed.len(),
             if killed.len() == 1 {
@@ -800,6 +828,58 @@ mod tests {
         assert_eq!(service_list_port("web", &host_only, &overrides), Some(3123));
         assert_eq!(service_list_port("api", &declared, &overrides), Some(3000));
         assert_eq!(service_list_port("worker", &host_only, &overrides), None);
+    }
+
+    #[test]
+    fn listening_port_process_is_sanitized_before_width_and_truncation() {
+        const HOSTILE_PROCESS: &str =
+            "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let rows = [listening_port(3000, Some(42), Some(HOSTILE_PROCESS))];
+        let rows = terminal_listening_port_rows(&rows);
+
+        let width =
+            listening_port_cell_width(rows.iter().map(|row| row.process.as_ref()), "Process", 28);
+        let rendered = fit_cell(&rows[0].process, width);
+
+        assert_eq!(width, "safe?FORGED?rewritten?end".chars().count());
+        assert_eq!(rendered, "safe?FORGED?rewritten?end");
+    }
+
+    #[test]
+    fn listening_port_project_is_sanitized_before_width_and_truncation() {
+        const HOSTILE_PROJECT: &str =
+            "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let mut row = listening_port(3000, Some(42), Some("node"));
+        row.project = Some(HOSTILE_PROJECT.to_string());
+        let rows = [row];
+        let rows = terminal_listening_port_rows(&rows);
+
+        let width =
+            listening_port_cell_width(rows.iter().map(|row| row.project.as_ref()), "Project", 28);
+        let rendered = fit_cell(&rows[0].project, width);
+
+        assert_eq!(width, "safe?FORGED?rewritten?end".chars().count());
+        assert_eq!(rendered, "safe?FORGED?rewritten?end");
+    }
+
+    #[test]
+    fn listening_port_framework_is_sanitized_before_width_and_truncation() {
+        const HOSTILE_FRAMEWORK: &str =
+            "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let mut row = listening_port(3000, Some(42), Some("node"));
+        row.framework = Some(HOSTILE_FRAMEWORK.to_string());
+        let rows = [row];
+        let rows = terminal_listening_port_rows(&rows);
+
+        let width = listening_port_cell_width(
+            rows.iter().map(|row| row.framework.as_ref()),
+            "Framework",
+            22,
+        );
+        let rendered = fit_cell(&rows[0].framework, width);
+
+        assert_eq!(width, 22);
+        assert_eq!(rendered, "safe?FORGED?rewritt...");
     }
 
     fn listening_port(port: u16, pid: Option<u32>, process: Option<&str>) -> ListeningPort {

@@ -164,7 +164,7 @@ pub(super) fn prepare_install_routing_context(
 
     if !json_output {
         for warning in route_table.npmrc_warnings() {
-            output::warn(warning);
+            output::warn(&lpm_common::sanitize_terminal_inline(warning));
         }
     }
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
@@ -174,11 +174,12 @@ pub(super) fn prepare_install_routing_context(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
              DISABLED for this install across ALL registries. This is a \
              security risk.",
-            tagged.source, tagged.line
+            lpm_common::sanitize_terminal_inline(&tagged.source),
+            tagged.line
         ));
     }
     for warning in route_table.npmrc_security_warnings() {
-        output::warn(warning);
+        output::warn(&lpm_common::sanitize_terminal_inline(warning));
     }
 
     let top_level_specs = top_level_registry_specs(deps);
@@ -226,30 +227,26 @@ fn maybe_emit_install_resolving_phase(
     }
 
     let hosts_label = if eager_origins.is_empty() {
-        install_ui::yellow(&install_ui::short_registry_host(client.base_url()))
+        install_ui::short_registry_host(client.base_url())
     } else {
         eager_origins
             .iter()
             .map(|origin| {
-                let host = origin
+                origin
                     .host_lower
                     .strip_prefix("registry.")
                     .unwrap_or(&origin.host_lower)
-                    .to_owned();
-                install_ui::yellow(&host)
+                    .to_owned()
             })
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let line = if is_add_invocation {
-        format!("Resolving dependencies from {hosts_label}")
-    } else {
-        format!(
-            "Resolving dependencies from {hosts_label} for {}",
-            install_ui::bold(pkg_name)
-        )
-    };
-    install_ui::phase(&line);
+    let mut line =
+        install_ui::TerminalLine::new("Resolving dependencies from ").yellow(&hosts_label);
+    if !is_add_invocation {
+        line = line.text(" for ").bold(pkg_name);
+    }
+    install_ui::phase_line(line);
 }
 
 pub(super) fn configure_install_client_for_routing(
@@ -262,7 +259,7 @@ pub(super) fn configure_install_client_for_routing(
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
     if !json_output && let Some(line) = owned_client.render_effective_tls_summary() {
-        output::info(&line);
+        output::info(&lpm_common::sanitize_terminal_inline(&line));
     }
     Ok(owned_client)
 }
@@ -795,6 +792,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 "tarball+URL dep without declared SRI — trusting whatever the server returns AND pinning the computed hash into lpm.lock (trust-on-first-use). Pin via `#sha512-...` on the URL, or pass `--strict-integrity` to refuse."
             );
             if !json_output {
+                let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+                let url = lpm_common::sanitize_terminal_inline(&url);
                 output::warn(&format!(
                     "tarball+URL dep '{local_name}' has no declared SRI — pinning trust-on-first-use to {url}"
                 ));
@@ -818,6 +817,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // fetched-package name controls store identity. Surface the
         // divergence so users notice unintended renames.
         if local_name != real_name && !json_output {
+            let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+            let real_name = lpm_common::sanitize_terminal_inline(&real_name);
+            let url = lpm_common::sanitize_terminal_inline(&url);
             output::warn(&format!(
                 "dep '{local_name}' resolves to package '{real_name}' from {url}; \
                  using local key as the link name in node_modules"
@@ -901,10 +903,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         )?;
 
         if local_name != real_name && !json_output {
+            let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+            let real_name = lpm_common::sanitize_terminal_inline(&real_name);
+            let path =
+                lpm_common::sanitize_terminal_inline(&abs_path.display().to_string()).into_owned();
             output::warn(&format!(
                 "dep '{local_name}' resolves to package '{real_name}' from local \
-                 tarball {}; using local key as the link name in node_modules",
-                abs_path.display()
+                 tarball {path}; using local key as the link name in node_modules",
             ));
         }
 
@@ -1009,10 +1014,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         )? {
             WorkspaceOverlap::DedupeWith(member) => {
                 if !json_output {
+                    let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+                    let raw_path = lpm_common::sanitize_terminal_inline(&raw_path);
+                    let member_name = lpm_common::sanitize_terminal_inline(&member.name);
                     output::info(&format!(
                         "note: file: dep '{local_name}' at {} resolves to workspace \
-                         member '{}'; using workspace symlink instead",
-                        raw_path, member.name,
+                         member '{member_name}'; using workspace symlink instead",
+                        raw_path,
                     ));
                 }
                 // **Invariant invariant.** Previously this branch
@@ -1046,10 +1054,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // Same dep-key vs fetched-name policy as the tarball arms
         // (umbrella— locked as warn-not-reject).
         if local_name != real_name && !json_output {
+            let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+            let real_name = lpm_common::sanitize_terminal_inline(&real_name);
+            let path =
+                lpm_common::sanitize_terminal_inline(&realpath.display().to_string()).into_owned();
             output::warn(&format!(
                 "dep '{local_name}' resolves to package '{real_name}' from local \
-                 directory {}; using local key as the link name in node_modules",
-                realpath.display()
+                 directory {path}; using local key as the link name in node_modules",
             ));
         }
 
@@ -1120,10 +1131,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         )? {
             WorkspaceOverlap::DedupeWith(member) => {
                 if !json_output {
+                    let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+                    let raw_path = lpm_common::sanitize_terminal_inline(&raw_path);
+                    let member_name = lpm_common::sanitize_terminal_inline(&member.name);
                     output::info(&format!(
                         "note: link: dep '{local_name}' at {} resolves to workspace \
-                         member '{}'; using workspace symlink instead",
-                        raw_path, member.name,
+                         member '{member_name}'; using workspace symlink instead",
+                        raw_path,
                     ));
                 }
                 // Invariant invariant — see file: arm above for
@@ -1150,10 +1164,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
 
         // Same dep-key vs fetched-name policy as every other arm.
         if local_name != real_name && !json_output {
+            let local_name = lpm_common::sanitize_terminal_inline(&local_name);
+            let real_name = lpm_common::sanitize_terminal_inline(&real_name);
+            let path =
+                lpm_common::sanitize_terminal_inline(&realpath.display().to_string()).into_owned();
             output::warn(&format!(
                 "dep '{local_name}' resolves to package '{real_name}' from link: \
-                 source {}; using local key as the link name in node_modules",
-                realpath.display()
+                 source {path}; using local key as the link name in node_modules",
             ));
         }
 
@@ -1703,8 +1720,8 @@ pub(super) fn maybe_warn_pkg_node_modules(
          ignored (untracked host state would silently change install \
          output). Run `lpm install` in {} to populate the source's \
          own deps.",
-        source_realpath.display(),
-        source_realpath.display()
+        lpm_common::sanitize_terminal_inline(&source_realpath.display().to_string()),
+        lpm_common::sanitize_terminal_inline(&source_realpath.display().to_string())
     ));
 }
 
@@ -1958,12 +1975,15 @@ pub(super) fn recurse_local_source_deps(
                 )? {
                     WorkspaceOverlap::DedupeWith(member) => {
                         if !json_output {
+                            let local_name = lpm_common::sanitize_terminal_inline(&spec.local_name);
+                            let path = lpm_common::sanitize_terminal_inline(
+                                &realpath.display().to_string(),
+                            )
+                            .into_owned();
+                            let member_name = lpm_common::sanitize_terminal_inline(&member.name);
                             output::info(&format!(
-                                "note: transitive '{}' at {} resolves to workspace \
-                                 member '{}'; using workspace symlink instead",
-                                spec.local_name,
-                                realpath.display(),
-                                member.name,
+                                "note: transitive '{local_name}' at {path} resolves to workspace \
+                                 member '{member_name}'; using workspace symlink instead",
                             ));
                         }
                         let optional_path = inherited_optional || spec.optional;

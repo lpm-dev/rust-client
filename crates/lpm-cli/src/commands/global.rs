@@ -221,7 +221,7 @@ async fn run_list_outdated(
                 .unwrap()
             );
         } else {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "No registry-backed global packages to check ({} local link{} skipped).",
                 local_links.len(),
                 if local_links.len() == 1 { "" } else { "s" },
@@ -451,7 +451,7 @@ fn emit_outdated_human(
     verbose: bool,
 ) {
     if outdated.is_empty() && unresolved.is_empty() {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "All {} registry-backed global package{} are up-to-date.",
             up_to_date.len(),
             if up_to_date.len() == 1 { "" } else { "s" },
@@ -461,11 +461,11 @@ fn emit_outdated_human(
                 .iter()
                 .map(|n| sanitize_for_terminal(n))
                 .collect();
-            install_ui::phase(&format!(
+            install_ui::phase_line(crate::install_ui::terminal_line!(
                 "{} local link{} skipped: {}",
                 local_links.len(),
                 if local_links.len() == 1 { "" } else { "s" },
-                names_safe.join(", ").dimmed(),
+                install_ui::dim(&names_safe.join(", ")),
             ));
         }
         return;
@@ -512,7 +512,7 @@ fn emit_outdated_human(
         println!();
     }
     if !unresolved.is_empty() {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "{} package{} could not be compared:",
             unresolved.len(),
             if unresolved.len() == 1 { "" } else { "s" },
@@ -529,15 +529,15 @@ fn emit_outdated_human(
             .iter()
             .map(|n| sanitize_for_terminal(n))
             .collect();
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "{} up-to-date: {}",
             up_to_date.len(),
-            names_safe.join(", ").dimmed(),
+            install_ui::dim(&names_safe.join(", ")),
         ));
     }
     if unresolved.is_empty() {
         let checked_count = outdated.len() + up_to_date.len();
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "{} global package{} installed",
             checked_count,
             if checked_count == 1 { "" } else { "s" },
@@ -644,7 +644,7 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
     if manifest.packages.is_empty() {
         install_ui::warn("No globally-installed packages");
         if !root.global_manifest().exists() {
-            install_ui::phase(&format!(
+            install_ui::phase_untrusted(&format!(
                 "Run `lpm install -g <pkg>` to install one. Manifest lives at {}.",
                 root.global_manifest().display()
             ));
@@ -723,7 +723,7 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
         }
     }
     println!();
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "{} global package{} installed",
         manifest.packages.len(),
         if manifest.packages.len() == 1 {
@@ -762,7 +762,10 @@ fn run_bin(root: &LpmRoot, json_output: bool) {
             .unwrap()
         );
     } else {
-        println!("{}", path.display());
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!("{}", path.display().to_string())
+        );
     }
 }
 
@@ -1283,16 +1286,21 @@ fn emit_link_success(link: &LocalLinkPackage, json_output: bool) {
         );
         return;
     }
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "Linked {}@{}",
         sanitize_for_terminal(&link.name),
         sanitize_for_terminal(&link.version),
     ));
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Path: {}",
-        sanitize_for_terminal(&link.source_dir.display().to_string()).dimmed(),
+        install_ui::dim(&sanitize_for_terminal(
+            &link.source_dir.display().to_string()
+        )),
     ));
-    install_ui::phase(&format!("Commands: {}", format_bins(&commands).dimmed(),));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Commands: {}",
+        install_ui::dim(&format_bins(&commands)),
+    ));
 }
 
 fn emit_unlink_success(summary: &UnlinkSummary, json_output: bool) {
@@ -1310,7 +1318,7 @@ fn emit_unlink_success(summary: &UnlinkSummary, json_output: bool) {
         );
         return;
     }
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "Unlinked {}@{}",
         sanitize_for_terminal(&summary.package),
         sanitize_for_terminal(&summary.version),

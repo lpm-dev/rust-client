@@ -209,7 +209,7 @@ pub async fn bundle(
         pinned_rolldown.as_deref(),
     )?;
     if !json_output {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Bundling with {} {}",
             install_ui::yellow("Rolldown"),
             rolldown_version
@@ -223,12 +223,12 @@ pub async fn bundle(
     if !json_output {
         if outcome.success() {
             let duration = install_ui::format_duration(start.elapsed());
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Done · bundled in {}",
                 install_ui::green(&duration)
             ));
         } else if let Some(code) = outcome.exit_code {
-            install_ui::failed(&format!("bundle failed · exit code {code}"));
+            install_ui::failed_untrusted(&format!("bundle failed · exit code {code}"));
         }
     }
     outcome.into_result()
@@ -371,7 +371,7 @@ async fn bundle_workspace(
             });
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         } else if affected_only {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "no packages affected vs {} — nothing to bundle",
                 affected_base.unwrap_or("main"),
             ));
@@ -381,7 +381,10 @@ async fn bundle_workspace(
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
-                    eprintln!("  {}", line.dimmed());
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {}",
+                        install_ui::dim(line)
+                    ));
                 }
                 eprintln!();
             }
@@ -408,7 +411,7 @@ async fn bundle_workspace(
                         std::time::Duration::from_millis(0),
                     );
                 } else {
-                    install_ui::failed(&format!("bundle: {prewarm_err}"));
+                    install_ui::failed_untrusted(&format!("bundle: {prewarm_err}"));
                     emit_human_summary(
                         "bundle",
                         failed_members.len(),
@@ -563,7 +566,10 @@ async fn run_one_member(
     let start = std::time::Instant::now();
 
     if matches!(stdio, StdioMode::Inherit) {
-        eprintln!("  {} bundle", format!("[{member_name}]").bold());
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} bundle",
+            install_ui::bold(&format!("[{member_name}]"))
+        ));
     }
 
     let outcome =
@@ -581,9 +587,9 @@ async fn run_one_member(
 
     if matches!(stdio, StdioMode::Inherit) && !success {
         if let Some(code) = exit_code {
-            install_ui::failed(&format!("{member_name}: exit {code}"));
+            install_ui::failed_untrusted(&format!("{member_name}: exit {code}"));
         } else if let Some(ref msg) = error {
-            install_ui::failed(&format!("{member_name}: {msg}"));
+            install_ui::failed_untrusted(&format!("{member_name}: {msg}"));
         }
     }
 
@@ -683,8 +689,9 @@ fn emit_human_summary(
 ) {
     if failed == 0 {
         let duration = install_ui::format_duration(elapsed);
-        install_ui::done(&format!(
-            "{tool} passed in {} {} in {}",
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "{} passed in {} {} in {}",
+            tool,
             install_ui::bold(&total.to_string()),
             install_ui::packages_word(total),
             install_ui::green(&duration)
@@ -698,7 +705,7 @@ fn emit_human_summary(
         }
     } else {
         let duration = install_ui::format_duration(elapsed);
-        install_ui::failed(&format!(
+        install_ui::failed_untrusted(&format!(
             "{tool}: {succeeded} passed, {failed} failed out of {total} packages in {duration}"
         ));
     }

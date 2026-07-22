@@ -65,12 +65,14 @@ pub(super) fn handle_dry_run(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         eprintln!("\n  Dry run -- no files will be modified.\n");
+        let target = target_dir
+            .strip_prefix(project_dir)
+            .unwrap_or(target_dir)
+            .display()
+            .to_string();
         eprintln!(
             "  Would install to: {}",
-            target_dir
-                .strip_prefix(project_dir)
-                .unwrap_or(target_dir)
-                .display()
+            lpm_common::sanitize_terminal_inline(&target)
         );
         eprintln!("  Files:");
         for (path, action) in &file_actions {
@@ -81,7 +83,12 @@ pub(super) fn handle_dry_run(
             } else {
                 "-".dimmed().to_string()
             };
-            eprintln!("    {} {} ({})", icon, path, action);
+            eprintln!(
+                "    {} {} ({})",
+                icon,
+                lpm_common::sanitize_terminal_inline(path),
+                action
+            );
         }
         if dep_count > 0 {
             eprintln!("\n  Dependencies to install: {dep_count}");
@@ -98,7 +105,7 @@ pub(super) fn handle_dry_run(
                     if let Some(deps) = dep_map.get(config_value).and_then(|d| d.as_array()) {
                         for dep in deps {
                             if let Some(dep_name) = dep.as_str() {
-                                eprintln!("    {dep_name}");
+                                eprintln!("    {}", lpm_common::sanitize_terminal_inline(dep_name));
                             }
                         }
                     }
@@ -134,7 +141,11 @@ pub(super) fn print_add_project_structure(
 
 fn add_detail(label: &str, value: &str) {
     let label = format!("{label:<13}");
-    install_ui::detail(&format!("    {} {}", install_ui::dim(&label), value));
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "    {} {}",
+        install_ui::dim(&label),
+        value
+    ));
 }
 
 fn framework_label(project_dir: &Path, ecosystem: &str) -> String {
@@ -153,7 +164,7 @@ fn framework_label(project_dir: &Path, ecosystem: &str) -> String {
 }
 
 pub(super) fn print_add_file(path: &str) {
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "{} {}",
         install_ui::green("+"),
         install_ui::dim(path)

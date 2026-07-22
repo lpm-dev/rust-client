@@ -17,8 +17,9 @@ pub async fn run(
     if !json_output {
         let registry_label = search_registry_label(&context.client, &route);
         let query_safe = sanitize_for_terminal(query);
-        install_ui::phase(&format!(
-            "Searching {registry_label} for \"{}\"",
+        install_ui::phase_line(crate::install_ui::terminal_line!(
+            "Searching {} for \"{}\"",
+            registry_label,
             install_ui::cyan(&query_safe)
         ));
     }
@@ -42,7 +43,7 @@ pub async fn run(
 
     if results.packages.is_empty() {
         let query_safe = sanitize_for_terminal(query);
-        install_ui::warn(&format!("No packages found for \"{query_safe}\""));
+        install_ui::warn_untrusted(&format!("No packages found for \"{query_safe}\""));
         return Ok(());
     }
 
@@ -73,7 +74,7 @@ pub async fn run(
         println!();
     }
 
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "Found {} {}",
         results.packages.len(),
         install_ui::packages_word(results.packages.len())

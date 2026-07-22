@@ -210,7 +210,7 @@ pub async fn run(
         }
         install_ui::phase("Only @lpm.dev packages will route through lpm.dev.");
         if !expires_at.is_empty() {
-            install_ui::phase(&format!(
+            install_ui::phase_line(crate::install_ui::terminal_line!(
                 "{} {} ({})",
                 install_ui::dim("Token expires:"),
                 expires_at,

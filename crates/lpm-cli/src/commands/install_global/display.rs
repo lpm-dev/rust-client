@@ -1,7 +1,6 @@
 use super::commit::CommitOutput;
 use super::prepare::PrepResult;
-use crate::output;
-use lpm_common::color::Painted;
+use crate::{install_ui, output};
 use lpm_common::{LpmRoot, sanitize_for_terminal};
 
 pub(super) fn print_success(
@@ -36,11 +35,11 @@ pub(super) fn print_success(
     let name_safe = sanitize_for_terminal(&out.name);
     let version_safe = sanitize_for_terminal(&out.version);
     let saved_spec_safe = sanitize_for_terminal(&out.saved_spec);
-    output::success(&format!(
+    output::success_line(crate::install_ui::terminal_line!(
         "Installed {}@{} (saved as {})",
-        name_safe.bold(),
-        version_safe.dimmed(),
-        saved_spec_safe.dimmed()
+        install_ui::bold(&name_safe),
+        install_ui::dim(&version_safe),
+        install_ui::dim(&saved_spec_safe)
     ));
     if out.commands.is_empty() {
         // Shouldn't happen — we error out earlier when bin entries are
@@ -125,9 +124,9 @@ pub(super) fn emit_post_install_blocked_warning(
     }
 
     eprintln!();
-    output::warn(&format!(
+    output::warn_line(crate::install_ui::terminal_line!(
         "{} package{} in this global install have lifecycle scripts blocked pending review.",
-        remaining.len().to_string().bold(),
+        install_ui::bold(&remaining.len().to_string()),
         if remaining.len() == 1 { "" } else { "s" },
     ));
     // Show the first few by name so the user has concrete signal.

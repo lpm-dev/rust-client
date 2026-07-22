@@ -60,7 +60,7 @@ pub(crate) async fn prepare_npm_target_artifact(
                     })?;
 
                 if !input.json_output {
-                    install_ui::done(&format!(
+                    install_ui::done_untrusted(&format!(
                         "Sigstore provenance generated for {} → Rekor",
                         input.target_label
                     ));

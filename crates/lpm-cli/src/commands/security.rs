@@ -292,7 +292,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                     .unwrap()
                 );
             } else {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "Temporary {} unlock for {} is active for {}.",
                     grant.target.as_str(),
                     scope.as_str(),
@@ -342,13 +342,13 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             }
 
             if revocations.is_empty() {
-                install_ui::warn(&format!(
+                install_ui::warn_untrusted(&format!(
                     "No active {} unlocks matched {}.",
                     target.kind.as_str(),
                     scope.as_str(),
                 ));
             } else {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "Revoked {} from {} {} unlock{}.",
                     scope.as_str(),
                     revocations.len(),
@@ -382,7 +382,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 return Ok(());
             }
 
-            print_status_field("target", &policy_value(status.target.as_str()));
+            print_status_field("target", policy_value(status.target.as_str()));
             let root_value = status
                 .project_root
                 .as_deref()
@@ -465,21 +465,21 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             );
             match status.managed_policy.as_ref() {
                 Some(policy) => {
-                    print_status_field("managed policy", &install_ui::cyan(&policy.path));
+                    print_status_field("managed policy", install_ui::cyan(&policy.path));
                     if let Some(name) = policy.name.as_deref() {
-                        print_status_field("policy name", name);
+                        print_status_field("policy name", install_ui::yellow(name));
                     }
                     if let Some(source) = policy.source.as_deref() {
-                        print_status_field("policy source", source);
+                        print_status_field("policy source", install_ui::dim(source));
                     }
                     if !policy.enforced_controls.is_empty() {
                         print_status_field(
                             "enforced controls",
-                            &policy.enforced_controls.join(", "),
+                            install_ui::dim(&policy.enforced_controls.join(", ")),
                         );
                     }
                 }
-                None => print_status_field("managed policy", &install_ui::dim("inactive")),
+                None => print_status_field("managed policy", install_ui::dim("inactive")),
             }
 
             println!();
@@ -589,7 +589,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 return Ok(());
             }
 
-            println!("security dir  {}", report.security_dir);
+            println!("security dir  {}", install_ui::cyan(&report.security_dir));
             println!();
             println!("quarantined files");
             if report.quarantined.is_empty() {
@@ -600,7 +600,9 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 for item in &report.quarantined {
                     println!(
                         "  {} -> {} ({})",
-                        item.original_path, item.quarantine_path, item.reason
+                        install_ui::cyan(&item.original_path),
+                        install_ui::cyan(&item.quarantine_path),
+                        install_ui::dim(&item.reason)
                     );
                 }
                 println!();
@@ -626,13 +628,13 @@ fn print_protect_report_json(report: &security_approval::ManagedProtectionReport
 fn print_protect_change(label: &str, change: security_approval::ManagedProtectionChange) {
     match change {
         security_approval::ManagedProtectionChange::Enabled => {
-            install_ui::done(&format!("{label} enabled."));
+            install_ui::done_untrusted(&format!("{label} enabled."));
         }
         security_approval::ManagedProtectionChange::Disabled => {
-            install_ui::done(&format!("{label} disabled."));
+            install_ui::done_untrusted(&format!("{label} disabled."));
         }
         security_approval::ManagedProtectionChange::Unchanged => {
-            install_ui::warn(&format!("{label} unchanged."));
+            install_ui::warn_untrusted(&format!("{label} unchanged."));
         }
     }
 }
@@ -645,19 +647,22 @@ fn print_protect_status(status: &security_approval::ManagedProtectionStatus) {
         install_ui::dim("inactive")
     };
     print_status_field("status", &active);
-    print_status_field("policy", &install_ui::cyan(&status.path));
+    print_status_field("policy", install_ui::cyan(&status.path));
     if let Some(mode) = status.firewall_mode.as_deref() {
-        print_status_field("firewall", &policy_value(mode));
+        print_status_field("firewall", policy_value(mode));
     }
     if let Some(policy) = status.managed_policy.as_ref() {
         if let Some(name) = policy.name.as_deref() {
-            print_status_field("name", name);
+            print_status_field("name", install_ui::yellow(name));
         }
         if let Some(source) = policy.source.as_deref() {
-            print_status_field("source", source);
+            print_status_field("source", install_ui::dim(source));
         }
         if !policy.enforced_controls.is_empty() {
-            print_status_field("controls", &policy.enforced_controls.join(", "));
+            print_status_field(
+                "controls",
+                install_ui::dim(&policy.enforced_controls.join(", ")),
+            );
         }
     }
 }
@@ -670,20 +675,26 @@ fn source_name(source: security_approval::PostureSourceKind) -> &'static str {
     }
 }
 
-fn print_status_field(label: &str, value: &str) {
-    println!("{} {value}", install_ui::dim(&format!("{label:<8}")));
+fn print_status_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!("{} {}", install_ui::dim(&format!("{label:<8}")), value)
+    );
 }
 
-fn policy_value(value: &str) -> String {
+fn policy_value(value: &str) -> install_ui::TerminalFragment {
     install_ui::section(value)
 }
 
-fn source_suffix(source: security_approval::PostureSourceKind) -> String {
+fn source_suffix(source: security_approval::PostureSourceKind) -> install_ui::TerminalFragment {
     install_ui::dim(&format!("({})", source_name(source)))
 }
 
-fn sourced_policy_value(value: &str, source: security_approval::PostureSourceKind) -> String {
-    format!("{} {}", policy_value(value), source_suffix(source))
+fn sourced_policy_value(
+    value: &str,
+    source: security_approval::PostureSourceKind,
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!("{} {}", policy_value(value), source_suffix(source))
 }
 
 fn format_release_age(secs: u64) -> String {

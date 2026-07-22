@@ -104,7 +104,7 @@ pub(crate) async fn publish_current_project(
         if options.json_output {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Dry run · would stage {}",
                 install_ui::yellow(&format!("{}@{}", npm_name, prepared.version))
             ));
@@ -115,11 +115,13 @@ pub(crate) async fn publish_current_project(
     if !options.json_output && !options.yes {
         let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
         if is_tty {
-            let confirm =
-                cliclack::confirm(format!("Stage {}@{} to npm?", npm_name, prepared.version))
-                    .initial_value(true)
-                    .interact()
-                    .map_err(|e| LpmError::Registry(e.to_string()))?;
+            let confirm = cliclack::confirm(crate::prompt::untrusted(format!(
+                "Stage {}@{} to npm?",
+                npm_name, prepared.version
+            )))
+            .initial_value(true)
+            .interact()
+            .map_err(|e| LpmError::Registry(e.to_string()))?;
             if !confirm {
                 install_ui::skipped("Stage cancelled");
                 return Ok(());
@@ -160,7 +162,7 @@ pub(crate) async fn publish_current_project(
     let upload_spinner = if options.json_output {
         None
     } else {
-        Some(install_ui::spin(&format!(
+        Some(install_ui::spin_line(crate::install_ui::terminal_line!(
             "Staging {} to npm",
             install_ui::yellow(&format!("{}@{}", npm_name, prepared.version))
         )))
@@ -194,10 +196,11 @@ pub(crate) async fn publish_current_project(
         }));
     } else {
         let elapsed = install_ui::green(&install_ui::format_duration(started_at.elapsed()));
-        install_ui::done(&format!(
-            "Done · staged {} with id {} in {elapsed}",
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Done · staged {} with id {} in {}",
             install_ui::yellow(&format!("{}@{}", npm_name, prepared.version)),
             install_ui::cyan(&result.stage_id),
+            elapsed,
         ));
     }
 
@@ -309,7 +312,7 @@ pub(crate) async fn download(
             "data": result.manifest,
         }));
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Downloaded staged package to {}",
             install_ui::cyan(&result.path.display().to_string())
         ));
@@ -350,9 +353,10 @@ async fn mutate_stage(
             "data": data,
         }));
     } else {
-        install_ui::done(&format!(
-            "Staged package {} {action}",
-            install_ui::cyan(stage_id)
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Staged package {} {}",
+            install_ui::cyan(stage_id),
+            action,
         ));
     }
 
