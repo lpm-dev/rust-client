@@ -629,7 +629,7 @@ async fn run_verification(cwd: &Path, json: bool) -> Result<(), LpmError> {
 
     // Resolve the managed runtime once for the whole verification pass — the
     // build and test scripts run back-to-back against the same project.
-    let bin_hint = super::run::ensure_runtime(cwd).await;
+    let bin_hint = super::run::ensure_runtime(cwd).await?;
 
     // Run build if it exists
     if has_build {

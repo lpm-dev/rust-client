@@ -42,7 +42,7 @@ pub async fn run_multi(
     no_cache: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await;
+    let bin_hint = ensure_runtime(project_dir).await?;
 
     if scripts.is_empty() {
         install_ui::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
@@ -176,7 +176,7 @@ pub async fn run_external_shortcut(
         return Err(missing_external_shortcut_error(command_name));
     }
 
-    let bin_hint = ensure_runtime(project_dir).await;
+    let bin_hint = ensure_runtime(project_dir).await?;
     install_ui::phase(&format!("Executing {}", install_ui::yellow(command_name)));
     let start = std::time::Instant::now();
     lpm_runner::script::run_local_bin(

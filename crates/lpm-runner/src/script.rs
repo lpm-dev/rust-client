@@ -119,7 +119,7 @@ pub fn run_script_with_envs(
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     // Build PATH with .bin dirs prepended
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
 
     // Load .env files + merge extra env vars (from HTTPS/tunnel/network setup)
     let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
@@ -208,7 +208,7 @@ pub fn run_script_captured(
 ) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
@@ -287,7 +287,7 @@ pub fn run_script_buffered(
 ) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 
@@ -369,7 +369,7 @@ pub fn run_command_buffered_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
@@ -411,7 +411,7 @@ pub fn run_script_prefixed(
 ) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, _scripts) = resolve_script_command(project_dir, script_name)?;
 
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 
@@ -452,7 +452,7 @@ pub fn run_command_prefixed(
     color: &str,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 
@@ -508,7 +508,7 @@ pub fn run_command_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
@@ -545,7 +545,7 @@ pub fn build_local_bin_command(
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<Command, LpmError> {
     let bin_path = resolve_local_bin_path(project_dir, command_name)?;
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let env_vars =
         dotenv::load_project_env_with_schema_validation(project_dir, env_mode, !no_env_check)?;
 
@@ -694,7 +694,7 @@ pub fn run_command_captured(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 

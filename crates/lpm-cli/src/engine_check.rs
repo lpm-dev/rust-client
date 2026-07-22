@@ -34,9 +34,10 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
+use lpm_runtime::detect::{DetectedNodeVersion, detect_node_version_with_engines};
 use lpm_runtime::effective::{
-    Effective, EffectiveNodeResolution, probe_effective_node_fingerprint_with_engines,
-    resolve_effective_node_with_fingerprint_with_engines,
+    Effective, EffectiveNodeResolution, probe_detected_node_fingerprint,
+    resolve_detected_node_with_fingerprint,
 };
 use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
 use std::collections::HashMap;
@@ -48,23 +49,20 @@ const LOCKFILE_NODE_ENGINE_NEEDLE: &str = "node-engine = ";
 pub(crate) struct DependencyEnginePolicy {
     engine_strict: bool,
     json_output: bool,
-    root_dir: PathBuf,
-    root_engines: HashMap<String, String>,
+    detected_node: Option<DetectedNodeVersion>,
     effective_node: OnceLock<EffectiveNodeResolution>,
 }
 
 impl DependencyEnginePolicy {
     fn new(
-        root_dir: PathBuf,
-        root_engines: HashMap<String, String>,
+        detected_node: Option<DetectedNodeVersion>,
         engine_strict: bool,
         json_output: bool,
     ) -> Self {
         Self {
             engine_strict,
             json_output,
-            root_dir,
-            root_engines,
+            detected_node,
             effective_node: OnceLock::new(),
         }
     }
@@ -74,9 +72,8 @@ impl DependencyEnginePolicy {
     }
 
     fn effective_node_resolution(&self) -> &EffectiveNodeResolution {
-        self.effective_node.get_or_init(|| {
-            resolve_effective_node_with_fingerprint_with_engines(&self.root_dir, &self.root_engines)
-        })
+        self.effective_node
+            .get_or_init(|| resolve_detected_node_with_fingerprint(self.detected_node.clone()))
     }
 
     fn check_node_requirement(&self, required: &str, source: String) -> Result<(), Mismatch> {
@@ -160,7 +157,7 @@ impl DependencyEnginePolicy {
     }
 
     pub(crate) fn probe_node_runtime_fingerprint(&self) -> Option<String> {
-        probe_effective_node_fingerprint_with_engines(&self.root_dir, &self.root_engines)
+        probe_detected_node_fingerprint(self.detected_node.clone())
     }
 
     pub(crate) fn resolved_node_runtime_fingerprint(&self) -> Option<&str> {
@@ -195,20 +192,11 @@ pub(crate) fn prepare_dependency_policy(
     json_output: bool,
 ) -> Result<DependencyEnginePolicy, LpmError> {
     let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
-        return Ok(DependencyEnginePolicy::new(
-            start_dir.to_path_buf(),
-            HashMap::new(),
-            false,
-            json_output,
-        ));
+        return Ok(DependencyEnginePolicy::new(None, false, json_output));
     };
     let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
-    let policy = DependencyEnginePolicy::new(
-        root_dir,
-        root_pkg.engines.clone(),
-        engine_strict,
-        json_output,
-    );
+    let detected_node = detect_node_version_with_engines(&root_dir, &root_pkg.engines)?;
+    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
     enforce_root_with_policy(&root_pkg, &policy)?;
     Ok(policy)
 }
@@ -250,12 +238,8 @@ pub fn enforce_with_root(
     engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let policy = DependencyEnginePolicy::new(
-        root_dir.to_path_buf(),
-        root_pkg.engines.clone(),
-        engine_strict,
-        json_output,
-    );
+    let detected_node = detect_node_version_with_engines(root_dir, &root_pkg.engines)?;
+    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
     enforce_root_with_policy(root_pkg, &policy)
 }
 
@@ -623,9 +607,7 @@ mod tests {
 
     #[test]
     fn legacy_lockfile_uses_migration_freshness_without_resolving_node() {
-        let dir = tempdir().unwrap();
-        let policy =
-            DependencyEnginePolicy::new(dir.path().to_path_buf(), HashMap::new(), true, true);
+        let policy = DependencyEnginePolicy::new(None, true, true);
 
         assert_eq!(policy.freshness_key("lockfile-version = 5\n"), "legacy");
         assert!(policy.effective_node.get().is_none());
@@ -633,9 +615,7 @@ mod tests {
 
     #[test]
     fn current_unconstrained_lockfile_preserves_existing_freshness() {
-        let dir = tempdir().unwrap();
-        let policy =
-            DependencyEnginePolicy::new(dir.path().to_path_buf(), HashMap::new(), true, true);
+        let policy = DependencyEnginePolicy::new(None, true, true);
         let lockfile = format!("lockfile-version = {}\n", lpm_lockfile::LOCKFILE_VERSION);
 
         assert_eq!(policy.freshness_key(&lockfile), "none");
@@ -644,9 +624,7 @@ mod tests {
 
     #[test]
     fn unknown_node_version_is_never_reused_from_fingerprint_cache() {
-        let dir = tempdir().unwrap();
-        let policy =
-            DependencyEnginePolicy::new(dir.path().to_path_buf(), HashMap::new(), true, true);
+        let policy = DependencyEnginePolicy::new(None, true, true);
 
         assert!(!policy.can_reuse_constrained_freshness_key("1:unknown"));
     }

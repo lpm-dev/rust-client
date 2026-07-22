@@ -12,6 +12,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_text_file_capped};
+
+/// Result of reading local runtime-version configuration.
+pub type DetectionResult<T> = Result<T, BoundedReadError>;
+
 /// Managed runtime kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeKind {
@@ -100,7 +105,8 @@ impl std::fmt::Display for VersionSource {
 /// Detect the required Node.js version for a project.
 ///
 /// Walks through config sources in priority order and returns the first match.
-pub fn detect_node_version(project_dir: &Path) -> Option<DetectedNodeVersion> {
+/// Missing files are skipped; any other read failure stops detection.
+pub fn detect_node_version(project_dir: &Path) -> DetectionResult<Option<DetectedNodeVersion>> {
     detect_node_version_inner(project_dir, None)
 }
 
@@ -108,20 +114,21 @@ pub fn detect_node_version(project_dir: &Path) -> Option<DetectedNodeVersion> {
 ///
 /// Bun is intentionally scoped to `lpm.json > runtime.bun`; `engines.bun`
 /// remains a compatibility warning, not an enforced runtime contract.
-pub fn detect_bun_version(project_dir: &Path) -> Option<DetectedRuntimeVersion> {
+pub fn detect_bun_version(project_dir: &Path) -> DetectionResult<Option<DetectedRuntimeVersion>> {
     detect_from_lpm_json_runtime(project_dir, RuntimeKind::Bun)
 }
 
 /// Detect every managed runtime requirement in deterministic PATH order.
-pub fn detect_runtime_versions(project_dir: &Path) -> Vec<DetectedRuntimeVersion> {
+/// Missing files are skipped; any other read failure stops detection.
+pub fn detect_runtime_versions(project_dir: &Path) -> DetectionResult<Vec<DetectedRuntimeVersion>> {
     let mut detected = Vec::with_capacity(2);
-    if let Some(node) = detect_node_version(project_dir) {
+    if let Some(node) = detect_node_version(project_dir)? {
         detected.push(node);
     }
-    if let Some(bun) = detect_bun_version(project_dir) {
+    if let Some(bun) = detect_bun_version(project_dir)? {
         detected.push(bun);
     }
-    detected
+    Ok(detected)
 }
 
 /// Variant for callers that have already parsed `package.json`'s
@@ -134,71 +141,89 @@ pub fn detect_runtime_versions(project_dir: &Path) -> Vec<DetectedRuntimeVersion
 pub fn detect_node_version_with_engines(
     project_dir: &Path,
     engines: &HashMap<String, String>,
-) -> Option<DetectedNodeVersion> {
+) -> DetectionResult<Option<DetectedNodeVersion>> {
     detect_node_version_inner(project_dir, Some(engines))
 }
 
 fn detect_node_version_inner(
     project_dir: &Path,
     engines: Option<&HashMap<String, String>>,
-) -> Option<DetectedNodeVersion> {
+) -> DetectionResult<Option<DetectedNodeVersion>> {
     // 1. lpm.json -> runtime.node
-    if let Some(v) = detect_from_lpm_json_runtime(project_dir, RuntimeKind::Node) {
-        return Some(v);
+    if let Some(v) = detect_from_lpm_json_runtime(project_dir, RuntimeKind::Node)? {
+        return Ok(Some(v));
     }
 
     // 2. package.json -> engines.node — prefer the pre-parsed map
     //    when the caller supplied it; otherwise read the file.
     let engines_hit = match engines {
         Some(map) => detect_from_engines_map(map),
-        None => detect_from_engines(project_dir),
+        None => detect_from_engines(project_dir)?,
     };
     if let Some(v) = engines_hit {
-        return Some(v);
+        return Ok(Some(v));
     }
 
     // 3. .nvmrc
-    if let Some(v) = detect_from_file(project_dir, ".nvmrc", VersionSource::Nvmrc) {
-        return Some(v);
+    if let Some(v) = detect_from_file(project_dir, ".nvmrc", VersionSource::Nvmrc)? {
+        return Ok(Some(v));
     }
 
     // 4. .node-version
-    if let Some(v) = detect_from_file(project_dir, ".node-version", VersionSource::NodeVersion) {
-        return Some(v);
+    if let Some(v) = detect_from_file(project_dir, ".node-version", VersionSource::NodeVersion)? {
+        return Ok(Some(v));
     }
 
-    None
+    Ok(None)
 }
 
 fn detect_from_lpm_json_runtime(
     project_dir: &Path,
     runtime: RuntimeKind,
-) -> Option<DetectedRuntimeVersion> {
+) -> DetectionResult<Option<DetectedRuntimeVersion>> {
     let path = project_dir.join("lpm.json");
-    let content =
-        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
-    let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let spec = doc.get("runtime")?.get(runtime.as_str())?.as_str()?;
+    let Some(content) = read_optional_runtime_config(&path)? else {
+        return Ok(None);
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ok(None);
+    };
+    let Some(spec) = doc
+        .get("runtime")
+        .and_then(|config| config.get(runtime.as_str()))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
 
-    Some(DetectedRuntimeVersion {
+    Ok(Some(DetectedRuntimeVersion {
         runtime,
         spec: spec.to_string(),
         source: VersionSource::LpmJson,
-    })
+    }))
 }
 
-fn detect_from_engines(project_dir: &Path) -> Option<DetectedNodeVersion> {
+fn detect_from_engines(project_dir: &Path) -> DetectionResult<Option<DetectedNodeVersion>> {
     let path = project_dir.join("package.json");
-    let content =
-        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
-    let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let spec = doc.get("engines")?.get("node")?.as_str()?;
+    let Some(content) = read_optional_runtime_config(&path)? else {
+        return Ok(None);
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ok(None);
+    };
+    let Some(spec) = doc
+        .get("engines")
+        .and_then(|engines| engines.get("node"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
 
-    Some(DetectedRuntimeVersion {
+    Ok(Some(DetectedRuntimeVersion {
         runtime: RuntimeKind::Node,
         spec: spec.to_string(),
         source: VersionSource::PackageJsonEngines,
-    })
+    }))
 }
 
 /// Pure variant: read `node` from a pre-parsed `engines` HashMap.
@@ -244,21 +269,32 @@ fn detect_from_file(
     project_dir: &Path,
     filename: &str,
     source: VersionSource,
-) -> Option<DetectedNodeVersion> {
+) -> DetectionResult<Option<DetectedNodeVersion>> {
     let path = project_dir.join(filename);
-    let content =
-        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
-    let spec = parse_version_file(&content)?;
+    let Some(content) = read_optional_runtime_config(&path)? else {
+        return Ok(None);
+    };
+    let Some(spec) = parse_version_file(&content) else {
+        return Ok(None);
+    };
 
     if spec.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(DetectedRuntimeVersion {
+    Ok(Some(DetectedRuntimeVersion {
         runtime: RuntimeKind::Node,
         spec,
         source,
-    })
+    }))
+}
+
+fn read_optional_runtime_config(path: &Path) -> DetectionResult<Option<String>> {
+    match read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => Ok(Some(content)),
+        Err(BoundedReadError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -275,7 +311,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.runtime, RuntimeKind::Node);
         assert_eq!(v.spec, ">=22.0.0");
         assert!(matches!(v.source, VersionSource::LpmJson));
@@ -295,7 +331,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = detect_bun_version(dir.path()).unwrap();
+        let v = detect_bun_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.runtime, RuntimeKind::Bun);
         assert_eq!(v.spec, "1.3.14");
         assert!(matches!(v.source, VersionSource::LpmJson));
@@ -310,7 +346,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(detect_bun_version(dir.path()).is_none());
+        assert!(detect_bun_version(dir.path()).unwrap().is_none());
     }
 
     #[test]
@@ -322,7 +358,7 @@ mod tests {
         )
         .unwrap();
 
-        let versions = detect_runtime_versions(dir.path());
+        let versions = detect_runtime_versions(dir.path()).unwrap();
         let kinds: Vec<RuntimeKind> = versions.iter().map(|v| v.runtime).collect();
         assert_eq!(kinds, vec![RuntimeKind::Node, RuntimeKind::Bun]);
     }
@@ -336,7 +372,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, ">=20.0.0");
         assert!(matches!(v.source, VersionSource::PackageJsonEngines));
     }
@@ -346,7 +382,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "v22.5.0\n").unwrap();
 
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "22.5.0"); // v prefix stripped
         assert!(matches!(v.source, VersionSource::Nvmrc));
     }
@@ -356,7 +392,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".node-version"), "20.18.0\n").unwrap();
 
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "20.18.0");
         assert!(matches!(v.source, VersionSource::NodeVersion));
     }
@@ -376,14 +412,94 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join(".nvmrc"), "18").unwrap();
 
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "22"); // lpm.json wins
     }
 
     #[test]
     fn no_version_detected() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(detect_node_version(dir.path()).is_none());
+        assert!(detect_node_version(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_lpm_json_does_not_fall_back_to_package_json_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.json");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"engines": {"node": "20"}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            detect_node_version(dir.path()),
+            Err(BoundedReadError::TooLarge { path: error_path, .. }) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn oversized_package_json_does_not_fall_back_to_nvmrc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+        fs::write(dir.path().join(".nvmrc"), "20").unwrap();
+
+        assert!(matches!(
+            detect_node_version(dir.path()),
+            Err(BoundedReadError::TooLarge { path: error_path, .. }) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn oversized_nvmrc_does_not_fall_back_to_node_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".nvmrc");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+        fs::write(dir.path().join(".node-version"), "20").unwrap();
+
+        assert!(matches!(
+            detect_node_version(dir.path()),
+            Err(BoundedReadError::TooLarge { path: error_path, .. }) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn oversized_node_version_is_not_treated_as_no_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".node-version");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        assert!(matches!(
+            detect_node_version(dir.path()),
+            Err(BoundedReadError::TooLarge { path: error_path, .. }) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_nvmrc_does_not_fall_back_to_node_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".nvmrc");
+        fs::write(&path, b"20\xff").unwrap();
+        fs::write(dir.path().join(".node-version"), "20").unwrap();
+
+        assert!(matches!(
+            detect_node_version(dir.path()),
+            Err(BoundedReadError::InvalidUtf8 { path: error_path, .. }) if error_path == path
+        ));
     }
 
     // .nvmrc parsing -- comments, v prefix, lts/*
@@ -424,7 +540,7 @@ mod tests {
     fn nvmrc_with_comments() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "# comment\n22").unwrap();
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "22");
     }
 
@@ -432,7 +548,7 @@ mod tests {
     fn nvmrc_lts_star() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "lts/*").unwrap();
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "lts");
     }
 
@@ -440,7 +556,7 @@ mod tests {
     fn nvmrc_lts_codename() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "lts/iron").unwrap();
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "lts");
     }
 
@@ -448,7 +564,7 @@ mod tests {
     fn nvmrc_v_prefix() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "v20.5.0").unwrap();
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "20.5.0");
     }
 
@@ -456,7 +572,7 @@ mod tests {
     fn nvmrc_whitespace() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "  22.1.0  ").unwrap();
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "22.1.0");
     }
 
@@ -464,7 +580,7 @@ mod tests {
     fn nvmrc_multiline_with_comments() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "# Use Node 22\n\n22.5.0\n# end").unwrap();
-        let v = detect_node_version(dir.path()).unwrap();
+        let v = detect_node_version(dir.path()).unwrap().unwrap();
         assert_eq!(v.spec, "22.5.0");
     }
 }

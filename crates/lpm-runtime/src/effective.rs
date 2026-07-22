@@ -91,8 +91,8 @@ impl Effective {
 /// Pure helper: no network, no filesystem mutation. Reads the project's
 /// pin sources and `~/.lpm/runtimes/node/`, and shells out to `node
 /// --version` once at the system-fallback step.
-pub fn resolve_effective_node_version(project_dir: &Path) -> Effective {
-    resolve_inner(detect::detect_node_version(project_dir))
+pub fn resolve_effective_node_version(project_dir: &Path) -> detect::DetectionResult<Effective> {
+    Ok(resolve_inner(detect::detect_node_version(project_dir)?))
 }
 
 /// Variant for callers that have already parsed `package.json`'s
@@ -100,11 +100,11 @@ pub fn resolve_effective_node_version(project_dir: &Path) -> Effective {
 pub fn resolve_effective_node_version_with_engines(
     project_dir: &Path,
     engines: &HashMap<String, String>,
-) -> Effective {
-    resolve_inner(detect::detect_node_version_with_engines(
+) -> detect::DetectionResult<Effective> {
+    Ok(resolve_inner(detect::detect_node_version_with_engines(
         project_dir,
         engines,
-    ))
+    )?))
 }
 
 /// Resolve effective Node and fingerprint the selected executable.
@@ -115,11 +115,17 @@ pub fn resolve_effective_node_version_with_engines(
 pub fn resolve_effective_node_with_fingerprint_with_engines(
     project_dir: &Path,
     engines: &HashMap<String, String>,
-) -> EffectiveNodeResolution {
-    resolve_inner_with_fingerprint(detect::detect_node_version_with_engines(
-        project_dir,
-        engines,
+) -> detect::DetectionResult<EffectiveNodeResolution> {
+    Ok(resolve_detected_node_with_fingerprint(
+        detect::detect_node_version_with_engines(project_dir, engines)?,
     ))
+}
+
+/// Resolve and fingerprint an already-detected Node requirement.
+pub fn resolve_detected_node_with_fingerprint(
+    detected: Option<detect::DetectedNodeVersion>,
+) -> EffectiveNodeResolution {
+    resolve_inner_with_fingerprint(detected)
 }
 
 /// Fingerprint the Node executable LPM would select without executing it.
@@ -129,12 +135,17 @@ pub fn resolve_effective_node_with_fingerprint_with_engines(
 pub fn probe_effective_node_fingerprint_with_engines(
     project_dir: &Path,
     engines: &HashMap<String, String>,
-) -> Option<String> {
-    selected_node(detect::detect_node_version_with_engines(
-        project_dir,
-        engines,
+) -> detect::DetectionResult<Option<String>> {
+    Ok(probe_detected_node_fingerprint(
+        detect::detect_node_version_with_engines(project_dir, engines)?,
     ))
-    .runtime_fingerprint()
+}
+
+/// Fingerprint the executable selected for an already-detected Node requirement.
+pub fn probe_detected_node_fingerprint(
+    detected: Option<detect::DetectedNodeVersion>,
+) -> Option<String> {
+    selected_node(detected).runtime_fingerprint()
 }
 
 enum SelectedNode {
@@ -369,7 +380,7 @@ mod tests {
         // assertion that holds across CI environments is "doesn't panic
         // and returns one of the three variants."
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_effective_node_version(dir.path());
+        let result = resolve_effective_node_version(dir.path()).unwrap();
         match result {
             Effective::Managed { .. } | Effective::System { .. } | Effective::Unknown => {}
         }
@@ -412,7 +423,7 @@ mod tests {
             r#"{"engines": {"node": "99.0.0"}}"#,
         )
         .unwrap();
-        let result = resolve_effective_node_version(dir.path());
+        let result = resolve_effective_node_version(dir.path()).unwrap();
         assert!(!matches!(
             result,
             Effective::Managed { ref version, .. } if version == "99.0.0"

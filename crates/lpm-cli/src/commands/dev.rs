@@ -276,6 +276,7 @@ pub async fn run(
     );
 
     // Process parallel results
+    let runtime_hint = runtime_hint?;
     startup.deps_status = install_result?;
     startup.env_status = env_result;
     startup.node_version = node_version_result;

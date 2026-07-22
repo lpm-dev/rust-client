@@ -1,4 +1,5 @@
 use crate::install_ui;
+use lpm_common::LpmError;
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::path::Path;
 
@@ -14,10 +15,10 @@ fn runtime_display_name(runtime: &str) -> &str {
 /// Detects version requirements from project config, auto-installs if needed,
 /// prints the runtime version in use, and returns a pre-resolved PATH hint for
 /// downstream script execution.
-pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
-    let statuses = lpm_runtime::ensure_runtime(project_dir).await;
+pub async fn ensure_runtime(project_dir: &Path) -> Result<ManagedRuntimeHint, LpmError> {
+    let statuses = lpm_runtime::ensure_runtime(project_dir).await?;
     if statuses.is_empty() {
-        return ManagedRuntimeHint::Absent;
+        return Ok(ManagedRuntimeHint::Absent);
     }
 
     let mut bin_dirs = Vec::with_capacity(statuses.len());
@@ -72,9 +73,9 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
         }
     }
 
-    match bin_dirs.len() {
+    Ok(match bin_dirs.len() {
         0 => ManagedRuntimeHint::Absent,
         1 => ManagedRuntimeHint::Bin(bin_dirs.remove(0)),
         _ => ManagedRuntimeHint::Bins(bin_dirs),
-    }
+    })
 }

@@ -493,9 +493,9 @@ pub async fn run(
     // === Runtime ===
 
     // 8. Node.js version
-    let detected = lpm_runtime::detect::detect_node_version(project_dir);
+    let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
     if let Some(ref det) = detected {
-        let system_node = get_system_node_version(project_dir);
+        let system_node = get_system_node_version(project_dir)?;
         let managed_versions = lpm_runtime::node::list_installed().unwrap_or_default();
 
         let spec = &det.spec;
@@ -527,7 +527,7 @@ pub async fn run(
             ));
         }
     } else {
-        let sys = get_system_node_version(project_dir);
+        let sys = get_system_node_version(project_dir)?;
         if let Some(v) = sys {
             checks.push(Check::pass(
                 &doctor_catalog::NODE_SYSTEM_UNPINNED,
@@ -541,8 +541,8 @@ pub async fn run(
         }
     }
 
-    if let Some(det) = lpm_runtime::detect::detect_bun_version(project_dir) {
-        let system_bun = get_system_bun_version(project_dir);
+    if let Some(det) = lpm_runtime::detect::detect_bun_version(project_dir)? {
+        let system_bun = get_system_bun_version(project_dir)?;
         let managed_versions = lpm_runtime::bun::list_installed().unwrap_or_default();
         let spec = &det.spec;
         let clean = lpm_runtime::bun::normalize_spec(spec);

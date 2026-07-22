@@ -842,6 +842,89 @@ fn run_rejects_oversized_lpm_json_before_spawning_script() {
 }
 
 #[test]
+fn run_rejects_oversized_nvmrc_before_lower_precedence_pin_or_script_spawn() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-nvmrc",
+        "version": "1.0.0",
+        "scripts": {"probe": "node write-marker.js"}
+    }"#,
+    );
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('executed-marker', 'ran')",
+    );
+    project.write_file(".node-version", "20.18.0\n");
+    let path = project.path().join(".nvmrc");
+    write_repeated_file(
+        &path,
+        b"22\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm(&project)
+        .env("LPM_NO_AUTO_INSTALL", "true")
+        .args(["run", "probe"])
+        .output()
+        .expect("run script with oversized .nvmrc");
+
+    assert!(!output.status.success(), "oversized .nvmrc must fail");
+    assert!(
+        !project.file_exists("executed-marker"),
+        "script must not spawn after .nvmrc failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify .nvmrc and limit; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_oversized_node_version_before_system_node_or_script_spawn() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-node-version",
+        "version": "1.0.0",
+        "scripts": {"probe": "node write-marker.js"}
+    }"#,
+    );
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('executed-marker', 'ran')",
+    );
+    let path = project.path().join(".node-version");
+    write_repeated_file(
+        &path,
+        b"20.18.0\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "probe"])
+        .output()
+        .expect("run script with oversized .node-version");
+
+    assert!(
+        !output.status.success(),
+        "oversized .node-version must fail"
+    );
+    assert!(
+        !project.file_exists("executed-marker"),
+        "script must not spawn after .node-version failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify .node-version and limit; got:\n{stderr}"
+    );
+}
+
+#[test]
 fn run_rejects_oversized_dotenv_before_spawning_script() {
     let project = TempProject::empty(
         r#"{

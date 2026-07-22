@@ -249,7 +249,7 @@ fn run_bundle_process(
     options: &BundleOptions,
     stdio: StdioMode,
 ) -> Result<ToolOutcome, LpmError> {
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
     let mut cmd = Command::new("node");
     cmd.arg(engine_entry)
         .args(options.rolldown_args())

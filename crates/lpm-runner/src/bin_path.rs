@@ -96,7 +96,7 @@ impl Default for ManagedRuntimeHint {
 /// Thin wrapper around `build_path_with_bins_pre_resolved` with `Unknown` hint —
 /// preserves the silent-detect contract for callers that don't go through
 /// `ensure_runtime` first (rebuild, dlx, hooks, tools.rs, doctor, orchestrator).
-pub fn build_path_with_bins(start_dir: &Path) -> String {
+pub fn build_path_with_bins(start_dir: &Path) -> lpm_runtime::detect::DetectionResult<String> {
     build_path_with_bins_pre_resolved(start_dir, &ManagedRuntimeHint::Unknown)
 }
 
@@ -107,7 +107,10 @@ pub fn build_path_with_bins(start_dir: &Path) -> String {
 /// 1. `node_modules/.bin` dirs (project-level, then workspace root)
 /// 2. Managed Node.js runtime bin dir, then managed Bun bin dir (per `hint`)
 /// 3. Existing system PATH
-pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntimeHint) -> String {
+pub fn build_path_with_bins_pre_resolved(
+    start_dir: &Path,
+    hint: &ManagedRuntimeHint,
+) -> lpm_runtime::detect::DetectionResult<String> {
     let bin_dirs = find_bin_dirs(start_dir);
     let existing_path = std::env::var("PATH").unwrap_or_default();
     let separator = if cfg!(windows) { ";" } else { ":" };
@@ -128,7 +131,7 @@ pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntime
             // Caller confirmed no managed runtime — skip the silent detect.
         }
         ManagedRuntimeHint::Unknown => {
-            parts.extend(detect_managed_runtime_bins(start_dir));
+            parts.extend(detect_managed_runtime_bins(start_dir)?);
         }
     }
 
@@ -136,7 +139,7 @@ pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntime
         parts.push(existing_path);
     }
 
-    parts.join(separator)
+    Ok(parts.join(separator))
 }
 
 /// Detect if the project has pinned managed runtimes that are installed locally.
@@ -144,14 +147,16 @@ pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntime
 /// If found, returns managed runtime `bin/` directories in PATH precedence order.
 /// Messaging is handled by `ensure_runtime()` in the CLI layer — this function
 /// is a silent PATH builder.
-fn detect_managed_runtime_bins(project_dir: &Path) -> Vec<String> {
+fn detect_managed_runtime_bins(
+    project_dir: &Path,
+) -> lpm_runtime::detect::DetectionResult<Vec<String>> {
     let mut bins = Vec::with_capacity(2);
-    for detected in lpm_runtime::detect::detect_runtime_versions(project_dir) {
+    for detected in lpm_runtime::detect::detect_runtime_versions(project_dir)? {
         if let Some(bin_dir) = detect_one_managed_runtime_bin(&detected) {
             bins.push(bin_dir);
         }
     }
-    bins
+    Ok(bins)
 }
 
 fn detect_one_managed_runtime_bin(
@@ -248,8 +253,27 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
-        let path = build_path_with_bins(dir.path());
+        let path = build_path_with_bins(dir.path()).unwrap();
         assert!(path.starts_with(&bin.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn build_path_unknown_hint_propagates_oversized_runtime_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let path = dir.path().join(".nvmrc");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        assert!(matches!(
+            build_path_with_bins(dir.path()),
+            Err(lpm_common::BoundedReadError::TooLarge {
+                path: error_path,
+                ..
+            }) if error_path == path
+        ));
     }
 
     /// Split the inherited `PATH` env var into the same segment list the
@@ -288,7 +312,8 @@ mod tests {
         let path = build_path_with_bins_pre_resolved(
             dir.path(),
             &ManagedRuntimeHint::Bin(fake_runtime_bin.clone()),
-        );
+        )
+        .unwrap();
 
         let parts = path_segments(&path);
         let inherited = inherited_path_segments();
@@ -319,7 +344,8 @@ mod tests {
         let path = build_path_with_bins_pre_resolved(
             dir.path(),
             &ManagedRuntimeHint::Bins(vec![node_bin.clone(), bun_bin.clone()]),
-        );
+        )
+        .unwrap();
 
         let mut expected: Vec<String> = vec![
             nm_bin.to_string_lossy().to_string(),
@@ -343,7 +369,8 @@ mod tests {
         fs::create_dir_all(&nm_bin).unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
-        let path = build_path_with_bins_pre_resolved(dir.path(), &ManagedRuntimeHint::Absent);
+        let path =
+            build_path_with_bins_pre_resolved(dir.path(), &ManagedRuntimeHint::Absent).unwrap();
 
         let parts = path_segments(&path);
         let inherited = inherited_path_segments();
