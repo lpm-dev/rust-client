@@ -189,6 +189,8 @@ pub fn run_ci_platform(platform: &str, project_dir: &Path, env_mode: &str) -> Re
 fn setup_github_actions(project_dir: &Path, env_mode: &str) {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .unwrap_or_else(|| "<your-vault-id>".to_string());
+    let env_mode = install_ui::field(env_mode);
+    let vault_id = install_ui::field(&vault_id);
 
     println!();
     println!("  {} GitHub Actions OIDC Setup", "▸".bold());
@@ -215,8 +217,8 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
             LPM_VAULT_ID: {VAULT_ID}
         - name: Deploy
           run: lpm run deploy"
-            .replace("{ENV}", env_mode)
-            .replace("{VAULT_ID}", &vault_id)
+            .replace("{ENV}", env_mode.as_ref())
+            .replace("{VAULT_ID}", vault_id.as_ref())
             .dimmed()
     );
     println!();
@@ -233,6 +235,8 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
 }
 
 fn setup_gitlab_ci(env_mode: &str) {
+    let env_mode = install_ui::field(env_mode);
+
     println!();
     println!("  {} GitLab CI OIDC Setup", "▸".bold());
     println!();
@@ -248,7 +252,7 @@ fn setup_gitlab_ci(env_mode: &str) {
     - npm install -g @lpm-registry/cli
     - lpm env pull --oidc --env={ENV} --output=.env
     - lpm run deploy"
-            .replace("{ENV}", env_mode)
+            .replace("{ENV}", env_mode.as_ref())
             .dimmed()
     );
     println!();

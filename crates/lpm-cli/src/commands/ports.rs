@@ -2,6 +2,7 @@ use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json;
 use lpm_runner::ports::{self, ListeningPort};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
@@ -335,22 +336,14 @@ fn render_listening_ports(scope: &str, rows: &[ListeningPort], json_output: bool
 }
 
 fn print_listening_port_table(rows: &[ListeningPort]) {
-    let process_width = bounded_width(
-        rows.iter()
-            .map(|row| display_or_dash(row.process.as_deref()).chars().count()),
-        "Process".len(),
-        28,
-    );
-    let project_width = bounded_width(
-        rows.iter()
-            .map(|row| display_or_dash(row.project.as_deref()).chars().count()),
-        "Project".len(),
-        28,
-    );
-    let framework_width = bounded_width(
-        rows.iter()
-            .map(|row| display_or_dash(row.framework.as_deref()).chars().count()),
-        "Framework".len(),
+    let rows = terminal_listening_port_rows(rows);
+    let process_width =
+        listening_port_cell_width(rows.iter().map(|row| row.process.as_ref()), "Process", 28);
+    let project_width =
+        listening_port_cell_width(rows.iter().map(|row| row.project.as_ref()), "Project", 28);
+    let framework_width = listening_port_cell_width(
+        rows.iter().map(|row| row.framework.as_ref()),
+        "Framework",
         22,
     );
 
@@ -364,10 +357,10 @@ fn print_listening_port_table(rows: &[ListeningPort]) {
         install_ui::dim("Status")
     );
 
-    for row in rows {
-        let process = fit_cell(display_or_dash(row.process.as_deref()), process_width);
-        let project = fit_cell(display_or_dash(row.project.as_deref()), project_width);
-        let framework = fit_cell(display_or_dash(row.framework.as_deref()), framework_width);
+    for row in &rows {
+        let process = fit_cell(&row.process, process_width);
+        let project = fit_cell(&row.project, project_width);
+        let framework = fit_cell(&row.framework, framework_width);
         let pid = row
             .pid
             .map_or_else(|| "-".to_string(), |pid| pid.to_string());
@@ -382,6 +375,38 @@ fn print_listening_port_table(rows: &[ListeningPort]) {
             install_ui::yellow(&format!("{project:<project_width$}")),
         );
     }
+}
+
+struct TerminalListeningPortRow<'a> {
+    port: u16,
+    pid: Option<u32>,
+    process: Cow<'a, str>,
+    project: Cow<'a, str>,
+    framework: Cow<'a, str>,
+}
+
+fn terminal_listening_port_rows(rows: &[ListeningPort]) -> Vec<TerminalListeningPortRow<'_>> {
+    let mut terminal_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        terminal_rows.push(TerminalListeningPortRow {
+            port: row.port,
+            pid: row.pid,
+            process: lpm_common::sanitize_terminal_inline(display_or_dash(row.process.as_deref())),
+            project: lpm_common::sanitize_terminal_inline(display_or_dash(row.project.as_deref())),
+            framework: lpm_common::sanitize_terminal_inline(display_or_dash(
+                row.framework.as_deref(),
+            )),
+        });
+    }
+    terminal_rows
+}
+
+fn listening_port_cell_width<'a>(
+    cells: impl Iterator<Item = &'a str>,
+    header: &str,
+    max: usize,
+) -> usize {
+    bounded_width(cells.map(|cell| cell.chars().count()), header.len(), max)
 }
 
 fn bounded_width(widths: impl Iterator<Item = usize>, header: usize, max: usize) -> usize {
@@ -803,6 +828,58 @@ mod tests {
         assert_eq!(service_list_port("web", &host_only, &overrides), Some(3123));
         assert_eq!(service_list_port("api", &declared, &overrides), Some(3000));
         assert_eq!(service_list_port("worker", &host_only, &overrides), None);
+    }
+
+    #[test]
+    fn listening_port_process_is_sanitized_before_width_and_truncation() {
+        const HOSTILE_PROCESS: &str =
+            "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let rows = [listening_port(3000, Some(42), Some(HOSTILE_PROCESS))];
+        let rows = terminal_listening_port_rows(&rows);
+
+        let width =
+            listening_port_cell_width(rows.iter().map(|row| row.process.as_ref()), "Process", 28);
+        let rendered = fit_cell(&rows[0].process, width);
+
+        assert_eq!(width, "safe?FORGED?rewritten?end".chars().count());
+        assert_eq!(rendered, "safe?FORGED?rewritten?end");
+    }
+
+    #[test]
+    fn listening_port_project_is_sanitized_before_width_and_truncation() {
+        const HOSTILE_PROJECT: &str =
+            "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let mut row = listening_port(3000, Some(42), Some("node"));
+        row.project = Some(HOSTILE_PROJECT.to_string());
+        let rows = [row];
+        let rows = terminal_listening_port_rows(&rows);
+
+        let width =
+            listening_port_cell_width(rows.iter().map(|row| row.project.as_ref()), "Project", 28);
+        let rendered = fit_cell(&rows[0].project, width);
+
+        assert_eq!(width, "safe?FORGED?rewritten?end".chars().count());
+        assert_eq!(rendered, "safe?FORGED?rewritten?end");
+    }
+
+    #[test]
+    fn listening_port_framework_is_sanitized_before_width_and_truncation() {
+        const HOSTILE_FRAMEWORK: &str =
+            "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+        let mut row = listening_port(3000, Some(42), Some("node"));
+        row.framework = Some(HOSTILE_FRAMEWORK.to_string());
+        let rows = [row];
+        let rows = terminal_listening_port_rows(&rows);
+
+        let width = listening_port_cell_width(
+            rows.iter().map(|row| row.framework.as_ref()),
+            "Framework",
+            22,
+        );
+        let rendered = fit_cell(&rows[0].framework, width);
+
+        assert_eq!(width, 22);
+        assert_eq!(rendered, "safe?FORGED?rewritt...");
     }
 
     fn listening_port(port: u16, pid: Option<u32>, process: Option<&str>) -> ListeningPort {

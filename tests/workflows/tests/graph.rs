@@ -14,6 +14,24 @@ mod support;
 use support::TempProject;
 use support::lpm;
 
+const HOSTILE_GRAPH_FIELD: &str =
+    "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+
+fn assert_hostile_graph_field_is_inline_safe(context: &str, rendered: &str) {
+    assert!(
+        rendered.contains("safe?FORGED?rewritten?end"),
+        "{context} must preserve readable graph text without forged rows, got:\n{rendered}"
+    );
+    for attacker_fragment in [
+        "\nFORGED", "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "{context} retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+        );
+    }
+}
+
 /// Use the existing graph fixture (package.json + lpm.lock with a real
 /// transitive shape including a duplicate `ms` package). Copying the
 /// fixture into a TempProject keeps each test isolated.
@@ -140,6 +158,29 @@ fn graph_tree_human_uses_slim_completion() {
         !stderr.contains('●') && !stderr.contains('│'),
         "graph status output must not use cliclack gutter output, got:\n{stderr}"
     );
+}
+
+#[test]
+fn graph_why_argument_cannot_inject_terminal_rows() {
+    let project = graph_fixture();
+
+    let output = lpm(&project)
+        .args(["graph", "--why", HOSTILE_GRAPH_FIELD])
+        .output()
+        .expect("failed to run lpm graph --why with terminal controls");
+
+    assert!(
+        output.status.success(),
+        "graph --why should render the not-found result:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_hostile_graph_field_is_inline_safe("graph --why output", &rendered);
 }
 
 // ─── --format html writes to .lpm/graph.html ────────────────────────

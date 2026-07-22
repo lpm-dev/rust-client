@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use lpm_common::sanitize_terminal_inline;
+
 /// Maximum number of paths returned by `find_all_paths` / `dfs_paths` to prevent
 /// exponential blowup on diamond-heavy graphs.
 const MAX_PATHS: usize = 100;
@@ -308,17 +310,14 @@ pub fn render_tree(graph: &DepGraph, use_color: bool) -> String {
     let dup_info = if graph.stats.duplicates.is_empty() {
         String::new()
     } else {
-        let names: Vec<String> = graph
-            .stats
-            .duplicates
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        format!(
-            ", {} duplicates ({})",
-            graph.stats.duplicates.len(),
-            names.join(", ")
-        )
+        let mut names = String::new();
+        for (index, (name, _)) in graph.stats.duplicates.iter().enumerate() {
+            if index > 0 {
+                names.push_str(", ");
+            }
+            names.push_str(&sanitize_terminal_inline(name));
+        }
+        format!(", {} duplicates ({})", graph.stats.duplicates.len(), names)
     };
     output.push_str(&format!(
         "{} packages, max depth {}{}\n",
@@ -400,11 +399,13 @@ fn render_tree_node(
 }
 
 fn render_tree_label(node: &DepNode, use_color: bool) -> String {
+    let name = sanitize_terminal_inline(&node.name);
+    let version = sanitize_terminal_inline(&node.version);
     format!(
         "{}{}{}",
-        node.name,
+        name,
         color_tree_meta("@", use_color),
-        color_tree_version(&node.version, use_color)
+        color_tree_version(&version, use_color)
     )
 }
 
@@ -822,11 +823,16 @@ pub fn render_stats(graph: &DepGraph) -> String {
     } else {
         output.push_str(&format!("Duplicates: {}\n", graph.stats.duplicates.len()));
         for (name, versions) in &graph.stats.duplicates {
-            let version_list = versions
-                .iter()
-                .map(|v| format!("{name}@{v}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let name = sanitize_terminal_inline(name);
+            let mut version_list = String::new();
+            for (index, version) in versions.iter().enumerate() {
+                if index > 0 {
+                    version_list.push_str(", ");
+                }
+                version_list.push_str(&name);
+                version_list.push('@');
+                version_list.push_str(&sanitize_terminal_inline(version));
+            }
             output.push_str(&format!("  {version_list}\n"));
         }
     }
@@ -842,6 +848,7 @@ pub fn render_why(
     overrides_state: Option<&crate::overrides_state::OverridesState>,
     patch_state: Option<&crate::patch_state::PatchState>,
 ) -> String {
+    let target_display = sanitize_terminal_inline(target_name);
     let is_direct = graph
         .nodes
         .values()
@@ -850,31 +857,32 @@ pub fn render_why(
     let paths = graph.find_paths(target_name);
 
     if paths.is_empty() {
-        return format!("{target_name} is not in your dependency tree.\n");
+        return format!("{target_display} is not in your dependency tree.\n");
     }
 
     let mut output = String::new();
 
     if is_direct {
-        output.push_str(&format!("{target_name} is a direct dependency.\n\n"));
+        output.push_str(&format!("{target_display} is a direct dependency.\n\n"));
     }
 
     output.push_str(&format!(
-        "{target_name} is required by {} path(s):\n\n",
+        "{target_display} is required by {} path(s):\n\n",
         paths.len()
     ));
 
     for path in &paths {
-        let display = path
-            .iter()
-            .map(|k| {
-                graph
-                    .nodes
-                    .get(k)
-                    .map_or_else(|| k.clone(), |n| format!("{}@{}", n.name, n.version))
-            })
-            .collect::<Vec<_>>()
-            .join(" → ");
+        let mut display = String::with_capacity(path.len().saturating_mul(24));
+        for (index, key) in path.iter().enumerate() {
+            if index > 0 {
+                display.push_str(" → ");
+            }
+            if let Some(node) = graph.nodes.get(key) {
+                display.push_str(&terminal_package_label(&node.name, &node.version));
+            } else {
+                display.push_str(&sanitize_terminal_inline(key));
+            }
+        }
         output.push_str(&format!("  {display}\n"));
     }
 
@@ -909,14 +917,18 @@ pub fn render_why(
             output.push_str("Overrides applied to this package:\n");
             for hit in matching {
                 let parent_suffix = match &hit.via_parent {
-                    Some(p) => format!(", reached through {p}"),
+                    Some(parent) => {
+                        format!(", reached through {}", sanitize_terminal_inline(parent))
+                    }
                     None => String::new(),
                 };
+                let from_version = sanitize_terminal_inline(&hit.from_version);
+                let to_version = sanitize_terminal_inline(&hit.to_version);
+                let source_display = hit.source_display();
+                let source_display = sanitize_terminal_inline(&source_display);
                 output.push_str(&format!(
                     "  {} → {} (via {}{parent_suffix})\n",
-                    hit.from_version,
-                    hit.to_version,
-                    hit.source_display(),
+                    from_version, to_version, source_display,
                 ));
             }
         }
@@ -952,19 +964,31 @@ pub fn render_why(
                 };
                 let integrity_part = match &hit.original_integrity {
                     Some(integ) => {
-                        format!("originalIntegrity {}", truncate_integrity(integ))
+                        let integ = sanitize_terminal_inline(integ);
+                        format!("originalIntegrity {}", truncate_integrity(&integ))
                     }
                     None => "originalIntegrity recorded".to_string(),
                 };
+                let patch_path = sanitize_terminal_inline(&hit.patch_path);
                 output.push_str(&format!(
                     "  {} ({}{})\n",
-                    hit.patch_path, file_part, integrity_part,
+                    patch_path, file_part, integrity_part,
                 ));
             }
         }
     }
 
     output
+}
+
+fn terminal_package_label(name: &str, version: &str) -> String {
+    let name = sanitize_terminal_inline(name);
+    let version = sanitize_terminal_inline(version);
+    let mut label = String::with_capacity(name.len() + 1 + version.len());
+    label.push_str(&name);
+    label.push('@');
+    label.push_str(&version);
+    label
 }
 
 /// Truncate an SRI integrity hash for compact human-readable display.
@@ -1105,6 +1129,25 @@ pub fn render_html(graph: &DepGraph) -> Result<String, serde_json::Error> {
 mod tests {
     use super::*;
     use lpm_lockfile::LockedPackage;
+
+    const HOSTILE_TERMINAL_FIELD: &str =
+        "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+
+    fn assert_hostile_terminal_field_is_inline_safe(context: &str, rendered: &str) {
+        assert!(
+            rendered.contains("safe?FORGED?rewritten?end"),
+            "{context} must preserve readable graph text without forged rows, got:\n{rendered}"
+        );
+        for attacker_fragment in [
+            "\nFORGED", "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}",
+            "hidden",
+        ] {
+            assert!(
+                !rendered.contains(attacker_fragment),
+                "{context} retained attacker fragment {attacker_fragment:?}:\n{rendered}"
+            );
+        }
+    }
 
     fn mock_packages() -> Vec<LockedPackage> {
         vec![
@@ -2036,6 +2079,55 @@ mod tests {
     }
 
     #[test]
+    fn render_tree_sanitizes_package_name_and_version_fields() {
+        let mut packages = mock_packages();
+        packages[0].name = HOSTILE_TERMINAL_FIELD.to_string();
+        packages[0].version = HOSTILE_TERMINAL_FIELD.to_string();
+        let direct = HashSet::from([HOSTILE_TERMINAL_FIELD.to_string()]);
+        let mut graph = DepGraph::from_lockfile(&packages, &direct, "test-app@1.0.0");
+        graph.stats.duplicates = vec![(
+            HOSTILE_TERMINAL_FIELD.to_string(),
+            vec!["1.0.0".to_string(), "2.0.0".to_string()],
+        )];
+
+        let tree = render_tree(&graph, false);
+
+        assert_hostile_terminal_field_is_inline_safe("graph tree output", &tree);
+    }
+
+    #[test]
+    fn render_tree_sanitizes_package_fields_before_lpm_styling() {
+        let mut packages = mock_packages();
+        packages[0].name = HOSTILE_TERMINAL_FIELD.to_string();
+        packages[0].version = HOSTILE_TERMINAL_FIELD.to_string();
+        let direct = HashSet::from([HOSTILE_TERMINAL_FIELD.to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "test-app@1.0.0");
+
+        let tree = render_tree(&graph, true);
+
+        assert!(
+            tree.contains("\u{1b}[33msafe?FORGED?rewritten?end\u{1b}[39m"),
+            "LPM version styling must wrap the sanitized value: {tree}"
+        );
+        assert!(!tree.contains("\u{1b}]52"));
+        assert!(!tree.contains("\nFORGED"));
+        assert!(!tree.contains("hidden"));
+    }
+
+    #[test]
+    fn render_stats_sanitizes_duplicate_package_fields() {
+        let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        graph.stats.duplicates = vec![(
+            HOSTILE_TERMINAL_FIELD.to_string(),
+            vec![HOSTILE_TERMINAL_FIELD.to_string(), "2.0.0".to_string()],
+        )];
+
+        let stats = render_stats(&graph);
+
+        assert_hostile_terminal_field_is_inline_safe("graph stats output", &stats);
+    }
+
+    #[test]
     fn render_tree_has_ansi_when_color_enabled() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let tree = render_tree(&graph, true);
@@ -2115,6 +2207,19 @@ mod tests {
         );
         assert!(why.contains("required by"), "should also show paths: {why}");
         assert!(why.contains("→"), "should contain path arrows: {why}");
+    }
+
+    #[test]
+    fn render_why_sanitizes_package_names_and_versions_in_paths() {
+        let mut packages = mock_packages();
+        packages[0].name = HOSTILE_TERMINAL_FIELD.to_string();
+        packages[0].version = HOSTILE_TERMINAL_FIELD.to_string();
+        let direct = HashSet::from([HOSTILE_TERMINAL_FIELD.to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "test-app@1.0.0");
+
+        let why = render_why(&graph, HOSTILE_TERMINAL_FIELD, None, None);
+
+        assert_hostile_terminal_field_is_inline_safe("graph why path output", &why);
     }
 
     // ── JSON root field ─────────────────────────────────────
@@ -2447,6 +2552,21 @@ mod tests {
     }
 
     #[test]
+    fn render_why_sanitizes_override_trace_fields() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let state = fake_overrides_state(
+            "ms",
+            HOSTILE_TERMINAL_FIELD,
+            HOSTILE_TERMINAL_FIELD,
+            Some(HOSTILE_TERMINAL_FIELD),
+        );
+
+        let why = render_why(&graph, "ms", Some(&state), None);
+
+        assert_hostile_terminal_field_is_inline_safe("graph override trace", &why);
+    }
+
+    #[test]
     fn render_why_skips_override_section_when_no_match() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         // Override is for a different package; should not appear in `ms`'s why output.
@@ -2541,6 +2661,18 @@ mod tests {
             !why.contains("originalIntegrity recorded"),
             "must NOT emit the legacy placeholder when integrity is known: {why}"
         );
+    }
+
+    #[test]
+    fn render_why_sanitizes_patch_trace_fields() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let mut state = fake_patch_state("ms");
+        state.applied[0].patch_path = HOSTILE_TERMINAL_FIELD.to_string();
+        state.applied[0].original_integrity = Some(HOSTILE_TERMINAL_FIELD.to_string());
+
+        let why = render_why(&graph, "ms", None, Some(&state));
+
+        assert_hostile_terminal_field_is_inline_safe("graph patch trace", &why);
     }
 
     #[test]
