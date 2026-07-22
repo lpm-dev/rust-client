@@ -1177,25 +1177,72 @@ fn npm_firewall_decision_json(decision: &NpmFirewallDecision) -> serde_json::Val
             "external_intel": authority.external_intel,
         });
     }
+    if let Some(display) = &decision.display {
+        json["display"] = serde_json::json!({
+            "summary": &display.summary,
+            "report_url": &display.report_url,
+        });
+    }
     json
 }
 
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {
     for decision in decisions {
-        let name = lpm_common::sanitize_for_terminal(&decision.name);
-        let version = lpm_common::sanitize_for_terminal(&decision.version);
-        let verdict = lpm_common::sanitize_for_terminal(&decision.verdict);
-        let reason = lpm_common::sanitize_for_terminal(&decision.reason);
-        let context = firewall_decision_context(decision);
-        eprintln!("    {name}@{version} - {verdict}: {reason}{context}");
+        for line in firewall_decision_lines(decision) {
+            eprintln!("{line}");
+        }
     }
+}
+
+fn firewall_decision_lines(decision: &NpmFirewallDecision) -> Vec<String> {
+    let name = lpm_common::sanitize_for_terminal(&decision.name);
+    let version = lpm_common::sanitize_for_terminal(&decision.version);
+    if let Some(display) = &decision.display
+        && let Some(summary) = non_empty_display_text(display.summary.as_deref())
+    {
+        let action = decision.action.as_str();
+        let summary = lpm_common::sanitize_for_terminal(summary);
+        let mut lines = vec![format!("    {name}@{version} - {action}: {summary}")];
+        if let Some(report_url) = non_empty_display_text(display.report_url.as_deref()) {
+            let report_url = lpm_common::sanitize_for_terminal(report_url);
+            lines.push(format!("    report: {report_url}"));
+        }
+        return lines;
+    }
+
+    let verdict = lpm_common::sanitize_for_terminal(&decision.verdict);
+    let reason = lpm_common::sanitize_for_terminal(&decision.reason);
+    let context = firewall_decision_context(decision);
+    let mut lines = vec![format!(
+        "    {name}@{version} - {verdict}: {reason}{context}"
+    )];
+    if let Some(report_url) = decision
+        .display
+        .as_ref()
+        .and_then(|display| non_empty_display_text(display.report_url.as_deref()))
+    {
+        let report_url = lpm_common::sanitize_for_terminal(report_url);
+        lines.push(format!("    report: {report_url}"));
+    }
+    lines
+}
+
+fn non_empty_display_text(value: Option<&str>) -> Option<&str> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
 fn firewall_decision_context(decision: &NpmFirewallDecision) -> String {
     let policy = decision.policy.as_ref().map(|policy| {
         format!(
             "policy {}",
-            lpm_common::sanitize_for_terminal(&policy.group)
+            lpm_common::sanitize_for_terminal(firewall_policy_group_label(&policy.group))
         )
     });
     let authority = decision.authority.as_ref().map(|authority| {
@@ -1209,5 +1256,133 @@ fn firewall_decision_context(decision: &NpmFirewallDecision) -> String {
         (Some(policy), None) => format!(" ({policy})"),
         (None, Some(authority)) => format!(" ({authority})"),
         (None, None) => String::new(),
+    }
+}
+
+fn firewall_policy_group_label(group: &str) -> &str {
+    if group == "static_only_suspicious" {
+        "lpm_ai_suspicious"
+    } else {
+        group
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lpm_registry::client::{
+        NpmFirewallDecisionAuthority, NpmFirewallDecisionDisplay, NpmFirewallDecisionPolicy,
+    };
+
+    #[test]
+    fn firewall_decision_context_renders_legacy_static_only_group_as_ai_suspicious() {
+        let decision = NpmFirewallDecision {
+            decision_id: "decision-1".to_string(),
+            name: "legacy-ai-warning".to_string(),
+            version: "1.0.0".to_string(),
+            action: NpmFirewallAction::Warn,
+            verdict: "suspicious".to_string(),
+            reason: "client policy maps lpm_ai_suspicious to warn".to_string(),
+            match_source: "package".to_string(),
+            matched_key: None,
+            policy_mode: "product_default".to_string(),
+            enqueue_scan: false,
+            scanned_at: None,
+            scan_run_id: None,
+            report_path: None,
+            confidence: None,
+            policy: Some(NpmFirewallDecisionPolicy {
+                group: "static_only_suspicious".to_string(),
+                key: None,
+                intent: None,
+                default_action: None,
+            }),
+            authority: Some(NpmFirewallDecisionAuthority {
+                source: "lpm_ai".to_string(),
+                source_type: Some("lpm".to_string()),
+                external_intel: Some(false),
+            }),
+            display: None,
+        };
+
+        assert_eq!(
+            firewall_decision_context(&decision),
+            " (policy lpm_ai_suspicious, source lpm_ai)"
+        );
+    }
+
+    #[test]
+    fn firewall_decision_lines_prefer_display_summary_and_report_url() {
+        let decision = NpmFirewallDecision {
+            decision_id: "decision-1".to_string(),
+            name: "moi-computer".to_string(),
+            version: "0.1.0".to_string(),
+            action: NpmFirewallAction::Warn,
+            verdict: "suspicious".to_string(),
+            reason: "client policy maps lpm_ai_suspicious to warn".to_string(),
+            match_source: "package".to_string(),
+            matched_key: None,
+            policy_mode: "product_default".to_string(),
+            enqueue_scan: false,
+            scanned_at: None,
+            scan_run_id: None,
+            report_path: None,
+            confidence: None,
+            policy: None,
+            authority: None,
+            display: Some(NpmFirewallDecisionDisplay {
+                summary: Some(
+                    "May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces."
+                        .to_string(),
+                ),
+                report_url: Some("https://firewall.lpm.dev/npm/moi-computer/v/0.1.0".to_string()),
+            }),
+        };
+
+        assert_eq!(
+            firewall_decision_lines(&decision),
+            vec![
+                "    moi-computer@0.1.0 - warn: May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces.".to_string(),
+                "    report: https://firewall.lpm.dev/npm/moi-computer/v/0.1.0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_firewall_decision_json_includes_display_metadata() {
+        let decision = NpmFirewallDecision {
+            decision_id: "decision-1".to_string(),
+            name: "n8n-nodes-pwn".to_string(),
+            version: "1.0.1".to_string(),
+            action: NpmFirewallAction::Block,
+            verdict: "malicious".to_string(),
+            reason: "client policy maps lpm_ai_confirmed_malware to block".to_string(),
+            match_source: "package".to_string(),
+            matched_key: None,
+            policy_mode: "product_default".to_string(),
+            enqueue_scan: false,
+            scanned_at: None,
+            scan_run_id: None,
+            report_path: None,
+            confidence: Some(0.99),
+            policy: None,
+            authority: None,
+            display: Some(NpmFirewallDecisionDisplay {
+                summary: Some(
+                    "Host and potentially sensitive root-readable file contents are sent to a hard-coded external host."
+                        .to_string(),
+                ),
+                report_url: Some("https://firewall.lpm.dev/npm/n8n-nodes-pwn/v/1.0.1".to_string()),
+            }),
+        };
+
+        let json = npm_firewall_decision_json(&decision);
+        assert_eq!(
+            json["display"],
+            serde_json::json!({
+                "summary": "Host and potentially sensitive root-readable file contents are sent to a hard-coded external host.",
+                "report_url": "https://firewall.lpm.dev/npm/n8n-nodes-pwn/v/1.0.1",
+            })
+        );
     }
 }

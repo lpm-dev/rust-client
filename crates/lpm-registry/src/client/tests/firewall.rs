@@ -76,7 +76,11 @@ async fn npm_firewall_batch_verdicts_sends_bearer_auth_header_when_token_is_pres
                         "reason": "product_default policy maps malicious to block",
                         "matchSource": "package",
                         "matchedKey": "fw:npm:v1:left-pad@1.3.0",
-                        "policyMode": "product_default"
+                        "policyMode": "product_default",
+                        "display": {
+                            "summary": "OSV advisory MAL-2026-1 reports malicious code in left-pad.",
+                            "reportUrl": "https://firewall.lpm.dev/npm/left-pad/v/1.3.0"
+                        }
                     }]
                 })),
         )
@@ -96,6 +100,20 @@ async fn npm_firewall_batch_verdicts_sends_bearer_auth_header_when_token_is_pres
 
     assert_eq!(result.summary.block, 1);
     assert_eq!(result.decisions[0].action, NpmFirewallAction::Block);
+    assert_eq!(
+        result.decisions[0]
+            .display
+            .as_ref()
+            .and_then(|display| display.summary.as_deref()),
+        Some("OSV advisory MAL-2026-1 reports malicious code in left-pad.")
+    );
+    assert_eq!(
+        result.decisions[0]
+            .display
+            .as_ref()
+            .and_then(|display| display.report_url.as_deref()),
+        Some("https://firewall.lpm.dev/npm/left-pad/v/1.3.0")
+    );
     let diagnostics = result
         .diagnostics
         .expect("firewall diagnostics should be preserved");
@@ -182,6 +200,7 @@ async fn npm_firewall_batch_verdicts_sends_policy_profile_when_configured() {
         .and(body_string_contains(
             "\"lpmAiAgentControlSurface\":\"warn\"",
         ))
+        .and(body_string_contains("\"lpmAiSuspicious\":\"allow\""))
         .respond_with(
             ResponseTemplate::new(200)
                 .append_header("content-type", "application/json")
@@ -235,6 +254,7 @@ async fn npm_firewall_batch_verdicts_sends_policy_profile_when_configured() {
             AuthPosture::AnonymousPreferred,
             Some(NpmFirewallPolicyProfile {
                 lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Warn,
+                lpm_ai_suspicious: NpmFirewallPolicyAction::Allow,
                 ..NpmFirewallPolicyProfile::default()
             }),
         )

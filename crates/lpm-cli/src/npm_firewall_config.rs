@@ -14,8 +14,9 @@ pub(crate) const TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY: &str =
     "trusted_public_malicious_advisories";
 pub(crate) const LPM_AI_CONFIRMED_MALWARE_POLICY_KEY: &str = "lpm_ai_confirmed_malware";
 pub(crate) const LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY: &str = "lpm_ai_agent_control_surface";
+pub(crate) const LPM_AI_SUSPICIOUS_POLICY_KEY: &str = "lpm_ai_suspicious";
 pub(crate) const CRITICAL_VULNERABILITY_POLICY_KEY: &str = "critical_vulnerability";
-pub(crate) const STATIC_ONLY_SUSPICIOUS_POLICY_KEY: &str = "static_only_suspicious";
+pub(crate) const LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY: &str = "static_only_suspicious";
 
 const ENV_NPM_FIREWALL: &str = "LPM_NPM_FIREWALL";
 const ENV_EXPERIMENT_NPM_FIREWALL: &str = "LPM_EXPERIMENT_NPM_FIREWALL";
@@ -198,7 +199,11 @@ pub(crate) fn config_policy_profile(
         ))
     })?;
     let mut profile = NpmFirewallPolicyProfile::default();
+    let has_canonical_ai_suspicious = policies.contains_key(LPM_AI_SUSPICIOUS_POLICY_KEY);
     for (key, value) in policies {
+        if key == LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY && has_canonical_ai_suspicious {
+            continue;
+        }
         let raw = value.as_str().ok_or_else(|| {
             LpmError::Registry(format!(
                 "`{FIREWALL_NPM_POLICIES_CONFIG_PATH}.{key}` must be a string: allow | warn | block"
@@ -219,11 +224,14 @@ pub(crate) fn config_policy_profile(
             LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY => {
                 profile.lpm_ai_agent_control_surface = action;
             }
+            LPM_AI_SUSPICIOUS_POLICY_KEY => {
+                profile.lpm_ai_suspicious = action;
+            }
             CRITICAL_VULNERABILITY_POLICY_KEY => {
                 profile.critical_vulnerability = action;
             }
-            STATIC_ONLY_SUSPICIOUS_POLICY_KEY => {
-                profile.static_only_suspicious = action;
+            LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY if !has_canonical_ai_suspicious => {
+                profile.lpm_ai_suspicious = action;
             }
             _ => {
                 return Err(LpmError::Registry(format!(
@@ -353,6 +361,7 @@ mod tests {
             profile.critical_vulnerability,
             NpmFirewallPolicyAction::Warn
         );
+        assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Warn);
     }
 
     #[test]
@@ -365,6 +374,10 @@ mod tests {
         policies.insert(
             TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY.to_string(),
             toml::Value::String("block".to_string()),
+        );
+        policies.insert(
+            LPM_AI_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("allow".to_string()),
         );
         let mut npm = toml::map::Map::new();
         npm.insert(
@@ -393,6 +406,69 @@ mod tests {
             profile.trusted_public_malicious_advisories,
             NpmFirewallPolicyAction::Block
         );
+        assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Allow);
+    }
+
+    #[test]
+    fn npm_firewall_config_policy_profile_accepts_legacy_static_only_suspicious_key() {
+        let mut policies = toml::map::Map::new();
+        policies.insert(
+            LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("allow".to_string()),
+        );
+        let mut npm = toml::map::Map::new();
+        npm.insert(
+            FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+            toml::Value::Table(policies),
+        );
+        let mut firewall = toml::map::Map::new();
+        firewall.insert(
+            FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+        let mut table = toml::map::Map::new();
+        table.insert(
+            FIREWALL_CONFIG_SECTION.to_string(),
+            toml::Value::Table(firewall),
+        );
+        let global = GlobalConfig::from_table(table);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Allow);
+    }
+
+    #[test]
+    fn npm_firewall_config_policy_profile_prefers_canonical_ai_suspicious_key() {
+        let mut policies = toml::map::Map::new();
+        policies.insert(
+            LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("allow".to_string()),
+        );
+        policies.insert(
+            LPM_AI_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("warn".to_string()),
+        );
+        let mut npm = toml::map::Map::new();
+        npm.insert(
+            FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+            toml::Value::Table(policies),
+        );
+        let mut firewall = toml::map::Map::new();
+        firewall.insert(
+            FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+        let mut table = toml::map::Map::new();
+        table.insert(
+            FIREWALL_CONFIG_SECTION.to_string(),
+            toml::Value::Table(firewall),
+        );
+        let global = GlobalConfig::from_table(table);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Warn);
     }
 
     #[test]

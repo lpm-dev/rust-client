@@ -224,9 +224,10 @@ pub(in crate::commands::config) fn persist_firewall_policy_profile_in_config_val
         crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY.to_string(),
         policy_action_value(profile.critical_vulnerability),
     );
+    policies_table.remove(crate::npm_firewall_config::LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY);
     policies_table.insert(
-        crate::npm_firewall_config::STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
-        policy_action_value(profile.static_only_suspicious),
+        crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY.to_string(),
+        policy_action_value(profile.lpm_ai_suspicious),
     );
     Ok(())
 }
@@ -291,8 +292,8 @@ fn policy_profile_json(profile: NpmFirewallPolicyProfile) -> serde_json::Value {
         serde_json::Value::String(profile.critical_vulnerability.as_str().to_string()),
     );
     policies.insert(
-        crate::npm_firewall_config::STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
-        serde_json::Value::String(profile.static_only_suspicious.as_str().to_string()),
+        crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY.to_string(),
+        serde_json::Value::String(profile.lpm_ai_suspicious.as_str().to_string()),
     );
     serde_json::Value::Object(policies)
 }
@@ -303,7 +304,7 @@ enum FirewallPolicyField {
     LpmAiConfirmedMalware,
     LpmAiAgentControlSurface,
     CriticalVulnerability,
-    StaticOnlySuspicious,
+    LpmAiSuspicious,
 }
 
 impl FirewallPolicyField {
@@ -313,7 +314,7 @@ impl FirewallPolicyField {
             Self::LpmAiConfirmedMalware => profile.lpm_ai_confirmed_malware,
             Self::LpmAiAgentControlSurface => profile.lpm_ai_agent_control_surface,
             Self::CriticalVulnerability => profile.critical_vulnerability,
-            Self::StaticOnlySuspicious => profile.static_only_suspicious,
+            Self::LpmAiSuspicious => profile.lpm_ai_suspicious,
         }
     }
 
@@ -325,7 +326,7 @@ impl FirewallPolicyField {
             Self::LpmAiConfirmedMalware => profile.lpm_ai_confirmed_malware = action,
             Self::LpmAiAgentControlSurface => profile.lpm_ai_agent_control_surface = action,
             Self::CriticalVulnerability => profile.critical_vulnerability = action,
-            Self::StaticOnlySuspicious => profile.static_only_suspicious = action,
+            Self::LpmAiSuspicious => profile.lpm_ai_suspicious = action,
         }
     }
 
@@ -335,7 +336,7 @@ impl FirewallPolicyField {
             | Self::LpmAiConfirmedMalware
             | Self::LpmAiAgentControlSurface
             | Self::CriticalVulnerability => &BLOCK_WARN_ALLOW_ACTIONS,
-            Self::StaticOnlySuspicious => &WARN_ALLOW_ACTIONS,
+            Self::LpmAiSuspicious => &WARN_ALLOW_ACTIONS,
         }
     }
 }
@@ -369,9 +370,9 @@ const FIREWALL_POLICY_GROUPS: [FirewallPolicyGroup; 5] = [
         detail: "Legitimate package risk without malicious author intent",
     },
     FirewallPolicyGroup {
-        field: FirewallPolicyField::StaticOnlySuspicious,
-        title: "Static-only suspicious signals",
-        detail: "No AI or trusted advisory confirmation yet",
+        field: FirewallPolicyField::LpmAiSuspicious,
+        title: "LPM Firewall AI-suspicious findings",
+        detail: "AI-reviewed suspicious findings without confirmed malware intent",
     },
 ];
 
@@ -641,7 +642,7 @@ mod tests {
         assert!(plain.contains("LPM Firewall AI-confirmed malware"));
         assert!(plain.contains("LPM Firewall AI-agent control-surface policy"));
         assert!(plain.contains("Critical vulnerabilities"));
-        assert!(plain.contains("Static-only suspicious signals"));
+        assert!(plain.contains("LPM Firewall AI-suspicious findings"));
     }
 
     #[test]
@@ -683,19 +684,19 @@ mod tests {
     }
 
     #[test]
-    fn firewall_policy_editor_preserves_manual_static_only_block_action() {
+    fn firewall_policy_editor_preserves_manual_ai_suspicious_block_action() {
         let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile {
-            static_only_suspicious: NpmFirewallPolicyAction::Block,
+            lpm_ai_suspicious: NpmFirewallPolicyAction::Block,
             ..NpmFirewallPolicyProfile::default()
         });
-        let static_only = rows
+        let ai_suspicious = rows
             .iter()
-            .find(|row| row.group.field == FirewallPolicyField::StaticOnlySuspicious)
-            .expect("static-only suspicious row must exist");
+            .find(|row| row.group.field == FirewallPolicyField::LpmAiSuspicious)
+            .expect("AI-suspicious row must exist");
 
-        assert_eq!(static_only.action, NpmFirewallPolicyAction::Block);
+        assert_eq!(ai_suspicious.action, NpmFirewallPolicyAction::Block);
         assert!(
-            static_only
+            ai_suspicious
                 .actions
                 .contains(&NpmFirewallPolicyAction::Block)
         );
@@ -715,7 +716,7 @@ mod tests {
     fn default_enforce_policy_with_existing_policy_table_persists_to_reset_custom_values() {
         let mut policies = toml::map::Map::new();
         policies.insert(
-            crate::npm_firewall_config::STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
+            crate::npm_firewall_config::LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
             toml::Value::String("allow".to_string()),
         );
         let mut npm = toml::map::Map::new();
