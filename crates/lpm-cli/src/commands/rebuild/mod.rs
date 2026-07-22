@@ -357,7 +357,7 @@ async fn run_under_store_lock(
         // Surface drift to the user — even though the script is skipped,
         // they need to know WHY so they can re-review with `lpm approve-scripts`.
         if trust_reason == TrustReason::BindingDrift && !json_output {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{}: stored approval drifted (script changed since approval). \
                  Re-run `lpm approve-scripts {}` to re-review.",
                 lp.name, lp.name,
@@ -369,7 +369,7 @@ async fn run_under_store_lock(
         // `LegacyName` only when `TrustMatch::LegacyNameOnly` won AND
         // scope did not).
         if trust_reason == TrustReason::LegacyName && !json_output {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{}: legacy bare-name trustedDependencies entry — run \
                  `lpm approve-scripts {}` to upgrade to a strict (script-hash-bound) approval",
                 lp.name, lp.name,
@@ -423,7 +423,7 @@ async fn run_under_store_lock(
             .filter(|p| p.trust_reason == TrustReason::SuspendedByForceFloor)
             .count();
         if suspended_count > 0 {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{suspended_count} approval(s) suspended by \
                  `force-security-floor = true` in ~/.lpm/config.toml. \
                  Run `lpm config unset force-security-floor` to reactivate."
@@ -465,7 +465,7 @@ async fn run_under_store_lock(
                 None => {
                     let safe_name = lpm_common::sanitize_for_terminal(name);
                     if !json_output {
-                        install_ui::warn(&format!(
+                        install_ui::warn_untrusted(&format!(
                             "{safe_name} has no lifecycle scripts or is not installed"
                         ));
                     }
@@ -552,7 +552,7 @@ async fn run_under_store_lock(
                 && specific_packages.is_empty()
                 && effective_policy != ScriptPolicy::Allow
             {
-                install_ui::warn(&format!(
+                install_ui::warn_untrusted(&format!(
                     "{untrusted_unbuilt_count_local} package(s) are not in trustedDependencies and will be skipped."
                 ));
                 if effective_policy == ScriptPolicy::Triage {
@@ -568,7 +568,7 @@ async fn run_under_store_lock(
                     );
                 }
             } else {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "All {built}/{total} packages with scripts are already built."
                 ));
                 if !force {
@@ -590,7 +590,7 @@ async fn run_under_store_lock(
             let json = rebuild_dry_run_envelope(&to_build, force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            install_ui::phase(&format!(
+            install_ui::phase_untrusted(&format!(
                 "Dry run: {} package(s) would be built:",
                 to_build.len()
             ));
@@ -608,24 +608,30 @@ async fn run_under_store_lock(
                 let trust = if pkg.is_trusted {
                     match pkg.trust_reason {
                         TrustReason::GreenTierUnderTriage => {
-                            "trusted ✓ (green-tier auto-approval)".green().to_string()
+                            install_ui::green("trusted ✓ (green-tier auto-approval)")
                         }
-                        _ => "trusted ✓".green().to_string(),
+                        _ => install_ui::green("trusted ✓"),
                     }
                 } else {
-                    "not trusted".yellow().to_string()
+                    install_ui::yellow("not trusted")
                 };
                 println!(
-                    "\n  {} {} ({})",
-                    install_ui::bold(&pkg.name),
-                    install_ui::dim(&format!("({})", pkg.version)),
-                    trust,
+                    "\n{}",
+                    crate::install_ui::terminal_line!(
+                        "  {} {} ({})",
+                        install_ui::bold(&pkg.name),
+                        install_ui::dim(&format!("({})", pkg.version)),
+                        trust,
+                    )
                 );
                 for (phase, cmd) in &pkg.scripts {
                     println!(
-                        "    {}: {}",
-                        lpm_common::sanitize_terminal_inline(phase),
-                        install_ui::dim(cmd)
+                        "{}",
+                        crate::install_ui::terminal_line!(
+                            "    {}: {}",
+                            phase,
+                            install_ui::dim(cmd)
+                        )
                     );
                 }
             }
@@ -694,7 +700,7 @@ async fn run_under_store_lock(
         && specific_packages.is_empty()
         && effective_policy != ScriptPolicy::Allow
     {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "{untrusted_unbuilt_count} package(s) are not in trustedDependencies and will be skipped."
         ));
         if effective_policy == ScriptPolicy::Triage {
@@ -726,7 +732,7 @@ async fn run_under_store_lock(
             .filter(|p| p.trust_reason == TrustReason::GreenTierUnderTriage)
             .count();
         if green_auto_count > 0 {
-            install_ui::phase(&format!(
+            install_ui::phase_untrusted(&format!(
                 "  {green_auto_count} of these were auto-approved by green-tier classification \
                  (script-policy = \"triage\"). Run `lpm rebuild --dry-run` to see why."
             ));
@@ -998,7 +1004,7 @@ async fn run_under_store_lock(
             // is a security signal a strict-mode user must not miss.
             tracing::warn!(target: "lpm_cli::sandbox", "{line}");
             if !json_output {
-                install_ui::warn(&line);
+                install_ui::warn_untrusted(&line);
                 install_ui::warn(
                     "strict sandbox requested but kernel-level network containment is NOT \
                      enforced under this posture. Lifecycle scripts can reach the network. \
@@ -1061,7 +1067,7 @@ async fn run_under_store_lock(
         && let Some(line) =
             crate::sandbox_config::strict_banner_for_runtime(sandbox_mode, resolved_sandbox_mode)
     {
-        install_ui::warn(line);
+        install_ui::warn_untrusted(line);
     }
     if sandbox_log {
         // The `--sandbox-log` banner is a SECURITY signal — the user
@@ -1109,16 +1115,17 @@ async fn run_under_store_lock(
                 Ok(lock) => Some(lock),
                 Err(error) => {
                     if !json_output {
-                        let label = rebuild_package_label(pkg);
+                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
                         let error = error.to_string();
-                        install_ui::detail(&format!(
-                            "  {} {label:<package_label_width$}  failed to lock package build state: {}",
+                        install_ui::detail_line(crate::install_ui::terminal_line!(
+                            "  {} {}  failed to lock package build state: {}",
                             install_ui::red("✗"),
+                            label,
                             lpm_common::sanitize_terminal_inline(&error),
                         ));
                     }
                     if json_output {
-                        install_ui::failed(&rebuild_package_failure_message(pkg, &error));
+                        install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error));
                     }
                     failures += 1;
                     continue;
@@ -1172,16 +1179,17 @@ async fn run_under_store_lock(
             Ok(d) => d,
             Err(e) => {
                 if !json_output {
-                    let label = rebuild_package_label(pkg);
+                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
                     let error = e.to_string();
-                    install_ui::detail(&format!(
-                        "  {} {label:<package_label_width$}  {}",
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} {}  {}",
                         install_ui::red("✗"),
+                        label,
                         lpm_common::sanitize_terminal_inline(&error),
                     ));
                 }
                 if json_output {
-                    install_ui::failed(&rebuild_package_failure_message(pkg, &e));
+                    install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &e));
                 }
                 failures += 1;
                 continue;
@@ -1247,10 +1255,12 @@ async fn run_under_store_lock(
                                 );
                             }
                             if !json_output {
-                                let label = rebuild_package_label(pkg);
-                                install_ui::detail(&format!(
-                                    "  {} {label:<package_label_width$}  {}",
+                                let label =
+                                    format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                                install_ui::detail_line(crate::install_ui::terminal_line!(
+                                    "  {} {}  {}",
                                     install_ui::green("✓"),
+                                    label,
                                     install_ui::dim("build cache hit"),
                                 ));
                             }
@@ -1298,11 +1308,12 @@ async fn run_under_store_lock(
                 build_cache_metrics.rematerialize_ms +=
                     elapsed_millis(rematerialize_start.elapsed());
                 if !json_output {
-                    let label = rebuild_package_label(pkg);
+                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
                     let error = error.to_string();
-                    install_ui::detail(&format!(
-                        "  {} {label:<package_label_width$}  failed to restore pristine source: {}",
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} {}  failed to restore pristine source: {}",
                         install_ui::red("✗"),
+                        label,
                         lpm_common::sanitize_terminal_inline(&error),
                     ));
                 }
@@ -1364,10 +1375,11 @@ async fn run_under_store_lock(
             ) {
                 Ok(()) => {
                     if !json_output {
-                        let label = rebuild_package_label(pkg);
-                        install_ui::detail(&format!(
-                            "  {} {label:<package_label_width$}  {}",
+                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                        install_ui::detail_line(crate::install_ui::terminal_line!(
+                            "  {} {}  {}",
                             install_ui::green("✓"),
+                            label,
                             install_ui::dim(phase),
                         ));
                     }
@@ -1376,11 +1388,12 @@ async fn run_under_store_lock(
                 Err(e) => {
                     pkg_success = false;
                     if !json_output {
-                        let label = rebuild_package_label(pkg);
+                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
                         let error = e.to_string();
-                        install_ui::detail(&format!(
-                            "  {} {label:<package_label_width$}  {} failed: {}",
+                        install_ui::detail_line(crate::install_ui::terminal_line!(
+                            "  {} {}  {} failed: {}",
                             install_ui::red("✗"),
+                            label,
                             install_ui::dim(phase),
                             lpm_common::sanitize_terminal_inline(&error),
                         ));
@@ -1434,7 +1447,7 @@ async fn run_under_store_lock(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if failures == 0 {
         eprintln!();
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Completed {completed_scripts} {}",
             scripts_word(completed_scripts),
         ));
@@ -1444,26 +1457,31 @@ async fn run_under_store_lock(
             && effective_policy != ScriptPolicy::Allow
         {
             let package_word = install_ui::packages_word(untrusted_unbuilt_count);
-            install_ui::detail(&format!(
-                "  {} {} blocked {package_word}",
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {} {} blocked {}",
                 install_ui::dim("skipped:"),
                 install_ui::section(&untrusted_unbuilt_count.to_string()),
+                package_word,
             ));
             let hint = if effective_policy == ScriptPolicy::Triage {
                 "run lpm approve-scripts"
             } else {
                 "add trustedDependencies or run lpm rebuild --all"
             };
-            install_ui::detail(&format!("  {} {hint}", install_ui::dim("hint:")));
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {} {}",
+                install_ui::dim("hint:"),
+                hint,
+            ));
         }
         eprintln!();
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · rebuild finished in {}",
             install_ui::green(&install_ui::format_duration(rebuild_start.elapsed())),
         ));
     } else {
         eprintln!();
-        install_ui::warn(&format!("{successes} succeeded, {failures} failed"));
+        install_ui::warn_untrusted(&format!("{successes} succeeded, {failures} failed"));
     }
 
     if failures > 0 {

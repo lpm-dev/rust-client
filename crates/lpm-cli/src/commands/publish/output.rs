@@ -68,8 +68,8 @@ pub(super) fn publish_check_json(
     json
 }
 
-pub(super) fn format_upload_message(registry: &str) -> String {
-    format!("Uploading tarball to {}", install_ui::yellow(registry))
+pub(super) fn format_upload_message(registry: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!("Uploading tarball to {}", install_ui::yellow(registry))
 }
 
 pub(super) fn print_upload_details(
@@ -80,10 +80,10 @@ pub(super) fn print_upload_details(
 ) {
     publish_detail(
         "target",
-        &install_ui::yellow(&format!("{target_name}@{version}")),
+        install_ui::yellow(&format!("{target_name}@{version}")),
     );
-    publish_detail("visibility", &format_publish_visibility(visibility));
-    publish_detail("dist-tag", &install_ui::yellow(dist_tag));
+    publish_detail("visibility", format_publish_visibility(visibility));
+    publish_detail("dist-tag", install_ui::yellow(dist_tag));
 }
 
 pub(super) struct DryRunSummary<'a> {
@@ -103,22 +103,22 @@ pub(super) fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
     install_ui::phase("Dry run — no changes will be made");
     publish_detail(
         "package",
-        &install_ui::yellow(&format!("{}@{}", summary.name, summary.version)),
+        install_ui::yellow(&format!("{}@{}", summary.name, summary.version)),
     );
     for (registry_key, target_name) in summary.target_names {
         publish_detail(
             &format!("{registry_key} name"),
-            &install_ui::yellow(target_name),
+            install_ui::yellow(target_name),
         );
     }
     publish_detail(
         "files",
-        &format_dry_run_files_value(summary.file_count, summary.tarball_size),
+        format_dry_run_files_value(summary.file_count, summary.tarball_size),
     );
     if let Some(qr) = summary.quality_result {
         publish_detail(
             "quality",
-            &format!(
+            &crate::install_ui::terminal_line!(
                 "{}/{}",
                 install_ui::status_ok(&qr.score.to_string()),
                 qr.max_score
@@ -126,25 +126,32 @@ pub(super) fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
         );
     }
     if summary.has_skills {
-        publish_detail("skills", &install_ui::status_ok("included"));
+        publish_detail("skills", install_ui::status_ok("included"));
     }
-    publish_detail("ecosystem", &install_ui::yellow(summary.ecosystem));
+    publish_detail("ecosystem", install_ui::yellow(summary.ecosystem));
     let target_keys = summary
         .targets
         .iter()
         .map(PublishTarget::key)
         .collect::<Vec<_>>();
-    publish_detail("targets", &install_ui::yellow(&target_keys.join(", ")));
+    publish_detail("targets", install_ui::yellow(&target_keys.join(", ")));
     install_ui::detail("");
 }
 
-pub(super) fn publish_detail(label: &str, value: &str) {
+pub(super) fn publish_detail<T: install_ui::TerminalValue>(label: &str, value: T) {
     let label = format!("{label:<10}");
-    install_ui::detail(&format!("    {} {}", install_ui::dim(&label), value));
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "    {} {}",
+        install_ui::dim(&label),
+        value
+    ));
 }
 
-pub(super) fn format_dry_run_files_value(file_count: usize, tarball_size: usize) -> String {
-    format!(
+pub(super) fn format_dry_run_files_value(
+    file_count: usize,
+    tarball_size: usize,
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "{} files {}",
         install_ui::status_ok(&file_count.to_string()),
         install_ui::dim(&format!(
@@ -154,8 +161,8 @@ pub(super) fn format_dry_run_files_value(file_count: usize, tarball_size: usize)
     )
 }
 
-pub(super) fn format_publish_retry_detail(target: &PublishTarget) -> String {
-    format!(
+pub(super) fn format_publish_retry_detail(target: &PublishTarget) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "  {} {}",
         install_ui::dim("Retry:"),
         install_ui::yellow(&format!("lpm publish {}", target.retry_flag()))
@@ -174,7 +181,7 @@ pub(super) fn visibility_from_access(access: &str) -> &str {
     }
 }
 
-pub(super) fn format_publish_visibility(visibility: &str) -> String {
+pub(super) fn format_publish_visibility(visibility: &str) -> install_ui::TerminalFragment {
     match visibility {
         "public" => install_ui::status_ok("public"),
         other => install_ui::yellow(other),
@@ -182,24 +189,22 @@ pub(super) fn format_publish_visibility(visibility: &str) -> String {
 }
 
 pub(super) fn print_publish_quality_result(result: &quality::QualityResult) {
-    install_ui::done(&format!(
+    install_ui::done_untrusted(&format!(
         "Quality score: {}/{}",
         result.score, result.max_score
     ));
     for check in result.checks.iter().filter(|check| !check.passed) {
-        install_ui::warn(&format_publish_quality_issue(check));
+        install_ui::warn_line(format_publish_quality_issue(check));
     }
 }
 
-pub(super) fn format_publish_quality_issue(check: &quality::QualityCheck) -> String {
+pub(super) fn format_publish_quality_issue(
+    check: &quality::QualityCheck,
+) -> install_ui::TerminalLine {
     let detail = check.detail.as_deref().unwrap_or(if check.server_only {
         "pending"
     } else {
         "missing"
     });
-    format!(
-        "{}  {}",
-        lpm_common::sanitize_terminal_inline(&check.label),
-        install_ui::dim(detail)
-    )
+    crate::install_ui::terminal_line!("{}  {}", &check.label, install_ui::dim(detail))
 }

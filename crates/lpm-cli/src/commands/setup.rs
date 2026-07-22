@@ -76,7 +76,7 @@ pub async fn run(
             Ok(oidc_token) => Some(ResolvedSetupBearer::oidc(oidc_token.token)),
             Err(e) => {
                 if !json_output {
-                    install_ui::warn(&format!("OIDC token exchange failed: {e}"));
+                    install_ui::warn_untrusted(&format!("OIDC token exchange failed: {e}"));
                     install_ui::warn("Falling back to stored token / ${LPM_TOKEN} placeholder.");
                 }
                 resolve_lpm_bearer_optional(registry_url, json_output).await

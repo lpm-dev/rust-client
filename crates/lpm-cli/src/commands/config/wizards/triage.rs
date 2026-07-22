@@ -34,10 +34,12 @@ pub(in crate::commands::config) async fn run_triage_wizard(
     if current_policy != "triage" {
         println!();
         println!(
-            "  {}: triage advisor only applies when script-policy = \"triage\". \
-             Current policy: {}.",
-            "note".cyan(),
-            current_policy.yellow()
+            "{}",
+            crate::install_ui::terminal_line!(
+                "  {}: triage advisor only applies when script-policy = \"triage\". Current policy: {}.",
+                install_ui::cyan("note"),
+                install_ui::yellow(&current_policy)
+            )
         );
         let switch = cliclack::confirm(r#"Switch script-policy to "triage" now?"#)
             .initial_value(false)
@@ -45,15 +47,18 @@ pub(in crate::commands::config) async fn run_triage_wizard(
             .map_err(prompt_err)?;
         if switch {
             persist_script_policy(config_path, "triage", json_output)?;
-            install_ui::done(&format!(
-                "Done · {SCRIPT_POLICY_KEY} = {}",
+            install_ui::done_line(crate::install_ui::terminal_line!(
+                "Done · {} = {}",
+                SCRIPT_POLICY_KEY,
                 install_ui::section("\"triage\"")
             ));
         } else {
             println!(
-                "  Leaving script-policy at {}. The triage-advisor value will be saved \
-                 but stay inert until you switch policy.",
-                current_policy.yellow()
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  Leaving script-policy at {}. The triage-advisor value will be saved but stay inert until you switch policy.",
+                    install_ui::yellow(&current_policy)
+                )
             );
         }
     }

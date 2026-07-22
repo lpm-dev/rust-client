@@ -30,7 +30,7 @@ fn secret_scan_human_renderer_uses_slim_lines_with_expected_content() {
         .map(|line| match line {
             SecretScanLine::Warn(message)
             | SecretScanLine::Failed(message)
-            | SecretScanLine::Detail(message) => message.as_str(),
+            | SecretScanLine::Detail(message) => message.as_ref(),
         })
         .collect::<Vec<_>>()
         .join("\n");

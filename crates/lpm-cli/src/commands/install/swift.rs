@@ -75,7 +75,7 @@ pub(super) async fn run_swift_install_spm(
     let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
 
     if !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Installing {} via SE-0292 registry → {}",
             install_ui::bold(&name.scoped()),
             install_ui::dim(se0292_id),
@@ -117,20 +117,20 @@ pub(super) async fn run_swift_install_spm(
 
     if edit.already_exists {
         if !json_output {
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "{} is already in Package.swift",
                 install_ui::dim(se0292_id)
             ));
         }
     } else if !json_output {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Added .package(id: \"{}\", from: \"{}\")",
-            lpm_common::sanitize_terminal_inline(se0292_id),
-            lpm_common::sanitize_terminal_inline(version)
+            se0292_id,
+            version
         ));
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Added .product(name: \"{}\") to target {}",
-            lpm_common::sanitize_terminal_inline(product_name),
+            product_name,
             install_ui::bold(&target_name)
         ));
     }
@@ -161,10 +161,10 @@ pub(super) async fn run_swift_install_spm(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
         println!();
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Installed {}@{} via SE-0292 registry",
             install_ui::bold(&name.scoped()),
-            lpm_common::sanitize_terminal_inline(version),
+            version,
         ));
         println!(
             "  import {} // in your Swift code",
@@ -204,7 +204,7 @@ pub(super) async fn run_swift_install_xcode(
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
 
     if !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Installing {} via SE-0292 registry → {} (Xcode project)",
             install_ui::bold(&name.scoped()),
             install_ui::dim(se0292_id),
@@ -227,16 +227,16 @@ pub(super) async fn run_swift_install_xcode(
 
     if edit.already_exists {
         if !json_output {
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "{} is already installed",
                 install_ui::dim(se0292_id)
             ));
         }
     } else if !json_output {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Added .package(id: \"{}\", from: \"{}\")",
-            lpm_common::sanitize_terminal_inline(se0292_id),
-            lpm_common::sanitize_terminal_inline(version),
+            se0292_id,
+            version,
         ));
     }
 
@@ -248,7 +248,7 @@ pub(super) async fn run_swift_install_xcode(
     )?;
 
     if link_result.package_ref_added && !json_output {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Linked LPMDependencies to Xcode target {}",
             install_ui::bold(&link_result.target_name),
         ));
@@ -283,10 +283,10 @@ pub(super) async fn run_swift_install_xcode(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
         println!();
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "Installed {}@{} via SE-0292 registry",
             install_ui::bold(&name.scoped()),
-            lpm_common::sanitize_terminal_inline(version),
+            version,
         ));
         println!(
             "  import {} // in your Swift code",

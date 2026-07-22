@@ -199,7 +199,8 @@ async fn async_main() -> Result<()> {
             lpm_runner::ts_transform::run_stdio()
         };
         if let Err(error) = result {
-            eprintln!("{error}");
+            let error = error.to_string();
+            eprintln!("{}", lpm_common::sanitize_terminal_multiline(&error));
             std::process::exit(1);
         }
         std::process::exit(0);
@@ -1480,13 +1481,13 @@ async fn async_main() -> Result<()> {
             // Custom registry logout (explicit URL or --all)
             if let Some(url) = &logout_registry {
                 match auth::clear_custom_registry_token(url) {
-                    Ok(()) if !cli.json => output::success(&format!(
+                    Ok(()) if !cli.json => output::success_line(crate::install_ui::terminal_line!(
                         "Logged out from {}",
-                        crate::install_ui::url(url)
+                        crate::install_ui::url(url),
                     )),
-                    Err(_) if !cli.json => output::info(&format!(
+                    Err(_) if !cli.json => output::info_line(crate::install_ui::terminal_line!(
                         "Not logged in to {}",
-                        crate::install_ui::url(url)
+                        crate::install_ui::url(url),
                     )),
                     _ => {}
                 }
@@ -1494,9 +1495,9 @@ async fn async_main() -> Result<()> {
             if all {
                 for (url, result) in auth::clear_all_custom_registries() {
                     match result {
-                        Ok(()) if !cli.json => output::success(&format!(
+                        Ok(()) if !cli.json => output::success_line(crate::install_ui::terminal_line!(
                             "Logged out from {}",
-                            crate::install_ui::url(&url)
+                            crate::install_ui::url(&url),
                         )),
                         _ => {}
                     }

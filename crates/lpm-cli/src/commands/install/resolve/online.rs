@@ -185,9 +185,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         match lockfile_result {
             Some(fast_path) => {
                 if !json_output {
-                    output::info(&format!(
+                    output::info_line(crate::install_ui::terminal_line!(
                         "Using lockfile ({} packages)",
-                        fast_path.packages.len().to_string().bold()
+                        install_ui::bold(&fast_path.packages.len().to_string())
                     ));
                 }
                 lockfile_peer_context_authoritative = fast_path.lockfile.metadata.lockfile_version
@@ -548,12 +548,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             arc_client.as_ref(),
                             npm_firewall_lookup_mode,
                         );
-                    let install_message = format!(
-                        "Installing {} {}",
-                        reported_install_count.to_string().bold(),
-                        install_ui::packages_word(reported_install_count),
-                    );
-                    install_ui::phase(&install_ui::with_firewall_badge(
+                    let install_message = install_ui::TerminalLine::new("Installing ")
+                        .bold(&reported_install_count.to_string())
+                        .text(" ")
+                        .text(install_ui::packages_word(reported_install_count));
+                    install_ui::phase_line(install_ui::with_firewall_badge(
                         install_message,
                         firewall_active,
                     ));
@@ -570,10 +569,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             })
                             .collect::<Vec<_>>()
                             .join("; ");
-                        output::warn(&format!(
+                        output::warn_line(crate::install_ui::terminal_line!(
                             "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
-                            lpm_common::sanitize_terminal_inline(&report.canonical).bold(),
-                            lpm_common::sanitize_terminal_inline(&report.chosen_version),
+                            install_ui::bold(&report.canonical),
+                            &report.chosen_version,
                             report.unsatisfied_consumers.len(),
                             unsatisfied_str,
                         ));

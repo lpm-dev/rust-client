@@ -287,12 +287,12 @@ fn emit_human(inventory: &LicenseInventory, summary: &PolicySummary) {
     }
 
     if summary.failed {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "license policy failed: {} copyleft, {} missing, {} denied",
             summary.copyleft_count, summary.missing_count, summary.denied_count
         ));
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Listed {} package license(s)",
             inventory.packages.len()
         ));

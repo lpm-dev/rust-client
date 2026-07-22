@@ -258,7 +258,7 @@ fn diff_entry_json(e: &DiffEntry) -> serde_json::Value {
 fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
     if entries.is_empty() {
         match snapshot {
-            Some(s) => install_ui::done(&format!(
+            Some(s) => install_ui::done_untrusted(&format!(
                 "Trust ledger unchanged since last install ({})",
                 lpm_common::sanitize_terminal_inline(&s.captured_at),
             )),
@@ -283,7 +283,7 @@ fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
     } else {
         "need review before the next install"
     };
-    install_ui::warn(&format!(
+    install_ui::warn_untrusted(&format!(
         "{} trust {entry_word} {suffix} — lpm trust review",
         entries.len()
     ));
@@ -453,7 +453,7 @@ async fn run_prune(
         if json {
             print_prune_json(&stale, dry_run, false);
         } else {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Dry run · {} stale trust {} would be removed",
                 stale.len(),
                 trust_entry_word(stale.len())
@@ -495,7 +495,7 @@ async fn run_prune(
     if json {
         print_prune_json(&stale, dry_run, true);
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Removed {} stale trust {}",
             stale.len(),
             trust_entry_word(stale.len())

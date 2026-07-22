@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 
 /// Show pool revenue stats.
@@ -23,10 +22,13 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         println!();
 
         if let Some(period) = &stats.billing_period {
-            print_field("billing period", period.to_string());
+            print_field("billing period", install_ui::field(&period.to_string()));
         }
         if let Some(downloads) = stats.total_weighted_downloads {
-            print_field("weighted downloads", format_count(downloads));
+            print_field(
+                "weighted downloads",
+                install_ui::field(&format_count(downloads)),
+            );
         }
         if let Some(earnings) = stats.estimated_earnings_cents {
             print_field(
@@ -49,11 +51,13 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 .unwrap_or(0);
             for pkg in &stats.packages {
                 let downloads = pkg.weighted_downloads.unwrap_or(0);
-                let name = install_ui::cyan(&format!("{:<width$}", pkg.name));
                 println!(
-                    "    {}   {}",
-                    name,
-                    format!("({} downloads)", format_count(downloads)).dimmed()
+                    "{}",
+                    install_ui::terminal_line!(
+                        "    {:<width$}   {}",
+                        install_ui::cyan(&pkg.name),
+                        install_ui::dim(&format!("({} downloads)", format_count(downloads))),
+                    )
                 );
             }
         }
@@ -64,8 +68,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     Ok(())
 }
 
-fn print_field(label: &str, value: String) {
-    println!("  {} {value}", install_ui::dim(&format!("{label:<20}")));
+fn print_field(label: &'static str, value: install_ui::TerminalFragment) {
+    println!(
+        "{}",
+        install_ui::terminal_line!("  {:<20} {}", install_ui::dim(label), value)
+    );
 }
 
 fn format_count(value: u64) -> String {

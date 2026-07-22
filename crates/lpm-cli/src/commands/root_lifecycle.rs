@@ -79,7 +79,7 @@ impl RootProjectLifecycle {
         json_output: bool,
     ) -> Result<(), LpmError> {
         if !json_output {
-            install_ui::phase(&format!(
+            install_ui::phase_line(crate::install_ui::terminal_line!(
                 "Running root lifecycle {}",
                 install_ui::yellow(script.phase)
             ));

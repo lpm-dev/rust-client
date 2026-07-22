@@ -95,7 +95,7 @@ pub(super) async fn run_tasks_sequential(
             continue;
         }
 
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "Running {}",
             lpm_common::sanitize_terminal_inline(script)
         ));

@@ -278,9 +278,9 @@ pub(in crate::commands::config) fn announce_release_age_set(value: Option<u64>, 
     match value {
         None => install_ui::done("Using default minimum release age (1d)"),
         Some(0) => install_ui::done("Set minimum release age = off"),
-        Some(secs) => install_ui::done(&format!(
+        Some(secs) => install_ui::done_line(crate::install_ui::terminal_line!(
             "Set minimum release age = {}",
-            format_release_age_cli_value(secs).bold()
+            install_ui::bold(&format_release_age_cli_value(secs)),
         )),
     }
 }
@@ -300,8 +300,8 @@ pub(in crate::commands::config) fn announce_release_age_policy_set(
         );
         return;
     }
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Set release-age-policy = {}",
-        policy.as_str().bold()
+        install_ui::bold(policy.as_str()),
     ));
 }

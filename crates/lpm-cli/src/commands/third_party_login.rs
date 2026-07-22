@@ -1,7 +1,6 @@
 use crate::commands::web_auth;
 use crate::{auth, install_ui};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use std::io::IsTerminal;
 use std::time::Duration;
 
@@ -63,9 +62,9 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
             Some(auth::AuthStorageStatus::from_backend(storage_backend)),
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Logged in to {} with npm web auth",
-            NPM_DISPLAY.bold()
+            install_ui::bold(NPM_DISPLAY)
         ));
         render_storage_backend(auth::AuthStorageStatus::from_backend(storage_backend));
     }
@@ -150,10 +149,12 @@ pub fn run_custom(
         }
         None => {
             install_ui::phase("Provide the registry auth token");
-            cliclack::password(format!("Paste {registry_url} token"))
-                .mask('*')
-                .interact()
-                .map_err(|e| LpmError::Registry(e.to_string()))?
+            cliclack::password(crate::prompt::untrusted(format!(
+                "Paste {registry_url} token"
+            )))
+            .mask('*')
+            .interact()
+            .map_err(|e| LpmError::Registry(e.to_string()))?
         }
     };
 
@@ -201,10 +202,11 @@ fn store_builtin_token(
             } else {
                 ""
             };
-            install_ui::done(&format!(
-                "Token stored for {} (reminder: {}{otp_note})",
-                registry_display.bold(),
-                expires_human.dimmed()
+            install_ui::done_line(crate::install_ui::terminal_line!(
+                "Token stored for {} (reminder: {}{})",
+                install_ui::bold(registry_display),
+                install_ui::dim(&expires_human),
+                otp_note,
             ));
             render_storage_backend(storage_status);
             return Ok(());
@@ -230,9 +232,10 @@ fn store_builtin_token(
         } else {
             ""
         };
-        install_ui::done(&format!(
-            "Token stored for {}{otp_note}",
-            registry_display.bold()
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Token stored for {}{}",
+            install_ui::bold(registry_display),
+            otp_note,
         ));
         render_storage_backend(storage_status);
     }
@@ -242,7 +245,7 @@ fn store_builtin_token(
 
 fn render_storage_backend(storage_status: auth::AuthStorageStatus) {
     if let Some(label) = storage_status.human_label() {
-        install_ui::detail(&format!("secure storage backend: {label}"));
+        install_ui::detail_untrusted(&format!("secure storage backend: {label}"));
     }
     if storage_status.degraded {
         install_ui::warn(
@@ -274,9 +277,9 @@ fn token_metadata(
     let expiry_days = days.parse().ok();
 
     let otp_required = supports_otp_metadata
-        && cliclack::confirm(format!(
+        && cliclack::confirm(crate::prompt::untrusted(format!(
             "Does this {registry_display} account use 2FA / OTP for publishing?"
-        ))
+        )))
         .initial_value(false)
         .interact()
         .unwrap_or(false);

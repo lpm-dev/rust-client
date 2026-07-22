@@ -181,7 +181,7 @@ fn request_windows_terminal_fallback(prompt: &str, reason: &str) -> Result<bool,
     crate::output::warn(&format!(
         "Windows Hello security approval is unavailable: {reason}. Falling back to terminal confirmation."
     ));
-    cliclack::confirm(prompt)
+    cliclack::confirm(crate::prompt::untrusted(prompt))
         .interact()
         .map_err(crate::prompt::prompt_err)
 }

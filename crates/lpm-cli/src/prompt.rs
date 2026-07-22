@@ -6,6 +6,11 @@
 
 use lpm_common::LpmError;
 
+/// Sanitizes externally controlled text before handing it to an interactive TUI.
+pub fn untrusted(text: impl std::fmt::Display) -> String {
+    lpm_common::sanitize_terminal_inline(&text.to_string()).into_owned()
+}
+
 /// Convert a cliclack error to an LpmError.
 /// Detects Ctrl+C (user cancellation) and exits cleanly with code 130.
 pub fn prompt_err(e: impl std::fmt::Display) -> LpmError {

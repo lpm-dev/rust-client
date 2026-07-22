@@ -23,6 +23,56 @@ fn sample_pool_stats() -> serde_json::Value {
     })
 }
 
+fn assert_pool_output_is_terminal_safe(rendered: &str) {
+    assert!(
+        rendered.contains("safe?FORGED?rewritten?end"),
+        "hostile pool fields must remain visible as one sanitized field: {rendered:?}",
+    );
+    for attacker_fragment in [
+        "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "pool output retained {attacker_fragment:?}: {rendered:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn pool_registry_fields_cannot_inject_terminal_rows() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let hostile = "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+    mock.with_pool_stats(
+        "pool-session-token",
+        serde_json::json!({
+            "billingPeriod": hostile,
+            "totalWeightedDownloads": 1,
+            "estimatedEarningsCents": 1,
+            "packages": [{
+                "name": hostile,
+                "weightedDownloads": 1,
+                "estimatedEarningsCents": 1
+            }]
+        }),
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .args(["pool"])
+        .output()
+        .expect("failed to run lpm pool");
+
+    assert!(output.status.success(), "lpm pool failed: {output:?}");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_pool_output_is_terminal_safe(&rendered);
+}
+
 #[tokio::test]
 async fn pool_human_output_formats_revenue_summary_and_package_rows() {
     let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
@@ -112,6 +162,64 @@ async fn pool_human_output_applies_slim_color_roles_when_forced() {
             && combined.contains("\x1b[36m@lpm.dev/neo.widget"),
         "pool should color sections, labels, earnings, and package scopes, got:\n{combined:?}",
     );
+}
+
+#[tokio::test]
+async fn pool_registry_fields_are_sanitized_before_trusted_styles_are_applied() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let hostile =
+        "safe\nFORGED\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+    mock.with_pool_stats(
+        "pool-session-token",
+        serde_json::json!({
+            "billingPeriod": hostile,
+            "totalWeightedDownloads": 1,
+            "estimatedEarningsCents": 1,
+            "packages": [{
+                "name": hostile,
+                "weightedDownloads": 1,
+                "estimatedEarningsCents": 1
+            }]
+        }),
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .args(["--color=always", "pool"])
+        .output()
+        .expect("failed to run colored lpm pool");
+
+    assert!(
+        output.status.success(),
+        "colored lpm pool failed: {output:?}"
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        rendered.contains("\u{1b}[33mPool Revenue Stats")
+            && rendered.contains("\u{1b}[36msafe?FORGED?rewritten?end"),
+        "trusted color roles must survive around sanitized fields: {rendered:?}",
+    );
+    for attacker_fragment in [
+        "\u{1b}[2J",
+        "\u{1b}]52",
+        "\u{7}",
+        "\u{8}",
+        "\r",
+        "\u{0090}",
+        "\u{009c}",
+        "hidden",
+    ] {
+        assert!(
+            !rendered.contains(attacker_fragment),
+            "colored pool output retained {attacker_fragment:?}: {rendered:?}",
+        );
+    }
 }
 
 #[tokio::test]

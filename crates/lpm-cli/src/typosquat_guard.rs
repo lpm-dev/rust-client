@@ -272,14 +272,15 @@ fn prompt_explicit_findings(
             .ok_or_else(|| LpmError::Registry("internal typosquat prompt mismatch".to_string()))?;
         let rewritten =
             rewrite_spec_name(&specs[package_idx], &finding.package, &finding.similar_to);
-        let allow_label = format!("Allow {} in project policy", finding.package);
-        let choice: &str = cliclack::select(format!(
+        let allow_label =
+            crate::prompt::untrusted(format!("Allow {} in project policy", finding.package));
+        let choice: &str = cliclack::select(crate::prompt::untrusted(format!(
             "{} looks like {}",
             finding.package, finding.similar_to
-        ))
+        )))
         .item(
             "install_suggestion",
-            format!("Install {rewritten} instead"),
+            crate::prompt::untrusted(format!("Install {rewritten} instead")),
             "",
         )
         .item("allow", allow_label, "Writes policy.typosquat to lpm.toml")
@@ -379,9 +380,9 @@ fn prompt_allow_manifest_findings(
 }
 
 fn prompt_allow_reason(package: &str, similar_to: &str) -> Result<String, LpmError> {
-    let reason: String = cliclack::input(format!(
+    let reason: String = cliclack::input(crate::prompt::untrusted(format!(
         "Reason for allowing {package} instead of {similar_to}"
-    ))
+    )))
     .placeholder("Intentional internal package")
     .interact()
     .map_err(crate::prompt::prompt_err)?;

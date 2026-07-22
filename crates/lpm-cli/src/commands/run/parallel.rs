@@ -57,7 +57,7 @@ pub(super) async fn run_tasks_parallel(
     // Show execution plan when there's parallelism
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
     if levels.len() > 1 || levels.first().map_or(0, |l| l.len()) > 1 {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Running {} tasks {}",
             install_ui::yellow(&total_tasks.to_string()),
             install_ui::dim(&format!("({} parallel groups)", levels.len()))
@@ -152,7 +152,7 @@ pub(super) async fn run_tasks_parallel(
                 continue;
             }
 
-            install_ui::phase(&format!(
+            install_ui::phase_untrusted(&format!(
                 "Running {}",
                 lpm_common::sanitize_terminal_inline(task_name)
             ));
@@ -435,7 +435,7 @@ pub(super) async fn run_tasks_parallel(
                         }
                         Err(_) => {
                             let name = chunk_names[i].clone();
-                            install_ui::detail(&format_run_failure_detail(
+                            install_ui::detail_line(format_run_failure_detail(
                                 &name,
                                 "thread panicked",
                             ));
@@ -454,9 +454,9 @@ pub(super) async fn run_tasks_parallel(
                 // Dump failed task output after the level completes
                 for (name, stderr) in &failed_outputs {
                     install_ui::detail("");
-                    install_ui::detail(&format_failed_task_output_header(name));
+                    install_ui::detail_line(format_failed_task_output_header(name));
                     print_captured_stderr(stderr);
-                    install_ui::detail(&format_failed_task_output_footer());
+                    install_ui::detail_line(format_failed_task_output_footer());
                 }
             }
         }

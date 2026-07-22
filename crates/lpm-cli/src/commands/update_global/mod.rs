@@ -37,10 +37,10 @@ use self::commit::{UpgradeOutput, commit_upgrade_locked};
 use self::inner::do_install_upgrade;
 use self::prepare::{UpgradePrep, active_matches_planned_snapshot, prepare_upgrade_locked};
 use super::global_util::{discover_bin_commands, mk_tx_id, pick_version_with_policy};
-use crate::output;
 use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
 };
+use crate::{install_ui, output};
 use lpm_common::color::Painted;
 use lpm_common::{
     LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock, with_exclusive_lock_async,
@@ -89,7 +89,11 @@ pub async fn run(
                 if !json_output {
                     let name_safe = sanitize_for_terminal(&target.name);
                     let reason_safe = sanitize_for_terminal(&e.to_string());
-                    output::warn(&format!("planning {}: {reason_safe}", name_safe.bold()));
+                    output::warn_line(install_ui::terminal_line!(
+                        "planning {}: {}",
+                        install_ui::bold(&name_safe),
+                        reason_safe,
+                    ));
                 }
                 // Continue planning other targets — one bad spec doesn't
                 // block the bulk update.
@@ -674,11 +678,11 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                 let name_safe = sanitize_for_terminal(&out.name);
                 let from_safe = sanitize_for_terminal(&out.from_version);
                 let to_safe = sanitize_for_terminal(&out.to_version);
-                output::success(&format!(
+                output::success_line(install_ui::terminal_line!(
                     "Upgraded {} {} \u{2192} {}",
-                    name_safe.bold(),
-                    from_safe.dimmed(),
-                    to_safe.green()
+                    install_ui::bold(&name_safe),
+                    install_ui::dim(&from_safe),
+                    install_ui::green(&to_safe),
                 ));
             }
             UpgradeResult::SaveSpecRewritten {
@@ -691,27 +695,31 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                 let version_safe = sanitize_for_terminal(version);
                 let old_safe = sanitize_for_terminal(old_saved_spec);
                 let new_safe = sanitize_for_terminal(new_saved_spec);
-                output::success(&format!(
+                output::success_line(install_ui::terminal_line!(
                     "Retuned {} {} (saved_spec {} \u{2192} {})",
-                    package_safe.bold(),
-                    format!("@{version_safe}").dimmed(),
-                    old_safe.dimmed(),
-                    new_safe.green()
+                    install_ui::bold(&package_safe),
+                    install_ui::dim(&format!("@{version_safe}")),
+                    install_ui::dim(&old_safe),
+                    install_ui::green(&new_safe),
                 ));
             }
             UpgradeResult::AlreadyCurrent { package, version } => {
                 let package_safe = sanitize_for_terminal(package);
                 let version_safe = sanitize_for_terminal(version);
-                output::info(&format!(
+                output::info_line(install_ui::terminal_line!(
                     "{} {} already current",
-                    package_safe.dimmed(),
-                    format!("@{version_safe}").dimmed()
+                    install_ui::dim(&package_safe),
+                    install_ui::dim(&format!("@{version_safe}")),
                 ));
             }
             UpgradeResult::Failed { package, reason } => {
                 let package_safe = sanitize_for_terminal(package);
                 let reason_safe = sanitize_for_terminal(reason);
-                output::warn(&format!("{}: {reason_safe}", package_safe.bold()));
+                output::warn_line(install_ui::terminal_line!(
+                    "{}: {}",
+                    install_ui::bold(&package_safe),
+                    reason_safe,
+                ));
             }
         }
     }

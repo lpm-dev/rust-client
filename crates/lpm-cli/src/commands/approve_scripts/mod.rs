@@ -77,7 +77,7 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use crate::build_state::{self, BlockedPackage, BuildState};
     #[allow(unused_imports)]
-    pub(super) use crate::output;
+    pub(super) use crate::{install_ui, output};
     #[allow(unused_imports)]
     pub(super) use lpm_common::LpmError;
     #[allow(unused_imports)]

@@ -141,7 +141,11 @@ pub(super) fn print_add_project_structure(
 
 fn add_detail(label: &str, value: &str) {
     let label = format!("{label:<13}");
-    install_ui::detail(&format!("    {} {}", install_ui::dim(&label), value));
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "    {} {}",
+        install_ui::dim(&label),
+        value
+    ));
 }
 
 fn framework_label(project_dir: &Path, ecosystem: &str) -> String {
@@ -160,7 +164,7 @@ fn framework_label(project_dir: &Path, ecosystem: &str) -> String {
 }
 
 pub(super) fn print_add_file(path: &str) {
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "{} {}",
         install_ui::green("+"),
         install_ui::dim(path)

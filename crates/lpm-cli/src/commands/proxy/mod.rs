@@ -6,7 +6,6 @@ mod tests;
 
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_proxy::ProxyStatus;
 use lpm_runner::lpm_json;
 use std::path::Path;
@@ -263,7 +262,7 @@ async fn run_start(
             listeners.join(", ")
         )
     };
-    install_ui::phase(&message);
+    install_ui::phase_untrusted(&message);
     lpm_proxy::serve_control_default_with_options(options)
         .await
         .map_err(|err| LpmError::Script(err.to_string()))?;
@@ -532,19 +531,19 @@ fn render_status_human(status: &ProxyStatus) {
             .map_or_else(|| "PID unknown".to_string(), |pid| format!("PID {pid}"));
         print_field(
             "status",
-            &format!("{} ({pid})", install_ui::status_ok("running")),
+            install_ui::terminal_line!("{} ({})", install_ui::status_ok("running"), pid),
         );
         if let Some(http_addr) = &status.http_addr {
-            print_field("http", &install_ui::url(http_addr));
+            print_field("http", install_ui::url(http_addr));
         }
         if let Some(http_redirect_addr) = &status.http_redirect_addr {
-            print_field("redirect", &install_ui::url(http_redirect_addr));
+            print_field("redirect", install_ui::url(http_redirect_addr));
         }
         if let Some(tls_addr) = &status.tls_addr {
-            print_field("https", &install_ui::url(tls_addr));
+            print_field("https", install_ui::url(tls_addr));
         }
     } else {
-        print_field("status", &install_ui::dim("not running"));
+        print_field("status", install_ui::dim("not running"));
     }
 
     if status.stale {
@@ -589,16 +588,20 @@ fn render_routes_human(status: &ProxyStatus) {
     for route in &status.routes {
         let project = route.project_dir.display().to_string();
         let service = route.service.as_deref().unwrap_or("-");
-        eprintln!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "{}  {}  {}  {}",
-            format!("{:<host_width$}", route.host).yellow(),
-            route.upstream_port.to_string().green(),
-            format!("{project:<project_width$}").dimmed(),
+            install_ui::yellow(&format!("{:<host_width$}", route.host)),
+            install_ui::green(&route.upstream_port.to_string()),
+            install_ui::dim(&format!("{project:<project_width$}")),
             service,
-        );
+        ));
     }
 }
 
-fn print_field(label: &str, value: &str) {
-    eprintln!("  {} {}", install_ui::dim(&format!("{label:<10}")), value);
+fn print_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
+    install_ui::detail_line(crate::install_ui::terminal_line!(
+        "  {} {}",
+        install_ui::dim(&format!("{label:<10}")),
+        value
+    ));
 }

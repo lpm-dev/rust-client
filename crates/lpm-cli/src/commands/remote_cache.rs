@@ -155,14 +155,20 @@ pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
 pub fn print_cache_status_human(status: &CacheStatus) {
     println!("{}", install_ui::section("Local cache"));
     println!(
-        "  {} {}",
-        cache_status_label("path"),
-        status.local_path.display()
+        "{}",
+        crate::install_ui::terminal_line!(
+            "  {} {}",
+            cache_status_label("path"),
+            status.local_path.display().to_string()
+        )
     );
     println!(
-        "  {} {}",
-        cache_status_label("size"),
-        format_bytes(status.local_bytes)
+        "{}",
+        crate::install_ui::terminal_line!(
+            "  {} {}",
+            cache_status_label("size"),
+            format_bytes(status.local_bytes)
+        )
     );
     println!();
 
@@ -172,41 +178,66 @@ pub fn print_cache_status_human(status: &CacheStatus) {
     } else {
         install_ui::dim("false")
     };
-    println!("  {} {}", cache_status_label("enabled"), enabled_value);
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!("  {} {}", cache_status_label("enabled"), enabled_value)
+    );
     if status.remote.enabled {
         let status_value = status
             .remote
             .status
             .as_deref()
             .map_or_else(|| install_ui::dim("unknown"), install_ui::status_ok);
-        println!("  {} {}", cache_status_label("status"), status_value);
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!(
+                "  {} {}",
+                cache_status_label("status"),
+                status_value
+            )
+        );
         if let Some(url) = &status.remote.url {
-            println!("  {} {url}", cache_status_label("url"));
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {} {}",
+                    cache_status_label("url"),
+                    install_ui::url(url)
+                )
+            );
         }
         if let (Some(usage), Some(limit)) = (status.remote.usage_bytes, status.remote.limit_bytes) {
             let usage_display = format_bytes(usage);
             let limit_display = format_bytes(limit);
             let usage_bar = install_ui::usage_bar(usage, limit, 10);
-            let mut usage_line = format!(
-                "  {} {usage_display} / {limit_display}",
-                cache_status_label("usage")
-            );
-            if !usage_bar.is_empty() {
-                usage_line.push_str("  ");
-                usage_line.push_str(&usage_bar);
-            }
+            let usage_line = if usage_bar.is_empty() {
+                crate::install_ui::terminal_line!(
+                    "  {} {} / {}",
+                    cache_status_label("usage"),
+                    usage_display,
+                    limit_display
+                )
+            } else {
+                crate::install_ui::terminal_line!(
+                    "  {} {} / {}  {}",
+                    cache_status_label("usage"),
+                    usage_display,
+                    limit_display,
+                    usage_bar
+                )
+            };
             println!("{usage_line}");
         }
     }
     println!();
 
     if let Some(error) = &status.remote.error {
-        install_ui::warn(&format!("Remote status unavailable: {error}"));
+        install_ui::warn_untrusted(&format!("Remote status unavailable: {error}"));
     }
     install_ui::done("Cache status loaded");
 }
 
-fn cache_status_label(label: &str) -> String {
+fn cache_status_label(label: &'static str) -> install_ui::TerminalFragment {
     install_ui::dim(&format!("{label:<8}"))
 }
 
@@ -906,7 +937,7 @@ fn is_ci_environment() -> bool {
 
 fn warn_once(message: &str) {
     if !REMOTE_CACHE_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
-        install_ui::warn(message);
+        install_ui::warn_untrusted(message);
     }
 }
 

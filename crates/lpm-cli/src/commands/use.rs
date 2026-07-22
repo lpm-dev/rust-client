@@ -1,6 +1,5 @@
 use super::use_ui;
 use crate::install_ui;
-use lpm_common::color::Painted;
 use lpm_common::{LpmError, format_bytes};
 use lpm_runtime::detect::RuntimeKind;
 use lpm_runtime::download::RuntimeInstallReport;
@@ -181,15 +180,15 @@ pub async fn run(
                 println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
             } else {
                 if removed_versions.len() == 1 {
-                    use_ui::done(&format!(
+                    use_ui::done_line(crate::install_ui::terminal_line!(
                         "Removed {} {}",
                         runtime.display_name(),
-                        removed_versions[0].bold()
+                        install_ui::bold(&removed_versions[0])
                     ));
                 } else {
-                    use_ui::done(&format!(
+                    use_ui::done_line(crate::install_ui::terminal_line!(
                         "Removed {} {} versions",
-                        removed_versions.len().to_string().bold(),
+                        install_ui::bold(&removed_versions.len().to_string()),
                         runtime.display_name()
                     ));
                     for version in &removed_versions {
@@ -268,7 +267,7 @@ pub async fn run(
                 );
                 println!("{}", serde_json::json!({"success": true, "pinned": pinned}));
             } else {
-                use_ui::done(&format!(
+                use_ui::done_line(crate::install_ui::terminal_line!(
                     "Pinned {}@{} in lpm.json",
                     runtime.as_str(),
                     install_ui::yellow(&pinned_version)
@@ -309,7 +308,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                 })?;
             let version = release.version_bare().to_string();
             if !json_output {
-                use_ui::phase(&format!(
+                use_ui::phase_line(crate::install_ui::terminal_line!(
                     "Resolving node@{} {} {}{}",
                     install_ui::yellow(&version_spec),
                     install_ui::dim("→"),
@@ -340,7 +339,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                 })?;
             let version = release.version_bare().to_string();
             if !json_output {
-                use_ui::phase(&format!(
+                use_ui::phase_line(crate::install_ui::terminal_line!(
                     "Resolving bun@{} {} {}",
                     install_ui::yellow(&version_spec),
                     install_ui::dim("→"),
@@ -379,7 +378,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
         use_ui::done(&format!("Extracted {}", runtime.display_name()));
         use_ui::done(&format!("Linked {}", runtime.display_name()));
         let duration = install_ui::format_duration(install_start.elapsed());
-        use_ui::done(&format!(
+        use_ui::done_line(crate::install_ui::terminal_line!(
             "Now using {} {} · {}",
             runtime.display_name(),
             install_ui::yellow(&installed),
@@ -409,14 +408,14 @@ where
         return install().await;
     }
 
-    let spinner = install_ui::spin(&format!(
+    let spinner = install_ui::spin_line(crate::install_ui::terminal_line!(
         "Downloading {} {}",
         runtime.display_name(),
         install_ui::yellow(version)
     ));
     match install().await {
         Ok(report) => {
-            spinner.done(&format!(
+            spinner.done_line(crate::install_ui::terminal_line!(
                 "Downloaded {} {} · {}",
                 runtime.display_name(),
                 install_ui::yellow(&report.version),
@@ -425,7 +424,7 @@ where
             Ok(report)
         }
         Err(err) => {
-            spinner.failed(&format!(
+            spinner.failed_line(crate::install_ui::terminal_line!(
                 "Failed to install {} {}",
                 runtime.display_name(),
                 install_ui::yellow(version)
@@ -435,38 +434,39 @@ where
     }
 }
 
-fn format_download_report(report: &RuntimeInstallReport) -> String {
+fn format_download_report(report: &RuntimeInstallReport) -> install_ui::TerminalLine {
     let Some(downloaded) = report.downloaded_bytes else {
-        return install_ui::dim("cached");
+        return install_ui::TerminalLine::new("").dim("cached");
     };
     let bytes = format_bytes(downloaded);
     match report.total_bytes.filter(|total| *total > 0) {
-        Some(total) => format!(
+        Some(total) => crate::install_ui::terminal_line!(
             "{} {} {}",
             install_ui::usage_bar(downloaded, total, 12),
             install_ui::dim(&bytes),
             install_ui::dim("100%")
         ),
-        None => install_ui::dim(&bytes),
+        None => install_ui::TerminalLine::new("").dim(&bytes),
     }
 }
 
 fn print_verified_checksum(report: &RuntimeInstallReport) {
     if let Some(sha256) = &report.sha256 {
-        use_ui::done(&format!(
+        use_ui::done_line(crate::install_ui::terminal_line!(
             "Verified SHA-256 {}",
             install_ui::dim(&format!("sha256:{sha256}"))
         ));
     }
 }
 
-fn format_node_lts_suffix(release: &lpm_runtime::node::NodeRelease) -> String {
-    release.lts.name().map_or_else(String::new, |name| {
-        format!(
-            " ({})",
-            format!("lts/{}", name.to_ascii_lowercase()).dimmed()
-        )
-    })
+fn format_node_lts_suffix(release: &lpm_runtime::node::NodeRelease) -> install_ui::TerminalLine {
+    match release.lts.name() {
+        Some(name) => {
+            let label = format!("lts/{}", name.to_ascii_lowercase());
+            crate::install_ui::terminal_line!(" ({})", install_ui::dim(&label))
+        }
+        None => install_ui::TerminalLine::new(""),
+    }
 }
 
 fn parse_runtime_spec(spec: &str) -> Result<(RuntimeKind, String), LpmError> {
@@ -514,7 +514,7 @@ fn print_already_installed(runtime: RuntimeKind, version: &str, json_output: boo
             serde_json::json!({"success": true, "status": "already_installed", "runtime": runtime.as_str(), "version": version})
         );
     } else {
-        use_ui::done(&format!(
+        use_ui::done_line(crate::install_ui::terminal_line!(
             "{} {} already installed",
             runtime.display_name(),
             install_ui::yellow(version)

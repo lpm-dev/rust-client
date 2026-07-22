@@ -143,11 +143,17 @@ pub(super) async fn run(
         );
         std::io::stdout().flush().map_err(LpmError::Io)?;
     } else {
-        crate::install_ui::done(&format!("Skills dashboard: {}", handle.display_url));
+        crate::install_ui::done_line(crate::install_ui::terminal_line!(
+            "Skills dashboard: {}",
+            crate::install_ui::url(&handle.display_url)
+        ));
         if !opened {
-            crate::install_ui::detail(&format!("  Open {}", handle.launch_url));
+            crate::install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  Open {}",
+                crate::install_ui::url(&handle.launch_url)
+            ));
         }
-        crate::install_ui::detail(&format!(
+        crate::install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {}",
             crate::install_ui::dim("Press Ctrl+C to stop")
         ));

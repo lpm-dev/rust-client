@@ -30,7 +30,7 @@ pub(in crate::commands::audit) fn print_discovery_summary(discovery: &DiscoveryR
         message.push_str(&install_ui::dim("node_modules"));
     }
 
-    install_ui::done(&message);
+    install_ui::done_untrusted(&message);
 
     if discovery.lockfile_path.is_none() {
         install_ui::warn("No lockfile found; scanning node_modules directly");
@@ -42,7 +42,7 @@ pub(in crate::commands::audit) fn print_discovery_summary(discovery: &DiscoveryR
 
 pub(in crate::commands::audit) fn print_osv_status(osv_degraded_reason: Option<&str>) {
     if let Some(reason) = osv_degraded_reason {
-        install_ui::warn(&format!(
+        install_ui::warn_line(crate::install_ui::terminal_line!(
             "{} database unavailable; vulnerability scan incomplete",
             install_ui::yellow("OSV")
         ));
@@ -52,7 +52,7 @@ pub(in crate::commands::audit) fn print_osv_status(osv_degraded_reason: Option<&
             lpm_common::sanitize_terminal_inline(reason)
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Checked against {} database",
             install_ui::yellow("OSV")
         ));
@@ -277,7 +277,7 @@ pub(in crate::commands::audit) fn print_summary(
         .sum();
 
     if osv_degraded {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Audit incomplete · {total_scanned} {} scanned",
             install_ui::packages_word(total_scanned)
         ));
@@ -289,7 +289,7 @@ pub(in crate::commands::audit) fn print_summary(
         if behavioral.packages_scanned > 0 {
             parts.push(format!("{} analyzed", behavioral.packages_scanned));
         }
-        install_ui::done(&format!("No issues found · {}", parts.join(" · ")));
+        install_ui::done_untrusted(&format!("No issues found · {}", parts.join(" · ")));
     } else {
         let mut parts = Vec::new();
         if vuln_count > 0 {
@@ -307,6 +307,6 @@ pub(in crate::commands::audit) fn print_summary(
         }
         parts.push(format!("{total_scanned} scanned"));
 
-        install_ui::warn(&parts.join(" · "));
+        install_ui::warn_untrusted(&parts.join(" · "));
     }
 }

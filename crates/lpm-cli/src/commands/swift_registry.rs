@@ -67,7 +67,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
     let is_https = registry_url.starts_with("https://");
 
     if !json_output {
-        install_ui::phase(&swift_package_manager_phase());
+        install_ui::phase_line(swift_package_manager_phase());
     }
 
     // Step 1: Set the registry for the lpmdev scope
@@ -116,7 +116,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
         ));
     }
     if !json_output {
-        install_ui::done(&scope_set_message(&swift_registry_url));
+        install_ui::done_line(scope_set_message(&swift_registry_url));
     }
 
     // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
@@ -316,7 +316,7 @@ pub async fn ensure_configured(
                 "SwiftPM `lpmdev` scope is mapped to a non-LPM URL — re-resolving",
             );
             if !json_output {
-                install_ui::warn(&format!(
+                install_ui::warn_untrusted(&format!(
                     "SwiftPM `lpmdev` scope mapped to {existing}, expected {swift_registry_url} — re-resolving"
                 ));
             }
@@ -325,7 +325,7 @@ pub async fn ensure_configured(
     }
 
     if !json_output {
-        install_ui::phase(&swift_package_manager_phase());
+        install_ui::phase_line(swift_package_manager_phase());
     }
 
     // Step 1: Set the registry scope
@@ -355,7 +355,7 @@ pub async fn ensure_configured(
         ));
     }
     if !json_output {
-        install_ui::done(&scope_set_message(&swift_registry_url));
+        install_ui::done_line(scope_set_message(&swift_registry_url));
     }
 
     // Step 2: Login (HTTPS only)
@@ -434,7 +434,7 @@ async fn install_signing_certificate(
     // previously-truncated install (empty / aborted writes).
     if !force && is_cert_valid(&cert_path) {
         if !json_output {
-            install_ui::done(&signing_certificate_already_installed_message(&cert_path));
+            install_ui::done_line(signing_certificate_already_installed_message(&cert_path));
         }
         return Ok(CertOutcome::AlreadyInstalled);
     }
@@ -496,7 +496,7 @@ async fn install_signing_certificate(
     })?;
 
     if !json_output {
-        install_ui::done(&signing_certificate_installed_message(&cert_path));
+        install_ui::done_line(signing_certificate_installed_message(&cert_path));
     }
 
     Ok(CertOutcome::Installed)
@@ -557,7 +557,7 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
 
     if already_configured {
         if !json_output {
-            install_ui::done(&signing_trust_already_configured_message(&config_path));
+            install_ui::done_line(signing_trust_already_configured_message(&config_path));
         }
         return Ok(TrustOutcome::AlreadyConfigured);
     }
@@ -642,27 +642,28 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
     })?;
 
     if !json_output {
-        install_ui::done(&signing_trust_updated_message(&config_path));
+        install_ui::done_line(signing_trust_updated_message(&config_path));
     }
 
     Ok(TrustOutcome::Configured)
 }
 
-fn swift_package_manager_phase() -> String {
-    format!(
+fn swift_package_manager_phase() -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "Configuring Swift Package Manager for {}",
         install_ui::yellow("lpmdev")
     )
 }
 
-fn scope_set_message(swift_registry_url: &str) -> String {
-    format!(
-        "Scope set: {} → {swift_registry_url}",
-        install_ui::yellow("lpmdev")
+fn scope_set_message(swift_registry_url: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
+        "Scope set: {} → {}",
+        install_ui::yellow("lpmdev"),
+        swift_registry_url
     )
 }
 
-fn signing_certificate_installed_message(cert_path: &Path) -> String {
+fn signing_certificate_installed_message(cert_path: &Path) -> install_ui::TerminalLine {
     let home = dirs::home_dir();
     signing_certificate_installed_message_with_home(cert_path, home.as_deref())
 }
@@ -670,14 +671,14 @@ fn signing_certificate_installed_message(cert_path: &Path) -> String {
 fn signing_certificate_installed_message_with_home(
     cert_path: &Path,
     home: Option<&Path>,
-) -> String {
-    format!(
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "Installed signing certificate {}",
         display_home_relative_with(cert_path, home)
     )
 }
 
-fn signing_certificate_already_installed_message(cert_path: &Path) -> String {
+fn signing_certificate_already_installed_message(cert_path: &Path) -> install_ui::TerminalLine {
     let home = dirs::home_dir();
     signing_certificate_already_installed_message_with_home(cert_path, home.as_deref())
 }
@@ -685,23 +686,26 @@ fn signing_certificate_already_installed_message(cert_path: &Path) -> String {
 fn signing_certificate_already_installed_message_with_home(
     cert_path: &Path,
     home: Option<&Path>,
-) -> String {
-    format!(
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "Signing certificate already installed {}",
         display_home_relative_with(cert_path, home)
     )
 }
 
-fn signing_trust_updated_message(config_path: &Path) -> String {
+fn signing_trust_updated_message(config_path: &Path) -> install_ui::TerminalLine {
     let home = dirs::home_dir();
     signing_trust_updated_message_with_home(config_path, home.as_deref())
 }
 
-fn signing_trust_updated_message_with_home(config_path: &Path, home: Option<&Path>) -> String {
-    format!("Updated {}", display_home_relative_with(config_path, home))
+fn signing_trust_updated_message_with_home(
+    config_path: &Path,
+    home: Option<&Path>,
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!("Updated {}", display_home_relative_with(config_path, home))
 }
 
-fn signing_trust_already_configured_message(config_path: &Path) -> String {
+fn signing_trust_already_configured_message(config_path: &Path) -> install_ui::TerminalLine {
     let home = dirs::home_dir();
     signing_trust_already_configured_message_with_home(config_path, home.as_deref())
 }
@@ -709,8 +713,8 @@ fn signing_trust_already_configured_message(config_path: &Path) -> String {
 fn signing_trust_already_configured_message_with_home(
     config_path: &Path,
     home: Option<&Path>,
-) -> String {
-    format!(
+) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
         "Signing trust already configured {}",
         display_home_relative_with(config_path, home)
     )
@@ -886,11 +890,11 @@ mod tests {
             "~/.swiftpm/security/trusted-root-certs/lpm.der"
         );
         assert_eq!(
-            signing_certificate_installed_message_with_home(&cert_path, Some(&home)),
+            signing_certificate_installed_message_with_home(&cert_path, Some(&home)).to_string(),
             "Installed signing certificate ~/.swiftpm/security/trusted-root-certs/lpm.der"
         );
         assert_eq!(
-            signing_trust_updated_message_with_home(&config_path, Some(&home)),
+            signing_trust_updated_message_with_home(&config_path, Some(&home)).to_string(),
             "Updated ~/.swiftpm/configuration/registries.json"
         );
     }

@@ -41,7 +41,7 @@ pub async fn ensure_detected_runtimes(
                 source,
                 bin_dir,
             } => {
-                install_ui::phase(&format!(
+                install_ui::phase_line(crate::install_ui::terminal_line!(
                     "Using {} {} ({})",
                     runtime_display_name(runtime.as_str()),
                     install_ui::status_ok(&version),
@@ -55,7 +55,7 @@ pub async fn ensure_detected_runtimes(
                 source,
                 bin_dir,
             } => {
-                install_ui::done(&format!(
+                install_ui::done_line(crate::install_ui::terminal_line!(
                     "Auto-installed {} {} (from {})",
                     runtime_display_name(runtime.as_str()),
                     install_ui::status_ok(&version),
@@ -68,14 +68,14 @@ pub async fn ensure_detected_runtimes(
                 spec,
                 source,
             } => {
-                install_ui::warn(&format!(
+                install_ui::warn_line(crate::install_ui::terminal_line!(
                     "{} requires {} {}, but it's not installed. Using system {}.",
                     source,
                     runtime_display_name(runtime.as_str()),
                     install_ui::yellow(&spec),
                     runtime_display_name(runtime.as_str()),
                 ));
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "    {} {}",
                     install_ui::dim("Run:"),
                     install_ui::yellow(&format!("lpm use {}@{spec}", runtime.as_str())),

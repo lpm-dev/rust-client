@@ -40,7 +40,7 @@ pub async fn run(action: &str, deep: bool, fix: bool, json_output: bool) -> Resu
                     .unwrap()
                 );
             } else {
-                println!("{path}");
+                println!("{}", lpm_common::sanitize_terminal_inline(&path));
             }
             Ok(())
         }
@@ -119,7 +119,7 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
                 .unwrap()
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Wiped package store · freed {}",
             format_bytes(bytes_before)
         ));
@@ -443,12 +443,12 @@ fn run_verify(
                             };
                             if !json_output {
                                 let status = if fixed { "fixed" } else { "fix failed" };
-                                install_ui::warn(&format!(
+                                install_ui::warn_untrusted(&format!(
                                     "{safe_name}@{safe_version} — security analysis mismatch ({status})"
                                 ));
                             }
                         } else if !json_output {
-                            install_ui::warn(&format!(
+                            install_ui::warn_untrusted(&format!(
                                 "{name}@{version} — security analysis mismatch (use --fix to refresh)"
                             ));
                         }
@@ -476,12 +476,12 @@ fn run_verify(
                         };
                         if !json_output {
                             let status = if fixed { "fixed" } else { "fix failed" };
-                            install_ui::warn(&format!(
+                            install_ui::warn_untrusted(&format!(
                                 "{safe_name}@{safe_version} — missing security cache ({status})"
                             ));
                         }
                     } else if !json_output {
-                        install_ui::warn(&format!(
+                        install_ui::warn_untrusted(&format!(
                             "{name}@{version} — missing security cache (use --fix to generate)"
                         ));
                     }
@@ -556,17 +556,17 @@ fn run_verify(
             ));
         }
         if deep && security_mismatches > 0 && !fix {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{verified} store entries verified, {security_mismatches} security analysis mismatch{} (use --fix to refresh)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else if deep && security_mismatches > 0 && fix {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{verified} store entries verified, {security_mismatches} security analysis mismatch{} (fixed)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else {
-            install_ui::done(&format!("Store verified · {msg}"));
+            install_ui::done_untrusted(&format!("Store verified · {msg}"));
         }
         if deep {
             // Make the scope explicit so users don't assume a clean
@@ -579,9 +579,9 @@ fn run_verify(
             );
         }
     } else {
-        install_ui::failed(&format!("{} corrupted, {} OK", corrupted.len(), verified));
+        install_ui::failed_untrusted(&format!("{} corrupted, {} OK", corrupted.len(), verified));
         for issue in &corrupted {
-            install_ui::warn(issue);
+            install_ui::warn_untrusted(issue);
         }
         if deep && security_mismatches > 0 {
             let suffix = if fix && security_fix_failures > 0 {
@@ -591,7 +591,7 @@ fn run_verify(
             } else {
                 "use --fix to refresh"
             };
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{security_mismatches} security analysis mismatch{} ({suffix})",
                 if security_mismatches == 1 { "" } else { "es" }
             ));

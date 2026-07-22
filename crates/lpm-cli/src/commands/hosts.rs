@@ -110,7 +110,7 @@ fn run_clean(json_output: bool, yes: bool) -> Result<(), LpmError> {
             outcome.changed,
         );
     } else if outcome.changed {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "removed {} LPM-managed hosts file {}",
             outcome.removed_blocks,
             if outcome.removed_blocks == 1 {
@@ -454,9 +454,9 @@ fn confirm_hosts_file_clean(
         "LPM will remove its managed entries from your hosts file.".bold()
     );
     println!();
-    print_field("Hosts file:", &plan.path.display().to_string());
-    print_field("Backup:", &plan.backup_path.display().to_string());
-    print_field("Blocks:", &plan.block_count.to_string());
+    print_field("Hosts file:", plan.path.display().to_string());
+    print_field("Backup:", plan.backup_path.display().to_string());
+    print_field("Blocks:", plan.block_count.to_string());
     println!();
     let answer = cliclack::confirm("Clean LPM hosts entries now?")
         .initial_value(false)
@@ -470,8 +470,15 @@ fn confirm_hosts_file_clean(
     Ok(())
 }
 
-fn print_field(label: &str, value: &str) {
-    println!("    {} {value}", install_ui::dim(&format!("{label:<12}")));
+fn print_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!(
+            "    {} {}",
+            install_ui::dim(&format!("{label:<12}")),
+            value
+        )
+    );
 }
 
 fn print_clean_json(

@@ -66,6 +66,9 @@ pub(in crate::commands::config) fn announce_trust_policy_set(value: &str, json_o
             .unwrap()
         );
     } else {
-        install_ui::done(&format!("Set trust-policy = {}", value.bold()));
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Set trust-policy = {}",
+            install_ui::bold(value),
+        ));
     }
 }

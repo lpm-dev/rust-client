@@ -16,7 +16,7 @@ pub(super) fn format_severity(severity: &str) -> String {
 
 pub(super) fn format_osv_severity(severity: &str) -> String {
     let severity = lpm_common::sanitize_terminal_inline(severity);
-    install_ui::dim(&format!("severity {}", severity.to_lowercase()))
+    install_ui::dim(&format!("severity {}", severity.to_lowercase())).to_string()
 }
 
 pub(super) fn package_name_without_version(pkg_id: &str) -> String {
@@ -35,7 +35,7 @@ pub(super) fn preview_versioned_packages(packages: &[String], limit: usize) -> S
     if packages.len() > limit {
         preview.push(format!("+{}", packages.len() - limit));
     }
-    install_ui::dim(&preview.join(", "))
+    install_ui::dim(&preview.join(", ")).to_string()
 }
 
 pub(super) fn preview_package_names(packages: &[String], limit: usize) -> String {
@@ -47,7 +47,7 @@ pub(super) fn preview_package_names(packages: &[String], limit: usize) -> String
     if packages.len() > limit {
         preview.push(format!("+{}", packages.len() - limit));
     }
-    install_ui::dim(&preview.join(", "))
+    install_ui::dim(&preview.join(", ")).to_string()
 }
 
 pub(super) fn behavior_token_label(token: &str) -> &str {

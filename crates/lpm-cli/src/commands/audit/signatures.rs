@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 
 use crate::install_ui;
@@ -83,7 +82,7 @@ fn registry_signature_inputs_from_discovery(
 
 fn print_registry_signature_report(report: &crate::registry_signatures::RegistrySignatureReport) {
     if report.has_failures() {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Registry signatures · {} verified · {} not verified",
             report.verified(),
             report.not_verified()
@@ -96,10 +95,14 @@ fn print_registry_signature_report(report: &crate::registry_signatures::Registry
             let package_id = package.package_id();
             let package_id = lpm_common::sanitize_terminal_inline(&package_id);
             let reason = lpm_common::sanitize_terminal_inline(&reason);
-            install_ui::detail(&format!("  {}  {reason}", package_id.yellow()));
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {}  {}",
+                install_ui::yellow(&package_id),
+                reason,
+            ));
         }
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Registry signatures verified · {} verified",
             report.verified()
         ));

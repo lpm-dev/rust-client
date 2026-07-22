@@ -133,13 +133,17 @@ pub(super) fn vars_init(
         for env in &all_envs {
             if let Some(alias) = &env.alias {
                 println!(
-                    "    {}  {}  {}",
-                    alias.bold(),
-                    "->".dimmed(),
-                    env.file_path
-                        .as_deref()
-                        .unwrap_or(&format!(".env.{}", env.canonical))
-                        .dimmed(),
+                    "{}",
+                    install_ui::terminal_line!(
+                        "    {}  {}  {}",
+                        install_ui::bold(alias),
+                        install_ui::dim("->"),
+                        install_ui::dim(
+                            env.file_path
+                                .as_deref()
+                                .unwrap_or(&format!(".env.{}", env.canonical)),
+                        ),
+                    )
                 );
             }
         }
@@ -153,14 +157,24 @@ pub(super) fn vars_init(
         let fp = action.file_path.as_deref().unwrap_or(&fallback);
         if action.file_exists {
             println!(
-                "    {} {} ({} variable{})",
-                "found".green(),
-                fp.bold(),
-                action.file_var_count,
-                if action.file_var_count == 1 { "" } else { "s" }
+                "{}",
+                install_ui::terminal_line!(
+                    "    {} {} ({} variable{})",
+                    install_ui::green("found"),
+                    install_ui::bold(fp),
+                    action.file_var_count,
+                    if action.file_var_count == 1 { "" } else { "s" },
+                )
             );
         } else {
-            println!("    {}  {}", "missing".dimmed(), fp.dimmed());
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "    {}  {}",
+                    install_ui::dim("missing"),
+                    install_ui::dim(fp),
+                )
+            );
         }
     }
     println!();
@@ -180,22 +194,25 @@ pub(super) fn vars_init(
                 lpm_vault::import_env_file_to_env(project_dir, &action.canonical, &path, force)
             }
             .map_err(LpmError::Script)?;
-            output::success(&format!(
+            output::success_line(install_ui::terminal_line!(
                 "imported {} variable{} from {} into \"{}\"",
                 count,
                 if count == 1 { "" } else { "s" },
-                fp.cyan(),
-                action.canonical
+                install_ui::cyan(fp),
+                &action.canonical,
             ));
             imported_count += 1;
         } else if action.file_exists && action.vault_exists {
             println!(
-                "  {} \"{}\" already has {} secret{} (use {} to overwrite)",
-                "skip".yellow(),
-                action.canonical,
-                action.vault_var_count,
-                if action.vault_var_count == 1 { "" } else { "s" },
-                "--force".bold()
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} \"{}\" already has {} secret{} (use {} to overwrite)",
+                    install_ui::yellow("skip"),
+                    &action.canonical,
+                    action.vault_var_count,
+                    if action.vault_var_count == 1 { "" } else { "s" },
+                    install_ui::bold("--force"),
+                )
             );
             skipped_count += 1;
         } else if !action.vault_exists && !action.file_exists && action.canonical != "default" {
@@ -352,12 +369,18 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let schema_suffix = match row.schema_status {
             Some((valid, total)) if total > 0 => {
                 if valid == total {
-                    format!(" {}", install_ui::status_ok(&format!("{valid}/{total} ok")))
+                    install_ui::terminal_line!(
+                        " {}",
+                        install_ui::status_ok(&format!("{valid}/{total} ok")),
+                    )
                 } else {
-                    format!(" {}", install_ui::red(&format!("{valid}/{total} !!")))
+                    install_ui::terminal_line!(
+                        " {}",
+                        install_ui::red(&format!("{valid}/{total} !!")),
+                    )
                 }
             }
-            _ => String::new(),
+            _ => install_ui::TerminalLine::new(""),
         };
 
         let row_synced = sync_summary.synced && row.var_count > 0;
@@ -377,15 +400,25 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let updated_str = install_ui::dim(&format!("{updated_raw:<updated_width$}"));
 
         let source_indicator = match row.source {
-            lpm_env::EnvSource::Legacy => format!(" {}", install_ui::yellow("legacy")),
-            _ => String::new(),
+            lpm_env::EnvSource::Legacy => {
+                install_ui::terminal_line!(" {}", install_ui::yellow("legacy"))
+            }
+            _ => install_ui::TerminalLine::new(""),
         };
 
         let var_count = install_ui::dim(&format!("{:>9}", row.var_count));
 
         println!(
-            "  {:<name_width$}  {}  {}  {}{}{}",
-            row.canonical, var_count, synced_str, updated_str, schema_suffix, source_indicator,
+            "{}",
+            install_ui::terminal_line!(
+                "  {:<name_width$}  {}  {}  {}{}{}",
+                &row.canonical,
+                var_count,
+                synced_str,
+                updated_str,
+                schema_suffix,
+                source_indicator,
+            )
         );
     }
     println!();
@@ -464,12 +497,12 @@ pub(super) fn vars_copy(
                 })
             );
         } else {
-            output::info(&format!(
+            output::info_line(install_ui::terminal_line!(
                 "nothing to copy — all {} key{} already exist in \"{}\" (use {} to overwrite)",
                 to_skip.len(),
                 if to_skip.len() == 1 { "" } else { "s" },
-                resolved_dst.canonical,
-                "--overwrite".bold()
+                &resolved_dst.canonical,
+                install_ui::bold("--overwrite"),
             ));
         }
         return Ok(());
@@ -490,22 +523,26 @@ pub(super) fn vars_copy(
             })
         );
     } else {
-        output::success(&format!(
-            "copied {} secret{} from \"{}\" to \"{}\"{}",
-            to_copy.len(),
-            if to_copy.len() == 1 { "" } else { "s" },
-            resolved_src.canonical,
-            resolved_dst.canonical,
-            if to_skip.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " ({} existing skipped, use {} to overwrite)",
-                    to_skip.len(),
-                    "--overwrite".bold()
-                )
-            }
-        ));
+        let message = if to_skip.is_empty() {
+            install_ui::terminal_line!(
+                "copied {} secret{} from \"{}\" to \"{}\"",
+                to_copy.len(),
+                if to_copy.len() == 1 { "" } else { "s" },
+                &resolved_src.canonical,
+                &resolved_dst.canonical,
+            )
+        } else {
+            install_ui::terminal_line!(
+                "copied {} secret{} from \"{}\" to \"{}\" ({} existing skipped, use {} to overwrite)",
+                to_copy.len(),
+                if to_copy.len() == 1 { "" } else { "s" },
+                &resolved_src.canonical,
+                &resolved_dst.canonical,
+                to_skip.len(),
+                install_ui::bold("--overwrite"),
+            )
+        };
+        output::success_line(message);
     }
 
     Ok(())

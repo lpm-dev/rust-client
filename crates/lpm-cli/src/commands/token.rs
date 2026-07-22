@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::{RegistryClient, parse_capped_api_json};
 
 /// Rotate the current token (create new, revoke old).
@@ -10,7 +9,10 @@ pub async fn run_rotate(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
-        install_ui::phase(&format!("Rotating {} token", install_ui::yellow("lpm.dev")));
+        install_ui::phase_line(crate::install_ui::terminal_line!(
+            "Rotating {} token",
+            install_ui::yellow("lpm.dev")
+        ));
     }
 
     // The server handles rotation: POST creates new token and invalidates old
@@ -46,7 +48,7 @@ pub async fn run_rotate(
             install_ui::done("Old token invalidated");
             install_ui::done("New token stored");
             if let Some(label) = storage_status.human_label() {
-                install_ui::detail(&format!("secure storage backend: {label}"));
+                install_ui::detail_untrusted(&format!("secure storage backend: {label}"));
             }
             if storage_status.degraded {
                 install_ui::warn(
@@ -55,7 +57,11 @@ pub async fn run_rotate(
             }
             install_ui::done("Done · session token rotated successfully");
             if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
-                eprintln!("  {} {}", "Expires:".dimmed(), expires.dimmed());
+                install_ui::detail_line(crate::install_ui::terminal_line!(
+                    "  {} {}",
+                    install_ui::dim("Expires:"),
+                    install_ui::dim(expires)
+                ));
             }
             eprintln!();
         }

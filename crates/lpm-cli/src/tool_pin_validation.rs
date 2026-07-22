@@ -53,35 +53,32 @@ fn collect_unsupported(tools: &std::collections::HashMap<String, String>) -> Vec
 }
 
 fn emit_warning(unsupported: &[String]) {
-    install_ui::warn(&format_warning(unsupported));
+    install_ui::warn_line(format_warning(unsupported));
 }
 
-fn format_warning(unsupported: &[String]) -> String {
+fn format_warning(unsupported: &[String]) -> install_ui::TerminalLine {
     let names = unsupported
         .iter()
-        .map(|n| install_ui::cyan(&format!("tools.{n}")))
+        .map(|name| format!("tools.{name}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let supported = PLUGIN_BACKED_TOOLS
-        .iter()
-        .map(|tool| install_ui::yellow(tool))
-        .collect::<Vec<_>>();
-    format!(
-        "{}: {names} ignored — only {supported} are plugin-backed today",
+    install_ui::terminal_line!(
+        "{}: {} ignored — only {} are plugin-backed today",
         install_ui::cyan("lpm.json"),
-        supported = join_natural(&supported),
+        install_ui::cyan(&names),
+        install_ui::yellow(&join_natural(PLUGIN_BACKED_TOOLS)),
     )
 }
 
-fn join_natural(items: &[String]) -> String {
+fn join_natural(items: &[&str]) -> String {
     match items {
         [] => String::new(),
-        [one] => one.clone(),
+        [one] => (*one).to_owned(),
         [one, two] => format!("{one} and {two}"),
         _ => {
             let mut out = items[..items.len() - 1].join(", ");
             out.push_str(", and ");
-            out.push_str(&items[items.len() - 1]);
+            out.push_str(items[items.len() - 1]);
             out
         }
     }

@@ -31,21 +31,33 @@ pub fn suppress_stderr(enabled: bool) -> Result<Option<gag::Gag>, String> {
 
 /// Print a success message.
 pub fn success(msg: &str) {
-    install_ui::done(msg);
+    install_ui::done_untrusted(msg);
+}
+
+pub fn success_line(msg: install_ui::TerminalLine) {
+    install_ui::done_line(msg);
 }
 
 /// Print a warning message.
 pub fn warn(msg: &str) {
-    install_ui::warn(msg);
+    install_ui::warn_untrusted(msg);
+}
+
+pub fn warn_line(msg: install_ui::TerminalLine) {
+    install_ui::warn_line(msg);
 }
 
 /// Print an info message.
 pub fn info(msg: &str) {
-    install_ui::phase(msg);
+    install_ui::phase_untrusted(msg);
+}
+
+pub fn info_line(msg: install_ui::TerminalLine) {
+    install_ui::phase_line(msg);
 }
 
 /// Print a label: value pair with the label dimmed.
-pub fn field(label: &str, value: &str) {
+pub fn field(label: &'static str, value: &str) {
     let label = format!("{label}:");
     let value = lpm_common::sanitize_terminal_inline(value);
     eprintln!("    {} {value}", format!("{label:<24}").dimmed());

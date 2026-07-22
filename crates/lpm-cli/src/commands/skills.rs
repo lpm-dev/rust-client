@@ -15,7 +15,6 @@ mod source;
 use crate::install_ui;
 use clap::{Args, Subcommand, ValueEnum};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -311,7 +310,7 @@ async fn run_add(
             .unwrap()
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Installed {} managed {} for {}",
             selected.len(),
             plural(selected.len(), "skill", "skills"),
@@ -407,11 +406,17 @@ async fn add_package_skills(
                 .unwrap()
             );
         } else {
-            println!("{}", name.scoped().cyan());
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!("{}", install_ui::cyan(&name.scoped()))
+            );
             for skill in &response.skills {
-                println!("  {}", skill.name);
+                println!("{}", crate::install_ui::terminal_line!("  {}", &skill.name));
             }
-            install_ui::phase(&format!("would materialize {}", target.display()));
+            install_ui::phase_line(crate::install_ui::terminal_line!(
+                "would materialize {}",
+                target.display().to_string()
+            ));
         }
         return Ok(());
     }
@@ -439,12 +444,15 @@ async fn add_package_skills(
             .unwrap()
         );
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Materialized {} package-published {}",
             result.installed,
             plural(result.installed, "skill", "skills")
         ));
-        eprintln!("  {}", result.directory.display().to_string().dimmed());
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {}",
+            install_ui::dim(&result.directory.display().to_string())
+        ));
     }
     Ok(())
 }
@@ -492,8 +500,11 @@ fn select_skills<'a>(
     for skill in discovered {
         prompt = prompt.item(
             skill.name.clone(),
-            skill.name.clone(),
-            format!("{} · ~{} tokens", skill.description, skill.context_tokens),
+            crate::prompt::untrusted(&skill.name),
+            crate::prompt::untrusted(format!(
+                "{} · ~{} tokens",
+                skill.description, skill.context_tokens
+            )),
         );
     }
     let selected_names: Vec<String> = prompt.interact().map_err(crate::prompt::prompt_err)?;
@@ -586,7 +597,7 @@ fn require_confirmation(yes: bool, json_output: bool, prompt: &str) -> Result<()
             "non-interactive mutation requires `--yes` after reviewing `--dry-run`".into(),
         ));
     }
-    let confirmed = cliclack::confirm(prompt)
+    let confirmed = cliclack::confirm(crate::prompt::untrusted(prompt))
         .initial_value(false)
         .interact()
         .map_err(crate::prompt::prompt_err)?;
@@ -635,19 +646,25 @@ fn print_discovery(
     } else {
         for skill in discovered {
             println!(
-                "{}  {} · ~{} tokens",
-                skill.name,
-                skill.description.dimmed(),
-                skill.context_tokens
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "{}  {} · ~{} tokens",
+                    &skill.name,
+                    install_ui::dim(&skill.description),
+                    skill.context_tokens
+                )
             );
             for finding in &skill.findings {
                 println!(
-                    "  {} {} · {} · {}:{}",
-                    security_severity_label(finding.severity),
-                    install_ui::cyan(&finding.rule_id),
-                    finding.category,
-                    finding.path,
-                    finding.line
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "  {} {} · {} · {}:{}",
+                        security_severity_label(finding.severity),
+                        install_ui::cyan(&finding.rule_id),
+                        &finding.category,
+                        &finding.path,
+                        finding.line
+                    )
                 );
             }
         }
@@ -674,27 +691,43 @@ fn print_standalone_plan(
         );
         return;
     }
-    install_ui::phase(&format!("Source: {}", tree.descriptor.display()));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Source: {}",
+        tree.descriptor.display()
+    ));
     for skill in selected {
         println!(
-            "  {}  {}",
-            skill.name.yellow(),
-            format!("~{} tokens", skill.context_tokens).dimmed()
+            "{}",
+            crate::install_ui::terminal_line!(
+                "  {}  {}",
+                install_ui::yellow(&skill.name),
+                install_ui::dim(&format!("~{} tokens", skill.context_tokens))
+            )
         );
         for finding in &skill.findings {
             println!(
-                "    {} {} · {} · {}:{}",
-                security_severity_label(finding.severity),
-                install_ui::cyan(&finding.rule_id),
-                finding.category,
-                finding.path,
-                finding.line
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "    {} {} · {} · {}:{}",
+                    security_severity_label(finding.severity),
+                    install_ui::cyan(&finding.rule_id),
+                    &finding.category,
+                    &finding.path,
+                    finding.line
+                )
             );
         }
     }
     install_ui::phase("Planned filesystem changes:");
     for change in &plan.changes {
-        println!("  {} {}", change.action, change.path.display());
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!(
+                "  {} {}",
+                &change.action,
+                change.path.display().to_string()
+            )
+        );
     }
 }
 
@@ -765,28 +798,42 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
     if !managed.is_empty() {
         println!("{}", install_ui::section("managed"));
         for skill in &managed {
-            println!("  {:<24} {}", skill.name, skill.summary().dimmed());
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {:<24} {}",
+                    &skill.name,
+                    install_ui::dim(&skill.summary())
+                )
+            );
         }
         println!();
     }
     if !external.is_empty() {
         println!("{}", install_ui::section("external"));
         for skill in &external {
-            println!("  {:<24} {}", skill.name, skill.summary().dimmed());
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {:<24} {}",
+                    &skill.name,
+                    install_ui::dim(&skill.summary())
+                )
+            );
         }
         println!();
     }
     if total == 0 {
         install_ui::warn("No skills installed or discovered");
     } else if managed.is_empty() && external.is_empty() {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "{package_total} {} installed across {} {}",
             plural(package_total, "skill", "skills"),
             packages.len(),
             plural(packages.len(), "package", "packages"),
         ));
     } else {
-        install_ui::done(&format!("{total} skills in the unified inventory"));
+        install_ui::done_untrusted(&format!("{total} skills in the unified inventory"));
     }
     Ok(())
 }
@@ -823,10 +870,22 @@ fn print_package_view(package: &str, name: &str, size: u64, json_output: bool) {
             .unwrap()
         );
     } else {
-        println!("{}", format!("@lpm.dev/{package}/{name}").cyan());
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!(
+                "{}",
+                install_ui::cyan(&format!("@lpm.dev/{package}/{name}"))
+            )
+        );
         println!("  kind: package-published");
-        println!("  size: {}", lpm_common::format_bytes(size));
-        println!("  path: .lpm/skills/{package}/{name}.md");
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!("  size: {}", lpm_common::format_bytes(size))
+        );
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!("  path: .lpm/skills/{}/{}.md", package, name)
+        );
     }
 }
 
@@ -881,12 +940,23 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
         .max()
         .unwrap_or(0);
     for (package, skills) in packages {
-        println!("{}", install_ui::cyan(&format!("@lpm.dev/{package}")));
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!(
+                "{}",
+                install_ui::cyan(&format!("@lpm.dev/{package}"))
+            )
+        );
         for (name, size) in skills {
             let file_name = format!("{name}.md");
+            let file_name = format!("{file_name:<width$}");
             println!(
-                "  {file_name:<width$}  {}",
-                lpm_common::format_bytes(*size).dimmed()
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {}  {}",
+                    file_name,
+                    install_ui::dim(&lpm_common::format_bytes(*size))
+                )
             );
         }
         println!();
@@ -931,21 +1001,25 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
         } else {
             install_ui::phase("Validating package skills in .lpm/skills/");
             for file in &report.valid_files {
-                eprintln!("  {} {file}", install_ui::status_ok("valid"));
+                install_ui::detail_line(crate::install_ui::terminal_line!(
+                    "  {} {}",
+                    install_ui::status_ok("valid"),
+                    file
+                ));
             }
         }
         if report.ignored_package_sets > 0 {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "Ignored {} installed LPM.dev package skill {}",
                 report.ignored_package_sets,
                 plural(report.ignored_package_sets, "set", "sets")
             ));
         }
         for error in &report.errors {
-            install_ui::warn(error);
+            install_ui::warn_untrusted(error);
         }
         for located in &report.security_issues {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "{}: {} security finding at line {} ({})",
                 located.path,
                 located.issue.category,
@@ -957,7 +1031,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
             if report.valid_files.is_empty() {
                 install_ui::warn("No publisher-authored .lpm/skills/*.md files found");
             } else {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "{} package {} valid · {}",
                     report.valid_files.len(),
                     plural(report.valid_files.len(), "skill", "skills"),
@@ -1070,14 +1144,14 @@ fn clean_skills(project_dir: &Path, args: CleanArgs, json_output: bool) -> Resul
     if json_output {
         print_clean_json(&plan, false, &removed, files_removed, bytes_removed)?;
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Removed {} package skill {} · {files_removed} {} · {}",
             removed.len(),
             plural(removed.len(), "set", "sets"),
             plural(files_removed, "file", "files"),
             lpm_common::format_bytes(bytes_removed)
         ));
-        eprintln!("  Run lpm install to restore them.");
+        install_ui::detail("  Run lpm install to restore them.");
     }
     Ok(())
 }
@@ -1188,13 +1262,14 @@ fn print_package_clean_plan(plan: &PackageCleanPlan) {
                 .version
                 .as_deref()
                 .map_or_else(String::new, |version| format!("@{version}"));
-            eprintln!(
-                "  {}{version} · {} {} · {}",
-                target.package,
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {}{} · {} {} · {}",
+                &target.package,
+                version,
                 target.files,
                 plural(target.files, "file", "files"),
                 lpm_common::format_bytes(target.size_bytes)
-            );
+            ));
         }
     }
     if !plan.publisher_files.is_empty() {
@@ -1206,7 +1281,7 @@ fn print_package_clean_plan(plan: &PackageCleanPlan) {
         );
     }
     for skipped in &plan.skipped {
-        install_ui::warn(&format!("Preserving {} — {}", skipped.path, skipped.reason));
+        install_ui::warn_untrusted(&format!("Preserving {} — {}", skipped.path, skipped.reason));
     }
 }
 
@@ -1243,7 +1318,7 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 
 fn security_severity_label(
     severity: lpm_security::skill_security::SkillSecuritySeverity,
-) -> String {
+) -> install_ui::TerminalFragment {
     match severity {
         lpm_security::skill_security::SkillSecuritySeverity::Warning => {
             install_ui::section("warning")

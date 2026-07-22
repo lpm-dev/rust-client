@@ -362,7 +362,7 @@ pub(super) async fn enforce_registry_signature_policy(
 
     if report.has_failures() {
         if !json_output {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "Registry signatures · {} verified · {} not verified",
                 report.verified(),
                 report.not_verified()
@@ -373,7 +373,7 @@ pub(super) async fn enforce_registry_signature_policy(
                     .as_ref()
                     .map_or_else(|| "not verified".to_string(), |reason| reason.human());
                 let package_id = package.package_id();
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {}  {}",
                     install_ui::yellow(&package_id),
                     lpm_common::sanitize_terminal_inline(&reason)
@@ -386,7 +386,7 @@ pub(super) async fn enforce_registry_signature_policy(
     }
 
     if !json_output {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Registry signatures verified · {} verified",
             report.verified()
         ));

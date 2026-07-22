@@ -141,6 +141,9 @@ pub(in crate::commands::config) fn announce_sandbox_set(value: &str, json_output
             .unwrap()
         );
     } else {
-        install_ui::done(&format!("Set [sandbox] mode = {}", value.bold()));
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Set [sandbox] mode = {}",
+            install_ui::bold(value)
+        ));
     }
 }

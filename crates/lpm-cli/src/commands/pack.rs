@@ -233,17 +233,20 @@ pub async fn pack(
         return Ok(());
     }
 
-    install_ui::phase(&format!("Using local {}", install_ui::yellow("tsdown")));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Using local {}",
+        install_ui::yellow("tsdown")
+    ));
 
     let outcome = run_pack_process(project_dir, options, StdioMode::Inherit)?;
     if outcome.success() {
         let duration = install_ui::format_duration(start.elapsed());
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · package build complete in {}",
             install_ui::green(&duration)
         ));
     } else if let Some(code) = outcome.exit_code {
-        install_ui::failed(&format!("pack failed · exit code {code}"));
+        install_ui::failed_untrusted(&format!("pack failed · exit code {code}"));
     }
     outcome.into_result()
 }
@@ -431,7 +434,7 @@ async fn pack_workspace(
             });
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         } else if affected_only {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "no packages affected vs {} — nothing to pack",
                 affected_base.unwrap_or("main"),
             ));
@@ -441,7 +444,10 @@ async fn pack_workspace(
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
-                    eprintln!("  {}", line.dimmed());
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {}",
+                        install_ui::dim(line)
+                    ));
                 }
                 eprintln!();
             }
@@ -565,7 +571,10 @@ async fn run_one_member(
     let start = std::time::Instant::now();
 
     if matches!(stdio, StdioMode::Inherit) {
-        eprintln!("  {} pack", format!("[{member_name}]").bold());
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} pack",
+            install_ui::bold(&format!("[{member_name}]"))
+        ));
     }
 
     let outcome = run_pack_process(member_dir, options, stdio).unwrap_or_else(|e| ToolOutcome {
@@ -576,9 +585,9 @@ async fn run_one_member(
 
     if matches!(stdio, StdioMode::Inherit) && !result.success {
         if let Some(code) = result.exit_code {
-            install_ui::failed(&format!("{member_name}: exit {code}"));
+            install_ui::failed_untrusted(&format!("{member_name}: exit {code}"));
         } else if let Some(ref msg) = result.error {
-            install_ui::failed(&format!("{member_name}: {msg}"));
+            install_ui::failed_untrusted(&format!("{member_name}: {msg}"));
         }
     }
 
@@ -701,8 +710,9 @@ fn emit_human_summary(
 ) {
     if failed == 0 {
         let duration = install_ui::format_duration(elapsed);
-        install_ui::done(&format!(
-            "{tool} passed in {} {} in {}",
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "{} passed in {} {} in {}",
+            tool,
             install_ui::bold(&total.to_string()),
             install_ui::packages_word(total),
             install_ui::green(&duration)
@@ -716,7 +726,7 @@ fn emit_human_summary(
         }
     } else {
         let duration = install_ui::format_duration(elapsed);
-        install_ui::failed(&format!(
+        install_ui::failed_untrusted(&format!(
             "{tool}: {succeeded} passed, {failed} failed out of {total} packages in {duration}"
         ));
     }

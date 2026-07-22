@@ -255,9 +255,10 @@ fn announce_firewall_selection_set(selection: FirewallWizardSelection, json_outp
             .unwrap()
         );
     } else {
-        install_ui::done(&format!(
-            "Set {FIREWALL_CONFIG_PATH} = {}",
-            mode.as_str().bold()
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Set {} = {}",
+            FIREWALL_CONFIG_PATH,
+            install_ui::bold(mode.as_str()),
         ));
     }
 }

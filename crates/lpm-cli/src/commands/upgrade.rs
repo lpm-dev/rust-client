@@ -466,7 +466,7 @@ pub async fn run(
 
     // Warn about fetch errors
     if fetch_errors > 0 && !json_output {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Could not check {} package(s) (network errors)",
             fetch_errors
         ));
@@ -489,7 +489,7 @@ pub async fn run(
             } else {
                 "All requested package.json dependencies are up to date"
             };
-            install_ui::done(message);
+            install_ui::done_untrusted(message);
             warn_skipped_private(&skipped_private);
         }
         return Ok(());
@@ -533,7 +533,7 @@ pub async fn run(
             return Ok(());
         }
     } else {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "Upgrading {} {}",
             deduped.len(),
             install_ui::packages_word(deduped.len())
@@ -563,7 +563,7 @@ pub async fn run(
         }
 
         if dry_run {
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Done · would upgrade {} {} (dry run)",
                 deduped.len(),
                 install_ui::packages_word(deduped.len())
@@ -680,7 +680,7 @@ pub async fn run(
 
     if !json_output {
         install_ui::done("Updated package.json, lpm.lock, node_modules");
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Done · upgraded {} {} in {}",
             deduped.len(),
             install_ui::packages_word(deduped.len()),
@@ -766,7 +766,7 @@ fn warn_skipped_private(skipped_private: &[String]) {
         .iter()
         .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
         .collect::<Vec<_>>();
-    install_ui::warn(&format!(
+    install_ui::warn_untrusted(&format!(
         "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
         skipped_private.len(),
         names.join(", "),
@@ -786,9 +786,9 @@ fn select_candidates_interactively(
     };
     let target_count = candidates.len();
     if target_count == pkg_count {
-        install_ui::phase(&format!("{pkg_count} package(s) can be upgraded."));
+        install_ui::phase_untrusted(&format!("{pkg_count} package(s) can be upgraded."));
     } else {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "{target_count} upgrade targets across {pkg_count} packages."
         ));
     }

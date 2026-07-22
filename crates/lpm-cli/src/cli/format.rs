@@ -32,8 +32,8 @@ where
 
 #[derive(Debug, Eq, PartialEq)]
 enum SlimErrorLine {
-    Failed(String),
-    Detail(String),
+    Failed(install_ui::TerminalLine),
+    Detail(install_ui::TerminalLine),
 }
 
 fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option<String>) -> ! {
@@ -240,8 +240,8 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
 fn render_slim_clap_error(error: &clap::Error, help_hint: Option<&str>) {
     for line in slim_clap_error_lines(error, help_hint) {
         match line {
-            SlimErrorLine::Failed(message) => install_ui::failed(&message),
-            SlimErrorLine::Detail(message) => install_ui::detail(&message),
+            SlimErrorLine::Failed(message) => install_ui::failed_line(message),
+            SlimErrorLine::Detail(message) => install_ui::detail_line(message),
         }
     }
 }
@@ -249,14 +249,16 @@ fn render_slim_clap_error(error: &clap::Error, help_hint: Option<&str>) {
 fn render_slim_error(error: &lpm_common::LpmError) {
     for line in slim_error_lines(error) {
         match line {
-            SlimErrorLine::Failed(message) => install_ui::failed(&message),
-            SlimErrorLine::Detail(message) => install_ui::detail(&message),
+            SlimErrorLine::Failed(message) => install_ui::failed_line(message),
+            SlimErrorLine::Detail(message) => install_ui::detail_line(message),
         }
     }
 }
 
 fn slim_clap_error_lines(error: &clap::Error, help_hint: Option<&str>) -> Vec<SlimErrorLine> {
-    let mut lines = vec![SlimErrorLine::Failed("Invalid command line".to_owned())];
+    let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+        "Invalid command line",
+    ))];
     push_multiline_detail(&mut lines, "reason", &clap_error_reason(error));
     push_clap_context_detail(
         &mut lines,
@@ -323,13 +325,13 @@ fn slim_clap_error_lines(error: &clap::Error, help_hint: Option<&str>) -> Vec<Sl
     );
 
     if let Some(usage) = clap_usage(error) {
-        push_detail(&mut lines, "usage", &install_ui::yellow(&usage));
+        push_detail(&mut lines, "usage", install_ui::yellow(&usage));
     }
 
     push_detail(
         &mut lines,
         "hint",
-        &install_ui::dim(&clap_help_hint(error, help_hint)),
+        install_ui::dim(&clap_help_hint(error, help_hint)),
     );
     lines
 }
@@ -343,9 +345,11 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             diagnostic_lines("Invalid integrity hash", Some(reason), error)
         }
         lpm_common::LpmError::IntegrityMismatch { expected, actual } => {
-            let mut lines = vec![SlimErrorLine::Failed("Integrity mismatch".to_owned())];
-            push_detail(&mut lines, "expected", &install_ui::cyan(expected));
-            push_detail(&mut lines, "actual", &install_ui::cyan(actual));
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Integrity mismatch",
+            ))];
+            push_detail(&mut lines, "expected", install_ui::cyan(expected));
+            push_detail(&mut lines, "actual", install_ui::cyan(actual));
             push_diagnostic_help(&mut lines, error);
             lines
         }
@@ -365,21 +369,23 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             } else {
                 "Suspicious package name"
             };
-            let mut lines = vec![SlimErrorLine::Failed(headline.to_owned())];
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                headline,
+            ))];
             for finding in &context.findings {
-                push_detail(&mut lines, "package", &install_ui::yellow(&finding.package));
-                push_detail(
+                push_detail(&mut lines, "package", install_ui::yellow(&finding.package));
+                push_detail_line(
                     &mut lines,
                     "resembles",
-                    &format!(
+                    install_ui::terminal_line!(
                         "{} {}",
                         install_ui::yellow(&finding.similar_to),
-                        install_ui::dim(&format!("({})", finding.technique))
+                        install_ui::dim(&format!("({})", finding.technique)),
                     ),
                 );
             }
             if let Some(command) = &context.suggested_command {
-                push_detail(&mut lines, "try", &install_ui::yellow(command));
+                push_detail(&mut lines, "try", install_ui::yellow(command));
             }
             lines
         }
@@ -395,7 +401,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             } else {
                 install_ui::yellow(&status.to_string())
             };
-            let mut lines = vec![SlimErrorLine::Failed(format!("HTTP {status}"))];
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::terminal_line!(
+                "HTTP {}", status
+            ))];
             push_untrusted_detail(&mut lines, "message", message);
             lines
         }
@@ -416,36 +424,39 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             match_source,
         } => {
             let mut lines = vec![
-                SlimErrorLine::Failed(format!("Firewall blocked {}", install_ui::yellow(package))),
-                SlimErrorLine::Detail(format!(
+                SlimErrorLine::Failed(install_ui::terminal_line!(
+                    "Firewall blocked {}",
+                    install_ui::yellow(package),
+                )),
+                SlimErrorLine::Detail(install_ui::terminal_line!(
                     "  {} {}",
                     install_ui::dim("verdict"),
-                    install_ui::yellow(verdict)
+                    install_ui::yellow(verdict),
                 )),
-                SlimErrorLine::Detail(format!(
+                SlimErrorLine::Detail(install_ui::terminal_line!(
                     "  {} {}",
                     install_ui::dim("reason"),
-                    lpm_common::sanitize_terminal_inline(reason)
+                    reason,
                 )),
             ];
             if let Some(decision_id) = decision_id {
-                lines.push(SlimErrorLine::Detail(format!(
+                lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
                     "  {} {}",
                     install_ui::dim("decision"),
-                    install_ui::cyan(decision_id)
+                    install_ui::cyan(decision_id),
                 )));
             }
             if let Some(match_source) = match_source {
-                lines.push(SlimErrorLine::Detail(format!(
+                lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
                     "  {} {}",
                     install_ui::dim("match"),
-                    install_ui::cyan(match_source)
+                    install_ui::cyan(match_source),
                 )));
             }
-            lines.push(SlimErrorLine::Detail(format!(
+            lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
                 "  {} {}",
                 install_ui::dim("hint"),
-                install_ui::dim("The package was not downloaded.")
+                install_ui::dim("The package was not downloaded."),
             )));
             lines
         }
@@ -475,11 +486,13 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             diagnostic_lines("Not found", Some(reason), error)
         }
         lpm_common::LpmError::RateLimited { retry_after_secs } => {
-            let mut lines = vec![SlimErrorLine::Failed("Rate limited".to_owned())];
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Rate limited",
+            ))];
             push_detail(
                 &mut lines,
                 "retry after",
-                &install_ui::status_ok(&format!("{retry_after_secs}s")),
+                install_ui::status_ok(&format!("{retry_after_secs}s")),
             );
             push_diagnostic_help(&mut lines, error);
             lines
@@ -499,18 +512,18 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             stdout,
             stderr,
         } => {
-            let mut lines = vec![SlimErrorLine::Failed(format!(
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::terminal_line!(
                 "Script exited with code {}",
-                install_ui::red(&code.to_string())
+                install_ui::red(&code.to_string()),
             ))];
             push_captured_output(&mut lines, "stdout", stdout);
             push_captured_output(&mut lines, "stderr", stderr);
             lines
         }
         lpm_common::LpmError::ExitCode(code) => {
-            vec![SlimErrorLine::Failed(format!(
+            vec![SlimErrorLine::Failed(install_ui::terminal_line!(
                 "Process exited with code {}",
-                install_ui::red(&code.to_string())
+                install_ui::red(&code.to_string()),
             ))]
         }
         lpm_common::LpmError::Io(reason) => {
@@ -534,12 +547,12 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             catalog,
             specifier,
         } => {
-            let mut lines = vec![SlimErrorLine::Failed(
-                "Invalid recursive catalog entry".to_owned(),
-            )];
-            push_detail(&mut lines, "dependency", &install_ui::yellow(dependency));
-            push_detail(&mut lines, "catalog", &install_ui::cyan(catalog));
-            push_detail(&mut lines, "specifier", &install_ui::cyan(specifier));
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Invalid recursive catalog entry",
+            ))];
+            push_detail(&mut lines, "dependency", install_ui::yellow(dependency));
+            push_detail(&mut lines, "catalog", install_ui::cyan(catalog));
+            push_detail(&mut lines, "specifier", install_ui::cyan(specifier));
             push_diagnostic_help(&mut lines, error);
             lines
         }
@@ -552,11 +565,13 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             actual,
             from,
         } => {
-            let mut lines = vec![SlimErrorLine::Failed("Engine version mismatch".to_owned())];
-            push_detail(&mut lines, "engine", &install_ui::yellow(engine));
-            push_detail(&mut lines, "required", &install_ui::cyan(required));
-            push_detail(&mut lines, "actual", &install_ui::cyan(actual));
-            push_detail(&mut lines, "from", &install_ui::dim(from));
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Engine version mismatch",
+            ))];
+            push_detail(&mut lines, "engine", install_ui::yellow(engine));
+            push_detail(&mut lines, "required", install_ui::cyan(required));
+            push_detail(&mut lines, "actual", install_ui::cyan(actual));
+            push_detail(&mut lines, "from", install_ui::dim(from));
             push_diagnostic_help(&mut lines, error);
             lines
         }
@@ -584,26 +599,22 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             project_root,
             suggested_command,
         } => {
-            let mut lines = vec![SlimErrorLine::Failed(
-                "Security approval required".to_owned(),
-            )];
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Security approval required",
+            ))];
             push_multiline_detail(&mut lines, "reason", message);
             if !requested_scopes.is_empty() {
                 push_detail(
                     &mut lines,
                     "scopes",
-                    &install_ui::cyan(&requested_scopes.join(", ")),
+                    install_ui::cyan(&requested_scopes.join(", ")),
                 );
             }
             if let Some(project_root) = project_root {
-                push_detail(&mut lines, "project", &install_ui::cyan(project_root));
+                push_detail(&mut lines, "project", install_ui::cyan(project_root));
             }
             if let Some(suggested_command) = suggested_command {
-                push_detail(
-                    &mut lines,
-                    "command",
-                    &install_ui::yellow(suggested_command),
-                );
+                push_detail(&mut lines, "command", install_ui::yellow(suggested_command));
             }
             push_diagnostic_help(&mut lines, error);
             lines
@@ -615,27 +626,27 @@ fn resolution_error_lines(
     context: &lpm_common::ResolutionErrorContext,
     error: &lpm_common::LpmError,
 ) -> Vec<SlimErrorLine> {
-    let mut lines = vec![SlimErrorLine::Failed(
-        "Could not resolve dependencies".to_owned(),
-    )];
+    let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+        "Could not resolve dependencies",
+    ))];
     push_detail(
         &mut lines,
         "package",
-        &install_ui::yellow(&context.package_request()),
+        install_ui::yellow(&context.package_request()),
     );
     if context.dependency != context.package {
         push_detail(
             &mut lines,
             "dependency",
-            &install_ui::cyan(&context.dependency),
+            install_ui::cyan(&context.dependency),
         );
     }
     if let Some(required_by) = &context.required_by {
-        push_detail(&mut lines, "required by", &install_ui::yellow(required_by));
+        push_detail(&mut lines, "required by", install_ui::yellow(required_by));
     }
     push_untrusted_detail(&mut lines, "reason", &context.reason);
     if let Some(available) = resolution_available_detail(context) {
-        push_detail(&mut lines, "available", &available);
+        push_detail_line(&mut lines, "available", available);
     }
     if let Some(derivation) = &context.derivation {
         push_dimmed_multiline_detail(&mut lines, "because", derivation);
@@ -644,25 +655,31 @@ fn resolution_error_lines(
     lines
 }
 
-fn resolution_available_detail(context: &lpm_common::ResolutionErrorContext) -> Option<String> {
+fn resolution_available_detail(
+    context: &lpm_common::ResolutionErrorContext,
+) -> Option<install_ui::TerminalLine> {
     let count = context.available_versions?;
     let noun = if count == 1 { "version" } else { "versions" };
     let count = install_ui::status_ok(&count.to_string());
     match context.newest_version.as_deref() {
-        Some(newest) => Some(format!(
-            "{count} {noun}, newest {}",
-            install_ui::yellow(newest)
+        Some(newest) => Some(install_ui::terminal_line!(
+            "{} {}, newest {}",
+            count,
+            noun,
+            install_ui::yellow(newest),
         )),
-        None => Some(format!("{count} {noun}")),
+        None => Some(install_ui::terminal_line!("{} {}", count, noun)),
     }
 }
 
 fn diagnostic_lines(
-    headline: &str,
+    headline: &'static str,
     reason: Option<&str>,
     error: &lpm_common::LpmError,
 ) -> Vec<SlimErrorLine> {
-    let mut lines = vec![SlimErrorLine::Failed(headline.to_owned())];
+    let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+        headline,
+    ))];
     if let Some(reason) = reason {
         push_multiline_detail(&mut lines, "reason", reason);
     }
@@ -671,62 +688,78 @@ fn diagnostic_lines(
 }
 
 fn entitlement_error_lines(
-    title: &str,
+    title: &'static str,
     message: &str,
     reason: Option<&str>,
     entitlement_source: Option<&str>,
-    hint: &str,
+    hint: &'static str,
 ) -> Vec<SlimErrorLine> {
     let mut lines = vec![
-        SlimErrorLine::Failed(title.to_owned()),
-        SlimErrorLine::Detail(format!(
+        SlimErrorLine::Failed(install_ui::TerminalLine::new(title)),
+        SlimErrorLine::Detail(install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("reason"),
-            lpm_common::sanitize_terminal_inline(message)
+            message,
         )),
     ];
     if let Some(reason) = reason {
-        lines.push(SlimErrorLine::Detail(format!(
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("policy"),
-            install_ui::cyan(reason)
+            install_ui::cyan(reason),
         )));
     }
     if let Some(entitlement_source) = entitlement_source {
-        lines.push(SlimErrorLine::Detail(format!(
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("entitlement"),
-            install_ui::cyan(entitlement_source)
+            install_ui::cyan(entitlement_source),
         )));
     }
-    lines.push(SlimErrorLine::Detail(format!(
+    lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
         "  {} {}",
         install_ui::dim("hint"),
-        install_ui::dim(hint)
+        install_ui::dim(hint),
     )));
     lines
 }
 
-fn push_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
-    lines.push(SlimErrorLine::Detail(format!(
-        "  {} {value}",
-        install_ui::dim(label)
+fn push_detail(
+    lines: &mut Vec<SlimErrorLine>,
+    label: &'static str,
+    value: install_ui::TerminalFragment,
+) {
+    lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+        "  {} {}",
+        install_ui::dim(label),
+        value,
     )));
 }
 
-fn push_untrusted_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
-    push_detail(lines, label, &lpm_common::sanitize_terminal_inline(value));
+fn push_detail_line(
+    lines: &mut Vec<SlimErrorLine>,
+    label: &'static str,
+    value: install_ui::TerminalLine,
+) {
+    lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+        "  {} {}",
+        install_ui::dim(label),
+        value,
+    )));
 }
 
-fn push_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
+fn push_untrusted_detail(lines: &mut Vec<SlimErrorLine>, label: &'static str, value: &str) {
+    push_detail(lines, label, install_ui::field(value));
+}
+
+fn push_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &'static str, value: &str) {
     let mut non_empty = value.lines().filter(|line| !line.trim().is_empty());
     if let Some(first) = non_empty.next() {
         push_untrusted_detail(lines, label, first);
     }
     for line in non_empty {
-        lines.push(SlimErrorLine::Detail(format!(
-            "    {}",
-            lpm_common::sanitize_terminal_inline(line)
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+            "    {}", line,
         )));
     }
 }
@@ -737,22 +770,22 @@ fn push_diagnostic_help(lines: &mut Vec<SlimErrorLine>, error: &lpm_common::LpmE
     }
 }
 
-fn push_captured_output(lines: &mut Vec<SlimErrorLine>, label: &str, output: &str) {
+fn push_captured_output(lines: &mut Vec<SlimErrorLine>, label: &'static str, output: &str) {
     if output.trim().is_empty() {
         return;
     }
     push_dimmed_multiline_detail(lines, label, output.trim_end());
 }
 
-fn push_dimmed_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
+fn push_dimmed_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &'static str, value: &str) {
     let mut non_empty = value.lines().filter(|line| !line.trim().is_empty());
     if let Some(first) = non_empty.next() {
-        push_detail(lines, label, &install_ui::dim(first));
+        push_detail(lines, label, install_ui::dim(first));
     }
     for line in non_empty {
-        lines.push(SlimErrorLine::Detail(format!(
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
             "    {}",
-            install_ui::dim(line)
+            install_ui::dim(line),
         )));
     }
 }
@@ -765,7 +798,7 @@ enum ClapDetailStyle {
 
 fn push_clap_context_detail(
     lines: &mut Vec<SlimErrorLine>,
-    label: &str,
+    label: &'static str,
     error: &clap::Error,
     kind: clap::error::ContextKind,
     style: ClapDetailStyle,
@@ -780,7 +813,7 @@ fn push_clap_context_detail(
         ClapDetailStyle::Command => install_ui::yellow(&joined),
         ClapDetailStyle::Value => install_ui::cyan(&joined),
     };
-    push_detail(lines, label, &styled);
+    push_detail(lines, label, styled);
 }
 
 fn clap_context_first(error: &clap::Error, kind: clap::error::ContextKind) -> Option<String> {

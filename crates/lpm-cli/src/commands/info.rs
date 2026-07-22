@@ -2,8 +2,7 @@ use crate::commands::registry_reads::{
     fetch_routed_package_metadata, normalize_package_version_input, prepare_routed_read_context,
 };
 use crate::install_ui;
-use lpm_common::color::Painted;
-use lpm_common::{LpmError, sanitize_for_terminal};
+use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use std::path::Path;
 
@@ -28,7 +27,10 @@ pub async fn run(
         return Ok(());
     }
 
-    println!("{}", sanitize_for_terminal(&metadata.name).bold());
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!("{}", install_ui::bold(&metadata.name))
+    );
 
     // Determine which version to show
     let version_key = version
@@ -86,15 +88,20 @@ pub async fn run(
         );
         let latest = metadata.latest_version_tag().unwrap_or("");
         for v in &versions {
-            let safe_version = sanitize_for_terminal(v);
             if *v == latest {
                 println!(
-                    "  {:<12} {}",
-                    safe_version,
-                    install_ui::status_ok("(latest)")
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "  {:<12} {}",
+                        v,
+                        install_ui::status_ok("(latest)")
+                    )
                 );
             } else {
-                println!("  {}", safe_version.dimmed());
+                println!(
+                    "{}",
+                    crate::install_ui::terminal_line!("  {}", install_ui::dim(v))
+                );
             }
         }
     }
@@ -111,20 +118,27 @@ pub async fn run(
     Ok(())
 }
 
-fn print_field(label: &str, value: &str) {
-    let safe_value = sanitize_for_terminal(value);
-    println!("  {} {safe_value}", format!("{label:<12}").dimmed());
+fn print_field(label: &'static str, value: &str) {
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim(&format!("{label:<12}")),
+            value
+        )
+    );
 }
 
 fn print_name_value_rows(values: &std::collections::HashMap<String, String>) {
-    let mut rows: Vec<_> = values
-        .iter()
-        .map(|(name, value)| (sanitize_for_terminal(name), sanitize_for_terminal(value)))
-        .collect();
+    let mut rows: Vec<_> = values.iter().collect();
     rows.sort_by(|(left, _), (right, _)| left.cmp(right));
     let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
     for (name, value) in rows {
-        println!("  {name:<width$}  {}", value.dimmed());
+        let name = format!("{name:<width$}");
+        println!(
+            "{}",
+            crate::install_ui::terminal_line!("  {}  {}", name, install_ui::dim(value),)
+        );
     }
 }
 

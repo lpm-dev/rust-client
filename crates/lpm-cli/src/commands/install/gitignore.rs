@@ -65,7 +65,7 @@ pub(super) fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: boo
     let legacy_isolated_root = layout.isolated_legacy_wrapper_root();
     if layout.legacy_isolated_root_has_wrapper_segments() {
         if !json_output {
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "migrating wrapper layout: {} → {}",
                 install_ui::dim(&legacy_isolated_root.display().to_string()),
                 install_ui::dim(&layout.isolated_wrapper_root().display().to_string()),
@@ -82,7 +82,7 @@ pub(super) fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: boo
     let legacy_hoisted_metadata = layout.hoisted_legacy_metadata_path();
     if legacy_hoisted_metadata.exists() {
         if !json_output {
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "migrating hoisted layout: {} → {}",
                 install_ui::dim(&legacy_hoisted_metadata.display().to_string()),
                 install_ui::dim(&layout.hoisted_metadata_path().display().to_string()),

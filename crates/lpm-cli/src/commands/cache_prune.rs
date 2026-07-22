@@ -846,7 +846,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         // act — silently degrading would hide a real problem with
         // their machine state. Sanitize the reason because it can
         // include parser-controlled bytes from the corrupt file.
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Project registry at ~/.lpm/known-projects.json is unusable ({reason}). \
              Delete the file (a fresh `lpm install` will recreate it) or pass \
              `--project <path>` to walk a specific project. Orphan detection is \
@@ -866,7 +866,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
              still runs under --apply.",
         );
     } else if applied {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Done · pruned {} link entr{} + {} object{} ({}) in {}",
             summary.link_entries_orphaned.len(),
             if summary.link_entries_orphaned.len() == 1 {
@@ -884,7 +884,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
             elapsed,
         ));
     } else {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "{} orphan link entries, {} orphan objects ({} eligible to free; pass --apply to remove)",
             summary.link_entries_orphaned.len(),
             summary.object_entries_orphaned.len(),
@@ -892,19 +892,19 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         ));
     }
     if applied && summary.tombstones_swept > 0 {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "Swept {} global-install tombstone(s) (freed {})",
             summary.tombstones_swept,
             format_bytes(summary.tombstone_bytes_freed),
         ));
     }
     if applied && !summary.tombstones_retained.is_empty() {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "{} tombstone(s) could not be cleaned (files in use?); will retry on next prune",
             summary.tombstones_retained.len(),
         ));
         for failure in &summary.tombstones_retained {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "  {}: {}",
                 sanitize_for_terminal(&failure.relative_path),
                 sanitize_for_terminal(&failure.reason),
@@ -912,27 +912,27 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         }
     }
     if let Some(reason) = &summary.tombstone_sweep_error {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Could not sweep global-install tombstones ({}). The global manifest may be \
              unreadable or corrupted — the retained list is unknown for this run.",
             sanitize_for_terminal(reason),
         ));
     }
     if let Some(reason) = &summary.tombstone_count_error {
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Could not inspect pending global-install tombstones ({}). Dry-run reports 0 \
              pending but the actual count is unknown until the manifest is readable.",
             sanitize_for_terminal(reason),
         ));
     }
     if !applied && summary.tombstones_pending > 0 && summary.tombstone_count_error.is_none() {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "{} pending global-install tombstone(s) — `lpm cache prune --apply` will sweep them",
             summary.tombstones_pending,
         ));
     }
     if summary.registry_entries_dropped > 0 {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "Dropped {} stale registry entr{}",
             summary.registry_entries_dropped,
             if summary.registry_entries_dropped == 1 {
@@ -943,7 +943,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         ));
     }
     if !summary.compat_islands_orphaned.is_empty() {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "{} stale compat island(s) {} {}",
             summary.compat_islands_orphaned.len(),
             if applied { "evicted" } else { "eligible —" },
@@ -955,7 +955,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         ));
     }
     if !summary.build_artifacts_orphaned.is_empty() {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "{} stale build artifact(s) {} {}",
             summary.build_artifacts_orphaned.len(),
             if applied { "evicted" } else { "eligible —" },
@@ -993,7 +993,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         }
     }
     if !applied {
-        install_ui::done(&format!("Done · checked cache in {elapsed}"));
+        install_ui::done_untrusted(&format!("Done · checked cache in {elapsed}"));
     }
 }
 

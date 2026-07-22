@@ -110,7 +110,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             }
         }
     } else {
-        print_field("status", &install_ui::red("not installed"));
+        print_field("status", install_ui::red("not installed"));
         println!(
             "  {}",
             install_ui::dim("Run `lpm cert trust` to generate and install the CA")
@@ -121,7 +121,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         println!();
         println!("{}", install_ui::section("Permission drift"));
         for d in &drifts {
-            print_field(d.role, &install_ui::red(&d.summary()));
+            print_field(d.role, install_ui::red(&d.summary()));
             println!("  {}", install_ui::dim(&format!("fix: {}", d.chmod_hint())));
         }
     }
@@ -130,18 +130,18 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     println!("{}", install_ui::section("Project cert"));
     if status.project_cert_exists {
         if status.project_cert_needs_renewal {
-            print_field("status", &install_ui::section("needs renewal"));
+            print_field("status", install_ui::section("needs renewal"));
         } else {
-            print_field("status", &install_ui::status_ok("valid"));
+            print_field("status", install_ui::status_ok("valid"));
         }
         if !status.project_cert_hostnames.is_empty() {
-            print_field("hosts", &status.project_cert_hostnames.join(", "));
+            print_field("hosts", status.project_cert_hostnames.join(", "));
         }
         if let Some(expires) = &status.project_cert_expires {
             print_field("expires", expires);
         }
     } else {
-        print_field("status", &install_ui::dim("not generated"));
+        print_field("status", install_ui::dim("not generated"));
         println!(
             "  {}",
             install_ui::dim("Run `lpm dev --https` or `lpm cert generate` to create")
@@ -224,7 +224,7 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
         let info = lpm_cert::cert::read_cert_info(&ca_cert_path)?;
         print_field("subject", &info.subject);
         print_field("expires", &info.not_after);
-        print_field("path", &ca_cert_path.to_string_lossy());
+        print_field("path", ca_cert_path.to_string_lossy());
     }
 
     Ok(())
@@ -338,9 +338,9 @@ fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
     print_field("mode", result.mode);
     print_field("old_fingerprint", &result.old_fingerprint);
     print_field("new_fingerprint", &result.new_fingerprint);
-    print_field("reissued", &result.reissued_leaves.len().to_string());
+    print_field("reissued", result.reissued_leaves.len().to_string());
     if !result.skipped_missing.is_empty() {
-        print_field("skipped_missing", &result.skipped_missing.len().to_string());
+        print_field("skipped_missing", result.skipped_missing.len().to_string());
     }
     if let Some(when) = &result.old_ca_removal_scheduled {
         print_field("old_ca_removes_at", when);
@@ -365,15 +365,22 @@ fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
     } else {
         install_ui::done("reconcile complete");
     }
-    print_field("grace_removed", &result.grace_removed.len().to_string());
-    print_field("grace_pending", &result.grace_pending.len().to_string());
-    print_field("stale_removed", &result.stale_removed.len().to_string());
+    print_field("grace_removed", result.grace_removed.len().to_string());
+    print_field("grace_pending", result.grace_pending.len().to_string());
+    print_field("stale_removed", result.stale_removed.len().to_string());
     if result.reconcile_required_cleared {
         print_field("reconcile_required_cleared", "true");
     }
     Ok(())
 }
 
-fn print_field(label: &str, value: &str) {
-    println!("  {} {value}", install_ui::dim(&format!("{label:<10}")));
+fn print_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim(&format!("{label:<10}")),
+            value
+        )
+    );
 }

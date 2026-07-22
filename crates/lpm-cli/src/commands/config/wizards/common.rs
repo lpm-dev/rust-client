@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 
 use super::super::global_config::GlobalConfig;
 use super::super::io::{read_config, write_config};
@@ -61,9 +60,10 @@ pub(in crate::commands::config) fn announce_bool_set(key: &str, value: bool, jso
             .unwrap()
         );
     } else {
-        install_ui::done(&format!(
-            "Set {key} = {}",
-            format_bool_enabled(value).bold()
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Set {} = {}",
+            key,
+            install_ui::bold(format_bool_enabled(value)),
         ));
     }
 }
@@ -99,8 +99,9 @@ pub(in crate::commands::config) fn announce_set(key: &str, value: &str, json_out
             .unwrap()
         );
     } else {
-        install_ui::done(&format!(
-            "Done · {key} = {}",
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Done · {} = {}",
+            key,
             install_ui::section(&format!("\"{value}\""))
         ));
     }

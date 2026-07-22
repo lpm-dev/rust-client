@@ -697,7 +697,7 @@ pub async fn run(
                 "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
                     if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
                         if !json_output {
-                            install_ui::phase(&format!(
+                            install_ui::phase_untrusted(&format!(
                                 "fixing: lpm use node@{}",
                                 lpm_common::sanitize_terminal_inline(&spec)
                             ));
@@ -784,7 +784,7 @@ pub async fn run(
                     if let Some(domain) = check.detail.split(" —").next() {
                         let domain = domain.trim();
                         if !json_output {
-                            install_ui::phase(&format!(
+                            install_ui::phase_untrusted(&format!(
                                 "fixing: lpm tunnel claim {}",
                                 lpm_common::sanitize_terminal_inline(domain)
                             ));
@@ -805,12 +805,12 @@ pub async fn run(
             if fixes_applied.is_empty() {
                 install_ui::phase("no auto-fixable issues found");
             } else {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "applied {} fix(es): {}",
                     fixes_applied.len(),
                     fixes_applied.join(", ")
                 ));
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {} Run {} to verify fixes.",
                     install_ui::dim("hint"),
                     install_ui::yellow("lpm doctor")
@@ -968,7 +968,7 @@ pub async fn run(
 
 fn render_autofix_failed(action: &str, error: &impl std::fmt::Display) {
     let error = error.to_string();
-    install_ui::failed(&format!(
+    install_ui::failed_untrusted(&format!(
         "{} failed: {}",
         lpm_common::sanitize_terminal_inline(action),
         lpm_common::sanitize_terminal_inline(&error)

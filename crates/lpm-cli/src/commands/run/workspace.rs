@@ -106,7 +106,10 @@ pub async fn run_workspace(
         if let Some(h) = hint {
             install_ui::detail("");
             for line in h.lines() {
-                install_ui::detail(&format!("  {}", install_ui::dim(line)));
+                install_ui::detail_line(crate::install_ui::terminal_line!(
+                    "  {}",
+                    install_ui::dim(line)
+                ));
             }
             install_ui::detail("");
         }
@@ -199,7 +202,7 @@ pub async fn run_workspace(
                         }
                         Ok(None) => {} // skipped
                         Err(_) => {
-                            install_ui::detail(&format_run_failure_detail(
+                            install_ui::detail_line(format_run_failure_detail(
                                 "workspace task",
                                 "panicked",
                             ));
@@ -227,7 +230,7 @@ pub async fn run_workspace(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        install_ui::done(&format!(
+        install_ui::done_untrusted(&format!(
             "{total} packages, {total_succeeded} succeeded ({:.1}s)",
             elapsed.as_secs_f64()
         ));
@@ -269,7 +272,7 @@ fn run_workspace_package(
     let pkg = match lpm_workspace::read_package_json(&pkg_json_path) {
         Ok(p) => p,
         Err(e) => {
-            install_ui::detail(&format_run_failure_detail(member_name, e));
+            install_ui::detail_line(format_run_failure_detail(member_name, e));
             return Some(false);
         }
     };
@@ -294,16 +297,13 @@ fn run_workspace_package(
     }
 
     install_ui::detail("");
-    install_ui::detail(&format_workspace_member_scripts_header(
-        member_name,
-        scripts,
-    ));
+    install_ui::detail_line(format_workspace_member_scripts_header(member_name, scripts));
 
     // Build per-package task graph
     let task_levels = match lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts) {
         Ok(l) => l,
         Err(e) => {
-            install_ui::detail(&format_run_failure_detail(member_name, e));
+            install_ui::detail_line(format_run_failure_detail(member_name, e));
             return Some(false);
         }
     };
@@ -316,7 +316,7 @@ fn run_workspace_package(
         Ok(Some(_)) => ManagedRuntimeHint::Unknown,
         Ok(None) => root_hint.clone(),
         Err(error) => {
-            install_ui::detail(&format_run_failure_detail(member_name, error));
+            install_ui::detail_line(format_run_failure_detail(member_name, error));
             return Some(false);
         }
     };
@@ -333,7 +333,7 @@ fn run_workspace_package(
         ) {
             Ok(()) => Some(true),
             Err(e) => {
-                install_ui::detail(&format_run_failure_detail(member_name, e));
+                install_ui::detail_line(format_run_failure_detail(member_name, e));
                 Some(false)
             }
         };

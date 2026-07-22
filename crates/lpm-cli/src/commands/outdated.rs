@@ -240,7 +240,7 @@ pub async fn run(
             } else {
                 "All checked LPM dependency entries are up to date"
             };
-            install_ui::done(message);
+            install_ui::done_untrusted(message);
         } else {
             let rendered = outdated
                 .iter()
@@ -298,7 +298,7 @@ pub async fn run(
                 );
             }
             println!();
-            install_ui::done(&format!(
+            install_ui::done_untrusted(&format!(
                 "Found {} outdated {}",
                 outdated.len(),
                 install_ui::packages_word(outdated.len()),
@@ -309,7 +309,7 @@ pub async fn run(
                 .iter()
                 .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
                 .collect::<Vec<_>>();
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
                 skipped_private.len(),
                 skipped_private_list.join(", "),
@@ -317,14 +317,14 @@ pub async fn run(
             install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run");
         }
         if !lookup_failures.is_empty() {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "could not check {} package(s) due to registry lookup failures",
                 lookup_failures.len(),
             ));
             for failure in &lookup_failures {
-                install_ui::detail(&format!(
+                install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {} {}: {}",
-                    failure.section.dimmed(),
+                    install_ui::dim(failure.section),
                     lpm_common::sanitize_terminal_inline(&failure.name),
                     lpm_common::sanitize_terminal_inline(&failure.reason),
                 ));

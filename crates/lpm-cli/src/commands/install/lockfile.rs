@@ -773,9 +773,9 @@ pub(super) async fn run_offline_install_phase(
     filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     let _platform_skipped = filter_platform_packages(&mut locked)?;
     if !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Offline: using lockfile ({} packages)",
-            locked.len().to_string().bold()
+            install_ui::bold(&locked.len().to_string())
         ));
     }
 

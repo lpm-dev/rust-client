@@ -227,30 +227,26 @@ fn maybe_emit_install_resolving_phase(
     }
 
     let hosts_label = if eager_origins.is_empty() {
-        install_ui::yellow(&install_ui::short_registry_host(client.base_url()))
+        install_ui::short_registry_host(client.base_url())
     } else {
         eager_origins
             .iter()
             .map(|origin| {
-                let host = origin
+                origin
                     .host_lower
                     .strip_prefix("registry.")
                     .unwrap_or(&origin.host_lower)
-                    .to_owned();
-                install_ui::yellow(&host)
+                    .to_owned()
             })
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let line = if is_add_invocation {
-        format!("Resolving dependencies from {hosts_label}")
-    } else {
-        format!(
-            "Resolving dependencies from {hosts_label} for {}",
-            install_ui::bold(pkg_name)
-        )
-    };
-    install_ui::phase(&line);
+    let mut line =
+        install_ui::TerminalLine::new("Resolving dependencies from ").yellow(&hosts_label);
+    if !is_add_invocation {
+        line = line.text(" for ").bold(pkg_name);
+    }
+    install_ui::phase_line(line);
 }
 
 pub(super) fn configure_install_client_for_routing(

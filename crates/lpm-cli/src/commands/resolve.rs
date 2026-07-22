@@ -42,7 +42,7 @@ pub async fn run(
     let start = Instant::now();
 
     if !json_output {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Resolving {} {}",
             install_ui::bold(&deps.len().to_string()),
             install_ui::packages_word(deps.len())
@@ -85,7 +85,7 @@ pub async fn run(
             }
             println!();
             let duration = install_ui::format_duration(elapsed);
-            install_ui::done(&format!(
+            install_ui::done_line(crate::install_ui::terminal_line!(
                 "Resolved {} {} in {}",
                 install_ui::bold(&resolved.len().to_string()),
                 install_ui::packages_word(resolved.len()),
@@ -108,7 +108,7 @@ fn render_resolved_tree(
     resolved: &[ResolvedPackage],
     requested_roots: &[String],
     root_aliases: &HashMap<String, String>,
-) -> Vec<String> {
+) -> Vec<install_ui::TerminalLine> {
     let mut by_key: HashMap<PackageKey, &ResolvedPackage> = HashMap::with_capacity(resolved.len());
     let mut by_name: HashMap<String, Vec<&ResolvedPackage>> =
         HashMap::with_capacity(resolved.len());
@@ -168,7 +168,7 @@ fn render_tree_node(
     prefix: &str,
     by_key: &HashMap<PackageKey, &ResolvedPackage>,
     path: &mut HashSet<PackageKey>,
-    lines: &mut Vec<String>,
+    lines: &mut Vec<install_ui::TerminalLine>,
 ) {
     let name = package.package.canonical_name();
     let version = package.version.to_string();
@@ -198,13 +198,19 @@ fn render_tree_node(
         let child_prefix = if prefix.is_empty() { "  " } else { prefix };
         let branch = install_ui::dim(&format!("{child_prefix}{connector}"));
         if path.contains(child_key) {
-            lines.push(format!(
-                "{branch} {child_label} {}",
+            lines.push(crate::install_ui::terminal_line!(
+                "{} {} {}",
+                branch,
+                child_label,
                 install_ui::dim("(circular)")
             ));
             continue;
         }
-        lines.push(format!("{branch} {child_label}"));
+        lines.push(crate::install_ui::terminal_line!(
+            "{} {}",
+            branch,
+            child_label
+        ));
         let next_prefix = format!("{child_prefix}{}", if last { "   " } else { "│  " });
         render_tree_node(child, &next_prefix, by_key, path, lines);
     }
@@ -233,9 +239,10 @@ fn resolved_child_keys(
     children
 }
 
-fn format_package_label(name: &str, version: &str) -> String {
-    format!(
-        "{name}{}{}",
+fn format_package_label(name: &str, version: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
+        "{}{}{}",
+        name,
         install_ui::dim("@"),
         install_ui::yellow(version)
     )

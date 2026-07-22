@@ -1623,7 +1623,10 @@ pub(super) async fn run_online_fetch_phase(
                     .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
                 let queue_wait_ms = queue_start.elapsed().as_millis();
 
-                overall.set_message(format!("{}@{}", p.name, p.version));
+                overall.set_message(
+                    lpm_common::sanitize_terminal_inline(&format!("{}@{}", p.name, p.version))
+                        .into_owned(),
+                );
 
                 // — Source::Tarball install packages
                 // bypass the registry-routed legacy/streaming paths

@@ -363,7 +363,7 @@ pub(super) fn warn_stale_trusted_deps(
 
     if !stale.is_empty() {
         stale.sort();
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Stale trustedDependencies (no lifecycle scripts): {}",
             stale.join(", ")
         ));

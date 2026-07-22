@@ -71,7 +71,7 @@ pub async fn run(
     registry: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Generating {} SBOM from lpm.lock",
         install_ui::yellow(sbom_format_title(format)),
     ));
@@ -95,10 +95,11 @@ pub async fn run(
     };
     emit_sbom(&value, output)?;
 
-    install_ui::done(metadata_inclusion_line(&document));
+    install_ui::done_untrusted(metadata_inclusion_line(&document));
     let verb = if output.is_some() { "wrote" } else { "printed" };
-    install_ui::done(&format!(
-        "Done · {verb} SBOM in {}",
+    install_ui::done_line(crate::install_ui::terminal_line!(
+        "Done · {} SBOM in {}",
+        verb,
         install_ui::green(&install_ui::format_duration(start.elapsed())),
     ));
     Ok(())
@@ -124,12 +125,12 @@ fn print_sbom_summary(
     format: SbomFormat,
     output: Option<&Path>,
 ) {
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "    {} {}",
         install_ui::dim(&format!("{:<8}", "packages")),
         document.components.len(),
     ));
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "    {} {}",
         install_ui::dim(&format!("{:<8}", "format")),
         sbom_format_id(format),
@@ -140,7 +141,7 @@ fn print_sbom_summary(
         } else {
             project_dir.join(path)
         };
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "    {} {}",
             install_ui::dim(&format!("{:<8}", "output")),
             install_ui::dim(&display_path.display().to_string()),

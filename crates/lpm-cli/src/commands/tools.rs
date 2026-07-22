@@ -1,7 +1,6 @@
 use super::tools_ui;
 use crate::{CheckEngine, install_ui};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -340,7 +339,7 @@ fn read_tool_version(project_dir: &Path, tool_name: &str) -> Option<String> {
         Ok(Some(config)) => config.tools.get(tool_name).cloned(),
         Ok(None) => None,
         Err(e) => {
-            install_ui::warn(&format!("failed to read lpm.json tools config: {e}"));
+            install_ui::warn_untrusted(&format!("failed to read lpm.json tools config: {e}"));
             None
         }
     }
@@ -703,7 +702,10 @@ pub async fn tool_workspace(
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
-                    eprintln!("  {}", line.dimmed());
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {}",
+                        install_ui::dim(line)
+                    ));
                 }
                 eprintln!();
             }
@@ -951,7 +953,7 @@ async fn run_one_member(
     let start = std::time::Instant::now();
 
     if matches!(stdio, StdioMode::Inherit) {
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
             install_ui::cyan(&format!("[{member_name}]")),
             install_ui::yellow(tool)
@@ -989,9 +991,9 @@ async fn run_one_member(
 
     if matches!(stdio, StdioMode::Inherit) && !success {
         if let Some(code) = exit_code {
-            install_ui::detail(&format_member_failure(member_name, &format!("exit {code}")));
+            install_ui::detail_line(format_member_failure(member_name, &format!("exit {code}")));
         } else if let Some(ref msg) = error {
-            install_ui::detail(&format_member_failure(member_name, msg));
+            install_ui::detail_line(format_member_failure(member_name, msg));
         }
     }
 
@@ -1335,7 +1337,7 @@ fn emit_human_summary(
         tools_ui::done_workspace(tool, total, elapsed);
         if targeted > total {
             // Some level filtering reduced the actual run set; surface that.
-            install_ui::detail(&format!(
+            install_ui::detail_line(crate::install_ui::terminal_line!(
                 "  {} {} targeted",
                 install_ui::dim("·"),
                 install_ui::dim(&format!("{targeted} packages"))
@@ -1348,36 +1350,39 @@ fn emit_human_summary(
 
 #[derive(Debug, Eq, PartialEq)]
 enum ToolFailureLine {
-    Failed(String),
-    Detail(String),
+    Failed(install_ui::TerminalLine),
+    Detail(install_ui::TerminalLine),
 }
 
 fn emit_prewarm_failure(tool: &str, reason: &str) {
     for line in format_prewarm_failure(tool, reason) {
         match line {
-            ToolFailureLine::Failed(message) => install_ui::failed(&message),
-            ToolFailureLine::Detail(message) => install_ui::detail(&message),
+            ToolFailureLine::Failed(message) => install_ui::failed_line(message),
+            ToolFailureLine::Detail(message) => install_ui::detail_line(message),
         }
     }
 }
 
 fn format_prewarm_failure(tool: &str, reason: &str) -> Vec<ToolFailureLine> {
     vec![
-        ToolFailureLine::Failed(format!("{} prewarm failed", install_ui::yellow(tool))),
-        ToolFailureLine::Detail(format!(
+        ToolFailureLine::Failed(install_ui::terminal_line!(
+            "{} prewarm failed",
+            install_ui::yellow(tool),
+        )),
+        ToolFailureLine::Detail(install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("reason"),
-            lpm_common::sanitize_for_terminal(reason)
+            reason,
         )),
     ]
 }
 
-fn format_member_failure(member_name: &str, reason: &str) -> String {
-    format!(
+fn format_member_failure(member_name: &str, reason: &str) -> install_ui::TerminalLine {
+    install_ui::terminal_line!(
         "  {} {}: {}",
         install_ui::red("✗"),
         install_ui::yellow(member_name),
-        lpm_common::sanitize_for_terminal(reason)
+        reason,
     )
 }
 
@@ -1428,24 +1433,18 @@ mod tests {
     #[test]
     fn prewarm_failure_formats_as_slim_failure_with_reason_detail() {
         let lines = format_prewarm_failure("lint", "download failed");
-        let plain: Vec<ToolFailureLine> = lines
+        let plain: Vec<String> = lines
             .into_iter()
             .map(|line| match line {
-                ToolFailureLine::Failed(message) => {
-                    ToolFailureLine::Failed(console::strip_ansi_codes(&message).into_owned())
-                }
-                ToolFailureLine::Detail(message) => {
-                    ToolFailureLine::Detail(console::strip_ansi_codes(&message).into_owned())
+                ToolFailureLine::Failed(message) | ToolFailureLine::Detail(message) => {
+                    console::strip_ansi_codes(&message).into_owned()
                 }
             })
             .collect();
 
         assert_eq!(
             plain,
-            vec![
-                ToolFailureLine::Failed("lint prewarm failed".to_string()),
-                ToolFailureLine::Detail("  reason download failed".to_string()),
-            ]
+            vec!["lint prewarm failed", "  reason download failed"]
         );
     }
 

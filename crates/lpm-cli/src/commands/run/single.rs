@@ -30,14 +30,14 @@ fn script_command_for_display(
 }
 
 fn print_run_metadata(cache_status: &str, command: Option<&str>) {
-    install_ui::detail(&format!(
+    install_ui::detail_line(crate::install_ui::terminal_line!(
         "    {} {}",
         install_ui::dim(&format!("{:<8}", "cache")),
         cache_status,
     ));
     if let Some(command) = command {
         let command = lpm_common::sanitize_terminal_inline(command);
-        install_ui::detail(&format!(
+        install_ui::detail_line(crate::install_ui::terminal_line!(
             "    {} {}",
             install_ui::dim(&format!("{:<8}", "command")),
             command,
@@ -84,7 +84,7 @@ pub async fn run(
         if !hit.stderr.is_empty() {
             print_captured_stderr(&hit.stderr);
         }
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "{} · restored from {} (originally {})",
             install_ui::yellow(script_name),
             install_ui::dim("cache"),
@@ -95,7 +95,10 @@ pub async fn run(
         return Ok(());
     }
 
-    install_ui::phase(&format!("Running {}", install_ui::yellow(script_name)));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Running {}",
+        install_ui::yellow(script_name)
+    ));
     let cache_status = if no_cache {
         "disabled"
     } else if caching_enabled {
@@ -131,7 +134,7 @@ pub async fn run(
         lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;
     }
 
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "{} · success in {}",
         install_ui::yellow(script_name),
         install_ui::green(&install_ui::format_duration(start.elapsed())),
@@ -169,12 +172,12 @@ pub fn run_watch(
         .unwrap_or_default();
 
     if input_globs.is_empty() {
-        install_ui::phase(&format!(
+        install_ui::phase_untrusted(&format!(
             "Watching {} (Ctrl+C to stop)",
             lpm_common::sanitize_terminal_inline(script_name)
         ));
     } else {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Watching {} [{}] (Ctrl+C to stop)",
             lpm_common::sanitize_terminal_inline(script_name),
             install_ui::dim(&input_globs.join(", ")),
@@ -197,20 +200,23 @@ pub fn run_watch(
                 let _ = write!(stderr, "\x1B[2J\x1B[1;1H");
                 let _ = stderr.flush();
             }
-            install_ui::phase(&format!("watch running {}", install_ui::yellow(&script)));
+            install_ui::phase_line(crate::install_ui::terminal_line!(
+                "watch running {}",
+                install_ui::yellow(&script)
+            ));
 
             let result =
                 lpm_runner::script::run_script(&dir, &script, &args, mode.as_deref(), &hint);
 
             match result {
                 Ok(()) => {
-                    install_ui::done(&format!(
+                    install_ui::done_line(crate::install_ui::terminal_line!(
                         "{} completed. Waiting for changes...",
                         install_ui::yellow(&script)
                     ));
                 }
                 Err(e) => {
-                    install_ui::failed(&format!(
+                    install_ui::failed_line(crate::install_ui::terminal_line!(
                         "{}: {}",
                         install_ui::yellow(&script),
                         lpm_common::sanitize_for_terminal(&e.to_string())
@@ -236,7 +242,10 @@ pub async fn exec(
     no_env_check: bool,
 ) -> Result<(), LpmError> {
     let bin_hint = ensure_runtime(project_dir).await?;
-    install_ui::phase(&format!("Executing {}", install_ui::yellow(command_name)));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Executing {}",
+        install_ui::yellow(command_name)
+    ));
     let start = std::time::Instant::now();
     lpm_runner::script::run_local_bin(
         project_dir,
@@ -246,7 +255,7 @@ pub async fn exec(
         no_env_check,
         &bin_hint,
     )?;
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · exited 0 in {}",
         install_ui::green(&install_ui::format_duration(start.elapsed())),
     ));
@@ -274,14 +283,14 @@ fn exec_once(
     options: &lpm_runner::exec::ExecOptions,
 ) -> Result<(), LpmError> {
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, options)?;
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Executing {} with {}",
         lpm_common::sanitize_terminal_inline(file_path),
         install_ui::yellow(&plan.runtime_label())
     ));
     let start = std::time::Instant::now();
     lpm_runner::exec::execute_exec_plan(project_dir, &plan)?;
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · exited 0 in {}",
         install_ui::green(&install_ui::format_duration(start.elapsed())),
     ));
@@ -301,7 +310,7 @@ pub async fn run_file_watch(
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, &options)?;
     let (watch_dir, input_globs) = exec_watch_scope(project_dir, &plan);
 
-    install_ui::phase(&format!(
+    install_ui::phase_untrusted(&format!(
         "Watching {} (Ctrl+C to stop)",
         lpm_common::sanitize_terminal_inline(file_path)
     ));
@@ -319,7 +328,7 @@ pub async fn run_file_watch(
                 let _ = stderr.flush();
             }
 
-            install_ui::phase(&format!(
+            install_ui::phase_line(crate::install_ui::terminal_line!(
                 "watch executing {} with {}",
                 install_ui::yellow(&file),
                 install_ui::yellow(&plan_for_watch.runtime_label())
@@ -328,14 +337,14 @@ pub async fn run_file_watch(
 
             match lpm_runner::exec::execute_exec_plan(&dir, &plan_for_watch) {
                 Ok(()) => {
-                    install_ui::done(&format!(
+                    install_ui::done_line(crate::install_ui::terminal_line!(
                         "{} completed in {}. Waiting for changes...",
                         install_ui::yellow(&file),
                         install_ui::green(&install_ui::format_duration(start.elapsed())),
                     ));
                 }
                 Err(e) => {
-                    install_ui::failed(&format!(
+                    install_ui::failed_line(crate::install_ui::terminal_line!(
                         "{}: {}",
                         install_ui::yellow(&file),
                         lpm_common::sanitize_for_terminal(&e.to_string())
@@ -595,7 +604,7 @@ fn identity_for_display(
 fn print_dlx_identity(identity: &DlxResolvedIdentity) {
     let package = package_version_spec(&identity.package_name, &identity.version);
     let integrity = identity.integrity.as_deref().unwrap_or("unavailable");
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Resolved {} · {} {} · {} {}",
         install_ui::yellow(&package),
         install_ui::dim("integrity"),
@@ -647,22 +656,25 @@ pub async fn dlx(
             .as_ref()
             .is_some_and(|identity| cache_identity_matches_target(identity, &target));
     let needs_install = options.refresh || !was_ready;
-    install_ui::phase(&format!("Resolving {}", install_ui::yellow(package_spec)));
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Resolving {}",
+        install_ui::yellow(package_spec)
+    ));
     if !options.refresh && was_ready {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Reusing dlx cache entry ({})",
             install_ui::status_ok("fresh"),
         ));
     } else if !options.refresh && !install.root().join("node_modules/.bin").is_dir() {
         // First install or evicted entry — silent install (matches prior dlx behavior).
     } else if !options.refresh && cached_identity.is_none() {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Refreshing unaudited dlx cache entry for {}",
             install_ui::yellow(package_spec),
         ));
     } else if !options.refresh {
         // Markers present but TTL expired — be loud about the reinstall.
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Refreshing expired dlx cache entry for {}",
             install_ui::yellow(package_spec),
         ));
@@ -677,7 +689,7 @@ pub async fn dlx(
         )
         .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
 
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Installing {}",
             install_ui::yellow(&target.install_spec)
         ));
@@ -743,7 +755,7 @@ pub async fn dlx(
         "lpm dlx executed `{}` after install-policy gates; the package command inherits the caller cwd and process privileges.",
         package_spec,
     );
-    install_ui::warn(&format!(
+    install_ui::warn_untrusted(&format!(
         "running `{package_spec}` inherits cwd privileges; credential env vars are stripped"
     ));
 

@@ -146,12 +146,14 @@ pub(super) fn tier_label_text(tier: lpm_security::triage::StaticTier) -> &'stati
 /// Colored rendering of the tier label. Green → green, Red → red,
 /// the ambers → yellow. Kept thin so the color policy lives in one
 /// place and the plain-text helper stays unit-testable.
-pub(super) fn colored_tier_label(tier: lpm_security::triage::StaticTier) -> String {
+pub(super) fn colored_tier_label(
+    tier: lpm_security::triage::StaticTier,
+) -> install_ui::TerminalFragment {
     use lpm_security::triage::StaticTier;
     let text = tier_label_text(tier);
     match tier {
-        StaticTier::Green => text.green(),
-        StaticTier::Amber | StaticTier::AmberLlm => text.yellow(),
-        StaticTier::Red => text.red(),
+        StaticTier::Green => install_ui::green(text),
+        StaticTier::Amber | StaticTier::AmberLlm => install_ui::yellow(text),
+        StaticTier::Red => install_ui::red(text),
     }
 }

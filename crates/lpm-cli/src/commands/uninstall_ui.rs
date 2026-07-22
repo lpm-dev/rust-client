@@ -3,7 +3,7 @@ use lpm_common::format_bytes;
 use std::time::Duration;
 
 pub fn phase_resolving_graph(package_count: usize) {
-    install_ui::phase(&format!(
+    install_ui::phase_line(crate::install_ui::terminal_line!(
         "Resolving dependency graph ({} {})",
         install_ui::bold(&package_count.to_string()),
         install_ui::packages_word(package_count),
@@ -35,7 +35,7 @@ pub fn warn_no_packages_removed() {
 }
 
 pub fn warn_not_found(names: &[String]) {
-    install_ui::warn(&format!(
+    install_ui::warn_untrusted(&format!(
         "Not found in any targeted manifest: {}",
         names.join(", ")
     ));
@@ -43,7 +43,7 @@ pub fn warn_not_found(names: &[String]) {
 
 pub fn done_removed(removed_count: usize, elapsed: Duration) {
     let duration_str = install_ui::format_duration(elapsed);
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · removed {} {} in {}",
         install_ui::bold(&removed_count.to_string()),
         install_ui::packages_word(removed_count),
@@ -55,7 +55,7 @@ pub fn done_cleaned_empty_dirs(cleaned_count: usize) {
     if cleaned_count == 1 {
         install_ui::done("Cleaned empty directories");
     } else {
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Cleaned {} empty directories",
             install_ui::bold(&cleaned_count.to_string())
         ));
@@ -63,14 +63,14 @@ pub fn done_cleaned_empty_dirs(cleaned_count: usize) {
 }
 
 pub fn done_freed_disk(freed_bytes: u64) {
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Freed {} on disk",
         install_ui::green(&format_bytes(freed_bytes))
     ));
 }
 
 pub fn done_global(package: &str, version: &str) {
-    install_ui::done(&format!(
+    install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · uninstalled {}{}",
         install_ui::bold(package),
         install_ui::dim(&format!("@{version}")),
@@ -78,7 +78,7 @@ pub fn done_global(package: &str, version: &str) {
 }
 
 pub fn warn_pruned_trust_entries(trust_entries_pruned: usize) {
-    install_ui::warn(&format!(
+    install_ui::warn_untrusted(&format!(
         "Pruned {} host-global trust entr{} reachable only through this install.",
         trust_entries_pruned,
         if trust_entries_pruned == 1 {

@@ -190,11 +190,9 @@ pub async fn run(
     )?;
 
     if !json_output {
-        let download_message = format!(
-            "Downloading source package {}",
-            install_ui::yellow(&format!("{}@{version}", target.display()))
-        );
-        install_ui::phase(&install_ui::with_firewall_badge(
+        let download_message = install_ui::TerminalLine::new("Downloading source package ")
+            .yellow(&format!("{}@{version}", target.display()));
+        install_ui::phase_line(install_ui::with_firewall_badge(
             download_message,
             firewall_preflight.is_active(),
         ));
@@ -304,10 +302,11 @@ pub async fn run(
                     .and_then(json_value_to_config_string)
                     .or_else(|| field.get("default").and_then(json_value_to_config_string))
                     .unwrap_or_default();
+                let safe_label = crate::prompt::untrusted(label);
 
                 match field_type {
                     "boolean" => {
-                        let result = cliclack::confirm(label)
+                        let result = cliclack::confirm(safe_label)
                             .initial_value(default_val == "true")
                             .interact()
                             .map_err(prompt_err)?;
@@ -348,9 +347,10 @@ pub async fn run(
                         let values: Vec<String> = options.iter().map(|(v, _)| v.clone()).collect();
 
                         if multi {
-                            let mut ms = cliclack::multiselect(label);
+                            let mut ms = cliclack::multiselect(safe_label);
                             for (value, label_str) in &options {
-                                ms = ms.item(value.clone(), label_str, "");
+                                ms =
+                                    ms.item(value.clone(), crate::prompt::untrusted(label_str), "");
                             }
                             // Default all selected
                             ms = ms.initial_values(values);
@@ -363,9 +363,13 @@ pub async fn run(
                                 .iter()
                                 .position(|v| *v == default_val.as_str())
                                 .unwrap_or(0);
-                            let mut sel = cliclack::select(label);
+                            let mut sel = cliclack::select(safe_label);
                             for (i, (value, label_str)) in options.iter().enumerate() {
-                                sel = sel.item(value.clone(), label_str, "");
+                                sel = sel.item(
+                                    value.clone(),
+                                    crate::prompt::untrusted(label_str),
+                                    "",
+                                );
                                 if i == default_idx {
                                     sel = sel.initial_value(value.clone());
                                 }
@@ -376,8 +380,8 @@ pub async fn run(
                     }
                     _ => {
                         // string / text input
-                        let value: String = cliclack::input(label)
-                            .default_input(&default_val)
+                        let value: String = cliclack::input(safe_label)
+                            .default_input(&crate::prompt::untrusted(&default_val))
                             .interact()
                             .map_err(prompt_err)?;
                         inline_config.insert(key.clone(), value);
@@ -746,7 +750,11 @@ pub async fn run(
             }
         }
         if skipped > 0 {
-            install_ui::skipped(&format!("{} {} unchanged", skipped, files_word(skipped)));
+            install_ui::skipped_untrusted(&format!(
+                "{} {} unchanged",
+                skipped,
+                files_word(skipped)
+            ));
         }
     }
 
@@ -785,7 +793,9 @@ pub async fn run(
     } else {
         let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path())?;
         if count > 0 && !json_output {
-            install_ui::skipped(&format!("Skipped {count} dependencies (--no-install-deps)"));
+            install_ui::skipped_untrusted(&format!(
+                "Skipped {count} dependencies (--no-install-deps)"
+            ));
         }
         Vec::new()
     };
@@ -925,12 +935,13 @@ pub async fn run(
             print_security_warnings(&target.display(), &version, ver_meta);
         }
         let elapsed = install_ui::green(&install_ui::format_duration(add_started.elapsed()));
-        install_ui::done(&format!(
-            "Done · added {} {} and {} {} in {elapsed}",
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Done · added {} {} and {} {} in {}",
             copied,
             files_word(copied),
             dep_count,
-            dependencies_word(dep_count)
+            dependencies_word(dep_count),
+            elapsed
         ));
     }
 

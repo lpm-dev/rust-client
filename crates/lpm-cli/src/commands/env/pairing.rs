@@ -67,84 +67,91 @@ impl PairConfirmationView {
             code: code.to_string(),
             fingerprint: lpm_vault::crypto::browser_key_fingerprint(browser_pub_b64),
             match_number: lpm_vault::crypto::pairing_match_number(code, browser_pub_b64),
-            // Every server-supplied string that reaches the terminal must
-            // go through the same sanitizer — partial coverage (e.g.
-            // `device_label` only) lets a MITM'd or compromised server
-            // embed cursor-manipulation escapes in a sibling field and
-            // repaint the fingerprint / match-number lines.
             device_label: session
                 .device_label
                 .as_deref()
-                .map(|s| sanitize_server_string(s, 80)),
+                .map(|s| bounded_server_field(s, 80)),
             created_at: session
                 .created_at
                 .as_deref()
-                .map(|s| sanitize_server_string(s, 64)),
+                .map(|s| bounded_server_field(s, 64)),
             created_from_ip: session
                 .created_from_ip
                 .as_deref()
-                .map(|s| sanitize_server_string(s, 64)),
+                .map(|s| bounded_server_field(s, 64)),
         }
     }
 }
 
-/// Strip ASCII control bytes (including ANSI CSI escape introducers) and
-/// truncate to `max_len` characters before rendering an attacker-influenced
-/// server string to the terminal. Used for every field on `PairingSession`
-/// that reaches `print_pair_confirmation` — `device_label` originates from
-/// `navigator.userAgent.slice(0, 200)` on the dashboard side (attacker can
-/// set it via a malicious browser extension or XSS on lpm.dev), and
-/// `created_at` / `created_from_ip` are echoed verbatim from the server
-/// response, which the pair-flow threat model explicitly treats as
-/// potentially adversarial. Without this guard the prompt could be made to
-/// scroll itself off-screen, repaint the fingerprint or match-number line,
-/// or fake an "OK" confirmation glyph.
-fn sanitize_server_string(value: &str, max_len: usize) -> String {
-    let mut out = String::with_capacity(value.len().min(max_len));
-    let mut chars = 0usize;
-    for c in value.chars() {
-        if c.is_control() {
-            continue;
-        }
-        if chars >= max_len {
-            out.push('…');
-            break;
-        }
-        out.push(c);
-        chars += 1;
+fn bounded_server_field(value: &str, max_len: usize) -> String {
+    let safe = lpm_common::sanitize_terminal_inline(value);
+    if safe.chars().count() <= max_len {
+        safe.into_owned()
+    } else {
+        let mut bounded = String::with_capacity(safe.len().min(max_len) + '…'.len_utf8());
+        bounded.extend(safe.chars().take(max_len));
+        bounded.push('…');
+        bounded
     }
-    out
 }
 
 fn print_pair_confirmation(view: &PairConfirmationView) {
     println!();
-    println!("  {}", "Pair this browser to your vault?".bold());
+    println!(
+        "{}",
+        install_ui::terminal_line!("  {}", install_ui::bold("Pair this browser to your vault?"))
+    );
     println!();
-    println!("    {}: {}", "Code".dimmed(), view.code);
+    println!(
+        "{}",
+        install_ui::terminal_line!("    {}: {}", install_ui::dim("Code"), &view.code)
+    );
     match &view.fingerprint {
-        Some(fp) => println!("    {}: {}", "Browser key fingerprint".dimmed(), fp),
+        Some(fp) => println!(
+            "{}",
+            install_ui::terminal_line!(
+                "    {}: {}",
+                install_ui::dim("Browser key fingerprint"),
+                fp
+            )
+        ),
         None => println!(
-            "    {}: {}",
-            "Browser key fingerprint".dimmed(),
-            "unavailable (server returned an invalid key)".red()
+            "{}",
+            install_ui::terminal_line!(
+                "    {}: {}",
+                install_ui::dim("Browser key fingerprint"),
+                install_ui::red("unavailable (server returned an invalid key)")
+            )
         ),
     }
     if let Some(label) = &view.device_label
         && !label.is_empty()
     {
-        println!("    {}: {label}", "Device".dimmed());
+        println!(
+            "{}",
+            install_ui::terminal_line!("    {}: {}", install_ui::dim("Device"), label)
+        );
     }
     if let Some(created_at) = &view.created_at {
-        println!("    {}: {created_at}", "Created".dimmed());
+        println!(
+            "{}",
+            install_ui::terminal_line!("    {}: {}", install_ui::dim("Created"), created_at)
+        );
     }
     if let Some(ip) = &view.created_from_ip {
-        println!("    {}: {ip}", "From IP".dimmed());
+        println!(
+            "{}",
+            install_ui::terminal_line!("    {}: {}", install_ui::dim("From IP"), ip)
+        );
     }
     println!();
     println!(
-        "  {} {}",
-        "Verify the dashboard shows the same number:".bold(),
-        view.match_number.yellow().bold()
+        "{}",
+        install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::bold("Verify the dashboard shows the same number:"),
+            install_ui::section(&view.match_number)
+        )
     );
     println!();
 }
@@ -416,29 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_server_string_strips_ansi_csi_escape_introducers() {
+    fn bounded_server_field_neutralizes_terminal_controls() {
         // An attacker-controlled UA could embed \x1b[2J (clear screen) or
-        // \x07 (BEL) to repaint the prompt — must be stripped, not rendered.
+        // \x07 (BEL) to repaint the prompt — neither may remain executable.
         let dirty = "Chrome\x1b[2Jon macOS\x07";
-        let clean = sanitize_server_string(dirty, 80);
-        assert_eq!(clean, "Chrome[2Jon macOS");
+        let clean = bounded_server_field(dirty, 80);
+        assert_eq!(clean, "Chromeon macOS?");
         assert!(!clean.contains('\x1b'));
         assert!(!clean.contains('\x07'));
     }
 
     #[test]
-    fn sanitize_server_string_truncates_with_ellipsis_at_char_boundary() {
+    fn bounded_server_field_truncates_with_ellipsis_at_char_boundary() {
         let label = "a".repeat(200);
-        let clean = sanitize_server_string(&label, 10);
+        let clean = bounded_server_field(&label, 10);
         // 10 ASCII chars + "…" marker.
         assert_eq!(clean.chars().count(), 11);
         assert!(clean.ends_with('…'));
     }
 
     #[test]
-    fn sanitize_server_string_preserves_legitimate_user_agents() {
+    fn bounded_server_field_preserves_legitimate_user_agents() {
         let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15";
-        let clean = sanitize_server_string(ua, 80);
+        let clean = bounded_server_field(ua, 80);
         assert_eq!(clean, ua);
     }
 

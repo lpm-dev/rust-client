@@ -242,8 +242,14 @@ fn print_catalog_entries(entries: &[CatalogEntryReport], unused_only: bool) {
     for entry in entries {
         let status = if entry.used { "used" } else { "unused" };
         println!(
-            "{} {} {} {}",
-            entry.catalog, entry.package, entry.specifier, status
+            "{}",
+            crate::install_ui::terminal_line!(
+                "{} {} {} {}",
+                &entry.catalog,
+                &entry.package,
+                &entry.specifier,
+                status
+            )
         );
     }
 }
@@ -256,8 +262,15 @@ fn print_resolved_catalog_entries(entries: &[ResolvedCatalogEntryReport]) {
 
     for entry in entries {
         println!(
-            "{} {} {} -> {} ({})",
-            entry.catalog, entry.package, entry.reference, entry.version, entry.specifier
+            "{}",
+            crate::install_ui::terminal_line!(
+                "{} {} {} -> {} ({})",
+                &entry.catalog,
+                &entry.package,
+                &entry.reference,
+                &entry.version,
+                &entry.specifier
+            )
         );
     }
 }

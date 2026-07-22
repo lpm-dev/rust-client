@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -75,7 +74,7 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
     let mut cleaned_dirs = 0;
 
     if !json_output {
-        install_ui::phase(&format!(
+        install_ui::phase_line(crate::install_ui::terminal_line!(
             "Removing tracked source files for {}",
             install_ui::yellow(package)
         ));
@@ -159,19 +158,23 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
             .unwrap()
         );
     } else if removed_paths.is_empty() {
-        install_ui::warn(&format!(
+        install_ui::warn_line(crate::install_ui::terminal_line!(
             "No files found for {} — it may not have been added, or was added to a custom path",
             install_ui::yellow(package)
         ));
     } else {
         for path in &removed_paths {
-            eprintln!("  {} {}", "-".red(), path.dimmed());
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {} {}",
+                install_ui::red("-"),
+                install_ui::dim(path)
+            ));
         }
         if cleaned_dirs > 0 || removed_paths.iter().any(|path| path.ends_with('/')) {
             install_ui::done("Cleaned empty directories");
         }
         let duration = install_ui::format_duration(start.elapsed());
-        install_ui::done(&format!(
+        install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · removed {} files in {}",
             install_ui::green(&removed_paths.len().to_string()),
             install_ui::green(&duration)

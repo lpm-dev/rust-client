@@ -36,9 +36,9 @@ pub(super) async fn env_rotate_key(
             "version": result.version,
         }));
     } else {
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "encryption key rotated (version {})",
-            result.version.unwrap_or(0).to_string().bold()
+            install_ui::bold(&result.version.unwrap_or(0).to_string())
         ));
     }
     Ok(())
@@ -259,9 +259,9 @@ pub(super) async fn env_rotate_sharing_key(
             .unwrap_or("(unknown)");
         let invalidated = response.invalidated_wrapped_keys.unwrap_or(0);
         let orgs = response.affected_orgs.unwrap_or(0);
-        output::success(&format!(
+        output::success_line(crate::install_ui::terminal_line!(
             "sharing key rotated. New fingerprint: {}.",
-            fp.bold()
+            install_ui::bold(fp)
         ));
         if invalidated > 0 || orgs > 0 {
             output::info(&format!(

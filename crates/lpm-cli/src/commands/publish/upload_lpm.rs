@@ -42,7 +42,7 @@ pub(super) async fn publish_to_lpm(
         && !json_output
     {
         install_ui::detail("");
-        install_ui::warn(&format!(
+        install_ui::warn_line(crate::install_ui::terminal_line!(
             "Publishing to non-default registry: {}",
             install_ui::url(registry_url)
         ));
@@ -124,7 +124,7 @@ pub(super) async fn publish_to_lpm(
     let tarball_mb = tarball_data.len() / (1024 * 1024);
     if tarball_mb > 50 && !json_output {
         let peak_mb = tarball_data.len() * 4 / 3 / (1024 * 1024) + tarball_mb;
-        install_ui::warn(&format!(
+        install_ui::warn_untrusted(&format!(
             "Large tarball ({tarball_mb}MB). This will require ~{peak_mb}MB of memory."
         ));
     }

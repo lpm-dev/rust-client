@@ -466,9 +466,9 @@ pub(super) async fn run_link_and_finish(
     // workspace members because they're never resolved through the registry.
     let workspace_links_created = link_workspace_members(project_dir, workspace_member_deps)?;
     if workspace_links_created > 0 && !json_output {
-        output::info(&format!(
+        output::info_line(crate::install_ui::terminal_line!(
             "Linked {} workspace member(s)",
-            workspace_links_created.to_string().bold()
+            install_ui::bold(&workspace_links_created.to_string())
         ));
     }
 
@@ -774,9 +774,9 @@ pub(super) async fn run_link_and_finish(
         // files.
         if !applied_patches_summary.is_empty() {
             println!();
-            output::info(&format!(
+            output::info_line(crate::install_ui::terminal_line!(
                 "Applied {} patch{}:",
-                applied_patches_summary.len().to_string().bold(),
+                install_ui::bold(&applied_patches_summary.len().to_string()),
                 if applied_patches_summary.len() == 1 {
                     ""
                 } else {
@@ -790,20 +790,23 @@ pub(super) async fn run_link_and_finish(
                     .unwrap_or(&a.patch_path);
                 let total = a.files_modified + a.files_added + a.files_deleted;
                 println!(
-                    "   {}@{} ({}, {} file{})",
-                    install_ui::bold(&a.name),
-                    install_ui::dim(&a.version),
-                    install_ui::dim(&rel_patch.display().to_string()),
-                    total,
-                    if total == 1 { "" } else { "s" },
+                    "{}",
+                    crate::install_ui::terminal_line!(
+                        "   {}@{} ({}, {} file{})",
+                        install_ui::bold(&a.name),
+                        install_ui::dim(&a.version),
+                        install_ui::dim(&rel_patch.display().to_string()),
+                        total,
+                        if total == 1 { "" } else { "s" },
+                    )
                 );
             }
         }
         println!();
-        output::success(&format!(
-            "{} packages installed in {:.1}s",
-            packages.len().to_string().bold(),
-            elapsed.as_secs_f64()
+        output::success_line(crate::install_ui::terminal_line!(
+            "{} packages installed in {}s",
+            install_ui::bold(&packages.len().to_string()),
+            format!("{:.1}", elapsed.as_secs_f64())
         ));
         println!(
             "  {} linked, {} symlinked",

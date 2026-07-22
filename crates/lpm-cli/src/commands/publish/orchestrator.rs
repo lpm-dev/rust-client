@@ -104,7 +104,7 @@ pub async fn run(
         if !validation.security_issues.is_empty() {
             for located in &validation.security_issues {
                 let issue = &located.issue;
-                install_ui::warn(&format!(
+                install_ui::warn_untrusted(&format!(
                     "Skill security: {}: {} — {} at line {} ({})",
                     lpm_common::sanitize_terminal_inline(&located.path),
                     lpm_common::sanitize_terminal_inline(&issue.matched_text),
@@ -120,7 +120,7 @@ pub async fn run(
 
         if !validation.errors.is_empty() {
             for error in &validation.errors {
-                install_ui::warn(&lpm_common::sanitize_terminal_inline(error));
+                install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(error));
             }
             return Err(LpmError::Registry(
                 "skills validation failed — fix errors above".into(),
@@ -130,7 +130,7 @@ pub async fn run(
         let has_authored_skills = !validation.valid_files.is_empty();
         if has_authored_skills {
             if !json_output {
-                install_ui::done(&format!(
+                install_ui::done_untrusted(&format!(
                     "{} skill(s) validated",
                     validation.valid_files.len()
                 ));
@@ -525,7 +525,7 @@ pub async fn run(
                     let upload_spinner = if json_output {
                         None
                     } else {
-                        Some(install_ui::spin(&format_upload_message("lpm.dev")))
+                        Some(install_ui::spin_line(format_upload_message("lpm.dev")))
                     };
                     let response = publish_to_lpm(
                         client,
@@ -561,16 +561,16 @@ pub async fn run(
                             if let Some((owner, pkg)) = owner_pkg.split_once('.') {
                                 publish_detail(
                                     "url",
-                                    &install_ui::url(&format!("https://lpm.dev/{owner}/{pkg}")),
+                                    install_ui::url(&format!("https://lpm.dev/{owner}/{pkg}")),
                                 );
                             }
                             if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array())
                             {
                                 for w in warnings {
                                     if let Some(msg) = w.as_str() {
-                                        install_ui::warn(&lpm_common::sanitize_terminal_inline(
-                                            msg,
-                                        ));
+                                        install_ui::warn_untrusted(
+                                            &lpm_common::sanitize_terminal_inline(msg),
+                                        );
                                     }
                                 }
                             }
@@ -586,7 +586,7 @@ pub async fn run(
                     Err(e) => {
                         if !json_output {
                             let error = e.to_string();
-                            install_ui::warn(&format!(
+                            install_ui::warn_untrusted(&format!(
                                 "LPM publish failed: {}",
                                 lpm_common::sanitize_terminal_inline(&error)
                             ));
@@ -750,7 +750,7 @@ pub async fn run(
                     let upload_spinner = if json_output {
                         None
                     } else {
-                        Some(install_ui::spin(&format_upload_message(display)))
+                        Some(install_ui::spin_line(format_upload_message(display)))
                     };
                     let npm_result = publish_npm::publish_to_npm(
                         &token,
@@ -804,12 +804,12 @@ pub async fn run(
                                 _ => None,
                             };
                             if let Some(url) = package_url {
-                                publish_detail("url", &install_ui::url(&url));
+                                publish_detail("url", install_ui::url(&url));
                             }
                         }
                     } else if !json_output {
                         let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
-                        install_ui::warn(&format!(
+                        install_ui::warn_untrusted(&format!(
                             "{} publish failed: {}",
                             lpm_common::sanitize_terminal_inline(display),
                             lpm_common::sanitize_terminal_inline(err_msg)
@@ -834,7 +834,7 @@ pub async fn run(
                         let duration = start.elapsed();
                         if !json_output {
                             let error = e.to_string();
-                            install_ui::warn(&format!(
+                            install_ui::warn_untrusted(&format!(
                                 "{} publish failed: {}",
                                 lpm_common::sanitize_terminal_inline(target.display_name()),
                                 lpm_common::sanitize_terminal_inline(&error)
@@ -865,21 +865,22 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if targets.len() > 1 {
         if any_failed {
-            install_ui::warn(&format!(
+            install_ui::warn_untrusted(&format!(
                 "Published to {succeeded} of {} registries.",
                 targets.len()
             ));
             for (target, result) in targets.iter().zip(results.iter()) {
                 if !result.success {
-                    install_ui::detail(&format_publish_retry_detail(target));
+                    install_ui::detail_line(format_publish_retry_detail(target));
                 }
             }
         } else {
             let elapsed =
                 install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
-            install_ui::done(&format!(
-                "Done · published to {} registries in {elapsed}",
-                targets.len()
+            install_ui::done_line(crate::install_ui::terminal_line!(
+                "Done · published to {} registries in {}",
+                targets.len(),
+                elapsed
             ));
         }
     } else if !any_failed {
@@ -887,9 +888,10 @@ pub async fn run(
         let key = target.key();
         let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());
         let elapsed = install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
-        install_ui::done(&format!(
-            "Done · published {} in {elapsed}",
-            install_ui::yellow(&format!("{published_name}@{version}"))
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Done · published {} in {}",
+            install_ui::yellow(&format!("{published_name}@{version}")),
+            elapsed,
         ));
     }
 
