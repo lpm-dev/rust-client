@@ -480,20 +480,23 @@ fn render_detected_source(result: &lpm_migrate::MigrateResult, dry_run: bool) {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("lockfile");
-    let mut source = format!(
+    let source = crate::install_ui::terminal_line!(
         "{} v{} · {}",
-        result.source.kind,
-        result.source.version,
+        result.source.kind.to_string(),
+        &result.source.version,
         install_ui::yellow(lockfile),
     );
-    if result.workspace_members > 0 {
-        source.push_str(&format!(
-            " · {} workspace members",
+    let source = if result.workspace_members > 0 {
+        crate::install_ui::terminal_line!(
+            "{} · {} workspace members",
+            source,
             result.workspace_members
-        ));
-    }
+        )
+    } else {
+        source
+    };
 
-    render_migrate_detail("source:", &source);
+    render_migrate_detail("source:", source);
     let backups = if dry_run {
         "not written in dry-run"
     } else {
@@ -506,7 +509,7 @@ fn render_written_file(path: &str) {
     render_migrate_detail("wrote:", path);
 }
 
-fn render_migrate_detail(label: &str, value: &str) {
+fn render_migrate_detail<T: install_ui::TerminalValue>(label: &'static str, value: T) {
     let label = format!("{label:<8}");
     install_ui::detail_line(crate::install_ui::terminal_line!(
         "  {} {}",

@@ -408,17 +408,17 @@ pub async fn run_patch_remove(
             .unwrap()
         );
     } else {
-        let target = if outcome.removed.len() == 1 {
-            install_ui::yellow(&outcome.removed[0].key)
+        let line = if dry_run {
+            install_ui::TerminalLine::new("Previewing removal for ")
         } else {
-            install_ui::field(&format!("{} patch registrations", outcome.removed.len()))
+            install_ui::TerminalLine::new("Removing patch registration for ")
         };
-        let action = if dry_run {
-            "Previewing removal"
+        let line = if outcome.removed.len() == 1 {
+            line.yellow(&outcome.removed[0].key)
         } else {
-            "Removing patch registration"
+            line.field(&format!("{} patch registrations", outcome.removed.len()))
         };
-        install_ui::phase_untrusted(&format!("{action} for {target}"));
+        install_ui::phase_line(line);
         let label_width = "manifest:".len();
         install_ui::detail_line(crate::install_ui::terminal_line!(
             "    {} {}",
