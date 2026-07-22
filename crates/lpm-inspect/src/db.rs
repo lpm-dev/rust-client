@@ -53,6 +53,8 @@ enum DbWrite {
     EndSession {
         id: String,
     },
+    #[cfg(test)]
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 impl InspectorDb {
@@ -146,6 +148,19 @@ impl InspectorDb {
     /// Record a tunnel session end.
     pub fn end_session(&self, id: String) {
         let _ = self.write_tx.send(DbWrite::EndSession { id });
+    }
+
+    #[cfg(test)]
+    async fn flush_pending_writes(&self) {
+        let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            self.write_tx.send(DbWrite::Flush(flushed_tx)).is_ok(),
+            "inspector database flush task must remain available"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), flushed_rx)
+            .await
+            .expect("inspector database flush timed out")
+            .expect("inspector database flush task stopped before committing writes");
     }
 
     /// Query recent requests, newest first.
@@ -555,24 +570,48 @@ async fn flush_task(conn: Arc<Mutex<Connection>>, mut rx: mpsc::UnboundedReceive
             }
         }
 
-        // Flush the batch in a single transaction
-        if !batch.is_empty() {
-            let conn = conn.lock().await;
-            if let Err(e) = flush_batch(&conn, &batch) {
-                tracing::warn!("inspector db flush error: {e}");
-            }
-            batch.clear();
-        }
+        flush_pending_batch(&conn, &mut batch).await;
     }
 
     // Drain remaining writes on shutdown
     while let Ok(write) = rx.try_recv() {
         batch.push(write);
     }
-    if !batch.is_empty() {
-        let conn = conn.lock().await;
-        let _ = flush_batch(&conn, &batch);
+    flush_pending_batch(&conn, &mut batch).await;
+}
+
+async fn flush_pending_batch(conn: &Arc<Mutex<Connection>>, batch: &mut Vec<DbWrite>) {
+    if batch.is_empty() {
+        return;
     }
+
+    let flush_succeeded = {
+        let conn = conn.lock().await;
+        match flush_batch(&conn, batch) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!("inspector db flush error: {error}");
+                false
+            }
+        }
+    };
+    finish_batch(batch, flush_succeeded);
+}
+
+fn finish_batch(batch: &mut Vec<DbWrite>, flush_succeeded: bool) {
+    #[cfg(test)]
+    if flush_succeeded {
+        for write in batch.drain(..) {
+            if let DbWrite::Flush(flushed_tx) = write {
+                let _ = flushed_tx.send(());
+            }
+        }
+        return;
+    }
+
+    #[cfg(not(test))]
+    let _ = flush_succeeded;
+    batch.clear();
 }
 
 fn flush_batch(conn: &Connection, batch: &[DbWrite]) -> Result<(), rusqlite::Error> {
@@ -599,6 +638,8 @@ fn flush_batch(conn: &Connection, batch: &[DbWrite]) -> Result<(), rusqlite::Err
                     params![id],
                 )?;
             }
+            #[cfg(test)]
+            DbWrite::Flush(_) => {}
         }
     }
 
@@ -824,9 +865,7 @@ mod tests {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
         db.insert_request(make_webhook("w2", 500), None);
-
-        // Wait for flush
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let requests = db.list_requests(10, 0).await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -839,7 +878,7 @@ mod tests {
     async fn get_request_detail() {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let detail = db.get_request("w1").await.unwrap().unwrap();
         assert_eq!(detail.id, "w1");
@@ -860,8 +899,7 @@ mod tests {
             br#"{"type":"payment_intent.failed","error":"insufficient_funds"}"#.to_vec();
         w2.summary = "Stripe: payment_intent.failed".to_string();
         db.insert_request(w2, None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         // Search for "insufficient_funds"
         let results = db
@@ -886,8 +924,7 @@ mod tests {
         w2.provider = None;
         w2.summary = "POST /api/hook".to_string();
         db.insert_request(w2, None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let results = db.search("", Some("Stripe"), None, 10).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -899,8 +936,7 @@ mod tests {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
         db.insert_request(make_webhook("w2", 500), None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let results = db
             .search("", None, Some(StatusQuery::Class(5)), 10)
@@ -924,8 +960,7 @@ mod tests {
         db.insert_request(make_webhook("w1", 200), Some("s1".to_string()));
         db.insert_request(make_webhook("w2", 200), Some("s1".to_string()));
         db.end_session("s1".to_string());
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let sessions = db.list_sessions(10).await.unwrap();
         assert_eq!(sessions.len(), 1);
@@ -941,8 +976,7 @@ mod tests {
         db.insert_request(make_webhook("w1", 200), None);
         db.insert_request(make_webhook("w2", 200), None);
         db.insert_request(make_webhook("w3", 200), None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         assert_eq!(db.count().await.unwrap(), 3);
     }
@@ -955,8 +989,7 @@ mod tests {
             w.timestamp = format!("2026-04-06T12:00:{i:02}Z");
             db.insert_request(w, None);
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let page1 = db.list_requests(2, 0).await.unwrap();
         assert_eq!(page1.len(), 2);
@@ -998,8 +1031,7 @@ mod tests {
         w.request_body = br#"{"event":"unique_phantom_canary_xyz"}"#.to_vec();
         w.summary = "unique_phantom_canary_xyz".to_string();
         db.insert_request(w, None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         // Verify the search finds it
         let results = db
@@ -1039,16 +1071,14 @@ mod tests {
         w1.request_body = br#"{"event":"original_value_abc"}"#.to_vec();
         w1.summary = "original_value_abc".to_string();
         db.insert_request(w1, None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         // Replace with different body
         let mut w2 = make_webhook("replace-test", 200);
         w2.request_body = br#"{"event":"replaced_value_def"}"#.to_vec();
         w2.summary = "replaced_value_def".to_string();
         db.insert_request(w2, None);
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         // Old value must NOT be in FTS index (direct query, no JOIN masking)
         {
@@ -1084,7 +1114,7 @@ mod tests {
     async fn rename_session() {
         let db = InspectorDb::open_temp().unwrap();
         db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let updated = db
             .rename_session("s1", "debugging payment flow")
@@ -1111,7 +1141,7 @@ mod tests {
         db.insert_request(make_webhook("w2", 500), Some("s1".to_string()));
         db.insert_request(make_webhook("w3", 200), Some("s1".to_string()));
         db.end_session("s1".to_string());
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let detail = db.get_session("s1").await.unwrap().unwrap();
         assert_eq!(detail.id, "s1");
@@ -1135,7 +1165,7 @@ mod tests {
         db.insert_request(make_webhook("w2", 200), Some("s1".to_string()));
         // This one belongs to a different session
         db.insert_request(make_webhook("w3", 200), None);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let requests = db.list_session_requests("s1", 10, 0).await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -1145,7 +1175,7 @@ mod tests {
     async fn update_tags() {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.flush_pending_writes().await;
 
         let tags = vec!["bug".to_string(), "repro".to_string()];
         let updated = db.update_tags("w1", &tags).await.unwrap();
