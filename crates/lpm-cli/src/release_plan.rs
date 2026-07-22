@@ -274,7 +274,7 @@ fn read_workspace_manifest(
 }
 
 fn read_manifest_json(path: &Path) -> Result<serde_json::Value, LpmError> {
-    let content = std::fs::read_to_string(path).map_err(LpmError::Io)?;
+    let content = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
     serde_json::from_str(&content).map_err(LpmError::Json)
 }
 
@@ -469,7 +469,8 @@ pub(crate) fn load_change_bumps(
     paths.sort();
 
     for path in paths {
-        let content = std::fs::read_to_string(&path).map_err(LpmError::Io)?;
+        let content =
+            lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
         parse_change_file(&content, &path, &mut bumps)?;
     }
     Ok(bumps)

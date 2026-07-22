@@ -413,7 +413,8 @@ async fn run_prune(
     // (preserve ordering, whitespace, etc.). Parse
     // `trustedDependencies` via the typed path to reuse the variant-
     // aware stale computation.
-    let manifest_text = std::fs::read_to_string(&pkg_json_path).map_err(LpmError::Io)?;
+    let manifest_text =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
         .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
     // Audit-v4 F2: malformed `lpm.trustedDependencies` surfaces as a

@@ -3418,6 +3418,7 @@ dependencies = [
  "lpm-store",
  "lpm-workspace",
  "serde_json",
+ "syn 2.0.117",
  "tempfile",
 ]
 
@@ -3655,6 +3656,7 @@ dependencies = [
  "dirs",
  "landlock",
  "libc",
+ "lpm-common",
  "seccompiler",
  "serde_json",
  "tempfile",
@@ -3804,6 +3806,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "keyring",
+ "lpm-common",
  "lpm-http",
  "p256",
  "rand 0.8.6",

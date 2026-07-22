@@ -1347,11 +1347,13 @@ pub(super) fn read_pkg_json_node_engine(
 
 fn read_pkg_json(cas_path: &Path, source_label: &str) -> Result<serde_json::Value, LpmError> {
     let pkg_json_path = cas_path.join("package.json");
-    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to read package.json from {source_label}: {e}"
-        ))
-    })?;
+    let pkg_json_str =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read package.json from {source_label}: {e}"
+            ))
+        })?;
     serde_json::from_str(&pkg_json_str)
         .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))
 }
@@ -1399,12 +1401,14 @@ fn package_json_node_engine(pkg_json: &serde_json::Value) -> Option<String> {
 /// alternative.
 pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>, LpmError> {
     let pkg_json_path = source_dir.join("package.json");
-    let pkg_json_str = std::fs::read_to_string(&pkg_json_path).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to read package.json from local source at {}: {e}",
-            source_dir.display()
-        ))
-    })?;
+    let pkg_json_str =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read package.json from local source at {}: {e}",
+                source_dir.display()
+            ))
+        })?;
     let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).map_err(|e| {
         LpmError::Registry(format!(
             "invalid package.json in local source at {}: {e}",

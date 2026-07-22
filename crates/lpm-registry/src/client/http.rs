@@ -262,19 +262,21 @@ pub(super) fn build_per_origin_http_client(
     let mut all_roots: Vec<TaggedRoot> = global.extra_roots.clone();
     for cafile in &per_origin.cafiles {
         let resolved = cafile.resolve();
-        let bytes = std::fs::read(&resolved).map_err(|e| {
-            tracing::debug!(
-                resolved_path = %resolved.display(),
-                source = %cafile.source,
-                line = cafile.line,
-                error = %e,
-                "per-origin cafile read failed",
-            );
-            LpmError::Cert(format!(
-                "{}:{}: failed to read per-origin cafile for {origin}: {e}",
-                cafile.source, cafile.line,
-            ))
-        })?;
+        let bytes =
+            lpm_common::read_file_capped(&resolved, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+                .map_err(|e| {
+                tracing::debug!(
+                    resolved_path = %resolved.display(),
+                    source = %cafile.source,
+                    line = cafile.line,
+                    error = %e,
+                    "per-origin cafile read failed",
+                );
+                LpmError::Cert(format!(
+                    "{}:{}: failed to read per-origin cafile for {origin}: {e}",
+                    cafile.source, cafile.line,
+                ))
+            })?;
         if !contains_pem_certificate_block_inline(&bytes) {
             return Err(LpmError::Cert(format!(
                 "{}:{}: per-origin cafile for {origin} contains no '-----BEGIN CERTIFICATE-----' block",

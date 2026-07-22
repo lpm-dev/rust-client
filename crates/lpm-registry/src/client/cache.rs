@@ -278,25 +278,18 @@ impl RegistryClient {
     }
 
     pub(super) fn read_cache_content_path(path: &std::path::Path) -> Option<CacheContent> {
-        if !path.exists() {
-            return None;
-        }
-
-        // Reject oversized cache files before any bytes hit memory.
-        // Same boundary as `read_metadata_cache_as`; complements its
-        // TTL-only check on the stale-conditional-request path.
-        let file_size = path.metadata().ok()?.len();
-        if file_size > METADATA_CACHE_FILE_CAP {
-            tracing::warn!(
-                path = %path.display(),
-                size = file_size,
-                cap = METADATA_CACHE_FILE_CAP,
-                "metadata cache entry exceeds size cap — treating as miss"
-            );
-            return None;
-        }
-
-        let content = std::fs::read(path).ok()?;
+        let content = match lpm_common::read_file_capped(path, METADATA_CACHE_FILE_CAP) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::TooLarge { .. }) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    cap = METADATA_CACHE_FILE_CAP,
+                    "metadata cache entry exceeds size cap — treating as miss"
+                );
+                return None;
+            }
+            Err(_) => return None,
+        };
         let (etag_bytes, data) = parse_cached_metadata_blob(&content)?;
 
         #[cfg(test)]

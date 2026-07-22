@@ -10,6 +10,17 @@ use super::*;
 /// accepts it. `*` is the canonical "any version" spec.
 pub(super) const STAGE_PLACEHOLDER: &str = "*";
 
+fn read_manifest_text(path: &Path) -> Result<String, LpmError> {
+    match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => Ok(content),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => Err(LpmError::NotFound(format!(
+            "no package.json at {}",
+            path.display()
+        ))),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(super) fn manifest_install_deps(pkg: &lpm_workspace::PackageJson) -> HashMap<String, String> {
     let mut deps = pkg.dependencies.clone();
     for (name, range) in &pkg.dev_dependencies {
@@ -133,14 +144,7 @@ pub(crate) fn stage_packages_to_manifest(
 ) -> Result<StagedManifest, LpmError> {
     use crate::save_spec::{UserSaveIntent, parse_user_save_intent};
 
-    if !pkg_json_path.exists() {
-        return Err(LpmError::NotFound(format!(
-            "no package.json at {}",
-            pkg_json_path.display()
-        )));
-    }
-
-    let content = std::fs::read_to_string(pkg_json_path)?;
+    let content = read_manifest_text(pkg_json_path)?;
     let mut doc: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
 
@@ -506,7 +510,7 @@ pub(super) fn finalize_packages_in_manifest_with_catalog_policy(
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let content = read_manifest_text(&staged.pkg_json_path)?;
     let mut doc: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
 
@@ -745,7 +749,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let content = read_manifest_text(&staged.pkg_json_path)?;
     let doc: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
     let dep_key = if staged.save_dev {
@@ -858,7 +862,7 @@ pub(super) async fn pin_staged_dist_tags_for_resolution(
     let route_table = lpm_registry::RouteTable::from_env_and_filesystem(route_cwd)
         .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
 
-    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let content = read_manifest_text(&staged.pkg_json_path)?;
     let mut doc: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
 

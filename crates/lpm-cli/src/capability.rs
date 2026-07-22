@@ -526,9 +526,12 @@ impl CapabilitySet {
     /// `package_json` is the path to the manifest; typically
     /// `<project_dir>/package.json`.
     pub fn from_package_json(package_json: &std::path::Path) -> Result<Self, CapabilityParseError> {
-        let raw = match std::fs::read_to_string(package_json) {
+        let raw = match lpm_common::read_text_file_capped(
+            package_json,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
                 return Ok(Self::default());
             }
             Err(e) => {

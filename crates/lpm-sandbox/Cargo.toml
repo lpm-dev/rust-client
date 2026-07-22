@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Filesystem-scoped post-install script sandboxing for LPM"
 
 [dependencies]
+lpm-common = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }

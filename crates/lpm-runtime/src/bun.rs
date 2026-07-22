@@ -115,8 +115,11 @@ pub async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<BunRelease>,
             .duration_since(modified)
             .unwrap_or_default();
         if age.as_secs() < 3600
-            && let Ok(content) = std::fs::read_to_string(&cache_path)
-            && let Ok(releases) = serde_json::from_str::<Vec<BunRelease>>(&content)
+            && let Ok(Some(content)) = lpm_common::read_capped_state_file(
+                &cache_path,
+                lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+            )
+            && let Ok(releases) = serde_json::from_slice::<Vec<BunRelease>>(&content)
         {
             tracing::debug!(
                 "using cached bun release index ({} releases)",

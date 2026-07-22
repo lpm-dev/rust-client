@@ -106,9 +106,12 @@ pub fn load_sandbox_write_dirs(
     user_allowlist: &[PathBuf],
     home_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>, SandboxError> {
-    let raw = match std::fs::read_to_string(package_json) {
+    let raw = match lpm_common::read_text_file_capped(
+        package_json,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Vec::new()),
         Err(e) => {
             return Err(SandboxError::InvalidSpec {
                 reason: format!("failed to read {}: {e}", package_json.display()),
@@ -837,9 +840,12 @@ pub fn load_sandbox_read_allow(
 
     // Per-project list from package.json.
     let mut entries: Vec<(String, usize, &'static str)> = Vec::new();
-    let project_raw = match std::fs::read_to_string(package_json) {
+    let project_raw = match lpm_common::read_text_file_capped(
+        package_json,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
         Err(e) => {
             return Err(SandboxError::InvalidSpec {
                 reason: format!("failed to read {}: {e}", package_json.display()),

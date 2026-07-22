@@ -233,8 +233,8 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
         tools_ui::detected_test_runner(&runner_name);
     }
 
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None);
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
+    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None)?;
 
     let full_cmd = if args.is_empty() {
         runner_cmd
@@ -273,8 +273,8 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
         tools_ui::detected_bench_runner(&runner_name);
     }
 
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None);
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
+    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None)?;
 
     let full_cmd = if args.is_empty() {
         cmd
@@ -463,7 +463,7 @@ async fn run_check_engine(
     }
 
     let binary = check_engine_binary(engine);
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
     let mut cmd_args = vec!["--noEmit".to_string()];
     cmd_args.extend_from_slice(args);
 
@@ -1074,8 +1074,24 @@ fn run_test_or_bench_member(
         build_safe_command(&runner_name, &base_cmd, args)
     };
 
-    let path = lpm_runner::bin_path::build_path_with_bins(member_dir);
-    let env_vars = lpm_runner::dotenv::load_env_files(member_dir, None);
+    let path = match lpm_runner::bin_path::build_path_with_bins(member_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolOutcome {
+                error: Some(error.to_string()),
+                ..Default::default()
+            };
+        }
+    };
+    let env_vars = match lpm_runner::dotenv::load_env_files(member_dir, None) {
+        Ok(env_vars) => env_vars,
+        Err(error) => {
+            return ToolOutcome {
+                error: Some(error.to_string()),
+                ..Default::default()
+            };
+        }
+    };
     let shell_cmd = lpm_runner::shell::ShellCommand {
         command: &full_cmd,
         cwd: member_dir,

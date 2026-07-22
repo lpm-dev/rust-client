@@ -19,13 +19,18 @@ pub(crate) fn prepare_publish_project(project_dir: &Path) -> Result<PublishProje
 
 pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifest, LpmError> {
     let package_json_path = project_dir.join("package.json");
-    if !package_json_path.exists() {
-        return Err(LpmError::NotFound(
-            "no package.json found in current directory".to_string(),
-        ));
-    }
-
-    let content = std::fs::read_to_string(&package_json_path)?;
+    let content = match lpm_common::read_text_file_capped(
+        &package_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Err(LpmError::NotFound(
+                "no package.json found in current directory".to_string(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let pkg_json: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
 
@@ -82,7 +87,7 @@ pub(super) fn prepare_publish_project_from_manifest(
         )));
     }
 
-    let (detected_ecosystem, swift_manifest) = detect_publish_ecosystem(project_dir);
+    let (detected_ecosystem, swift_manifest) = detect_publish_ecosystem(project_dir)?;
 
     Ok(PublishProject {
         pkg_json,
@@ -98,12 +103,26 @@ pub(super) fn prepare_publish_project_from_manifest(
     })
 }
 
-pub(super) fn detect_publish_ecosystem(project_dir: &Path) -> (String, Option<serde_json::Value>) {
+pub(super) fn read_optional_lpm_config(
+    project_dir: &Path,
+) -> Result<Option<serde_json::Value>, LpmError> {
+    let path = project_dir.join("lpm.config.json");
+    let content =
+        match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| LpmError::Registry(format!("failed to parse {}: {error}", path.display())))
+}
+
+pub(super) fn detect_publish_ecosystem(
+    project_dir: &Path,
+) -> Result<(String, Option<serde_json::Value>), LpmError> {
     let mut detected_ecosystem = "js".to_string();
-    let lpm_config_path = project_dir.join("lpm.config.json");
-    if lpm_config_path.exists()
-        && let Ok(config_str) = std::fs::read_to_string(&lpm_config_path)
-        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str)
+    if let Some(config) = read_optional_lpm_config(project_dir)?
         && let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str())
     {
         detected_ecosystem = eco.to_string();
@@ -126,5 +145,5 @@ pub(super) fn detect_publish_ecosystem(project_dir: &Path) -> (String, Option<se
         None
     };
 
-    (detected_ecosystem, swift_manifest)
+    Ok((detected_ecosystem, swift_manifest))
 }

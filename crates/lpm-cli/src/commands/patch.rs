@@ -207,12 +207,14 @@ async fn run_patch_commit_inner(
 
     // 1. Read the breadcrumb left by `lpm patch`.
     let breadcrumb_path = staging_dir.join(STAGING_BREADCRUMB_FILE);
-    let breadcrumb_text = std::fs::read_to_string(&breadcrumb_path).map_err(|e| {
-        LpmError::Script(format!(
-            "{staging_dir:?} is not an lpm-patch staging dir (no \
+    let breadcrumb_text =
+        lpm_common::read_text_file_capped(&breadcrumb_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Script(format!(
+                    "{staging_dir:?} is not an lpm-patch staging dir (no \
              .lpm-patch.json): {e}"
-        ))
-    })?;
+                ))
+            })?;
     let breadcrumb: serde_json::Value = serde_json::from_str(&breadcrumb_text).map_err(|e| {
         LpmError::Script(format!(
             "staging breadcrumb at {breadcrumb_path:?} is malformed: {e}"
@@ -464,7 +466,7 @@ fn remove_package_json_patches(
     }
 
     let pkg_path = project_dir.join("package.json");
-    let raw = std::fs::read_to_string(&pkg_path)
+    let raw = lpm_common::read_text_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
@@ -683,7 +685,7 @@ fn update_package_json_patches(
     integrity: &str,
 ) -> Result<(), LpmError> {
     let pkg_path = project_dir.join("package.json");
-    let raw = std::fs::read_to_string(&pkg_path)
+    let raw = lpm_common::read_text_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;

@@ -374,12 +374,14 @@ fn sandbox_mode_key_name(mode: SandboxModeKey) -> &'static str {
 /// file → empty `RawSandboxKeys`. Malformed file or invalid value →
 /// error with the file path baked in for diagnostics.
 fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> {
-    if !path.exists() {
-        return Ok(RawSandboxKeys::default());
-    }
-
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| LpmError::Registry(format!("failed to read {}: {e}", path.display())))?;
+    let raw = match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    {
+        Ok(raw) => raw,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Ok(RawSandboxKeys::default());
+        }
+        Err(error) => return Err(LpmError::Registry(error.to_string())),
+    };
 
     let parsed: toml::Value = toml::from_str(&raw)
         .map_err(|e| LpmError::Registry(format!("failed to parse {}: {e}", path.display())))?;

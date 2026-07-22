@@ -616,7 +616,10 @@ fn collect_source_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf
 /// Analyze package.json for manifest tags.
 fn analyze_package_manifest(package_dir: &Path) -> ManifestTags {
     let pkg_json_path = package_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
+    let content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(c) => c,
         Err(_) => return ManifestTags::default(),
     };
@@ -875,8 +878,9 @@ impl PackageAnalyzer {
 /// - Schema version is outdated (needs re-analysis)
 pub fn read_cached_analysis(package_dir: &Path) -> Option<PackageAnalysis> {
     let path = package_dir.join(".lpm-security.json");
-    let content = std::fs::read_to_string(&path).ok()?;
-    let analysis: PackageAnalysis = serde_json::from_str(&content).ok()?;
+    let content =
+        lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()??;
+    let analysis: PackageAnalysis = serde_json::from_slice(&content).ok()?;
 
     // Check schema version — re-analyze if outdated
     if analysis.version < SCHEMA_VERSION {

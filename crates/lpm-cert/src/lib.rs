@@ -82,7 +82,9 @@ pub fn trust_store_label() -> &'static str {
 /// Days remaining until the CA at `path` expires. `Some(0)` for already-expired,
 /// `None` only if the cert can't be read or parsed.
 pub fn ca_days_until_expiry(path: &Path) -> Option<i64> {
-    let pem_str = std::fs::read_to_string(path).ok()?;
+    let pem_str =
+        lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let pem = pem::parse(&pem_str).ok()?;
     let (_, parsed) = x509_parser::parse_x509_certificate(pem.contents()).ok()?;
     let not_after = parsed.validity().not_after.to_datetime();
@@ -523,10 +525,16 @@ pub fn ensure_https_with_consent_and_permitted_dns(
         std::fs::create_dir_all(&project_cert_dir)
             .map_err(|e| LpmError::Cert(format!("failed to create project cert dir: {e}")))?;
 
-        let ca_cert_pem = std::fs::read_to_string(&active_ca_cert)
-            .map_err(|e| LpmError::Cert(format!("failed to read CA cert: {e}")))?;
-        let ca_key_pem = std::fs::read_to_string(paths::ca_key_path()?)
-            .map_err(|e| LpmError::Cert(format!("failed to read CA key: {e}")))?;
+        let ca_cert_pem = lpm_common::read_text_file_capped(
+            &active_ca_cert,
+            lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|e| LpmError::Cert(format!("failed to read CA cert: {e}")))?;
+        let ca_key_pem = lpm_common::read_text_file_capped(
+            &paths::ca_key_path()?,
+            lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|e| LpmError::Cert(format!("failed to read CA key: {e}")))?;
 
         let (cert_pem, key_pem) = if needs_project_intermediate {
             if !ca::cert_allows_project_intermediates(&active_ca_cert)? {

@@ -96,7 +96,8 @@ pub(crate) async fn resolve_publish_auth_with_policy(
 }
 
 pub(crate) fn resolve_token_auth() -> Result<NpmAuth, LpmError> {
-    auth::get_npm_token()
+    auth::try_get_npm_token()
+        .map_err(LpmError::Registry)?
         .map(|token| NpmAuth {
             token,
             source: NpmAuthSource::Token,

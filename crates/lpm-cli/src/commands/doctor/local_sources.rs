@@ -29,7 +29,9 @@ use super::check::Check;
 /// uncluttered.
 pub(super) fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
     let pkg_json_path = project_dir.join("package.json");
-    let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return Vec::new();
     };
     let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) else {

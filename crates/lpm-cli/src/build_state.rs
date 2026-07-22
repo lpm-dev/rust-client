@@ -958,7 +958,9 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
 /// have been evicted by `lpm cache clean` or a fresh clone.
 pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
     let pkg_json_path = pkg_dir.join("package.json");
-    let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return vec![];
     };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -993,7 +995,9 @@ pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
 /// reads disk but writes nothing.
 pub fn read_manifest_repository(pkg_dir: &Path) -> Option<String> {
     let pkg_json_path = pkg_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
     let repo = parsed.get("repository")?;
     match repo {

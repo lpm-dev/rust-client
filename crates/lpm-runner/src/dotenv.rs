@@ -11,7 +11,7 @@
 //! Does NOT expand `$VAR` references — values are taken literally.
 
 use crate::lpm_json;
-use lpm_common::LpmError;
+use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -70,7 +70,7 @@ pub fn load_project_env_with_schema_validation(
     env_name: Option<&str>,
     validate_schema: bool,
 ) -> Result<HashMap<String, String>, LpmError> {
-    let lpm_config = lpm_json::read_lpm_json(project_dir).ok().flatten();
+    let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
 
     // Validate env name to prevent path traversal
     let env_name = env_name.filter(|m| {
@@ -97,7 +97,7 @@ pub fn load_project_env_with_schema_validation(
         match lpm_env::resolve_chain(envs_config, env_name) {
             Ok(chain) => {
                 tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
-                load_env_from_chain(project_dir, &chain)
+                load_env_from_chain(project_dir, &chain)?
             }
             Err(e) if e.contains("not found") => {
                 // Env not declared in `environments` config — fall back to standard
@@ -107,7 +107,7 @@ pub fn load_project_env_with_schema_validation(
                 tracing::debug!(
                     "env '{env_name}' not in environments config, falling back to standard loading"
                 );
-                load_env_files(project_dir, Some(env_name))
+                load_env_files(project_dir, Some(env_name))?
             }
             Err(e) => {
                 // Cycle or other structural error — hard fail
@@ -116,7 +116,7 @@ pub fn load_project_env_with_schema_validation(
         }
     } else {
         // Standard loading (no environments config or no env name)
-        load_env_files(project_dir, env_name)
+        load_env_files(project_dir, env_name)?
     };
 
     if !loaded.is_empty() {
@@ -169,12 +169,13 @@ pub fn load_project_env_with_schema_validation(
 /// Parse a `.env` file into a key-value map.
 ///
 /// Returns an empty map if the file doesn't exist (not an error).
-pub fn parse_env_file(path: &Path) -> HashMap<String, String> {
-    let content = match std::fs::read_to_string(path) {
+pub fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, BoundedReadError> {
+    let content = match read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES) {
         Ok(c) => c,
-        Err(_) => return HashMap::new(),
+        Err(BoundedReadError::NotFound { .. }) => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
     };
-    parse_env_str(&content)
+    Ok(parse_env_str(&content))
 }
 
 /// Parse `.env` content string into a key-value map.
@@ -274,19 +275,22 @@ fn unquote(s: &str) -> String {
 /// 2. `.env.local` — local overrides (gitignored)
 /// 3. `.env.{mode}` — mode-specific (e.g., `.env.staging`)
 /// 4. `.env.{mode}.local` — mode-specific local overrides
-pub fn load_env_files(project_dir: &Path, mode: Option<&str>) -> HashMap<String, String> {
+pub fn load_env_files(
+    project_dir: &Path,
+    mode: Option<&str>,
+) -> Result<HashMap<String, String>, LpmError> {
     let mut merged = HashMap::new();
 
     // 1. .env
-    merge_env_file(&mut merged, &project_dir.join(".env"));
+    merge_env_file(&mut merged, &project_dir.join(".env"))?;
 
     // 2. .env.local
-    merge_env_file(&mut merged, &project_dir.join(".env.local"));
+    merge_env_file(&mut merged, &project_dir.join(".env.local"))?;
 
     // 3 & 4. Mode-specific files
     if let Some(mode) = mode {
-        merge_env_file(&mut merged, &project_dir.join(format!(".env.{mode}")));
-        merge_env_file(&mut merged, &project_dir.join(format!(".env.{mode}.local")));
+        merge_env_file(&mut merged, &project_dir.join(format!(".env.{mode}")))?;
+        merge_env_file(&mut merged, &project_dir.join(format!(".env.{mode}.local")))?;
     }
 
     // Filter out vars that already exist in process environment
@@ -295,7 +299,7 @@ pub fn load_env_files(project_dir: &Path, mode: Option<&str>) -> HashMap<String,
 
     remove_dangerous_env_vars(&mut merged, ".env file");
 
-    merged
+    Ok(merged)
 }
 
 /// Load environment variables from an inheritance chain of file paths.
@@ -306,17 +310,20 @@ pub fn load_env_files(project_dir: &Path, mode: Option<&str>) -> HashMap<String,
 ///
 /// Same security filtering as `load_env_files`: process env takes precedence,
 /// dangerous vars are blocked.
-pub fn load_env_from_chain(project_dir: &Path, file_chain: &[String]) -> HashMap<String, String> {
+pub fn load_env_from_chain(
+    project_dir: &Path,
+    file_chain: &[String],
+) -> Result<HashMap<String, String>, LpmError> {
     let mut merged = HashMap::new();
 
     for file_path in file_chain {
         let full_path = project_dir.join(file_path);
-        merge_env_file(&mut merged, &full_path);
+        merge_env_file(&mut merged, &full_path)?;
 
         // Also load the .local variant for each file in the chain
         // e.g., .env.staging → .env.staging.local
         let local_path = project_dir.join(format!("{file_path}.local"));
-        merge_env_file(&mut merged, &local_path);
+        merge_env_file(&mut merged, &local_path)?;
     }
 
     // Filter out vars that already exist in process environment
@@ -324,7 +331,7 @@ pub fn load_env_from_chain(project_dir: &Path, file_chain: &[String]) -> HashMap
 
     remove_dangerous_env_vars(&mut merged, ".env file");
 
-    merged
+    Ok(merged)
 }
 
 fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
@@ -350,11 +357,12 @@ fn is_denied_env_var(key: &str) -> bool {
 }
 
 /// Merge a single `.env` file into an existing map (overwriting existing keys).
-fn merge_env_file(target: &mut HashMap<String, String>, path: &Path) {
-    let vars = parse_env_file(path);
+fn merge_env_file(target: &mut HashMap<String, String>, path: &Path) -> Result<(), LpmError> {
+    let vars = parse_env_file(path).map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     for (k, v) in vars {
         target.insert(k, v);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -423,7 +431,7 @@ mod tests {
 
     #[test]
     fn load_env_file_missing_ok() {
-        let vars = parse_env_file(Path::new("/nonexistent/.env"));
+        let vars = parse_env_file(Path::new("/nonexistent/.env")).unwrap();
         assert!(vars.is_empty());
     }
 
@@ -434,7 +442,7 @@ mod tests {
         fs::write(dir.path().join(".env"), "A=from-env\nB=from-env").unwrap();
         fs::write(dir.path().join(".env.local"), "B=from-local").unwrap();
 
-        let vars = load_env_files(dir.path(), None);
+        let vars = load_env_files(dir.path(), None).unwrap();
         assert_eq!(vars.get("A").unwrap(), "from-env");
         assert_eq!(vars.get("B").unwrap(), "from-local");
     }
@@ -446,7 +454,7 @@ mod tests {
         fs::write(dir.path().join(".env"), "A=default\nB=default").unwrap();
         fs::write(dir.path().join(".env.staging"), "B=staging").unwrap();
 
-        let vars = load_env_files(dir.path(), Some("staging"));
+        let vars = load_env_files(dir.path(), Some("staging")).unwrap();
         assert_eq!(vars.get("A").unwrap(), "default");
         assert_eq!(vars.get("B").unwrap(), "staging");
     }
@@ -462,7 +470,7 @@ mod tests {
         )
         .unwrap();
 
-        let vars = load_env_files(dir.path(), None);
+        let vars = load_env_files(dir.path(), None).unwrap();
         // HOME should be filtered out (process env wins)
         assert!(!vars.contains_key("HOME"));
         // Our unique key should be present (not in process env)
@@ -525,7 +533,7 @@ mod tests {
 		)
 		.unwrap();
 
-        let vars = load_env_files(dir.path(), None);
+        let vars = load_env_files(dir.path(), None).unwrap();
         assert!(
             !vars.contains_key("LD_PRELOAD"),
             "LD_PRELOAD should be denied"
@@ -593,7 +601,7 @@ mod tests {
         )
         .unwrap();
 
-        let vars = load_env_files(dir.path(), None);
+        let vars = load_env_files(dir.path(), None).unwrap();
         assert!(
             !vars.contains_key("ld_preload"),
             "lowercase ld_preload should be denied"
@@ -611,7 +619,7 @@ mod tests {
         fs::write(dir.path().join(".env.staging"), "DB=staging-db").unwrap();
         fs::write(dir.path().join(".env.staging.local"), "DB=local-override").unwrap();
 
-        let vars = load_env_files(dir.path(), Some("staging"));
+        let vars = load_env_files(dir.path(), Some("staging")).unwrap();
         assert_eq!(
             vars.get("DB").unwrap(),
             "local-override",

@@ -246,8 +246,9 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
         CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
     };
 
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|err| ProxyError::Tls(format!("read {}: {err}", cert_path.display())))?;
+    let cert_pem =
+        lpm_common::read_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|err| ProxyError::Tls(format!("read {}: {err}", cert_path.display())))?;
     let certs = pem::parse_many(cert_pem)
         .map_err(|err| ProxyError::Tls(format!("parse {}: {err}", cert_path.display())))?
         .into_iter()
@@ -261,8 +262,9 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
         )));
     }
 
-    let key_pem = std::fs::read(key_path)
-        .map_err(|err| ProxyError::Tls(format!("read {}: {err}", key_path.display())))?;
+    let key_pem =
+        lpm_common::read_file_capped(key_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|err| ProxyError::Tls(format!("read {}: {err}", key_path.display())))?;
     let key = pem::parse_many(key_pem)
         .map_err(|err| ProxyError::Tls(format!("parse {}: {err}", key_path.display())))?
         .into_iter()
@@ -292,8 +294,9 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
 }
 
 pub(crate) fn cert_covers_hostname(cert_path: &Path, host: &str) -> Result<bool, ProxyError> {
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|err| ProxyError::Tls(format!("read {}: {err}", cert_path.display())))?;
+    let cert_pem =
+        lpm_common::read_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|err| ProxyError::Tls(format!("read {}: {err}", cert_path.display())))?;
     let pem = pem::parse(cert_pem)
         .map_err(|err| ProxyError::Tls(format!("parse {}: {err}", cert_path.display())))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())

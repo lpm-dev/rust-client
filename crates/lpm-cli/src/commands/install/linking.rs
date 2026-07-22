@@ -499,7 +499,7 @@ pub(super) async fn run_link_and_finish(
 
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
     let script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
     let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
         project_dir,
         script_policy_override,

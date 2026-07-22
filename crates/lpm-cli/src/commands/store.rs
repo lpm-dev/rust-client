@@ -335,7 +335,10 @@ fn run_verify(
         // Deep mode: parse package.json, validate name/version fields,
         // and verify integrity hash against lockfile.
         if deep {
-            match std::fs::read_to_string(&pkg_json_path) {
+            match lpm_common::read_text_file_capped(
+                &pkg_json_path,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            ) {
                 Ok(content) => {
                     match serde_json::from_str::<serde_json::Value>(&content) {
                         Ok(pkg) => {

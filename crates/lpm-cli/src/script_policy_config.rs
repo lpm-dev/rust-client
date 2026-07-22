@@ -160,13 +160,24 @@ impl ScriptPolicyConfig {
     /// at their defaults) — the install pipeline's own missing-manifest
     /// handling surfaces the real error earlier; here we must return
     /// something rather than panicking.
+    #[cfg(test)]
     pub fn from_package_json(project_dir: &Path) -> Self {
+        Self::try_from_package_json(project_dir).unwrap_or_default()
+    }
+
+    /// Read project script policy while preserving configuration I/O failures.
+    pub fn try_from_package_json(project_dir: &Path) -> Result<Self, lpm_common::LpmError> {
         let pkg_json_path = project_dir.join("package.json");
-        let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
-            return Self::default();
+        let content = match lpm_common::read_text_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Self::default()),
+            Err(error) => return Err(error.into()),
         };
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
-            return Self::default();
+            return Ok(Self::default());
         };
 
         let lpm = parsed.get("lpm");
@@ -216,14 +227,14 @@ impl ScriptPolicyConfig {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        Self {
+        Ok(Self {
             policy,
             auto_build,
             deny_all,
             trusted_scopes,
             policy_parse_error,
             triage_advisor,
-        }
+        })
     }
 }
 
@@ -290,7 +301,7 @@ pub fn collapse_policy_flags(
 /// guarantee.
 ///
 /// `project_config` is a pre-loaded [`ScriptPolicyConfig`] (see
-/// [`ScriptPolicyConfig::from_package_json`]). Taking the loaded
+/// [`ScriptPolicyConfig::try_from_package_json`]). Taking the loaded
 /// config rather than a path lets the caller inspect
 /// [`ScriptPolicyConfig::policy_parse_error`] and surface the typo via
 /// [`crate::output::warn`] before resolving — so a team-shared

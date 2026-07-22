@@ -149,7 +149,8 @@ fn salt_path() -> Result<PathBuf, String> {
 fn get_or_create_salt() -> Result<Vec<u8>, String> {
     let path = salt_path()?;
     if path.exists() {
-        return std::fs::read(&path).map_err(|e| format!("failed to read vault salt: {e}"));
+        return lpm_common::read_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| format!("failed to read vault salt: {e}"));
     }
 
     let mut salt = vec![0u8; 32];
@@ -180,7 +181,7 @@ fn read_fallback_key() -> Result<Option<String>, String> {
     let key_path = fallback_key_path()?;
 
     if key_path.exists() {
-        return std::fs::read_to_string(&key_path)
+        return lpm_common::read_text_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
             .map(Some)
             .map_err(|e| format!("failed to read vault fallback key: {e}"));
     }
@@ -499,7 +500,7 @@ pub fn read_vault_file_env(vault_id: &str, env: &str) -> Result<Option<SecretMap
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&path)
+    let content = lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
         .map_err(|e| format!("failed to read vault {}: {e}", path.display()))?;
     let json = decrypt(content.trim())?;
 
@@ -525,7 +526,7 @@ pub fn read_all_environments(vault_id: &str) -> Result<Option<EnvironmentMap>, S
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&path)
+    let content = lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
         .map_err(|e| format!("failed to read vault {}: {e}", path.display()))?;
     let json = decrypt(content.trim())?;
 
@@ -578,7 +579,8 @@ pub fn write_vault_file_env(vault_id: &str, env: &str, secrets: &SecretMap) -> R
     // Read existing environments (if any)
     let mut data = if path.exists() {
         let content =
-            std::fs::read_to_string(&path).map_err(|e| format!("failed to read vault: {e}"))?;
+            lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+                .map_err(|e| format!("failed to read vault: {e}"))?;
         let json = decrypt(content.trim())?;
         serde_json::from_str::<VaultData>(&json).unwrap_or(VaultData {
             environments: HashMap::new(),

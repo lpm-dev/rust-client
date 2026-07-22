@@ -190,11 +190,12 @@ impl NpmrcRequest {
 }
 
 fn npmrc_request(path: &Path) -> Result<Option<NpmrcRequest>, LpmError> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(LpmError::Io(err)),
-    };
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
 
     let mut request = None;
     let mut provenance_line = None;

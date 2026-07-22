@@ -22,6 +22,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use lpm_common::{CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
+
 /// A constraint violation found during checking.
 #[derive(Debug)]
 pub struct ConstraintViolation {
@@ -46,10 +48,12 @@ pub struct Constraints {
 
 impl Constraints {
     /// Parse constraints from root package.json's "lpm.constraints" field.
-    pub fn from_package_json(path: &Path) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
-        let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let constraints = doc.get("lpm")?.get("constraints")?;
+    pub fn from_package_json(path: &Path) -> Result<Option<Self>, LpmError> {
+        let content = read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES)?;
+        let doc: serde_json::Value = serde_json::from_str(&content)?;
+        let Some(constraints) = doc.get("lpm").and_then(|lpm| lpm.get("constraints")) else {
+            return Ok(None);
+        };
 
         let enforce = constraints
             .get("enforce")
@@ -81,11 +85,11 @@ impl Constraints {
             })
             .unwrap_or_default();
 
-        Some(Constraints {
+        Ok(Some(Constraints {
             enforce,
             ban,
             require_license,
-        })
+        }))
     }
 
     /// Check constraints against a package.json's dependencies.

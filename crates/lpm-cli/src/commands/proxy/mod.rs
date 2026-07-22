@@ -163,7 +163,8 @@ async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
             "the internal proxy forwarder must run as root".into(),
         ));
     }
-    let bytes = std::fs::read(config_path).map_err(LpmError::Io)?;
+    let bytes = lpm_common::read_file_capped(config_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| LpmError::Script(error.to_string()))?;
     let config: proxy_service::PrivilegedForwarderConfig =
         serde_json::from_slice(&bytes).map_err(|err| LpmError::Script(err.to_string()))?;
     if config.rules.is_empty() {

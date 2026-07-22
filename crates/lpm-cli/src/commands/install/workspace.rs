@@ -735,8 +735,13 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
         workspace_member_deps.iter().cloned().collect();
     while let Some(member) = queue.pop_front() {
         let pkg_json_path = member.source_dir.join("package.json");
-        let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
-            continue;
+        let content = match lpm_common::read_text_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
             continue;

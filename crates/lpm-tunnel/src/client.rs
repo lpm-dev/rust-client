@@ -437,11 +437,14 @@ const EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX: Option<&str> = None;
 /// migration. The legacy file is read but never written — the next
 /// successful verification migrates the pin to the new layout via
 /// [`write_tofu_pin`].
-fn read_tofu_pin(host: &str) -> Option<String> {
-    if let Some(path) = crate::relay::tofu_pin_path_for_host(host)
-        && let Ok(s) = std::fs::read_to_string(&path)
-    {
-        return Some(s.trim().to_string());
+fn read_tofu_pin(host: &str) -> Result<Option<String>, lpm_common::BoundedReadError> {
+    if let Some(path) = crate::relay::tofu_pin_path_for_host(host) {
+        match lpm_common::read_text_file_capped(&path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+        {
+            Ok(pin) => return Ok(Some(pin.trim().to_string())),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
     }
 
     // Legacy fallback: only honored on the canonical default relay,
@@ -450,12 +453,16 @@ fn read_tofu_pin(host: &str) -> Option<String> {
     // correct semantic, since a stored pin is meaningless across hosts.
     if host == crate::relay::DEFAULT_RELAY_HOST
         && let Some(path) = crate::relay::legacy_tofu_pin_path()
-        && let Ok(s) = std::fs::read_to_string(&path)
     {
-        return Some(s.trim().to_string());
+        match lpm_common::read_text_file_capped(&path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+        {
+            Ok(pin) => return Ok(Some(pin.trim().to_string())),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
     }
 
-    None
+    Ok(None)
 }
 
 /// Store a TOFU pin for `host` to `~/.lpm/relay-pins/<host>`.
@@ -649,7 +656,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuPinningVerifier {
 
         tracing::debug!("relay certificate SPKI SHA-256 for {host}: {current_pin}");
 
-        match read_tofu_pin(&host) {
+        match read_tofu_pin(&host).map_err(|error| rustls::Error::General(error.to_string()))? {
             Some(stored_pin) => {
                 if stored_pin != current_pin {
                     let pin_path = crate::relay::tofu_pin_path_for_host(&host).map_or_else(
@@ -1650,7 +1657,7 @@ mod tests {
             "expected per-host pin file at {}",
             expected.display()
         );
-        let read_back = read_tofu_pin("relay.lpm.fyi").unwrap();
+        let read_back = read_tofu_pin("relay.lpm.fyi").unwrap().unwrap();
 
         assert_eq!(read_back, "deadbeef");
     }
@@ -1668,7 +1675,7 @@ mod tests {
         std::fs::write(&legacy, "legacy_pin_value").unwrap();
 
         let _home = HomeGuard::set(home.path());
-        let got = read_tofu_pin("relay.lpm.fyi");
+        let got = read_tofu_pin("relay.lpm.fyi").unwrap();
         assert_eq!(got.as_deref(), Some("legacy_pin_value"));
     }
 
@@ -1685,7 +1692,7 @@ mod tests {
         std::fs::write(&legacy, "wrong_relay_pin").unwrap();
 
         let _home = HomeGuard::set(home.path());
-        let got = read_tofu_pin("relay-eu.lpm.fyi");
+        let got = read_tofu_pin("relay-eu.lpm.fyi").unwrap();
         assert!(
             got.is_none(),
             "legacy pin must not bleed into a different host: {got:?}"
@@ -1711,7 +1718,7 @@ mod tests {
         std::fs::write(&per_host, "new").unwrap();
 
         let _home = HomeGuard::set(home.path());
-        let got = read_tofu_pin("relay.lpm.fyi");
+        let got = read_tofu_pin("relay.lpm.fyi").unwrap();
         assert_eq!(got.as_deref(), Some("new"));
     }
 
@@ -1727,9 +1734,9 @@ mod tests {
         write_tofu_pin("relay.lpm.fyi", "pin_a").unwrap();
         write_tofu_pin("relay-eu.lpm.fyi", "pin_b").unwrap();
 
-        let a = read_tofu_pin("relay.lpm.fyi");
-        let b = read_tofu_pin("relay-eu.lpm.fyi");
-        let c = read_tofu_pin("never-stored.example");
+        let a = read_tofu_pin("relay.lpm.fyi").unwrap();
+        let b = read_tofu_pin("relay-eu.lpm.fyi").unwrap();
+        let c = read_tofu_pin("never-stored.example").unwrap();
 
         assert_eq!(a.as_deref(), Some("pin_a"));
         assert_eq!(b.as_deref(), Some("pin_b"));

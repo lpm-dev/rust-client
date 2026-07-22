@@ -22,6 +22,8 @@ pub(super) async fn publish_to_lpm(
     detected_ecosystem: &str,
     swift_manifest: &Option<serde_json::Value>,
 ) -> Result<serde_json::Value, LpmError> {
+    let lpm_config = super::prepare::read_optional_lpm_config(project_dir)?;
+
     // Credentials must not travel over plain HTTP for LPM publish.
     let registry_url = client.base_url();
     if !registry_url.starts_with("https://")
@@ -100,11 +102,7 @@ pub(super) async fn publish_to_lpm(
     });
 
     // Read lpm.config.json for version payload
-    let lpm_config_path = project_dir.join("lpm.config.json");
-    if lpm_config_path.exists()
-        && let Ok(config_str) = std::fs::read_to_string(&lpm_config_path)
-        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str)
-    {
+    if let Some(config) = lpm_config {
         lpm_version["_lpmConfig"] = config;
     }
 

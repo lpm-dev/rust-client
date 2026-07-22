@@ -694,7 +694,10 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
 
         // Read once; treat I/O failure as "no peer deps" (equivalent to the
         // old `exists()` check but saves one stat(2) syscall per package).
-        let content = match std::fs::read(&pkg_json_path) {
+        let content = match lpm_common::read_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(

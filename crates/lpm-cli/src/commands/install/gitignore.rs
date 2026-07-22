@@ -116,8 +116,7 @@ pub fn ensure_lpm_wrappers_gitignore(project_dir: &Path) {
     let gitignore_path = project_dir.join(".gitignore");
     let marker = ".lpm/wrappers/";
 
-    if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if let Some(content) = read_gitignore(&gitignore_path) {
         if content.lines().any(|l| l.trim() == marker) {
             return; // Already present
         }
@@ -152,8 +151,7 @@ pub fn ensure_lpm_hoisted_gitignore(project_dir: &Path) {
     let gitignore_path = project_dir.join(".gitignore");
     let marker = ".lpm/hoisted/";
 
-    if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if let Some(content) = read_gitignore(&gitignore_path) {
         if content.lines().any(|l| l.trim() == marker) {
             return; // Already present
         }
@@ -179,8 +177,7 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
     let gitignore_path = project_dir.join(".gitignore");
     let marker = ".lpm/skills/";
 
-    if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if let Some(content) = read_gitignore(&gitignore_path) {
         if content.lines().any(|l| l.trim() == marker) {
             return; // Already present
         }
@@ -199,6 +196,17 @@ pub fn ensure_skills_gitignore(project_dir: &Path) {
         }
     } else {
         let _ = std::fs::write(&gitignore_path, format!("# LPM Agent Skills\n{marker}\n"));
+    }
+}
+
+fn read_gitignore(path: &Path) -> Option<String> {
+    match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => Some(content),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to inspect .gitignore");
+            Some(String::new())
+        }
     }
 }
 

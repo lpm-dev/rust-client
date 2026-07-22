@@ -315,7 +315,8 @@ pub fn read_pending_x25519_keypair() -> Result<Option<PendingPublicKey>, String>
     if !path.exists() {
         return Ok(None);
     }
-    let data = std::fs::read(&path).map_err(|e| format!("failed to read pending key: {e}"))?;
+    let data = lpm_common::read_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .map_err(|e| format!("failed to read pending key: {e}"))?;
     if data.len() != 32 {
         return Err(format!(
             "pending key file has invalid length {} (expected 32)",
@@ -459,8 +460,8 @@ fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), St
         .join(".x25519_key");
 
     if key_path.exists() {
-        let data =
-            std::fs::read(&key_path).map_err(|e| format!("failed to read X25519 key: {e}"))?;
+        let data = lpm_common::read_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| format!("failed to read X25519 key: {e}"))?;
         if data.len() == 32 {
             let mut private_key = [0u8; 32];
             private_key.copy_from_slice(&data);

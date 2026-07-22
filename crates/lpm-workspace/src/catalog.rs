@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_text_file_capped};
+
 use crate::error::WorkspaceError;
 use crate::package_json::{PackageJson, strip_json_bom_str};
 
@@ -80,8 +82,8 @@ pub fn prune_unused_package_json_catalogs(
     path: &Path,
     references: &CatalogReferences,
 ) -> Result<bool, WorkspaceError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let content = read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| WorkspaceError::Io(error.to_string()))?;
     let mut doc: serde_json::Value =
         serde_json::from_str(strip_json_bom_str(&content)).map_err(|e| {
             WorkspaceError::Parse(format!(
@@ -151,12 +153,11 @@ pub fn prune_unused_pnpm_workspace_catalogs(
     path: &Path,
     references: &CatalogReferences,
 ) -> Result<bool, WorkspaceError> {
-    if !path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let content = match read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => content,
+        Err(BoundedReadError::NotFound { .. }) => return Ok(false),
+        Err(error) => return Err(WorkspaceError::Io(error.to_string())),
+    };
     if content.trim().is_empty() {
         return Ok(false);
     }

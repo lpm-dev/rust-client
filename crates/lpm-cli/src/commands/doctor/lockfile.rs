@@ -82,7 +82,9 @@ pub(super) fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
 
     if lockb_path.exists() || lockfile.exists() {
         if ga_path.exists() {
-            let ga_content = std::fs::read_to_string(&ga_path).unwrap_or_default();
+            let ga_content =
+                lpm_common::read_text_file_capped(&ga_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                    .unwrap_or_default();
             if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
                 checks.push(Check::pass(
                     &doctor_catalog::GITATTRIBUTES_LOCKB_MARKED,
@@ -131,7 +133,9 @@ pub(super) fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
     let pkg_json_path = project_dir.join("package.json");
     let lockfile_path = project_dir.join("lpm.lock");
 
-    let pkg_content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let pkg_content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let pkg: serde_json::Value = serde_json::from_str(&pkg_content).ok()?;
 
     let lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).ok()?;

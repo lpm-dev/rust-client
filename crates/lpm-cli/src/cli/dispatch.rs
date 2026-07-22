@@ -56,7 +56,11 @@ pub(crate) fn run() -> Result<()> {
         // captures `start` at function entry before `check_install_state`.
         let start = std::time::Instant::now();
 
-        let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
+        let pkg_content_opt = lpm_common::read_text_file_capped(
+            &cwd.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .ok();
         let workspace_json_output = fast_lane.json
             && (pkg_content_opt
                 .as_deref()
@@ -802,7 +806,7 @@ async fn async_main() -> Result<()> {
             // emission is deferred until after resolve so the user sees
             // the policy that actually took effect.
             let script_policy_cfg =
-                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+                script_policy_config::ScriptPolicyConfig::try_from_package_json(&cwd)?;
             // preserve the collapsed CLI override
             // separately so we can forward it to install entry points
             // that re-resolve against a workspace member's config.
@@ -1788,7 +1792,7 @@ async fn async_main() -> Result<()> {
             // resolve so the user sees the policy that actually took
             // effect.
             let script_policy_cfg =
-                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+                script_policy_config::ScriptPolicyConfig::try_from_package_json(&cwd)?;
             let cli_override =
                 script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
                     .map_err(lpm_common::LpmError::Script)?;
@@ -1934,7 +1938,7 @@ async fn async_main() -> Result<()> {
                             .into(),
                     ));
                 }
-                let bin_hint = commands::run::ensure_runtime(&cwd).await;
+                let bin_hint = commands::run::ensure_runtime(&cwd).await?;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
             } else if workspace_mode {
                 // Workspace mode: run scripts across packages with task graph
@@ -2578,7 +2582,7 @@ async fn async_main() -> Result<()> {
             }
 
             let script_policy_cfg =
-                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+                script_policy_config::ScriptPolicyConfig::try_from_package_json(&cwd)?;
             let cli_script_policy_override =
                 script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
                     .map_err(lpm_common::LpmError::Script)?;
@@ -2672,9 +2676,12 @@ async fn async_main() -> Result<()> {
             } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            // Runtime config must fail closed before tunnel auth or any child process starts.
+            let detected_runtimes = lpm_runtime::detect::detect_runtime_versions(&cwd)?;
 
             // Read lpm.json for auto-detection
-            let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd).ok().flatten();
+            let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd)
+                .map_err(lpm_common::LpmError::Script)?;
 
             // Auto-detect tunnel from lpm.json if not explicitly set.
             // Track the source for the startup banner.
@@ -2716,6 +2723,7 @@ async fn async_main() -> Result<()> {
             commands::dev::run(
                 &client,
                 &cwd,
+                detected_runtimes,
                 https,
                 tunnel,
                 network,

@@ -58,8 +58,18 @@ fn is_ca_installed_test(
         return Ok(false);
     }
     let recorded = match test_trust_store_sidecar() {
-        Some(p) if p.exists() => std::fs::read_to_string(&p)
-            .map_err(|e| LpmError::Cert(format!("failed to read sidecar: {e}")))?,
+        Some(p) => {
+            match lpm_common::read_text_file_capped(&p, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+                Ok(recorded) => recorded,
+                Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                    let fp = cert::fingerprint_sha256(trust_store_path)?;
+                    cert::fingerprint_hex(&fp)
+                }
+                Err(error) => {
+                    return Err(LpmError::Cert(format!("failed to read sidecar: {error}")));
+                }
+            }
+        }
         _ => {
             let fp = cert::fingerprint_sha256(trust_store_path)?;
             cert::fingerprint_hex(&fp)

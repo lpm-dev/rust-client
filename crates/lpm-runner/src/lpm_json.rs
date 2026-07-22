@@ -8,6 +8,7 @@
 //!
 //! This file is optional. Falls back to `package.json` fields when absent.
 
+use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_text_file_capped};
 use lpm_env::{EnvSchema, EnvironmentsConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -445,12 +446,11 @@ pub fn generate_schema() -> serde_json::Value {
 /// Returns `Err` if the file exists but is malformed.
 pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String> {
     let path = project_dir.join("lpm.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("failed to read lpm.json: {e}"))?;
+    let content = match read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => content,
+        Err(BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(format!("failed to read lpm.json: {error}")),
+    };
 
     let mut config: LpmJsonConfig =
         serde_json::from_str(&content).map_err(|e| format!("failed to parse lpm.json: {e}"))?;

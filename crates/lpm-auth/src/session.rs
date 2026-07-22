@@ -796,7 +796,6 @@ fn is_ci_token_env() -> bool {
 /// "new device" and the user re-pairs.
 pub fn compute_device_fingerprint() -> String {
     use rand::RngCore;
-    use std::io::Read;
     use std::path::PathBuf;
 
     fn device_id_path() -> Option<PathBuf> {
@@ -816,18 +815,16 @@ pub fn compute_device_fingerprint() -> String {
         return generate_random_id();
     };
 
-    if let Ok(mut f) = std::fs::File::open(&path) {
-        let mut buf = String::new();
-        if f.read_to_string(&mut buf).is_ok() {
-            let trimmed = buf.trim();
-            if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                return trimmed.to_string();
-            }
-            tracing::warn!(
-                path = %path.display(),
-                "device-id file is malformed — regenerating"
-            );
+    if let Ok(buf) = lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    {
+        let trimmed = buf.trim();
+        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return trimmed.to_string();
         }
+        tracing::warn!(
+            path = %path.display(),
+            "device-id file is malformed — regenerating"
+        );
     }
 
     if let Some(parent) = path.parent()

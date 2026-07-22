@@ -350,24 +350,29 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 ///
 /// Priority: `NPM_TOKEN` env → keychain(`registry.npmjs.org`) → `.npmrc` parsing
 pub fn get_npm_token() -> Option<String> {
+    try_get_npm_token().ok().flatten()
+}
+
+/// Resolve the npm token while preserving `.npmrc` read failures.
+pub fn try_get_npm_token() -> Result<Option<String>, String> {
     // 1. NPM_TOKEN environment variable (CI standard)
     if let Ok(token) = std::env::var("NPM_TOKEN")
         && !token.is_empty()
     {
-        return Some(token);
+        return Ok(Some(token));
     }
 
     // 2. Keychain (stored via `lpm login --npm`)
     if let Some(token) = get_stored_builtin_token(NPM_REGISTRY_URL) {
-        return Some(token);
+        return Ok(Some(token));
     }
 
     // 3. .npmrc fallback — parse token from project or home .npmrc
-    if let Some(token) = parse_npmrc_token() {
-        return Some(token);
+    if let Some(token) = parse_npmrc_token()? {
+        return Ok(Some(token));
     }
 
-    None
+    Ok(None)
 }
 
 /// Store an npm token in the keychain.
@@ -657,7 +662,9 @@ fn discover_file_backed_custom_registries() -> Vec<String> {
     let Some(path) = credentials_path().ok() else {
         return Vec::new();
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return Vec::new();
     };
     let encrypted = content.trim();
@@ -710,7 +717,9 @@ pub fn list_custom_registries() -> Vec<String> {
     let Some(path) = custom_registries_path() else {
         return Vec::new();
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return Vec::new();
     };
     serde_json::from_str(&content).unwrap_or_default()
@@ -813,7 +822,7 @@ pub fn list_registry_auth_statuses() -> Vec<RegistryAuthStatus> {
             status: stored.backend.registry_status_label().into(),
             storage: AuthStorageStatus::from_backend(stored.backend),
         });
-    } else if parse_npmrc_token().is_some() {
+    } else if parse_npmrc_token().is_ok_and(|token| token.is_some()) {
         result.push(RegistryAuthStatus {
             name: "npmjs.org".into(),
             status: "found in .npmrc (may be expired — run `lpm login --npm` to verify)".into(),
@@ -909,7 +918,9 @@ pub fn read_token_expiries() -> std::collections::HashMap<String, TokenExpiry> {
     let Some(path) = token_expiry_path() else {
         return std::collections::HashMap::new();
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return std::collections::HashMap::new();
     };
     serde_json::from_str(&content).unwrap_or_default()
@@ -996,9 +1007,12 @@ pub fn session_metadata_corrupted() -> bool {
     let Some(path) = token_expiry_path() else {
         return false;
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
+    let content =
+        match lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return false,
+            Err(_) => return true,
+        };
     if content.trim().is_empty() {
         return false;
     }
@@ -1171,22 +1185,22 @@ pub fn clear_refresh_token(registry: &str) {
 ///
 /// Checks project `.npmrc` first, then home `~/.npmrc`.
 /// Looks for: `//registry.npmjs.org/:_authToken=xxx`
-fn parse_npmrc_token() -> Option<String> {
+fn parse_npmrc_token() -> Result<Option<String>, String> {
     // Project-level .npmrc first
     if let Ok(cwd) = std::env::current_dir()
-        && let Some(token) = parse_npmrc_file(&cwd.join(".npmrc"))
+        && let Some(token) = parse_npmrc_file(&cwd.join(".npmrc"))?
     {
-        return Some(token);
+        return Ok(Some(token));
     }
 
     // Home-level ~/.npmrc
     if let Some(home) = dirs::home_dir()
-        && let Some(token) = parse_npmrc_file(&home.join(".npmrc"))
+        && let Some(token) = parse_npmrc_file(&home.join(".npmrc"))?
     {
-        return Some(token);
+        return Ok(Some(token));
     }
 
-    None
+    Ok(None)
 }
 
 /// Parse a single .npmrc file for the npm registry auth token.
@@ -1197,8 +1211,13 @@ fn parse_npmrc_token() -> Option<String> {
 /// repo's author (the M6 hazard). The previous pre-fix behaviour
 /// only emitted a `tracing::warn` and still returned the token, which
 /// hid the risk in default-quiet logs.
-fn parse_npmrc_file(path: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+fn parse_npmrc_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
 
     #[cfg(unix)]
     {
@@ -1215,7 +1234,7 @@ fn parse_npmrc_file(path: &std::path::Path) -> Option<String> {
                 meta.permissions().mode() & 0o777,
                 path.display(),
             );
-            return None;
+            return Ok(None);
         }
     }
 
@@ -1228,12 +1247,12 @@ fn parse_npmrc_file(path: &std::path::Path) -> Option<String> {
                 .unwrap_or("")
                 .trim();
             if !token.is_empty() {
-                return Some(token.to_string());
+                return Ok(Some(token.to_string()));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 // The 24h `should_revalidate_token` / `mark_token_validated` /
@@ -1451,7 +1470,7 @@ fn get_encryption_key() -> Result<String, String> {
         .join(".key");
 
     if key_path.exists() {
-        return std::fs::read_to_string(&key_path)
+        return lpm_common::read_text_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read key file: {e}"));
     }
 
@@ -1502,7 +1521,7 @@ fn get_encryption_key() -> Result<String, String> {
 
     // Try file-based key
     if key_path.exists() {
-        return std::fs::read_to_string(&key_path)
+        return lpm_common::read_text_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read key file: {e}"));
     }
 
@@ -1574,7 +1593,8 @@ fn get_or_create_salt() -> Result<Vec<u8>, String> {
     let path = salt_path()?;
 
     if path.exists() {
-        return std::fs::read(&path).map_err(|e| format!("failed to read salt: {e}"));
+        return lpm_common::read_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| format!("failed to read salt: {e}"));
     }
 
     // Generate new salt
@@ -1678,7 +1698,8 @@ fn get_token_from_file(registry_url: &str) -> Option<String> {
         return None;
     }
 
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()?;
     let encrypted = content.trim();
     if encrypted.is_empty() {
         return None;
@@ -1706,7 +1727,9 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
 
     // Read existing store (or create empty)
     let mut store: serde_json::Value = if path.exists() {
-        let content = std::fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+        let content =
+            lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+                .map_err(|e| format!("read error: {e}"))?;
         let encrypted = content.trim();
         if encrypted.is_empty() {
             serde_json::json!({})
@@ -1762,7 +1785,8 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read error: {e}"))?;
+    let content = lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .map_err(|e| format!("read error: {e}"))?;
     let encrypted = content.trim();
     if encrypted.is_empty() {
         return Ok(());
@@ -2052,7 +2076,7 @@ mod tests {
             "//registry.npmjs.org/:_authToken=npm_ABCDEF123456\nregistry=https://registry.npmjs.org/\n",
         );
 
-        let token = parse_npmrc_file(&npmrc_path);
+        let token = parse_npmrc_file(&npmrc_path).unwrap();
         assert_eq!(token, Some("npm_ABCDEF123456".to_string()));
     }
 
@@ -2062,7 +2086,7 @@ mod tests {
         let npmrc_path = dir.path().join(".npmrc");
         std::fs::write(&npmrc_path, "//npm.pkg.github.com/:_authToken=ghp_xxxxx\n").unwrap();
 
-        let token = parse_npmrc_file(&npmrc_path);
+        let token = parse_npmrc_file(&npmrc_path).unwrap();
         assert!(token.is_none(), "should only read npmjs.org token");
     }
 
@@ -2072,7 +2096,7 @@ mod tests {
         let npmrc_path = dir.path().join(".npmrc");
         std::fs::write(&npmrc_path, "").unwrap();
 
-        let token = parse_npmrc_file(&npmrc_path);
+        let token = parse_npmrc_file(&npmrc_path).unwrap();
         assert!(token.is_none());
     }
 
@@ -2081,7 +2105,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let npmrc_path = dir.path().join(".npmrc");
         // Don't create the file
-        let token = parse_npmrc_file(&npmrc_path);
+        let token = parse_npmrc_file(&npmrc_path).unwrap();
         assert!(token.is_none());
     }
 
@@ -3078,7 +3102,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(
-            parse_npmrc_file(&path).is_none(),
+            parse_npmrc_file(&path).unwrap().is_none(),
             "permissive perms must skip the token surface",
         );
     }
@@ -3096,7 +3120,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         assert_eq!(
-            parse_npmrc_file(&path).as_deref(),
+            parse_npmrc_file(&path).unwrap().as_deref(),
             Some("legit_token"),
             "0o600 perms must allow the token surface",
         );

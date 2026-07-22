@@ -180,8 +180,10 @@ pub fn snapshot_path(project_dir: &Path) -> PathBuf {
 /// compatibility.
 pub fn read_snapshot(project_dir: &Path) -> Option<TrustSnapshot> {
     let path = snapshot_path(project_dir);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let snap: TrustSnapshot = serde_json::from_str(&content).ok()?;
+    let bytes = lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .ok()
+        .flatten()?;
+    let snap: TrustSnapshot = serde_json::from_slice(&bytes).ok()?;
     if snap.schema_version > SCHEMA_VERSION {
         tracing::debug!(
             "trust-snapshot.json is newer than this binary supports \

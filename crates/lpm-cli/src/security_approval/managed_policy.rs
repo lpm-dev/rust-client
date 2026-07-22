@@ -166,11 +166,16 @@ fn ensure_policy_parent_for_write(path: &Path) -> Result<(), LpmError> {
 }
 
 fn read_managed_policy_value(path: &Path) -> Result<toml::Value, LpmError> {
-    if !path.exists() {
-        return Ok(toml::Value::Table(toml::map::Map::new()));
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(toml::Value::Table(toml::map::Map::new()));
+        }
+        Err(error) => return Err(privileged_policy_io_error(path, "inspect", error)),
     }
     validate_managed_policy_authority(path)?;
-    let content = std::fs::read_to_string(path)?;
+    let content = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| managed_policy_error(path, error.to_string()))?;
     toml::from_str(&content).map_err(|e| managed_policy_error(path, format!("parse error: {e}")))
 }
 
@@ -706,12 +711,15 @@ fn parse_policy_firewall(
 
 pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
-    if !path.exists() {
-        return Ok(None);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(privileged_policy_io_error(&path, "inspect", error)),
     }
     validate_managed_policy_authority(&path)?;
 
-    let content = std::fs::read_to_string(&path)?;
+    let content = lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| managed_policy_error(&path, error.to_string()))?;
     let parsed: toml::Value = toml::from_str(&content)
         .map_err(|e| managed_policy_error(&path, format!("parse error: {e}")))?;
     let table = parsed

@@ -164,7 +164,11 @@ fn read_dep_sets(
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
 )> {
-    let content = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
+    let content = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let dev_deps = json
@@ -185,8 +189,10 @@ fn read_dep_sets(
 /// Detect how many workspace members exist in the project.
 fn detect_workspace_members(project_dir: &Path) -> usize {
     // Check package.json "workspaces" field (npm/yarn/bun)
-    if let Ok(content) = std::fs::read_to_string(project_dir.join("package.json"))
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+    if let Ok(content) = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(workspaces) = json.get("workspaces")
     {
         // "workspaces": ["packages/*", "apps/*"]
@@ -202,8 +208,10 @@ fn detect_workspace_members(project_dir: &Path) -> usize {
     }
 
     // Check pnpm-workspace.yaml
-    if let Ok(content) = std::fs::read_to_string(project_dir.join("pnpm-workspace.yaml"))
-        && let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content)
+    if let Ok(content) = lpm_common::read_text_file_capped(
+        &project_dir.join("pnpm-workspace.yaml"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) && let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content)
         && let Some(arr) = yaml.get("packages").and_then(|p| p.as_array())
     {
         return count_workspace_globs(project_dir, arr);

@@ -186,7 +186,7 @@ pub fn build_exec_plan(
     let resolved_path = resolve_exec_path(project_dir, file_path)?;
     let file_kind = detect_file_kind(&resolved_path)?;
     let path =
-        bin_path::build_path_with_bins_pre_resolved(project_dir, &options.managed_runtime_hint);
+        bin_path::build_path_with_bins_pre_resolved(project_dir, &options.managed_runtime_hint)?;
     let node_version = detect_effective_node_version_with_path(&path);
     let strategy = choose_exec_strategy(file_kind, project_dir, node_version.as_deref(), options)?;
     let runtime = runtime_for_strategy(&strategy, node_version);
@@ -759,9 +759,11 @@ fn no_safe_tsx_runtime_error(node_version: Option<&str>, plain_node: bool) -> Lp
 
 /// Detect the Node.js version that direct file execution will actually see on PATH.
 #[cfg(test)]
-fn detect_effective_node_version(project_dir: &Path) -> Option<String> {
-    let path = bin_path::build_path_with_bins(project_dir);
-    detect_effective_node_version_with_path(&path)
+fn detect_effective_node_version(
+    project_dir: &Path,
+) -> lpm_runtime::detect::DetectionResult<Option<String>> {
+    let path = bin_path::build_path_with_bins(project_dir)?;
+    Ok(detect_effective_node_version_with_path(&path))
 }
 
 fn detect_effective_node_version_with_path(path: &str) -> Option<String> {
@@ -1251,7 +1253,9 @@ mod tests {
         write_fake_node(dir.path(), "v22.9.0");
 
         assert_eq!(
-            detect_effective_node_version(dir.path()).as_deref(),
+            detect_effective_node_version(dir.path())
+                .unwrap()
+                .as_deref(),
             Some("v22.9.0")
         );
     }

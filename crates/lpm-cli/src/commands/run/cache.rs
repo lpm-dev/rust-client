@@ -49,7 +49,7 @@ pub(super) fn build_cache_context(
         _ => return Ok(None),
     };
 
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, env_mode);
+    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, env_mode)?;
 
     let pkg_json_path = project_dir.join("package.json");
     let deps_json = if pkg_json_path.exists() {

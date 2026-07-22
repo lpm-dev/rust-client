@@ -184,7 +184,10 @@ pub(super) fn print_full_script(
         }
     };
     let pkg_json_path = pkg_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
+    let content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(c) => c,
         Err(e) => {
             output::warn(&format!(

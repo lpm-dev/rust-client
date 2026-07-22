@@ -16,12 +16,12 @@ use super::check::Check;
 /// - Falls back to serde deserialization for type-level validation
 pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     let lpm_json_path = project_dir.join("lpm.json");
-    if !lpm_json_path.exists() {
-        return None; // No lpm.json is fine — it's optional
-    }
-
-    let content = match std::fs::read_to_string(&lpm_json_path) {
+    let content = match lpm_common::read_text_file_capped(
+        &lpm_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(c) => c,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return None,
         Err(e) => {
             return Some(Check::fail(
                 &doctor_catalog::LPM_JSON_UNREADABLE,

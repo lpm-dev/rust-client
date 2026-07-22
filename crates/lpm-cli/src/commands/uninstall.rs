@@ -210,7 +210,9 @@ fn remove_owned_cmd_shim(shim_path: &Path, expected_target: &Path) -> Result<u64
     let Ok(expected_canonical) = expected_target.canonicalize() else {
         return Ok(0);
     };
-    let Ok(content) = std::fs::read_to_string(shim_path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(shim_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return Ok(0);
     };
     if !content.contains(&expected_canonical.to_string_lossy().replace('/', "\\")) {
@@ -400,7 +402,9 @@ fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<Str
         .join("node_modules")
         .join(package)
         .join("package.json");
-    let content = std::fs::read_to_string(manifest_path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let manifest: Value = serde_json::from_str(&content).ok()?;
     manifest
         .get("version")
@@ -420,7 +424,8 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
     }
 
     let manifest_path = project_dir.join("package.json");
-    let manifest_content = std::fs::read_to_string(&manifest_path)?;
+    let manifest_content =
+        lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
     let manifest: Value =
         serde_json::from_str(&manifest_content).map_err(|e| LpmError::Registry(e.to_string()))?;
     let direct_specs = collect_manifest_dependency_specs(&manifest);
@@ -544,14 +549,19 @@ fn uninstall_from_manifest(
     packages: &[String],
     _json_output: bool,
 ) -> Result<UninstallResult, LpmError> {
-    if !pkg_json_path.exists() {
-        return Err(LpmError::NotFound(format!(
-            "no package.json at {}",
-            pkg_json_path.display()
-        )));
-    }
-
-    let content = std::fs::read_to_string(pkg_json_path)?;
+    let content = match lpm_common::read_text_file_capped(
+        pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Err(LpmError::NotFound(format!(
+                "no package.json at {}",
+                pkg_json_path.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut doc: Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
 

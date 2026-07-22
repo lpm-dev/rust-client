@@ -1,4 +1,5 @@
 use super::config::NpmrcConfig;
+use lpm_common::{BoundedReadError, NPMRC_FILE_SIZE_CAP_BYTES, read_text_file_capped};
 use std::path::{Path, PathBuf};
 
 impl NpmrcConfig {
@@ -68,8 +69,10 @@ impl NpmrcConfig {
     /// - **NotFound** — silently skipped. Most users don't have
     ///   `/etc/npmrc` or `/usr/etc/npmrc`; warning every time would be
     ///   pure noise.
+    /// - **Oversized or invalid UTF-8** — recorded as a fatal
+    ///   configuration error so precedence cannot silently change.
     /// - **Any other IO error** (PermissionDenied, EISDIR, etc.) —
-    ///   warned and skipped. Never aborts the install.
+    ///   warned and skipped, preserving the existing compatibility policy.
     ///
     /// The `env_lookup` is threaded through to each file's parse so
     /// `${VAR}` interpolation works the same way the single-file API
@@ -89,7 +92,7 @@ impl NpmrcConfig {
     ) -> Self {
         let mut acc = NpmrcConfig::default();
         for (idx, path) in paths.iter().enumerate() {
-            match std::fs::read_to_string(path) {
+            match read_text_file_capped(path, NPMRC_FILE_SIZE_CAP_BYTES) {
                 Ok(content) => {
                     let label = path.display().to_string();
                     let source_dir = path.parent();
@@ -99,14 +102,20 @@ impl NpmrcConfig {
                     );
                     acc.merge_over(layer);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(BoundedReadError::NotFound { .. }) => {
                     // Silent — see method-level comment.
                 }
-                Err(e) => {
+                Err(
+                    error @ (BoundedReadError::TooLarge { .. }
+                    | BoundedReadError::InvalidUtf8 { .. }),
+                ) => {
+                    acc.errors.push(error.to_string());
+                }
+                Err(error) => {
                     acc.warnings.push(format!(
                         "{}: failed to read .npmrc ({}); skipped this layer",
                         path.display(),
-                        e
+                        error
                     ));
                 }
             }

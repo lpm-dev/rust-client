@@ -229,7 +229,7 @@ pub async fn exec(
     env_mode: Option<&str>,
     no_env_check: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await;
+    let bin_hint = ensure_runtime(project_dir).await?;
     install_ui::phase(&format!("Executing {}", install_ui::yellow(command_name)));
     let start = std::time::Instant::now();
     lpm_runner::script::run_local_bin(
@@ -256,7 +256,7 @@ pub async fn run_file(
     no_env_check: bool,
     plain_node: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await;
+    let bin_hint = ensure_runtime(project_dir).await?;
     let options = exec_options(env_mode, no_env_check, plain_node, bin_hint);
     exec_once(project_dir, file_path, extra_args, &options)
 }
@@ -289,7 +289,7 @@ pub async fn run_file_watch(
     no_env_check: bool,
     plain_node: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await;
+    let bin_hint = ensure_runtime(project_dir).await?;
     let options = exec_options(env_mode, no_env_check, plain_node, bin_hint);
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, &options)?;
     let (watch_dir, input_globs) = exec_watch_scope(project_dir, &plan);
@@ -498,15 +498,16 @@ fn resolve_dlx_target(project_dir: &Path, package_spec: &str) -> Result<DlxTarge
 
 fn read_project_lpm_config(project_dir: &Path) -> Result<Option<serde_json::Value>, LpmError> {
     let path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(LpmError::Script(format!(
-                "failed to read caller package.json for dlx policy: {e}"
-            )));
-        }
-    };
+    let content =
+        match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(LpmError::Script(format!(
+                    "failed to read caller package.json for dlx policy: {e}"
+                )));
+            }
+        };
     let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
         LpmError::Script(format!(
             "failed to parse caller package.json for dlx policy: {e}"

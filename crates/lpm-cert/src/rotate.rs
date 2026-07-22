@@ -206,10 +206,14 @@ fn stage_and_run(
     }
 
     // Step 3: reissue every reachable leaf against the staged CA.
-    let staged_cert_pem = std::fs::read_to_string(staged_cert)
-        .map_err(|e| LpmError::Cert(format!("failed to read staged CA cert: {e}")))?;
-    let staged_key_pem = std::fs::read_to_string(staged_key)
-        .map_err(|e| LpmError::Cert(format!("failed to read staged CA key: {e}")))?;
+    let staged_cert_pem = lpm_common::read_text_file_capped(
+        staged_cert,
+        lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|e| LpmError::Cert(format!("failed to read staged CA cert: {e}")))?;
+    let staged_key_pem =
+        lpm_common::read_text_file_capped(staged_key, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read staged CA key: {e}")))?;
 
     let project_dirs = collect_project_dirs(&opts.extra_projects)?;
 
@@ -487,9 +491,10 @@ fn schedule_grace(fingerprint: &str, removes_at: &str) -> Result<(), LpmError> {
     if let Some(parent) = path.parent() {
         crate::create_dir_secure(parent)?;
     }
-    let mut file: GraceFile = if path.exists() {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| LpmError::Cert(format!("failed to read grace file: {e}")))?;
+    let mut file: GraceFile = if let Some(bytes) =
+        lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read grace file: {e}")))?
+    {
         if bytes.is_empty() {
             GraceFile::default()
         } else {
@@ -514,11 +519,12 @@ fn schedule_grace(fingerprint: &str, removes_at: &str) -> Result<(), LpmError> {
 /// Read every grace-scheduled entry. Used by `lpm cert reconcile`.
 pub fn read_grace_entries() -> Result<Vec<GraceEntry>, LpmError> {
     let path = grace_file_path()?;
-    if !path.exists() {
+    let Some(bytes) =
+        lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read grace file: {e}")))?
+    else {
         return Ok(Vec::new());
-    }
-    let bytes = std::fs::read(&path)
-        .map_err(|e| LpmError::Cert(format!("failed to read grace file: {e}")))?;
+    };
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -530,11 +536,12 @@ pub fn read_grace_entries() -> Result<Vec<GraceEntry>, LpmError> {
 /// Remove a fingerprint from the grace file. Returns whether anything was removed.
 pub fn drop_grace_entry(fingerprint: &str) -> Result<bool, LpmError> {
     let path = grace_file_path()?;
-    if !path.exists() {
+    let Some(bytes) =
+        lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read grace file: {e}")))?
+    else {
         return Ok(false);
-    }
-    let bytes = std::fs::read(&path)
-        .map_err(|e| LpmError::Cert(format!("failed to read grace file: {e}")))?;
+    };
     if bytes.is_empty() {
         return Ok(false);
     }

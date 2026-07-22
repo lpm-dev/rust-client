@@ -89,13 +89,13 @@ pub fn display_manifest_path(path: &Path) -> String {
 
 pub fn read_state(project_dir: &Path) -> Result<Option<AddedSourcesState>, LpmError> {
     let path = state_path(project_dir);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(LpmError::Io(error)),
-    };
+    let bytes =
+        match lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
 
-    let state: AddedSourcesState = serde_json::from_str(&content).map_err(|error| {
+    let state: AddedSourcesState = serde_json::from_slice(&bytes).map_err(|error| {
         LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
     })?;
 

@@ -302,7 +302,8 @@ pub async fn run(
     // the resolution-error path emits a fail anyway via the install
     // pipeline. Best-effort: any I/O / parse failure here downgrades
     // to a quiet skip rather than failing doctor.
-    if let Ok(pkg_content) = std::fs::read_to_string(&pkg_json_path)
+    if let Ok(pkg_content) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(pkg_parsed) = serde_json::from_str::<lpm_workspace::PackageJson>(&pkg_content)
     {
         let cfg = crate::commands::config::GlobalConfig::load();
@@ -492,9 +493,9 @@ pub async fn run(
     // === Runtime ===
 
     // 8. Node.js version
-    let detected = lpm_runtime::detect::detect_node_version(project_dir);
+    let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
     if let Some(ref det) = detected {
-        let system_node = get_system_node_version(project_dir);
+        let system_node = get_system_node_version(project_dir)?;
         let managed_versions = lpm_runtime::node::list_installed().unwrap_or_default();
 
         let spec = &det.spec;
@@ -526,7 +527,7 @@ pub async fn run(
             ));
         }
     } else {
-        let sys = get_system_node_version(project_dir);
+        let sys = get_system_node_version(project_dir)?;
         if let Some(v) = sys {
             checks.push(Check::pass(
                 &doctor_catalog::NODE_SYSTEM_UNPINNED,
@@ -540,8 +541,8 @@ pub async fn run(
         }
     }
 
-    if let Some(det) = lpm_runtime::detect::detect_bun_version(project_dir) {
-        let system_bun = get_system_bun_version(project_dir);
+    if let Some(det) = lpm_runtime::detect::detect_bun_version(project_dir)? {
+        let system_bun = get_system_bun_version(project_dir)?;
         let managed_versions = lpm_runtime::bun::list_installed().unwrap_or_default();
         let spec = &det.spec;
         let clean = lpm_runtime::bun::normalize_spec(spec);

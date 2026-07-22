@@ -426,15 +426,12 @@ pub(super) fn read_and_scan(path: &Path) -> (Option<String>, SecurityAssessment)
             )),
         );
     }
-    let content = match std::fs::read_to_string(path) {
+    let content = match lpm_common::read_text_file_capped(path, MAX_SCANNED_SKILL_BYTES) {
         Ok(content) => content,
         Err(error) => {
             return (
                 None,
-                SecurityAssessment::unavailable(format!(
-                    "could not read skill content: {}",
-                    error.kind()
-                )),
+                SecurityAssessment::unavailable(format!("could not read skill content: {error}")),
             );
         }
     };

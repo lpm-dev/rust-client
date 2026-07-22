@@ -256,7 +256,7 @@ fn run_pack_process(
     let pack_bin = resolve_local_pack_binary(project_dir).ok_or_else(|| {
         LpmError::Script("tsdown not installed. Run: lpm install -D tsdown".to_string())
     })?;
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
     let mut cmd = Command::new(&pack_bin);
     cmd.args(options.tsdown_args())
         .current_dir(project_dir)

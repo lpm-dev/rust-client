@@ -155,10 +155,12 @@ pub(crate) fn compute_link_stamp(target: &LinkTarget) -> String {
 /// unparseable bytes, or unknown versions all produce `false` so the
 /// caller force-relinks.
 pub(crate) fn link_stamp_matches(marker_path: &Path, target: &LinkTarget) -> bool {
-    let Ok(on_disk) = std::fs::read_to_string(marker_path) else {
+    let Ok(on_disk) =
+        lpm_common::read_file_capped(marker_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return false;
     };
-    on_disk == compute_link_stamp(target)
+    on_disk == compute_link_stamp(target).as_bytes()
 }
 
 /// Stale-entry cleanup — removes `.lpm/<pkg>@<ver>`

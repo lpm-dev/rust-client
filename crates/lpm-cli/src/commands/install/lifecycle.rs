@@ -175,7 +175,7 @@ pub(super) fn maybe_emit_post_install_lifecycle_hint(
     }
 
     let script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
     let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
         project_dir,
         script_policy_override,
@@ -310,7 +310,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     let user_bound = crate::security_approval::authorized_capability_user_bound();
 
     let script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
     let config_auto_build = script_policy_cfg.auto_build;
     let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
         project_dir,
@@ -775,7 +775,9 @@ pub(super) fn read_trusted_deps_from_manifest(
     project_dir: &Path,
 ) -> Option<lpm_workspace::TrustedDependencies> {
     let pkg_json_path = project_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
     // `trustedDependencies` sits under `lpm.trustedDependencies` per
     // the manifest schema; also accept it at the top level for

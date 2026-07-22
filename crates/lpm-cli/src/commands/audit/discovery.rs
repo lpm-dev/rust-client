@@ -501,7 +501,9 @@ fn read_package_from_node_modules(
     name: &str,
 ) -> Option<(DiscoveredPackage, Vec<String>)> {
     let pkg_json_path = pkg_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let version = json.get("version")?.as_str()?.to_string();
     let canonical_name = json

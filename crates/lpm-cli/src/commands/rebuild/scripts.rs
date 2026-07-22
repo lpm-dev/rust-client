@@ -18,7 +18,8 @@ pub(super) fn package_baseline_dir_indexed(
 }
 
 pub(super) fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String>> {
-    let content = std::fs::read(pkg_json_path).ok()?;
+    let content =
+        lpm_common::read_file_capped(pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
 
     // Fast byte pre-scan: if "scripts" never appears as a JSON key, the
     // result is always None — skip the full parse.

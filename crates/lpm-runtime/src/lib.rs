@@ -60,8 +60,20 @@ pub enum RuntimeStatus {
 /// Each `Ready` or `Installed` result carries a bin dir for PATH injection.
 ///
 /// Auto-install is enabled by default. Set `LPM_NO_AUTO_INSTALL=true` to disable.
-pub async fn ensure_runtime(project_dir: &std::path::Path) -> Vec<RuntimeStatus> {
-    let detected = detect::detect_runtime_versions(project_dir);
+pub async fn ensure_runtime(
+    project_dir: &std::path::Path,
+) -> detect::DetectionResult<Vec<RuntimeStatus>> {
+    let detected = detect::detect_runtime_versions(project_dir)?;
+    Ok(ensure_detected_runtimes(detected).await)
+}
+
+/// Auto-install already-detected managed runtime requirements if needed.
+///
+/// Callers can run fallible configuration detection before starting other
+/// work, then pass the validated requirements here without rereading files.
+pub async fn ensure_detected_runtimes(
+    detected: Vec<detect::DetectedRuntimeVersion>,
+) -> Vec<RuntimeStatus> {
     if detected.is_empty() {
         return Vec::new();
     }

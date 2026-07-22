@@ -188,7 +188,8 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     // compute the *effective* blocked set, so an already-approved package
     // doesn't appear in --list / --yes output.
 
-    let manifest_text = std::fs::read_to_string(&pkg_json_path).map_err(LpmError::Io)?;
+    let manifest_text =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
         .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 

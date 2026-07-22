@@ -459,12 +459,16 @@ fn validate_npm_name_part(part: &str, label: &str, full_name: &str) -> Result<()
 
 fn ensure_npm_publish_config(project_dir: &Path) -> Result<FileWriteStatus, LpmError> {
     let path = project_dir.join("lpm.json");
-    let mut value = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|e| LpmError::Registry(format!("failed to parse lpm.json: {e}")))?
-    } else {
-        serde_json::json!({})
+    let existing =
+        match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => Some(content),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+    let mut value = match &existing {
+        Some(content) => serde_json::from_str::<serde_json::Value>(content)
+            .map_err(|e| LpmError::Registry(format!("failed to parse lpm.json: {e}")))?,
+        None => serde_json::json!({}),
     };
 
     let obj = value
@@ -500,8 +504,7 @@ fn ensure_npm_publish_config(project_dir: &Path) -> Result<FileWriteStatus, LpmE
     let rendered =
         serde_json::to_string_pretty(&value).map_err(|e| LpmError::Registry(e.to_string()))?;
     let rendered = format!("{rendered}\n");
-    if path.exists() {
-        let current = std::fs::read_to_string(&path)?;
+    if let Some(current) = existing {
         if current == rendered {
             return Ok(FileWriteStatus::Unchanged);
         }

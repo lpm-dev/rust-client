@@ -2,7 +2,7 @@ use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// MCP server management: setup, remove, status.
 pub async fn run(
@@ -130,12 +130,15 @@ fn default_server_config() -> Value {
     })
 }
 
-fn load_config(path: &PathBuf) -> Result<Value, LpmError> {
-    if !path.exists() {
-        return Ok(serde_json::json!({}));
-    }
-
-    let content = std::fs::read_to_string(path)?;
+fn load_config(path: &Path) -> Result<Value, LpmError> {
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                return Ok(serde_json::json!({}));
+            }
+            Err(error) => return Err(LpmError::Registry(error.to_string())),
+        };
     serde_json::from_str(&content).map_err(|error| {
         LpmError::Registry(format!(
             "failed to parse MCP config at {}: {error}",
@@ -144,7 +147,7 @@ fn load_config(path: &PathBuf) -> Result<Value, LpmError> {
     })
 }
 
-fn write_config(path: &PathBuf, config: &Value) -> Result<(), LpmError> {
+fn write_config(path: &Path, config: &Value) -> Result<(), LpmError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -456,6 +459,24 @@ mod tests {
             global_path: Some(path),
             server_key,
         }
+    }
+
+    #[test]
+    fn load_config_rejects_oversized_editor_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let error = load_config(&path).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&path.display().to_string())
+                && message.contains("16777216-byte limit"),
+            "error must identify MCP config and limit: {message}"
+        );
     }
 
     #[test]

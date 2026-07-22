@@ -621,8 +621,9 @@ struct HoistMetadata {
 /// Read `.lpm-metadata.json` from a previous hoisted run.
 /// Returns `None` if the file is missing, corrupt, or has an unexpected format.
 fn read_hoist_metadata(path: &Path) -> Option<HoistMetadata> {
-    let data = std::fs::read_to_string(path).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let data =
+        lpm_common::read_capped_state_file(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()??;
+    let val: serde_json::Value = serde_json::from_slice(&data).ok()?;
 
     let hoisted = val.get("hoisted")?.as_object()?;
     let nested = val.get("nested")?.as_object()?;

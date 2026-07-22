@@ -220,7 +220,8 @@ async fn run_under_store_lock(
     // the package.json read is a single pass across all four keys
     // (scriptPolicy, autoBuild, denyAll, trustedScopes).
     let config_deny_all =
-        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir).deny_all;
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?
+            .deny_all;
     if deny_all || config_deny_all {
         if !json_output {
             install_ui::warn(

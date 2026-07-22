@@ -942,7 +942,11 @@ fn link_destination(canonical: &Path, target: &Path) -> PathBuf {
 }
 
 fn copy_marker_matches(target: &Path, expected: &str) -> bool {
-    std::fs::read_to_string(target.join(COPY_MARKER)).is_ok_and(|content| {
+    lpm_common::read_text_file_capped(
+        &target.join(COPY_MARKER),
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    )
+    .is_ok_and(|content| {
         serde_json::from_str::<serde_json::Value>(&content)
             .ok()
             .and_then(|value| {
@@ -2660,13 +2664,14 @@ fn stores_for(project_dir: &Path, include_global: bool) -> Result<Vec<Store>, Lp
 
 fn load_state(store: &Store) -> Result<ManagedState, LpmError> {
     let path = store.state_path();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ManagedState::default());
-        }
-        Err(error) => return Err(LpmError::Io(error)),
-    };
+    let content =
+        match lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                return Ok(ManagedState::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
     let state: ManagedState = serde_json::from_str(&content).map_err(|error| {
         LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
     })?;

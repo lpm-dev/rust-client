@@ -47,7 +47,7 @@ pub async fn run_workspace(
 
     // Capture the root hint so members without their own version pin can
     // inherit it; members with local pins still resolve themselves.
-    let root_hint = Arc::new(ensure_runtime(project_dir).await);
+    let root_hint = Arc::new(ensure_runtime(project_dir).await?);
 
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
@@ -312,10 +312,13 @@ fn run_workspace_package(
 
     // If the member has its own Node.js version pin, let silent detection
     // resolve at the member level. Otherwise inherit the workspace-root hint.
-    let bin_hint = if lpm_runtime::detect::detect_node_version(member_dir).is_some() {
-        ManagedRuntimeHint::Unknown
-    } else {
-        root_hint.clone()
+    let bin_hint = match lpm_runtime::detect::detect_node_version(member_dir) {
+        Ok(Some(_)) => ManagedRuntimeHint::Unknown,
+        Ok(None) => root_hint.clone(),
+        Err(error) => {
+            install_ui::detail(&format_run_failure_detail(member_name, error));
+            return Some(false);
+        }
     };
 
     // Single task, no deps → simple run

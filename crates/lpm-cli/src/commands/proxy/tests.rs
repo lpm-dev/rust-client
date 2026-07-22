@@ -5,6 +5,23 @@ use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
 
 #[test]
+fn resolve_start_options_rejects_oversized_project_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lpm.json");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+        .unwrap();
+
+    let error = resolve_start_options(dir.path(), None, None, None).unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains(&path.display().to_string()) && message.contains("16777216-byte limit"),
+        "error must identify proxy config and limit: {message}"
+    );
+}
+
+#[test]
 fn resolve_start_options_keeps_control_only_without_local_domain_config() {
     let dir = tempfile::tempdir().unwrap();
 

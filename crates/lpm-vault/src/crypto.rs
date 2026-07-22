@@ -147,7 +147,8 @@ fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
             return None;
         }
     }
-    let hex_key = std::fs::read_to_string(&key_path).ok()?;
+    let hex_key =
+        lpm_common::read_text_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()?;
     let bytes = hex::decode(hex_key.trim()).ok()?;
     if bytes.len() != 32 {
         return None;

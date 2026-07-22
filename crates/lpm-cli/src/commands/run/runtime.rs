@@ -1,4 +1,5 @@
 use crate::install_ui;
+use lpm_common::LpmError;
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::path::Path;
 
@@ -14,8 +15,19 @@ fn runtime_display_name(runtime: &str) -> &str {
 /// Detects version requirements from project config, auto-installs if needed,
 /// prints the runtime version in use, and returns a pre-resolved PATH hint for
 /// downstream script execution.
-pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
-    let statuses = lpm_runtime::ensure_runtime(project_dir).await;
+pub async fn ensure_runtime(project_dir: &Path) -> Result<ManagedRuntimeHint, LpmError> {
+    let detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+    Ok(ensure_detected_runtimes(detected).await)
+}
+
+/// Ensure already-detected managed runtimes are available before running scripts.
+///
+/// This preserves the runtime status UI and PATH hint while allowing callers to
+/// complete fallible configuration reads before starting unrelated work.
+pub async fn ensure_detected_runtimes(
+    detected: Vec<lpm_runtime::detect::DetectedRuntimeVersion>,
+) -> ManagedRuntimeHint {
+    let statuses = lpm_runtime::ensure_detected_runtimes(detected).await;
     if statuses.is_empty() {
         return ManagedRuntimeHint::Absent;
     }

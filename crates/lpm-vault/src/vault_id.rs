@@ -51,7 +51,9 @@ pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
 /// [`is_safe_vault_id`] check (per M31).
 pub fn read_vault_id(project_dir: &Path) -> Option<String> {
     let lpm_json_path = project_dir.join("lpm.json");
-    let content = std::fs::read_to_string(lpm_json_path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&lpm_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let config: serde_json::Value = serde_json::from_str(&content).ok()?;
     let raw = config.get("vault").and_then(|v| v.as_str())?;
     if !is_safe_vault_id(raw) {
@@ -242,7 +244,8 @@ pub fn read_sync_summary(project_dir: &Path) -> VaultSyncSummary {
 pub fn read_project_name(project_dir: &Path) -> String {
     // Try package.json first
     let pkg_path = project_dir.join("package.json");
-    if let Ok(content) = std::fs::read_to_string(&pkg_path)
+    if let Ok(content) =
+        lpm_common::read_text_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(name) = pkg.get("name").and_then(|v| v.as_str())
     {
@@ -251,7 +254,8 @@ pub fn read_project_name(project_dir: &Path) -> String {
 
     // Try lpm.json
     let lpm_path = project_dir.join("lpm.json");
-    if let Ok(content) = std::fs::read_to_string(&lpm_path)
+    if let Ok(content) =
+        lpm_common::read_text_file_capped(&lpm_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(name) = cfg.get("name").and_then(|v| v.as_str())
     {
@@ -301,12 +305,14 @@ fn empty_lpm_json(project_dir: &Path) -> (PathBuf, serde_json::Value) {
 
 fn read_lpm_json_value(project_dir: &Path) -> Result<Option<(PathBuf, serde_json::Value)>, String> {
     let lpm_json_path = project_dir.join("lpm.json");
-    if !lpm_json_path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&lpm_json_path)
-        .map_err(|e| format!("failed to read lpm.json: {e}"))?;
+    let content = match lpm_common::read_text_file_capped(
+        &lpm_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(format!("failed to read lpm.json: {error}")),
+    };
     let config =
         serde_json::from_str(&content).map_err(|e| format!("failed to parse lpm.json: {e}"))?;
 

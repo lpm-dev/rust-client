@@ -20,13 +20,17 @@ pub(super) fn is_runtime_source_text_file(path: &Path) -> bool {
 }
 
 /// Read lpm.config.json from extracted package.
-pub(super) fn read_lpm_config(extract_dir: &Path) -> Option<serde_json::Value> {
+pub(super) fn read_lpm_config(extract_dir: &Path) -> Result<Option<serde_json::Value>, LpmError> {
     let path = extract_dir.join("lpm.config.json");
-    if !path.exists() {
-        return None;
-    }
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content =
+        match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| LpmError::Registry(format!("failed to parse {}: {error}", path.display())))
 }
 
 /// Coerce a JSON value from `lpm.config.json` to its canonical string
@@ -283,8 +287,8 @@ pub(super) fn collect_source_with_fallback(
 ) -> Result<Vec<(String, String)>, LpmError> {
     // Check package.json for lpm.source field (legacy packages)
     let pkg_json_path = extract_dir.join("package.json");
-    if pkg_json_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&pkg_json_path)
+    if let Ok(content) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(source_dir) = doc
             .get("lpm")

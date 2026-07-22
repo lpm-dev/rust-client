@@ -102,6 +102,7 @@ fn format_cert_prompt_field(label: &str, value: &str) -> String {
 pub async fn run(
     client: &lpm_registry::RegistryClient,
     project_dir: &Path,
+    detected_runtimes: Vec<lpm_runtime::detect::DetectedRuntimeVersion>,
     https: bool,
     tunnel: bool,
     network: bool,
@@ -179,7 +180,7 @@ pub async fn run(
     //   - auto_install_if_stale (async, potentially slow — runs `lpm install`)
     //   - auto_copy_env_example (sync file I/O — wrap in spawn_blocking)
     //   - HTTPS cert setup (sync, may generate certs — wrap in spawn_blocking)
-    //   - ensure_runtime (async, may download node — potentially slow)
+    //   - ensure_detected_runtimes (async, may download node — potentially slow)
     //
     // Network display and tunnel setup depend on HTTPS result (cert env vars),
     // so they run after the parallel batch.
@@ -187,7 +188,6 @@ pub async fn run(
     let install_dir = project_dir.to_path_buf();
     let env_dir = project_dir.to_path_buf();
     let https_dir = project_dir.to_path_buf();
-    let runtime_dir = project_dir.to_path_buf();
     let host_owned = host.map(|h| h.to_string());
 
     // Pre-compute network info once (used for both cert SANs and display)
@@ -271,7 +271,7 @@ pub async fn run(
                 Ok::<_, LpmError>(None)
             }
         },
-        async { super::run::ensure_runtime(&runtime_dir).await },
+        async { super::run::ensure_detected_runtimes(detected_runtimes).await },
         async { node_version_handle.await.unwrap_or(None) },
     );
 
@@ -355,7 +355,10 @@ pub async fn run(
             && ca_cert_path.exists()
         {
             if allow_ca_bootstrap {
-                let ca_cert_data = std::fs::read(&ca_cert_path).unwrap_or_default();
+                let ca_cert_data = lpm_common::read_file_capped(
+                    &ca_cert_path,
+                    lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+                )?;
                 if !ca_cert_data.is_empty() {
                     let ca_port = port + 1;
                     tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));

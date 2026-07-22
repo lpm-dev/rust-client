@@ -101,15 +101,20 @@ fn remember_signing_secret(cache_key: &str, secret: &[u8]) {
 fn remember_signing_secret(_cache_key: &str, _secret: &[u8]) {}
 
 fn read_file_signing_secret(path: &Path) -> Result<Vec<u8>, SigningSecretReadError> {
-    if !path.exists() {
-        return Err(SigningSecretReadError::Missing);
-    }
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        SigningSecretReadError::Unavailable(format!(
-            "security approval signing secret {} could not be read: {e}",
-            path.display(),
-        ))
-    })?;
+    let raw =
+        match lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+        {
+            Ok(raw) => raw,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                return Err(SigningSecretReadError::Missing);
+            }
+            Err(error) => {
+                return Err(SigningSecretReadError::Unavailable(format!(
+                    "security approval signing secret {} could not be read: {error}",
+                    path.display(),
+                )));
+            }
+        };
     decode_signing_secret(&raw, "security approval file signing secret")
 }
 
@@ -281,10 +286,12 @@ pub(super) fn write_signed_json<T: Serialize + Clone>(
 }
 
 fn parse_signed_json_file(path: &Path) -> Result<Option<ParsedSignedJson>, LpmError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let body = std::fs::read_to_string(path)?;
+    let body = match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    {
+        Ok(body) => body,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(signed_state_file_error(path, error.to_string())),
+    };
     let parsed: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| signed_state_file_error(path, format!("has invalid JSON: {e}")))?;
     let signature = parsed
@@ -362,7 +369,8 @@ fn existing_nonempty_audit_log_path() -> Result<Option<PathBuf>, LpmError> {
 }
 
 fn signed_json_unverified_reason(path: &Path, secret: &[u8]) -> Result<Option<String>, LpmError> {
-    let body = std::fs::read_to_string(path)?;
+    let body = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| signed_state_file_error(path, error.to_string()))?;
     let parsed: serde_json::Value = match serde_json::from_str(&body) {
         Ok(parsed) => parsed,
         Err(e) => return Ok(Some(format!("invalid JSON: {e}"))),

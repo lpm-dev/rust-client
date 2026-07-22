@@ -291,8 +291,10 @@ pub fn default_cache_path() -> Option<PathBuf> {
 /// staleness logic. Backwards-compatible with the legacy
 /// `{latest, lastCheck}` JSON that pre-refactor `update_check.rs` wrote.
 pub fn read_cache_at(path: &Path) -> Option<UpdateCache> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let bytes = lpm_common::read_capped_state_file(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .ok()
+        .flatten()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Atomic write via `<path>.tmp` + rename. Best-effort directory

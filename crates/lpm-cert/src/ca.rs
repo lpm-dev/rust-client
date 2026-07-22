@@ -72,9 +72,11 @@ pub fn wants_name_constraints() -> bool {
 /// Returns `Err` if the file is unreadable or not a valid X.509 cert; returns
 /// `Ok(false)` if the file is a valid cert but the extension is absent.
 pub fn cert_has_name_constraints(path: &Path) -> Result<bool, LpmError> {
-    let pem_str = std::fs::read_to_string(path).map_err(|e| {
-        LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
-    })?;
+    let pem_str =
+        lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
+            })?;
     let pem = pem::parse(&pem_str)
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
@@ -89,9 +91,11 @@ pub fn cert_has_name_constraints(path: &Path) -> Result<bool, LpmError> {
 /// True iff the PEM-encoded root CA at `path` is allowed to sign a project
 /// intermediate CA.
 pub fn cert_allows_project_intermediates(path: &Path) -> Result<bool, LpmError> {
-    let pem_str = std::fs::read_to_string(path).map_err(|e| {
-        LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
-    })?;
+    let pem_str =
+        lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
+            })?;
     let pem = pem::parse(&pem_str)
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())

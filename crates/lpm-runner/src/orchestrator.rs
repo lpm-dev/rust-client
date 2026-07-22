@@ -509,7 +509,7 @@ pub fn run_services(
     let cross_env = ports::build_cross_service_env(&port_map, options.https);
 
     // Build PATH
-    let path = crate::bin_path::build_path_with_bins(project_dir);
+    let path = crate::bin_path::build_path_with_bins(project_dir)?;
 
     // Load .env files + vault + validate schema (unified loader)
     let dotenv = crate::dotenv::load_project_env(project_dir, None)?;

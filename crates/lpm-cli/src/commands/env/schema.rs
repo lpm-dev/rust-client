@@ -293,7 +293,8 @@ pub(super) fn vars_validate(
         ));
     }
 
-    let content = std::fs::read_to_string(&example_path)?;
+    let content =
+        lpm_common::read_text_file_capped(&example_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
 
     // Parse .env.example — extract key names (values are ignored)
     let required_keys: Vec<String> = content

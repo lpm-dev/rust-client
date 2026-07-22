@@ -4,6 +4,9 @@ use std::path::Path;
 
 use crate::error::WorkspaceError;
 use crate::trust::TrustedDependencies;
+use lpm_common::{
+    BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_file_capped, read_text_file_capped,
+};
 
 const UTF8_BOM_BYTES: &[u8] = b"\xEF\xBB\xBF";
 
@@ -626,8 +629,8 @@ pub struct PatchedDependencyEntry {
 }
 
 pub fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let content =
+        read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES).map_err(map_manifest_read_error)?;
 
     serde_json::from_str(strip_json_bom_str(&content))
         .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
@@ -642,10 +645,17 @@ pub type PeerDepsResult = (HashMap<String, String>, HashMap<String, PeerDependen
 /// peer-dependency values in third-party manifests don't reject the whole
 /// scan. Callers should byte-scan first when they are on hot paths.
 pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceError> {
-    let content = std::fs::read(path)
-        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let content =
+        read_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES).map_err(map_manifest_read_error)?;
     parse_peer_dependencies(&content)
         .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
+}
+
+fn map_manifest_read_error(error: BoundedReadError) -> WorkspaceError {
+    match error {
+        BoundedReadError::NotFound { path } => WorkspaceError::NotFound(path.display().to_string()),
+        other => WorkspaceError::Io(other.to_string()),
+    }
 }
 
 /// Parse peer-dependency info from already-read JSON bytes.

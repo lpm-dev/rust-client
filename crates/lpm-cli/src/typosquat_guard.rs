@@ -485,12 +485,14 @@ fn locked_direct_names(project_dir: &Path) -> BTreeSet<String> {
 impl TyposquatPolicy {
     fn load(project_dir: &Path) -> Result<Self, LpmError> {
         let path = project_dir.join("lpm.toml");
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| LpmError::Registry(format!("failed to read {}: {e}", path.display())))?;
+        let raw = match lpm_common::read_text_file_capped(
+            &path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(raw) => raw,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Self::default()),
+            Err(error) => return Err(LpmError::Registry(error.to_string())),
+        };
         let parsed: toml::Value = toml::from_str(&raw)
             .map_err(|e| LpmError::Registry(format!("failed to parse {}: {e}", path.display())))?;
         let mut policy = Self::default();
@@ -565,15 +567,11 @@ fn append_allow_entry(
     reason: &str,
 ) -> Result<(), LpmError> {
     let path = project_dir.join("lpm.toml");
-    let raw = match std::fs::read_to_string(&path) {
+    let raw = match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(LpmError::Registry(format!(
-                "failed to read {}: {e}",
-                path.display()
-            )));
-        }
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
+        Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
     let mut doc = raw
         .parse::<DocumentMut>()

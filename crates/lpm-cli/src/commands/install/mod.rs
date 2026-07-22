@@ -926,7 +926,7 @@ async fn run_with_options_under_store_lock(
     let experimental_resolver_requested = experimental_resolver::enabled();
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
         let script_policy_cfg =
-            crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+            crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
         let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
             project_dir,
             script_policy_override,
