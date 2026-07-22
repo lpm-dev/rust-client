@@ -662,15 +662,15 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             for hit in applied_overrides {
                 let source_ref = hit.source_display();
                 let parent_suffix = match &hit.via_parent {
-                    Some(p) => format!(", reached through {}", p.bold()),
+                    Some(p) => format!(", reached through {}", install_ui::bold(p)),
                     None => String::new(),
                 };
                 println!(
                     "   {} {} → {} (via {}{})",
-                    hit.package.bold(),
-                    hit.from_version.dimmed(),
-                    hit.to_version.bold(),
-                    source_ref,
+                    install_ui::bold(&hit.package),
+                    install_ui::dim(&hit.from_version),
+                    install_ui::bold(&hit.to_version),
+                    lpm_common::sanitize_terminal_inline(&source_ref),
                     parent_suffix,
                 );
             }
@@ -706,9 +706,9 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                 let total = a.files_modified + a.files_added + a.files_deleted;
                 println!(
                     "   {}@{} ({}, {} file{})",
-                    a.name.bold(),
-                    a.version.dimmed(),
-                    rel_patch.display(),
+                    install_ui::bold(&a.name),
+                    install_ui::dim(&a.version),
+                    install_ui::dim(&rel_patch.display().to_string()),
                     total,
                     if total == 1 { "" } else { "s" },
                 );

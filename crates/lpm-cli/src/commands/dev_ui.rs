@@ -9,11 +9,13 @@ pub fn phase(msg: &str) {
     install_ui::phase(msg);
 }
 
-pub fn detail(label: &str, value: &str) {
+/// Emits a detail row assembled from trusted text and field-role helpers.
+pub fn trusted_detail(label: &str, value: &str) {
     install_ui::detail(&format_detail_line(label, value, None));
 }
 
-pub fn detail_with_hint(label: &str, value: &str, hint: &str) {
+/// Emits a trusted detail row while sanitizing the untrusted hint field.
+pub fn trusted_detail_with_hint(label: &str, value: &str, hint: &str) {
     install_ui::detail(&format_detail_line(label, value, Some(hint)));
 }
 
@@ -27,6 +29,8 @@ pub fn readiness_with_hint(label: &str, value: &str, hint: &str) {
 
 fn format_readiness_line(label: &str, value: &str, hint: Option<&str>) -> String {
     let suffix = hint.map_or_else(String::new, |hint| format!(" {}", install_ui::dim(hint)));
+    let label = lpm_common::sanitize_terminal_inline(label);
+    let value = lpm_common::sanitize_terminal_inline(value);
     format!(
         "  {} {:<7} {value}{suffix}",
         install_ui::bullet(true),
@@ -46,19 +50,27 @@ pub fn done(msg: &str) {
 pub fn done_ready(subject: &str, duration: Duration) {
     let duration_str = install_ui::format_duration(duration);
     install_ui::done(&format!(
-        "{subject} ready ({})",
+        "{} ready ({})",
+        lpm_common::sanitize_terminal_inline(subject),
         install_ui::green(&duration_str),
     ));
 }
 
 pub fn warn(msg: &str) {
-    install_ui::warn(msg);
+    install_ui::warn(&lpm_common::sanitize_terminal_inline(msg));
 }
 
 pub fn hint_line(msg: &str) {
     eprintln!("  {}", install_ui::dim(msg));
 }
 
+/// Emits a hint assembled only from LPM-owned text and field-level style helpers.
+pub fn trusted_hint_line(msg: &str) {
+    eprintln!("  {msg}");
+}
+
+/// Emits an LPM-generated terminal block verbatim; untrusted text must use a
+/// field or readiness renderer instead.
 pub fn raw_block(block: &str) {
     eprint!("{block}");
     if !block.ends_with('\n') {

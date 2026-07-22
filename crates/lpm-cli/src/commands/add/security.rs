@@ -1,4 +1,4 @@
-use crate::output;
+use crate::{install_ui, output};
 use lpm_common::color::Painted;
 
 /// Print security warnings for a single package version.
@@ -56,12 +56,16 @@ pub fn print_security_warnings(
     println!();
     output::warn(&format!(
         "{} ({}) has {} issue(s):",
-        name.bold(),
-        version,
+        install_ui::bold(name),
+        lpm_common::sanitize_terminal_inline(version),
         warnings.len()
     ));
     for warning in &warnings {
-        println!("    {} {}", "\u{26a0}".yellow(), warning);
+        println!(
+            "    {} {}",
+            "\u{26a0}".yellow(),
+            lpm_common::sanitize_terminal_inline(warning)
+        );
     }
     println!("  Run {} for details", "lpm audit".bold());
 }

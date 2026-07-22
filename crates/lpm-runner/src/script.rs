@@ -14,8 +14,8 @@ use crate::dotenv;
 use crate::hooks;
 use crate::lpm_json;
 use crate::shell::{self, ShellCommand};
-use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_common::{LpmError, sanitize_terminal_inline};
 use lpm_workspace::read_package_json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -722,12 +722,15 @@ pub fn run_command_captured(
 /// Example output:
 ///   Env: development (via lpm.json "dev") · 5 vault secrets
 fn print_env_context(loaded: &LoadedEnv) {
-    let env_label = loaded.env_name.as_deref().unwrap_or("default");
+    let env_label = sanitize_terminal_inline(loaded.env_name.as_deref().unwrap_or("default"));
 
     let via = match (loaded.source, &loaded.alias) {
         ("--env flag", _) => format!("via {}", "--env".dimmed()),
         ("lpm.json", Some(alias)) => {
-            format!("via lpm.json \"{}\"", alias.dimmed())
+            format!(
+                "via lpm.json \"{}\"",
+                sanitize_terminal_inline(alias).dimmed()
+            )
         }
         _ => String::new(),
     };

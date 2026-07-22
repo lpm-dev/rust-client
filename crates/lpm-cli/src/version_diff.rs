@@ -463,8 +463,11 @@ pub fn render_terse_hint(diff: &VersionDiff, package_name: &str) -> Option<Strin
     if !diff.is_drift() {
         return None;
     }
-    let head = format!("  {}@{} — ", package_name, diff.candidate_version);
-    let since = format!(" since v{}", diff.prior_version);
+    let package_name = lpm_common::sanitize_terminal_inline(package_name);
+    let candidate_version = lpm_common::sanitize_terminal_inline(&diff.candidate_version);
+    let prior_version = lpm_common::sanitize_terminal_inline(&diff.prior_version);
+    let head = format!("  {package_name}@{candidate_version} — ");
+    let since = format!(" since v{prior_version}");
     let body = match &diff.reason {
         VersionDiffReason::NoChange => return None,
         VersionDiffReason::ScriptHashDrift => format!("script content changed{since}"),
@@ -508,10 +511,10 @@ fn render_provenance_terse(kind: &ProvenanceDriftKind, since: &str) -> String {
 fn tag_delta_suffix(gained: &[String], lost: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for t in gained {
-        parts.push(format!("+{t}"));
+        parts.push(format!("+{}", lpm_common::sanitize_terminal_inline(t)));
     }
     for t in lost {
-        parts.push(format!("-{t}"));
+        parts.push(format!("-{}", lpm_common::sanitize_terminal_inline(t)));
     }
     if parts.is_empty() {
         // The diff core guarantees at least one delta when it returns
@@ -556,9 +559,11 @@ pub fn render_preflight_card(
     }
 
     let mut out = String::new();
+    let package_name = lpm_common::sanitize_terminal_inline(package_name);
+    let candidate_version = lpm_common::sanitize_terminal_inline(&diff.candidate_version);
+    let prior_version = lpm_common::sanitize_terminal_inline(&diff.prior_version);
     out.push_str(&format!(
-        "  {}@{} — changes since v{}:\n",
-        package_name, diff.candidate_version, diff.prior_version
+        "  {package_name}@{candidate_version} — changes since v{prior_version}:\n"
     ));
 
     // Helper closures over the three dimension renderings so the
@@ -579,10 +584,16 @@ pub fn render_preflight_card(
     let render_tags = |out: &mut String, shift: &TagShift| {
         out.push_str("    Behavioral tags:\n");
         for t in &shift.gained {
-            out.push_str(&format!("      + {t}\n"));
+            out.push_str(&format!(
+                "      + {}\n",
+                lpm_common::sanitize_terminal_inline(t)
+            ));
         }
         for t in &shift.lost {
-            out.push_str(&format!("      - {t}\n"));
+            out.push_str(&format!(
+                "      - {}\n",
+                lpm_common::sanitize_terminal_inline(t)
+            ));
         }
     };
 
@@ -661,13 +672,15 @@ fn render_script_body_diff(prior: Option<&PhaseBodies>, candidate: Option<&Phase
         if p == c {
             continue;
         }
+        let p = lpm_common::sanitize_terminal_multiline(p);
+        let c = lpm_common::sanitize_terminal_multiline(c);
 
         // Ensure both sides end with a trailing newline so diffy's
         // line-by-line patch format doesn't attribute a "\ No
         // newline at end of file" marker to a phase that just has a
         // single shell command without a trailing \n.
-        let p_norm = ensure_trailing_newline(p);
-        let c_norm = ensure_trailing_newline(c);
+        let p_norm = ensure_trailing_newline(&p);
+        let c_norm = ensure_trailing_newline(&c);
 
         out.push_str(&format!("--- scripts.{phase} (v<prior>)\n"));
         out.push_str(&format!("+++ scripts.{phase} (v<candidate>)\n"));
@@ -1539,6 +1552,45 @@ mod tests {
         );
         // Unified-diff headers should identify WHICH phase drifted.
         assert!(card.contains("scripts.postinstall"));
+    }
+
+    #[test]
+    fn preflight_card_sanitizes_package_metadata_and_script_bodies() {
+        let prior = bodies(&[("postinstall", "echo prior\n")]);
+        let candidate = bodies(&[(
+            "postinstall",
+            "safe\rrewritten\u{8}\x1b[2J\x1b]52;c;AAAA\x07\u{0090}hidden\u{009c}end\n",
+        )]);
+        let diff = VersionDiff {
+            prior_version: "1.0.0\rforged".into(),
+            candidate_version: "2.0.0\u{8}".into(),
+            reason: VersionDiffReason::ScriptHashDrift,
+        };
+        let card = render_preflight_card(
+            &diff,
+            "safe-package\nFORGED-PACKAGE",
+            Some(&prior),
+            Some(&candidate),
+        )
+        .unwrap();
+
+        assert!(card.contains("safe-package?FORGED-PACKAGE@2.0.0?"));
+        assert!(card.contains("safe?rewritten?end"));
+        for attacker_fragment in [
+            "\x1b[2J",
+            "\x1b]52;c;AAAA",
+            "\x07",
+            "\x08",
+            "\r",
+            "\u{0090}",
+            "\u{009c}",
+            "hidden",
+        ] {
+            assert!(
+                !card.contains(attacker_fragment),
+                "preflight card retained {attacker_fragment:?}: {card:?}"
+            );
+        }
     }
 
     #[test]

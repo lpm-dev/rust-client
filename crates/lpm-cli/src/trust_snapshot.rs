@@ -227,7 +227,9 @@ pub fn format_new_bindings_notice(additions: &[String]) -> Option<String> {
     }
     let mut out = String::from("Manifest trust bindings changed since last install:\n");
     for key in additions {
-        out.push_str(&format!("    + {key}\n"));
+        out.push_str("    + ");
+        out.push_str(&lpm_common::sanitize_terminal_inline(key));
+        out.push('\n');
     }
     out.push_str("  Run `lpm trust diff` to inspect before scripts run.");
     Some(out)
@@ -408,6 +410,22 @@ mod tests {
         assert!(n.contains("+ plain-crypto-js@1.0.0"));
         assert!(n.contains("+ axios@1.14.1"));
         assert!(n.contains("lpm trust diff"));
+    }
+
+    #[test]
+    fn format_cannot_forge_terminal_lines() {
+        let notice = format_new_bindings_notice(&[
+            "safe\nforged\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}end".into(),
+        ])
+        .expect("non-empty additions render");
+
+        assert!(notice.contains("    + safe?forged?rewritten?end\n"));
+        for control in ['\u{1b}', '\u{7}', '\u{8}', '\r'] {
+            assert!(
+                !notice.contains(control),
+                "retained {control:?}: {notice:?}"
+            );
+        }
     }
 
     // ── read / write round-trip ────────────────────────────────────

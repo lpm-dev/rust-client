@@ -55,6 +55,7 @@ mod sigstore;
 mod sigstore_verify;
 mod step_up;
 mod swift_manifest;
+mod terminal_output;
 #[cfg(test)]
 mod test_env;
 mod tool_pin_validation;

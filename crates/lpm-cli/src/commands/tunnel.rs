@@ -336,7 +336,7 @@ async fn run_start(
         },
         |msg| {
             if !json_output {
-                install_ui::warn(msg);
+                install_ui::warn(&lpm_common::sanitize_terminal_inline(msg));
             }
         },
         move |usage, initial| {
@@ -402,7 +402,7 @@ async fn run_claim(
         println!("{result}");
     } else {
         let url = result["url"].as_str().unwrap_or("");
-        install_ui::done(&format!("claimed {url}"));
+        install_ui::done(&format!("claimed {}", install_ui::url(url)));
         if let Some(org_name) = org {
             tunnel_detail("org", org_name);
         }
@@ -430,7 +430,7 @@ async fn run_unclaim(
             serde_json::json!({ "success": true, "released": true, "domain": domain })
         );
     } else {
-        install_ui::done(&format!("released {domain}"));
+        install_ui::done(&format!("released {}", install_ui::yellow(domain)));
     }
 
     Ok(())
@@ -455,7 +455,7 @@ async fn run_list(
 
     let heading = org.map_or_else(
         || "Tunnel Domains".to_string(),
-        |org_name| format!("Tunnel Domains · {org_name}"),
+        |org_name| format!("Tunnel Domains · {}", install_ui::cyan(org_name)),
     );
     install_ui::phase(&heading);
 
@@ -849,7 +849,7 @@ fn style_tunnel_detail_value(label: &str, value: &str) -> String {
     match label {
         "public URL" | "inspector" | "browser" => install_ui::url(value),
         "local" => install_ui::yellow(value),
-        _ => value.to_string(),
+        _ => lpm_common::sanitize_terminal_inline(value).into_owned(),
     }
 }
 
@@ -1052,8 +1052,12 @@ fn style_http_method(method: &str) -> String {
     match method {
         "GET" => install_ui::url(method),
         "POST" => install_ui::yellow(method),
-        _ => method.to_string(),
+        _ => lpm_common::sanitize_terminal_inline(method).into_owned(),
     }
+}
+
+fn format_untrusted_block_line(indent: &str, line: &str) -> String {
+    format!("{indent}{}", lpm_common::sanitize_terminal_inline(line))
 }
 
 fn style_http_status(status: u16) -> String {
@@ -1217,7 +1221,7 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
                 &lines
             };
             for line in display_lines {
-                install_ui::detail(&format!("    {line}"));
+                install_ui::detail(&format_untrusted_block_line("    ", line));
             }
             if lines.len() > 40 {
                 install_ui::detail(&format!(
@@ -1226,20 +1230,31 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
                 ));
             }
         } else if body_str.len() > 2000 {
-            install_ui::detail(&format!("    {}", &body_str[..2000]));
+            let preview_end = body_str
+                .char_indices()
+                .nth(2000)
+                .map_or(body_str.len(), |(index, _)| index);
+            for line in body_str[..preview_end].lines() {
+                install_ui::detail(&format_untrusted_block_line("    ", line));
+            }
             install_ui::detail(&format!(
                 "    {}",
                 install_ui::dim(&format!("... ({} bytes total)", webhook.request_body.len()))
             ));
         } else {
-            install_ui::detail(&format!("    {body_str}"));
+            for line in body_str.lines() {
+                install_ui::detail(&format_untrusted_block_line("    ", line));
+            }
         }
     }
 
     // Signature diagnostic
     if let Some(ref diag) = webhook.signature_diagnostic {
         install_ui::detail("");
-        install_ui::warn(&format!("Signature issue: {diag}"));
+        install_ui::warn(&format!(
+            "Signature issue: {}",
+            lpm_common::sanitize_terminal_inline(diag)
+        ));
     }
 
     install_ui::detail("");
@@ -1429,6 +1444,22 @@ mod tests {
             format_tunnel_detail("session", "stripe-test"),
             "    session     stripe-test"
         );
+    }
+
+    #[test]
+    fn tunnel_fields_and_multiline_blocks_cannot_inject_terminal_controls() {
+        lpm_common::color::set_enabled(false);
+        let malicious = "safe\nforged\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}end";
+
+        assert_eq!(
+            format_tunnel_detail("session", malicious),
+            "    session     safe?forged?rewritten?end"
+        );
+        assert_eq!(
+            format_untrusted_block_line("    ", malicious),
+            "    safe?forged?rewritten?end"
+        );
+        assert_eq!(style_http_method(malicious), "safe?forged?rewritten?end");
     }
 
     #[test]

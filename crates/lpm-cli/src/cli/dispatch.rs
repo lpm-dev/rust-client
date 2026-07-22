@@ -225,6 +225,7 @@ async fn async_main() -> Result<()> {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_target(false)
+            .fmt_fields(crate::terminal_output::SanitizedTracingFields::default())
             .without_time();
 
         #[cfg(feature = "tracy")]
@@ -652,7 +653,7 @@ async fn async_main() -> Result<()> {
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
-                    output::warn(&warning);
+                    output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1134,7 +1135,7 @@ async fn async_main() -> Result<()> {
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
-                    output::warn(&warning);
+                    output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1188,7 +1189,7 @@ async fn async_main() -> Result<()> {
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
-                    output::warn(&warning);
+                    output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1268,7 +1269,7 @@ async fn async_main() -> Result<()> {
                 } => {
                     if !cli.json {
                         for warning in auth::check_token_expiry_warnings() {
-                            output::warn(&warning);
+                            output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                         }
                     }
                     let selection = release_selection(selection);
@@ -1299,7 +1300,7 @@ async fn async_main() -> Result<()> {
             }
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
-                    output::warn(&warning);
+                    output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1479,15 +1480,24 @@ async fn async_main() -> Result<()> {
             // Custom registry logout (explicit URL or --all)
             if let Some(url) = &logout_registry {
                 match auth::clear_custom_registry_token(url) {
-                    Ok(()) if !cli.json => output::success(&format!("Logged out from {url}")),
-                    Err(_) if !cli.json => output::info(&format!("Not logged in to {url}")),
+                    Ok(()) if !cli.json => output::success(&format!(
+                        "Logged out from {}",
+                        crate::install_ui::url(url)
+                    )),
+                    Err(_) if !cli.json => output::info(&format!(
+                        "Not logged in to {}",
+                        crate::install_ui::url(url)
+                    )),
                     _ => {}
                 }
             }
             if all {
                 for (url, result) in auth::clear_all_custom_registries() {
                     match result {
-                        Ok(()) if !cli.json => output::success(&format!("Logged out from {url}")),
+                        Ok(()) if !cli.json => output::success(&format!(
+                            "Logged out from {}",
+                            crate::install_ui::url(&url)
+                        )),
                         _ => {}
                     }
                 }
@@ -2503,7 +2513,7 @@ async fn async_main() -> Result<()> {
 
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
-                    output::warn(&warning);
+                    output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
 

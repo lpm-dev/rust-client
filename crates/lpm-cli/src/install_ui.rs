@@ -36,6 +36,13 @@
 //! starts from a known-clean ANSI state regardless of what cliclack
 //! left behind — a `+ pkg@version` line will never inherit a dim or
 //! color attribute from a warning printed above it.
+//!
+//! **Terminal trust boundary.** The color/role helpers in this module accept
+//! one untrusted inline field: they sanitize it before applying LPM-owned ANSI
+//! styling. The line emitters accept trusted UI strings assembled from static
+//! text and those helpers. Do not pass an already-styled composite back through
+//! a role helper, because field sanitization intentionally removes embedded
+//! terminal sequences before applying the requested style.
 
 use lpm_common::color::Painted;
 use std::io::{IsTerminal, Write as _};
@@ -324,14 +331,15 @@ pub fn detail(msg: &str) {
 
 fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
     settle_any_active_spinner();
+    let name = lpm_common::sanitize_terminal_inline(name);
     let mut suffix = String::new();
     if let Some(version) = version {
         suffix.push('@');
-        suffix.push_str(version);
+        suffix.push_str(&lpm_common::sanitize_terminal_inline(version));
     }
     if let Some(hint) = hint {
         suffix.push(' ');
-        suffix.push_str(hint);
+        suffix.push_str(&lpm_common::sanitize_terminal_inline(hint));
     }
 
     if suffix.is_empty() {
@@ -364,13 +372,16 @@ pub fn minus(name: &str, version: Option<&str>, hint: Option<&str>) {
 /// subject, not low-priority metadata.
 pub fn minus_target(name: &str, version: Option<&str>, hint: Option<&str>) {
     settle_any_active_spinner();
+    let name = lpm_common::sanitize_terminal_inline(name);
 
     let mut suffix = String::new();
     if let Some(version) = version {
+        let version = lpm_common::sanitize_terminal_inline(version);
         suffix.push_str(&"@".dimmed());
         suffix.push_str(&version.yellow());
     }
     if let Some(hint) = hint {
+        let hint = lpm_common::sanitize_terminal_inline(hint);
         suffix.push(' ');
         suffix.push_str(&hint.dimmed());
     }
@@ -396,37 +407,37 @@ pub fn format_duration(d: std::time::Duration) -> String {
 /// Dim helper — wraps `Painted::dimmed` so callers can avoid pulling
 /// the trait in directly when they only need one dim call.
 pub fn dim(text: &str) -> String {
-    text.dimmed()
+    lpm_common::sanitize_terminal_inline(text).dimmed()
 }
 
 /// Bold helper.
 pub fn bold(text: &str) -> String {
-    text.bold()
+    lpm_common::sanitize_terminal_inline(text).bold()
 }
 
 /// Yellow helper for the subject/tool/target role.
 pub fn yellow(text: &str) -> String {
-    text.yellow()
+    lpm_common::sanitize_terminal_inline(text).yellow()
 }
 
 /// Section-header helper: yellow + bold.
 pub fn section(text: &str) -> String {
-    text.yellow().bold()
+    lpm_common::sanitize_terminal_inline(text).yellow().bold()
 }
 
 /// Cyan helper for path/scope/identifier/key/flag roles.
 pub fn cyan(text: &str) -> String {
-    text.cyan()
+    lpm_common::sanitize_terminal_inline(text).cyan()
 }
 
 /// URL helper: blue for `http(s)://…` values.
 pub fn url(text: &str) -> String {
-    text.blue()
+    lpm_common::sanitize_terminal_inline(text).blue()
 }
 
 /// Green helper for success/status-value roles.
 pub fn green(text: &str) -> String {
-    text.green()
+    lpm_common::sanitize_terminal_inline(text).green()
 }
 
 /// Named status-value helper for grep-able call sites.
@@ -445,7 +456,7 @@ pub fn bullet(active: bool) -> String {
 
 /// Magenta helper for shell keywords such as `export` and `local`.
 pub fn magenta(text: &str) -> String {
-    text.magenta()
+    lpm_common::sanitize_terminal_inline(text).magenta()
 }
 
 /// Compact quota meter used by account/cache status surfaces.
@@ -476,6 +487,7 @@ pub fn yellow_badge(text: &str) -> String {
 }
 
 fn badge(text: &str, open: &str) -> String {
+    let text = lpm_common::sanitize_terminal_inline(text);
     let padded = format!(" {text} ");
     if lpm_common::color::enabled() {
         format!("{open}{padded}\x1b[0m")
@@ -497,7 +509,7 @@ fn usage_bar_filled_cells(used: u64, limit: u64, width: usize) -> usize {
 
 /// Red helper (for the vulnerability count in the audit advisory).
 pub fn red(text: &str) -> String {
-    text.red()
+    lpm_common::sanitize_terminal_inline(text).red()
 }
 
 /// Pluralize "package": returns `"package"` for `count == 1`, else

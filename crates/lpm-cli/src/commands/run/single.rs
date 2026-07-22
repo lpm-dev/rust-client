@@ -1,6 +1,7 @@
 use super::cache::{
     is_task_cached_with_config, try_cache_hit_with_config, try_cache_store_with_output_and_config,
 };
+use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::ensure_runtime;
 use super::task::reject_direct_hidden_scripts;
 use crate::install_ui;
@@ -35,6 +36,7 @@ fn print_run_metadata(cache_status: &str, command: Option<&str>) {
         cache_status,
     ));
     if let Some(command) = command {
+        let command = lpm_common::sanitize_terminal_inline(command);
         install_ui::detail(&format!(
             "    {} {}",
             install_ui::dim(&format!("{:<8}", "command")),
@@ -77,10 +79,10 @@ pub async fn run(
     {
         // Cache hit — replay output
         if !hit.stdout.is_empty() {
-            print!("{}", hit.stdout);
+            print_captured_stdout(&hit.stdout);
         }
         if !hit.stderr.is_empty() {
-            eprint!("{}", hit.stderr);
+            print_captured_stderr(&hit.stderr);
         }
         install_ui::done(&format!(
             "{} · restored from {} (originally {})",
@@ -167,10 +169,14 @@ pub fn run_watch(
         .unwrap_or_default();
 
     if input_globs.is_empty() {
-        install_ui::phase(&format!("Watching {script_name} (Ctrl+C to stop)"));
+        install_ui::phase(&format!(
+            "Watching {} (Ctrl+C to stop)",
+            lpm_common::sanitize_terminal_inline(script_name)
+        ));
     } else {
         install_ui::phase(&format!(
-            "Watching {script_name} [{}] (Ctrl+C to stop)",
+            "Watching {} [{}] (Ctrl+C to stop)",
+            lpm_common::sanitize_terminal_inline(script_name),
             install_ui::dim(&input_globs.join(", ")),
         ));
     }
@@ -269,7 +275,8 @@ fn exec_once(
 ) -> Result<(), LpmError> {
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, options)?;
     install_ui::phase(&format!(
-        "Executing {file_path} with {}",
+        "Executing {} with {}",
+        lpm_common::sanitize_terminal_inline(file_path),
         install_ui::yellow(&plan.runtime_label())
     ));
     let start = std::time::Instant::now();
@@ -294,7 +301,10 @@ pub async fn run_file_watch(
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, &options)?;
     let (watch_dir, input_globs) = exec_watch_scope(project_dir, &plan);
 
-    install_ui::phase(&format!("Watching {file_path} (Ctrl+C to stop)"));
+    install_ui::phase(&format!(
+        "Watching {} (Ctrl+C to stop)",
+        lpm_common::sanitize_terminal_inline(file_path)
+    ));
 
     let dir = project_dir.to_path_buf();
     let file = file_path.to_string();

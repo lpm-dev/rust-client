@@ -578,7 +578,10 @@ pub(super) async fn run_link_and_finish(
             }
             Err(e) => {
                 if !json_output {
-                    output::warn(&format!("Auto-build failed: {e}"));
+                    output::warn(&format!(
+                        "Auto-build failed: {}",
+                        lpm_common::sanitize_terminal_inline(&e.to_string())
+                    ));
                 }
                 return Err(e);
             }
@@ -788,9 +791,9 @@ pub(super) async fn run_link_and_finish(
                 let total = a.files_modified + a.files_added + a.files_deleted;
                 println!(
                     "   {}@{} ({}, {} file{})",
-                    a.name.bold(),
-                    a.version.dimmed(),
-                    rel_patch.display(),
+                    install_ui::bold(&a.name),
+                    install_ui::dim(&a.version),
+                    install_ui::dim(&rel_patch.display().to_string()),
                     total,
                     if total == 1 { "" } else { "s" },
                 );

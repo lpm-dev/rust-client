@@ -47,6 +47,7 @@ pub fn info(msg: &str) {
 /// Print a label: value pair with the label dimmed.
 pub fn field(label: &str, value: &str) {
     let label = format!("{label}:");
+    let value = lpm_common::sanitize_terminal_inline(value);
     eprintln!("    {} {value}", format!("{label:<24}").dimmed());
 }
 

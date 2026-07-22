@@ -14,7 +14,7 @@
 //! `ExitStatus::code()` returns `None` on Unix. We handle this by extracting
 //! the signal number and translating it to a conventional exit code (128 + signal).
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, sanitize_terminal_inline};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -160,7 +160,8 @@ pub struct ShellCommand<'a> {
 /// Spawn a shell command and wait for it to complete.
 ///
 /// Returns the exit status. Stdio is inherited so the child process
-/// can interact with the terminal directly.
+/// can interact with the terminal directly. This deliberately gives the child
+/// ownership of the terminal; LPM cannot sanitize output on this raw path.
 pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
     let (shell, flag) = shell_and_flag();
 
@@ -223,8 +224,9 @@ pub struct CapturedOutput {
 
 /// Spawn a shell command with tee-captured stdout/stderr.
 ///
-/// Output is both displayed to the terminal in real-time AND captured into strings.
-/// Used by task caching to replay output from cache hits.
+/// Output is sanitized line-by-line for the live terminal and captured verbatim
+/// into strings so stored data keeps its original semantics. Cache replay must
+/// sanitize the captured strings again at its terminal boundary.
 pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
     let (shell, flag) = shell_and_flag();
 
@@ -263,7 +265,7 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
             let reader = std::io::BufReader::new(stdout);
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
-                println!("{line}");
+                println!("{}", sanitize_terminal_inline(&line));
                 push_capped_line(&mut buf, &line);
             }
         }
@@ -277,7 +279,7 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
             let reader = std::io::BufReader::new(stderr);
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
-                eprintln!("{line}");
+                eprintln!("{}", sanitize_terminal_inline(&line));
                 push_capped_line(&mut buf, &line);
             }
         }
@@ -379,8 +381,8 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
 
 /// Spawn a shell command with prefixed output — each line gets a `[prefix]` tag.
 ///
-/// Output is displayed to the terminal in real-time with prefixes AND captured.
-/// Used by streaming parallel mode (`--parallel --stream`).
+/// Prefixes and child lines are sanitized before LPM-owned styling is added.
+/// Captured strings remain verbatim and must be sanitized by any later renderer.
 pub fn spawn_shell_prefixed(
     cmd: &ShellCommand,
     prefix: &str,
@@ -411,7 +413,7 @@ pub fn spawn_shell_prefixed(
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let prefix_out = format!("[{}]", prefix);
+    let prefix_out = format!("[{}]", sanitize_terminal_inline(prefix));
     let prefix_err = prefix_out.clone();
     let color_out = color.to_string();
     let color_err = color_out.clone();
@@ -423,7 +425,8 @@ pub fn spawn_shell_prefixed(
             let reader = std::io::BufReader::new(stdout);
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
-                eprintln!("\x1b[{}m{}\x1b[0m {}", color_out, prefix_out, line);
+                let safe_line = sanitize_terminal_inline(&line);
+                eprintln!("\x1b[{}m{}\x1b[0m {}", color_out, prefix_out, safe_line);
                 push_capped_line(&mut buf, &line);
             }
         }
@@ -437,7 +440,8 @@ pub fn spawn_shell_prefixed(
             let reader = std::io::BufReader::new(stderr);
             use std::io::BufRead;
             for line in reader.lines().map_while(Result::ok) {
-                eprintln!("\x1b[{}m{}\x1b[0m {}", color_err, prefix_err, line);
+                let safe_line = sanitize_terminal_inline(&line);
+                eprintln!("\x1b[{}m{}\x1b[0m {}", color_err, prefix_err, safe_line);
                 push_capped_line(&mut buf, &line);
             }
         }

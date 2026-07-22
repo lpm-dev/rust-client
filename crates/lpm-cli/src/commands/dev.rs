@@ -85,7 +85,11 @@ fn print_cert_prompt_field(label: &str, value: &str) {
 }
 
 fn format_cert_prompt_field(label: &str, value: &str) -> String {
-    format!("    {} {value}", install_ui::dim(&format!("{label:<12}")))
+    format!(
+        "    {} {}",
+        install_ui::dim(&format!("{label:<12}")),
+        lpm_common::sanitize_terminal_inline(value)
+    )
 }
 
 /// Run the `lpm dev` command with zero-config detection.
@@ -313,7 +317,7 @@ pub async fn run(
                 format!("{scheme}://{}:{port}", primary.ip)
             };
             dev_ui::blank_line();
-            dev_ui::detail_with_hint(
+            dev_ui::trusted_detail_with_hint(
                 "Network",
                 &install_ui::url(&url),
                 &format!("({})", primary.interface_type),
@@ -327,7 +331,7 @@ pub async fn run(
                     } else {
                         format!("{scheme}://{}:{port}", addr.ip)
                     };
-                    dev_ui::hint_line(&format!(
+                    dev_ui::trusted_hint_line(&format!(
                         "{} {}",
                         install_ui::url(&url),
                         install_ui::dim(&format!("({})", addr.interface_type))
@@ -363,7 +367,7 @@ pub async fn run(
                     let ca_port = port + 1;
                     tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
                     dev_ui::blank_line();
-                    dev_ui::detail(
+                    dev_ui::trusted_detail(
                         "Mobile",
                         &format!(
                             "First time on mobile? Visit {} to install the CA certificate",
@@ -373,7 +377,7 @@ pub async fn run(
                 }
             } else {
                 dev_ui::blank_line();
-                dev_ui::detail(
+                dev_ui::trusted_detail(
                     "Mobile",
                     &format!(
                         "enable with {} or copy {} to the device manually",
@@ -423,7 +427,7 @@ pub async fn run(
         if let Some(domain) = tunnel_domain
             && !quiet
         {
-            dev_ui::detail("Tunnel domain", domain);
+            dev_ui::trusted_detail("Tunnel domain", &install_ui::cyan(domain));
         }
 
         // ── Inspector startup (paired with tunnel) ──────────────────
@@ -615,7 +619,7 @@ pub async fn run(
                         });
                     }
 
-                    dev_ui::detail(
+                    dev_ui::trusted_detail(
                         "Tunnel",
                         &format!(
                             "{} → localhost:{}",
@@ -885,7 +889,7 @@ pub async fn run(
 
     let scheme = if https { "https" } else { "http" };
     let url = format!("{scheme}://localhost:{port}");
-    dev_ui::detail("Local", &install_ui::url(&url));
+    dev_ui::trusted_detail("Local", &install_ui::url(&url));
     dev_ui::blank_line();
 
     // Start readiness check + browser open in background thread (non-blocking)
@@ -1325,9 +1329,9 @@ fn print_registered_proxy_routes(routes: &[lpm_proxy::Route]) {
     for route in routes {
         let target = format!("{} -> localhost:{}", route.host, route.upstream_port);
         if let Some(ref service) = route.service {
-            dev_ui::detail_with_hint("Proxy", &install_ui::yellow(&target), service);
+            dev_ui::trusted_detail_with_hint("Proxy", &install_ui::yellow(&target), service);
         } else {
-            dev_ui::detail("Proxy", &install_ui::yellow(&target));
+            dev_ui::trusted_detail("Proxy", &install_ui::yellow(&target));
         }
     }
     dev_ui::blank_line();
@@ -1755,7 +1759,7 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
             }
             dev_ui::warn("No .env file found. Created from .env.example");
             dev_ui::hint_line("Review .env and fill in missing values");
-            dev_ui::hint_line(&format!(
+            dev_ui::trusted_hint_line(&format!(
                 "Or use {} to store secrets in the vault",
                 install_ui::yellow("lpm env vars set")
             ));

@@ -168,7 +168,10 @@ pub(crate) fn confirm_multi_member_mutation(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().to_string(),
             );
-            println!("  {}", label.dimmed());
+            println!(
+                "  {}",
+                lpm_common::sanitize_terminal_inline(&label).dimmed()
+            );
         }
     }
 
@@ -660,10 +663,12 @@ pub(super) fn pre_extract_file_link_workspace_members(
         );
         if seen.insert(key) {
             if !json_output {
+                let dep_name = lpm_common::sanitize_terminal_inline(&dep_name);
+                let raw_spec = lpm_common::sanitize_terminal_inline(&raw_spec);
+                let member_name = lpm_common::sanitize_terminal_inline(&member_link.name);
                 output::info(&format!(
                     "note: file/link dep '{dep_name}' ({raw_spec}) resolves to workspace \
-                     member '{}'; using workspace symlink instead",
-                    member_link.name,
+                     member '{member_name}'; using workspace symlink instead",
                 ));
             }
             workspace_member_deps.push(member_link);

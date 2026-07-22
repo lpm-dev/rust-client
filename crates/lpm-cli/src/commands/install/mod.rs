@@ -1379,16 +1379,16 @@ async fn run_with_options_under_store_lock(
                     .unwrap_or(&phantom.file);
                 eprintln!(
                     "    {} ({}:{})",
-                    phantom.package_name.bold(),
-                    rel_file.display().to_string().dimmed(),
+                    install_ui::bold(&phantom.package_name),
+                    install_ui::dim(&rel_file.display().to_string()),
                     phantom.line,
                 );
                 if let Some(via) = &phantom.available_via {
-                    eprintln!("      {}", via.dimmed());
+                    eprintln!("      {}", install_ui::dim(via));
                 }
                 eprintln!(
                     "      Fix: {}",
-                    format!("lpm install {}", phantom.package_name).dimmed()
+                    install_ui::dim(&format!("lpm install {}", phantom.package_name))
                 );
             }
             if phantom_result.phantom_imports.len() > 5 {
@@ -1416,11 +1416,11 @@ async fn run_with_options_under_store_lock(
                         .unwrap_or(&unresolved.file);
                     eprintln!(
                         "    {}:{} → {}",
-                        rel_file.display().to_string().dimmed(),
+                        install_ui::dim(&rel_file.display().to_string()),
                         unresolved.line,
-                        format!("import \"{}\"", unresolved.specifier).bold(),
+                        install_ui::bold(&format!("import \"{}\"", unresolved.specifier)),
                     );
-                    eprintln!("      {}", unresolved.suggestion.dimmed());
+                    eprintln!("      {}", install_ui::dim(&unresolved.suggestion));
                 }
             }
         }
@@ -1456,7 +1456,9 @@ async fn run_with_options_under_store_lock(
                 };
                 println!(
                     "  {icon} {}@{}: {}",
-                    warning.package_name, warning.version, warning.message
+                    lpm_common::sanitize_terminal_inline(&warning.package_name),
+                    lpm_common::sanitize_terminal_inline(&warning.version),
+                    lpm_common::sanitize_terminal_inline(&warning.message)
                 );
             }
 

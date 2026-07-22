@@ -46,7 +46,11 @@ pub(in crate::commands::audit) fn print_osv_status(osv_degraded_reason: Option<&
             "{} database unavailable; vulnerability scan incomplete",
             install_ui::yellow("OSV")
         ));
-        eprintln!("  {} {reason}", install_ui::dim("reason:"));
+        eprintln!(
+            "  {} {}",
+            install_ui::dim("reason:"),
+            lpm_common::sanitize_terminal_inline(reason)
+        );
     } else {
         install_ui::done(&format!(
             "Checked against {} database",
@@ -83,19 +87,23 @@ pub(in crate::commands::audit) fn print_lpm_results(
             .collect();
 
         if registry_issues.is_empty() {
+            let name = lpm_common::sanitize_terminal_inline(&result.name);
+            let version = lpm_common::sanitize_terminal_inline(&result.version);
             eprintln!(
                 "  {} {}{}",
                 "✓".green(),
-                format!("{}@{}", result.name, result.version).dimmed(),
+                format!("{name}@{version}").dimmed(),
                 score_str.dimmed(),
             );
             continue;
         }
 
+        let name = lpm_common::sanitize_terminal_inline(&result.name);
+        let version = lpm_common::sanitize_terminal_inline(&result.version);
         eprintln!(
             "\n  {} {}",
-            install_ui::yellow(&result.name),
-            format!("({}){}", result.version, score_str).dimmed(),
+            install_ui::yellow(&name),
+            format!("({version}){score_str}").dimmed(),
         );
 
         for issue in registry_issues {
@@ -107,8 +115,8 @@ pub(in crate::commands::audit) fn print_lpm_results(
             eprintln!(
                 "    {icon} {} {} {}",
                 format_severity(&issue.severity),
-                issue.message,
-                format!("[{}]", issue.source).dimmed()
+                lpm_common::sanitize_terminal_inline(&issue.message),
+                format!("[{}]", lpm_common::sanitize_terminal_inline(&issue.source)).dimmed()
             );
         }
     }
@@ -189,7 +197,12 @@ pub(in crate::commands::audit) fn print_behavioral_results(
         let mut sorted: Vec<(&String, &Vec<String>)> = critical_tags.iter().collect();
         sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
         for (message, packages) in sorted {
-            eprintln!("  {} {}  {}", "✗".red(), "CRITICAL".red().bold(), message,);
+            eprintln!(
+                "  {} {}  {}",
+                "✗".red(),
+                "CRITICAL".red().bold(),
+                lpm_common::sanitize_terminal_inline(message),
+            );
             eprintln!("              {}", preview_versioned_packages(packages, 4),);
         }
         eprintln!();

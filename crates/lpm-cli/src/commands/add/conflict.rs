@@ -95,8 +95,18 @@ pub(super) fn handle_file_conflict(
                 eprintln!("  +++ incoming\n");
                 for (i, (old, new)) in existing_text.lines().zip(new_text.lines()).enumerate() {
                     if old != new {
-                        eprintln!("  {:>4} {} {}", i + 1, "-".red(), old.red());
-                        eprintln!("  {:>4} {} {}", i + 1, "+".green(), new.green());
+                        eprintln!(
+                            "  {:>4} {} {}",
+                            i + 1,
+                            "-".red(),
+                            lpm_common::sanitize_terminal_inline(old).red()
+                        );
+                        eprintln!(
+                            "  {:>4} {} {}",
+                            i + 1,
+                            "+".green(),
+                            lpm_common::sanitize_terminal_inline(new).green()
+                        );
                     }
                 }
                 eprintln!();
@@ -120,7 +130,11 @@ pub(super) fn handle_file_conflict(
 }
 
 fn format_file_conflict_header(rel_display: &str) -> String {
-    format!("\n  {} File exists: {}", "!".yellow(), rel_display)
+    format!(
+        "\n  {} File exists: {}",
+        "!".yellow(),
+        lpm_common::sanitize_terminal_inline(rel_display)
+    )
 }
 
 #[cfg(test)]

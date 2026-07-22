@@ -26,10 +26,11 @@ pub fn section(message: &str) {
 }
 
 pub fn registry(name: &str, status: &str, active: bool) {
+    let name = lpm_common::sanitize_terminal_inline(name);
     let status = if active {
         install_ui::status_ok(status)
     } else {
-        status.dimmed()
+        install_ui::dim(status)
     };
     eprintln!("  {} {name} {status}", install_ui::bullet(active));
 }

@@ -330,7 +330,8 @@ pub(super) fn enforce_registry_integrity_policy(
         if !json_output {
             output::warn(&format!(
                 "registry package {}@{} has no integrity hash; pinning trust-on-first-use",
-                package.name, package.version
+                lpm_common::sanitize_terminal_inline(&package.name),
+                lpm_common::sanitize_terminal_inline(&package.version)
             ));
         }
     }
@@ -371,7 +372,12 @@ pub(super) async fn enforce_registry_signature_policy(
                     .reason
                     .as_ref()
                     .map_or_else(|| "not verified".to_string(), |reason| reason.human());
-                install_ui::detail(&format!("  {}  {}", package.package_id().yellow(), reason));
+                let package_id = package.package_id();
+                install_ui::detail(&format!(
+                    "  {}  {}",
+                    install_ui::yellow(&package_id),
+                    lpm_common::sanitize_terminal_inline(&reason)
+                ));
             }
         }
         return Err(LpmError::Registry(registry_signature_failure_message(
@@ -582,7 +588,9 @@ pub(super) fn finalize_packages_in_manifest_with_catalog_policy(
                     lpm_workspace::CatalogMode::Prefer => {
                         output::warn(&format!(
                             "Catalog version mismatch for {}: using direct version {} instead of catalog:{}.",
-                            entry.name, requested_spec, catalog_range
+                            lpm_common::sanitize_terminal_inline(&entry.name),
+                            lpm_common::sanitize_terminal_inline(&requested_spec),
+                            lpm_common::sanitize_terminal_inline(catalog_range)
                         ));
                     }
                     lpm_workspace::CatalogMode::Manual => unreachable!("guarded above"),
@@ -1259,7 +1267,7 @@ pub async fn run_install_filtered_add(
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
-                    eprintln!("  {}", line.dimmed());
+                    eprintln!("  {}", install_ui::dim(line));
                 }
                 eprintln!();
             }

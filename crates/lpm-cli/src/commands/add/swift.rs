@@ -1,6 +1,6 @@
 use super::run;
 use crate::output;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, sanitize_terminal_inline};
 use lpm_registry::{RegistryClient, VersionMetadata};
 use std::path::Path;
 
@@ -46,7 +46,11 @@ pub(super) async fn handle_swift_lpm_deps(
 
     for (dep_name, dep_range) in &lpm_deps {
         if !json_output {
-            output::info(&format!("  Adding dependency: {dep_name}@{dep_range}"));
+            output::info(&format!(
+                "  Adding dependency: {}@{}",
+                sanitize_terminal_inline(dep_name),
+                sanitize_terminal_inline(dep_range)
+            ));
         }
         // Recursive add (source delivery for recursive deps)
         Box::pin(run(

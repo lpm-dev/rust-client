@@ -1,7 +1,10 @@
 use super::cache::{
     is_task_cached_with_config, try_cache_hit_with_config, try_cache_store_with_output_and_config,
 };
-use super::format::{TaskResult, print_json_summary, print_results_summary, print_task_result};
+use super::format::{
+    TaskResult, print_captured_stderr, print_captured_stdout, print_json_summary,
+    print_results_summary, print_task_result,
+};
 use super::task::{is_meta_task, run_task, run_task_captured};
 use crate::install_ui;
 use lpm_common::LpmError;
@@ -76,10 +79,10 @@ pub(super) async fn run_tasks_sequential(
                 try_cache_hit_with_config(project_dir, script, env_mode, lpm_config)
         {
             if !hit.stdout.is_empty() {
-                print!("{}", hit.stdout);
+                print_captured_stdout(&hit.stdout);
             }
             if !hit.stderr.is_empty() {
-                eprint!("{}", hit.stderr);
+                print_captured_stderr(&hit.stderr);
             }
             results.push(TaskResult {
                 name: script.clone(),
@@ -92,7 +95,10 @@ pub(super) async fn run_tasks_sequential(
             continue;
         }
 
-        install_ui::phase(&format!("Running {script}"));
+        install_ui::phase(&format!(
+            "Running {}",
+            lpm_common::sanitize_terminal_inline(script)
+        ));
 
         let caching_enabled = !no_cache && is_task_cached_with_config(script, lpm_config);
         let task_start = std::time::Instant::now();

@@ -488,7 +488,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 );
                 if !peer_warnings.is_empty() && !json_output {
                     for w in &peer_warnings {
-                        output::warn(&format!("peer dep: {w}"));
+                        output::warn(&format!(
+                            "peer dep: {}",
+                            lpm_common::sanitize_terminal_inline(&w.to_string())
+                        ));
                     }
                 }
 
@@ -558,13 +561,19 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         let unsatisfied_str = report
                             .unsatisfied_consumers
                             .iter()
-                            .map(|(c, r)| format!("{c} wants {r}"))
+                            .map(|(consumer, range)| {
+                                format!(
+                                    "{} wants {}",
+                                    lpm_common::sanitize_terminal_inline(consumer),
+                                    lpm_common::sanitize_terminal_inline(range)
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join("; ");
                         output::warn(&format!(
                             "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
-                            report.canonical.bold(),
-                            report.chosen_version,
+                            lpm_common::sanitize_terminal_inline(&report.canonical).bold(),
+                            lpm_common::sanitize_terminal_inline(&report.chosen_version),
                             report.unsatisfied_consumers.len(),
                             unsatisfied_str,
                         ));

@@ -396,7 +396,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
                 install_ui::yellow(&status.to_string())
             };
             let mut lines = vec![SlimErrorLine::Failed(format!("HTTP {status}"))];
-            push_detail(&mut lines, "message", message);
+            push_untrusted_detail(&mut lines, "message", message);
             lines
         }
         lpm_common::LpmError::AuthRequired => {
@@ -422,7 +422,11 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
                     install_ui::dim("verdict"),
                     install_ui::yellow(verdict)
                 )),
-                SlimErrorLine::Detail(format!("  {} {reason}", install_ui::dim("reason"))),
+                SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("reason"),
+                    lpm_common::sanitize_terminal_inline(reason)
+                )),
             ];
             if let Some(decision_id) = decision_id {
                 lines.push(SlimErrorLine::Detail(format!(
@@ -629,7 +633,7 @@ fn resolution_error_lines(
     if let Some(required_by) = &context.required_by {
         push_detail(&mut lines, "required by", &install_ui::yellow(required_by));
     }
-    push_detail(&mut lines, "reason", &context.reason);
+    push_untrusted_detail(&mut lines, "reason", &context.reason);
     if let Some(available) = resolution_available_detail(context) {
         push_detail(&mut lines, "available", &available);
     }
@@ -675,7 +679,11 @@ fn entitlement_error_lines(
 ) -> Vec<SlimErrorLine> {
     let mut lines = vec![
         SlimErrorLine::Failed(title.to_owned()),
-        SlimErrorLine::Detail(format!("  {} {message}", install_ui::dim("reason"))),
+        SlimErrorLine::Detail(format!(
+            "  {} {}",
+            install_ui::dim("reason"),
+            lpm_common::sanitize_terminal_inline(message)
+        )),
     ];
     if let Some(reason) = reason {
         lines.push(SlimErrorLine::Detail(format!(
@@ -706,13 +714,20 @@ fn push_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
     )));
 }
 
+fn push_untrusted_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
+    push_detail(lines, label, &lpm_common::sanitize_terminal_inline(value));
+}
+
 fn push_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
     let mut non_empty = value.lines().filter(|line| !line.trim().is_empty());
     if let Some(first) = non_empty.next() {
-        push_detail(lines, label, first);
+        push_untrusted_detail(lines, label, first);
     }
     for line in non_empty {
-        lines.push(SlimErrorLine::Detail(format!("    {line}")));
+        lines.push(SlimErrorLine::Detail(format!(
+            "    {}",
+            lpm_common::sanitize_terminal_inline(line)
+        )));
     }
 }
 

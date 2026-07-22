@@ -106,11 +106,11 @@ pub async fn run(
                 let issue = &located.issue;
                 install_ui::warn(&format!(
                     "Skill security: {}: {} — {} at line {} ({})",
-                    located.path,
-                    issue.matched_text,
-                    issue.category,
+                    lpm_common::sanitize_terminal_inline(&located.path),
+                    lpm_common::sanitize_terminal_inline(&issue.matched_text),
+                    lpm_common::sanitize_terminal_inline(&issue.category),
                     issue.line_number,
-                    issue.pattern
+                    lpm_common::sanitize_terminal_inline(&issue.pattern)
                 ));
             }
             return Err(LpmError::Registry(
@@ -120,7 +120,7 @@ pub async fn run(
 
         if !validation.errors.is_empty() {
             for error in &validation.errors {
-                install_ui::warn(error);
+                install_ui::warn(&lpm_common::sanitize_terminal_inline(error));
             }
             return Err(LpmError::Registry(
                 "skills validation failed — fix errors above".into(),
@@ -425,9 +425,11 @@ pub async fn run(
         println!();
         let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
         if is_tty {
+            let safe_name = lpm_common::sanitize_terminal_inline(&name);
+            let safe_version = lpm_common::sanitize_terminal_inline(&version);
             let prompt_msg = if targets.len() > 1 {
                 format!(
-                    "Publish {name}@{version} to {}?",
+                    "Publish {safe_name}@{safe_version} to {}?",
                     targets
                         .iter()
                         .map(|t| t.display_name())
@@ -435,7 +437,7 @@ pub async fn run(
                         .join(" + ")
                 )
             } else {
-                format!("Publish {name}@{version}?")
+                format!("Publish {safe_name}@{safe_version}?")
             };
             let confirm = cliclack::confirm(prompt_msg)
                 .initial_value(true)
@@ -566,7 +568,9 @@ pub async fn run(
                             {
                                 for w in warnings {
                                     if let Some(msg) = w.as_str() {
-                                        install_ui::warn(msg);
+                                        install_ui::warn(&lpm_common::sanitize_terminal_inline(
+                                            msg,
+                                        ));
                                     }
                                 }
                             }
@@ -581,7 +585,11 @@ pub async fn run(
                     }
                     Err(e) => {
                         if !json_output {
-                            install_ui::warn(&format!("LPM publish failed: {e}"));
+                            let error = e.to_string();
+                            install_ui::warn(&format!(
+                                "LPM publish failed: {}",
+                                lpm_common::sanitize_terminal_inline(&error)
+                            ));
                         }
                         results.push(PublishResult {
                             target: "lpm".into(),
@@ -801,7 +809,11 @@ pub async fn run(
                         }
                     } else if !json_output {
                         let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
-                        install_ui::warn(&format!("{display} publish failed: {err_msg}"));
+                        install_ui::warn(&format!(
+                            "{} publish failed: {}",
+                            lpm_common::sanitize_terminal_inline(display),
+                            lpm_common::sanitize_terminal_inline(err_msg)
+                        ));
                     }
 
                     Ok(PublishResult {
@@ -821,9 +833,11 @@ pub async fn run(
                     Err(e) => {
                         let duration = start.elapsed();
                         if !json_output {
+                            let error = e.to_string();
                             install_ui::warn(&format!(
-                                "{} publish failed: {e}",
-                                target.display_name()
+                                "{} publish failed: {}",
+                                lpm_common::sanitize_terminal_inline(target.display_name()),
+                                lpm_common::sanitize_terminal_inline(&error)
                             ));
                         }
                         results.push(PublishResult {

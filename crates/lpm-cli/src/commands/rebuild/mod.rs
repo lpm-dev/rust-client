@@ -617,12 +617,16 @@ async fn run_under_store_lock(
                 };
                 println!(
                     "\n  {} {} ({})",
-                    pkg.name.bold(),
-                    format!("({})", pkg.version).dimmed(),
+                    install_ui::bold(&pkg.name),
+                    install_ui::dim(&format!("({})", pkg.version)),
                     trust,
                 );
                 for (phase, cmd) in &pkg.scripts {
-                    println!("    {phase}: {}", cmd.dimmed());
+                    println!(
+                        "    {}: {}",
+                        lpm_common::sanitize_terminal_inline(phase),
+                        install_ui::dim(cmd)
+                    );
                 }
             }
         }
@@ -1106,9 +1110,11 @@ async fn run_under_store_lock(
                 Err(error) => {
                     if !json_output {
                         let label = rebuild_package_label(pkg);
+                        let error = error.to_string();
                         install_ui::detail(&format!(
-                            "  {} {label:<package_label_width$}  failed to lock package build state: {error}",
+                            "  {} {label:<package_label_width$}  failed to lock package build state: {}",
                             install_ui::red("✗"),
+                            lpm_common::sanitize_terminal_inline(&error),
                         ));
                     }
                     if json_output {
@@ -1167,9 +1173,11 @@ async fn run_under_store_lock(
             Err(e) => {
                 if !json_output {
                     let label = rebuild_package_label(pkg);
+                    let error = e.to_string();
                     install_ui::detail(&format!(
-                        "  {} {label:<package_label_width$}  {e}",
+                        "  {} {label:<package_label_width$}  {}",
                         install_ui::red("✗"),
+                        lpm_common::sanitize_terminal_inline(&error),
                     ));
                 }
                 if json_output {
@@ -1291,9 +1299,11 @@ async fn run_under_store_lock(
                     elapsed_millis(rematerialize_start.elapsed());
                 if !json_output {
                     let label = rebuild_package_label(pkg);
+                    let error = error.to_string();
                     install_ui::detail(&format!(
-                        "  {} {label:<package_label_width$}  failed to restore pristine source: {error}",
+                        "  {} {label:<package_label_width$}  failed to restore pristine source: {}",
                         install_ui::red("✗"),
+                        lpm_common::sanitize_terminal_inline(&error),
                     ));
                 }
                 failures += 1;
@@ -1367,10 +1377,12 @@ async fn run_under_store_lock(
                     pkg_success = false;
                     if !json_output {
                         let label = rebuild_package_label(pkg);
+                        let error = e.to_string();
                         install_ui::detail(&format!(
-                            "  {} {label:<package_label_width$}  {} failed: {e}",
+                            "  {} {label:<package_label_width$}  {} failed: {}",
                             install_ui::red("✗"),
                             install_ui::dim(phase),
+                            lpm_common::sanitize_terminal_inline(&error),
                         ));
                     }
                     break; // Don't run subsequent phases if one fails

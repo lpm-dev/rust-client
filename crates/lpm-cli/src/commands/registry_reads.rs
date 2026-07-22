@@ -75,7 +75,7 @@ pub fn prepare_routed_read_context(
 
     if !json_output {
         for warning in route_table.npmrc_warnings() {
-            install_ui::warn(warning);
+            install_ui::warn(&lpm_common::sanitize_terminal_inline(warning));
         }
     }
 
@@ -86,12 +86,13 @@ pub fn prepare_routed_read_context(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
 			 DISABLED across ALL registries for this command. This is a \
 			 security risk.",
-            tagged.source, tagged.line
+            lpm_common::sanitize_terminal_inline(&tagged.source),
+            tagged.line
         ));
     }
 
     for warning in route_table.npmrc_security_warnings() {
-        install_ui::warn(warning);
+        install_ui::warn(&lpm_common::sanitize_terminal_inline(warning));
     }
 
     let eager_origins = route_table.effective_registry_origins(
@@ -104,7 +105,7 @@ pub fn prepare_routed_read_context(
         .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
 
     if !json_output && let Some(summary) = configured_client.render_effective_tls_summary() {
-        install_ui::phase(&summary);
+        install_ui::phase(&lpm_common::sanitize_terminal_inline(&summary));
     }
 
     Ok(RoutedReadContext {

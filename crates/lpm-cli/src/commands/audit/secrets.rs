@@ -143,9 +143,9 @@ pub async fn run_secrets(
                     "high" => "·".yellow().to_string(),
                     _ => "·".dimmed().to_string(),
                 },
-                m.matched_text.dimmed(),
+                install_ui::dim(&m.matched_text),
                 location.dimmed(),
-                m.description
+                lpm_common::sanitize_terminal_inline(&m.description)
             );
         }
         eprintln!();

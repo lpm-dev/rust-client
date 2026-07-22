@@ -212,10 +212,20 @@ pub fn show_install_build_hint(
         };
 
         let script_names: Vec<&str> = row.scripts.keys().map(|s| s.as_str()).collect();
+        let package = format!(
+            "{}@{}",
+            lpm_common::sanitize_terminal_inline(&row.name),
+            lpm_common::sanitize_terminal_inline(&row.version)
+        );
+        let scripts = script_names
+            .iter()
+            .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
             "  {:<30} {:<30} ({})",
-            format!("{}@{}", row.name, row.version).bold(),
-            script_names.join(", ").dimmed(),
+            package.bold(),
+            scripts.dimmed(),
             trust_label,
         );
     }

@@ -93,7 +93,10 @@ fn print_registry_signature_report(report: &crate::registry_signatures::Registry
                 .reason
                 .as_ref()
                 .map_or_else(|| "not verified".to_string(), |reason| reason.human());
-            install_ui::detail(&format!("  {}  {}", package.package_id().yellow(), reason));
+            let package_id = package.package_id();
+            let package_id = lpm_common::sanitize_terminal_inline(&package_id);
+            let reason = lpm_common::sanitize_terminal_inline(&reason);
+            install_ui::detail(&format!("  {}  {reason}", package_id.yellow()));
         }
     } else {
         install_ui::done(&format!(

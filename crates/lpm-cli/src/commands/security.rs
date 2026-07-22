@@ -467,15 +467,15 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 Some(policy) => {
                     print_status_field("managed policy", &install_ui::cyan(&policy.path));
                     if let Some(name) = policy.name.as_deref() {
-                        print_status_field("policy name", name);
+                        print_status_field("policy name", &install_ui::yellow(name));
                     }
                     if let Some(source) = policy.source.as_deref() {
-                        print_status_field("policy source", source);
+                        print_status_field("policy source", &install_ui::dim(source));
                     }
                     if !policy.enforced_controls.is_empty() {
                         print_status_field(
                             "enforced controls",
-                            &policy.enforced_controls.join(", "),
+                            &install_ui::dim(&policy.enforced_controls.join(", ")),
                         );
                     }
                 }
@@ -589,7 +589,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 return Ok(());
             }
 
-            println!("security dir  {}", report.security_dir);
+            println!("security dir  {}", install_ui::cyan(&report.security_dir));
             println!();
             println!("quarantined files");
             if report.quarantined.is_empty() {
@@ -600,7 +600,9 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 for item in &report.quarantined {
                     println!(
                         "  {} -> {} ({})",
-                        item.original_path, item.quarantine_path, item.reason
+                        install_ui::cyan(&item.original_path),
+                        install_ui::cyan(&item.quarantine_path),
+                        install_ui::dim(&item.reason)
                     );
                 }
                 println!();
@@ -651,13 +653,16 @@ fn print_protect_status(status: &security_approval::ManagedProtectionStatus) {
     }
     if let Some(policy) = status.managed_policy.as_ref() {
         if let Some(name) = policy.name.as_deref() {
-            print_status_field("name", name);
+            print_status_field("name", &install_ui::yellow(name));
         }
         if let Some(source) = policy.source.as_deref() {
-            print_status_field("source", source);
+            print_status_field("source", &install_ui::dim(source));
         }
         if !policy.enforced_controls.is_empty() {
-            print_status_field("controls", &policy.enforced_controls.join(", "));
+            print_status_field(
+                "controls",
+                &install_ui::dim(&policy.enforced_controls.join(", ")),
+            );
         }
     }
 }

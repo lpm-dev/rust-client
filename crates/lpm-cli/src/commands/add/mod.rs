@@ -92,7 +92,7 @@ pub async fn run(
         .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
     if !json_output {
         for w in route_table.npmrc_warnings() {
-            output::warn(w);
+            output::warn(&lpm_common::sanitize_terminal_inline(w));
         }
     }
     // strict-ssl=false is a security signal; emit unconditionally on stderr.
@@ -103,12 +103,13 @@ pub async fn run(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
              DISABLED for this `lpm add` across ALL registries. This is a \
              security risk.",
-            tagged.source, tagged.line
+            lpm_common::sanitize_terminal_inline(&tagged.source),
+            tagged.line
         ));
     }
     // Project-local `.npmrc` refusals are surfaced even in JSON mode.
     for w in route_table.npmrc_security_warnings() {
-        output::warn(w);
+        output::warn(&lpm_common::sanitize_terminal_inline(w));
     }
     // Request-aware eager-build: `lpm add <spec>`'s
     // top-level request is exactly `{spec}`. The fetch site below
@@ -133,7 +134,7 @@ pub async fn run(
     let client = &owned_client;
     // Install-start summary of effective TLS overrides.
     if !json_output && let Some(line) = client.render_effective_tls_summary() {
-        output::info(&line);
+        output::info(&lpm_common::sanitize_terminal_inline(&line));
     }
 
     // Routed metadata fetch.
@@ -824,6 +825,10 @@ pub async fn run(
         Vec::new()
     };
     if !external_imports.is_empty() && !json_output {
+        let external_imports = external_imports
+            .iter()
+            .map(|specifier| lpm_common::sanitize_terminal_inline(specifier).into_owned())
+            .collect::<Vec<_>>();
         output::info(&format!(
             "Source uses external imports: {}\n  Make sure these are in your project's dependencies.",
             external_imports.join(", "),
@@ -949,8 +954,9 @@ pub async fn run(
         crate::commands::install::ensure_skills_gitignore(project_dir);
         if !json_output {
             output::info(&format!(
-                "Materialized {} package-published skill(s) for {short_name}",
-                result.installed
+                "Materialized {} package-published skill(s) for {}",
+                result.installed,
+                lpm_common::sanitize_terminal_inline(&short_name)
             ));
         }
     }

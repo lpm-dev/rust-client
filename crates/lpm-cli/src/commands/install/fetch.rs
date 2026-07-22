@@ -54,6 +54,7 @@ pub(super) fn max_concurrent_downloads() -> usize {
     match raw.parse::<usize>() {
         Ok(n) if n > 0 && n <= 256 => n,
         _ => {
+            let raw = lpm_common::sanitize_terminal_inline(&raw);
             crate::output::warn(&format!(
                 "LPM_CONCURRENT_DOWNLOADS={raw:?} is not a valid integer in 1..=256 \
                  — falling back to default ({DEFAULT_MAX_CONCURRENT_DOWNLOADS})"
@@ -942,6 +943,8 @@ pub(super) async fn run_online_fetch_phase(
                     cooldown_policy.minimum_release_age_secs,
                 ));
                 for (name, version, hours, minutes) in &too_new {
+                    let name = lpm_common::sanitize_terminal_inline(name);
+                    let version = lpm_common::sanitize_terminal_inline(version);
                     eprintln!(
                         "    {}@{} — {}h {}m remaining",
                         name, version, hours, minutes
@@ -1052,10 +1055,13 @@ pub(super) async fn run_online_fetch_phase(
                 // compare.
                 if drift_ignore_policy.ignores_name(&p.name) {
                     if !json_output {
+                        let name = lpm_common::sanitize_terminal_inline(&p.name);
+                        let version = lpm_common::sanitize_terminal_inline(&p.version);
+                        let approved_version =
+                            lpm_common::sanitize_terminal_inline(approved_version);
                         output::warn(&format!(
-                            "{}@{} — provenance-drift check waived by \
+                            "{name}@{version} — provenance-drift check waived by \
                              --ignore-provenance-drift (approved reference: v{approved_version})",
-                            p.name, p.version,
                         ));
                     }
                     continue;
@@ -1184,14 +1190,15 @@ pub(super) async fn run_online_fetch_phase(
                             let snapshot = match verify_policy.enforce {
                                 crate::provenance_fetch::EnforceMode::Warn => {
                                     if !json_output {
+                                        let pkg = lpm_common::sanitize_terminal_inline(&p.name);
+                                        let ver = lpm_common::sanitize_terminal_inline(&p.version);
+                                        let reason = lpm_common::sanitize_terminal_inline(&reason);
                                         crate::output::warn(&format!(
                                             "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
                                              LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
                                              verified provenance for this package. Re-run with \
                                              LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
                                              `--unverified-provenance {pkg}` to opt out explicitly.",
-                                            pkg = p.name,
-                                            ver = p.version,
                                         ));
                                     }
                                     tracing::warn!(

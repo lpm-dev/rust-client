@@ -541,10 +541,13 @@ pub async fn run(
         for u in &deduped {
             let dev_tag = if u.is_dev { " (dev)" } else { "" };
             let glyph = format_upgrade_glyph(u.semver_class);
-            let name = format!("{:<24}", u.name).bold();
-            let from = format!("{:>8}", u.from).dimmed();
+            let safe_name = lpm_common::sanitize_terminal_inline(&u.name);
+            let safe_from = lpm_common::sanitize_terminal_inline(&u.from);
+            let safe_to = lpm_common::sanitize_terminal_inline(&u.to);
+            let name = format!("{safe_name:<24}").bold();
+            let from = format!("{safe_from:>8}").dimmed();
             let arrow = "→".dimmed();
-            let to = format!("{:<8}", u.to).yellow();
+            let to = format!("{safe_to:<8}").yellow();
             let class_label = format_class_label(u.semver_class);
             let hint = format_candidate_hint(u);
             let hint_suffix = if hint.is_empty() {
@@ -759,10 +762,14 @@ fn warn_skipped_private(skipped_private: &[String]) {
         return;
     }
 
+    let names = skipped_private
+        .iter()
+        .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
+        .collect::<Vec<_>>();
     install_ui::warn(&format!(
         "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
         skipped_private.len(),
-        skipped_private.join(", "),
+        names.join(", "),
     ));
     install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run.");
 }
@@ -856,9 +863,12 @@ fn format_candidate_row_for_tui(c: &EnrichedCandidate) -> String {
         TargetKind::AbsoluteLatest => " (latest)",
         TargetKind::WithinMajor => "",
     };
+    let name = lpm_common::sanitize_terminal_inline(&c.name);
+    let from = lpm_common::sanitize_terminal_inline(&c.from);
+    let to = lpm_common::sanitize_terminal_inline(&c.to);
     format!(
         "{:<40} {} → {} {}{}{}",
-        c.name, c.from, c.to, class_label, kind_tag, dev_tag,
+        name, from, to, class_label, kind_tag, dev_tag,
     )
 }
 
@@ -872,10 +882,18 @@ fn format_candidate_hint(c: &EnrichedCandidate) -> String {
     if !c.peer_impact.ok {
         let mut peer_parts: Vec<String> = Vec::new();
         for v in &c.peer_impact.violations {
-            peer_parts.push(format!("{}={}≠{}", v.name, v.have, v.want));
+            peer_parts.push(format!(
+                "{}={}≠{}",
+                lpm_common::sanitize_terminal_inline(&v.name),
+                lpm_common::sanitize_terminal_inline(&v.have),
+                lpm_common::sanitize_terminal_inline(&v.want)
+            ));
         }
         for m in &c.peer_impact.missing {
-            peer_parts.push(format!("{} missing", m));
+            peer_parts.push(format!(
+                "{} missing",
+                lpm_common::sanitize_terminal_inline(m)
+            ));
         }
         if !peer_parts.is_empty() {
             parts.push(format!(
@@ -886,7 +904,10 @@ fn format_candidate_hint(c: &EnrichedCandidate) -> String {
     }
 
     if let Some(ref inv) = c.patch_invalidation {
-        parts.push(format!("orphans patch {}", inv.key));
+        parts.push(format!(
+            "orphans patch {}",
+            lpm_common::sanitize_terminal_inline(&inv.key)
+        ));
     }
 
     parts.join("  •  ")

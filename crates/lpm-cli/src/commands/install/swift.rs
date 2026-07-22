@@ -77,8 +77,8 @@ pub(super) async fn run_swift_install_spm(
     if !json_output {
         output::info(&format!(
             "Installing {} via SE-0292 registry → {}",
-            name.scoped().bold(),
-            se0292_id.dimmed(),
+            install_ui::bold(&name.scoped()),
+            install_ui::dim(se0292_id),
         ));
     }
 
@@ -89,7 +89,11 @@ pub(super) async fn run_swift_install_spm(
     } else if targets.len() > 1 {
         let mut sel = cliclack::select("Which target should use this dependency?");
         for (i, target) in targets.iter().enumerate() {
-            sel = sel.item(target.clone(), target, "");
+            sel = sel.item(
+                target.clone(),
+                lpm_common::sanitize_terminal_inline(target).into_owned(),
+                "",
+            );
             if i == 0 {
                 sel = sel.initial_value(target.clone());
             }
@@ -115,18 +119,19 @@ pub(super) async fn run_swift_install_spm(
         if !json_output {
             output::info(&format!(
                 "{} is already in Package.swift",
-                se0292_id.dimmed()
+                install_ui::dim(se0292_id)
             ));
         }
     } else if !json_output {
         output::success(&format!(
             "Added .package(id: \"{}\", from: \"{}\")",
-            se0292_id, version
+            lpm_common::sanitize_terminal_inline(se0292_id),
+            lpm_common::sanitize_terminal_inline(version)
         ));
         output::success(&format!(
             "Added .product(name: \"{}\") to target {}",
-            product_name,
-            target_name.bold()
+            lpm_common::sanitize_terminal_inline(product_name),
+            install_ui::bold(&target_name)
         ));
     }
 
@@ -158,10 +163,13 @@ pub(super) async fn run_swift_install_spm(
         println!();
         output::success(&format!(
             "Installed {}@{} via SE-0292 registry",
-            name.scoped().bold(),
-            version,
+            install_ui::bold(&name.scoped()),
+            lpm_common::sanitize_terminal_inline(version),
         ));
-        println!("  import {} // in your Swift code", product_name.bold());
+        println!(
+            "  import {} // in your Swift code",
+            install_ui::bold(product_name)
+        );
     }
 
     // Security check
@@ -198,8 +206,8 @@ pub(super) async fn run_swift_install_xcode(
     if !json_output {
         output::info(&format!(
             "Installing {} via SE-0292 registry → {} (Xcode project)",
-            name.scoped().bold(),
-            se0292_id.dimmed(),
+            install_ui::bold(&name.scoped()),
+            install_ui::dim(se0292_id),
         ));
     }
 
@@ -219,12 +227,16 @@ pub(super) async fn run_swift_install_xcode(
 
     if edit.already_exists {
         if !json_output {
-            output::info(&format!("{} is already installed", se0292_id.dimmed()));
+            output::info(&format!(
+                "{} is already installed",
+                install_ui::dim(se0292_id)
+            ));
         }
     } else if !json_output {
         output::success(&format!(
             "Added .package(id: \"{}\", from: \"{}\")",
-            se0292_id, version,
+            lpm_common::sanitize_terminal_inline(se0292_id),
+            lpm_common::sanitize_terminal_inline(version),
         ));
     }
 
@@ -238,7 +250,7 @@ pub(super) async fn run_swift_install_xcode(
     if link_result.package_ref_added && !json_output {
         output::success(&format!(
             "Linked LPMDependencies to Xcode target {}",
-            link_result.target_name.bold(),
+            install_ui::bold(&link_result.target_name),
         ));
     }
 
@@ -273,10 +285,13 @@ pub(super) async fn run_swift_install_xcode(
         println!();
         output::success(&format!(
             "Installed {}@{} via SE-0292 registry",
-            name.scoped().bold(),
-            version,
+            install_ui::bold(&name.scoped()),
+            lpm_common::sanitize_terminal_inline(version),
         ));
-        println!("  import {} // in your Swift code", product_name.bold());
+        println!(
+            "  import {} // in your Swift code",
+            install_ui::bold(product_name)
+        );
     }
 
     // Security check

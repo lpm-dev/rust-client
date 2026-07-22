@@ -197,5 +197,9 @@ pub(super) fn format_publish_quality_issue(check: &quality::QualityCheck) -> Str
     } else {
         "missing"
     });
-    format!("{}  {}", check.label, install_ui::dim(detail))
+    format!(
+        "{}  {}",
+        lpm_common::sanitize_terminal_inline(&check.label),
+        install_ui::dim(detail)
+    )
 }

@@ -67,8 +67,8 @@ pub(super) fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: boo
         if !json_output {
             output::info(&format!(
                 "migrating wrapper layout: {} → {}",
-                legacy_isolated_root.display(),
-                layout.isolated_wrapper_root().display(),
+                install_ui::dim(&legacy_isolated_root.display().to_string()),
+                install_ui::dim(&layout.isolated_wrapper_root().display().to_string()),
             ));
         }
         // Best-effort wipe — a permission error or partial wipe shows
@@ -84,8 +84,8 @@ pub(super) fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: boo
         if !json_output {
             output::info(&format!(
                 "migrating hoisted layout: {} → {}",
-                legacy_hoisted_metadata.display(),
-                layout.hoisted_metadata_path().display(),
+                install_ui::dim(&legacy_hoisted_metadata.display().to_string()),
+                install_ui::dim(&layout.hoisted_metadata_path().display().to_string()),
             ));
         }
         // Wipe the metadata sidecar AND the nested fallback root.

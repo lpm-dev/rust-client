@@ -260,7 +260,7 @@ fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
         match snapshot {
             Some(s) => install_ui::done(&format!(
                 "Trust ledger unchanged since last install ({})",
-                s.captured_at,
+                lpm_common::sanitize_terminal_inline(&s.captured_at),
             )),
             None => install_ui::warn(
                 "no prior snapshot found; this project has not been installed with LPM before",

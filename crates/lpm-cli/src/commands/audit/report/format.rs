@@ -3,6 +3,7 @@ use lpm_common::color::Painted;
 use crate::install_ui;
 
 pub(super) fn format_severity(severity: &str) -> String {
+    let severity = lpm_common::sanitize_terminal_inline(severity);
     match severity.to_lowercase().as_str() {
         "critical" => " CRITICAL ".on_red().white().bold(),
         "high" => severity.red().bold(),
@@ -14,6 +15,7 @@ pub(super) fn format_severity(severity: &str) -> String {
 }
 
 pub(super) fn format_osv_severity(severity: &str) -> String {
+    let severity = lpm_common::sanitize_terminal_inline(severity);
     install_ui::dim(&format!("severity {}", severity.to_lowercase()))
 }
 
@@ -60,7 +62,7 @@ pub(super) fn format_behavior_message(message: &str) -> String {
     let tokens: Vec<String> = body
         .split(", ")
         .filter(|part| !part.is_empty())
-        .map(|part| behavior_token_label(part).to_string())
+        .map(|part| lpm_common::sanitize_terminal_inline(behavior_token_label(part)).into_owned())
         .collect();
     if tokens.len() == 2 && tokens[0] == "eval()" && tokens[1] == "dyn-require" {
         return "eval() / dynamic require (misc)".to_string();
@@ -78,7 +80,7 @@ pub(super) fn info_tag_label(tag: &str, count: usize) -> String {
         "high-entropy strings detected" => "high-entropy strings".to_string(),
         "wildcard dep" if count != 1 => "wildcard deps".to_string(),
         "native bindings" if count == 1 => "native binding".to_string(),
-        other => other.to_string(),
+        other => lpm_common::sanitize_terminal_inline(other).into_owned(),
     }
 }
 

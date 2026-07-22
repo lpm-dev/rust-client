@@ -1,5 +1,13 @@
 use crate::install_ui;
 
+pub(super) fn print_captured_stdout(output: &str) {
+    print!("{}", lpm_common::sanitize_terminal_multiline(output));
+}
+
+pub(super) fn print_captured_stderr(output: &str) {
+    eprint!("{}", lpm_common::sanitize_terminal_multiline(output));
+}
+
 pub(super) struct TaskResult {
     pub(super) name: String,
     pub(super) success: bool,
@@ -9,11 +17,12 @@ pub(super) struct TaskResult {
 }
 
 pub(super) fn print_task_result(result: &TaskResult) {
+    let name = lpm_common::sanitize_terminal_inline(&result.name);
     if result.skipped {
         install_ui::detail(&format!(
             "  {} {}   {}",
             install_ui::dim("⊘"),
-            install_ui::dim(&result.name),
+            install_ui::dim(&name),
             install_ui::dim("skipped"),
         ));
     } else if result.success {
@@ -22,7 +31,7 @@ pub(super) fn print_task_result(result: &TaskResult) {
         install_ui::detail(&format!(
             "  {} {}   passed ({}{})",
             install_ui::status_ok("✓"),
-            install_ui::yellow(&result.name),
+            install_ui::yellow(&name),
             timing,
             cache_label,
         ));
@@ -31,27 +40,29 @@ pub(super) fn print_task_result(result: &TaskResult) {
         install_ui::detail(&format!(
             "  {} {}   failed (exit 1, {})",
             install_ui::red("✗"),
-            install_ui::yellow(&result.name),
+            install_ui::yellow(&name),
             timing,
         ));
     }
 }
 
 pub(super) fn format_run_failure_detail(subject: &str, reason: impl std::fmt::Display) -> String {
+    let subject = lpm_common::sanitize_terminal_inline(subject);
     let reason = reason.to_string();
     format!(
         "  {} {}: {}",
         install_ui::red("✗"),
-        install_ui::yellow(subject),
-        lpm_common::sanitize_for_terminal(&reason)
+        install_ui::yellow(&subject),
+        lpm_common::sanitize_terminal_inline(&reason)
     )
 }
 
 pub(super) fn format_failed_task_output_header(name: &str) -> String {
+    let name = lpm_common::sanitize_terminal_inline(name);
     format!(
         "  {} {} output {}",
         install_ui::dim("──"),
-        install_ui::yellow(name),
+        install_ui::yellow(&name),
         install_ui::dim(&"─".repeat(40))
     )
 }
@@ -73,6 +84,11 @@ pub(super) fn format_workspace_member_scripts_header(
     member_name: &str,
     scripts: &[String],
 ) -> String {
+    let member_name = lpm_common::sanitize_terminal_inline(member_name);
+    let scripts = scripts
+        .iter()
+        .map(|script| lpm_common::sanitize_terminal_inline(script))
+        .collect::<Vec<_>>();
     format!(
         "  {} {}",
         install_ui::cyan(&format!("[{member_name}]")),

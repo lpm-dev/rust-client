@@ -56,10 +56,12 @@ pub(crate) fn run(
     } else {
         install_ui::done(&format!(
             "{} {} -> {}",
-            package.name, package.old_version, package.new_version
+            install_ui::yellow(&package.name),
+            install_ui::dim(&package.old_version),
+            install_ui::yellow(&package.new_version)
         ));
         if git_tag_version {
-            install_ui::detail(&format!("tag: {tag}"));
+            install_ui::detail(&format!("tag: {}", install_ui::cyan(&tag)));
         }
     }
     Ok(())
