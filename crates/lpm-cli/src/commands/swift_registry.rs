@@ -269,26 +269,30 @@ enum ExistingScope {
 fn evaluate_existing_lpmdev_scope(
     config_path: &std::path::Path,
     expected_url: &str,
-) -> ExistingScope {
-    if !config_path.exists() {
-        return ExistingScope::Absent;
-    }
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return ExistingScope::Absent;
+) -> Result<ExistingScope, LpmError> {
+    let content = match lpm_common::read_text_file_capped(
+        config_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Ok(ExistingScope::Absent);
+        }
+        Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return ExistingScope::Absent;
+        return Ok(ExistingScope::Absent);
     };
     let Some(scope) = json.get("registries").and_then(|r| r.get("lpmdev")) else {
-        return ExistingScope::Absent;
+        return Ok(ExistingScope::Absent);
     };
     let existing_url = scope.get("url").and_then(|u| u.as_str()).unwrap_or("");
     if existing_url == expected_url {
-        ExistingScope::Matches
+        Ok(ExistingScope::Matches)
     } else {
-        ExistingScope::Mismatch {
+        Ok(ExistingScope::Mismatch {
             existing: existing_url.to_string(),
-        }
+        })
     }
 }
 
@@ -303,7 +307,7 @@ pub async fn ensure_configured(
     let is_https = registry_url.starts_with("https://");
 
     let config_path = package_dir.join(".swiftpm/configuration/registries.json");
-    match evaluate_existing_lpmdev_scope(&config_path, &swift_registry_url) {
+    match evaluate_existing_lpmdev_scope(&config_path, &swift_registry_url)? {
         ExistingScope::Matches => return Ok(()),
         ExistingScope::Mismatch { existing } => {
             tracing::warn!(
@@ -530,14 +534,15 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
     let config_path = home.join(".swiftpm/configuration/registries.json");
 
     // Read existing config or start fresh
-    let mut config: serde_json::Value = if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => serde_json::from_str(&content)
-                .unwrap_or_else(|_| serde_json::json!({ "version": 1 })),
-            Err(_) => serde_json::json!({ "version": 1 }),
+    let mut config: serde_json::Value = match lpm_common::read_text_file_capped(
+        &config_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => {
+            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({ "version": 1 }))
         }
-    } else {
-        serde_json::json!({ "version": 1 })
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => serde_json::json!({ "version": 1 }),
+        Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
 
     // Check if scope override for lpmdev is already configured
@@ -734,6 +739,24 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn existing_scope_check_rejects_oversized_swift_registry_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registries.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let error = evaluate_existing_lpmdev_scope(&path, "https://swift.lpm.dev").unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&path.display().to_string())
+                && message.contains("16777216-byte limit"),
+            "error must identify Swift registry config and limit: {message}"
+        );
+    }
 
     /// Serialize tests that mutate the process-wide `HOME` env var, so they
     /// don't trample each other under `cargo test` parallelism. Async-aware
@@ -1155,7 +1178,8 @@ mod tests {
     fn scope_eval_returns_absent_when_no_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("registries.json");
-        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        let outcome =
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap();
         assert_eq!(outcome, ExistingScope::Absent);
     }
 
@@ -1169,7 +1193,8 @@ mod tests {
             r#"{"registries": {"other": {"url": "https://other.example/"}}}"#,
         )
         .unwrap();
-        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        let outcome =
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap();
         assert_eq!(outcome, ExistingScope::Absent);
     }
 
@@ -1183,7 +1208,8 @@ mod tests {
             r#"{"registries": {"lpmdev": {"url": "https://lpm.dev/api/swift-registry"}}}"#,
         )
         .unwrap();
-        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        let outcome =
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap();
         assert_eq!(outcome, ExistingScope::Matches);
     }
 
@@ -1199,7 +1225,8 @@ mod tests {
             r#"{"registries": {"lpmdev": {"url": "https://attacker.example/registry"}}}"#,
         )
         .unwrap();
-        let outcome = evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry");
+        let outcome =
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap();
         assert_eq!(
             outcome,
             ExistingScope::Mismatch {
@@ -1219,13 +1246,13 @@ mod tests {
 
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(
-            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry"),
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap(),
             ExistingScope::Absent
         );
 
         std::fs::write(&path, r#"{"registries": {"lpmdev": {}}}"#).unwrap();
         assert_eq!(
-            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry"),
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap(),
             ExistingScope::Mismatch {
                 existing: String::new(),
             }

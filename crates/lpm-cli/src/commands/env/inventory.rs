@@ -10,9 +10,7 @@ pub(super) fn vars_init(
     force: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
@@ -51,12 +49,10 @@ pub(super) fn vars_init(
 
         let (file_exists, file_var_count) = if let Some(ref fp) = file_path {
             let abs = project_dir.join(fp);
-            if abs.exists() {
-                let content = std::fs::read_to_string(&abs).unwrap_or_default();
-                let count = lpm_vault::parse_env_content(&content).len();
-                (true, count)
-            } else {
-                (false, 0)
+            match lpm_common::read_text_file_capped(&abs, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+                Ok(content) => (true, lpm_vault::parse_env_content(&content).len()),
+                Err(lpm_common::BoundedReadError::NotFound { .. }) => (false, 0),
+                Err(error) => return Err(error.into()),
             }
         } else {
             (false, 0)

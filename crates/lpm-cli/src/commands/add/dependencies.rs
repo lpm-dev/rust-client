@@ -104,8 +104,10 @@ fn collect_source_pkg_deps(
     //    the downstream save-spec logic preserves it verbatim.
     if !dep_config_present {
         let pkg_json_path = extract_dir.join("package.json");
-        if let Ok(content) = std::fs::read_to_string(&pkg_json_path)
-            && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
+        if let Ok(content) = lpm_common::read_text_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
         {
             for section in ["dependencies", "peerDependencies"] {
                 if let Some(map) = doc.get(section).and_then(|d| d.as_object()) {
@@ -381,8 +383,11 @@ pub(super) async fn handle_dependencies(
     // LPM lockfiles, the selected PM's lockfile, every Step-8 dest
     // file) and invalidating `.lpm/install-hash`.
     {
-        let content = std::fs::read_to_string(&pkg_json_path)
-            .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+        let content = lpm_common::read_text_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
         let mut doc: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 

@@ -121,7 +121,9 @@ pub fn compute_script_hash_with_phase_bodies(
     store_pkg_dir: &Path,
 ) -> Option<ScriptHashWithPhaseBodies> {
     let pkg_json_path = store_pkg_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
     let scripts = parsed.get("scripts")?.as_object()?;
 

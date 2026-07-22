@@ -12,7 +12,7 @@ use support::mock_registry::{
 };
 use support::{
     TempProject, configure_fake_node, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry,
-    write_signed_unlock,
+    write_repeated_file, write_signed_unlock,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -118,6 +118,273 @@ fn install_rejects_malformed_global_config() {
     assert!(
         stderr.contains("config parse error"),
         "install must surface the config parse error; got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_rejects_oversized_project_config_before_registry_access() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-project-config",
+        "version": "1.0.0",
+        "dependencies": {
+            "oversized-guard-fixture": "1.0.0"
+        }
+    }"#,
+    );
+    let path = project.path().join("lpm.toml");
+    write_repeated_file(
+        &path,
+        b"save-prefix = \"^\"\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with oversized project config");
+
+    assert!(
+        !output.status.success(),
+        "oversized project config must fail install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string())
+            && stderr.contains("16777216-byte limit")
+            && !stderr.contains("save-prefix"),
+        "error must identify only the oversized file and limit; got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "oversized project config must fail before registry access; requests={requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn install_rejects_oversized_global_config_before_registry_access() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-global-config",
+        "version": "1.0.0",
+        "dependencies": {"global-config-fixture": "1.0.0"}
+    }"#,
+    );
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    let path = lpm_dir.join("config.toml");
+    write_repeated_file(
+        &path,
+        b"save-prefix = \"^\"\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with oversized global config");
+
+    assert!(
+        !output.status.success(),
+        "oversized global config must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify global config and limit; got:\n{stderr}"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .is_empty(),
+        "global config failure must precede registry access"
+    );
+}
+
+#[tokio::test]
+async fn install_rejects_oversized_project_npmrc_before_registry_access() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-npmrc",
+        "version": "1.0.0",
+        "dependencies": {"npmrc-fixture": "1.0.0"}
+    }"#,
+    );
+    let path = project.path().join(".npmrc");
+    let prefix = format!("registry={}\n#", mock.url());
+    write_repeated_file(
+        &path,
+        prefix.as_bytes(),
+        b'a',
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with oversized project .npmrc");
+
+    assert!(!output.status.success(), "oversized .npmrc must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("1048576-byte limit"),
+        "error must identify .npmrc and limit; got:\n{stderr}"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .is_empty(),
+        ".npmrc failure must precede registry access"
+    );
+}
+
+#[tokio::test]
+async fn install_rejects_oversized_package_manifest_before_registry_access() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(r#"{"name":"placeholder","version":"1.0.0"}"#);
+    let path = project.path().join("package.json");
+    write_repeated_file(
+        &path,
+        br#"{"name":"oversized-package","version":"1.0.0","dependencies":{"manifest-fixture":"1.0.0"},"padding":""#,
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        br#""}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with oversized package.json");
+
+    assert!(!output.status.success(), "oversized package.json must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify package.json and limit; got:\n{stderr}"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .is_empty(),
+        "manifest failure must precede registry access"
+    );
+}
+
+#[tokio::test]
+async fn install_rejects_oversized_pnpm_workspace_manifest_before_registry_access() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-workspace",
+        "version": "1.0.0",
+        "dependencies": {"workspace-fixture": "1.0.0"}
+    }"#,
+    );
+    let path = project.path().join("pnpm-workspace.yaml");
+    write_repeated_file(
+        &path,
+        b"packages:\n  - 'packages/*'\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with oversized pnpm-workspace.yaml");
+
+    assert!(
+        !output.status.success(),
+        "oversized pnpm-workspace.yaml must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify workspace manifest and limit; got:\n{stderr}"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .is_empty(),
+        "workspace manifest failure must precede registry access"
+    );
+}
+
+#[test]
+fn install_accepts_project_config_exactly_at_the_limit() {
+    let project = TempProject::empty(r#"{"name":"max-config","version":"1.0.0"}"#);
+    write_repeated_file(
+        &project.path().join("lpm.toml"),
+        b"save-prefix = \"^\"\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        b"\n",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with maximum-size project config");
+
+    assert!(
+        output.status.success(),
+        "config exactly at cap must remain compatible\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

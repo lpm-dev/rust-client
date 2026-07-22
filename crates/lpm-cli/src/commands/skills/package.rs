@@ -144,7 +144,7 @@ pub(super) fn read_manifest(directory: &Path, expected_package: &str) -> Package
     {
         return PackageManifestStatus::Invalid;
     }
-    let content = match std::fs::read_to_string(path) {
+    let content = match lpm_common::read_text_file_capped(&path, MAX_MANIFEST_SIZE) {
         Ok(content) => content,
         Err(_) => return PackageManifestStatus::Invalid,
     };

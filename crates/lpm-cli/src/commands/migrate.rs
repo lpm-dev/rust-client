@@ -512,10 +512,16 @@ fn render_migrate_detail(label: &str, value: &str) {
 fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Result<(), LpmError> {
     let npmrc_path = cwd.join(".npmrc");
 
-    if npmrc_path.exists() {
-        let content = std::fs::read_to_string(&npmrc_path)
-            .map_err(|e| LpmError::Script(format!("failed to read .npmrc: {e}")))?;
-
+    let existing =
+        match lpm_common::read_text_file_capped(&npmrc_path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES)
+        {
+            Ok(content) => Some(content),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+            Err(error) => {
+                return Err(LpmError::Script(format!("failed to read .npmrc: {error}")));
+            }
+        };
+    if let Some(content) = existing {
         if content.contains("@lpm.dev:registry") {
             if !json {
                 install_ui::skipped(".npmrc already has @lpm.dev:registry scope");
@@ -597,17 +603,17 @@ async fn run_verification(cwd: &Path, json: bool) -> Result<(), LpmError> {
 
     // Read package.json to find available scripts
     let pkg_json_path = cwd.join("package.json");
-    let scripts = match std::fs::read_to_string(&pkg_json_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-    {
-        Some(json_val) => json_val
-            .get("scripts")
-            .and_then(|s| s.as_object())
-            .map(|s| s.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
+    let scripts =
+        match Some(content).and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()) {
+            Some(json_val) => json_val
+                .get("scripts")
+                .and_then(|s| s.as_object())
+                .map(|s| s.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
 
     let has_build = scripts.iter().any(|s| s == "build");
     let has_test = scripts.iter().any(|s| s == "test");
@@ -882,8 +888,10 @@ fn apply_overrides_to_package_json(
     pkg_path: &Path,
     to_apply: &std::collections::HashMap<String, String>,
 ) -> Result<(), LpmError> {
-    let raw = std::fs::read_to_string(pkg_path)
-        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let raw = lpm_common::read_text_file_capped(pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|e| {
+        LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}"))
+    })?;
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
@@ -1180,8 +1188,10 @@ fn apply_peer_rules_to_package_json(
     pkg_path: &Path,
     plan: &super::migrate_peer_rules::PnpmPeerRulesPlan,
 ) -> Result<(), LpmError> {
-    let raw = std::fs::read_to_string(pkg_path)
-        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let raw = lpm_common::read_text_file_capped(pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|e| {
+        LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}"))
+    })?;
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
@@ -1319,8 +1329,10 @@ fn apply_patches(
         );
     }
 
-    let raw = std::fs::read_to_string(pkg_path)
-        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let raw = lpm_common::read_text_file_capped(pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|e| {
+        LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}"))
+    })?;
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 

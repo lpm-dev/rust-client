@@ -534,16 +534,17 @@ pub(super) fn reject_removing_foreign_privileged_forwarder(
 fn read_existing_privileged_forwarder_config(
     config_path: &Path,
 ) -> Result<Option<PrivilegedForwarderConfig>, LpmError> {
-    let bytes = match std::fs::read(config_path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(LpmError::Script(format!(
-                "read existing privileged proxy forwarder config {}: {err}",
-                config_path.display()
-            )));
-        }
-    };
+    let bytes =
+        match lpm_common::read_file_capped(config_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(bytes) => bytes,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(err) => {
+                return Err(LpmError::Script(format!(
+                    "read existing privileged proxy forwarder config {}: {err}",
+                    config_path.display()
+                )));
+            }
+        };
     serde_json::from_slice(&bytes).map(Some).map_err(|err| {
         LpmError::Script(format!(
             "parse existing privileged proxy forwarder config {}: {err}",

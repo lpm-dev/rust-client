@@ -162,14 +162,19 @@ pub async fn run(
     let start = Instant::now();
     let project_dir = cwd;
     let manifest_path = project_dir.join("package.json");
-    if !manifest_path.is_file() {
-        return Err(LpmError::NotFound(format!(
-            "no package.json found at {}",
-            manifest_path.display()
-        )));
-    }
-
-    let manifest_bytes = std::fs::read(&manifest_path).map_err(LpmError::Io)?;
+    let manifest_bytes = match lpm_common::read_file_capped(
+        &manifest_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Err(LpmError::NotFound(format!(
+                "no package.json found at {}",
+                manifest_path.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let manifest_text = String::from_utf8(manifest_bytes.clone()).map_err(|error| {
         LpmError::Registry(format!(
             "package.json at {} is not valid UTF-8: {error}",
@@ -198,7 +203,10 @@ pub async fn run(
         )
         .await?;
         if !removed.is_empty() {
-            let refreshed_text = std::fs::read_to_string(&manifest_path).map_err(LpmError::Io)?;
+            let refreshed_text = lpm_common::read_text_file_capped(
+                &manifest_path,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            )?;
             manifest = serde_json::from_str(&refreshed_text).map_err(|error| {
                 LpmError::Registry(format!(
                     "failed to parse package.json at {} after tidy --fix: {error}",
@@ -642,7 +650,9 @@ fn collect_installed_bin_names<'a>(
             .join("node_modules")
             .join(name)
             .join("package.json");
-        let Ok(content) = std::fs::read_to_string(&manifest) else {
+        let Ok(content) =
+            lpm_common::read_text_file_capped(&manifest, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<Value>(&content) else {
@@ -703,7 +713,10 @@ fn read_known_config_text(project_dir: &Path) -> String {
 
     let mut text = String::new();
     for file in CONFIG_FILES {
-        if let Ok(content) = std::fs::read_to_string(project_dir.join(file)) {
+        if let Ok(content) = lpm_common::read_text_file_capped(
+            &project_dir.join(file),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
             text.push_str(&content);
             text.push('\n');
         }
@@ -771,7 +784,9 @@ fn collect_workspace_member_names(
             if path == project_dir.join("package.json") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(content) =
+                lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            else {
                 continue;
             };
             let Ok(value) = serde_json::from_str::<Value>(&content) else {
@@ -943,8 +958,13 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
 impl TidyConfig {
     fn load(project_dir: &Path) -> Result<Self, LpmError> {
         let path = project_dir.join("lpm.toml");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return Ok(Self::default());
+        let content = match lpm_common::read_text_file_capped(
+            &path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Self::default()),
+            Err(error) => return Err(error.into()),
         };
         let value: toml::Value = toml::from_str(&content).map_err(|error| {
             LpmError::Registry(format!("failed to parse {}: {error}", path.display()))

@@ -334,9 +334,9 @@ fn remove_managed_hosts_file_block_without_backup(
 }
 
 fn read_hosts_file(path: &Path) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
+    match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
         Ok(content) => Ok(content),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(String::new()),
         Err(err) => Err(format!("read hosts file {}: {err}", path.display())),
     }
 }

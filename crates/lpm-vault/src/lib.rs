@@ -350,8 +350,9 @@ pub fn import_env_file(
     env_path: &Path,
     overwrite: bool,
 ) -> Result<usize, String> {
-    let content = std::fs::read_to_string(env_path)
-        .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+    let content =
+        lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
 
     let parsed = parse_env_content(&content);
     if parsed.is_empty() {
@@ -393,8 +394,9 @@ pub fn import_env_file_to_env(
     env_path: &Path,
     overwrite: bool,
 ) -> Result<usize, String> {
-    let content = std::fs::read_to_string(env_path)
-        .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+    let content =
+        lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
 
     let parsed = parse_env_content(&content);
     if parsed.is_empty() {
@@ -756,7 +758,17 @@ fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
         |p| p.display().to_string(),
     );
 
-    let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    let existing = match lpm_common::read_text_file_capped(
+        &gitignore_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(existing) => existing,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
+        Err(error) => {
+            tracing::warn!(path = %gitignore_path.display(), %error, "failed to inspect .gitignore");
+            return;
+        }
+    };
 
     // Check if already in .gitignore
     for line in existing.lines() {

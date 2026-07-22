@@ -355,7 +355,10 @@ pub async fn run(
             && ca_cert_path.exists()
         {
             if allow_ca_bootstrap {
-                let ca_cert_data = std::fs::read(&ca_cert_path).unwrap_or_default();
+                let ca_cert_data = lpm_common::read_file_capped(
+                    &ca_cert_path,
+                    lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+                )?;
                 if !ca_cert_data.is_empty() {
                     let ca_port = port + 1;
                     tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));

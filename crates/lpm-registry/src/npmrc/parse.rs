@@ -1,5 +1,6 @@
 use super::config::NpmrcConfig;
 use super::types::{OriginKey, RegistryTarget, TaggedBool, TaggedPath, TaggedRoot, TaggedValue};
+use lpm_common::{TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped};
 use std::path::{Path, PathBuf};
 
 impl NpmrcConfig {
@@ -409,7 +410,7 @@ fn classify_and_apply(
             ));
             return;
         }
-        match std::fs::read(value) {
+        match read_file_capped(Path::new(value), TLS_MATERIAL_FILE_SIZE_CAP_BYTES) {
             Ok(bytes) => {
                 // No `decode_npmrc_pem_escapes` here — `cafile=<path>` reads
                 // the PEM from disk where newlines are real (`\n` bytes),
@@ -894,6 +895,25 @@ mod tests {
         assert!(
             cfg.errors[0].contains("cafile=") && cfg.errors[0].contains("failed to read"),
             "error message: {}",
+            cfg.errors[0]
+        );
+    }
+
+    #[test]
+    fn cafile_larger_than_tls_limit_is_a_fatal_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-ca.pem");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(TLS_MATERIAL_FILE_SIZE_CAP_BYTES + 1).unwrap();
+        let content = format!("cafile={}\n", path.display());
+
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+
+        assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
+        assert!(
+            cfg.errors[0].contains(&path.display().to_string())
+                && cfg.errors[0].contains("1048576-byte limit"),
+            "error must identify CA path and limit: {}",
             cfg.errors[0]
         );
     }

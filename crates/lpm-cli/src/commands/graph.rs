@@ -44,15 +44,20 @@ pub async fn run(
 
     // Read package.json once, reuse for both direct deps and root name
     let pkg_json_path = project_dir.join("package.json");
-    let pkg_json: Option<serde_json::Value> = if pkg_json_path.exists() {
-        let content = std::fs::read_to_string(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-        Some(
+    let pkg_json: Option<serde_json::Value> = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => Some(
             serde_json::from_str(&content)
                 .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?,
-        )
-    } else {
-        None
+        ),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read package.json: {error}"
+            )));
+        }
     };
 
     let direct_deps = if let Some(ref pkg) = pkg_json {

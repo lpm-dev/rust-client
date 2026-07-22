@@ -20,7 +20,11 @@ impl PackageFileSelector {
         package_dir: &Path,
     ) -> Result<Self, LpmError> {
         let manifest_path = package_dir.join("package.json");
-        let manifest = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        let manifest = lpm_common::read_text_file_capped(
+            &manifest_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|e| {
             LpmError::Script(format!(
                 "deploy: failed to read package manifest {manifest_path:?}: {e}"
             ))
@@ -101,11 +105,13 @@ fn read_ignore_rules(package_dir: &Path) -> Result<Vec<IgnoreRule>, LpmError> {
     let Some(ignore_path) = ignore_path else {
         return Ok(Vec::new());
     };
-    let content = std::fs::read_to_string(&ignore_path).map_err(|e| {
-        LpmError::Script(format!(
-            "deploy: failed to read ignore file {ignore_path:?}: {e}"
-        ))
-    })?;
+    let content =
+        lpm_common::read_text_file_capped(&ignore_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Script(format!(
+                    "deploy: failed to read ignore file {ignore_path:?}: {e}"
+                ))
+            })?;
     let mut rules = Vec::new();
     for raw in content.lines() {
         let line = raw.trim();

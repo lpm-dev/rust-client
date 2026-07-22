@@ -42,6 +42,8 @@ pub async fn run(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+
     let raw_args: Vec<String> = std::env::args().collect();
     let cmd_pos = raw_args.iter().position(|a| a == "env");
     let args: Vec<&str> = match cmd_pos {

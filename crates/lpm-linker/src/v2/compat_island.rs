@@ -155,11 +155,12 @@ fn collect_project_package_bin_names(
     bin_names: &mut HashSet<String>,
 ) -> Option<()> {
     let package_json = package_dir.join("package.json");
-    let content = match std::fs::read(&package_json) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(()),
-        Err(_) => return None,
-    };
+    let content =
+        match lpm_common::read_file_capped(&package_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Some(()),
+            Err(_) => return None,
+        };
     const BIN_KEY: &[u8] = b"\"bin\"";
     if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
         return Some(());
@@ -560,7 +561,10 @@ fn collect_compatibility_roots_for_bins<'a>(
             continue;
         };
         let pkg_json_path = store.paths().link_package_dir(key).join("package.json");
-        let content = match std::fs::read(&pkg_json_path) {
+        let content = match lpm_common::read_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
             Ok(content) => content,
             Err(error) => {
                 tracing::debug!(
@@ -952,10 +956,11 @@ fn create_dir_0700(path: &Path) -> std::io::Result<()> {
 
 fn compatibility_entry_reusable(final_dir: &Path, entry: &CompatibilityEntry<'_>) -> bool {
     let marker = final_dir.join(COMPAT_META_FILENAME);
-    let Ok(content) = std::fs::read_to_string(marker) else {
+    let Ok(content) = lpm_common::read_file_capped(&marker, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return false;
     };
-    content == compatibility_marker(entry)
+    content == compatibility_marker(entry).as_bytes()
         && final_dir
             .join("node_modules")
             .join(entry.key.name())

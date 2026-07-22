@@ -69,7 +69,9 @@ fn check_force_security_floor() -> Option<Check> {
 /// performs at install time.
 fn count_suspended_approvals_in_cwd() -> Option<usize> {
     let pkg_json = std::env::current_dir().ok()?.join("package.json");
-    let content = std::fs::read_to_string(&pkg_json).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
     let trusted = parsed.get("lpm")?.get("trustedDependencies")?;
     match trusted {

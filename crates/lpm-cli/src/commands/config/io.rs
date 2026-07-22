@@ -8,10 +8,14 @@ use super::wizards::{
 };
 
 pub(super) fn read_config(path: &std::path::Path) -> Result<toml::Value, LpmError> {
-    if !path.exists() {
-        return Ok(toml::Value::Table(toml::map::Map::new()));
-    }
-    let content = std::fs::read_to_string(path)?;
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                return Ok(toml::Value::Table(toml::map::Map::new()));
+            }
+            Err(error) => return Err(LpmError::Registry(error.to_string())),
+        };
     toml::from_str(&content).map_err(|e| LpmError::Registry(format!("config parse error: {e}")))
 }
 

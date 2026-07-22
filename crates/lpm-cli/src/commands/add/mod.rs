@@ -256,7 +256,7 @@ pub async fn run(
     validate_extracted_paths(&extracted_paths, temp_dir.path())?;
 
     // Read lpm.config.json.
-    let lpm_config = read_lpm_config(temp_dir.path());
+    let lpm_config = read_lpm_config(temp_dir.path())?;
 
     // Non-interactive simple-path guard.
     //

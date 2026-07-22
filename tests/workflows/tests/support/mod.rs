@@ -517,6 +517,33 @@ fn set_test_binary_executable(path: &Path) {
 #[cfg(not(unix))]
 fn set_test_binary_executable(_path: &Path) {}
 
+pub fn write_repeated_file(
+    path: &Path,
+    prefix: &[u8],
+    repeated_byte: u8,
+    total_len: u64,
+    suffix: &[u8],
+) {
+    use std::io::{Read, Write};
+
+    let fixed_len = u64::try_from(prefix.len() + suffix.len()).expect("fixture length fits u64");
+    assert!(
+        total_len >= fixed_len,
+        "fixture length must fit prefix and suffix"
+    );
+    let file = std::fs::File::create(path)
+        .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(prefix).expect("write fixture prefix");
+    std::io::copy(
+        &mut std::io::repeat(repeated_byte).take(total_len - fixed_len),
+        &mut writer,
+    )
+    .expect("write repeated fixture bytes");
+    writer.write_all(suffix).expect("write fixture suffix");
+    writer.flush().expect("flush repeated fixture");
+}
+
 /// Spawnable variant of [`lpm_with_registry`] for tests that need
 /// `Child::kill()` or two-process races. Shares env isolation with
 /// [`lpm_with_registry`] via [`apply_lpm_env`].

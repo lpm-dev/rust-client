@@ -175,7 +175,8 @@ fn detect_from_lpm_json_runtime(
     runtime: RuntimeKind,
 ) -> Option<DetectedRuntimeVersion> {
     let path = project_dir.join("lpm.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let spec = doc.get("runtime")?.get(runtime.as_str())?.as_str()?;
 
@@ -188,7 +189,8 @@ fn detect_from_lpm_json_runtime(
 
 fn detect_from_engines(project_dir: &Path) -> Option<DetectedNodeVersion> {
     let path = project_dir.join("package.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let spec = doc.get("engines")?.get("node")?.as_str()?;
 
@@ -244,7 +246,8 @@ fn detect_from_file(
     source: VersionSource,
 ) -> Option<DetectedNodeVersion> {
     let path = project_dir.join(filename);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
     let spec = parse_version_file(&content)?;
 
     if spec.is_empty() {

@@ -6,7 +6,11 @@ pub(super) fn write_post_install_hash(
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
-    let pkg = std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
+    let pkg = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .unwrap_or_default();
     let lock = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
@@ -78,7 +82,11 @@ pub(super) struct InstallFreshnessResult {
 pub(super) async fn run_install_freshness_phase(
     input: InstallFreshnessInput<'_>,
 ) -> Result<InstallFreshnessResult, LpmError> {
-    let pkg_content_for_state = std::fs::read_to_string(input.pkg_json_path).unwrap_or_default();
+    let pkg_content_for_state = lpm_common::read_text_file_capped(
+        input.pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .unwrap_or_default();
     let setup_state_t = Instant::now();
     let dependency_engine_key = dependency_engine_freshness_key_for_state(
         input.project_dir,
@@ -251,7 +259,8 @@ fn dependency_engine_freshness_key_for_state(
     policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> String {
     let state_path = project_dir.join(".lpm").join("install-hash");
-    if let Ok(state) = std::fs::read_to_string(&state_path)
+    if let Ok(state) =
+        lpm_common::read_text_file_capped(&state_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
         && let Some(cached) = parse_cached_dependency_engine_state(&state)
     {
         if matches!(cached.key, "none" | "legacy") {

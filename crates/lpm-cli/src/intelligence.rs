@@ -332,14 +332,18 @@ impl ProjectAliases {
 
         for cfg in ["tsconfig.json", "jsconfig.json"] {
             let path = project_dir.join(cfg);
-            if let Ok(content) = std::fs::read_to_string(&path)
+            if let Ok(content) =
+                lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
                 && absorb_ts_config(&content, project_dir, &mut aliases)
             {
                 break;
             }
         }
 
-        if let Ok(content) = std::fs::read_to_string(project_dir.join("lpm.config.json")) {
+        if let Ok(content) = lpm_common::read_text_file_capped(
+            &project_dir.join("lpm.config.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
             absorb_lpm_import_alias(&content, &mut aliases);
         }
 

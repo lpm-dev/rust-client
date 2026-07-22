@@ -793,7 +793,7 @@ fn resolve_and_load_env(
     script_name: &str,
     explicit_mode: Option<&str>,
 ) -> Result<LoadedEnv, LpmError> {
-    let config = lpm_json::read_lpm_json(project_dir).ok().flatten();
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
 
     // Determine the canonical env name via the resolver.
     // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
@@ -856,20 +856,24 @@ fn resolve_script_command(
 ) -> Result<(String, HashMap<String, String>), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
 
-    // Try package.json first
-    if pkg_json_path.exists() {
-        let pkg = read_package_json(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-
-        if let Some(cmd) = pkg.scripts.get(script_name) {
-            return Ok((cmd.clone(), pkg.scripts.clone()));
+    let package = match read_package_json(&pkg_json_path) {
+        Ok(package) => Some(package),
+        Err(lpm_workspace::WorkspaceError::NotFound(_)) => None,
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read package.json: {error}"
+            )));
         }
+    };
 
-        // Script not in package.json — fall through to lpm.json
+    if let Some(pkg) = &package
+        && let Some(cmd) = pkg.scripts.get(script_name)
+    {
+        return Ok((cmd.clone(), pkg.scripts.clone()));
     }
 
-    // Try lpm.json tasks
-    if let Ok(Some(config)) = lpm_json::read_lpm_json(project_dir) {
+    let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    if let Some(config) = &lpm_config {
         for (task_name, task_config) in &config.tasks {
             if task_name == script_name
                 && let Some(cmd) = &task_config.command
@@ -886,15 +890,10 @@ fn resolve_script_command(
     }
 
     // Neither package.json nor lpm.json had the script
-    if pkg_json_path.exists() {
-        let pkg = read_package_json(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+    if let Some(pkg) = package {
         Err(script_not_found_error(script_name, &pkg.scripts))
     } else {
-        // No package.json at all
-        let lpm_tasks = lpm_json::read_lpm_json(project_dir)
-            .ok()
-            .flatten()
+        let lpm_tasks = lpm_config
             .map(|c| {
                 c.tasks
                     .iter()
@@ -936,18 +935,23 @@ pub fn list_scripts(project_dir: &Path) -> Result<Vec<(String, String)>, LpmErro
 
     // Load from package.json
     let pkg_json_path = project_dir.join("package.json");
-    if pkg_json_path.exists()
-        && let Ok(pkg) = read_package_json(&pkg_json_path)
-    {
-        all_scripts.extend(
-            pkg.scripts
-                .into_iter()
-                .filter(|(name, _)| !is_hidden_script_name(name)),
-        );
+    match read_package_json(&pkg_json_path) {
+        Ok(pkg) => {
+            all_scripts.extend(
+                pkg.scripts
+                    .into_iter()
+                    .filter(|(name, _)| !is_hidden_script_name(name)),
+            );
+        }
+        Err(lpm_workspace::WorkspaceError::NotFound(_)) => {}
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read package.json: {error}"
+            )));
+        }
     }
 
-    // Load from lpm.json tasks (commands not already in package.json)
-    if let Ok(Some(config)) = lpm_json::read_lpm_json(project_dir) {
+    if let Some(config) = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)? {
         for (name, task) in &config.tasks {
             if let Some(cmd) = &task.command {
                 all_scripts

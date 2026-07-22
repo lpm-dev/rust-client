@@ -67,7 +67,10 @@ fn check_completeness(lockfile: &Lockfile, warnings: &mut Vec<String>) {
 /// Check that all deps from package.json are present in the lockfile.
 fn check_root_deps(lockfile: &Lockfile, project_dir: &Path, warnings: &mut Vec<String>) {
     let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
+    let content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(c) => c,
         Err(_) => return, // No package.json — nothing to check
     };

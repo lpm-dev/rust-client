@@ -104,7 +104,8 @@ impl ManifestTransaction {
         let mut snapshots = Vec::with_capacity(required.len() + optional.len());
 
         for path in required {
-            let bytes = std::fs::read(path)?;
+            let bytes = lpm_common::read_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                .map_err(std::io::Error::other)?;
             snapshots.push(SnapshotEntry {
                 path: path.to_path_buf(),
                 original_bytes: Some(bytes),
@@ -126,7 +127,8 @@ impl ManifestTransaction {
         let invalidate = invalidate.iter().map(|p| p.to_path_buf()).collect();
 
         for (path, expected) in required {
-            let bytes = std::fs::read(path)?;
+            let bytes = lpm_common::read_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                .map_err(std::io::Error::other)?;
             if bytes != *expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,

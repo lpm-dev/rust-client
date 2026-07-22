@@ -6,6 +6,7 @@
 //! this crate stay small and dependency-light so it remains the workspace floor.
 
 pub mod atomic_write;
+pub mod bounded_read;
 pub mod color;
 pub mod error;
 pub mod integrity;
@@ -17,6 +18,10 @@ pub mod provenance;
 pub mod symlink;
 
 pub use atomic_write::write_file_atomic;
+pub use bounded_read::{
+    BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
+    TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped, read_text_file_capped,
+};
 pub use error::{
     LpmError, ResolutionErrorContext, ResolutionFailureKind, TyposquatErrorContext,
     TyposquatErrorFinding,
@@ -78,11 +83,10 @@ pub fn sanitize_path_component(name: &str) -> String {
 /// parse on a multi-GB file at every command start.
 pub const STATE_FILE_SIZE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read a small state file with a size cap applied before any bytes
-/// are buffered. Returns `Ok(None)` when the file is missing OR larger
+/// Read a small state file while enforcing a hard byte cap. Returns
+/// `Ok(None)` when the file is missing OR larger
 /// than `cap`; returns `Ok(Some(bytes))` for files within budget;
-/// returns `Err` only when the file exists, fits the cap, and the
-/// read itself failed (disk error, permissions, etc.).
+/// returns `Err` for ordinary open, metadata, or read failures.
 ///
 /// Caller treats the `Ok(None)` cap-overflow case the same as "missing
 /// state" — these readers all fall back to "no prior state" when the
@@ -93,21 +97,22 @@ pub fn read_capped_state_file(
     path: &std::path::Path,
     cap: u64,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if meta.len() > cap {
-        tracing::warn!(
-            path = %path.display(),
-            size = meta.len(),
-            cap = cap,
-            "state file exceeds size cap — treating as missing"
-        );
-        return Ok(None);
+    match read_file_capped(path, cap) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(BoundedReadError::NotFound { .. }) => Ok(None),
+        Err(BoundedReadError::TooLarge { .. }) => {
+            tracing::warn!(
+                path = %path.display(),
+                cap = cap,
+                "state file exceeds size cap — treating as missing"
+            );
+            Ok(None)
+        }
+        Err(BoundedReadError::Io { source, .. }) => Err(source),
+        Err(BoundedReadError::InvalidUtf8 { .. }) => {
+            unreachable!("byte reads do not validate UTF-8")
+        }
     }
-    Ok(Some(std::fs::read(path)?))
 }
 
 /// Resolve the LPM registry URL with scheme + host gating applied to

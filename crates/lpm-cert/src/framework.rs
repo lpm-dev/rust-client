@@ -32,7 +32,9 @@ pub fn detect_and_get_env(
 /// Detect the dev framework by inspecting package.json dependencies.
 pub fn detect_framework(project_dir: &Path) -> Framework {
     let pkg_json_path = project_dir.join("package.json");
-    let Ok(contents) = std::fs::read_to_string(&pkg_json_path) else {
+    let Ok(contents) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return Framework::Unknown;
     };
 

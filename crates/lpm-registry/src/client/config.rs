@@ -512,7 +512,10 @@ impl RegistryClient {
         let mut per_origin_identity_fps: HashMap<OriginKey, Arc<str>> = HashMap::new();
         for (origin, per_origin) in &tls.per_origin {
             let fp = if let Some(cert) = &per_origin.certfile {
-                match std::fs::read(cert.resolve()) {
+                match lpm_common::read_file_capped(
+                    &cert.resolve(),
+                    lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+                ) {
                     Ok(bytes) => Some(cert_pem_fingerprint(&bytes)),
                     Err(_) => None,
                 }

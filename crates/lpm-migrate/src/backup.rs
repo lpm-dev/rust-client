@@ -225,24 +225,30 @@ impl Default for MigrationBackup {
 pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
     let manifest_path = project_dir.join(MANIFEST_FILENAME);
 
-    if manifest_path.exists() {
-        let content = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| LpmError::Script(format!("failed to read backup manifest: {e}")))?;
-        let manifest: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| LpmError::Script(format!("failed to parse backup manifest: {e}")))?;
+    match lpm_common::read_text_file_capped(&manifest_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => {
+            let manifest: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| LpmError::Script(format!("failed to parse backup manifest: {e}")))?;
 
-        let version = manifest
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
+            let version = manifest
+                .get("version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
 
-        if version == MANIFEST_VERSION as u64 {
-            return rollback_v2(project_dir, &manifest, &manifest_path);
+            if version == MANIFEST_VERSION as u64 {
+                return rollback_v2(project_dir, &manifest, &manifest_path);
+            }
+            // Fall through to the legacy scan path for v1 (and any other
+            // unknown version — best-effort recovery is preferable to
+            // erroring out and stranding the user).
+            return rollback_legacy_scan(project_dir, Some(&manifest), &manifest_path);
         }
-        // Fall through to the legacy scan path for v1 (and any other
-        // unknown version — best-effort recovery is preferable to
-        // erroring out and stranding the user).
-        return rollback_legacy_scan(project_dir, Some(&manifest), &manifest_path);
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read backup manifest: {error}"
+            )));
+        }
     }
 
     rollback_legacy_scan(project_dir, None, &manifest_path)

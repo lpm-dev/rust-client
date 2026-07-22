@@ -160,8 +160,11 @@ pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, L
             .duration_since(modified)
             .unwrap_or_default();
         if age.as_secs() < 3600
-            && let Ok(content) = std::fs::read_to_string(&cache_path)
-            && let Ok(releases) = serde_json::from_str::<Vec<NodeRelease>>(&content)
+            && let Ok(Some(content)) = lpm_common::read_capped_state_file(
+                &cache_path,
+                lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+            )
+            && let Ok(releases) = serde_json::from_slice::<Vec<NodeRelease>>(&content)
         {
             tracing::debug!("using cached node index ({} releases)", releases.len());
             return Ok(releases);

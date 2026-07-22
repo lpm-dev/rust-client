@@ -92,8 +92,10 @@ impl ProjectAuditCache {
     /// Read cache from disk. Returns None if missing, corrupt, or stale.
     pub fn read(project_root: &Path) -> Option<Self> {
         let path = cache_path(project_root);
-        let content = std::fs::read_to_string(&path).ok()?;
-        let cache: Self = serde_json::from_str(&content).ok()?;
+        let content =
+            lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+                .ok()??;
+        let cache: Self = serde_json::from_slice(&content).ok()?;
 
         // Check versions — stale cache requires full re-scan
         if cache.cache_version != CACHE_VERSION {

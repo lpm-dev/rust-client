@@ -48,7 +48,8 @@ fn is_workspace_root(dir: &Path) -> bool {
 
     // Check package.json for workspaces field
     let pkg_json = dir.join("package.json");
-    if let Ok(content) = std::fs::read_to_string(&pkg_json)
+    if let Ok(content) =
+        lpm_common::read_text_file_capped(&pkg_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
     {
         return doc.get("workspaces").is_some();

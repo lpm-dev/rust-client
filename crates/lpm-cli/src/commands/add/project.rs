@@ -40,9 +40,12 @@ pub(super) fn detect_default_install_dir(project_dir: &Path, _ecosystem: &str) -
 /// Returns: "next-app", "next-pages", "vite", "remix", or "unknown".
 pub(super) fn detect_framework(project_dir: &Path) -> String {
     let pkg_json_path = project_dir.join("package.json");
-    let doc = match std::fs::read_to_string(&pkg_json_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    let doc = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()
+    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
     {
         Some(d) => d,
         None => return "unknown".to_string(),
@@ -98,10 +101,14 @@ pub(super) fn detect_package_manager(project_dir: &Path) -> String {
 pub(super) fn detect_buyer_alias(project_dir: &Path) -> Option<String> {
     for config_name in ["tsconfig.json", "jsconfig.json"] {
         let path = project_dir.join(config_name);
-        if !path.exists() {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path).ok()?;
+        let content = match lpm_common::read_text_file_capped(
+            &path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => continue,
+            Err(_) => return None,
+        };
         // Strip comments (// and /* */) for JSON parsing
         let stripped = strip_json_comments(&content);
         let config: serde_json::Value = serde_json::from_str(&stripped).ok()?;

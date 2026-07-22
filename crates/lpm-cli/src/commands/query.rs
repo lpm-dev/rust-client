@@ -559,7 +559,10 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
 /// Read direct dependencies from the root package.json.
 fn read_root_dependencies(project_dir: &Path) -> HashSet<String> {
     let pkg_json_path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
+    let content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(c) => c,
         Err(_) => return HashSet::new(),
     };
@@ -587,7 +590,10 @@ fn read_root_dependencies(project_dir: &Path) -> HashSet<String> {
 /// Check if a package has lifecycle scripts by reading its package.json in the store.
 fn check_has_lifecycle_scripts(pkg_dir: &Path) -> bool {
     let pkg_json_path = pkg_dir.join("package.json");
-    let content = match std::fs::read_to_string(&pkg_json_path) {
+    let content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(c) => c,
         Err(_) => return false,
     };

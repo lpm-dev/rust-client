@@ -34,11 +34,12 @@ pub fn index_path() -> Result<PathBuf, LpmError> {
 
 fn read_index() -> Result<IndexFile, LpmError> {
     let path = index_path()?;
-    if !path.exists() {
+    let Some(bytes) =
+        lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read projects index: {e}")))?
+    else {
         return Ok(IndexFile::default());
-    }
-    let bytes = std::fs::read(&path)
-        .map_err(|e| LpmError::Cert(format!("failed to read projects index: {e}")))?;
+    };
     if bytes.is_empty() {
         return Ok(IndexFile::default());
     }

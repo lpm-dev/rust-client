@@ -20,15 +20,38 @@ pub async fn run(
     let npmrc_path = project_dir.join(".npmrc");
     let gitignore_path = project_dir.join(".gitignore");
 
-    if !pkg_json_path.exists() && !json_output {
+    let package_json_content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => Some(content),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let existing_npmrc =
+        match lpm_common::read_text_file_capped(&npmrc_path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES)
+        {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+    let existing_gitignore = match lpm_common::read_text_file_capped(
+        &gitignore_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => Some(content),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    if package_json_content.is_none() && !json_output {
         install_ui::warn("No package.json found. Run this command in your project root.");
     }
 
     // Derive project name for the token label
-    let project_name = if pkg_json_path.exists() {
-        std::fs::read_to_string(&pkg_json_path)
+    let project_name = if let Some(content) = package_json_content {
+        serde_json::from_str::<serde_json::Value>(&content)
             .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
             .map_or_else(
                 || "project".to_string(),
@@ -103,9 +126,8 @@ pub async fn run(
     };
     let registry_host = full_registry_url.replace("https:", "").replace("http:", "");
 
-    if npmrc_path.exists() {
-        let existing = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
-        let has_custom_registry = existing.lines().any(|line| {
+    if !existing_npmrc.is_empty() {
+        let has_custom_registry = existing_npmrc.lines().any(|line| {
             line.starts_with("registry=")
                 && !line.contains("registry.npmjs.org")
                 && !line.contains("lpm.dev")
@@ -116,9 +138,8 @@ pub async fn run(
     }
 
     // Read existing .npmrc, strip old LPM lines
-    let existing_content = if npmrc_path.exists() {
-        let content = std::fs::read_to_string(&npmrc_path).unwrap_or_default();
-        content
+    let existing_content = if !existing_npmrc.is_empty() {
+        existing_npmrc
             .lines()
             .filter(|line| {
                 !line.contains("@lpm.dev:registry") && !line.starts_with("registry=")
@@ -160,8 +181,7 @@ pub async fn run(
 
     // Ensure .npmrc is in .gitignore
     let mut gitignore_updated = false;
-    if gitignore_path.exists() {
-        let gitignore = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if let Some(gitignore) = existing_gitignore {
         if !gitignore.lines().any(|line| line.trim() == ".npmrc") {
             let updated = format!("{}\n.npmrc\n", gitignore.trim_end());
             std::fs::write(&gitignore_path, updated)?;

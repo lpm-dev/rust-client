@@ -78,7 +78,8 @@ pub(crate) fn refresh_install_hash_node_runtime_fingerprint(
     }
 
     let path = project_dir.join(".lpm").join("install-hash");
-    let original = std::fs::read_to_string(&path)?;
+    let original = lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .map_err(std::io::Error::other)?;
     let Some(updated) = replace_node_runtime_fingerprint(
         &original,
         expected_dependency_engine_key,
@@ -90,7 +91,10 @@ pub(crate) fn refresh_install_hash_node_runtime_fingerprint(
         return Ok(false);
     }
 
-    if std::fs::read_to_string(&path)? != original {
+    if lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .map_err(std::io::Error::other)?
+        != original
+    {
         return Ok(false);
     }
     write_state_file_owner_only(&path, updated.as_bytes())?;
@@ -447,7 +451,10 @@ pub fn collect_file_link_manifest_bytes(
                 continue; // already covered via file:/link:
             }
             let pkg_json_path = realpath.join("package.json");
-            let Ok(member_content) = std::fs::read_to_string(&pkg_json_path) else {
+            let Ok(member_content) = lpm_common::read_text_file_capped(
+                &pkg_json_path,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            ) else {
                 continue;
             };
             buf.push((realpath.clone(), member_content.as_bytes().to_vec()));
@@ -494,7 +501,8 @@ fn push_freshness_file(
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
     buf: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
 ) {
-    let Ok(content) = std::fs::read(&path) else {
+    let Ok(content) = lpm_common::read_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return;
     };
     let key = path.canonicalize().unwrap_or(path);
@@ -554,8 +562,10 @@ fn walk_file_link_deps(
             if !visited.insert(realpath.clone()) {
                 continue; // realpath cycle — skip
             }
-            let Ok(manifest_content) = std::fs::read_to_string(realpath.join("package.json"))
-            else {
+            let Ok(manifest_content) = lpm_common::read_text_file_capped(
+                &realpath.join("package.json"),
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            ) else {
                 continue;
             };
             buf.push((realpath.clone(), manifest_content.as_bytes().to_vec()));
@@ -600,7 +610,9 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
 
     // Read package.json + resolve linker BEFORE any freshness comparison.
     // pkg-read failure → no readable manifest, return hash=None.
-    let Ok(pkg_content) = std::fs::read_to_string(&pkg_json) else {
+    let Ok(pkg_content) =
+        lpm_common::read_text_file_capped(&pkg_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return InstallState {
             up_to_date: false,
             hash: None,
@@ -878,7 +890,9 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
 
     // Hash comparison — read only the first line of the file so v1 (bare
     // hash) and v2 (hash + mtime line) formats both parse identically.
-    let Ok(cached_hash_file) = std::fs::read_to_string(&hash_file) else {
+    let Ok(cached_hash_file) =
+        lpm_common::read_text_file_capped(&hash_file, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
         return InstallState {
             up_to_date: false,
             hash: Some(current_hash),
@@ -982,7 +996,9 @@ fn try_mtime_fast_path(
     }
 
     let hash_file = project_dir.join(".lpm").join("install-hash");
-    let content = std::fs::read_to_string(&hash_file).ok()?;
+    let content =
+        lpm_common::read_text_file_capped(&hash_file, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .ok()?;
 
     let mut lines = content.lines();
     let stored_hash = lines.next()?.trim();
@@ -1219,8 +1235,11 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     // negatives are impossible for the file: / link: case: every
     // such spec is `"<key>": "file:..."` / `"<key>": "link:..."`.
     let sentinel = hash_dir.join("has-local-sources");
-    let needs_slow_path = std::fs::read_to_string(project_dir.join("package.json"))
-        .is_ok_and(|s| package_json_needs_slow_freshness(&s))
+    let needs_slow_path = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .is_ok_and(|s| package_json_needs_slow_freshness(&s))
         || has_pnpm_workspace_yaml(project_dir);
     if needs_slow_path {
         write_state_file_owner_only(&sentinel, b"")?;
@@ -1360,7 +1379,7 @@ pub(crate) fn ci_env_is_truthy() -> bool {
 /// have `"workspaces"` as a JSON key.
 pub fn is_likely_workspace_root(project_dir: &Path) -> bool {
     let pkg_json = project_dir.join("package.json");
-    match std::fs::read_to_string(&pkg_json) {
+    match lpm_common::read_text_file_capped(&pkg_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
         Ok(content) => is_workspace_root_content(&content),
         Err(_) => false,
     }

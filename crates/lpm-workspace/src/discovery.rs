@@ -30,67 +30,65 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
 
     loop {
         let pkg_json_path = current.join("package.json");
-        if pkg_json_path.exists() {
-            let mut root_package = read_package_json(&pkg_json_path)?;
-
-            // Check for workspace globs in package.json
-            let workspace_globs = match &root_package.workspaces {
-                Some(WorkspacesConfig::Globs(globs)) => Some(globs.clone()),
-                Some(WorkspacesConfig::Object { packages }) => Some(packages.clone()),
-                None => None,
-            };
-
-            // Also check for pnpm-workspace.yaml
-            let pnpm_workspace_path = current.join("pnpm-workspace.yaml");
-            let pnpm_workspace = if pnpm_workspace_path.exists() {
-                Some(read_pnpm_workspace(&pnpm_workspace_path)?)
-            } else {
-                None
-            };
-
-            if let Some(config) = pnpm_workspace.as_ref() {
-                merge_pnpm_workspace_config(&mut root_package, config);
-            }
-
-            let globs = workspace_globs.or_else(|| {
-                pnpm_workspace.as_ref().and_then(|config| {
-                    if config.packages.is_empty() {
-                        None
-                    } else {
-                        Some(config.packages.clone())
-                    }
-                })
-            });
-
-            if let Some(globs) = globs {
-                let members = discover_members(&current, &globs)?;
-                warn_on_member_catalogs(&members);
-                let workspace = Workspace {
-                    root: current.clone(),
-                    root_package,
-                    members,
+        match read_package_json(&pkg_json_path) {
+            Ok(mut root_package) => {
+                // Check for workspace globs in package.json
+                let workspace_globs = match &root_package.workspaces {
+                    Some(WorkspacesConfig::Globs(globs)) => Some(globs.clone()),
+                    Some(WorkspacesConfig::Object { packages }) => Some(packages.clone()),
+                    None => None,
                 };
 
-                let start_is_root = original_start == workspace.root;
-                let start_within_root = original_start.starts_with(&workspace.root);
-                let start_is_member = workspace
-                    .members
-                    .iter()
-                    .any(|member| original_start.starts_with(&member.path));
-                let has_nested_non_member_package = start_within_root
-                    && has_intermediate_non_member_package_json(
-                        &original_start,
-                        &workspace.root,
-                        &workspace.members,
-                    );
+                // Also check for pnpm-workspace.yaml
+                let pnpm_workspace_path = current.join("pnpm-workspace.yaml");
+                let pnpm_workspace = read_pnpm_workspace(&pnpm_workspace_path)?;
 
-                if start_is_root
-                    || start_is_member
-                    || (start_within_root && !has_nested_non_member_package)
-                {
-                    return Ok(Some(workspace));
+                if let Some(config) = pnpm_workspace.as_ref() {
+                    merge_pnpm_workspace_config(&mut root_package, config);
+                }
+
+                let globs = workspace_globs.or_else(|| {
+                    pnpm_workspace.as_ref().and_then(|config| {
+                        if config.packages.is_empty() {
+                            None
+                        } else {
+                            Some(config.packages.clone())
+                        }
+                    })
+                });
+
+                if let Some(globs) = globs {
+                    let members = discover_members(&current, &globs)?;
+                    warn_on_member_catalogs(&members);
+                    let workspace = Workspace {
+                        root: current.clone(),
+                        root_package,
+                        members,
+                    };
+
+                    let start_is_root = original_start == workspace.root;
+                    let start_within_root = original_start.starts_with(&workspace.root);
+                    let start_is_member = workspace
+                        .members
+                        .iter()
+                        .any(|member| original_start.starts_with(&member.path));
+                    let has_nested_non_member_package = start_within_root
+                        && has_intermediate_non_member_package_json(
+                            &original_start,
+                            &workspace.root,
+                            &workspace.members,
+                        );
+
+                    if start_is_root
+                        || start_is_member
+                        || (start_within_root && !has_nested_non_member_package)
+                    {
+                        return Ok(Some(workspace));
+                    }
                 }
             }
+            Err(WorkspaceError::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
 
         // Walk up to parent
@@ -165,12 +163,16 @@ impl PnpmWorkspaceManifest {
 }
 
 /// Read pnpm-workspace.yaml and extract package globs plus root catalogs.
-fn read_pnpm_workspace(path: &Path) -> Result<PnpmWorkspaceConfig, WorkspaceError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+fn read_pnpm_workspace(path: &Path) -> Result<Option<PnpmWorkspaceConfig>, WorkspaceError> {
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(WorkspaceError::Io(error.to_string())),
+        };
 
     if content.trim().is_empty() {
-        return Ok(PnpmWorkspaceConfig::default());
+        return Ok(Some(PnpmWorkspaceConfig::default()));
     }
 
     let manifest: Option<PnpmWorkspaceManifest> = serde_yaml::from_str(&content).map_err(|e| {
@@ -180,7 +182,7 @@ fn read_pnpm_workspace(path: &Path) -> Result<PnpmWorkspaceConfig, WorkspaceErro
         ))
     })?;
 
-    Ok(manifest.unwrap_or_default().into_config())
+    Ok(Some(manifest.unwrap_or_default().into_config()))
 }
 
 fn merge_pnpm_workspace_config(root_package: &mut PackageJson, config: &PnpmWorkspaceConfig) {

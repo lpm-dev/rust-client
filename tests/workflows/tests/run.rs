@@ -6,7 +6,7 @@
 mod support;
 
 use std::sync::{Arc, Mutex};
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, write_repeated_file};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -799,6 +799,84 @@ fn run_loads_env_mode_file() {
     assert!(
         stdout.contains("staging-value"),
         "expected .env.staging variable to be loaded, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_oversized_lpm_json_before_spawning_script() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-lpm-json",
+        "version": "1.0.0",
+        "scripts": {"probe": "node write-marker.js"}
+    }"#,
+    );
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('executed-marker', 'ran')",
+    );
+    let path = project.path().join("lpm.json");
+    write_repeated_file(
+        &path,
+        br#"{"env":{},"padding":""#,
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        br#""}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["run", "probe"])
+        .output()
+        .expect("run script with oversized lpm.json");
+
+    assert!(!output.status.success(), "oversized lpm.json must fail");
+    assert!(
+        !project.file_exists("executed-marker"),
+        "script must not spawn after lpm.json failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify lpm.json and limit; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_oversized_dotenv_before_spawning_script() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-dotenv",
+        "version": "1.0.0",
+        "scripts": {"probe": "node write-marker.js"}
+    }"#,
+    );
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('executed-marker', 'ran')",
+    );
+    let path = project.path().join(".env");
+    write_repeated_file(
+        &path,
+        b"SAFE=value\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "probe"])
+        .output()
+        .expect("run script with oversized dotenv");
+
+    assert!(!output.status.success(), "oversized dotenv must fail");
+    assert!(
+        !project.file_exists("executed-marker"),
+        "script must not spawn after dotenv failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&path.display().to_string()) && stderr.contains("16777216-byte limit"),
+        "error must identify dotenv and limit; got:\n{stderr}"
     );
 }
 

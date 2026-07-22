@@ -19,7 +19,9 @@ pub(super) fn is_scope_trusted(package_name: &str, project_dir: &Path) -> bool {
 /// for re-parsing the same manifest in a loop.
 pub(super) fn parse_trusted_scopes(project_dir: &Path) -> Vec<String> {
     let pkg_json_path = project_dir.join("package.json");
-    let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return Vec::new();
     };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {

@@ -302,7 +302,8 @@ pub async fn run(
     // the resolution-error path emits a fail anyway via the install
     // pipeline. Best-effort: any I/O / parse failure here downgrades
     // to a quiet skip rather than failing doctor.
-    if let Ok(pkg_content) = std::fs::read_to_string(&pkg_json_path)
+    if let Ok(pkg_content) =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(pkg_parsed) = serde_json::from_str::<lpm_workspace::PackageJson>(&pkg_content)
     {
         let cfg = crate::commands::config::GlobalConfig::load();

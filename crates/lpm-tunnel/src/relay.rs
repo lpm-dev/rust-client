@@ -124,11 +124,10 @@ fn is_loopback_host(host: &str) -> bool {
 /// log) so a broken config never wedges the tunnel — the resolver just
 /// falls through to the default.
 fn read_relay_url_from_config(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    let raw = match std::fs::read_to_string(path) {
+    let raw = match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    {
         Ok(s) => s,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return None,
         Err(e) => {
             tracing::debug!("relay config read failed at {}: {e}", path.display());
             return None;

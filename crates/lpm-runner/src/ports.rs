@@ -1597,7 +1597,11 @@ fn discover_project_for_cwd(cwd: &Path) -> Option<ProjectInfo> {
 
 #[cfg(unix)]
 fn read_package_name(dir: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let content = lpm_common::read_text_file_capped(
+        &dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
     value
         .get("name")
@@ -1639,10 +1643,11 @@ fn read_port_overrides_from(
     path: &std::path::Path,
     project_dir: &std::path::Path,
 ) -> HashMap<String, u16> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
 
     let doc: toml::Value = match content.parse() {
         Ok(v) => v,
@@ -1669,7 +1674,8 @@ fn write_port_override_to(
     service_name: &str,
     port: u16,
 ) {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .unwrap_or_default();
     let mut doc: toml::value::Table = content
         .parse::<toml::Value>()
         .ok()
@@ -1699,10 +1705,11 @@ pub fn clear_port_overrides(project_dir: &std::path::Path) -> Result<(), LpmErro
 }
 
 fn clear_port_overrides_from(path: &std::path::Path, project_dir: &std::path::Path) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
     let mut doc: toml::value::Table = match content.parse::<toml::Value>() {
         Ok(v) => v.try_into().unwrap_or_default(),

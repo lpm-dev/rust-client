@@ -402,18 +402,7 @@ pub async fn run(
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            let mut eco = "js".to_string();
-            let lpm_cfg = project_dir.join("lpm.config.json");
-            if lpm_cfg.exists()
-                && let Ok(s) = std::fs::read_to_string(&lpm_cfg)
-                && let Ok(c) = serde_json::from_str::<serde_json::Value>(&s)
-                && let Some(e) = c.get("ecosystem").and_then(|v| v.as_str())
-            {
-                eco = e.to_string();
-            }
-            if project_dir.join("Package.swift").exists() && eco == "js" {
-                eco = "swift".to_string();
-            }
+            let eco = detected_ecosystem.clone();
 
             let summary = DryRunSummary {
                 name: &name,

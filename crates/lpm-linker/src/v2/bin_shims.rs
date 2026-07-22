@@ -134,7 +134,10 @@ pub(super) fn create_bin_links_v2(
 
         // Read once; treat I/O failure as "no bin" (equivalent to the old
         // exists() check but saves one stat(2) syscall per direct dep).
-        let content = match std::fs::read(&pkg_json_path) {
+        let content = match lpm_common::read_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -321,7 +324,9 @@ pub(super) fn create_bin_links_v2(
                 "{node_path_prefix}@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
             );
             let cmd_path = bin_dir.join(format!("{}.cmd", spec.cmd_name));
-            if std::fs::read_to_string(&cmd_path).is_ok_and(|existing| existing == cmd_content) {
+            if lpm_common::read_file_capped(&cmd_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+                .is_ok_and(|existing| existing == cmd_content.as_bytes())
+            {
                 count += 1;
                 continue;
             }
@@ -426,7 +431,8 @@ fn write_unix_bin_wrapper(
     };
     if metadata.as_ref().is_some_and(|metadata| {
         metadata.file_type().is_file() && !metadata.file_type().is_symlink()
-    }) && std::fs::read_to_string(link_path).is_ok_and(|existing| existing == content)
+    }) && lpm_common::read_file_capped(link_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        .is_ok_and(|existing| existing == content.as_bytes())
     {
         return set_unix_bin_shim_executable(link_path);
     }

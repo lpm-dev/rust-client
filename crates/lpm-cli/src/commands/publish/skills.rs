@@ -45,7 +45,10 @@ pub(super) fn ensure_lpm_in_files(
             s == ".lpm/skills" || s == ".lpm/skills/" || s == ".lpm"
         });
         if !has_skills {
-            let content = std::fs::read_to_string(pkg_json_path)?;
+            let content = lpm_common::read_text_file_capped(
+                pkg_json_path,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            )?;
             let mut updated = pkg_json.clone();
             let updated_files = updated
                 .get_mut("files")

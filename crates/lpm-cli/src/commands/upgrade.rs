@@ -177,14 +177,20 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let started_at = Instant::now();
     let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::NotFound("no package.json found".into()));
-    }
-
-    // Read file once, parse as Value for deps extraction AND as typed
-    // PackageJson for the patches map.
-    let original_content = std::fs::read_to_string(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+    let original_content = match lpm_common::read_text_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Err(LpmError::NotFound("no package.json found".into()));
+        }
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read package.json: {error}"
+            )));
+        }
+    };
     let mut doc: serde_json::Value = serde_json::from_str(&original_content)
         .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
 

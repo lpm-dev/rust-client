@@ -653,11 +653,14 @@ fn read_pinned_runtime_version(
     runtime: RuntimeKind,
 ) -> Result<Option<String>, LpmError> {
     let lpm_json_path = project_dir.join("lpm.json");
-    if !lpm_json_path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&lpm_json_path)?;
+    let content = match lpm_common::read_text_file_capped(
+        &lpm_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     let config: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?;
 
@@ -672,12 +675,14 @@ fn write_runtime_pin(
     version: &str,
 ) -> Result<(), LpmError> {
     let lpm_json_path = project_dir.join("lpm.json");
-    let mut config: serde_json::Value = if lpm_json_path.exists() {
-        let content = std::fs::read_to_string(&lpm_json_path)?;
-        serde_json::from_str(&content)
-            .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?
-    } else {
-        serde_json::json!({})
+    let mut config: serde_json::Value = match lpm_common::read_text_file_capped(
+        &lpm_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => serde_json::json!({}),
+        Err(error) => return Err(error.into()),
     };
 
     if config.get("runtime").is_none() {

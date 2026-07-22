@@ -49,9 +49,11 @@ pub fn restore_cache(key: &str, project_dir: &Path) -> Result<CacheHit, LpmError
 
     // Read meta
     let meta_path = entry.join("meta.json");
-    let meta_content = std::fs::read_to_string(&meta_path)
-        .map_err(|e| LpmError::Task(format!("failed to read cache meta: {e}")))?;
-    let meta: CacheMeta = serde_json::from_str(&meta_content)
+    let meta_bytes =
+        lpm_common::read_capped_state_file(&meta_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Task(format!("failed to read cache meta: {e}")))?
+            .ok_or_else(|| LpmError::Task("cache meta is missing or oversized".into()))?;
+    let meta: CacheMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| LpmError::Task(format!("failed to parse cache meta: {e}")))?;
 
     // Restore outputs archive

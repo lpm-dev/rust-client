@@ -64,12 +64,20 @@ async fn run_fix_under_project_lock(
 ) -> Result<(), LpmError> {
     let started_at = std::time::Instant::now();
     let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::NotFound("no package.json found".into()));
-    }
-
-    let original_content = std::fs::read(&pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+    let original_content = match lpm_common::read_file_capped(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Err(LpmError::NotFound("no package.json found".into()));
+        }
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read package.json: {error}"
+            )));
+        }
+    };
     let mut doc: serde_json::Value = serde_json::from_slice(&original_content)
         .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
 
@@ -311,12 +319,14 @@ fn select_installed_direct_locked_package<'a>(
     target_name: &str,
 ) -> Result<&'a lpm_lockfile::LockedPackage, String> {
     let manifest_path = installed_direct_manifest_path(project_dir, local_name)?;
-    let content = std::fs::read(&manifest_path).map_err(|error| {
-        format!(
-            "cannot read installed direct dependency {}: {error}",
-            manifest_path.display()
-        )
-    })?;
+    let content =
+        lpm_common::read_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| {
+                format!(
+                    "cannot read installed direct dependency {}: {error}",
+                    manifest_path.display()
+                )
+            })?;
     let manifest: serde_json::Value = serde_json::from_slice(&content).map_err(|error| {
         format!(
             "installed direct dependency {} has invalid package.json: {error}",

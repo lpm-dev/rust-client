@@ -498,15 +498,16 @@ fn resolve_dlx_target(project_dir: &Path, package_spec: &str) -> Result<DlxTarge
 
 fn read_project_lpm_config(project_dir: &Path) -> Result<Option<serde_json::Value>, LpmError> {
     let path = project_dir.join("package.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(LpmError::Script(format!(
-                "failed to read caller package.json for dlx policy: {e}"
-            )));
-        }
-    };
+    let content =
+        match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(LpmError::Script(format!(
+                    "failed to read caller package.json for dlx policy: {e}"
+                )));
+            }
+        };
     let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
         LpmError::Script(format!(
             "failed to parse caller package.json for dlx policy: {e}"

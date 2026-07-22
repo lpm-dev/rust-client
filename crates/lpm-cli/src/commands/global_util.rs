@@ -149,12 +149,14 @@ pub(super) fn discover_bin_commands(
             .join(package_name)
             .join("package.json"),
     );
-    let bytes = std::fs::read(&pkg_json_path).map_err(|e| {
-        LpmError::Script(format!(
-            "could not read installed package.json at {}: {e}",
-            pkg_json_path.display()
-        ))
-    })?;
+    let bytes =
+        lpm_common::read_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Script(format!(
+                    "could not read installed package.json at {}: {e}",
+                    pkg_json_path.display()
+                ))
+            })?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
         LpmError::Script(format!(
             "installed package.json is not valid JSON at {}: {e}",

@@ -50,11 +50,13 @@ pub(in crate::commands::deploy) fn rewrite_workspace_protocol_in_deploy_manifest
         })?;
 
     let manifest_path = output_dir.join("package.json");
-    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read deploy manifest at {manifest_path:?}: {e}"
-        ))
-    })?;
+    let content =
+        lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+            LpmError::Script(format!(
+                "failed to read deploy manifest at {manifest_path:?}: {e}"
+            ))
+        })?;
 
     let mut doc: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| LpmError::Script(format!("invalid package.json in deploy output: {e}")))?;
@@ -139,11 +141,13 @@ pub(in crate::commands::deploy) fn strip_dev_dependencies_from_deploy_manifest(
     output_dir: &Path,
 ) -> Result<usize, LpmError> {
     let manifest_path = output_dir.join("package.json");
-    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read deploy manifest at {manifest_path:?}: {e}"
-        ))
-    })?;
+    let content =
+        lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+            LpmError::Script(format!(
+                "failed to read deploy manifest at {manifest_path:?}: {e}"
+            ))
+        })?;
 
     let mut doc: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| LpmError::Script(format!("invalid package.json in deploy output: {e}")))?;
@@ -179,11 +183,13 @@ pub(in crate::commands::deploy) fn strip_dev_dependencies_from_deploy_manifest(
 pub(in crate::commands::deploy) fn read_manifest_value(
     manifest_path: &Path,
 ) -> Result<serde_json::Value, LpmError> {
-    let content = std::fs::read_to_string(manifest_path).map_err(|e| {
-        LpmError::Script(format!(
-            "deploy: failed to read manifest at {manifest_path:?}: {e}"
-        ))
-    })?;
+    let content =
+        lpm_common::read_text_file_capped(manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Script(format!(
+                    "deploy: failed to read manifest at {manifest_path:?}: {e}"
+                ))
+            })?;
     serde_json::from_str(&content)
         .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))
 }

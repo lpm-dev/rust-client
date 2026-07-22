@@ -215,7 +215,9 @@ pub(in crate::commands::deploy) fn read_member_name(manifest_path: &Path) -> Str
                 |n| n.to_string_lossy().to_string(),
             )
     };
-    let Ok(content) = std::fs::read_to_string(manifest_path) else {
+    let Ok(content) =
+        lpm_common::read_text_file_capped(manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
         return fallback();
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {

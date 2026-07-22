@@ -35,6 +35,7 @@
 //!   eager and lazy builds in the same process.
 
 use lpm_common::error::LpmError;
+use lpm_common::{TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -282,15 +283,16 @@ pub fn load_identity(
     // absolute inputs and for tests whose source is a non-file label.
     let cert_path = cert.resolve();
     let key_path = key.resolve();
-    let cert_bytes = std::fs::read(&cert_path).map_err(|e| {
-        LpmError::Cert(format!(
-            "{}:{}: failed to read certfile {}: {e}",
-            cert.source,
-            cert.line,
-            cert_path.display()
-        ))
-    })?;
-    let key_bytes = std::fs::read(&key_path).map_err(|e| {
+    let cert_bytes =
+        read_file_capped(&cert_path, TLS_MATERIAL_FILE_SIZE_CAP_BYTES).map_err(|e| {
+            LpmError::Cert(format!(
+                "{}:{}: failed to read certfile {}: {e}",
+                cert.source,
+                cert.line,
+                cert_path.display()
+            ))
+        })?;
+    let key_bytes = read_file_capped(&key_path, TLS_MATERIAL_FILE_SIZE_CAP_BYTES).map_err(|e| {
         LpmError::Cert(format!(
             "{}:{}: failed to read keyfile {}: {e}",
             key.source,
@@ -552,6 +554,46 @@ mod tests {
         let key = tagged(write(dir.path(), "key.pem", &key_pem));
         let pp = NoPassphrase;
         load_identity(&cert, &key, &pp).expect("identity ok");
+    }
+
+    #[test]
+    fn certfile_larger_than_tls_limit_is_rejected_before_identity_parsing() {
+        let (_, key_pem) = gen_rsa_pair();
+        let dir = TempDir::new().unwrap();
+        let cert_path = dir.path().join("oversized-cert.pem");
+        let file = std::fs::File::create(&cert_path).unwrap();
+        file.set_len(TLS_MATERIAL_FILE_SIZE_CAP_BYTES + 1).unwrap();
+        let cert = tagged(cert_path.clone());
+        let key = tagged(write(dir.path(), "key.pem", &key_pem));
+
+        let error = load_identity(&cert, &key, &NoPassphrase).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&cert_path.display().to_string())
+                && message.contains("1048576-byte limit"),
+            "error must identify cert path and limit: {message}"
+        );
+    }
+
+    #[test]
+    fn keyfile_larger_than_tls_limit_is_rejected_before_identity_parsing() {
+        let (cert_pem, _) = gen_rsa_pair();
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("oversized-key.pem");
+        let file = std::fs::File::create(&key_path).unwrap();
+        file.set_len(TLS_MATERIAL_FILE_SIZE_CAP_BYTES + 1).unwrap();
+        let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));
+        let key = tagged(key_path.clone());
+
+        let error = load_identity(&cert, &key, &NoPassphrase).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&key_path.display().to_string())
+                && message.contains("1048576-byte limit"),
+            "error must identify key path and limit: {message}"
+        );
     }
 
     /// Relative paths in `~/.npmrc` must resolve against the `.npmrc`'s

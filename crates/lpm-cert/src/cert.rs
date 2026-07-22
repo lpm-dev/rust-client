@@ -46,16 +46,22 @@ pub fn fingerprint_hex(bytes: &[u8]) -> String {
 }
 
 fn read_cert_der(path: &Path) -> Result<Vec<u8>, LpmError> {
-    let pem_str = std::fs::read_to_string(path)
-        .map_err(|e| LpmError::Cert(format!("failed to read cert at {}: {e}", path.display())))?;
+    let pem_str =
+        lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!("failed to read cert at {}: {e}", path.display()))
+            })?;
     let pem = pem::parse(&pem_str)
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     Ok(pem.into_contents())
 }
 
 fn read_cert_chain_der(path: &Path) -> Result<Vec<Vec<u8>>, LpmError> {
-    let pem_str = std::fs::read_to_string(path)
-        .map_err(|e| LpmError::Cert(format!("failed to read cert at {}: {e}", path.display())))?;
+    let pem_str =
+        lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!("failed to read cert at {}: {e}", path.display()))
+            })?;
     let pems = pem::parse_many(&pem_str)
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     if pems.is_empty() {
@@ -93,8 +99,11 @@ impl SanEntry {
 /// the rotation reissue flow cannot reproduce (URI, RFC822, X400, etc.) — these
 /// are not used by `lpm-cert::generate_project_cert`.
 pub fn read_san_entries(path: &Path) -> Result<Vec<SanEntry>, LpmError> {
-    let pem_str = std::fs::read_to_string(path)
-        .map_err(|e| LpmError::Cert(format!("failed to read cert at {}: {e}", path.display())))?;
+    let pem_str =
+        lpm_common::read_text_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!("failed to read cert at {}: {e}", path.display()))
+            })?;
     let pem = pem::parse(&pem_str)
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
@@ -484,8 +493,9 @@ fn cidr_subtree(cidr: &str) -> Result<GeneralSubtree, Box<dyn std::error::Error>
 
 /// Check if a certificate file needs renewal (within 30 days of expiry or invalid).
 pub fn needs_renewal(cert_path: &Path) -> Result<bool, LpmError> {
-    let pem_str = std::fs::read_to_string(cert_path)
-        .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
+    let pem_str =
+        lpm_common::read_text_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
 
     let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
 
@@ -508,8 +518,9 @@ pub fn covers_requested_hostnames(
         return Ok(true);
     }
 
-    let pem_str = std::fs::read_to_string(cert_path)
-        .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
+    let pem_str =
+        lpm_common::read_text_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
 
     let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
 
@@ -530,8 +541,9 @@ pub fn covers_requested_hostnames(
 
 /// Read certificate information from a PEM file.
 pub fn read_cert_info(cert_path: &Path) -> Result<CertInfo, LpmError> {
-    let pem_str = std::fs::read_to_string(cert_path)
-        .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
+    let pem_str =
+        lpm_common::read_text_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
 
     let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
 

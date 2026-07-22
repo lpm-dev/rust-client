@@ -36,7 +36,7 @@ impl ManifestMetadata {
 }
 
 pub(crate) fn read_json_file(path: &Path) -> Result<Value, LpmError> {
-    let content = std::fs::read_to_string(path).map_err(LpmError::Io)?;
+    let content = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
     serde_json::from_str(&content).map_err(|e| {
         LpmError::Registry(format!("failed to parse JSON from {}: {e}", path.display()))
     })

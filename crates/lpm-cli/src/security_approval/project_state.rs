@@ -27,11 +27,13 @@ fn trusted_dependencies_snapshot(
     crate::trust_snapshot::TrustSnapshot::capture_current(trusted).bindings
 }
 
-fn current_trusted_scopes(project_dir: &Path) -> BTreeSet<String> {
-    crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir)
-        .trusted_scopes
-        .into_iter()
-        .collect()
+fn current_trusted_scopes(project_dir: &Path) -> Result<BTreeSet<String>, LpmError> {
+    Ok(
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?
+            .trusted_scopes
+            .into_iter()
+            .collect(),
+    )
 }
 
 pub fn authorized_capability_user_bound() -> crate::capability::UserBound {
@@ -64,7 +66,7 @@ pub(super) fn candidate_project_policy_state(
     project_dir: &Path,
     trusted: &lpm_workspace::TrustedDependencies,
 ) -> Result<ApprovedProjectPolicyState, LpmError> {
-    let mut trusted_scopes: Vec<_> = current_trusted_scopes(project_dir).into_iter().collect();
+    let mut trusted_scopes: Vec<_> = current_trusted_scopes(project_dir)?.into_iter().collect();
     trusted_scopes.sort();
     Ok(ApprovedProjectPolicyState {
         schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
