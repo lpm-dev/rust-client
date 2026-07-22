@@ -64,8 +64,18 @@ pub async fn ensure_runtime(
     project_dir: &std::path::Path,
 ) -> detect::DetectionResult<Vec<RuntimeStatus>> {
     let detected = detect::detect_runtime_versions(project_dir)?;
+    Ok(ensure_detected_runtimes(detected).await)
+}
+
+/// Auto-install already-detected managed runtime requirements if needed.
+///
+/// Callers can run fallible configuration detection before starting other
+/// work, then pass the validated requirements here without rereading files.
+pub async fn ensure_detected_runtimes(
+    detected: Vec<detect::DetectedRuntimeVersion>,
+) -> Vec<RuntimeStatus> {
     if detected.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let mut install_context = RuntimeInstallContext::default();
@@ -73,7 +83,7 @@ pub async fn ensure_runtime(
     for runtime in detected {
         statuses.push(ensure_one_runtime(runtime, &mut install_context).await);
     }
-    Ok(statuses)
+    statuses
 }
 
 #[derive(Default)]

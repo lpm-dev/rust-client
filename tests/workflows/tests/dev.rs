@@ -1,7 +1,7 @@
 mod support;
 
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, configure_fake_node, lpm, lpm_with_registry, write_repeated_file};
 
 struct FrameworkBinCase {
     label: &'static str,
@@ -66,6 +66,47 @@ const FRAMEWORK_BIN_CASES: &[FrameworkBinCase] = &[
         script: "storybook dev",
     },
 ];
+
+#[test]
+fn dev_rejects_oversized_nvmrc_before_probing_system_node() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "oversized-nvmrc-dev",
+        "version": "1.0.0",
+        "scripts": {"dev": "node server.js"}
+    }"#,
+    );
+    project.write_file(".node-version", "20.18.0\n");
+    let nvmrc_path = project.path().join(".nvmrc");
+    write_repeated_file(
+        &nvmrc_path,
+        b"22\n#",
+        b'a',
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1,
+        b"\n",
+    );
+    let marker_path = project.path().join("fake-node-invoked");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.18.0");
+
+    let output = command
+        .env("LPM_FAKE_NODE_MARKER", &marker_path)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with oversized .nvmrc");
+
+    assert!(!output.status.success(), "oversized .nvmrc must fail");
+    assert!(
+        !marker_path.exists(),
+        "system Node must not be probed after .nvmrc validation fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&nvmrc_path.display().to_string())
+            && stderr.contains("16777216-byte limit"),
+        "error must identify .nvmrc and limit; got:\n{stderr}"
+    );
+}
 
 #[test]
 fn dev_passes_selected_port_to_single_service_script() {

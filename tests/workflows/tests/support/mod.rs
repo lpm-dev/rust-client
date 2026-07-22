@@ -488,9 +488,13 @@ pub fn configure_fake_node(
         bin_dir.join("node")
     };
     let script = if cfg!(windows) {
-        format!("@echo off\r\necho v{version}\r\n")
+        format!(
+            "@echo off\r\nif not \"%LPM_FAKE_NODE_MARKER%\"==\"\" type nul > \"%LPM_FAKE_NODE_MARKER%\"\r\necho v{version}\r\n"
+        )
     } else {
-        format!("#!/bin/sh\necho v{version}\n")
+        format!(
+            "#!/bin/sh\nif [ -n \"${{LPM_FAKE_NODE_MARKER:-}}\" ]; then : > \"$LPM_FAKE_NODE_MARKER\"; fi\necho v{version}\n"
+        )
     };
     std::fs::write(&node_path, script).expect("write fake Node binary");
     set_test_binary_executable(&node_path);
