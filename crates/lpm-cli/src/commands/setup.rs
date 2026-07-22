@@ -158,10 +158,12 @@ pub async fn run(
 
         if uses_env {
             install_ui::warn("No token found — .npmrc uses ${LPM_TOKEN} placeholder.");
-            hint_line(&format!(
-                "Set {} in your CI environment.",
-                install_ui::cyan("LPM_TOKEN")
-            ));
+            eprintln!(
+                "  {} {} {}",
+                install_ui::dim("Set"),
+                install_ui::cyan("LPM_TOKEN"),
+                install_ui::dim("in your CI environment.")
+            );
         }
     }
 
