@@ -1,0 +1,9 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: connect_json
+---
+{
+  "status": "connected",
+  "platform": "railway",
+  "success": true
+}
