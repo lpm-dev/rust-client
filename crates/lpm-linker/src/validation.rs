@@ -1,4 +1,4 @@
-use lpm_common::LpmError;
+use lpm_common::{LpmError, is_symlink_or_junction};
 use std::path::{Component, Path, PathBuf};
 
 /// Validate a self-reference package name to prevent path traversal.
@@ -52,7 +52,7 @@ pub(crate) fn ensure_real_dir_with_prefix(
             path.display()
         ))
     })?;
-    if metadata.file_type().is_symlink() {
+    if is_symlink_or_junction(&metadata) {
         return Err(LpmError::Store(format!(
             "{prefix}refusing to write {label} through symlinked directory {}",
             path.display()

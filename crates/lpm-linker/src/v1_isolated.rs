@@ -14,7 +14,7 @@ use crate::validation::{
     is_safe_node_modules_entry_name, is_valid_self_ref_name, validate_bin_name,
     validate_bin_target,
 };
-use lpm_common::LpmError;
+use lpm_common::{LpmError, is_symlink_or_junction, remove_path_entry};
 use rayon::prelude::*;
 use std::path::{Component, Path, PathBuf};
 
@@ -265,7 +265,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             };
             // For scoped packages, check the full path
             let full_name = if entry_metadata.is_dir()
-                && !entry_metadata.file_type().is_symlink()
+                && !is_symlink_or_junction(&entry_metadata)
                 && name.starts_with('@')
             {
                 // Check children of scope dir
@@ -273,16 +273,16 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                     for se in scope_entries.flatten() {
                         let se_path = se.path();
                         let scoped_name = format!("{name}/{}", se.file_name().to_string_lossy());
-                        let is_symlink = se_path
+                        let is_link = se_path
                             .symlink_metadata()
-                            .is_ok_and(|m| m.file_type().is_symlink());
-                        if !is_symlink {
+                            .is_ok_and(|metadata| is_symlink_or_junction(&metadata));
+                        if !is_link {
                             continue;
                         }
                         let stale = !direct_names.contains(scoped_name.as_str());
                         let legacy_shape = is_legacy_wrapper_symlink_target(&se_path);
                         if stale || legacy_shape {
-                            let _ = std::fs::remove_file(&se_path);
+                            let _ = remove_path_entry(&se_path);
                             tracing::debug!(
                                 "incremental: removed {} root symlink {scoped_name}",
                                 if legacy_shape {
@@ -298,14 +298,14 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             } else {
                 name.clone()
             };
-            let is_symlink = entry_metadata.file_type().is_symlink();
-            if !is_symlink {
+            let is_link = is_symlink_or_junction(&entry_metadata);
+            if !is_link {
                 continue;
             }
             let stale = !direct_names.contains(full_name.as_str());
             let legacy_shape = is_legacy_wrapper_symlink_target(&entry_path);
             if stale || legacy_shape {
-                let _ = std::fs::remove_file(&entry_path);
+                let _ = remove_path_entry(&entry_path);
                 tracing::debug!(
                     "incremental: removed {} root symlink {full_name}",
                     if legacy_shape {
@@ -348,10 +348,10 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                 continue;
             }
             let path = entry.path();
-            let is_symlink = path
+            let is_link = path
                 .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink());
-            if is_symlink || !path.is_dir() {
+                .is_ok_and(|metadata| is_symlink_or_junction(&metadata));
+            if is_link || !path.is_dir() {
                 continue;
             }
             if name_str.starts_with('@') {
@@ -359,10 +359,10 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                 if let Ok(scope_entries) = std::fs::read_dir(&path) {
                     for se in scope_entries.flatten() {
                         let se_path = se.path();
-                        let se_is_symlink = se_path
+                        let se_is_link = se_path
                             .symlink_metadata()
-                            .is_ok_and(|m| m.file_type().is_symlink());
-                        if se_is_symlink || !se_path.is_dir() {
+                            .is_ok_and(|metadata| is_symlink_or_junction(&metadata));
+                        if se_is_link || !se_path.is_dir() {
                             continue;
                         }
                         if se_path.join("package.json").is_file() {
@@ -860,8 +860,8 @@ pub fn link_workspace_member(
     // technically symlinks so `remove_file` succeeds. The fallback handles
     // the rare case where someone (or another tool) put a real directory
     // there: we want the install to recover, not crash.
-    if link_path.symlink_metadata().is_ok() && std::fs::remove_file(&link_path).is_err() {
-        let _ = std::fs::remove_dir_all(&link_path);
+    if link_path.symlink_metadata().is_ok() {
+        let _ = remove_path_entry(&link_path);
     }
 
     // Compute the symlink target relative to the link's parent directory.

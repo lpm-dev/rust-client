@@ -11,10 +11,18 @@ use crate::wal::{WalRecord, WalWriter};
 /// rather than write a path the gc sweeper would interpret as
 /// untrusted.
 pub(super) fn relative_install_root(root: &LpmRoot, abs_path: &std::path::Path) -> Option<String> {
-    abs_path
-        .strip_prefix(root.global_root())
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+    let relative = abs_path.strip_prefix(root.global_root()).ok()?;
+    let mut serialized = String::with_capacity(relative.as_os_str().len());
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return None;
+        };
+        if !serialized.is_empty() {
+            serialized.push('/');
+        }
+        serialized.push_str(&segment.to_string_lossy());
+    }
+    (!serialized.is_empty()).then_some(serialized)
 }
 
 pub(super) fn compact_wal_if_quiescent(
@@ -39,4 +47,21 @@ pub(super) fn compact_wal_if_quiescent(
         return Ok(true);
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_install_root_uses_platform_independent_separators() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(temp.path());
+        let install_root = root.global_root().join("installs").join("pkg@1.0.0");
+
+        assert_eq!(
+            relative_install_root(&root, &install_root),
+            Some("installs/pkg@1.0.0".to_string())
+        );
+    }
 }

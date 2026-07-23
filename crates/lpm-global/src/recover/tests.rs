@@ -4,9 +4,9 @@ use crate::install_root::{InstallReadyMarker, write_marker};
 use crate::manifest::{
     AliasEntry, GlobalManifest, PackageEntry, PackageSource, PendingEntry, read_for, write_for,
 };
-use crate::wal::{
-    IntentPayload, OwnershipChange, TrustPruneEntry, TxKind, WalReader, WalRecord, WalWriter,
-};
+#[cfg(unix)]
+use crate::wal::WalReader;
+use crate::wal::{IntentPayload, OwnershipChange, TrustPruneEntry, TxKind, WalRecord, WalWriter};
 use chrono::Utc;
 use lpm_common::LpmRoot;
 use std::path::{Path, PathBuf};

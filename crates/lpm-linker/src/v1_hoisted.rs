@@ -10,7 +10,7 @@ use crate::validation::{
     ensure_child_dir, ensure_real_dir, filter_node_modules_entry_name, is_valid_self_ref_name,
     validate_bin_name, validate_bin_target,
 };
-use lpm_common::LpmError;
+use lpm_common::{LpmError, is_symlink_or_junction, remove_path_entry};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -100,14 +100,7 @@ pub fn link_packages_hoisted(
             let name = entry.file_name();
             if name != ".bin" {
                 let path = entry.path();
-                if path
-                    .symlink_metadata()
-                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-                {
-                    let _ = std::fs::remove_dir_all(&path);
-                } else {
-                    let _ = std::fs::remove_file(&path);
-                }
+                let _ = remove_path_entry(&path);
             }
         }
     }
@@ -162,11 +155,11 @@ pub fn link_packages_hoisted(
                 continue;
             }
             let path = entry.path();
-            let is_symlink = path
+            let is_link = path
                 .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink());
-            if is_symlink {
-                let _ = std::fs::remove_file(&path);
+                .is_ok_and(|metadata| is_symlink_or_junction(&metadata));
+            if is_link {
+                let _ = remove_path_entry(&path);
                 tracing::debug!(
                     "hoisted: removed stale isolated symlink at node_modules/{name_str}",
                 );
@@ -179,11 +172,11 @@ pub fn link_packages_hoisted(
             {
                 for se in scope_entries.flatten() {
                     let se_path = se.path();
-                    let se_is_symlink = se_path
+                    let se_is_link = se_path
                         .symlink_metadata()
-                        .is_ok_and(|m| m.file_type().is_symlink());
-                    if se_is_symlink {
-                        let _ = std::fs::remove_file(&se_path);
+                        .is_ok_and(|metadata| is_symlink_or_junction(&metadata));
+                    if se_is_link {
+                        let _ = remove_path_entry(&se_path);
                         tracing::debug!(
                             "hoisted: removed stale isolated symlink at node_modules/{}/{}",
                             name_str,
@@ -568,7 +561,7 @@ pub fn link_packages_hoisted(
                     create_symlink_or_junction(&target, &self_link)?;
                     self_referenced = true;
                 }
-                Ok(meta) if meta.file_type().is_symlink() => {
+                Ok(meta) if is_symlink_or_junction(&meta) => {
                     // Self-ref survived the sweep (rare). Trust it.
                     self_referenced = true;
                 }

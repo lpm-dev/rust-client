@@ -315,7 +315,11 @@ impl WalWriter {
             std::fs::create_dir_all(parent)?;
         }
         let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).read(true).append(true);
+        // `append(true)` alone opens a Windows handle with FILE_APPEND_DATA,
+        // which cannot service `File::set_len`. Recovery compacts and repairs
+        // this same WAL through `truncate_to*`, so request ordinary write
+        // access as well as append positioning.
+        open_opts.create(true).read(true).write(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;

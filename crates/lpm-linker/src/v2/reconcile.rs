@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use lpm_common::LpmError;
-use lpm_common::symlink::create_dir_symlink_or_junction;
+use lpm_common::symlink::{
+    create_dir_symlink_or_junction, is_symlink_or_junction, remove_path_entry,
+};
 use lpm_store::v2::Store;
 
 use super::V2Target;
@@ -74,7 +76,7 @@ pub(super) fn reconcile_project_node_modules(
         }
         let is_real_dir = path
             .symlink_metadata()
-            .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+            .map(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata))
             .unwrap_or(false);
         if preserve_internal_lpm_dir && name == ".lpm" && is_real_dir {
             continue;
@@ -120,16 +122,11 @@ pub(super) fn reconcile_scoped_root_dir(
 }
 
 pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), LpmError> {
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
+    match path.symlink_metadata() {
+        Ok(_) => {}
         Err(_) => return Ok(()),
-    };
-    let result = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    };
-    result.map_err(|e| {
+    }
+    remove_path_entry(path).map_err(|e| {
         LpmError::Store(format!(
             "v2 linker: failed to remove {label} at {}: {e}",
             path.display()
@@ -185,8 +182,7 @@ pub(super) fn create_root_symlinks(
             // pass; if it still fails, escalate.
             for attempt in 0..2u8 {
                 if link_path.symlink_metadata().is_ok() {
-                    let _ = std::fs::remove_file(&link_path);
-                    let _ = std::fs::remove_dir_all(&link_path);
+                    let _ = remove_path_entry(&link_path);
                 }
                 match create_dir_symlink_or_junction(&target_path, &link_path) {
                     Ok(()) => break,

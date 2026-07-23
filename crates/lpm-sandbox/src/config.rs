@@ -1080,14 +1080,15 @@ mod tests {
         let allowlist = [unix_abs_pathbuf("/abs")];
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
         assert_eq!(v.len(), 3);
-        assert_eq!(v[0], unix_abs_pathbuf("/abs/one"));
+        let allowlist_root = AuthorizedRoot::resolve(&allowlist[0]).expect("resolve allowlist");
+        assert_eq!(v[0], allowlist_root.effective.join("one"));
         assert_eq!(
             v[1],
             std::fs::canonicalize(&e.project)
                 .expect("canonical project")
                 .join("rel-two")
         );
-        assert_eq!(v[2], unix_abs_pathbuf("/abs/three"));
+        assert_eq!(v[2], allowlist_root.effective.join("three"));
     }
 
     #[test]
@@ -1573,7 +1574,8 @@ mod tests {
         ));
         let allowlist = [unix_abs_pathbuf("/Users/alice/src")];
         let v = load_sandbox_write_dirs(&e.package_json, &e.project, &allowlist, None).unwrap();
-        assert_eq!(v, vec![unix_abs_pathbuf("/Users/alice/src/build-output")]);
+        let allowlist_root = AuthorizedRoot::resolve(&allowlist[0]).expect("resolve allowlist");
+        assert_eq!(v, vec![allowlist_root.effective.join("build-output")]);
     }
 
     /// Non-descendant absolute path rejected when allowlist is non-empty.

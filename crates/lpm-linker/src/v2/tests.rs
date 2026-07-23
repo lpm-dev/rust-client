@@ -3,7 +3,20 @@ use crate::LinkDependency;
 #[cfg(target_os = "macos")]
 use lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME;
 use lpm_store::v2::Store as V2Store;
+use std::path::Path;
 use std::path::PathBuf;
+
+fn bin_shim_path(project: &Path, name: &str) -> PathBuf {
+    let bin_dir = project.join("node_modules").join(".bin");
+    #[cfg(windows)]
+    {
+        bin_dir.join(format!("{name}.cmd"))
+    }
+    #[cfg(not(windows))]
+    {
+        bin_dir.join(name)
+    }
+}
 
 fn synthetic_sri(seed: &[u8]) -> String {
     lpm_store::compute_sri_hash(seed)
@@ -772,13 +785,7 @@ fn link_packages_v2_skips_compatibility_for_dependency_free_direct_bin() {
             .exists(),
         "dependency-free direct bins should not need compatibility islands"
     );
-    assert!(
-        project
-            .join("node_modules")
-            .join(".bin")
-            .join("tool")
-            .exists()
-    );
+    assert!(bin_shim_path(&project, "tool").exists());
 }
 
 #[test]
@@ -2439,7 +2446,7 @@ fn link_packages_v2_removes_stale_bin_shims_when_bins_disappear() {
         None,
     )
     .unwrap();
-    assert!(project.join("node_modules").join(".bin").join("a").exists());
+    assert!(bin_shim_path(&project, "a").exists());
 
     let without_bin_sri = synthetic_sri(b"v2/stale-bin/without");
     write_object(
@@ -2456,7 +2463,7 @@ fn link_packages_v2_removes_stale_bin_shims_when_bins_disappear() {
     )
     .unwrap();
 
-    assert!(!project.join("node_modules").join(".bin").join("a").exists());
+    assert!(!bin_shim_path(&project, "a").exists());
 }
 
 /// A root link name with `..` would escape `node_modules/` and could

@@ -12,6 +12,38 @@ use crate::validation::{is_valid_self_ref_name, validate_bin_name};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+fn bin_shim_path(bin_dir: &Path, name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        bin_dir.join(format!("{name}.cmd"))
+    }
+    #[cfg(not(windows))]
+    {
+        bin_dir.join(name)
+    }
+}
+
+fn assert_directory_link_target(link: &Path, expected_relative_target: &Path, message: &str) {
+    #[cfg(windows)]
+    {
+        let expected = link
+            .parent()
+            .unwrap()
+            .join(expected_relative_target)
+            .canonicalize()
+            .unwrap();
+        assert_eq!(link.canonicalize().unwrap(), expected, "{message}");
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(
+            std::fs::read_link(link).unwrap(),
+            expected_relative_target,
+            "{message}"
+        );
+    }
+}
+
 fn create_fake_store_package(dir: &Path, name: &str) -> PathBuf {
     let pkg_dir = dir.join(name);
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -194,7 +226,7 @@ fn bin_links_created_for_string_bin() {
     let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
     assert_eq!(result.bin_linked, 1);
 
-    let bin_link = project_dir.path().join("node_modules/.bin/my-tool");
+    let bin_link = bin_shim_path(&project_dir.path().join("node_modules/.bin"), "my-tool");
     assert!(
         bin_link.symlink_metadata().is_ok(),
         ".bin/my-tool should exist"
@@ -230,16 +262,12 @@ fn bin_links_created_for_map_bin() {
     assert_eq!(result.bin_linked, 2);
 
     assert!(
-        project_dir
-            .path()
-            .join("node_modules/.bin/cmd-a")
+        bin_shim_path(&project_dir.path().join("node_modules/.bin"), "cmd-a")
             .symlink_metadata()
             .is_ok()
     );
     assert!(
-        project_dir
-            .path()
-            .join("node_modules/.bin/cmd-b")
+        bin_shim_path(&project_dir.path().join("node_modules/.bin"), "cmd-b")
             .symlink_metadata()
             .is_ok()
     );
@@ -2377,7 +2405,7 @@ fn mode_switch_hoisted_to_isolated_replaces_root_dir_with_symlink() {
 
     let post_iso_meta = express_path.symlink_metadata().unwrap();
     assert!(
-        post_iso_meta.file_type().is_symlink(),
+        lpm_common::is_symlink_or_junction(&post_iso_meta),
         "post-isolated: node_modules/express MUST be a symlink (was hoisted dir)"
     );
 
@@ -2433,11 +2461,7 @@ fn mode_switch_isolated_to_hoisted_replaces_root_symlink_with_dir() {
     link_packages(project_dir.path(), &packages, false, None).unwrap();
     let lodash_path = project_dir.path().join("node_modules").join("lodash");
     assert!(
-        lodash_path
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink(),
+        lpm_common::is_symlink_or_junction(&lodash_path.symlink_metadata().unwrap()),
         "post-isolated: node_modules/lodash must be a symlink"
     );
 
@@ -2448,7 +2472,7 @@ fn mode_switch_isolated_to_hoisted_replaces_root_symlink_with_dir() {
 
     let post_hoisted_meta = lodash_path.symlink_metadata().unwrap();
     assert!(
-        !post_hoisted_meta.file_type().is_symlink(),
+        !lpm_common::is_symlink_or_junction(&post_hoisted_meta),
         "post-hoisted: node_modules/lodash MUST be a real directory (was isolated symlink)"
     );
     assert!(
@@ -3465,15 +3489,19 @@ fn materialize_directory_source_symlinks_target_canonical_source() {
     let dst = root.path().join("dst");
     materialize_directory_source(&src, &dst).unwrap();
 
-    let link_target = std::fs::read_link(dst.join("index.js")).unwrap();
+    let link = dst.join("index.js");
+    let link_target = std::fs::read_link(&link).unwrap();
     // Symlinks are absolute.
     assert!(
         link_target.is_absolute(),
         "wrapper symlinks must be absolute, got {link_target:?}",
     );
     // And they point at the canonicalized source path.
-    let canon_src = src.canonicalize().unwrap();
-    assert_eq!(link_target, canon_src.join("index.js"));
+    let source_file = src.join("index.js");
+    assert_eq!(
+        link.canonicalize().unwrap(),
+        source_file.canonicalize().unwrap()
+    );
 }
 
 #[test]
@@ -4283,7 +4311,6 @@ fn link_finalize_directory_root_symlink_targets_plus_wrapper() {
     link_packages(&project_dir, &[target], false, None).unwrap();
 
     let root_link = project_dir.join("node_modules/local-bar");
-    let symlink_target = std::fs::read_link(&root_link).unwrap();
     // Relative shape:
     // `node_modules/local-bar` → `../.lpm/wrappers/local-bar+f-.../node_modules/local-bar`
     let expected = PathBuf::from("..")
@@ -4292,7 +4319,7 @@ fn link_finalize_directory_root_symlink_targets_plus_wrapper() {
         .join("local-bar+f-cafebabe00000000")
         .join("node_modules")
         .join("local-bar");
-    assert_eq!(symlink_target, expected);
+    assert_directory_link_target(&root_link, &expected, "directory root link target");
 }
 
 // ── Legacy root-symlink retarget ─────────────────────────────────
@@ -4580,17 +4607,16 @@ fn link_finalize_retargets_legacy_root_symlink_after_migration() {
 
     // The root symlink must now point at the NEW wrapper shape,
     // and the resolved target must actually exist (no broken link).
-    let resolved_target = std::fs::read_link(&root_link).unwrap();
     let expected = PathBuf::from("..")
         .join(".lpm")
         .join("wrappers")
         .join("express@4.22.1")
         .join("node_modules")
         .join("express");
-    assert_eq!(
-        resolved_target, expected,
-        "post-migration root symlink must point at the new wrapper shape, \
-             not the wiped legacy location"
+    assert_directory_link_target(
+        &root_link,
+        &expected,
+        "post-migration root symlink must point at the new wrapper shape, not the wiped legacy location",
     );
     // `node_modules/express/package.json` resolves through the
     // new symlink — proves the install actually works.
@@ -4632,14 +4658,17 @@ fn link_one_package_dep_target_uses_plus_shape_for_file_source_edge() {
 
     // Inside parent's wrapper, `local-dep` symlink target uses `+`-shape.
     let dep_link = project_dir.join(".lpm/wrappers/parent@1.0.0/node_modules/local-dep");
-    let target = std::fs::read_link(&dep_link).unwrap();
     // Expected: `../../local-dep+f-deadbeef00000000/node_modules/local-dep`
     let expected = PathBuf::from("..")
         .join("..")
         .join("local-dep+f-deadbeef00000000")
         .join("node_modules")
         .join("local-dep");
-    assert_eq!(target, expected, "file source edge must route to + shape");
+    assert_directory_link_target(
+        &dep_link,
+        &expected,
+        "file source edge must route to + shape",
+    );
 }
 
 #[test]
@@ -4671,13 +4700,16 @@ fn link_one_package_dep_target_uses_plus_shape_for_link_source_edge() {
     link_packages(&project_dir, &[parent], false, None).unwrap();
 
     let dep_link = project_dir.join(".lpm/wrappers/parent@1.0.0/node_modules/linked-dep");
-    let target = std::fs::read_link(&dep_link).unwrap();
     let expected = PathBuf::from("..")
         .join("..")
         .join("linked-dep+l-cafebabe00000000")
         .join("node_modules")
         .join("linked-dep");
-    assert_eq!(target, expected, "link source edge must route to + shape");
+    assert_directory_link_target(
+        &dep_link,
+        &expected,
+        "link source edge must route to + shape",
+    );
 }
 
 #[test]
@@ -4707,11 +4739,14 @@ fn link_one_package_dep_target_uses_at_shape_for_semver_version() {
     link_packages(&project_dir, &[parent], false, None).unwrap();
 
     let dep_link = project_dir.join(".lpm/wrappers/parent@1.0.0/node_modules/lodash");
-    let target = std::fs::read_link(&dep_link).unwrap();
     let expected = PathBuf::from("..")
         .join("..")
         .join("lodash@4.17.21")
         .join("node_modules")
         .join("lodash");
-    assert_eq!(target, expected, "SemVer dep_version MUST keep the @ shape");
+    assert_directory_link_target(
+        &dep_link,
+        &expected,
+        "SemVer dep_version MUST keep the @ shape",
+    );
 }
