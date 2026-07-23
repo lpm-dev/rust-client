@@ -27,7 +27,7 @@
 mod support;
 
 use serde_json::json;
-use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{
     TempProject, lpm_with_registry, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
@@ -64,6 +64,85 @@ fn make_source_pkg_tarball(
         .collect();
 
     make_tarball_from_pkg_json(pkg_json, &extras_borrowed)
+}
+
+fn iso8601_n_secs_ago(n_secs: i64) -> String {
+    use chrono::SecondsFormat;
+    let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+async fn mount_release_age_source_package(
+    mock: &MockRegistry,
+    package_name: &str,
+    dependency_spec: &str,
+) {
+    let source_tarball = make_source_pkg_tarball(
+        package_name,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {
+                "withDependency": { "type": "boolean" }
+            },
+            "dependencies": {
+                "withDependency": {
+                    "true": [dependency_spec]
+                }
+            },
+            "files": [
+                { "src": "ReleaseAge.jsx" }
+            ]
+        }),
+        &[("ReleaseAge.jsx", b"export const ReleaseAge = () => null;\n")],
+    );
+    mock.with_package(package_name, "1.0.0", &source_tarball)
+        .await;
+}
+
+async fn mount_release_age_source_dependency(mock: &MockRegistry) {
+    let mature_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "release-age-source-dep", "version": "1.0.0" }),
+        &[],
+    );
+    let fresh_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "release-age-source-dep", "version": "1.1.0" }),
+        &[],
+    );
+    let metadata = json!({
+        "name": "release-age-source-dep",
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "release-age-source-dep",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("release-age-source-dep", "1.0.0"),
+                    "integrity": compute_integrity(&mature_tarball),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": "release-age-source-dep",
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url("release-age-source-dep", "1.1.0"),
+                    "integrity": compute_integrity(&fresh_tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        "release-age-source-dep",
+        metadata,
+        &[("1.0.0", mature_tarball), ("1.1.0", fresh_tarball)],
+    )
+    .await;
 }
 
 // ─── Test 1: happy path ─────────────────────────────────────────────
@@ -222,6 +301,95 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
         Some("4.17.21"),
         "explicit Exact specs must be preserved verbatim; got {deps:?}"
     );
+}
+
+#[tokio::test]
+async fn lpm_add_bare_source_dependency_selects_latest_mature_version() {
+    let mock = MockRegistry::start().await;
+    mount_release_age_source_package(&mock, "release-age-source-pkg", "release-age-source-dep")
+        .await;
+    mount_release_age_source_dependency(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "add-release-age-fallback",
+            "version": "1.0.0",
+            "dependencies": {},
+            "lpm": { "minimumReleaseAge": 86400 }
+        }"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "release-age-source-pkg?withDependency=true",
+            "--yes",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run release-age-aware lpm add");
+
+    assert!(
+        output.status.success(),
+        "bare source dependency should select the latest mature version; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest["dependencies"]["release-age-source-dep"],
+        json!("^1.0.0")
+    );
+    let installed: serde_json::Value = serde_json::from_str(
+        &project.read_file("node_modules/release-age-source-dep/package.json"),
+    )
+    .unwrap();
+    assert_eq!(installed["version"], json!("1.0.0"));
+}
+
+#[tokio::test]
+async fn lpm_add_explicit_source_range_does_not_select_version_below_its_lower_bound() {
+    let mock = MockRegistry::start().await;
+    mount_release_age_source_package(
+        &mock,
+        "explicit-release-age-source-pkg",
+        "release-age-source-dep@^1.1.0",
+    )
+    .await;
+    mount_release_age_source_dependency(&mock).await;
+
+    let original_manifest = r#"{
+        "name": "add-explicit-release-age",
+        "version": "1.0.0",
+        "dependencies": {},
+        "lpm": { "minimumReleaseAge": 86400 }
+    }"#;
+    let project = TempProject::empty(original_manifest);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "explicit-release-age-source-pkg?withDependency=true",
+            "--yes",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run explicit-range lpm add");
+
+    assert!(
+        !output.status.success(),
+        "explicit ^1.1.0 must not fall back to mature 1.0.0; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("release-age-source-dep@^1.1.0")
+            && stderr.contains("published too recently"),
+        "explicit range failure must report the unchanged range and release-age block:\n{stderr}"
+    );
+    assert_eq!(project.read_file("package.json"), original_manifest);
 }
 
 #[tokio::test]
