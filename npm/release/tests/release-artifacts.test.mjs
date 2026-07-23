@@ -14,8 +14,9 @@ import {
   parseReleaseVersion,
   runtimePlatformKey,
 } from "../release-artifacts.mjs";
+import { npmInvocation } from "../npm-invocation.mjs";
 import { prepareReleasePackages } from "../prepare-packages.mjs";
-import { npmInvocation, smokeInstall } from "../smoke-install.mjs";
+import { smokeInstall } from "../smoke-install.mjs";
 
 test("release versions accept stable and prerelease semver values", () => {
   assert.equal(parseReleaseVersion("0.69.0"), "0.69.0");
