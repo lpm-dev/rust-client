@@ -1,4 +1,5 @@
 mod coolify;
+mod github_actions;
 mod railway;
 
 use super::prelude::*;
@@ -16,6 +17,13 @@ const VERCEL_ID_MAX_CHARS: usize = 100;
 const COOLIFY_URL_MAX_CHARS: usize = 2048;
 const COOLIFY_APPLICATION_ID_MAX_CHARS: usize = 128;
 const RAILWAY_ID_MAX_CHARS: usize = 128;
+
+fn is_supported_platform(platform: &str) -> bool {
+    matches!(
+        platform,
+        "vercel" | "coolify" | "railway" | "github-actions"
+    )
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +59,27 @@ struct PlatformVariable {
     scope: VariableScope,
 }
 
+#[derive(Debug, Default)]
+struct PlatformState {
+    readable: HashMap<String, PlatformVariable>,
+    write_only: HashSet<String>,
+}
+
+impl PlatformState {
+    fn from_readable(readable: HashMap<String, PlatformVariable>) -> Self {
+        Self {
+            readable,
+            write_only: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LocalPlatformValues {
+    readable: HashMap<String, String>,
+    write_only: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 enum VariableScope {
     Vercel {
@@ -63,6 +92,7 @@ enum VariableScope {
         is_shown_once: bool,
     },
     Railway,
+    GitHubActions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,8 +123,48 @@ struct PlatformDiff {
     changed: Vec<String>,
     removed: Vec<String>,
     unchanged: Vec<String>,
+    write_only_added: Vec<String>,
+    write_only_present: Vec<String>,
+    write_only_removed: Vec<String>,
 }
 
+impl PlatformDiff {
+    fn added_count(&self) -> usize {
+        self.added.len() + self.write_only_added.len()
+    }
+
+    fn updated_count(&self) -> usize {
+        self.changed.len() + self.write_only_present.len()
+    }
+
+    fn removed_count(&self) -> usize {
+        self.removed.len() + self.write_only_removed.len()
+    }
+
+    fn has_push_mutations(&self) -> bool {
+        self.added_count() > 0 || self.updated_count() > 0 || self.removed_count() > 0
+    }
+
+    fn has_known_drift(&self) -> bool {
+        self.added_count() > 0 || !self.changed.is_empty() || self.removed_count() > 0
+    }
+
+    fn drift_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .added
+            .iter()
+            .chain(&self.changed)
+            .chain(&self.removed)
+            .chain(&self.write_only_added)
+            .chain(&self.write_only_removed)
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.truncate(20);
+        keys
+    }
+}
 #[derive(Debug, Clone, Copy, Default)]
 struct PlatformPushResult {
     added: usize,
@@ -166,6 +236,23 @@ impl PlatformApplyError {
     fn into_error(self) -> LpmError {
         match self {
             Self::Untracked(error) | Self::Tracked { error, .. } => *error,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PlatformApplyError {
+    Untracked(LpmError),
+    Tracked {
+        error: LpmError,
+        applied: PlatformPushResult,
+    },
+}
+
+impl PlatformApplyError {
+    fn error(&self) -> &LpmError {
+        match self {
+            Self::Untracked(error) | Self::Tracked { error, .. } => error,
         }
     }
 }
@@ -573,6 +660,7 @@ fn append_platform_error_context(error: LpmError, context: String) -> LpmError {
 enum PlatformClient {
     Vercel(VercelClient),
     Coolify(coolify::CoolifyClient),
+    GitHubActions(github_actions::GitHubActionsClient),
     Railway(railway::RailwayClient),
 }
 
@@ -601,6 +689,18 @@ impl PlatformClient {
                     config,
                 )?))
             }
+            "github-actions" => {
+                let config =
+                    serde_json::from_value::<github_actions::GitHubActionsConnectionConfig>(
+                        connection.connection_config.clone(),
+                    )
+                    .map_err(|error| {
+                        LpmError::Script(format!("invalid GitHub Actions connection: {error}"))
+                    })?;
+                Ok(Self::GitHubActions(
+                    github_actions::GitHubActionsClient::new(connection.token.clone(), config)?,
+                ))
+            }
             "railway" => {
                 let config = serde_json::from_value::<railway::RailwayConnectionConfig>(
                     connection.connection_config.clone(),
@@ -614,7 +714,7 @@ impl PlatformClient {
                 )?))
             }
             platform => Err(LpmError::Script(format!(
-                "unsupported env platform '{platform}'; use vercel, coolify, or railway"
+                "unsupported env platform '{platform}'; use vercel, coolify, railway, or github-actions"
             ))),
         }
     }
@@ -623,6 +723,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(_) => "Vercel",
             Self::Coolify(_) => "Coolify",
+            Self::GitHubActions(_) => "GitHub Actions",
             Self::Railway(_) => "Railway",
         }
     }
@@ -631,6 +732,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(client) => client.config.linked_env.as_deref(),
             Self::Coolify(client) => client.config().linked_env.as_deref(),
+            Self::GitHubActions(client) => client.config().linked_env.as_deref(),
             Self::Railway(client) => client.config().linked_env.as_deref(),
         }
     }
@@ -639,30 +741,66 @@ impl PlatformClient {
         match self {
             Self::Vercel(_) => is_vercel_managed_variable(key),
             Self::Coolify(_) => coolify::CoolifyClient::is_managed(key),
+            Self::GitHubActions(_) => false,
             Self::Railway(_) => railway::RailwayClient::is_managed(key),
         }
     }
 
-    async fn list(&self) -> Result<HashMap<String, PlatformVariable>, LpmError> {
+    fn partition_local(
+        &self,
+        project_dir: &std::path::Path,
+        local: &HashMap<String, String>,
+    ) -> Result<LocalPlatformValues, LpmError> {
         match self {
-            Self::Vercel(client) => client.list().await,
-            Self::Coolify(client) => client.list().await,
-            Self::Railway(client) => client.list().await,
+            Self::GitHubActions(_) => {
+                let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(|error| {
+                    LpmError::Script(format!(
+                        "failed to read lpm.json for GitHub Actions value classification: {error}"
+                    ))
+                })?;
+                github_actions::partition_local_values(
+                    local,
+                    config
+                        .as_ref()
+                        .and_then(|configuration| configuration.env_schema.as_ref()),
+                )
+            }
+            _ => Ok(LocalPlatformValues {
+                readable: local.clone(),
+                write_only: HashMap::new(),
+            }),
+        }
+    }
+
+    fn secret_verification(&self) -> &'static str {
+        match self {
+            Self::GitHubActions(_) => "names_only",
+            _ => "exact",
+        }
+    }
+
+    async fn list(&self) -> Result<PlatformState, LpmError> {
+        match self {
+            Self::Vercel(client) => client.list().await.map(PlatformState::from_readable),
+            Self::Coolify(client) => client.list().await.map(PlatformState::from_readable),
+            Self::GitHubActions(client) => client.list().await,
+            Self::Railway(client) => client.list().await.map(PlatformState::from_readable),
         }
     }
 
     async fn apply(
         &self,
         diff: &PlatformDiff,
-        local: &HashMap<String, String>,
-        remote: &HashMap<String, PlatformVariable>,
+        local: &LocalPlatformValues,
+        remote: &PlatformState,
         clean: bool,
     ) -> Result<PlatformPushResult, PlatformApplyError> {
         match self {
-            Self::Vercel(client) => client.apply(diff, local, remote).await,
-            Self::Coolify(client) => client.apply(diff, local, remote).await,
+            Self::Vercel(client) => client.apply(diff, &local.readable, &remote.readable).await,
+            Self::Coolify(client) => client.apply(diff, &local.readable, &remote.readable).await,
+            Self::GitHubActions(client) => client.apply(diff, local, remote, clean).await,
             Self::Railway(client) => client
-                .apply(diff, local, remote, clean)
+                .apply(diff, &local.readable, &remote.readable, clean)
                 .await
                 .map_err(PlatformApplyError::untracked),
         }
@@ -726,42 +864,66 @@ fn json_scalar_string(value: serde_json::Value) -> Option<String> {
 
 fn compute_diff(
     client: &PlatformClient,
-    remote: &HashMap<String, PlatformVariable>,
-    local: &HashMap<String, String>,
+    remote: &PlatformState,
+    local: &LocalPlatformValues,
     clean: bool,
 ) -> PlatformDiff {
     let mut added = Vec::new();
     let mut changed = Vec::new();
     let mut unchanged = Vec::new();
-    for (key, value) in local {
+    for (key, value) in &local.readable {
         if client.is_managed(key) {
             continue;
         }
-        match remote.get(key) {
+        match remote.readable.get(key) {
             None => added.push(key.clone()),
             Some(existing) if existing.value != *value => changed.push(key.clone()),
             Some(_) => unchanged.push(key.clone()),
         }
     }
 
-    let mut removed = if clean {
-        remote
-            .keys()
-            .filter(|key| !local.contains_key(*key) && !client.is_managed(key))
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut removed: Vec<String> = remote
+        .readable
+        .keys()
+        .filter(|key| {
+            !client.is_managed(key)
+                && (local.write_only.contains_key(*key)
+                    || (clean && !local.readable.contains_key(*key)))
+        })
+        .cloned()
+        .collect();
+    let mut write_only_added = Vec::new();
+    let mut write_only_present = Vec::new();
+    for key in local.write_only.keys() {
+        if remote.write_only.contains(key) {
+            write_only_present.push(key.clone());
+        } else {
+            write_only_added.push(key.clone());
+        }
+    }
+    let mut write_only_removed: Vec<String> = remote
+        .write_only
+        .iter()
+        .filter(|key| {
+            local.readable.contains_key(*key) || (clean && !local.write_only.contains_key(*key))
+        })
+        .cloned()
+        .collect();
     added.sort_unstable();
     changed.sort_unstable();
     removed.sort_unstable();
     unchanged.sort_unstable();
+    write_only_added.sort_unstable();
+    write_only_present.sort_unstable();
+    write_only_removed.sort_unstable();
     PlatformDiff {
         added,
         changed,
         removed,
         unchanged,
+        write_only_added,
+        write_only_present,
+        write_only_removed,
     }
 }
 
@@ -959,7 +1121,7 @@ pub(super) async fn vars_connect(
 ) -> Result<(), LpmError> {
     let platform = args.first().copied().ok_or_else(|| {
         LpmError::Script(
-            "usage: lpm env connect <vercel|coolify|railway> [platform options] [--token=<token>]"
+            "usage: lpm env connect <vercel|coolify|railway|github-actions> [platform options] [--token=<token>]"
                 .into(),
         )
     })?;
@@ -968,10 +1130,11 @@ pub(super) async fn vars_connect(
     let display_name = match platform {
         "vercel" => "Vercel",
         "coolify" => "Coolify",
+        "github-actions" => "GitHub Actions",
         "railway" => "Railway",
         _ => {
             return Err(LpmError::Script(format!(
-                "unsupported env platform '{platform}'; use vercel, coolify, or railway"
+                "unsupported env platform '{platform}'; use vercel, coolify, railway, or github-actions"
             )));
         }
     };
@@ -1047,6 +1210,36 @@ pub(super) async fn vars_connect(
             })?;
             let client = PlatformClient::Coolify(coolify_client);
             (client, config, format!("application: {application_id}"))
+        }
+        "github-actions" => {
+            let repository = parse_flag(args, "--repository")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --repository flag".into()))?;
+            let environment = parse_flag(args, "--environment").map(str::to_owned);
+            let github_client = github_actions::GitHubActionsClient::discover_config(
+                platform_token.clone(),
+                repository,
+                environment,
+                linked_env,
+            )
+            .await?;
+            let config = serde_json::to_value(github_client.config()).map_err(|error| {
+                LpmError::Script(format!(
+                    "failed to serialize GitHub Actions connection: {error}"
+                ))
+            })?;
+            let target = if let Some(environment) = &github_client.config().environment {
+                format!(
+                    "repository: {}, environment: {environment}",
+                    github_client.config().repository
+                )
+            } else {
+                format!(
+                    "repository: {}, repository scope",
+                    github_client.config().repository
+                )
+            };
+            (PlatformClient::GitHubActions(github_client), config, target)
         }
         "railway" => {
             let project_id = parse_flag(args, "--project")
@@ -1148,9 +1341,9 @@ pub(super) async fn vars_platform_push(
     let platform = parse_flag(args, "--to").ok_or_else(|| {
         LpmError::Script("missing --to flag. Usage: lpm env push --to <platform>".into())
     })?;
-    if !matches!(platform, "vercel" | "coolify" | "railway") {
+    if !is_supported_platform(platform) {
         return Err(LpmError::Script(
-            "unsupported env platform; use vercel, coolify, or railway".into(),
+            "unsupported env platform; use vercel, coolify, railway, or github-actions".into(),
         ));
     }
     let clean = args.contains(&"--clean");
@@ -1169,6 +1362,7 @@ pub(super) async fn vars_platform_push(
     let requested_env = parse_flag(args, "--env").or(client.linked_env());
     let resolved_env = resolve_env_name(project_dir, requested_env)?;
     let local = lpm_runner::dotenv::load_project_env(project_dir, resolved_env.as_deref())?;
+    let local = client.partition_local(project_dir, &local)?;
 
     if !json_output {
         output::info(&format!(
@@ -1180,18 +1374,26 @@ pub(super) async fn vars_platform_push(
     let orphan_count = if clean {
         0
     } else {
-        remote
+        let readable = remote
+            .readable
             .keys()
-            .filter(|key| !local.contains_key(*key) && !client.is_managed(key))
-            .count()
+            .filter(|key| !local.readable.contains_key(*key) && !client.is_managed(key))
+            .count();
+        let write_only = remote
+            .write_only
+            .iter()
+            .filter(|key| !local.write_only.contains_key(*key))
+            .count();
+        readable + write_only
     };
-    if diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty() {
+    if !diff.has_push_mutations() {
         if json_output {
             super::response::print_json_value(&serde_json::json!({
                 "success": true,
                 "status": "no_changes",
                 "platform": platform,
                 "orphans": orphan_count,
+                "secretVerification": client.secret_verification(),
             }));
         } else {
             output::success(&format!("{display_name} is already in sync"));
@@ -1228,6 +1430,28 @@ pub(super) async fn vars_platform_push(
                 )
             );
         }
+        for key in &diff.write_only_added {
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::green("+"),
+                    install_ui::bold(key),
+                    install_ui::dim("(new write-only secret)"),
+                )
+            );
+        }
+        for key in &diff.write_only_present {
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::yellow("~"),
+                    install_ui::bold(key),
+                    install_ui::dim("(write-only secret will be refreshed)"),
+                )
+            );
+        }
         for key in &diff.removed {
             println!(
                 "{}",
@@ -1236,6 +1460,17 @@ pub(super) async fn vars_platform_push(
                     install_ui::red("-"),
                     install_ui::bold(key),
                     install_ui::dim("(will be removed)"),
+                )
+            );
+        }
+        for key in &diff.write_only_removed {
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} {}",
+                    install_ui::red("-"),
+                    install_ui::bold(key),
+                    install_ui::dim("(write-only secret will be removed)"),
                 )
             );
         }
@@ -1248,9 +1483,9 @@ pub(super) async fn vars_platform_push(
     if !yes && !json_output {
         let confirmed = cliclack::confirm(format!(
             "Push {} added, {} changed, {} removed to {display_name}?",
-            diff.added.len(),
-            diff.changed.len(),
-            diff.removed.len()
+            diff.added_count(),
+            diff.updated_count(),
+            diff.removed_count()
         ))
         .initial_value(false)
         .interact()
@@ -1307,6 +1542,7 @@ pub(super) async fn vars_platform_push(
             "added": result.added,
             "updated": result.updated,
             "removed": result.removed,
+            "secretVerification": client.secret_verification(),
             "auditRecorded": audit.is_ok(),
         }));
     } else {
@@ -1341,7 +1577,7 @@ pub(super) async fn vars_platform_status(
             }));
         } else {
             output::warn(
-                "no platform connections. Run `lpm env connect vercel`, `lpm env connect coolify`, or `lpm env connect railway` first.",
+                "no platform connections. Run `lpm env connect vercel`, `lpm env connect coolify`, `lpm env connect railway`, or `lpm env connect github-actions` first.",
             );
         }
         return Ok(());
@@ -1366,7 +1602,21 @@ pub(super) async fn vars_platform_status(
         };
         let env_name = client.linked_env().unwrap_or("default");
         let mode = (env_name != "default").then_some(env_name);
-        let local = match lpm_runner::dotenv::load_project_env(project_dir, mode) {
+        let loaded_local = match lpm_runner::dotenv::load_project_env(project_dir, mode) {
+            Ok(local) => local,
+            Err(error) => {
+                statuses.push(serde_json::json!({
+                    "platform": connection.platform,
+                    "label": label,
+                    "env": env_name,
+                    "status": "error",
+                    "error": error.to_string(),
+                    "lastPushAt": last_push_at,
+                }));
+                continue;
+            }
+        };
+        let local = match client.partition_local(project_dir, &loaded_local) {
             Ok(local) => local,
             Err(error) => {
                 statuses.push(serde_json::json!({
@@ -1383,28 +1633,28 @@ pub(super) async fn vars_platform_status(
         match client.list().await {
             Ok(remote) => {
                 let diff = compute_diff(&client, &remote, &local, true);
-                let mut drift_keys = diff
-                    .added
-                    .iter()
-                    .chain(&diff.changed)
-                    .chain(&diff.removed)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                drift_keys.sort_unstable();
-                drift_keys.truncate(20);
-                let status = if drift_keys.is_empty() {
-                    "synced"
-                } else {
+                let drift_keys = diff.drift_keys();
+                let status = if diff.has_known_drift() {
                     "drifted"
+                } else if client.secret_verification() == "names_only"
+                    && !diff.write_only_present.is_empty()
+                {
+                    "names_only"
+                } else {
+                    "synced"
                 };
                 statuses.push(serde_json::json!({
                     "platform": connection.platform,
                     "label": label,
                     "env": env_name,
                     "status": status,
-                    "added": diff.added.len(),
+                    "added": diff.added_count(),
                     "changed": diff.changed.len(),
-                    "removed": diff.removed.len(),
+                    "removed": diff.removed_count(),
+                    "secretVerification": client.secret_verification(),
+                    "secretNamesPresent": diff.write_only_present.len(),
+                    "secretNamesMissing": diff.write_only_added.len(),
+                    "secretNamesExtra": diff.write_only_removed.len(),
                     "driftKeys": drift_keys,
                     "lastPushAt": last_push_at,
                 }));
@@ -1444,6 +1694,18 @@ pub(super) async fn vars_platform_status(
                     install_ui::green("synced"),
                 )
             ),
+            "names_only" => println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {} [{}]  {}",
+                    install_ui::green("✓"),
+                    install_ui::bold(platform),
+                    env,
+                    install_ui::yellow(
+                        "variables synced; secret names verified (values are write-only)"
+                    ),
+                )
+            ),
             "drifted" => println!(
                 "{}",
                 install_ui::terminal_line!(
@@ -1481,9 +1743,9 @@ pub(super) async fn vars_platform_pull(
     let platform = parse_flag(args, "--from").ok_or_else(|| {
         LpmError::Script("missing --from flag. Usage: lpm env pull --from <platform>".into())
     })?;
-    if !matches!(platform, "vercel" | "coolify" | "railway") {
+    if !is_supported_platform(platform) {
         return Err(LpmError::Script(
-            "unsupported env platform; use vercel, coolify, or railway".into(),
+            "unsupported env platform; use vercel, coolify, railway, or github-actions".into(),
         ));
     }
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
@@ -1506,22 +1768,37 @@ pub(super) async fn vars_platform_pull(
         ));
     }
     let remote = client.list().await?;
-    if remote.is_empty() {
+    let skipped_secrets = remote.write_only.len();
+    if remote.readable.is_empty() {
+        let status = if skipped_secrets > 0 {
+            "no_readable_values"
+        } else {
+            "no_values"
+        };
         if json_output {
             super::response::print_json_value(&serde_json::json!({
                 "success": true,
-                "status": "no_values",
+                "status": status,
                 "platform": platform,
                 "env": env_name,
                 "count": 0,
+                "skippedSecrets": skipped_secrets,
+                "secretVerification": client.secret_verification(),
             }));
         } else {
-            output::warn(&format!("no env values found on {display_name}"));
+            if skipped_secrets > 0 {
+                output::warn(&format!(
+                    "no readable env values found on {display_name}; {skipped_secrets} write-only secret name(s) were skipped"
+                ));
+            } else {
+                output::warn(&format!("no env values found on {display_name}"));
+            }
         }
         return Ok(());
     }
 
     let mut values = remote
+        .readable
         .into_iter()
         .map(|(key, variable)| (key, variable.value))
         .collect::<Vec<_>>();
@@ -1578,6 +1855,8 @@ pub(super) async fn vars_platform_pull(
             "env": env_name,
             "count": pairs.len(),
             "keys": values.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            "skippedSecrets": skipped_secrets,
+            "secretVerification": client.secret_verification(),
             "auditRecorded": audit.is_ok(),
         }));
     } else {
@@ -1585,6 +1864,11 @@ pub(super) async fn vars_platform_pull(
             "imported {} value(s) from {display_name} into {env_name}",
             pairs.len()
         ));
+        if skipped_secrets > 0 {
+            output::warn(&format!(
+                "{skipped_secrets} write-only GitHub Actions secret name(s) were not imported"
+            ));
+        }
         if let Err(error) = audit {
             output::warn(&format!(
                 "Values were imported, but LPM could not record the audit entry: {error}"
@@ -1600,22 +1884,34 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn remote(entries: &[(&str, &str)]) -> HashMap<String, PlatformVariable> {
-        entries
-            .iter()
-            .map(|(key, value)| {
-                (
-                    (*key).to_string(),
-                    PlatformVariable {
-                        id: format!("id-{key}"),
-                        value: (*value).to_string(),
-                        scope: VariableScope::Vercel {
-                            targets: vec!["production".into()],
+    fn remote(entries: &[(&str, &str)]) -> PlatformState {
+        PlatformState::from_readable(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        (*key).to_string(),
+                        PlatformVariable {
+                            id: format!("id-{key}"),
+                            value: (*value).to_string(),
+                            scope: VariableScope::Vercel {
+                                targets: vec!["production".into()],
+                            },
                         },
-                    },
-                )
-            })
-            .collect()
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn local(entries: &[(&str, &str)]) -> LocalPlatformValues {
+        LocalPlatformValues {
+            readable: entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            write_only: HashMap::new(),
+        }
     }
 
     fn vercel_client(targets: &[&str]) -> VercelClient {
@@ -1665,10 +1961,7 @@ mod tests {
     #[test]
     fn diff_preserves_platform_only_values_without_clean() {
         let remote = remote(&[("UNCHANGED", "same"), ("ORPHAN", "remote")]);
-        let local = HashMap::from([
-            ("UNCHANGED".into(), "same".into()),
-            ("NEW".into(), "new".into()),
-        ]);
+        let local = local(&[("UNCHANGED", "same"), ("NEW", "new")]);
 
         let diff = compute_diff(&platform_client(&["production"]), &remote, &local, false);
 
@@ -1684,7 +1977,7 @@ mod tests {
         let diff = compute_diff(
             &platform_client(&["production"]),
             &remote,
-            &HashMap::new(),
+            &LocalPlatformValues::default(),
             true,
         );
 
@@ -1692,9 +1985,26 @@ mod tests {
     }
 
     #[test]
+    fn diff_moves_values_between_readable_and_write_only_namespaces() {
+        let mut remote = remote(&[("BECAME_SECRET", "stale-plaintext")]);
+        remote.write_only.insert("BECAME_PUBLIC".into());
+        let local = LocalPlatformValues {
+            readable: HashMap::from([("BECAME_PUBLIC".into(), "public-value".into())]),
+            write_only: HashMap::from([("BECAME_SECRET".into(), "secret-value".into())]),
+        };
+
+        let diff = compute_diff(&platform_client(&["production"]), &remote, &local, false);
+
+        assert_eq!(diff.added, ["BECAME_PUBLIC"]);
+        assert_eq!(diff.removed, ["BECAME_SECRET"]);
+        assert_eq!(diff.write_only_added, ["BECAME_SECRET"]);
+        assert_eq!(diff.write_only_removed, ["BECAME_PUBLIC"]);
+    }
+
+    #[test]
     fn managed_vercel_values_never_enter_the_diff() {
         let remote = remote(&[("VERCEL_URL", "remote")]);
-        let local = HashMap::from([("VERCEL_ENV".into(), "production".into())]);
+        let local = local(&[("VERCEL_ENV", "production")]);
 
         let diff = compute_diff(&platform_client(&["production"]), &remote, &local, true);
 

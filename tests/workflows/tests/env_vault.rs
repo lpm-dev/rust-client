@@ -3282,6 +3282,216 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
 }
 
 #[tokio::test]
+async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes() {
+    let project = TempProject::empty(r#"{"name":"github-actions-platform","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer_token = "github-actions-session-token";
+    let platform_token = "github-actions-platform-token";
+    let vault_id = "vault-github-actions-123";
+    let repository = "lpm-dev/example";
+    let repository_id = "123456789";
+    let environment = "production";
+
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+                "vault":"{vault_id}",
+                "envSchema":{{
+                    "vars":{{
+                        "PUBLIC_ORIGIN":{{"client":true}},
+                        "API_TOKEN":{{"secret":true}}
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(bearer_token),
+            refresh_token: Some("github-actions-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let initial_set = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "set",
+            "--env",
+            environment,
+            "PUBLIC_ORIGIN=https://example.test",
+            "API_TOKEN=local-secret",
+        ])
+        .output()
+        .expect("failed to seed GitHub Actions env values");
+    assert!(
+        initial_set.status.success(),
+        "env set failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial_set.stdout),
+        String::from_utf8_lossy(&initial_set.stderr),
+    );
+
+    mock.with_github_actions_platform_connect_success(
+        bearer_token,
+        vault_id,
+        repository,
+        repository_id,
+        serde_json::json!({
+            "status": "connected",
+            "platform": "github-actions",
+        }),
+    )
+    .await;
+    mock.with_platform_credentials_success_calls(
+        bearer_token,
+        vault_id,
+        serde_json::json!({
+            "connections": [
+                {
+                    "id": "connection-github-actions",
+                    "platform": "github-actions",
+                    "token": platform_token,
+                    "connectionConfig": {
+                        "repository": repository,
+                        "repositoryId": repository_id,
+                        "environment": environment,
+                        "linkedEnv": environment
+                    },
+                    "label": "production",
+                    "lastPushAt": null
+                }
+            ]
+        }),
+        3,
+    )
+    .await;
+    mock.with_github_actions_repository(platform_token, repository, 123_456_789, 6)
+        .await;
+    mock.with_github_actions_environment_lists(
+        platform_token,
+        repository_id,
+        environment,
+        serde_json::json!([
+            { "name": "PUBLIC_ORIGIN", "value": "https://example.test" }
+        ]),
+        serde_json::json!([{ "name": "API_TOKEN" }]),
+        4,
+    )
+    .await;
+    mock.with_platform_audit_success(
+        bearer_token,
+        vault_id,
+        "github-actions",
+        "pull",
+        &[("imported", 1)],
+    )
+    .await;
+    mock.with_github_actions_public_key(platform_token, repository_id, environment)
+        .await;
+    mock.with_github_actions_variable_update_failure(
+        platform_token,
+        repository_id,
+        environment,
+        "PUBLIC_ORIGIN",
+    )
+    .await;
+    mock.with_platform_audit_success(
+        bearer_token,
+        vault_id,
+        "github-actions",
+        "push_failed",
+        &[("added", 0), ("updated", 0), ("removed", 0)],
+    )
+    .await;
+
+    let command = || {
+        let mut command = lpm(&project);
+        command
+            .env("LPM_REGISTRY_URL", mock.url())
+            .env("ACCEPTANCE_RUN_ID", "workflow-platform-github-actions")
+            .env("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", mock.url());
+        command
+    };
+    let connect = command()
+        .args([
+            "--json",
+            "env",
+            "connect",
+            "github-actions",
+            "--repository",
+            repository,
+            "--environment",
+            environment,
+            "--token",
+            platform_token,
+            "--linked-env",
+            environment,
+        ])
+        .output()
+        .expect("failed to run lpm env connect github-actions --json");
+    assert!(
+        connect.status.success(),
+        "env connect github-actions failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&connect.stdout),
+        String::from_utf8_lossy(&connect.stderr),
+    );
+    let connect_json = parse_clean_json_stdout(&connect);
+    assert_eq!(connect_json["platform"], "github-actions");
+
+    let status = command()
+        .args(["--json", "env", "status"])
+        .output()
+        .expect("failed to run lpm env status --json");
+    assert!(status.status.success(), "env status failed");
+    let status_json = parse_clean_json_stdout(&status);
+    assert_eq!(status_json["platforms"][0]["status"], "names_only");
+    assert_eq!(
+        status_json["platforms"][0]["secretVerification"],
+        "names_only"
+    );
+    assert_eq!(status_json["platforms"][0]["secretNamesPresent"], 1);
+
+    let pull = command()
+        .args(["--json", "env", "pull", "--from", "github-actions", "--yes"])
+        .output()
+        .expect("failed to run lpm env pull --from github-actions");
+    assert!(pull.status.success(), "env pull failed");
+    let pull_json = parse_clean_json_stdout(&pull);
+    assert_eq!(pull_json["keys"], serde_json::json!(["PUBLIC_ORIGIN"]));
+    assert_eq!(pull_json["skippedSecrets"], 1);
+    assert_eq!(pull_json["secretVerification"], "names_only");
+
+    let changed = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "set",
+            "--env",
+            environment,
+            "PUBLIC_ORIGIN=https://changed.example.test",
+        ])
+        .output()
+        .expect("failed to change GitHub Actions variable");
+    assert!(changed.status.success(), "env set change failed");
+    let failed_push = command()
+        .args(["--json", "env", "push", "--to", "github-actions", "--yes"])
+        .output()
+        .expect("failed to run lpm env push --to github-actions");
+    assert!(!failed_push.status.success(), "denied push must fail");
+    let failed_json = parse_clean_json_stdout(&failed_push);
+    assert_eq!(failed_json["success"], false);
+    assert!(
+        failed_json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("workflow denied")),
+        "failed push should preserve the GitHub error: {failed_json}"
+    );
+}
+
+#[tokio::test]
 async fn env_platform_json_error_paths_emit_error_envelopes_on_stdout() {
     let cases: &[(&[&str], &str)] = &[
         (&["--json", "env", "log"], "no vault configured"),
