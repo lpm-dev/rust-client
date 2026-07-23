@@ -240,6 +240,27 @@ fn build_save_decisions(
     Ok(out)
 }
 
+fn resolve_source_dependency_version(
+    metadata: &lpm_registry::PackageMetadata,
+    intent: &crate::save_spec::UserSaveIntent,
+    policy: &lpm_resolver::ResolverPolicy,
+) -> Result<String, LpmError> {
+    match intent {
+        crate::save_spec::UserSaveIntent::Bare => {
+            crate::release_age_selection::latest_allowed_version_or_policy_error(metadata, policy)
+        }
+        crate::save_spec::UserSaveIntent::DistTag(tag) if tag == "latest" => {
+            crate::release_age_selection::latest_allowed_version_or_policy_error(metadata, policy)
+        }
+        crate::save_spec::UserSaveIntent::DistTag(tag) => {
+            crate::release_age_selection::resolve_version_spec_with_policy(metadata, tag, policy)
+        }
+        _ => Err(LpmError::Registry(
+            "source dependency version resolution requires a bare name or dist-tag".to_string(),
+        )),
+    }
+}
+
 /// Handle npm/LPM dependencies from lpm.config.json.
 ///
 /// Source-package deps install identically regardless of registry origin
@@ -251,9 +272,10 @@ fn build_save_decisions(
 /// - Author-provided ranges (`"react@^18"`, `"lodash@4.17.21"`) are
 ///   preserved verbatim.
 /// - Bare names (`"react"`) and dist-tags (`"react@latest"`) resolve
-///   against the registry; the resolved version flows into the
-///   user's project save-policy default — typically `^resolvedLatest`,
-///   or whatever `~/.lpm/config.toml > save-prefix|save-exact` says.
+///   against the registry under the project's release-age policy; the
+///   resolved version flows into the user's project save-policy default —
+///   typically `^resolved`, or whatever
+///   `~/.lpm/config.toml > save-prefix|save-exact` says.
 /// - Resolution is **per-package routed** through `RouteTable` so
 ///   `.npmrc`-declared private registries, the LPM Worker, and the
 ///   public npm registry all work for bare/dist-tag entries. Mirrors
@@ -298,7 +320,14 @@ pub(super) async fn handle_dependencies(
         install_ui::phase("Installing declared dependencies");
     }
 
-    // Resolve latest version for each Bare / DistTag entry up-front,
+    let resolver_policy = crate::release_age_selection::resolver_policy_for_project(
+        project_dir,
+        None,
+        false,
+        json_output,
+    )?;
+
+    // Resolve a policy-allowed version for each Bare / DistTag entry up-front,
     // dispatching per-package through `RouteTable`. The walker's
     // three-arm pattern (LPM batch / npm fan-out / custom registries)
     // is overkill for the typical < 10 source-package deps; serial
@@ -345,9 +374,10 @@ pub(super) async fn handle_dependencies(
                     ))
                 })?
         };
-        let resolved_version_str = pkg_meta.resolve_version_spec(tag).map_err(|e| {
-            LpmError::Registry(format!("resolving '{name}@{tag}' against registry: {e}"))
-        })?;
+        let resolved_version_str =
+            resolve_source_dependency_version(&pkg_meta, intent, &resolver_policy).map_err(
+                |e| LpmError::Registry(format!("resolving '{name}@{tag}' against registry: {e}")),
+            )?;
         let version = lpm_semver::Version::parse(&resolved_version_str).map_err(|e| {
             LpmError::Registry(format!(
                 "registry returned non-semver version '{resolved_version_str}' for '{name}': {e}"
@@ -903,6 +933,41 @@ mod tests {
 
         fn v(s: &str) -> lpm_semver::Version {
             lpm_semver::Version::parse(s).unwrap()
+        }
+
+        #[test]
+        fn source_dependency_latest_tag_selects_latest_policy_allowed_version() {
+            let metadata: lpm_registry::PackageMetadata =
+                serde_json::from_value(serde_json::json!({
+                    "name": "release-age-source-dep",
+                    "dist-tags": { "latest": "1.1.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "release-age-source-dep",
+                            "version": "1.0.0"
+                        },
+                        "1.1.0": {
+                            "name": "release-age-source-dep",
+                            "version": "1.1.0"
+                        }
+                    },
+                    "time": {
+                        "1.0.0": "2025-01-01T00:00:00.000Z",
+                        "1.1.0": "2999-01-01T00:00:00.000Z"
+                    }
+                }))
+                .unwrap();
+            let policy =
+                lpm_resolver::ResolverPolicy::new(86_400, lpm_resolver::TrustPolicyMode::Off);
+
+            let resolved = resolve_source_dependency_version(
+                &metadata,
+                &UserSaveIntent::DistTag("latest".to_string()),
+                &policy,
+            )
+            .unwrap();
+
+            assert_eq!(resolved, "1.0.0");
         }
 
         #[test]
