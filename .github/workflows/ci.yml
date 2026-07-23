@@ -409,6 +409,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: npm release artifact tests
+        run: node --test npm/release/tests/*.test.mjs
+
       - name: Windows port backend tests
         run: cargo test --locked -p lpm-runner ports::tests
 

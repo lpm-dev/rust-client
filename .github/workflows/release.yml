@@ -561,7 +561,7 @@ jobs:
           docker run --rm --network none \
             -v "$PWD:/work:ro" \
             -w /work \
-            node:22-alpine@sha256:b74031e546d7f4faf561d797ac1b76beccac856a042815ca77dbb060bf5eb2e6 \
+            node:22-alpine@sha256:b74031e546d7f4faf561d797ac1b76beccac856a042815ca77db4fd047581605 \
             node npm/release/smoke-install.mjs \
               --tarballs npm-release-packages \
               --platform ${{ matrix.platform }} \

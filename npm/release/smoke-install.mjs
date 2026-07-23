@@ -13,6 +13,7 @@ import {
   parseReleaseVersion,
   runtimePlatformKey,
 } from "./release-artifacts.mjs";
+import { npmInvocation } from "./npm-invocation.mjs";
 
 export function smokeInstall({ tarballsDir, expectedPlatform, expectedVersion, prefix }) {
   const releaseVersion = parseReleaseVersion(expectedVersion);
@@ -42,9 +43,14 @@ export function smokeInstall({ tarballsDir, expectedPlatform, expectedVersion, p
 
   let succeeded = false;
   try {
+    const npm = npmInvocation();
+    if (process.platform === "win32") {
+      assertRegularFile(npm.argsPrefix[0], "npm CLI entry point");
+    }
     runChecked(
-      npmCommand(),
+      npm.command,
       [
+        ...npm.argsPrefix,
         "install",
         "--prefix",
         installPrefix,
@@ -272,10 +278,6 @@ function runChecked(command, args, options = {}) {
     );
   }
   return result;
-}
-
-function npmCommand() {
-  return process.platform === "win32" ? "npm.cmd" : "npm";
 }
 
 function parseArguments(argv) {

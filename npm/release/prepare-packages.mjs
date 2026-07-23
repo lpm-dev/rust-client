@@ -12,6 +12,7 @@ import {
   manifestForRelease,
   parseReleaseVersion,
 } from "./release-artifacts.mjs";
+import { npmInvocation } from "./npm-invocation.mjs";
 
 export function prepareReleasePackages({
   repoRoot,
@@ -104,9 +105,20 @@ function prepareWrapperPackage({ root, output, staging, releaseVersion }) {
 
 function packPackage({ packageDir, output, manifest, platform, binaryHashes }) {
   const expectedFiles = expectedPackedFiles(packageDir, manifest);
+  const npm = npmInvocation();
+  if (process.platform === "win32") {
+    assertRegularFile(npm.argsPrefix[0], "npm CLI entry point");
+  }
   const result = spawnSync(
-    npmCommand(),
-    ["pack", "--ignore-scripts", "--json", "--pack-destination", output],
+    npm.command,
+    [
+      ...npm.argsPrefix,
+      "pack",
+      "--ignore-scripts",
+      "--json",
+      "--pack-destination",
+      output,
+    ],
     {
       cwd: packageDir,
       encoding: "utf8",
@@ -226,10 +238,6 @@ function sha256File(file) {
     fs.closeSync(descriptor);
   }
   return hash.digest("hex");
-}
-
-function npmCommand() {
-  return process.platform === "win32" ? "npm.cmd" : "npm";
 }
 
 function parseArguments(argv) {
