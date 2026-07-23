@@ -44,6 +44,65 @@ test("CI and release Alpine smokes share one immutable Node image pin", () => {
   assert.deepEqual(releasePins, ciPins);
 });
 
+test("npm publish workflow treats release tarballs as local filesystem paths", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+  const publishSpecs = [...releaseWorkflow.matchAll(/npx npm@11\.12\.1 publish "([^"]+)"/g)].map(
+    match => match[1],
+  );
+
+  assert.deepEqual(publishSpecs, [
+    "./npm-release-packages/$tarball",
+    "./npm-release-packages/$TARBALL",
+  ]);
+});
+
+function assertNpmPublishRecoveryWorkflow(workflowSource) {
+  const releaseWorkflow = workflowSource.replaceAll("\r\n", "\n");
+  const jobSource = (job, nextJob) => {
+    const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
+    const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
+    assert.notEqual(start, -1, `missing ${job} job`);
+    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+    return releaseWorkflow.slice(start, end);
+  };
+
+  assert.match(releaseWorkflow, /^\s+- npm-publish-only$/m);
+  for (const source of [
+    jobSource("publish-npm-platform", "publish-npm-wrapper"),
+    jobSource("publish-npm-wrapper", "update-homebrew"),
+  ]) {
+    assert.match(source, /inputs\.mode == 'npm-publish-only'/);
+    assert.match(source, /run-id: \$\{\{ steps\.source\.outputs\.run_id \}\}/);
+    assert.match(source, /repository: \$\{\{ github\.repository \}\}/);
+    assert.match(source, /github-token: \$\{\{ github\.token \}\}/);
+    assert.match(source, /test "\$ARTIFACT_VERSION" = "\$INPUT_VERSION"/);
+  }
+}
+
+test("npm publish recovery reuses exact source-run artifacts for platforms and wrapper", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+
+  assertNpmPublishRecoveryWorkflow(releaseWorkflow);
+});
+
+test("npm publish recovery assertions accept Windows CRLF workflow files", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n")
+    .replaceAll("\n", "\r\n");
+
+  assertNpmPublishRecoveryWorkflow(releaseWorkflow);
+});
+
 test("Windows npm invocation runs npm CLI through Node without a command shell", () => {
   const nodeExecutable = path.join(os.tmpdir(), "node-fixture", "node.exe");
 
