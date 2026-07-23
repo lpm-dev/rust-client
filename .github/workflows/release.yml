@@ -18,8 +18,9 @@ on:
           - full
           - wrapper-only
           - windows-smoke-only
+          - npm-publish-only
       source_run_id:
-        description: "Release run ID supplying exact npm artifacts for a targeted smoke recovery"
+        description: "Release run ID supplying exact npm artifacts for a targeted recovery"
         required: false
 
 permissions:
@@ -704,7 +705,11 @@ jobs:
   publish-npm-platform:
     name: Publish npm Platform Packages
     needs: release
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    if: >-
+      always() &&
+      ((needs.release.result == 'success' &&
+      (github.event_name == 'push' || inputs.mode == 'full')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -719,11 +724,42 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Validate recovery source run
+        id: source
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::source_run_id must be a positive GitHub Actions run ID"
+            exit 1
+          fi
+          echo "run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+
       - name: Download verified npm tarballs
+        if: inputs.mode != 'npm-publish-only'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: npm-release-packages
           path: npm-release-packages
+
+      - name: Download exact npm tarballs from source release run
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-release-packages
+          path: npm-release-packages
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify recovery artifact version
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          ARTIFACT_VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
+          test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
 
       - name: Bootstrap npm 11 (required for trusted publishers OIDC)
         run: |
@@ -760,7 +796,7 @@ jobs:
 
             echo "Publishing ${package}@${VERSION} from verified tarball ${tarball}..."
             set +e
-            npx npm@11.12.1 publish "npm-release-packages/$tarball" \
+            npx npm@11.12.1 publish "./npm-release-packages/$tarball" \
               --provenance --access public 2>&1 | tee /tmp/npm-publish.log
             local exit_code=${PIPESTATUS[0]}
             set -e
@@ -791,7 +827,9 @@ jobs:
     if: >-
       always() &&
       ((needs.pack-npm-packages.result == 'success' && needs.publish-npm-platform.result == 'success') ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'))
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only' &&
+      needs.publish-npm-platform.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -813,11 +851,41 @@ jobs:
           echo "npx npm@11: $(npx npm@11.12.1 --version)"
 
       - name: Download verified full-release tarballs
-        if: inputs.mode != 'wrapper-only'
+        if: inputs.mode != 'wrapper-only' && inputs.mode != 'npm-publish-only'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: npm-release-packages
           path: npm-release-packages
+
+      - name: Validate recovery source run
+        id: source
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::source_run_id must be a positive GitHub Actions run ID"
+            exit 1
+          fi
+          echo "run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact npm tarballs from source release run
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-release-packages
+          path: npm-release-packages
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify recovery artifact version
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          ARTIFACT_VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
+          test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
 
       - name: Pack wrapper-only recovery artifact
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'
@@ -858,7 +926,7 @@ jobs:
           fi
           echo "Publishing @lpm-registry/cli@${VERSION} from verified tarball ${TARBALL}..."
           set +e
-          npx npm@11.12.1 publish "npm-release-packages/$TARBALL" \
+          npx npm@11.12.1 publish "./npm-release-packages/$TARBALL" \
             --provenance --access public 2>&1 | tee /tmp/npm-publish.log
           exit_code=${PIPESTATUS[0]}
           set -e
