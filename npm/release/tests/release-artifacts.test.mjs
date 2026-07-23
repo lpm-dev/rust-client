@@ -97,6 +97,7 @@ test("npm publish recovery assertions accept Windows CRLF workflow files", () =>
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n")
     .replaceAll("\n", "\r\n");
 
   assertNpmPublishRecoveryWorkflow(releaseWorkflow);
