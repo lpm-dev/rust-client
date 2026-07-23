@@ -17,6 +17,10 @@ on:
         options:
           - full
           - wrapper-only
+          - windows-smoke-only
+      source_run_id:
+        description: "Release run ID supplying exact npm artifacts for a targeted smoke recovery"
+        required: false
 
 permissions:
   contents: write
@@ -566,6 +570,53 @@ jobs:
               --tarballs npm-release-packages \
               --platform ${{ matrix.platform }} \
               --version ${{ needs.pack-npm-packages.outputs.version }}
+
+  smoke-windows-recovery:
+    name: Smoke npm artifacts (win32-x64 recovery)
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-smoke-only'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Validate source release run
+        id: source
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          if ($env:SOURCE_RUN_ID -notmatch '^[1-9][0-9]*$') {
+            throw "source_run_id must be a positive GitHub Actions run ID"
+          }
+          "run_id=$env:SOURCE_RUN_ID" >> $env:GITHUB_OUTPUT
+
+      - name: Download exact npm tarballs from source release run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-release-packages
+          path: npm-release-packages
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Install Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          architecture: x64
+
+      - name: Pin npm used by release consumers
+        run: npm install --global npm@11.12.1 --no-audit --no-fund
+
+      - name: Install and execute exact npm tarballs
+        run: >-
+          node npm/release/smoke-install.mjs
+          --tarballs npm-release-packages
+          --platform win32-x64
+          --version ${{ inputs.version }}
 
   release:
     name: Create Release
