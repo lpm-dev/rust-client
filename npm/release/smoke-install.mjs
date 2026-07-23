@@ -42,9 +42,14 @@ export function smokeInstall({ tarballsDir, expectedPlatform, expectedVersion, p
 
   let succeeded = false;
   try {
+    const npm = npmInvocation();
+    if (process.platform === "win32") {
+      assertRegularFile(npm.argsPrefix[0], "npm CLI entry point");
+    }
     runChecked(
-      npmCommand(),
+      npm.command,
       [
+        ...npm.argsPrefix,
         "install",
         "--prefix",
         installPrefix,
@@ -274,8 +279,19 @@ function runChecked(command, args, options = {}) {
   return result;
 }
 
-function npmCommand() {
-  return process.platform === "win32" ? "npm.cmd" : "npm";
+export function npmInvocation({
+  platform = process.platform,
+  nodeExecutable = process.execPath,
+} = {}) {
+  if (platform !== "win32") {
+    return { command: "npm", argsPrefix: [] };
+  }
+  return {
+    command: nodeExecutable,
+    argsPrefix: [
+      path.join(path.dirname(nodeExecutable), "node_modules", "npm", "bin", "npm-cli.js"),
+    ],
+  };
 }
 
 function parseArguments(argv) {

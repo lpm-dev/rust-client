@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +15,7 @@ import {
   runtimePlatformKey,
 } from "../release-artifacts.mjs";
 import { prepareReleasePackages } from "../prepare-packages.mjs";
-import { smokeInstall } from "../smoke-install.mjs";
+import { npmInvocation, smokeInstall } from "../smoke-install.mjs";
 
 test("release versions accept stable and prerelease semver values", () => {
   assert.equal(parseReleaseVersion("0.69.0"), "0.69.0");
@@ -26,6 +27,48 @@ test("release versions reject tags, traversal, and incomplete versions", () => {
     assert.throws(() => parseReleaseVersion(value), /valid npm semver/);
   }
 });
+
+test("CI and release Alpine smokes share one immutable Node image pin", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const imagePattern = /node:22-alpine@sha256:[0-9a-f]{64}/g;
+  const ciPins =
+    fs.readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8").match(imagePattern) ?? [];
+  const releasePins =
+    fs
+      .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+      .match(imagePattern) ?? [];
+
+  assert.equal(ciPins.length, 1);
+  assert.equal(releasePins.length, 1);
+  assert.deepEqual(releasePins, ciPins);
+});
+
+test("Windows npm invocation runs npm CLI through Node without a command shell", () => {
+  const nodeExecutable = path.join(os.tmpdir(), "node-fixture", "node.exe");
+
+  assert.deepEqual(npmInvocation({ platform: "win32", nodeExecutable }), {
+    command: nodeExecutable,
+    argsPrefix: [
+      path.join(path.dirname(nodeExecutable), "node_modules", "npm", "bin", "npm-cli.js"),
+    ],
+  });
+});
+
+test(
+  "Windows npm invocation executes the installed npm CLI",
+  { skip: process.platform !== "win32" },
+  () => {
+    const invocation = npmInvocation();
+    const result = spawnSync(invocation.command, [...invocation.argsPrefix, "--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+/);
+  },
+);
 
 test("wrapper release manifest pins every platform package and keeps the lifecycle contract", () => {
   const source = {
