@@ -3370,7 +3370,6 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
         expected_calls: 4,
     })
     .await;
-
     let command = || {
         let mut command = lpm(&project);
         command
@@ -3407,6 +3406,7 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
     );
     let connect_json = parse_clean_json_stdout(&connect);
     assert_eq!(connect_json["platform"], "fly");
+    insta::assert_json_snapshot!("env_fly_connect_json_envelope", connect_json);
 
     let status = command()
         .args(["--json", "env", "status"])
@@ -3421,6 +3421,7 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
         "names_only"
     );
     assert_eq!(status_json["platforms"][0]["secretNamesPresent"], 1);
+    insta::assert_json_snapshot!("env_fly_status_json_envelope", status_json);
 
     let pull = command()
         .args(["--json", "env", "pull", "--from", "fly", "--yes"])
@@ -3431,6 +3432,7 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
     assert_eq!(pull_json["status"], "no_readable_values");
     assert_eq!(pull_json["skippedSecrets"], 1);
     assert_eq!(pull_json["secretVerification"], "names_only");
+    insta::assert_json_snapshot!("env_fly_pull_json_envelope", pull_json);
 }
 
 #[tokio::test]
