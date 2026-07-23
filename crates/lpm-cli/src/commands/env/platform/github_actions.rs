@@ -161,48 +161,40 @@ impl GitHubActionsClient {
     ) -> Result<PlatformPushResult, PlatformApplyError> {
         self.verify_repository_binding()
             .await
-            .map_err(|error| PlatformApplyError::Tracked {
-                error,
-                applied: PlatformPushResult::default(),
-            })?;
-        let encrypted_secrets =
-            self.encrypt_secrets_for_push(diff, local)
-                .await
-                .map_err(|error| PlatformApplyError::Tracked {
-                    error,
-                    applied: PlatformPushResult::default(),
-                })?;
+            .map_err(|error| PlatformApplyError::tracked(error, PlatformPushResult::default()))?;
+        let encrypted_secrets = self
+            .encrypt_secrets_for_push(diff, local)
+            .await
+            .map_err(|error| PlatformApplyError::tracked(error, PlatformPushResult::default()))?;
         let mut applied = PlatformPushResult::default();
 
         for key in &diff.added {
-            let value = local
-                .readable
-                .get(key)
-                .ok_or_else(|| PlatformApplyError::Tracked {
-                    error: LpmError::Script(format!("missing local value for {key}")),
+            let value = local.readable.get(key).ok_or_else(|| {
+                PlatformApplyError::tracked(
+                    LpmError::Script(format!("missing local value for {key}")),
                     applied,
-                })?;
+                )
+            })?;
             if let Err(error) = self.create_variable(key, value).await {
-                return Err(PlatformApplyError::Tracked { error, applied });
+                return Err(PlatformApplyError::tracked(error, applied));
             }
             applied.added += 1;
         }
         for key in &diff.changed {
-            let value = local
-                .readable
-                .get(key)
-                .ok_or_else(|| PlatformApplyError::Tracked {
-                    error: LpmError::Script(format!("missing local value for {key}")),
+            let value = local.readable.get(key).ok_or_else(|| {
+                PlatformApplyError::tracked(
+                    LpmError::Script(format!("missing local value for {key}")),
                     applied,
-                })?;
+                )
+            })?;
             if let Err(error) = self.update_variable(key, value).await {
-                return Err(PlatformApplyError::Tracked { error, applied });
+                return Err(PlatformApplyError::tracked(error, applied));
             }
             applied.updated += 1;
         }
         for (key, encrypted_value, key_id, is_new) in encrypted_secrets {
             if let Err(error) = self.upsert_secret(&key, &encrypted_value, &key_id).await {
-                return Err(PlatformApplyError::Tracked { error, applied });
+                return Err(PlatformApplyError::tracked(error, applied));
             }
             if is_new {
                 applied.added += 1;
@@ -212,13 +204,13 @@ impl GitHubActionsClient {
         }
         for key in &diff.removed {
             if let Err(error) = self.delete_variable(key).await {
-                return Err(PlatformApplyError::Tracked { error, applied });
+                return Err(PlatformApplyError::tracked(error, applied));
             }
             applied.removed += 1;
         }
         for key in &diff.write_only_removed {
             if let Err(error) = self.delete_secret(key).await {
-                return Err(PlatformApplyError::Tracked { error, applied });
+                return Err(PlatformApplyError::tracked(error, applied));
             }
             applied.removed += 1;
         }
@@ -226,15 +218,15 @@ impl GitHubActionsClient {
         let observed = self
             .list()
             .await
-            .map_err(|error| PlatformApplyError::Tracked { error, applied })?;
+            .map_err(|error| PlatformApplyError::tracked(error, applied))?;
         if !state_matches_local(&observed, local, clean) {
-            return Err(PlatformApplyError::Tracked {
-                error: LpmError::Script(
+            return Err(PlatformApplyError::tracked(
+                LpmError::Script(
                     "GitHub Actions synchronization verification failed; readable variables or secret-name coverage do not match the requested state"
                         .into(),
                 ),
                 applied,
-            });
+            ));
         }
         Ok(applied)
     }

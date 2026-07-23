@@ -241,23 +241,6 @@ impl PlatformApplyError {
 }
 
 #[derive(Debug)]
-enum PlatformApplyError {
-    Untracked(LpmError),
-    Tracked {
-        error: LpmError,
-        applied: PlatformPushResult,
-    },
-}
-
-impl PlatformApplyError {
-    fn error(&self) -> &LpmError {
-        match self {
-            Self::Untracked(error) | Self::Tracked { error, .. } => error,
-        }
-    }
-}
-
-#[derive(Debug)]
 enum VercelMutation {
     Add {
         key: String,

@@ -3440,6 +3440,7 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
     );
     let connect_json = parse_clean_json_stdout(&connect);
     assert_eq!(connect_json["platform"], "github-actions");
+    insta::assert_json_snapshot!("env_github_actions_connect_json_envelope", connect_json);
 
     let status = command()
         .args(["--json", "env", "status"])
@@ -3453,6 +3454,7 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
         "names_only"
     );
     assert_eq!(status_json["platforms"][0]["secretNamesPresent"], 1);
+    insta::assert_json_snapshot!("env_github_actions_status_json_envelope", status_json);
 
     let pull = command()
         .args(["--json", "env", "pull", "--from", "github-actions", "--yes"])
@@ -3463,6 +3465,7 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
     assert_eq!(pull_json["keys"], serde_json::json!(["PUBLIC_ORIGIN"]));
     assert_eq!(pull_json["skippedSecrets"], 1);
     assert_eq!(pull_json["secretVerification"], "names_only");
+    insta::assert_json_snapshot!("env_github_actions_pull_json_envelope", pull_json);
 
     let changed = lpm(&project)
         .args([
@@ -3489,6 +3492,7 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
             .is_some_and(|error| error.contains("workflow denied")),
         "failed push should preserve the GitHub error: {failed_json}"
     );
+    insta::assert_json_snapshot!("env_github_actions_failed_push_json_envelope", failed_json);
 }
 
 #[tokio::test]
