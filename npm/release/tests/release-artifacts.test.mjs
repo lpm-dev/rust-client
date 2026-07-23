@@ -103,6 +103,30 @@ test("npm publish recovery assertions accept Windows CRLF workflow files", () =>
   assertNpmPublishRecoveryWorkflow(releaseWorkflow);
 });
 
+test("published wrapper verification tolerates five minutes of registry propagation", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const start = releaseWorkflow.indexOf("\n  publish-npm-wrapper:\n");
+  const end = releaseWorkflow.indexOf("\n  update-homebrew:\n", start + 1);
+
+  assert.notEqual(start, -1, "missing publish-npm-wrapper job");
+  assert.notEqual(end, -1, "missing update-homebrew job after publish-npm-wrapper");
+
+  const wrapperJob = releaseWorkflow.slice(start, end);
+  assert.match(wrapperJob, /REGISTRY_PROPAGATION_TIMEOUT_SECONDS=300/);
+  assert.match(
+    wrapperJob,
+    /deadline=\$\(\(SECONDS \+ REGISTRY_PROPAGATION_TIMEOUT_SECONDS\)\)/,
+  );
+  assert.match(wrapperJob, /NPM_CACHE=\$\(mktemp -d\)/);
+  assert.match(wrapperJob, /--cache "\$NPM_CACHE" --prefer-online/);
+  assert.match(wrapperJob, /BACKOFF_SECONDS=\$\(\(5 \* \(1 << \(attempt - 1\)\)\)\)/);
+  assert.match(wrapperJob, /if \[ "\$BACKOFF_SECONDS" -gt 30 \]; then/);
+  assert.doesNotMatch(wrapperJob, /for attempt in 1 2 3 4 5/);
+});
+
 test("Windows npm invocation runs npm CLI through Node without a command shell", () => {
   const nodeExecutable = path.join(os.tmpdir(), "node-fixture", "node.exe");
 
