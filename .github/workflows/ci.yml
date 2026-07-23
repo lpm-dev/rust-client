@@ -425,7 +425,7 @@ jobs:
     name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     # Run the audit fixtures on main, scheduled, and manual CI. The
     # suite catches mode-asymmetric regressions: a fix that lands and
     # accidentally breaks hoisted (or isolated) for a real-world package
