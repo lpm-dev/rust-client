@@ -14,6 +14,10 @@ expression: status_json
       "added": 0,
       "changed": 1,
       "removed": 0,
+      "secretVerification": "exact",
+      "secretNamesPresent": 0,
+      "secretNamesMissing": 0,
+      "secretNamesExtra": 0,
       "driftKeys": [
         "APPLICATION_SECRET"
       ],
