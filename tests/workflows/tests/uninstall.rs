@@ -14,7 +14,9 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry};
+use support::{
+    TempProject, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry, project_bin_path,
+};
 
 /// Seed `project` with an installed-looking layout for `pkg@version`:
 /// `package.json` deps entry, a minimal `lpm.lock`, and a
@@ -256,7 +258,7 @@ async fn uninstall_scoped_package_removes_owned_bin_shim() {
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let shim = project.path().join("node_modules/.bin/scoped-smoke");
+    let shim = project_bin_path(&project, "scoped-smoke");
     assert!(
         shim.symlink_metadata().is_ok(),
         "install must create the scoped CLI shim",

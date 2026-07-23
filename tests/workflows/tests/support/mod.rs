@@ -140,6 +140,18 @@ impl TempProject {
     }
 }
 
+pub fn project_bin_path(project: &TempProject, name: &str) -> PathBuf {
+    let bin_dir = project.path().join("node_modules").join(".bin");
+    #[cfg(windows)]
+    {
+        bin_dir.join(format!("{name}.cmd"))
+    }
+    #[cfg(not(windows))]
+    {
+        bin_dir.join(name)
+    }
+}
+
 /// Write a short-lived signed project unlock for workflow scenarios that
 /// intentionally need to cross the security-approval boundary.
 pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {

@@ -12,7 +12,7 @@ use support::mock_registry::{
 };
 use support::{
     TempProject, configure_fake_node, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry,
-    write_repeated_file, write_signed_unlock,
+    project_bin_path, write_repeated_file, write_signed_unlock,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -6023,14 +6023,11 @@ async fn install_creates_bin_symlink_for_binary_package() {
         .assert()
         .success();
 
-    let bin_entry = project
-        .path()
-        .join("node_modules")
-        .join(".bin")
-        .join("my-cli");
+    let bin_entry = project_bin_path(&project, "my-cli");
     assert!(
         bin_entry.exists(),
-        "node_modules/.bin/my-cli not found after installing binary package"
+        "{} not found after installing binary package",
+        bin_entry.display()
     );
 }
 
@@ -6128,11 +6125,7 @@ require('framework-plugin').run();
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let bin_path = project
-        .path()
-        .join("node_modules")
-        .join(".bin")
-        .join("framework-cli");
+    let bin_path = project_bin_path(&project, "framework-cli");
     let output = std::process::Command::new(&bin_path)
         .output()
         .unwrap_or_else(|e| panic!("failed to execute {}: {e}", bin_path.display()));
