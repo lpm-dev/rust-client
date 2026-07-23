@@ -13,15 +13,15 @@ const ENGINE_VERSION_CACHE_FILE_NAME: &str = ".version-cache.json";
 const MAX_ENGINE_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
 const MANAGED_ENGINE_TOOL_NAMES: &[&str] = &["rolldown"];
 const MANAGED_TOOL_NPM_REGISTRY_ENV: &str = "LPM_MANAGED_TOOL_NPM_REGISTRY";
-const ROLLDOWN_VERSION: &str = "1.1.5";
-const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.1.5.tgz";
-const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-t9z29cJjXf/vxQ8dyhCSpt6H6aSwHTk8cT5I3iy6SMXuFpk5mB6PL6XfC8PCwrPTx93udwKUm9HRteAlTGBLiA==";
+const ROLLDOWN_VERSION: &str = "1.2.0";
+const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.2.0.tgz";
+const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-u7tgm5l4Yw1iTqUL4EcYOAt7fFvCgQMLeidrnD4GALlC6aOznCjezYajgxeyKw27u0Q5N7fwgCzjVyPIWzwuBA==";
 const ROLLDOWN_PLUGINUTILS_TARBALL_URL: &str =
     "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.1.tgz";
 const ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY: &str = "sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==";
 const OXC_TYPES_TARBALL_URL: &str =
-    "https://registry.npmjs.org/@oxc-project/types/-/types-0.139.0.tgz";
-const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-r9gHphtCs+1M7J0pw6Sn/hh/Wpa/iQrOOkrNAlVLF/gHq+/CJmHIWKKUUhdWjcD6CIa8idarspCsASiXCXvFUw==";
+    "https://registry.npmjs.org/@oxc-project/types/-/types-0.140.0.tgz";
+const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-h5LUOzGArYemnW1NMz/DuuQhBi96J6JL2Bk8zE4kvqxB5Sg3jxmCiH4uyOWHDkiKSt5vWlG4FIwCR/DbstcNRQ==";
 const TSGO_VERSION: &str = "7.0.0-dev.20260707.2";
 
 #[derive(Debug, Clone, Copy)]
@@ -248,8 +248,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-darwin-arm64",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.1.5.tgz",
-                tarball_integrity: "sha512-51Bnx9pNiMRKSUNtBfySkNJ9vMU9Hh3I1ozDd6gyPPYzaXCfnptUcEZxXGYFn+ul2dtcMUiqGR1Yai2K10uoTw==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.2.0.tgz",
+                tarball_integrity: "sha512-pexNaW9ACLUOaBITOpU6qVu4VrsOFIjTv6bzgu0YUATo4eUJx0V605PxwZfndpPOn0ilqGqvGQ0M8UW0IE24jg==",
             },
         ],
     },
@@ -274,8 +274,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-darwin-x64",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.1.5.tgz",
-                tarball_integrity: "sha512-Tm+gbfC0aHu1tBA/JvKQh32S0K6YgCHkiAF4/W6xX0K0RmNuc94VeK419dJoE65R5aRxmo+noZQSWrAMF6yb6g==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.2.0.tgz",
+                tarball_integrity: "sha512-NqKYaq0355ZmNMG4QGpxtEDxsc7tGDhjhCm4PpE0cwnBW+5Il95LJyq414niEiaKLVjnVHBEjSo1wngKxJNiFw==",
             },
         ],
     },
@@ -300,8 +300,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-linux-x64-gnu",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.1.5.tgz",
-                tarball_integrity: "sha512-FjcpEKUyJygHgs1o50VYNvkt5+7Le/VEdYt0AkRpkL33MnyQfwr8l5mXwMmfmTbyMPr5vJLC+8/Gd9gXnwU1QQ==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.2.0.tgz",
+                tarball_integrity: "sha512-MK7L0018jjh1jR3mh21G2j1zAVcpscJBlPo2z19pRjv2XOYGRhaV4LyiD8HO6nCDdZln9IFgCMIV5yt4E3klGQ==",
             },
         ],
     },
@@ -326,8 +326,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-linux-arm64-gnu",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.1.5.tgz",
-                tarball_integrity: "sha512-navSiuTMogvnQoZoM/v+l3ZWo50/NTwSHSzheABx/RCnmUPaKwq9qSo4Br2OYRs21+Fz8uFqITZM3H4opOB0/Q==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.2.0.tgz",
+                tarball_integrity: "sha512-D+TgkdgM1vu+7/Fpf8+v0ARW+RXEP9Ccazgm8zQ4JFFd9Q7SrYQ2TakU5S5ihazQDgpKyAgZDOcIFsvoHmTZ8w==",
             },
         ],
     },
@@ -352,8 +352,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-win32-x64-msvc",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.1.5.tgz",
-                tarball_integrity: "sha512-tTZuDBPw85tEN5PQi1pnEBzDy0Z49HtScLAbD5t6hyeU92A95pRWaSMw1GZZi/RwgSgUIl0xrSlXIT/9QzvYSA==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.2.0.tgz",
+                tarball_integrity: "sha512-WfFv6/qGufotqBSBzBYwgpCkJBk8Nj7697LL9vTz/XWc67e0r3oewu8iMRwQj3AUL45GVD7wVsPjCsAAtW66Wg==",
             },
         ],
     },
@@ -378,8 +378,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-win32-arm64-msvc",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.1.5.tgz",
-                tarball_integrity: "sha512-gHv82k63z4qpV5+Q1y/12KrK0ltWBukVDI8nZcbT7Tt/ZlOIVwppazneq0F93oDxTo3IgAMEDIoQh3E2n6mVsw==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.2.0.tgz",
+                tarball_integrity: "sha512-+5suHwRiKGmhwyUaNT8a5QbrBvLFh2DbO910TEmGRH1aSxwrCezodvGQnulv4uiWEIv1Kq4ypRsJ5+O+ry1DiA==",
             },
         ],
     },
