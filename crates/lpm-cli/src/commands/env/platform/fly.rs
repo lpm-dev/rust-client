@@ -212,9 +212,9 @@ impl FlyClient {
         remote: &PlatformState,
         clean: bool,
     ) -> Result<PlatformPushResult, PlatformApplyError> {
-        let fresh = self.list().await.map_err(PlatformApplyError::Untracked)?;
+        let fresh = self.list().await.map_err(PlatformApplyError::untracked)?;
         if fresh.write_only != remote.write_only {
-            return Err(PlatformApplyError::Untracked(LpmError::Script(
+            return Err(PlatformApplyError::untracked(LpmError::Script(
                 "Fly.io secrets changed after comparison; rerun the push before mutating the app"
                     .into(),
             )));
@@ -233,7 +233,7 @@ impl FlyClient {
         {
             self.set_secrets(&local.write_only)
                 .await
-                .map_err(PlatformApplyError::Untracked)?;
+                .map_err(PlatformApplyError::untracked)?;
             applied.added = diff.write_only_added.len();
             applied.updated = diff.write_only_present.len();
         }
@@ -242,36 +242,36 @@ impl FlyClient {
             let after_set = self
                 .list()
                 .await
-                .map_err(|error| PlatformApplyError::Tracked { error, applied })?;
+                .map_err(|error| PlatformApplyError::tracked(error, applied))?;
             let mut expected_after_set = remote.write_only.clone();
             expected_after_set.extend(local.write_only.keys().cloned());
             if after_set.write_only != expected_after_set {
-                return Err(PlatformApplyError::Tracked {
-                    error: LpmError::Script(
+                return Err(PlatformApplyError::tracked(
+                    LpmError::Script(
                         "Fly.io secrets changed during synchronization; no removals were attempted"
                             .into(),
                     ),
                     applied,
-                });
+                ));
             }
             self.unset_secrets(&diff.write_only_removed)
                 .await
-                .map_err(|error| PlatformApplyError::Tracked { error, applied })?;
+                .map_err(|error| PlatformApplyError::tracked(error, applied))?;
             applied.removed = diff.write_only_removed.len();
         }
 
         let observed = self
             .list()
             .await
-            .map_err(|error| PlatformApplyError::Tracked { error, applied })?;
+            .map_err(|error| PlatformApplyError::tracked(error, applied))?;
         if observed.write_only != desired {
-            return Err(PlatformApplyError::Tracked {
-                error: LpmError::Script(
+            return Err(PlatformApplyError::tracked(
+                LpmError::Script(
                     "Fly.io synchronization verification failed; the authoritative secret names do not match the requested state"
                         .into(),
                 ),
                 applied,
-            });
+            ));
         }
         Ok(applied)
     }
