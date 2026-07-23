@@ -16,7 +16,7 @@ import {
 } from "../release-artifacts.mjs";
 import { npmInvocation } from "../npm-invocation.mjs";
 import { prepareReleasePackages } from "../prepare-packages.mjs";
-import { smokeInstall } from "../smoke-install.mjs";
+import { smokeInstall, windowsCommandInvocation } from "../smoke-install.mjs";
 
 test("release versions accept stable and prerelease semver values", () => {
   assert.equal(parseReleaseVersion("0.69.0"), "0.69.0");
@@ -68,6 +68,79 @@ test(
     assert.ifError(result.error);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+/);
+  },
+);
+
+test("Windows command shims use structured cmd arguments without escaped quotes", () => {
+  const command = path.join("C:\\", "release smoke ü", "lpm.cmd");
+
+  assert.deepEqual(windowsCommandInvocation(command, ["--version"]), {
+    command: "cmd.exe",
+    args: ["/D", "/S", "/C", "call", command, "--version"],
+  });
+});
+
+test(
+  "Windows command invocation executes an npm-generated shim in a path with spaces and Unicode",
+  { skip: process.platform !== "win32" },
+  t => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lpm command smoke ü-"));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const packageDirectory = path.join(directory, "fixture package");
+    const binDirectory = path.join(packageDirectory, "bin");
+    const installPrefix = path.join(directory, "install prefix");
+    fs.mkdirSync(binDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(packageDirectory, "package.json"),
+      `${JSON.stringify({
+        name: "lpm-command-shim-fixture",
+        version: "1.0.0",
+        bin: { "lpm-command-shim-fixture": "bin/cli.js" },
+      })}\n`,
+    );
+    fs.writeFileSync(
+      path.join(binDirectory, "cli.js"),
+      '#!/usr/bin/env node\nconsole.log(process.argv[2] === "--version" ? "lpm 0.69.0" : "unexpected args");\n',
+    );
+
+    const npm = npmInvocation();
+    const install = spawnSync(
+      npm.command,
+      [
+        ...npm.argsPrefix,
+        "install",
+        "--prefix",
+        installPrefix,
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--no-package-lock",
+        "--no-save",
+        packageDirectory,
+      ],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    assert.ifError(install.error);
+    assert.equal(install.status, 0, install.stderr);
+
+    const command = path.join(
+      installPrefix,
+      "node_modules",
+      ".bin",
+      "lpm-command-shim-fixture.cmd",
+    );
+    const invocation = windowsCommandInvocation(command, ["--version"]);
+    const result = spawnSync(invocation.command, invocation.args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "lpm 0.69.0");
   },
 );
 
