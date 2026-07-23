@@ -3058,6 +3058,136 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
 }
 
 #[tokio::test]
+async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
+    let project = TempProject::empty(r#"{"name":"railway-platform","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer_token = "railway-platform-session-token";
+    let platform_token = "railway-platform-token";
+    let vault_id = "vault-railway-platform-123";
+    let project_id = "project-123";
+    let environment_id = "environment-123";
+    let service_id = "service-123";
+
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(bearer_token),
+            refresh_token: Some("railway-platform-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    mock.with_platform_connect_success(
+        bearer_token,
+        vault_id,
+        "railway",
+        project_id,
+        serde_json::json!({
+            "status": "connected",
+            "platform": "railway",
+        }),
+    )
+    .await;
+    mock.with_platform_credentials_success(
+        bearer_token,
+        vault_id,
+        serde_json::json!({
+            "connections": [
+                {
+                    "id": "connection-railway",
+                    "platform": "railway",
+                    "token": platform_token,
+                    "connectionConfig": {
+                        "projectId": project_id,
+                        "environmentId": environment_id,
+                        "serviceId": service_id,
+                        "projectToken": false,
+                        "linkedEnv": "production"
+                    },
+                    "label": "production",
+                    "lastPushAt": null
+                }
+            ]
+        }),
+    )
+    .await;
+    mock.with_railway_variables_list(
+        platform_token,
+        project_id,
+        environment_id,
+        service_id,
+        serde_json::json!({
+            "APPLICATION_SECRET": "${{Shared.SECRET}}",
+            "RAILWAY_SERVICE_ID": "managed-service-id"
+        }),
+        2,
+    )
+    .await;
+
+    let connect = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-railway")
+        .env(
+            "LPM_ACCEPTANCE_RAILWAY_API_URL",
+            format!("{}/graphql/v2", mock.url()),
+        )
+        .args([
+            "--json",
+            "env",
+            "connect",
+            "railway",
+            "--project",
+            project_id,
+            "--environment",
+            environment_id,
+            "--service",
+            service_id,
+            "--token",
+            platform_token,
+            "--linked-env",
+            "production",
+            "--label",
+            "production",
+        ])
+        .output()
+        .expect("failed to run lpm env connect railway --json");
+    assert!(
+        connect.status.success(),
+        "env connect railway --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&connect.stdout),
+        String::from_utf8_lossy(&connect.stderr),
+    );
+    let connect_json = parse_clean_json_stdout(&connect);
+    assert_eq!(connect_json["success"], true);
+    assert_eq!(connect_json["platform"], "railway");
+
+    let status = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-railway")
+        .env(
+            "LPM_ACCEPTANCE_RAILWAY_API_URL",
+            format!("{}/graphql/v2", mock.url()),
+        )
+        .args(["--json", "env", "status"])
+        .output()
+        .expect("failed to run lpm env status --json");
+    assert!(
+        status.status.success(),
+        "env status --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+    let status_json = parse_clean_json_stdout(&status);
+    assert_eq!(status_json["success"], true);
+    assert_eq!(status_json["platforms"][0]["platform"], "railway");
+    assert_eq!(status_json["platforms"][0]["env"], "production");
+    assert_eq!(status_json["platforms"][0]["status"], "drifted");
+    assert_eq!(status_json["platforms"][0]["removed"], 1);
+}
+
+#[tokio::test]
 async fn env_platform_json_error_paths_emit_error_envelopes_on_stdout() {
     let cases: &[(&[&str], &str)] = &[
         (&["--json", "env", "log"], "no vault configured"),

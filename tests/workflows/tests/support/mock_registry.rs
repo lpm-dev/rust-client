@@ -1162,6 +1162,37 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_railway_variables_list(
+        &self,
+        token: &str,
+        project_id: &str,
+        environment_id: &str,
+        service_id: &str,
+        variables: serde_json::Value,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/graphql/v2"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"unrendered\":true"))
+            .and(body_string_contains(format!(
+                "\"projectId\":\"{project_id}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"environmentId\":\"{environment_id}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"serviceId\":\"{service_id}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "variables": variables },
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a successful wrapping-key escrow upload.
     pub async fn with_escrow_upload_success(&self, bearer_token: &str, vault_id: &str) -> &Self {
         Mock::given(method("POST"))

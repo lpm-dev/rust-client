@@ -1,4 +1,5 @@
 mod coolify;
+mod railway;
 
 use super::prelude::*;
 use futures::StreamExt;
@@ -14,6 +15,7 @@ const LINKED_ENV_MAX_CHARS: usize = 64;
 const VERCEL_ID_MAX_CHARS: usize = 100;
 const COOLIFY_URL_MAX_CHARS: usize = 2048;
 const COOLIFY_APPLICATION_ID_MAX_CHARS: usize = 128;
+const RAILWAY_ID_MAX_CHARS: usize = 128;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +62,7 @@ enum VariableScope {
         is_multiline: bool,
         is_shown_once: bool,
     },
+    Railway,
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,6 +573,7 @@ fn append_platform_error_context(error: LpmError, context: String) -> LpmError {
 enum PlatformClient {
     Vercel(VercelClient),
     Coolify(coolify::CoolifyClient),
+    Railway(railway::RailwayClient),
 }
 
 impl PlatformClient {
@@ -597,8 +601,20 @@ impl PlatformClient {
                     config,
                 )?))
             }
+            "railway" => {
+                let config = serde_json::from_value::<railway::RailwayConnectionConfig>(
+                    connection.connection_config.clone(),
+                )
+                .map_err(|error| {
+                    LpmError::Script(format!("invalid Railway connection: {error}"))
+                })?;
+                Ok(Self::Railway(railway::RailwayClient::new(
+                    connection.token.clone(),
+                    config,
+                )?))
+            }
             platform => Err(LpmError::Script(format!(
-                "unsupported env platform '{platform}'; use vercel or coolify"
+                "unsupported env platform '{platform}'; use vercel, coolify, or railway"
             ))),
         }
     }
@@ -607,6 +623,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(_) => "Vercel",
             Self::Coolify(_) => "Coolify",
+            Self::Railway(_) => "Railway",
         }
     }
 
@@ -614,6 +631,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(client) => client.config.linked_env.as_deref(),
             Self::Coolify(client) => client.config().linked_env.as_deref(),
+            Self::Railway(client) => client.config().linked_env.as_deref(),
         }
     }
 
@@ -621,6 +639,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(_) => is_vercel_managed_variable(key),
             Self::Coolify(_) => coolify::CoolifyClient::is_managed(key),
+            Self::Railway(_) => railway::RailwayClient::is_managed(key),
         }
     }
 
@@ -628,6 +647,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(client) => client.list().await,
             Self::Coolify(client) => client.list().await,
+            Self::Railway(client) => client.list().await,
         }
     }
 
@@ -636,10 +656,15 @@ impl PlatformClient {
         diff: &PlatformDiff,
         local: &HashMap<String, String>,
         remote: &HashMap<String, PlatformVariable>,
+        clean: bool,
     ) -> Result<PlatformPushResult, PlatformApplyError> {
         match self {
             Self::Vercel(client) => client.apply(diff, local, remote).await,
             Self::Coolify(client) => client.apply(diff, local, remote).await,
+            Self::Railway(client) => client
+                .apply(diff, local, remote, clean)
+                .await
+                .map_err(PlatformApplyError::untracked),
         }
     }
 }
@@ -934,7 +959,8 @@ pub(super) async fn vars_connect(
 ) -> Result<(), LpmError> {
     let platform = args.first().copied().ok_or_else(|| {
         LpmError::Script(
-            "usage: lpm env connect <vercel|coolify> [platform options] [--token=<token>]".into(),
+            "usage: lpm env connect <vercel|coolify|railway> [platform options] [--token=<token>]"
+                .into(),
         )
     })?;
     let label = parse_flag(args, "--label");
@@ -942,9 +968,10 @@ pub(super) async fn vars_connect(
     let display_name = match platform {
         "vercel" => "Vercel",
         "coolify" => "Coolify",
+        "railway" => "Railway",
         _ => {
             return Err(LpmError::Script(format!(
-                "unsupported env platform '{platform}'; use vercel or coolify"
+                "unsupported env platform '{platform}'; use vercel, coolify, or railway"
             )));
         }
     };
@@ -1021,6 +1048,44 @@ pub(super) async fn vars_connect(
             let client = PlatformClient::Coolify(coolify_client);
             (client, config, format!("application: {application_id}"))
         }
+        "railway" => {
+            let project_id = parse_flag(args, "--project")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --project flag".into()))?;
+            validate_connect_field("--project", project_id, RAILWAY_ID_MAX_CHARS, true)?;
+            let environment_id = parse_flag(args, "--environment")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --environment flag".into()))?;
+            validate_connect_field("--environment", environment_id, RAILWAY_ID_MAX_CHARS, true)?;
+            let service_id = parse_flag(args, "--service")
+                .map(|value| {
+                    validate_connect_field("--service", value, RAILWAY_ID_MAX_CHARS, true)?;
+                    Ok::<String, LpmError>(value.to_owned())
+                })
+                .transpose()?;
+            let config = railway::RailwayConnectionConfig {
+                project_id: project_id.to_owned(),
+                environment_id: environment_id.to_owned(),
+                service_id,
+                project_token: args.contains(&"--project-token"),
+                linked_env,
+            };
+            let client = PlatformClient::Railway(railway::RailwayClient::new(
+                platform_token.clone(),
+                config.clone(),
+            )?);
+            let config = serde_json::to_value(config).map_err(|error| {
+                LpmError::Script(format!("failed to serialize Railway connection: {error}"))
+            })?;
+            let target = if let Some(service_id) = parse_flag(args, "--service") {
+                format!(
+                    "project: {project_id}, environment: {environment_id}, service: {service_id}"
+                )
+            } else {
+                format!("project: {project_id}, environment: {environment_id}, shared variables")
+            };
+            (client, config, target)
+        }
         _ => unreachable!("supported platform validated above"),
     };
     if !json_output {
@@ -1083,9 +1148,9 @@ pub(super) async fn vars_platform_push(
     let platform = parse_flag(args, "--to").ok_or_else(|| {
         LpmError::Script("missing --to flag. Usage: lpm env push --to <platform>".into())
     })?;
-    if !matches!(platform, "vercel" | "coolify") {
+    if !matches!(platform, "vercel" | "coolify" | "railway") {
         return Err(LpmError::Script(
-            "unsupported env platform; use vercel or coolify".into(),
+            "unsupported env platform; use vercel, coolify, or railway".into(),
         ));
     }
     let clean = args.contains(&"--clean");
@@ -1197,7 +1262,7 @@ pub(super) async fn vars_platform_push(
     }
 
     let env_name = resolved_env.as_deref().unwrap_or("default");
-    let result = match client.apply(&diff, &local, &remote).await {
+    let result = match client.apply(&diff, &local, &remote, clean).await {
         Ok(result) => result,
         Err(error) => {
             if let PlatformApplyError::Tracked { applied, .. } = &error {
@@ -1276,7 +1341,7 @@ pub(super) async fn vars_platform_status(
             }));
         } else {
             output::warn(
-                "no platform connections. Run `lpm env connect vercel` or `lpm env connect coolify` first.",
+                "no platform connections. Run `lpm env connect vercel`, `lpm env connect coolify`, or `lpm env connect railway` first.",
             );
         }
         return Ok(());
@@ -1416,9 +1481,9 @@ pub(super) async fn vars_platform_pull(
     let platform = parse_flag(args, "--from").ok_or_else(|| {
         LpmError::Script("missing --from flag. Usage: lpm env pull --from <platform>".into())
     })?;
-    if !matches!(platform, "vercel" | "coolify") {
+    if !matches!(platform, "vercel" | "coolify" | "railway") {
         return Err(LpmError::Script(
-            "unsupported env platform; use vercel or coolify".into(),
+            "unsupported env platform; use vercel, coolify, or railway".into(),
         ));
     }
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
