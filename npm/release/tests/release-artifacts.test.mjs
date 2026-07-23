@@ -60,12 +60,8 @@ test("npm publish workflow treats release tarballs as local filesystem paths", (
   ]);
 });
 
-test("npm publish recovery reuses exact source-run artifacts for platforms and wrapper", () => {
-  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-  const releaseWorkflow = fs.readFileSync(
-    path.join(repoRoot, ".github/workflows/release.yml"),
-    "utf8",
-  );
+function assertNpmPublishRecoveryWorkflow(workflowSource) {
+  const releaseWorkflow = workflowSource.replaceAll("\r\n", "\n");
   const jobSource = (job, nextJob) => {
     const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
     const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
@@ -85,6 +81,25 @@ test("npm publish recovery reuses exact source-run artifacts for platforms and w
     assert.match(source, /github-token: \$\{\{ github\.token \}\}/);
     assert.match(source, /test "\$ARTIFACT_VERSION" = "\$INPUT_VERSION"/);
   }
+}
+
+test("npm publish recovery reuses exact source-run artifacts for platforms and wrapper", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+
+  assertNpmPublishRecoveryWorkflow(releaseWorkflow);
+});
+
+test("npm publish recovery assertions accept Windows CRLF workflow files", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\n", "\r\n");
+
+  assertNpmPublishRecoveryWorkflow(releaseWorkflow);
 });
 
 test("Windows npm invocation runs npm CLI through Node without a command shell", () => {
