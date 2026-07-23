@@ -1,0 +1,141 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 42%);
+  backdrop-filter: blur(3px);
+}
+
+.dialog {
+  width: min(680px, 100%);
+  max-height: min(720px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 28px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 24%);
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.title {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.02em;
+}
+
+.summary {
+  margin: 10px 0 20px;
+  color: var(--sub);
+  line-height: 1.6;
+}
+
+.warning {
+  padding: 10px 12px;
+  color: var(--warn, #a15c00);
+  background: var(--pill-dis-bg);
+  border: 1px solid currentColor;
+  border-radius: 7px;
+}
+
+.changes {
+  display: grid;
+  gap: 14px;
+  max-height: 390px;
+  overflow: auto;
+  padding: 14px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.changeList {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.changeList li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+}
+
+.changeList span {
+  color: var(--accent);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.changeList code {
+  overflow-wrap: anywhere;
+  color: var(--sub);
+}
+
+.diff {
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  color: var(--sub);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.cancel,
+.apply {
+  min-width: 110px;
+  padding: 9px 16px;
+  font: inherit;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.cancel {
+  color: var(--sub);
+  background: transparent;
+  border: 1px solid var(--border);
+}
+
+.apply {
+  color: white;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.cancel:disabled,
+.apply:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}

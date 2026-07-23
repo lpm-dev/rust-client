@@ -112,8 +112,8 @@ pub struct ViewArgs {
 
 #[derive(Debug, Args, Default)]
 pub struct DashboardArgs {
-    /// Include global managed and external skill locations.
-    #[arg(long)]
+    /// Accepted for compatibility; the dashboard always includes global skills.
+    #[arg(long, hide = true)]
     pub global: bool,
     /// Do not open the dashboard in the default browser.
     #[arg(long)]

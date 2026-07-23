@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -22,15 +22,14 @@ use super::managed::{self, ManagedMutationPlan, ManagedUpdatePlan, Mutation};
 use super::{AgentTarget, DashboardArgs};
 
 const INDEX_HTML: &str = include_str!("dashboard/index.html");
-const DASHBOARD_CSS: &str = include_str!("dashboard/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("dashboard/dashboard.js");
+const DASHBOARD_CSS: &str = include_str!("dashboard/assets/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("dashboard/assets/dashboard.js");
 const PLAN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_CACHED_PLANS: usize = 4;
 
 #[derive(Clone)]
 struct DashboardState {
     project_dir: Arc<PathBuf>,
-    include_global: bool,
     read_only: bool,
     auth_token: Arc<str>,
     allowed_hosts: Arc<[String; 2]>,
@@ -97,6 +96,13 @@ impl ApiError {
         }
     }
 
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
     fn internal(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -124,7 +130,7 @@ pub(super) async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let port = args.port.unwrap_or(0);
-    let handle = start(project_dir, args.global, args.read_only, port).await?;
+    let handle = start(project_dir, args.read_only, port).await?;
     let should_open = !args.no_open && !json_output;
     let opened = should_open && open::that(&handle.launch_url).is_ok();
 
@@ -134,7 +140,7 @@ pub(super) async fn run(
             "url": handle.launch_url,
             "display_url": handle.display_url,
             "port": handle.port,
-            "includes_global": args.global,
+            "includes_global": true,
             "read_only": args.read_only,
         });
         println!(
@@ -167,7 +173,6 @@ pub(super) async fn run(
 
 async fn start(
     project_dir: &Path,
-    include_global: bool,
     read_only: bool,
     port: u16,
 ) -> Result<DashboardHandle, LpmError> {
@@ -182,7 +187,6 @@ async fn start(
     let (allowed_hosts, allowed_origins) = loopback_authority_allowlists(bound_port);
     let state = DashboardState {
         project_dir: Arc::new(project_dir.to_path_buf()),
-        include_global,
         read_only,
         auth_token,
         allowed_hosts: Arc::new(allowed_hosts),
@@ -191,6 +195,8 @@ async fn start(
     };
     let api = Router::new()
         .route("/api/v1/inventory", get(get_inventory))
+        .route("/api/v1/skills/{skill_id}", get(get_skill))
+        .route("/api/v1/skills/{skill_id}/reveal", post(reveal_skill))
         .route("/api/v1/actions/preview", post(preview_action))
         .route("/api/v1/actions/apply", post(apply_action))
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -276,13 +282,49 @@ async fn get_inventory(
     State(state): State<DashboardState>,
 ) -> Result<Json<inventory::InventorySnapshot>, ApiError> {
     let project_dir = Arc::clone(&state.project_dir);
-    let snapshot = tokio::task::spawn_blocking(move || {
-        inventory::collect(&project_dir, state.include_global, state.read_only)
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(ApiError::internal)?;
+    let read_only = state.read_only;
+    let snapshot =
+        tokio::task::spawn_blocking(move || inventory::collect(&project_dir, true, read_only))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
     Ok(Json(snapshot))
+}
+
+async fn get_skill(
+    State(state): State<DashboardState>,
+    AxumPath(skill_id): AxumPath<String>,
+) -> Result<Json<inventory::SkillDetailSnapshot>, ApiError> {
+    let skill = find_skill(&state, &skill_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("skill is no longer present"))?;
+    let detail = tokio::task::spawn_blocking(move || inventory::detail(skill))
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(detail))
+}
+
+async fn reveal_skill(
+    State(state): State<DashboardState>,
+    AxumPath(skill_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let skill = find_skill(&state, &skill_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("skill is no longer present"))?;
+    let path = skill
+        .path
+        .map(PathBuf::from)
+        .ok_or_else(|| ApiError::bad_request("skill path is unavailable"))?;
+    let revealed_path = path.display().to_string();
+    tokio::task::spawn_blocking(move || reveal_in_file_manager(&path))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "skill_id": skill_id,
+        "path": revealed_path,
+    })))
 }
 
 async fn preview_action(
@@ -389,18 +431,8 @@ async fn resolve_managed_skill(
     state: &DashboardState,
     request: &PreviewActionRequest,
 ) -> Result<inventory::SkillInventoryItem, ApiError> {
-    let project_dir = Arc::clone(&state.project_dir);
-    let include_global = state.include_global;
-    let snapshot = tokio::task::spawn_blocking(move || {
-        inventory::collect(&project_dir, include_global, false)
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(ApiError::internal)?;
-    let skill = snapshot
-        .skills
-        .into_iter()
-        .find(|skill| skill.id == request.skill_id)
+    let skill = find_skill(state, &request.skill_id)
+        .await?
         .ok_or_else(|| ApiError::bad_request("skill is no longer present"))?;
     if skill.kind != SkillInventoryKind::Managed {
         return Err(ApiError::bad_request(
@@ -426,6 +458,60 @@ async fn resolve_managed_skill(
         }
     }
     Ok(skill)
+}
+
+async fn find_skill(
+    state: &DashboardState,
+    skill_id: &str,
+) -> Result<Option<inventory::SkillInventoryItem>, ApiError> {
+    if !valid_skill_id(skill_id) {
+        return Err(ApiError::bad_request("invalid skill identifier"));
+    }
+    let project_dir = Arc::clone(&state.project_dir);
+    let read_only = state.read_only;
+    let snapshot =
+        tokio::task::spawn_blocking(move || inventory::collect(&project_dir, true, read_only))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+    Ok(snapshot
+        .skills
+        .into_iter()
+        .find(|skill| skill.id == skill_id))
+}
+
+fn valid_skill_id(skill_id: &str) -> bool {
+    let Some((kind, digest)) = skill_id.split_once(':') else {
+        return false;
+    };
+    matches!(kind, "package" | "managed" | "external")
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "file manager exited with {status}"
+        )))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    let target = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    open::that_detached(target)
 }
 
 async fn cache_plan(state: &DashboardState, plan: CachedPlan) -> String {
@@ -558,8 +644,12 @@ mod tests {
     }
 
     #[test]
-    fn visually_hidden_actions_label_is_contained_by_its_table_header() {
-        assert!(DASHBOARD_CSS.contains("th:last-child { position: relative; }"));
+    fn bundled_dashboard_uses_csp_compatible_external_assets() {
+        assert!(INDEX_HTML.contains("src=\"./assets/dashboard.js\""));
+        assert!(INDEX_HTML.contains("href=\"./assets/dashboard.css\""));
+        assert!(!INDEX_HTML.contains("<style"));
+        assert!(!DASHBOARD_CSS.is_empty());
+        assert!(!DASHBOARD_JS.is_empty());
     }
 
     #[tokio::test]
@@ -568,7 +658,7 @@ mod tests {
         let busy_port = busy.local_addr().unwrap().port();
         let project = tempfile::tempdir().unwrap();
 
-        let handle = start(project.path(), false, true, 0).await.unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
 
         assert_ne!(handle.port, busy_port);
         handle.shutdown();
@@ -580,7 +670,7 @@ mod tests {
         let busy_port = busy.local_addr().unwrap().port();
         let project = tempfile::tempdir().unwrap();
 
-        let error = start(project.path(), false, true, busy_port)
+        let error = start(project.path(), true, busy_port)
             .await
             .err()
             .expect("an explicitly occupied port must fail");
@@ -591,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn inventory_api_rejects_requests_without_the_session_token() {
         let project = tempfile::tempdir().unwrap();
-        let handle = start(project.path(), false, true, 0).await.unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
 
         let response = reqwest::get(format!("{}api/v1/inventory", handle.display_url))
             .await
@@ -602,9 +692,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_detail_api_rejects_requests_without_the_session_token() {
+        let project = tempfile::tempdir().unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
+        let skill_id = format!("package:{}", "a".repeat(64));
+
+        let response = reqwest::get(format!("{}api/v1/skills/{skill_id}", handle.display_url))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn dashboard_page_disables_embedding_referrers_and_caching() {
         let project = tempfile::tempdir().unwrap();
-        let handle = start(project.path(), false, true, 0).await.unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
 
         let response = reqwest::get(&handle.display_url).await.unwrap();
 
@@ -624,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn mutation_api_rejects_foreign_browser_origins() {
         let project = tempfile::tempdir().unwrap();
-        let handle = start(project.path(), false, false, 0).await.unwrap();
+        let handle = start(project.path(), false, 0).await.unwrap();
         let token = handle.launch_url.split("#token=").nth(1).unwrap();
 
         let response = reqwest::Client::new()
@@ -646,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_dashboard_rejects_authenticated_mutations() {
         let project = tempfile::tempdir().unwrap();
-        let handle = start(project.path(), false, true, 0).await.unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
         let token = handle.launch_url.split("#token=").nth(1).unwrap();
         let origin = handle.display_url.trim_end_matches('/');
 
@@ -667,9 +771,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reveal_api_rejects_non_inventory_identifiers() {
+        let project = tempfile::tempdir().unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
+        let token = handle.launch_url.split("#token=").nth(1).unwrap();
+        let origin = handle.display_url.trim_end_matches('/');
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}api/v1/skills/private-tmp-secret/reveal",
+                handle.display_url
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::ORIGIN, origin)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn inventory_api_rejects_dns_rebinding_host_headers() {
         let project = tempfile::tempdir().unwrap();
-        let handle = start(project.path(), false, true, 0).await.unwrap();
+        let handle = start(project.path(), true, 0).await.unwrap();
         let token = handle.launch_url.split("#token=").nth(1).unwrap();
 
         let response = reqwest::Client::new()
@@ -687,7 +813,7 @@ mod tests {
     #[tokio::test]
     async fn apply_api_rejects_malformed_plan_identifiers() {
         let project = tempfile::tempdir().unwrap();
-        let handle = start(project.path(), false, false, 0).await.unwrap();
+        let handle = start(project.path(), false, 0).await.unwrap();
         let token = handle.launch_url.split("#token=").nth(1).unwrap();
         let origin = handle.display_url.trim_end_matches('/');
 

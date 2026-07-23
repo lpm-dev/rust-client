@@ -300,6 +300,79 @@ fn skills_dashboard_serves_authenticated_unified_inventory() {
 }
 
 #[test]
+fn skills_dashboard_includes_global_skills_without_a_launch_flag() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let global_skill = project.home().join(".codex/skills/global-guide/SKILL.md");
+    std::fs::create_dir_all(global_skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        global_skill,
+        "---\nname: global-guide\ndescription: Global workflow guidance\n---\n\nUse it.\n",
+    )
+    .unwrap();
+    let dashboard = DashboardProcess::start(&project, &["--read-only"]);
+
+    let inventory: serde_json::Value = dashboard
+        .client()
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory")
+        .json()
+        .expect("decode dashboard inventory");
+
+    assert!(
+        inventory["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| { skill["name"] == "global-guide" && skill["scope"] == "global" }),
+        "dashboard inventory must include global skills by default: {inventory}"
+    );
+}
+
+#[test]
+fn skills_dashboard_detail_returns_exact_authored_markdown_and_statistics() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let content = "---\nname: format-code\ndescription: Format code consistently\nversion: \"1.2.3\"\nglobs: [\"**/*.rs\"]\n---\n\nFollow formatter rules.\n";
+    seed_skill(&project, "alice.tools", "format-code", content);
+    let dashboard = DashboardProcess::start(&project, &["--read-only"]);
+    let client = dashboard.client();
+    let inventory: serde_json::Value = client
+        .get(dashboard.api_url("/api/v1/inventory"))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard inventory")
+        .json()
+        .expect("decode dashboard inventory");
+    let skill_id = inventory["skills"][0]["id"]
+        .as_str()
+        .expect("inventory skill must have an id");
+
+    let response = client
+        .get(dashboard.api_url(&format!("/api/v1/skills/{skill_id}")))
+        .bearer_auth(&dashboard.token)
+        .send()
+        .expect("request dashboard skill detail");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let detail: serde_json::Value = response.json().expect("decode dashboard skill detail");
+
+    assert_eq!(detail["detail"]["raw"], content);
+    assert_eq!(detail["detail"]["body"], "\nFollow formatter rules.\n");
+    assert_eq!(
+        detail["detail"]["files"],
+        serde_json::json!(["format-code.md"])
+    );
+    assert_eq!(detail["detail"]["stats"]["files"], 1);
+    assert_eq!(detail["detail"]["stats"]["words"], 3);
+    assert_eq!(detail["detail"]["stats"]["frontmatter_keys"], 4);
+    assert_eq!(detail["detail"]["metadata"]["version"], "1.2.3");
+    assert_eq!(
+        detail["detail"]["metadata"]["globs"],
+        serde_json::json!(["**/*.rs"])
+    );
+}
+
+#[test]
 fn skills_dashboard_surfaces_a_deleted_package_manifest_skill() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     let available =
@@ -527,6 +600,23 @@ fn skills_dashboard_explicit_busy_port_fails_without_fallback() {
         String::from_utf8_lossy(&output.stderr).contains("already in use"),
         "explicit occupied port must explain the collision: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn skills_dashboard_help_does_not_require_a_global_discovery_flag() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["skills", "dashboard", "--help"])
+        .output()
+        .expect("run skills dashboard help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("--global"),
+        "dashboard help must not advertise a scope flag: {stdout}"
     );
 }
 

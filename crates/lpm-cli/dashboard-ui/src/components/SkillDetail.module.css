@@ -1,0 +1,461 @@
+.pad {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 26px 40px 48px;
+  width: 100%;
+}
+
+.topRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.topRowLeft {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.crumb {
+  font-size: 12.5px;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.ghostBtn {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--sub);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ghostBtn:hover {
+  background: var(--row-hover);
+  color: var(--ink);
+  border-color: var(--muted);
+}
+
+.ghostBtn:disabled,
+.toggleBtn:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+/* The state toggle carries the skill's current state as well as the action, so
+   dropping the standalone ENABLED pill loses nothing. */
+.toggleBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--pill-dis);
+  background: var(--pill-dis-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.toggleBtnOn {
+  color: var(--pill-en);
+  background: var(--pill-en-bg);
+  border-color: var(--pill-en);
+}
+
+.toggleBtn:hover {
+  border-color: var(--muted);
+}
+
+.toggleBtnOn:hover {
+  border-color: var(--pill-en);
+}
+
+.toggleDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.title {
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  margin: 0 0 14px;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.desc {
+  font-size: 14.5px;
+  line-height: 1.68;
+  color: var(--sub);
+  margin: 0 0 22px;
+  max-width: 70ch;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 10px 0 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+  letter-spacing: 0.01em;
+}
+
+.bannerDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex-shrink: 0;
+}
+
+.bannerDotManaged {
+  background: var(--pill-en);
+}
+
+.pathRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 26px;
+  padding: 10px 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.pathCode {
+  flex: 1;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copyIcon {
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.copyIcon:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ---- stats ---- */
+
+.statsRow {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 28px;
+  background: var(--box-bg);
+}
+
+.stat {
+  padding: 16px 18px;
+  border-right: 1px solid var(--border);
+}
+
+.stat:last-child {
+  border-right: none;
+}
+
+.statLabel {
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.statValue {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+
+/* ---- detail tabs ---- */
+
+.detailTabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 22px;
+  overflow-x: auto;
+}
+
+.detailTab {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 10px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.detailTab:hover {
+  color: var(--ink);
+}
+
+.detailTabActive {
+  font-weight: 700;
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+.tabBody {
+  min-height: 200px;
+}
+
+/* ---- preview ---- */
+
+.previewDoc {
+  max-width: 70ch;
+}
+
+.mdH1 {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  margin: 2px 0 14px;
+}
+
+.mdH2 {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 22px 0 10px;
+}
+
+.mdP {
+  font-size: 13.5px;
+  line-height: 1.72;
+  color: var(--sub);
+  margin: 0 0 12px;
+  max-width: 62ch;
+}
+
+.mdList {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.mdLi {
+  font-size: 13.5px;
+  line-height: 1.66;
+  color: var(--sub);
+  margin: 0 0 7px;
+  padding-left: 6px;
+}
+
+.mdLi::before {
+  content: '—';
+  margin-right: 10px;
+}
+
+.mdCode {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--ink);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 0 0 14px;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* ---- raw ---- */
+
+.rawPre {
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--sub);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 22px;
+  white-space: pre-wrap;
+  margin: 0;
+  overflow-x: auto;
+}
+
+/* ---- files ---- */
+
+.tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.treeRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: var(--sub);
+}
+
+.treeRowDir {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.treeRowNested {
+  padding-left: 34px;
+}
+
+.treeIcon {
+  color: var(--faint);
+  width: 12px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.treeIconDir {
+  font-size: 10px;
+  text-align: left;
+}
+
+/* ---- metadata ---- */
+
+.metaTable {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--box-bg);
+  max-width: 640px;
+  margin: 0;
+}
+
+.metaRow {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 16px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border-2);
+  align-items: start;
+}
+
+.metaRow:last-child {
+  border-bottom: none;
+}
+
+.metaKey {
+  font-size: 12.5px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  margin: 0;
+}
+
+.metaValue {
+  font-size: 12.5px;
+  color: var(--ink);
+  word-break: break-word;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.metaValueWarn {
+  color: var(--warn);
+}
+
+/* ---- responsive ---- */
+
+@media (max-width: 900px) {
+  .pad {
+    max-width: none;
+    overflow-y: visible;
+  }
+}
+
+@media (max-width: 720px) {
+  .pad {
+    padding: 20px 16px 32px;
+  }
+
+  .topRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .actions {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .title {
+    font-size: 26px;
+  }
+
+  .statsRow {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .stat:nth-child(2n) {
+    border-right: none;
+  }
+
+  .stat:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .metaRow {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}

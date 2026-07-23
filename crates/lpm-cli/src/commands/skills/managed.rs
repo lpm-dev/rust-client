@@ -1,6 +1,7 @@
 use super::inventory::{
-    DashboardAction, SecurityAssessment, SkillInventoryItem, SkillInventoryKind, SkillTarget,
-    read_and_scan_directory, stable_id, target_path,
+    DashboardAction, DirectoryAssessment, InventoryBatch, InventoryWarning, SecurityAssessment,
+    SkillInventoryItem, SkillInventoryKind, SkillTarget, read_and_scan_directory, stable_id,
+    target_path,
 };
 use super::source::{self, DiscoveredSkill, SourceDescriptor, SourceTree};
 use super::{AgentTarget, ManageArgs, PruneArgs};
@@ -1082,19 +1083,49 @@ pub fn external_inventory(
     Ok(result)
 }
 
-pub(super) fn dashboard_inventory(
-    project_dir: &Path,
-    include_global: bool,
-) -> Result<Vec<SkillInventoryItem>, LpmError> {
-    let mut result = dashboard_managed_scope(&Store::for_scope(Scope::Project, project_dir)?)?;
+pub(super) fn dashboard_inventory(project_dir: &Path, include_global: bool) -> InventoryBatch {
+    let mut result = InventoryBatch::default();
+    append_dashboard_managed_scope(&mut result, Scope::Project, project_dir);
     if include_global {
-        result.extend(dashboard_managed_scope(&Store::for_scope(
-            Scope::Global,
-            project_dir,
-        )?)?);
+        append_dashboard_managed_scope(&mut result, Scope::Global, project_dir);
     }
-    result.extend(dashboard_external_inventory(project_dir, include_global)?);
-    Ok(result)
+    let managed_targets = result
+        .skills
+        .iter()
+        .filter(|skill| skill.kind == SkillInventoryKind::Managed)
+        .flat_map(|skill| skill.targets.iter())
+        .map(|target| PathBuf::from(&target.path))
+        .collect();
+    let external =
+        dashboard_external_inventory_report(project_dir, include_global, &managed_targets);
+    result.skills.extend(external.skills);
+    result.warnings.extend(external.warnings);
+    result.skipped_entries += external.skipped_entries;
+    result
+}
+
+fn append_dashboard_managed_scope(result: &mut InventoryBatch, scope: Scope, project_dir: &Path) {
+    let store = match Store::for_scope(scope, project_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            result
+                .warnings
+                .push(InventoryWarning::new(scope.as_str(), project_dir, error));
+            result.skipped_entries += 1;
+            return;
+        }
+    };
+    match dashboard_managed_scope(&store) {
+        Ok(skills) => result.skills.extend(skills),
+        Err(error) => {
+            result.warnings.push(InventoryWarning::new(
+                scope.as_str(),
+                &store.state_path(),
+                error,
+            ));
+            result.skipped_entries += 1;
+        }
+    }
 }
 
 fn dashboard_managed_scope(store: &Store) -> Result<Vec<SkillInventoryItem>, LpmError> {
@@ -1102,7 +1133,8 @@ fn dashboard_managed_scope(store: &Store) -> Result<Vec<SkillInventoryItem>, Lpm
     let mut result = Vec::with_capacity(state.skills.len());
     for record in state.skills.values() {
         let canonical = store.root.join(&record.canonical_dir);
-        let security = dashboard_managed_security(&canonical, &record.name);
+        let assessment = read_and_scan_directory(&canonical);
+        let security = dashboard_managed_security(&assessment, &record.name);
         let mut targets = Vec::with_capacity(record.targets.len());
         for (agent, target) in &record.targets {
             let diagnosis = diagnose_target(store, target, &canonical);
@@ -1150,7 +1182,9 @@ fn dashboard_managed_scope(store: &Store) -> Result<Vec<SkillInventoryItem>, Lpm
             version: None,
             path: Some(canonical.display().to_string()),
             size_bytes: None,
-            context_tokens: Some(record.context_tokens),
+            context_tokens: assessment.context_tokens.or(Some(record.context_tokens)),
+            file_count: assessment.file_count,
+            modified_at_ms: assessment.modified_at_ms,
             targets,
             healthy,
             integrity: None,
@@ -1162,18 +1196,20 @@ fn dashboard_managed_scope(store: &Store) -> Result<Vec<SkillInventoryItem>, Lpm
     Ok(result)
 }
 
-fn dashboard_managed_security(canonical: &Path, expected_name: &str) -> SecurityAssessment {
-    let (skill_content, _, security) = read_and_scan_directory(canonical);
-    if security.status != "scanned" {
-        return security;
+fn dashboard_managed_security(
+    assessment: &DirectoryAssessment,
+    expected_name: &str,
+) -> SecurityAssessment {
+    if assessment.security.status != "scanned" {
+        return assessment.security.clone();
     }
-    let Some(skill_content) = skill_content else {
+    let Some(skill_content) = assessment.skill_content.as_deref() else {
         return SecurityAssessment::unavailable(
             "managed canonical SKILL.md is missing or is not UTF-8 text".into(),
         );
     };
     let (metadata, _, errors) =
-        lpm_security::skill_security::parse_agent_skill_frontmatter(&skill_content);
+        lpm_security::skill_security::parse_agent_skill_frontmatter(skill_content);
     if !errors.is_empty()
         || metadata.name.as_deref() != Some(expected_name)
         || metadata.description.is_none()
@@ -1182,76 +1218,113 @@ fn dashboard_managed_security(canonical: &Path, expected_name: &str) -> Security
             "managed canonical SKILL.md has invalid frontmatter".into(),
         );
     }
-    security
+    assessment.security.clone()
 }
 
+#[cfg(test)]
 fn dashboard_external_inventory(
     project_dir: &Path,
     include_global: bool,
 ) -> Result<Vec<SkillInventoryItem>, LpmError> {
     Ok(external_inventory(project_dir, include_global)?
         .into_iter()
-        .map(|skill| {
-            let directory = PathBuf::from(&skill.path);
-            let (content, context_tokens, security) = if skill.healthy {
-                read_and_scan_directory(&directory)
-            } else {
-                (
-                    None,
-                    None,
-                    SecurityAssessment::unavailable(
-                        "external skill target is a broken link".into(),
-                    ),
-                )
-            };
-            let description = content.as_deref().and_then(|content| {
-                lpm_security::skill_security::parse_agent_skill_frontmatter(content)
-                    .0
-                    .description
-            });
-            let agent = agent_slug(skill.agent);
-            let global_flag = if skill.scope == "global" {
-                " --global"
-            } else {
-                ""
-            };
-            SkillInventoryItem {
-                id: stable_id(
-                    "external",
-                    &format!("{}:{agent}:{}", skill.scope, directory.display()),
-                ),
-                kind: SkillInventoryKind::External,
-                name: skill.name,
-                description,
-                source: "external agent directory".into(),
-                scope: skill.scope,
-                package: None,
-                version: None,
-                path: Some(directory.display().to_string()),
-                size_bytes: None,
-                context_tokens,
-                targets: vec![SkillTarget {
-                    agent: agent.into(),
-                    label: skill.agent.label().into(),
-                    path: directory.display().to_string(),
-                    enabled: skill.healthy,
-                    healthy: skill.healthy,
-                    status: if skill.healthy {
-                        "healthy"
-                    } else {
-                        "broken-link"
-                    }
-                    .into(),
-                    materialization: "external".into(),
-                }],
-                healthy: skill.healthy,
-                integrity: None,
-                security,
-                actions: Vec::new(),
-                command: format!("lpm skills list --kind external --agent {agent}{global_flag}"),
-            }
-        })
+        .map(dashboard_external_item)
         .collect())
+}
+
+fn dashboard_external_item(skill: ExternalInventory) -> SkillInventoryItem {
+    let directory = PathBuf::from(&skill.path);
+    let assessment = if skill.healthy {
+        read_and_scan_directory(&directory)
+    } else {
+        DirectoryAssessment {
+            skill_content: None,
+            context_tokens: None,
+            security: SecurityAssessment::unavailable(
+                "external skill target is a broken link".into(),
+            ),
+            file_count: 0,
+            modified_at_ms: None,
+        }
+    };
+    let description = assessment.skill_content.as_deref().and_then(|content| {
+        lpm_security::skill_security::parse_agent_skill_frontmatter(content)
+            .0
+            .description
+    });
+    let agent = agent_slug(skill.agent);
+    let global_flag = if skill.scope == "global" {
+        " --global"
+    } else {
+        ""
+    };
+    SkillInventoryItem {
+        id: stable_id(
+            "external",
+            &format!("{}:{agent}:{}", skill.scope, directory.display()),
+        ),
+        kind: SkillInventoryKind::External,
+        name: skill.name,
+        description,
+        source: "external agent directory".into(),
+        scope: skill.scope,
+        package: None,
+        version: None,
+        path: Some(directory.display().to_string()),
+        size_bytes: None,
+        context_tokens: assessment.context_tokens,
+        file_count: assessment.file_count,
+        modified_at_ms: assessment.modified_at_ms,
+        targets: vec![SkillTarget {
+            agent: agent.into(),
+            label: skill.agent.label().into(),
+            path: directory.display().to_string(),
+            enabled: skill.healthy,
+            healthy: skill.healthy,
+            status: if skill.healthy {
+                "healthy"
+            } else {
+                "broken-link"
+            }
+            .into(),
+            materialization: "external".into(),
+        }],
+        healthy: skill.healthy,
+        integrity: None,
+        security: assessment.security,
+        actions: Vec::new(),
+        command: format!("lpm skills list --kind external --agent {agent}{global_flag}"),
+    }
+}
+
+fn dashboard_external_inventory_report(
+    project_dir: &Path,
+    include_global: bool,
+    managed_targets: &BTreeSet<PathBuf>,
+) -> InventoryBatch {
+    let mut report = InventoryBatch::default();
+    let mut external = Vec::new();
+    scan_external_scope_best_effort(
+        Scope::Project,
+        project_dir,
+        managed_targets,
+        &mut external,
+        &mut report,
+    );
+    if include_global {
+        scan_external_scope_best_effort(
+            Scope::Global,
+            project_dir,
+            managed_targets,
+            &mut external,
+            &mut report,
+        );
+    }
+    external.sort_by(|left, right| left.name.cmp(&right.name));
+    report
+        .skills
+        .extend(external.into_iter().map(dashboard_external_item));
+    report
 }
 
 fn managed_target_paths(
@@ -1276,14 +1349,7 @@ fn scan_external_scope(
 ) -> Result<Vec<ExternalInventory>, LpmError> {
     let mut result = Vec::new();
     for agent in AgentTarget::ALL {
-        let root = match scope {
-            Scope::Project => match agent {
-                AgentTarget::Codex => project_dir.join(".agents/skills"),
-                AgentTarget::ClaudeCode => project_dir.join(".claude/skills"),
-                AgentTarget::Cursor => project_dir.join(".cursor/skills"),
-            },
-            Scope::Global => global_agent_root(agent)?,
-        };
+        let root = external_agent_root(scope, project_dir, agent)?;
         scan_external_root(&root, agent, scope, managed_targets, &mut result)?;
     }
     if scope == Scope::Global
@@ -1298,6 +1364,55 @@ fn scan_external_scope(
         )?;
     }
     Ok(result)
+}
+
+fn scan_external_scope_best_effort(
+    scope: Scope,
+    project_dir: &Path,
+    managed_targets: &BTreeSet<PathBuf>,
+    result: &mut Vec<ExternalInventory>,
+    report: &mut InventoryBatch,
+) {
+    for agent in AgentTarget::ALL {
+        let root = match external_agent_root(scope, project_dir, agent) {
+            Ok(root) => root,
+            Err(error) => {
+                report
+                    .warnings
+                    .push(InventoryWarning::new(scope.as_str(), project_dir, error));
+                report.skipped_entries += 1;
+                continue;
+            }
+        };
+        scan_external_root_best_effort(&root, agent, scope, managed_targets, result, report);
+    }
+    if scope == Scope::Global
+        && let Some(home) = dirs::home_dir()
+    {
+        scan_external_root_best_effort(
+            &home.join(".agents/skills"),
+            AgentTarget::Codex,
+            scope,
+            managed_targets,
+            result,
+            report,
+        );
+    }
+}
+
+fn external_agent_root(
+    scope: Scope,
+    project_dir: &Path,
+    agent: AgentTarget,
+) -> Result<PathBuf, LpmError> {
+    match scope {
+        Scope::Project => Ok(match agent {
+            AgentTarget::Codex => project_dir.join(".agents/skills"),
+            AgentTarget::ClaudeCode => project_dir.join(".claude/skills"),
+            AgentTarget::Cursor => project_dir.join(".cursor/skills"),
+        }),
+        Scope::Global => global_agent_root(agent),
+    }
 }
 
 fn scan_external_root(
@@ -1332,6 +1447,64 @@ fn scan_external_root(
         });
     }
     Ok(())
+}
+
+fn scan_external_root_best_effort(
+    root: &Path,
+    agent: AgentTarget,
+    scope: Scope,
+    managed_targets: &BTreeSet<PathBuf>,
+    result: &mut Vec<ExternalInventory>,
+    report: &mut InventoryBatch,
+) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            report
+                .warnings
+                .push(InventoryWarning::new(scope.as_str(), root, error));
+            report.skipped_entries += 1;
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report
+                    .warnings
+                    .push(InventoryWarning::new(scope.as_str(), root, error));
+                report.skipped_entries += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report
+                    .warnings
+                    .push(InventoryWarning::new(scope.as_str(), &path, error));
+                report.skipped_entries += 1;
+                continue;
+            }
+        };
+        let broken_symlink = metadata.file_type().is_symlink() && std::fs::metadata(&path).is_err();
+        if !broken_symlink && !path.join("SKILL.md").is_file() {
+            continue;
+        }
+        if managed_targets.contains(&path) {
+            continue;
+        }
+        result.push(ExternalInventory {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: path.display().to_string(),
+            agent,
+            scope: scope.as_str().into(),
+            healthy: !broken_symlink,
+        });
+    }
 }
 
 pub fn view(
@@ -3386,6 +3559,27 @@ mod tests {
             (skill_content.chars().count() + auxiliary_content.chars().count()).div_ceil(4);
 
         assert_eq!(inventory[0].context_tokens, Some(expected));
+    }
+
+    #[test]
+    fn dashboard_external_inventory_keeps_healthy_roots_when_another_root_cannot_be_scanned() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".agents")).unwrap();
+        std::fs::write(project.path().join(".agents/skills"), "not a directory").unwrap();
+        let healthy = project.path().join(".claude/skills/healthy");
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::write(
+            healthy.join("SKILL.md"),
+            "---\nname: healthy\ndescription: Healthy guide\n---\nUse the guide.",
+        )
+        .unwrap();
+
+        let snapshot = super::super::inventory::collect(project.path(), false, true).unwrap();
+
+        assert!(snapshot.skills.iter().any(|skill| skill.name == "healthy"));
+        assert_eq!(snapshot.skipped_entries, 1);
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert!(snapshot.warnings[0].path.ends_with(".agents/skills"));
     }
 
     #[test]

@@ -7,6 +7,6 @@ expression: dashboard.startup
   "url": "[dashboard-url]",
   "display_url": "[dashboard-display-url]",
   "port": "[dashboard-port]",
-  "includes_global": false,
+  "includes_global": true,
   "read_only": true
 }
