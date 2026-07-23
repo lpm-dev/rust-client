@@ -1,0 +1,23 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: status_json
+---
+{
+  "success": true,
+  "count": 1,
+  "platforms": [
+    {
+      "platform": "coolify",
+      "label": "production",
+      "env": "production",
+      "status": "drifted",
+      "added": 0,
+      "changed": 0,
+      "removed": 1,
+      "driftKeys": [
+        "APPLICATION_SECRET"
+      ],
+      "lastPushAt": null
+    }
+  ]
+}

@@ -51,8 +51,15 @@ struct PlatformVariable {
 
 #[derive(Debug, Clone)]
 enum VariableScope {
-    Vercel { targets: Vec<String> },
-    Coolify { preview: bool },
+    Vercel {
+        targets: Vec<String>,
+    },
+    Coolify {
+        preview: bool,
+        is_literal: bool,
+        is_multiline: bool,
+        is_shown_once: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]

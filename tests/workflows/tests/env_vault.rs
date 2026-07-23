@@ -2920,7 +2920,12 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
                 "uuid": "env-application-secret",
                 "key": "APPLICATION_SECRET",
                 "value": "remote-value",
-                "is_preview": false
+                "real_value": "remote-value",
+                "is_preview": false,
+                "is_literal": false,
+                "is_multiline": false,
+                "is_shown_once": false,
+                "is_shared": false
             }
         ]),
         2,
@@ -2957,6 +2962,10 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     let connect_json = parse_clean_json_stdout(&connect);
     assert_eq!(connect_json["success"], true);
     assert_eq!(connect_json["platform"], "coolify");
+    insta::assert_json_snapshot!(
+        "env_coolify_connect_json_envelope",
+        connect_json
+    );
 
     let status = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -2975,6 +2984,10 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     assert_eq!(status_json["platforms"][0]["platform"], "coolify");
     assert_eq!(status_json["platforms"][0]["env"], "production");
     assert_eq!(status_json["platforms"][0]["status"], "drifted");
+    insta::assert_json_snapshot!(
+        "env_coolify_status_json_envelope",
+        status_json
+    );
 }
 
 #[tokio::test]
