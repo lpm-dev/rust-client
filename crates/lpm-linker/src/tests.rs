@@ -26,13 +26,30 @@ fn bin_shim_path(bin_dir: &Path, name: &str) -> PathBuf {
 fn assert_directory_link_target(link: &Path, expected_relative_target: &Path, message: &str) {
     #[cfg(windows)]
     {
-        let expected = link
-            .parent()
-            .unwrap()
-            .join(expected_relative_target)
-            .canonicalize()
-            .unwrap();
-        assert_eq!(link.canonicalize().unwrap(), expected, "{message}");
+        use std::path::Component;
+
+        let actual = std::fs::read_link(link).unwrap();
+        assert!(actual.is_absolute(), "{message}: target must be absolute");
+
+        let expected = link.parent().unwrap().join(expected_relative_target);
+        let actual_segments: Vec<_> = actual
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(segment) => Some(segment.to_owned()),
+                _ => None,
+            })
+            .collect();
+        let mut expected_segments = Vec::new();
+        for component in expected.components() {
+            match component {
+                Component::Normal(segment) => expected_segments.push(segment.to_owned()),
+                Component::ParentDir => {
+                    expected_segments.pop();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(actual_segments, expected_segments, "{message}");
     }
     #[cfg(not(windows))]
     {

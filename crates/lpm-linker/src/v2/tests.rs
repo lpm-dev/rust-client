@@ -926,13 +926,7 @@ fn link_packages_v2_materializes_direct_bin_without_unrelated_direct_deps() {
         !copied_unrelated_library,
         "unrelated direct packages must not be blindly copied into compatibility islands"
     );
-    assert!(
-        project
-            .join("node_modules")
-            .join(".bin")
-            .join("tool")
-            .exists()
-    );
+    assert!(bin_shim_path(&project, "tool").exists());
     #[cfg(unix)]
     {
         let shim = project.join("node_modules").join(".bin").join("tool");

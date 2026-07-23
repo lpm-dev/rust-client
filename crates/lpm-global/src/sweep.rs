@@ -334,7 +334,12 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
     if relative_path.is_empty() {
         return Err("empty tombstone path (manifest corrupt?)".to_string());
     }
-    if relative_path.starts_with('/') || relative_path.starts_with('\\') {
+    let bytes = relative_path.as_bytes();
+    let has_windows_drive_root = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if relative_path.starts_with('/') || relative_path.starts_with('\\') || has_windows_drive_root {
         return Err(format!(
             "refusing to sweep tombstone {relative_path:?}: not a relative path under \
              the global root — manifest may be poisoned"
