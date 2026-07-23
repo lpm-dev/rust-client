@@ -1007,6 +1007,29 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_platform_connect_application_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        platform: &str,
+        application_id: &str,
+        response: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/connect"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!("\"platform\":\"{platform}\"")))
+            .and(body_string_contains(format!(
+                "\"applicationId\":\"{application_id}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_platform_credentials_success(
         &self,
         bearer_token: &str,
@@ -1046,6 +1069,23 @@ impl MockRegistry {
                 "envs": envs,
                 "pagination": { "next": null },
             })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_coolify_env_list(
+        &self,
+        token: &str,
+        application_id: &str,
+        envs: serde_json::Value,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/applications/{application_id}/envs")))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envs))
             .expect(expected_calls)
             .mount(&self.server)
             .await;

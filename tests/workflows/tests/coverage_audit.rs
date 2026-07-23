@@ -204,7 +204,8 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
         ],
         103 => &["crates/lpm-cli/src/commands/env/remote.rs"],
         106 => &[
-            "crates/lpm-cli/src/commands/env/platform.rs",
+            "crates/lpm-cli/src/commands/env/platform/mod.rs",
+            "crates/lpm-cli/src/commands/env/platform/coolify.rs",
             "crates/lpm-cli/src/commands/env/remote.rs",
             "crates/lpm-cli/src/commands/env/rotation.rs",
         ],

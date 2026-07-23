@@ -1,3 +1,5 @@
+mod coolify;
+
 use super::prelude::*;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -6,6 +8,12 @@ use std::collections::HashSet;
 const VERCEL_API_URL: &str = "https://api.vercel.com";
 const PLATFORM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PLATFORM_MUTATION_CONCURRENCY: usize = 8;
+const PLATFORM_TOKEN_MAX_CHARS: usize = 10_000;
+const PLATFORM_LABEL_MAX_CHARS: usize = 100;
+const LINKED_ENV_MAX_CHARS: usize = 64;
+const VERCEL_ID_MAX_CHARS: usize = 100;
+const COOLIFY_URL_MAX_CHARS: usize = 2048;
+const COOLIFY_APPLICATION_ID_MAX_CHARS: usize = 128;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,10 +43,16 @@ struct PlatformCredentialsResponse {
 }
 
 #[derive(Debug, Clone)]
-struct VercelVariable {
+struct PlatformVariable {
     id: String,
     value: String,
-    targets: Vec<String>,
+    scope: VariableScope,
+}
+
+#[derive(Debug, Clone)]
+enum VariableScope {
+    Vercel { targets: Vec<String> },
+    Coolify { preview: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +92,24 @@ struct PlatformPushResult {
     removed: usize,
 }
 
+impl PlatformPushResult {
+    fn from_outcomes(outcomes: Vec<MutationKind>) -> Self {
+        let mut result = Self {
+            added: 0,
+            updated: 0,
+            removed: 0,
+        };
+        for outcome in outcomes {
+            match outcome {
+                MutationKind::Added => result.added += 1,
+                MutationKind::Updated => result.updated += 1,
+                MutationKind::Removed => result.removed += 1,
+            }
+        }
+        result
+    }
+}
+
 #[derive(Debug)]
 enum VercelMutation {
     Add { key: String, value: String },
@@ -115,19 +147,6 @@ impl VercelClient {
         })
     }
 
-    fn from_connection(connection: &PlatformConnection) -> Result<Self, LpmError> {
-        if connection.platform != "vercel" {
-            return Err(LpmError::Script(format!(
-                "unsupported platform '{}'; this CLI currently supports Vercel",
-                connection.platform
-            )));
-        }
-        let config =
-            serde_json::from_value::<VercelConnectionConfig>(connection.connection_config.clone())
-                .map_err(|error| LpmError::Script(format!("invalid Vercel connection: {error}")))?;
-        Self::new(connection.token.clone(), config)
-    }
-
     fn collection_url(&self, version: &str) -> String {
         let project = urlencoding::encode(&self.config.project_id);
         let mut url = format!("{}/{version}/projects/{project}/env", self.api_url);
@@ -156,7 +175,7 @@ impl VercelClient {
             .unwrap_or_else(|| vec!["production".into(), "preview".into(), "development".into()])
     }
 
-    async fn list(&self) -> Result<HashMap<String, VercelVariable>, LpmError> {
+    async fn list(&self) -> Result<HashMap<String, PlatformVariable>, LpmError> {
         let project = urlencoding::encode(&self.config.project_id);
         let mut variables = HashMap::new();
         let mut cursor: Option<String> = None;
@@ -225,10 +244,12 @@ impl VercelClient {
                 }
                 variables.insert(
                     key,
-                    VercelVariable {
+                    PlatformVariable {
                         id: variable.id,
                         value: variable.value,
-                        targets: variable.target,
+                        scope: VariableScope::Vercel {
+                            targets: variable.target,
+                        },
                     },
                 );
             }
@@ -255,7 +276,7 @@ impl VercelClient {
         &self,
         diff: &PlatformDiff,
         local: &HashMap<String, String>,
-        remote: &HashMap<String, VercelVariable>,
+        remote: &HashMap<String, PlatformVariable>,
     ) -> Result<PlatformPushResult, LpmError> {
         let mut mutations =
             Vec::with_capacity(diff.added.len() + diff.changed.len() + diff.removed.len());
@@ -297,30 +318,22 @@ impl VercelClient {
             .try_collect()
             .await?;
 
-        let mut result = PlatformPushResult {
-            added: 0,
-            updated: 0,
-            removed: 0,
-        };
-        for outcome in outcomes {
-            match outcome {
-                MutationKind::Added => result.added += 1,
-                MutationKind::Updated => result.updated += 1,
-                MutationKind::Removed => result.removed += 1,
-            }
-        }
-        Ok(result)
+        Ok(PlatformPushResult::from_outcomes(outcomes))
     }
 
     fn assert_mutation_targets(
         &self,
         key: &str,
-        variable: &VercelVariable,
+        variable: &PlatformVariable,
     ) -> Result<(), LpmError> {
         let selected_targets = self.selected_targets().into_iter().collect::<HashSet<_>>();
-        if variable.targets.is_empty()
-            || !variable
-                .targets
+        let VariableScope::Vercel { targets } = &variable.scope else {
+            return Err(LpmError::Script(format!(
+                "Vercel value {key} does not match the configured deployment targets"
+            )));
+        };
+        if targets.is_empty()
+            || !targets
                 .iter()
                 .all(|target| selected_targets.contains(target))
         {
@@ -380,6 +393,83 @@ impl VercelClient {
     }
 }
 
+enum PlatformClient {
+    Vercel(VercelClient),
+    Coolify(coolify::CoolifyClient),
+}
+
+impl PlatformClient {
+    fn from_connection(connection: &PlatformConnection) -> Result<Self, LpmError> {
+        match connection.platform.as_str() {
+            "vercel" => {
+                let config = serde_json::from_value::<VercelConnectionConfig>(
+                    connection.connection_config.clone(),
+                )
+                .map_err(|error| LpmError::Script(format!("invalid Vercel connection: {error}")))?;
+                Ok(Self::Vercel(VercelClient::new(
+                    connection.token.clone(),
+                    config,
+                )?))
+            }
+            "coolify" => {
+                let config = serde_json::from_value::<coolify::CoolifyConnectionConfig>(
+                    connection.connection_config.clone(),
+                )
+                .map_err(|error| {
+                    LpmError::Script(format!("invalid Coolify connection: {error}"))
+                })?;
+                Ok(Self::Coolify(coolify::CoolifyClient::new(
+                    connection.token.clone(),
+                    config,
+                )?))
+            }
+            platform => Err(LpmError::Script(format!(
+                "unsupported env platform '{platform}'; use vercel or coolify"
+            ))),
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Vercel(_) => "Vercel",
+            Self::Coolify(_) => "Coolify",
+        }
+    }
+
+    fn linked_env(&self) -> Option<&str> {
+        match self {
+            Self::Vercel(client) => client.config.linked_env.as_deref(),
+            Self::Coolify(client) => client.config().linked_env.as_deref(),
+        }
+    }
+
+    fn is_managed(&self, key: &str) -> bool {
+        match self {
+            Self::Vercel(_) => is_vercel_managed_variable(key),
+            Self::Coolify(_) => coolify::CoolifyClient::is_managed(key),
+        }
+    }
+
+    async fn list(&self) -> Result<HashMap<String, PlatformVariable>, LpmError> {
+        match self {
+            Self::Vercel(client) => client.list().await,
+            Self::Coolify(client) => client.list().await,
+        }
+    }
+
+    async fn apply(
+        &self,
+        diff: &PlatformDiff,
+        local: &HashMap<String, String>,
+        remote: &HashMap<String, PlatformVariable>,
+    ) -> Result<PlatformPushResult, LpmError> {
+        match self {
+            Self::Vercel(client) => client.apply(diff, local, remote).await,
+            Self::Coolify(client) => client.apply(diff, local, remote).await,
+        }
+    }
+}
+
 fn vercel_api_url() -> Result<String, LpmError> {
     if !cfg!(any(debug_assertions, feature = "acceptance-test-hooks")) {
         return Ok(VERCEL_API_URL.into());
@@ -436,7 +526,8 @@ fn json_scalar_string(value: serde_json::Value) -> Option<String> {
 }
 
 fn compute_diff(
-    remote: &HashMap<String, VercelVariable>,
+    client: &PlatformClient,
+    remote: &HashMap<String, PlatformVariable>,
     local: &HashMap<String, String>,
     clean: bool,
 ) -> PlatformDiff {
@@ -444,7 +535,7 @@ fn compute_diff(
     let mut changed = Vec::new();
     let mut unchanged = Vec::new();
     for (key, value) in local {
-        if is_vercel_managed_variable(key) {
+        if client.is_managed(key) {
             continue;
         }
         match remote.get(key) {
@@ -457,7 +548,7 @@ fn compute_diff(
     let mut removed = if clean {
         remote
             .keys()
-            .filter(|key| !local.contains_key(*key) && !is_vercel_managed_variable(key))
+            .filter(|key| !local.contains_key(*key) && !client.is_managed(key))
             .cloned()
             .collect()
     } else {
@@ -604,6 +695,23 @@ fn parse_flag<'a>(args: &'a [&str], name: &str) -> Option<&'a str> {
     None
 }
 
+fn validate_connect_field(
+    flag: &str,
+    value: &str,
+    max_chars: usize,
+    required: bool,
+) -> Result<(), LpmError> {
+    if required && value.is_empty() {
+        return Err(LpmError::Script(format!("{flag} cannot be empty")));
+    }
+    if value.chars().count() > max_chars {
+        return Err(LpmError::Script(format!(
+            "{flag} must be at most {max_chars} characters"
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_env_name(
     project_dir: &std::path::Path,
     input: Option<&str>,
@@ -651,43 +759,102 @@ pub(super) async fn vars_connect(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let platform = args.first().copied().ok_or_else(|| {
-        LpmError::Script("usage: lpm env connect vercel --project=<id> [--token=<token>]".into())
+        LpmError::Script(
+            "usage: lpm env connect <vercel|coolify> [platform options] [--token=<token>]".into(),
+        )
     })?;
-    if platform != "vercel" {
-        return Err(LpmError::Script(
-            "Vercel is the only currently supported env platform".into(),
-        ));
-    }
-    let project_id = parse_flag(args, "--project")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| LpmError::Script("missing --project flag".into()))?;
-    let team_id = parse_flag(args, "--team").map(str::to_string);
     let label = parse_flag(args, "--label");
     let linked_env = resolve_env_name(project_dir, parse_flag(args, "--linked-env"))?;
-    let targets = parse_targets(parse_flag(args, "--target"))?;
-
-    let token_owned;
-    let platform_token = if let Some(token) = parse_flag(args, "--token") {
-        token
-    } else {
-        token_owned = cliclack::password("Paste Vercel API token")
-            .interact()
-            .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
-        token_owned.as_str()
+    let display_name = match platform {
+        "vercel" => "Vercel",
+        "coolify" => "Coolify",
+        _ => {
+            return Err(LpmError::Script(format!(
+                "unsupported env platform '{platform}'; use vercel or coolify"
+            )));
+        }
     };
+    let platform_token = if let Some(token) = parse_flag(args, "--token") {
+        token.to_owned()
+    } else {
+        cliclack::password(format!("Paste {display_name} API token"))
+            .interact()
+            .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?
+    };
+    if platform_token.is_empty() {
+        return Err(LpmError::Script("--token cannot be empty".into()));
+    }
+    validate_connect_field("--token", &platform_token, PLATFORM_TOKEN_MAX_CHARS, true)?;
+    if let Some(label) = label {
+        validate_connect_field("--label", label, PLATFORM_LABEL_MAX_CHARS, false)?;
+    }
+    if let Some(linked_env) = &linked_env {
+        validate_connect_field("--linked-env", linked_env, LINKED_ENV_MAX_CHARS, true)?;
+    }
 
-    let config = VercelConnectionConfig {
-        project_id: project_id.to_string(),
-        team_id,
-        target: targets,
-        linked_env,
+    let (client, config, target_description) = match platform {
+        "vercel" => {
+            let project_id = parse_flag(args, "--project")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --project flag".into()))?;
+            validate_connect_field("--project", project_id, VERCEL_ID_MAX_CHARS, true)?;
+            let team_id = parse_flag(args, "--team")
+                .map(|value| {
+                    validate_connect_field("--team", value, VERCEL_ID_MAX_CHARS, true)?;
+                    Ok::<String, LpmError>(value.to_owned())
+                })
+                .transpose()?;
+            let config = VercelConnectionConfig {
+                project_id: project_id.to_owned(),
+                team_id,
+                target: parse_targets(parse_flag(args, "--target"))?,
+                linked_env,
+            };
+            let client =
+                PlatformClient::Vercel(VercelClient::new(platform_token.clone(), config.clone())?);
+            (
+                client,
+                serde_json::to_value(config).map_err(|error| {
+                    LpmError::Script(format!("failed to serialize Vercel connection: {error}"))
+                })?,
+                format!("project: {project_id}"),
+            )
+        }
+        "coolify" => {
+            let url = parse_flag(args, "--url")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --url flag".into()))?;
+            validate_connect_field("--url", url, COOLIFY_URL_MAX_CHARS, true)?;
+            let application_id = parse_flag(args, "--application")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --application flag".into()))?;
+            validate_connect_field(
+                "--application",
+                application_id,
+                COOLIFY_APPLICATION_ID_MAX_CHARS,
+                true,
+            )?;
+            let config = coolify::CoolifyConnectionConfig {
+                url: url.to_owned(),
+                application_id: application_id.to_owned(),
+                preview: args.contains(&"--preview"),
+                linked_env,
+            };
+            let coolify_client = coolify::CoolifyClient::new(platform_token.clone(), config)?;
+            let config = serde_json::to_value(coolify_client.config()).map_err(|error| {
+                LpmError::Script(format!("failed to serialize Coolify connection: {error}"))
+            })?;
+            let client = PlatformClient::Coolify(coolify_client);
+            (client, config, format!("application: {application_id}"))
+        }
+        _ => unreachable!("supported platform validated above"),
     };
     if !json_output {
-        output::info("verifying the Vercel connection directly...");
+        output::info(&format!(
+            "verifying the {display_name} connection directly..."
+        ));
     }
-    VercelClient::new(platform_token.to_string(), config.clone())?
-        .list()
-        .await?;
+    client.list().await?;
 
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
@@ -725,9 +892,10 @@ pub(super) async fn vars_connect(
     } else {
         let status = result["status"].as_str().unwrap_or("connected");
         output::success_line(crate::install_ui::terminal_line!(
-            "Vercel {} (project: {})",
+            "{} {} ({})",
+            display_name,
             install_ui::bold(status),
-            project_id
+            target_description
         ));
     }
     Ok(())
@@ -739,11 +907,11 @@ pub(super) async fn vars_platform_push(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let platform = parse_flag(args, "--to").ok_or_else(|| {
-        LpmError::Script("missing --to flag. Usage: lpm env push --to vercel".into())
+        LpmError::Script("missing --to flag. Usage: lpm env push --to <platform>".into())
     })?;
-    if platform != "vercel" {
+    if !matches!(platform, "vercel" | "coolify") {
         return Err(LpmError::Script(
-            "Vercel is the only currently supported env platform".into(),
+            "unsupported env platform; use vercel or coolify".into(),
         ));
     }
     let clean = args.contains(&"--clean");
@@ -756,23 +924,26 @@ pub(super) async fn vars_platform_push(
         fetch_connections(&registry_url, &auth_token, &vault_id, Some(platform)).await?;
     let connection = connections
         .pop()
-        .ok_or_else(|| LpmError::Script("No Vercel connection found".into()))?;
-    let client = VercelClient::from_connection(&connection)?;
-    let requested_env = parse_flag(args, "--env").or(client.config.linked_env.as_deref());
+        .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
+    let client = PlatformClient::from_connection(&connection)?;
+    let display_name = client.display_name();
+    let requested_env = parse_flag(args, "--env").or(client.linked_env());
     let resolved_env = resolve_env_name(project_dir, requested_env)?;
     let local = lpm_runner::dotenv::load_project_env(project_dir, resolved_env.as_deref())?;
 
     if !json_output {
-        output::info("comparing local env values with Vercel...");
+        output::info(&format!(
+            "comparing local env values with {display_name}..."
+        ));
     }
     let remote = client.list().await?;
-    let diff = compute_diff(&remote, &local, clean);
+    let diff = compute_diff(&client, &remote, &local, clean);
     let orphan_count = if clean {
         0
     } else {
         remote
             .keys()
-            .filter(|key| !local.contains_key(*key) && !is_vercel_managed_variable(key))
+            .filter(|key| !local.contains_key(*key) && !client.is_managed(key))
             .count()
     };
     if diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty() {
@@ -784,7 +955,7 @@ pub(super) async fn vars_platform_push(
                 "orphans": orphan_count,
             }));
         } else {
-            output::success("Vercel is already in sync");
+            output::success(&format!("{display_name} is already in sync"));
             if orphan_count > 0 {
                 output::warn(&format!(
                     "{orphan_count} platform-only value(s) preserved. Use --clean to remove."
@@ -837,7 +1008,7 @@ pub(super) async fn vars_platform_push(
 
     if !yes && !json_output {
         let confirmed = cliclack::confirm(format!(
-            "Push {} added, {} changed, {} removed to Vercel?",
+            "Push {} added, {} changed, {} removed to {display_name}?",
             diff.added.len(),
             diff.changed.len(),
             diff.removed.len()
@@ -880,12 +1051,12 @@ pub(super) async fn vars_platform_push(
         }));
     } else {
         output::success(&format!(
-            "Vercel synced — {} added, {} updated, {} removed",
+            "{display_name} synced — {} added, {} updated, {} removed",
             result.added, result.updated, result.removed
         ));
         if let Err(error) = audit {
             output::warn(&format!(
-                "Vercel was updated, but LPM could not record the audit entry: {error}"
+                "{display_name} was updated, but LPM could not record the audit entry: {error}"
             ));
         }
     }
@@ -909,7 +1080,9 @@ pub(super) async fn vars_platform_status(
                 "count": 0,
             }));
         } else {
-            output::warn("no platform connections. Run `lpm env connect vercel` first.");
+            output::warn(
+                "no platform connections. Run `lpm env connect vercel` or `lpm env connect coolify` first.",
+            );
         }
         return Ok(());
     }
@@ -918,7 +1091,7 @@ pub(super) async fn vars_platform_status(
     for connection in connections {
         let label = connection.label.clone();
         let last_push_at = connection.last_push_at.clone();
-        let client = match VercelClient::from_connection(&connection) {
+        let client = match PlatformClient::from_connection(&connection) {
             Ok(client) => client,
             Err(error) => {
                 statuses.push(serde_json::json!({
@@ -931,7 +1104,7 @@ pub(super) async fn vars_platform_status(
                 continue;
             }
         };
-        let env_name = client.config.linked_env.as_deref().unwrap_or("default");
+        let env_name = client.linked_env().unwrap_or("default");
         let mode = (env_name != "default").then_some(env_name);
         let local = match lpm_runner::dotenv::load_project_env(project_dir, mode) {
             Ok(local) => local,
@@ -949,7 +1122,7 @@ pub(super) async fn vars_platform_status(
         };
         match client.list().await {
             Ok(remote) => {
-                let diff = compute_diff(&remote, &local, false);
+                let diff = compute_diff(&client, &remote, &local, true);
                 let mut drift_keys = diff
                     .added
                     .iter()
@@ -1046,11 +1219,11 @@ pub(super) async fn vars_platform_pull(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let platform = parse_flag(args, "--from").ok_or_else(|| {
-        LpmError::Script("missing --from flag. Usage: lpm env pull --from vercel".into())
+        LpmError::Script("missing --from flag. Usage: lpm env pull --from <platform>".into())
     })?;
-    if platform != "vercel" {
+    if !matches!(platform, "vercel" | "coolify") {
         return Err(LpmError::Script(
-            "Vercel is the only currently supported env platform".into(),
+            "unsupported env platform; use vercel or coolify".into(),
         ));
     }
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
@@ -1061,13 +1234,16 @@ pub(super) async fn vars_platform_pull(
         fetch_connections(&registry_url, &auth_token, &vault_id, Some(platform)).await?;
     let connection = connections
         .pop()
-        .ok_or_else(|| LpmError::Script("No Vercel connection found".into()))?;
-    let client = VercelClient::from_connection(&connection)?;
-    let requested_env = parse_flag(args, "--env").or(client.config.linked_env.as_deref());
+        .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
+    let client = PlatformClient::from_connection(&connection)?;
+    let display_name = client.display_name();
+    let requested_env = parse_flag(args, "--env").or(client.linked_env());
     let resolved_env = resolve_env_name(project_dir, requested_env)?;
     let env_name = resolved_env.as_deref().unwrap_or("default");
     if !json_output {
-        output::info("pulling env values directly from Vercel...");
+        output::info(&format!(
+            "pulling env values directly from {display_name}..."
+        ));
     }
     let remote = client.list().await?;
     if remote.is_empty() {
@@ -1080,7 +1256,7 @@ pub(super) async fn vars_platform_pull(
                 "count": 0,
             }));
         } else {
-            output::warn("no env values found on Vercel");
+            output::warn(&format!("no env values found on {display_name}"));
         }
         return Ok(());
     }
@@ -1102,7 +1278,7 @@ pub(super) async fn vars_platform_pull(
     }
     if !yes && !json_output {
         let confirmed = cliclack::confirm(crate::prompt::untrusted(format!(
-            "Import {} value(s) from Vercel into {env_name}?",
+            "Import {} value(s) from {display_name} into {env_name}?",
             values.len()
         )))
         .initial_value(true)
@@ -1146,7 +1322,7 @@ pub(super) async fn vars_platform_pull(
         }));
     } else {
         output::success(&format!(
-            "imported {} value(s) from Vercel into {env_name}",
+            "imported {} value(s) from {display_name} into {env_name}",
             pairs.len()
         ));
         if let Err(error) = audit {
@@ -1162,23 +1338,25 @@ pub(super) async fn vars_platform_pull(
 mod tests {
     use super::*;
 
-    fn remote(entries: &[(&str, &str)]) -> HashMap<String, VercelVariable> {
+    fn remote(entries: &[(&str, &str)]) -> HashMap<String, PlatformVariable> {
         entries
             .iter()
             .map(|(key, value)| {
                 (
                     (*key).to_string(),
-                    VercelVariable {
+                    PlatformVariable {
                         id: format!("id-{key}"),
                         value: (*value).to_string(),
-                        targets: vec!["production".into()],
+                        scope: VariableScope::Vercel {
+                            targets: vec!["production".into()],
+                        },
                     },
                 )
             })
             .collect()
     }
 
-    fn client(targets: &[&str]) -> VercelClient {
+    fn vercel_client(targets: &[&str]) -> VercelClient {
         VercelClient {
             http: reqwest::Client::new(),
             api_url: VERCEL_API_URL.into(),
@@ -1192,6 +1370,10 @@ mod tests {
         }
     }
 
+    fn platform_client(targets: &[&str]) -> PlatformClient {
+        PlatformClient::Vercel(vercel_client(targets))
+    }
+
     #[test]
     fn diff_preserves_platform_only_values_without_clean() {
         let remote = remote(&[("UNCHANGED", "same"), ("ORPHAN", "remote")]);
@@ -1200,7 +1382,7 @@ mod tests {
             ("NEW".into(), "new".into()),
         ]);
 
-        let diff = compute_diff(&remote, &local, false);
+        let diff = compute_diff(&platform_client(&["production"]), &remote, &local, false);
 
         assert_eq!(diff.added, ["NEW"]);
         assert!(diff.removed.is_empty());
@@ -1211,7 +1393,12 @@ mod tests {
     fn diff_removes_platform_only_values_with_clean() {
         let remote = remote(&[("ORPHAN", "remote")]);
 
-        let diff = compute_diff(&remote, &HashMap::new(), true);
+        let diff = compute_diff(
+            &platform_client(&["production"]),
+            &remote,
+            &HashMap::new(),
+            true,
+        );
 
         assert_eq!(diff.removed, ["ORPHAN"]);
     }
@@ -1221,7 +1408,7 @@ mod tests {
         let remote = remote(&[("VERCEL_URL", "remote")]);
         let local = HashMap::from([("VERCEL_ENV".into(), "production".into())]);
 
-        let diff = compute_diff(&remote, &local, true);
+        let diff = compute_diff(&platform_client(&["production"]), &remote, &local, true);
 
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
@@ -1260,16 +1447,32 @@ mod tests {
 
     #[test]
     fn mutation_refuses_a_variable_shared_with_an_unselected_target() {
-        let variable = VercelVariable {
+        let variable = PlatformVariable {
             id: "shared-id".into(),
             value: "secret".into(),
-            targets: vec!["production".into(), "preview".into()],
+            scope: VariableScope::Vercel {
+                targets: vec!["production".into(), "preview".into()],
+            },
         };
 
-        let error = client(&["production"])
+        let error = vercel_client(&["production"])
             .assert_mutation_targets("SHARED", &variable)
             .expect_err("a production sync must not mutate a preview value");
 
         assert!(error.to_string().contains("configured deployment targets"));
+    }
+
+    #[test]
+    fn connect_field_validation_matches_server_bounds() {
+        validate_connect_field("--application", "app-123", 128, true)
+            .expect("valid field must pass");
+
+        let empty =
+            validate_connect_field("--application", "", 128, true).expect_err("empty must fail");
+        let oversized = validate_connect_field("--application", &"a".repeat(129), 128, true)
+            .expect_err("oversized field must fail");
+
+        assert!(empty.to_string().contains("cannot be empty"));
+        assert!(oversized.to_string().contains("at most 128 characters"));
     }
 }

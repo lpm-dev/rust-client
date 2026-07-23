@@ -366,12 +366,14 @@ fn security_sensitive_client_paths_keep_shared_builders() {
         "lpm_http::client_builder()",
     );
 
-    let platform = read_workspace_source("crates/lpm-cli/src/commands/env/platform.rs");
+    let platform = read_workspace_source("crates/lpm-cli/src/commands/env/platform/mod.rs");
     assert_body_contains(
         &platform,
         "fn new(token: String, config: VercelConnectionConfig)",
         "lpm_http::client_builder_with_redirect_limit(5)",
     );
+    let coolify = read_workspace_source("crates/lpm-cli/src/commands/env/platform/coolify.rs");
+    assert_body_contains(&coolify, "pub(super) fn new(", "lpm_http::client_builder()");
 
     let remote_cache = read_workspace_source("crates/lpm-cli/src/commands/remote_cache.rs");
     assert_body_contains(

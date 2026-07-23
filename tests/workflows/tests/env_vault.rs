@@ -2859,6 +2859,125 @@ async fn env_platform_json_success_paths_emit_success_envelopes() {
 }
 
 #[tokio::test]
+async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
+    let project = TempProject::empty(r#"{"name":"coolify-platform","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer_token = "coolify-platform-session-token";
+    let platform_token = "coolify-platform-token";
+    let vault_id = "vault-coolify-platform-123";
+    let application_id = "application-123";
+
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(bearer_token),
+            refresh_token: Some("coolify-platform-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    mock.with_platform_connect_application_success(
+        bearer_token,
+        vault_id,
+        "coolify",
+        application_id,
+        serde_json::json!({
+            "status": "connected",
+            "platform": "coolify",
+        }),
+    )
+    .await;
+    mock.with_platform_credentials_success(
+        bearer_token,
+        vault_id,
+        serde_json::json!({
+            "connections": [
+                {
+                    "id": "connection-coolify",
+                    "platform": "coolify",
+                    "token": platform_token,
+                    "connectionConfig": {
+                        "url": mock.url(),
+                        "applicationId": application_id,
+                        "preview": false,
+                        "linkedEnv": "production"
+                    },
+                    "label": "production",
+                    "lastPushAt": null
+                }
+            ]
+        }),
+    )
+    .await;
+    mock.with_coolify_env_list(
+        platform_token,
+        application_id,
+        serde_json::json!([
+            {
+                "id": 1,
+                "uuid": "env-application-secret",
+                "key": "APPLICATION_SECRET",
+                "value": "remote-value",
+                "is_preview": false
+            }
+        ]),
+        2,
+    )
+    .await;
+
+    let connect = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-coolify")
+        .args([
+            "--json",
+            "env",
+            "connect",
+            "coolify",
+            "--url",
+            &mock.url(),
+            "--application",
+            application_id,
+            "--token",
+            platform_token,
+            "--linked-env",
+            "production",
+            "--label",
+            "production",
+        ])
+        .output()
+        .expect("failed to run lpm env connect coolify --json");
+    assert!(
+        connect.status.success(),
+        "env connect coolify --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&connect.stdout),
+        String::from_utf8_lossy(&connect.stderr),
+    );
+    let connect_json = parse_clean_json_stdout(&connect);
+    assert_eq!(connect_json["success"], true);
+    assert_eq!(connect_json["platform"], "coolify");
+
+    let status = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-coolify")
+        .args(["--json", "env", "status"])
+        .output()
+        .expect("failed to run lpm env status --json");
+    assert!(
+        status.status.success(),
+        "env status --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+    let status_json = parse_clean_json_stdout(&status);
+    assert_eq!(status_json["success"], true);
+    assert_eq!(status_json["platforms"][0]["platform"], "coolify");
+    assert_eq!(status_json["platforms"][0]["env"], "production");
+    assert_eq!(status_json["platforms"][0]["status"], "drifted");
+}
+
+#[tokio::test]
 async fn env_platform_json_error_paths_emit_error_envelopes_on_stdout() {
     let cases: &[(&[&str], &str)] = &[
         (&["--json", "env", "log"], "no vault configured"),
