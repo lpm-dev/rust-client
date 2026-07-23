@@ -7,7 +7,6 @@ use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 use support::assertions::parse_json_output;
-#[cfg(unix)]
 use support::{TempProject, lpm};
 
 #[cfg(unix)]

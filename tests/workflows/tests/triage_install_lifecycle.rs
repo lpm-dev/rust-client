@@ -63,7 +63,9 @@ use std::path::PathBuf;
 
 use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry, write_signed_unlock};
+#[cfg(unix)]
+use support::write_signed_unlock;
+use support::{TempProject, lpm_with_registry};
 
 // ─── Test constants ────────────────────────────────────────────────────
 

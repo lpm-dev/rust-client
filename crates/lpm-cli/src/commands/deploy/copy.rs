@@ -2,6 +2,7 @@ use lpm_common::LpmError;
 use std::path::Path;
 
 use super::file_select::PackageFileSelector;
+#[cfg(unix)]
 use super::paths::canonicalize_or_partial;
 
 /// Files and directories that are NEVER copied to the deploy output.
