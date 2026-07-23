@@ -134,6 +134,7 @@ mod tests {
         include_str!("pairing.rs"),
         include_str!("platform/mod.rs"),
         include_str!("platform/coolify.rs"),
+        include_str!("platform/fly.rs"),
         include_str!("platform/github_actions.rs"),
         include_str!("platform/railway.rs"),
         include_str!("pull.rs"),
