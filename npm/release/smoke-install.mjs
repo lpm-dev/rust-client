@@ -176,9 +176,11 @@ function verifyGeneratedCommands({ installPrefix, expectedVersion }) {
       assertRegularFile(command, "npm-generated Windows command shim");
     }
 
-    const cmdVersion = runChecked("cmd.exe", ["/D", "/S", "/C", `\"${cmdLpm}\" --version`]);
+    const cmdVersionInvocation = windowsCommandInvocation(cmdLpm, ["--version"]);
+    const cmdVersion = runChecked(cmdVersionInvocation.command, cmdVersionInvocation.args);
     assertCliVersion(cmdVersion.stdout, expectedVersion);
-    runChecked("cmd.exe", ["/D", "/S", "/C", `\"${cmdLpx}\" --help`]);
+    const cmdHelpInvocation = windowsCommandInvocation(cmdLpx, ["--help"]);
+    runChecked(cmdHelpInvocation.command, cmdHelpInvocation.args);
 
     const powerShellVersion = runChecked(
       "pwsh.exe",
@@ -201,6 +203,13 @@ function verifyGeneratedCommands({ installPrefix, expectedVersion }) {
   const version = runChecked(lpm, ["--version"]);
   assertCliVersion(version.stdout, expectedVersion);
   runChecked(lpx, ["--help"]);
+}
+
+export function windowsCommandInvocation(command, args) {
+  return {
+    command: "cmd.exe",
+    args: ["/D", "/S", "/C", "call", command, ...args],
+  };
 }
 
 function verifiedTarballPath(root, record) {
