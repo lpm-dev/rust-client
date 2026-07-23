@@ -39,7 +39,7 @@ pub(super) fn check_sigstore_verify_posture() -> Check {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::doctor_catalog::Severity;

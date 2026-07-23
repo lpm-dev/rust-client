@@ -1,11 +1,15 @@
-use super::copy::{copy_member_source, retarget_internal_node_modules_symlinks};
+use super::copy::copy_member_source;
+#[cfg(unix)]
+use super::copy::retarget_internal_node_modules_symlinks;
 use super::lockfile_prune::write_pruned_deploy_lockfile_if_possible;
 use super::manifest_rewrite::{
     apply_dependency_selection_to_deploy_manifest, apply_dependency_selection_to_manifest_path,
     copy_workspace_dependency_closure, rewrite_workspace_protocol_in_deploy_manifest,
     strip_dev_dependencies_from_deploy_manifest,
 };
-use super::paths::{DeployPlan, canonicalize_or_partial};
+use super::paths::DeployPlan;
+#[cfg(unix)]
+use super::paths::canonicalize_or_partial;
 use super::*;
 use serde_json::json;
 use std::collections::HashSet;

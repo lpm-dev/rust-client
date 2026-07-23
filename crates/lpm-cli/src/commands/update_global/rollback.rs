@@ -118,7 +118,7 @@ pub(super) fn rollback_aborted_upgrade(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::super::test_support::make_complete_install_root;
     use super::*;

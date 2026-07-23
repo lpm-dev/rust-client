@@ -255,7 +255,7 @@ pub(super) fn commit_upgrade_locked(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::super::test_support::{make_complete_install_root, pre_upgrade_manifest_with_alias};
     use super::*;
