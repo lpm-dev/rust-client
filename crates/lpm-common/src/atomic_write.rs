@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +12,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `std::fs::write` on an existing path.
 pub fn write_file_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| {
+    path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("path has no file name: {}", path.display()),
@@ -22,7 +21,7 @@ pub fn write_file_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<
 
     let mut last_error = None;
     for _ in 0..16 {
-        let tmp_path = temp_path(parent, file_name);
+        let tmp_path = temp_path(parent);
         let result = (|| {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -53,12 +52,9 @@ pub fn write_file_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<
     }))
 }
 
-fn temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+fn temp_path(parent: &Path) -> PathBuf {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut tmp_name = OsString::from(".");
-    tmp_name.push(file_name);
-    tmp_name.push(format!(".tmp.{}.{}", std::process::id(), id));
-    parent.join(tmp_name)
+    parent.join(format!(".tmp.{:x}.{id:x}", std::process::id()))
 }
 
 #[cfg(not(windows))]
@@ -125,5 +121,34 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
             .count();
         assert_eq!(tmp_files, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_file_atomic_supports_near_max_path_destination() {
+        use std::os::windows::ffi::OsStrExt;
+
+        fn utf16_len(path: &std::path::Path) -> usize {
+            path.as_os_str().encode_wide().count()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let padding_len = 230usize
+            .checked_sub(utf16_len(dir.path()) + 1)
+            .expect("temporary root must leave room for padding");
+        let parent = dir.path().join("x".repeat(padding_len));
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join(".lpm-object-integrity");
+        let legacy_tmp = parent.join(format!(
+            "..lpm-object-integrity.tmp.{}.0",
+            std::process::id()
+        ));
+
+        assert!(utf16_len(&path) < 260);
+        assert!(utf16_len(&legacy_tmp) >= 260);
+
+        write_file_atomic(&path, b"sha256-test\n").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"sha256-test\n");
     }
 }
