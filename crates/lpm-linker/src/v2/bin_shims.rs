@@ -43,7 +43,7 @@ fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
 
 fn ensure_bin_dir(bin_dir: &Path) -> Result<(), LpmError> {
     match bin_dir.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+        Ok(metadata) if metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata) => {
             return Ok(());
         }
         Ok(_) => {

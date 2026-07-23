@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lpm_common::LpmError;
-use lpm_common::symlink::create_dir_symlink_or_junction;
+use lpm_common::symlink::{create_dir_symlink_or_junction, is_symlink_or_junction};
 #[cfg(target_os = "macos")]
 use lpm_store::v2::{COMPAT_ISLAND_COMPLETE_FILENAME, CompatIslandKeyEntry};
 use lpm_store::v2::{GraphKey, Store};
@@ -758,7 +758,7 @@ fn remove_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError>
             )));
         }
     };
-    if metadata.file_type().is_symlink() {
+    if is_symlink_or_junction(&metadata) {
         return Err(LpmError::Store(format!(
             "v2 linker: refusing to clean compatibility directory through symlinked node_modules/.lpm at {}",
             lpm_dir.display()
@@ -794,7 +794,7 @@ fn remove_legacy_project_compatibility_root(project_dir: &Path) -> Result<(), Lp
             )));
         }
     };
-    if metadata.file_type().is_symlink() {
+    if is_symlink_or_junction(&metadata) {
         return Err(LpmError::Store(format!(
             "v2 linker: refusing to clean legacy compatibility directory through symlinked .lpm at {}",
             lpm_dir.display()
@@ -1016,7 +1016,7 @@ fn reconcile_compatibility_node_modules(
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_real_dir = path
             .symlink_metadata()
-            .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+            .map(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata))
             .unwrap_or(false);
         if name.starts_with('@') && is_real_dir {
             reconcile_scoped_root_dir(&path, &name, desired)?;

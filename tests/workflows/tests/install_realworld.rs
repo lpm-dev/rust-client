@@ -60,6 +60,7 @@
 
 mod support;
 
+#[cfg(unix)]
 use std::path::Path;
 use std::process::Output;
 use std::time::{Duration, Instant};

@@ -153,6 +153,7 @@ fn ensure_policy_parent_for_write(path: &Path) -> Result<(), LpmError> {
             "must have a managed parent directory",
         ));
     };
+    #[cfg(unix)]
     let parent_existed = parent.exists();
     std::fs::create_dir_all(parent)
         .map_err(|err| privileged_policy_io_error(path, "prepare", err))?;
@@ -884,7 +885,7 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -1,7 +1,9 @@
 use super::*;
 use crate::v2::finalize_permits::{FinalizePermitLimiter, parse_v2_finalize_permits};
+use crate::v2::fs_util::tmp_sibling;
+#[cfg(unix)]
 use crate::v2::fs_util::{
-    copy_dir_recursively, create_tmp_dir_locked, ensure_store_tier_dir_locked, tmp_sibling,
+    copy_dir_recursively, create_tmp_dir_locked, ensure_store_tier_dir_locked,
 };
 use crate::v2::graph_key::{GraphKeyInputs, LinkerModeTag, PeerEntry};
 use crate::v2::integrity::{
@@ -486,7 +488,10 @@ fn paths_for_known_sri() {
     let sri = synthetic_sri(b"paths_for_known_sri");
     let dir = store.paths().object_dir(&sri).unwrap();
     assert!(dir.starts_with(&root));
-    assert!(dir.to_string_lossy().contains("/objects/"));
+    assert!(
+        dir.components()
+            .any(|component| component.as_os_str() == "objects")
+    );
     assert!(dir.to_string_lossy().contains("sha512-"));
     // Hex segment: 128 hex chars + "sha512-" prefix.
     let segment = dir.file_name().unwrap().to_string_lossy().to_string();
@@ -1282,14 +1287,25 @@ fn populate_writes_sibling_symlinks() {
     .unwrap();
 
     let sibling = entry.link_dir.join("node_modules").join("debug");
-    let target = std::fs::read_link(&sibling).unwrap();
     // Target string format: `../../<dep_key.dir>/node_modules/debug`.
-    assert_eq!(
-        target.to_string_lossy(),
-        format!("../../{}/node_modules/debug", dep_key.dir_name())
-    );
+    #[cfg(not(windows))]
+    {
+        let target = std::fs::read_link(&sibling).unwrap();
+        assert_eq!(
+            target.to_string_lossy(),
+            format!("../../{}/node_modules/debug", dep_key.dir_name())
+        );
+    }
     // Symlink should resolve to the dep's link package dir.
     assert!(sibling.exists(), "sibling symlink must resolve");
+    assert_eq!(
+        sibling.canonicalize().unwrap(),
+        store
+            .paths()
+            .link_package_dir(&dep_key)
+            .canonicalize()
+            .unwrap()
+    );
     assert!(sibling.join("package.json").is_file());
 
     // Sidecar records the dep edge.
@@ -1396,17 +1412,20 @@ fn populate_writes_scoped_sibling_symlink_with_extra_dotdot() {
         .join("node_modules")
         .join("@types")
         .join("node");
-    let target = std::fs::read_link(&sibling).unwrap();
     // Three `..` segments because the symlink itself sits one
     // level deeper under `node_modules/@types/`.
-    assert_eq!(
-        target.to_string_lossy(),
-        format!(
-            "../../../{}/node_modules/{}",
-            dep_key.dir_name(),
-            dep_key.name()
-        )
-    );
+    #[cfg(not(windows))]
+    {
+        let target = std::fs::read_link(&sibling).unwrap();
+        assert_eq!(
+            target.to_string_lossy(),
+            format!(
+                "../../../{}/node_modules/{}",
+                dep_key.dir_name(),
+                dep_key.name()
+            )
+        );
+    }
     // Even though the dep's package dir is also at a scoped path
     // inside its own node_modules, its OWN dir name (sample_key
     // "@types/node") goes through the same `+` sanitization so the
@@ -1414,6 +1433,14 @@ fn populate_writes_scoped_sibling_symlink_with_extra_dotdot() {
     assert!(
         sibling.exists(),
         "scoped sibling symlink must resolve to the dep's package dir"
+    );
+    assert_eq!(
+        sibling.canonicalize().unwrap(),
+        store
+            .paths()
+            .link_package_dir(&dep_key)
+            .canonicalize()
+            .unwrap()
     );
 }
 
@@ -1465,17 +1492,28 @@ fn populate_nests_scoped_same_name_sibling_symlink() {
         .join("node_modules")
         .join("@scope")
         .join("pkg");
-    let mut expected = PathBuf::new();
-    for _ in 0..6 {
-        expected.push("..");
+    #[cfg(not(windows))]
+    {
+        let mut expected = PathBuf::new();
+        for _ in 0..6 {
+            expected.push("..");
+        }
+        expected.push(dep_key.dir_name());
+        expected.push(LINK_NODE_MODULES);
+        expected.push(dep_key.name());
+        assert_eq!(std::fs::read_link(&nested).unwrap(), expected);
     }
-    expected.push(dep_key.dir_name());
-    expected.push(LINK_NODE_MODULES);
-    expected.push(dep_key.name());
-    assert_eq!(std::fs::read_link(&nested).unwrap(), expected);
     assert!(
         nested.exists(),
         "scoped same-name sibling symlink must resolve to the older package"
+    );
+    assert_eq!(
+        nested.canonicalize().unwrap(),
+        store
+            .paths()
+            .link_package_dir(&dep_key)
+            .canonicalize()
+            .unwrap()
     );
 }
 
@@ -2230,7 +2268,9 @@ fn reusable_object_tree_policy_migrates_source_object_when_snapshot_metadata_is_
     let (object, sri, _) = store
         .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
         .unwrap();
-    std::fs::File::open(object.path.join("index.js"))
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(object.path.join("index.js"))
         .unwrap()
         .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();

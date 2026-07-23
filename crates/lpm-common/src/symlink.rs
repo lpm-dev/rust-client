@@ -1,7 +1,7 @@
 //! Cross-platform directory-symlink helper.
 //!
-//! Provides one entry point — [`create_dir_symlink_or_junction`] — that
-//! creates a directory link in a portable way:
+//! Provides shared creation, detection, and removal helpers for directory
+//! links so callers do not need to duplicate platform-specific behavior:
 //!
 //! - **Unix:** plain `symlink(2)` via [`std::os::unix::fs::symlink`].
 //! - **Windows:** tries [`std::os::windows::fs::symlink_dir`] first
@@ -49,6 +49,61 @@ pub fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     create_symlink_inner(target, link)
 }
 
+/// Return whether metadata obtained with [`std::fs::symlink_metadata`]
+/// describes a symbolic link or Windows reparse-point junction.
+pub fn is_symlink_or_junction(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Remove one filesystem entry without traversing a directory link.
+///
+/// Windows requires directory symlinks and junctions to be removed with
+/// `remove_dir`, while Unix removes directory symlinks with `remove_file`.
+/// Real directories are removed recursively and regular files use
+/// `remove_file` on every platform.
+pub fn remove_path_entry(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if is_symlink_or_junction(&metadata) {
+        return remove_link(path, &metadata);
+    }
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+#[cfg(unix)]
+fn remove_link(path: &Path, _metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn remove_link(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 #[cfg(unix)]
 fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -61,29 +116,14 @@ fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::Result<()> {
+    let abs_target = absolute_windows_link_target(target, link)?;
+
     // Try symlink_dir first — works without admin on Windows setups
     // running with Developer Mode or with the SeCreateSymbolicLink
     // privilege granted via group policy.
-    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+    if std::os::windows::fs::symlink_dir(&abs_target, link).is_ok() {
         return Ok(());
     }
-
-    // Junctions require absolute target paths. Resolve relative
-    // targets against the link's parent, then lexically clean any
-    // `..` segments — `\\?\`-prefixed paths handed to `mklink /J`
-    // don't get implicit `..` resolution from the kernel, so a
-    // literal `..` segment in the target would silently produce a
-    // broken junction.
-    let abs_target = if target.is_relative() {
-        let base = link.parent().unwrap_or(Path::new("."));
-        let joined = match base.canonicalize() {
-            Ok(abs_base) => abs_base.join(target),
-            Err(_) => base.join(target),
-        };
-        lexically_clean(&joined)
-    } else {
-        target.to_path_buf()
-    };
 
     // Validate path strings before handing them to cmd.exe.
     let link_str = link.to_string_lossy();
@@ -113,6 +153,21 @@ fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::
             "failed to create junction or symlink",
         )),
     }
+}
+
+#[cfg(windows)]
+fn absolute_windows_link_target(target: &Path, link: &Path) -> std::io::Result<PathBuf> {
+    if target.is_absolute() {
+        return Ok(lexically_clean(target));
+    }
+
+    let link_parent = link.parent().unwrap_or(Path::new("."));
+    let absolute_parent = if link_parent.is_absolute() {
+        link_parent.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(link_parent)
+    };
+    Ok(lexically_clean(&absolute_parent.join(target)))
 }
 
 #[cfg(windows)]
@@ -227,6 +282,28 @@ mod tests {
         let cleaned = lexically_clean(Path::new("a/b/../c"));
         assert_eq!(cleaned, PathBuf::from("a/c"));
     }
+
+    #[test]
+    fn directory_link_survives_parent_rename_and_removes_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("marker"), b"ok").unwrap();
+
+        let staged = dir.path().join("staged");
+        std::fs::create_dir(&staged).unwrap();
+        let link = staged.join("link");
+        create_dir_symlink_or_junction(Path::new("../target"), &link).unwrap();
+
+        let published = dir.path().join("published");
+        std::fs::rename(&staged, &published).unwrap();
+        let published_link = published.join("link");
+        assert_eq!(std::fs::read(published_link.join("marker")).unwrap(), b"ok");
+
+        remove_path_entry(&published_link).unwrap();
+        assert!(published_link.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"ok");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -253,5 +330,20 @@ mod tests {
         create_symlink(&target, &link).unwrap();
         let read = std::fs::read_link(&link).unwrap();
         assert_eq!(read, target);
+    }
+
+    #[test]
+    fn remove_path_entry_unlinks_directory_symlink_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("marker"), b"ok").unwrap();
+        let link = dir.path().join("link");
+        create_dir_symlink_or_junction(&target, &link).unwrap();
+
+        remove_path_entry(&link).unwrap();
+
+        assert!(link.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"ok");
     }
 }

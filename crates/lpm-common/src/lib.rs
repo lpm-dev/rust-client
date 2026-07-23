@@ -36,7 +36,9 @@ pub use paths::{
     with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
-pub use symlink::{create_dir_symlink_or_junction, create_symlink};
+pub use symlink::{
+    create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,
+};
 pub use terminal::{sanitize_for_terminal, sanitize_terminal_inline, sanitize_terminal_multiline};
 
 /// The LPM scope prefix. All LPM packages live under this scope.

@@ -222,9 +222,10 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
 /// Refusal cases (return `Err(reason)`):
 ///
 /// 1. Empty path.
-/// 2. Anything other than exactly two `Component::Normal` segments
+/// 2. Anything other than exactly two non-empty portable path segments
 ///    (rejects `"."`, `"installs"`, `"installs/"`, `"installs/foo/extra"`,
-///    `"./installs/foo@1"`, `"../escape"`, `"/etc/passwd"`).
+///    `"./installs/foo@1"`, `"../escape"`, `"/etc/passwd"`). Both `/` and
+///    `\` are recognized so manifests remain readable across operating systems.
 /// 3. First segment != `"installs"`.
 /// 4. Second segment without an `@` separator.
 /// 5. Defense in depth: even though steps 2-4 are textual, the joined
@@ -333,36 +334,38 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
     if relative_path.is_empty() {
         return Err("empty tombstone path (manifest corrupt?)".to_string());
     }
-    let candidate = Path::new(relative_path);
+    let bytes = relative_path.as_bytes();
+    let has_windows_drive_root = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if relative_path.starts_with('/') || relative_path.starts_with('\\') || has_windows_drive_root {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: not a relative path under \
+             the global root — manifest may be poisoned"
+        ));
+    }
 
-    // Collect components, refusing anything other than Normal segments.
-    // Explicit `..`, RootDir, Prefix, CurDir all become poison signals.
-    let mut segments: Vec<&std::ffi::OsStr> = Vec::with_capacity(2);
-    for component in candidate.components() {
-        match component {
-            Component::Normal(s) => segments.push(s),
-            Component::ParentDir => {
-                return Err(format!(
-                    "refusing to sweep tombstone {relative_path:?}: contains parent-directory \
-                     traversal — manifest may be poisoned"
-                ));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "refusing to sweep tombstone {relative_path:?}: not a relative path under \
-                     the global root — manifest may be poisoned"
-                ));
-            }
-            Component::CurDir => {
-                // Real writers never emit `./` prefixes; treating them as
-                // benign admits shapes like `"./installs"` whose component
-                // count is misjudged downstream. Refuse outright.
-                return Err(format!(
-                    "refusing to sweep tombstone {relative_path:?}: contains current-directory \
-                     reference — real install-root tombstones never include `./`"
-                ));
-            }
-        }
+    let segments: Vec<&str> = relative_path.split(['/', '\\']).collect();
+    if segments.contains(&"..") {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: contains parent-directory \
+             traversal — manifest may be poisoned"
+        ));
+    }
+    if segments.contains(&".") {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: contains current-directory \
+             reference — real install-root tombstones never include `./`"
+        ));
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || segment.contains([':', '\0']))
+    {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: contains an invalid path segment"
+        ));
     }
 
     // Tombstones are exactly `installs/<name>@<version>`.
@@ -376,12 +379,12 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
             segments.len()
         ));
     }
-    if segments[0] != std::ffi::OsStr::new("installs") {
+    if segments[0] != "installs" {
         return Err(format!(
             "refusing to sweep tombstone {relative_path:?}: first segment must be `installs/`"
         ));
     }
-    let leaf = segments[1].to_string_lossy();
+    let leaf = segments[1];
     if !leaf.contains('@') {
         return Err(format!(
             "refusing to sweep tombstone {relative_path:?}: leaf must match `<name>@<version>` \
@@ -389,7 +392,7 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
         ));
     }
 
-    let joined = global_root.join(candidate);
+    let joined = global_root.join("installs").join(leaf);
     // Defense in depth: the textual checks above should make this
     // unreachable, but a future refactor that admits a new component
     // variant would land here instead of escaping.
@@ -816,6 +819,7 @@ mod tests {
         // Happy paths — the exact `installs/<name>@<version>` shape.
         assert!(validated_tombstone_path(global_root, "installs/eslint@9.24.0").is_ok());
         assert!(validated_tombstone_path(global_root, "installs/@scope+pkg@1.0.0").is_ok());
+        assert!(validated_tombstone_path(global_root, r"installs\eslint@9.24.0").is_ok());
 
         // Pre-existing first-pass refusals.
         assert!(validated_tombstone_path(global_root, "").is_err());

@@ -370,18 +370,24 @@ impl WalWriter {
     /// Truncate the WAL to zero bytes. Used by the post-recovery
     /// compaction path when no uncommitted records remain.
     pub fn truncate_to_zero(&mut self) -> Result<(), WalError> {
-        self.file.set_len(0)?;
-        self.file.sync_all()?;
-        self.file.seek(SeekFrom::Start(0))?;
-        Ok(())
+        self.truncate_file_to(0)
     }
 
     /// Truncate the WAL to `offset`. Used by the recovery path to
     /// discard a torn tail returned by [`WalReader::scan`]. Fsyncs the
     /// file after truncation.
     pub fn truncate_to(&mut self, offset: u64) -> Result<(), WalError> {
-        self.file.set_len(offset)?;
+        self.truncate_file_to(offset)
+    }
+
+    fn truncate_file_to(&mut self, offset: u64) -> Result<(), WalError> {
         self.file.sync_all()?;
+        // Windows append handles lack the access right required by `set_len`.
+        let truncate_handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(as_extended_path(&self.path))?;
+        truncate_handle.set_len(offset)?;
+        truncate_handle.sync_all()?;
         self.file.seek(SeekFrom::End(0))?;
         Ok(())
     }

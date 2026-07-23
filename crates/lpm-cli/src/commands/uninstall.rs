@@ -215,12 +215,52 @@ fn remove_owned_cmd_shim(shim_path: &Path, expected_target: &Path) -> Result<u64
     else {
         return Ok(0);
     };
-    if !content.contains(&expected_canonical.to_string_lossy().replace('/', "\\")) {
+    let Some(actual_target) = generated_cmd_shim_target(&content) else {
+        return Ok(0);
+    };
+    let Ok(actual_canonical) = Path::new(actual_target).canonicalize() else {
+        return Ok(0);
+    };
+    if actual_canonical != expected_canonical {
         return Ok(0);
     }
     let freed_bytes = removable_path_size(shim_path, &metadata);
     std::fs::remove_file(shim_path)?;
     Ok(freed_bytes)
+}
+
+#[cfg(windows)]
+fn generated_cmd_shim_target(content: &str) -> Option<&str> {
+    const HEADER: &str = "@IF EXIST \"%~dp0\\node.exe\" (";
+    const LOCAL_NODE_PREFIX: &str = "  \"%~dp0\\node.exe\" \"";
+    const PATH_NODE_PREFIX: &str = "  node \"";
+    const TARGET_SUFFIX: &str = "\" %*";
+
+    let mut lines = content.lines();
+    let mut header = lines.next()?;
+    if header.starts_with("@SET \"NODE_PATH=") && header.ends_with(";%NODE_PATH%\"") {
+        header = lines.next()?;
+    }
+    if header != HEADER {
+        return None;
+    }
+
+    let local_target = lines
+        .next()?
+        .strip_prefix(LOCAL_NODE_PREFIX)?
+        .strip_suffix(TARGET_SUFFIX)?;
+    if lines.next()? != ") ELSE (" {
+        return None;
+    }
+    let path_target = lines
+        .next()?
+        .strip_prefix(PATH_NODE_PREFIX)?
+        .strip_suffix(TARGET_SUFFIX)?;
+    if lines.next()? != ")" || lines.next().is_some() || local_target != path_target {
+        return None;
+    }
+
+    Some(local_target)
 }
 
 fn remove_node_modules_entry(node_modules: &Path, name: &str) -> Result<u64, LpmError> {
@@ -805,6 +845,60 @@ mod tests {
             format!("{}\n", serde_json::to_string_pretty(value).unwrap()),
         )
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_owned_cmd_shim_removes_generated_shim_with_noncanonical_target_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("package").join("bin").join("cli.js");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "console.log('ok')\n").unwrap();
+
+        let shim = dir.path().join("cli.cmd");
+        let target_text = target.to_string_lossy();
+        std::fs::write(
+            &shim,
+            format!(
+                "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_text}\" %*\n) ELSE (\n  node \"{target_text}\" %*\n)",
+            ),
+        )
+        .unwrap();
+
+        remove_owned_cmd_shim(&shim, &target).unwrap();
+
+        assert!(
+            shim.symlink_metadata().is_err(),
+            "an LPM-generated shim must be removed when its raw target resolves to the expected file"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_owned_cmd_shim_preserves_shim_when_invocation_targets_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected_target = dir.path().join("expected.js");
+        let foreign_target = dir.path().join("foreign.js");
+        std::fs::write(&expected_target, "console.log('expected')\n").unwrap();
+        std::fs::write(&foreign_target, "console.log('foreign')\n").unwrap();
+
+        let shim = dir.path().join("cli.cmd");
+        let expected_text = expected_target.to_string_lossy();
+        let foreign_text = foreign_target.to_string_lossy();
+        std::fs::write(
+            &shim,
+            format!(
+                "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{expected_text}\" %*\n) ELSE (\n  node \"{foreign_text}\" %*\n)",
+            ),
+        )
+        .unwrap();
+
+        remove_owned_cmd_shim(&shim, &expected_target).unwrap();
+
+        assert!(
+            shim.is_file(),
+            "a modified shim with conflicting invocation targets must be preserved"
+        );
     }
 
     #[test]

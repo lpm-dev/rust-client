@@ -80,7 +80,7 @@ pub use self::compat_island::project_compatibility_bins_ready;
 use self::compat_island::{create_project_compatibility_links, normalize_compatibility_bin_names};
 pub use self::keymap::KeyMap;
 use self::keymap::derive_graph_keys;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use self::reconcile::symlink_points_to;
 use self::reconcile::{
     cleanup_v1_state, create_root_symlinks, create_self_ref, ensure_real_dir,

@@ -122,7 +122,7 @@ fn contained_relative_path<'a>(
     Ok(relative)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
