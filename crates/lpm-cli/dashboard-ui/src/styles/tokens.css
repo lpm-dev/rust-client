@@ -1,0 +1,83 @@
+/*
+ * Design tokens for SkillView.
+ *
+ * The source design exposed two authored knobs — `theme` (light | dark) and
+ * `accent` (one of five brand colors). Both are reproduced here as data
+ * attributes on <html> so nothing has to be applied as an inline style.
+ */
+
+:root {
+  /* typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+  /* accent — LPM brand blue, matching the CLI docs site */
+  --accent: #2376e3;
+  --accent-ink: #ffffff;
+
+  /* light palette */
+  --bg: #f6f5f2;
+  --panel: #ffffff;
+  --head-bg: #f0efeb;
+  --border: #e5e2dc;
+  --border-2: #eceae5;
+
+  --ink: #191818;
+  --sub: #57544f;
+  --muted: #8d8983;
+  --faint: #b6b1aa;
+
+  --row-sel: #eaf2fd;
+  --row-hover: #f2f1ed;
+  --box-bg: #ffffff;
+  --code-bg: #f4f2ee;
+
+  --pill-en-bg: #e7f4ec;
+  --pill-en: #227a44;
+  --pill-dis-bg: #eeece7;
+  --pill-dis: #8d8983;
+
+  --input-bg: #ffffff;
+
+  /* status */
+  --warn: #b8791f;
+
+  /* scrollbar */
+  --scroll-thumb: rgba(140, 138, 134, 0.35);
+  --scroll-thumb-hover: rgba(140, 138, 134, 0.6);
+
+  /* layout */
+  --left-width: 452px;
+  --header-height: 52px;
+  --footer-height: 40px;
+}
+
+[data-theme='dark'] {
+  --bg: #0c0c0e;
+  --panel: #0c0c0e;
+  --head-bg: #0c0c0e;
+  --border: #232327;
+  --border-2: #1a1a1d;
+
+  --ink: #ececed;
+  --sub: #b4b4b8;
+  --muted: #77777c;
+  --faint: #4c4c52;
+
+  --row-sel: #111a26;
+  --row-hover: #151517;
+  --box-bg: #121214;
+  --code-bg: #141416;
+
+  --pill-en-bg: #122318;
+  --pill-en: #4fcf7d;
+  --pill-dis-bg: #1c1c1f;
+  --pill-dis: #8a8a90;
+
+  --input-bg: #111113;
+}
+
+[data-accent='magenta'] { --accent: #c30b7f; }
+[data-accent='blue'] { --accent: #2376e3; }
+[data-accent='green'] { --accent: #137a5f; }
+[data-accent='orange'] { --accent: #c2410c; }
+[data-accent='violet'] { --accent: #7c3aed; }

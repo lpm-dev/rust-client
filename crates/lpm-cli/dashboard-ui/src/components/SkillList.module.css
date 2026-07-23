@@ -1,0 +1,273 @@
+/* ---- source tabs ---- */
+
+.tabBar {
+  display: flex;
+  gap: 4px;
+  padding: 12px 16px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 12px 12px;
+  cursor: pointer;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  color: var(--ink);
+}
+
+.tabActive {
+  font-weight: 700;
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+.tabCount {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--muted);
+  background: var(--row-hover);
+  border-radius: 20px;
+  padding: 1px 8px;
+  min-width: 20px;
+  text-align: center;
+}
+
+.tabActive .tabCount {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+/* ---- filter row: search + sort share one line ---- */
+
+.filterRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+}
+
+.sortWrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.sortLabel {
+  font-size: 11px;
+  color: var(--faint);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.sortSelect {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  height: 36px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.searchWrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  height: 36px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.searchWrap:focus-within {
+  border-color: var(--accent);
+}
+
+.searchIcon {
+  color: var(--faint);
+  font-size: 14px;
+}
+
+.searchInput {
+  flex: 1;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: transparent;
+  border: none;
+  outline: none;
+}
+
+.searchInput::placeholder {
+  color: var(--faint);
+}
+
+.searchKey {
+  font-size: 11px;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 7px;
+}
+
+/* ---- rows ---- */
+
+.listScroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 0 0 16px;
+}
+
+.listBox {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Square rows sitting flush to the panel edge, so the selected row reads as a
+   3px accent rule down the left rather than a floating pill. The transparent
+   border on every row keeps text from shifting when selection moves. */
+.row {
+  padding: 14px 18px 14px 15px;
+  cursor: pointer;
+  background: transparent;
+  border-left: 3px solid transparent;
+}
+
+.row:hover {
+  background: var(--row-hover);
+}
+
+.rowActive,
+.rowActive:hover {
+  background: var(--row-sel);
+  border-left-color: var(--accent);
+}
+
+.rowTop {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rowName {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+
+.rowActive .rowName {
+  color: var(--accent);
+}
+
+.badge {
+  font-size: 10.5px;
+  color: var(--sub);
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+  text-transform: uppercase;
+}
+
+.badgePackage {
+  color: var(--accent);
+}
+
+.badgeExternal {
+  color: var(--muted);
+}
+
+.rowOwner {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin: 3px 0 7px;
+}
+
+.rowDesc {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--sub);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.rowFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+}
+
+.rowFootLeft {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--pill-dis);
+  flex-shrink: 0;
+}
+
+.dotEnabled {
+  background: var(--pill-en);
+}
+
+.dotUnmanaged {
+  background: var(--faint);
+}
+
+.listEmpty {
+  padding: 22px 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+@media (max-width: 640px) {
+  .filterRow {
+    padding: 12px 14px;
+  }
+
+  /* Hidden from the a11y tree too, which is why the select carries its own
+     aria-label rather than relying on the wrapping <label>. */
+  .sortLabel {
+    display: none;
+  }
+
+  .tabBar {
+    padding: 10px 10px 0;
+  }
+}

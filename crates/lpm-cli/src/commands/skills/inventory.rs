@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use sha2::{Digest, Sha256};
 use super::managed;
 use super::package::{self, PackageManifestStatus};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_SCANNED_SKILL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
@@ -131,6 +132,9 @@ pub(super) struct SkillInventoryItem {
     pub(super) size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) context_tokens: Option<usize>,
+    pub(super) file_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) modified_at_ms: Option<u64>,
     pub(super) targets: Vec<SkillTarget>,
     pub(super) healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +142,30 @@ pub(super) struct SkillInventoryItem {
     pub(super) security: SecurityAssessment,
     pub(super) actions: Vec<DashboardAction>,
     pub(super) command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct InventoryWarning {
+    pub(super) scope: String,
+    pub(super) path: String,
+    pub(super) message: String,
+}
+
+impl InventoryWarning {
+    pub(super) fn new(scope: &str, path: &Path, error: impl std::fmt::Display) -> Self {
+        Self {
+            scope: scope.into(),
+            path: path.display().to_string(),
+            message: error.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct InventoryBatch {
+    pub(super) skills: Vec<SkillInventoryItem>,
+    pub(super) warnings: Vec<InventoryWarning>,
+    pub(super) skipped_entries: usize,
 }
 
 impl SkillInventoryItem {
@@ -175,7 +203,48 @@ pub(super) struct InventorySnapshot {
     pub(super) read_only: bool,
     pub(super) counts: InventoryCounts,
     pub(super) context_by_agent: Vec<AgentContextSummary>,
+    pub(super) warnings: Vec<InventoryWarning>,
+    pub(super) skipped_entries: usize,
     pub(super) skills: Vec<SkillInventoryItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillContentStats {
+    files: usize,
+    words: usize,
+    lines: usize,
+    frontmatter_keys: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillContentMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    globs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillContentDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    files: Vec<String>,
+    stats: SkillContentStats,
+    metadata: SkillContentMetadata,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SkillDetailSnapshot {
+    success: bool,
+    schema_version: u32,
+    pub(super) skill: SkillInventoryItem,
+    detail: SkillContentDetail,
 }
 
 pub(super) fn collect(
@@ -184,7 +253,8 @@ pub(super) fn collect(
     read_only: bool,
 ) -> Result<InventorySnapshot, LpmError> {
     let mut skills = package_inventory(project_dir)?;
-    skills.extend(managed::dashboard_inventory(project_dir, include_global)?);
+    let managed = managed::dashboard_inventory(project_dir, include_global);
+    skills.extend(managed.skills);
     skills.sort_by(|left, right| {
         left.kind
             .slug()
@@ -207,8 +277,165 @@ pub(super) fn collect(
         read_only,
         counts,
         context_by_agent,
+        warnings: managed.warnings,
+        skipped_entries: managed.skipped_entries,
         skills,
     })
+}
+
+pub(super) fn detail(skill: SkillInventoryItem) -> SkillDetailSnapshot {
+    let mut warnings = Vec::new();
+    let (raw, files) = match skill.path.as_deref() {
+        Some(path) if skill.kind == SkillInventoryKind::Package => {
+            read_package_detail(Path::new(path), &mut warnings)
+        }
+        Some(path) => read_directory_detail(Path::new(path), &mut warnings),
+        None => {
+            warnings.push("skill content path is unavailable".into());
+            (None, Vec::new())
+        }
+    };
+    let (metadata, body, frontmatter_warnings) =
+        parse_detail_frontmatter(skill.kind, raw.as_deref());
+    warnings.extend(frontmatter_warnings);
+    let stats = SkillContentStats {
+        files: files.len(),
+        words: body
+            .as_deref()
+            .map_or(0, |content| content.split_whitespace().count()),
+        lines: body.as_deref().map_or(0, |content| content.lines().count()),
+        frontmatter_keys: raw.as_deref().map_or(0, count_frontmatter_keys),
+    };
+    SkillDetailSnapshot {
+        success: true,
+        schema_version: SCHEMA_VERSION,
+        skill,
+        detail: SkillContentDetail {
+            raw,
+            body,
+            files,
+            stats,
+            metadata,
+            warnings,
+        },
+    }
+}
+
+fn read_package_detail(path: &Path, warnings: &mut Vec<String>) -> (Option<String>, Vec<String>) {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warnings.push(format!("could not inspect skill content: {error}"));
+            return (None, Vec::new());
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        warnings.push("skill content is not a regular file".into());
+        return (None, Vec::new());
+    }
+    if metadata.len() > MAX_SCANNED_SKILL_BYTES {
+        warnings.push(format!(
+            "skill content exceeds the {MAX_SCANNED_SKILL_BYTES} byte dashboard scan limit"
+        ));
+        return (None, Vec::new());
+    }
+    let files = vec![
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    match lpm_common::read_text_file_capped(path, MAX_SCANNED_SKILL_BYTES) {
+        Ok(content) => (Some(content), files),
+        Err(error) => {
+            warnings.push(format!("could not read skill content: {error}"));
+            (None, files)
+        }
+    }
+}
+
+fn read_directory_detail(path: &Path, warnings: &mut Vec<String>) -> (Option<String>, Vec<String>) {
+    let mut entries = match super::source::read_bounded_skill_directory(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!("could not read skill directory: {error}"));
+            return (None, Vec::new());
+        }
+    };
+    let files = entries
+        .keys()
+        .map(|path| path.display().to_string())
+        .collect();
+    let raw = match entries.remove(Path::new("SKILL.md")) {
+        Some(content) => match String::from_utf8(content) {
+            Ok(content) => Some(content),
+            Err(_) => {
+                warnings.push("primary SKILL.md is not valid UTF-8 text".into());
+                None
+            }
+        },
+        None => {
+            warnings.push("primary SKILL.md is missing".into());
+            None
+        }
+    };
+    (raw, files)
+}
+
+fn parse_detail_frontmatter(
+    kind: SkillInventoryKind,
+    raw: Option<&str>,
+) -> (SkillContentMetadata, Option<String>, Vec<String>) {
+    let Some(raw) = raw else {
+        return (
+            SkillContentMetadata {
+                name: None,
+                description: None,
+                version: None,
+                globs: Vec::new(),
+            },
+            None,
+            Vec::new(),
+        );
+    };
+    let (metadata, body, warnings) = if kind == SkillInventoryKind::Package {
+        lpm_security::skill_security::parse_skill_frontmatter(raw)
+    } else {
+        lpm_security::skill_security::parse_agent_skill_frontmatter(raw)
+    };
+    (
+        SkillContentMetadata {
+            name: metadata.name,
+            description: metadata.description,
+            version: metadata.version,
+            globs: metadata.globs,
+        },
+        Some(body),
+        warnings,
+    )
+}
+
+fn count_frontmatter_keys(content: &str) -> usize {
+    let Some(rest) = content
+        .strip_prefix("---\r\n")
+        .or_else(|| content.strip_prefix("---\n"))
+    else {
+        return 0;
+    };
+    let mut count = 0;
+    for line in rest.lines() {
+        if line == "---" {
+            break;
+        }
+        if !line.starts_with(char::is_whitespace)
+            && line
+                .split_once(':')
+                .is_some_and(|(key, _)| !key.trim().is_empty())
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn inventory_counts(skills: &[SkillInventoryItem]) -> InventoryCounts {
@@ -324,6 +551,8 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
                 path: Some(path.display().to_string()),
                 size_bytes: Some(metadata.len()),
                 context_tokens,
+                file_count: 1,
+                modified_at_ms: modified_at_ms(&metadata),
                 targets: Vec::new(),
                 healthy: integrity != "modified" && integrity != "invalid-manifest",
                 integrity: Some(integrity.into()),
@@ -353,6 +582,8 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
                     path: Some(path.display().to_string()),
                     size_bytes: None,
                     context_tokens: None,
+                    file_count: 0,
+                    modified_at_ms: None,
                     targets: Vec::new(),
                     healthy: false,
                     integrity: Some("missing".into()),
@@ -452,19 +683,35 @@ pub(super) fn read_and_scan(path: &Path) -> (Option<String>, SecurityAssessment)
     (content.into(), SecurityAssessment::scanned(findings))
 }
 
-pub(super) fn read_and_scan_directory(
-    directory: &Path,
-) -> (Option<String>, Option<usize>, SecurityAssessment) {
+pub(super) struct DirectoryAssessment {
+    pub(super) skill_content: Option<String>,
+    pub(super) context_tokens: Option<usize>,
+    pub(super) security: SecurityAssessment,
+    pub(super) file_count: usize,
+    pub(super) modified_at_ms: Option<u64>,
+}
+
+pub(super) fn read_and_scan_directory(directory: &Path) -> DirectoryAssessment {
     let files = match super::source::read_bounded_skill_directory(directory) {
         Ok(files) => files,
         Err(error) => {
-            return (
-                None,
-                None,
-                SecurityAssessment::unavailable(format!("could not scan skill directory: {error}")),
-            );
+            return DirectoryAssessment {
+                skill_content: None,
+                context_tokens: None,
+                security: SecurityAssessment::unavailable(format!(
+                    "could not scan skill directory: {error}"
+                )),
+                file_count: 0,
+                modified_at_ms: path_modified_at_ms(directory),
+            };
         }
     };
+    let file_count = files.len();
+    let modified_at_ms = files
+        .keys()
+        .filter_map(|path| path_modified_at_ms(&directory.join(path)))
+        .max()
+        .or_else(|| path_modified_at_ms(directory));
     let mut skill_content = None;
     let mut context_chars = 0usize;
     let mut findings = Vec::new();
@@ -473,13 +720,15 @@ pub(super) fn read_and_scan_directory(
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(_) if is_primary => {
-                return (
-                    None,
-                    None,
-                    SecurityAssessment::unavailable(
+                return DirectoryAssessment {
+                    skill_content: None,
+                    context_tokens: None,
+                    security: SecurityAssessment::unavailable(
                         "primary SKILL.md is not valid UTF-8 text".into(),
                     ),
-                );
+                    file_count,
+                    modified_at_ms,
+                };
             }
             Err(_) => continue,
         };
@@ -500,17 +749,37 @@ pub(super) fn read_and_scan_directory(
         }
     }
     let Some(skill_content) = skill_content else {
-        return (
-            None,
-            None,
-            SecurityAssessment::unavailable("primary SKILL.md is missing".into()),
-        );
+        return DirectoryAssessment {
+            skill_content: None,
+            context_tokens: None,
+            security: SecurityAssessment::unavailable("primary SKILL.md is missing".into()),
+            file_count,
+            modified_at_ms,
+        };
     };
-    (
-        Some(skill_content),
-        Some(context_chars.div_ceil(4)),
-        SecurityAssessment::scanned(findings),
-    )
+    DirectoryAssessment {
+        skill_content: Some(skill_content),
+        context_tokens: Some(context_chars.div_ceil(4)),
+        security: SecurityAssessment::scanned(findings),
+        file_count,
+        modified_at_ms,
+    }
+}
+
+fn path_modified_at_ms(path: &Path) -> Option<u64> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| modified_at_ms(&metadata))
+}
+
+fn modified_at_ms(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata.modified().ok().and_then(system_time_millis)
+}
+
+fn system_time_millis(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 pub(super) fn stable_id(kind: &str, identity: &str) -> String {

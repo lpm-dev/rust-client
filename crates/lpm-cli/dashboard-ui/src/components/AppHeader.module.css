@@ -1,0 +1,93 @@
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 22px;
+  height: var(--header-height);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--head-bg);
+}
+
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.logo {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.brand {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.brandLight {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.product {
+  font-size: 14px;
+  color: var(--sub);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.separator {
+  color: var(--faint);
+  flex-shrink: 0;
+}
+
+.refresh {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--sub);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.refresh:hover {
+  background: var(--row-hover);
+  color: var(--ink);
+  border-color: var(--muted);
+}
+
+.refresh:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.glyph {
+  margin-right: 6px;
+}
+
+/* Drop the product name before the brand or the action can wrap. */
+@media (max-width: 640px) {
+  .header {
+    padding: 0 14px;
+    gap: 10px;
+  }
+
+  .product,
+  .separator {
+    display: none;
+  }
+}
