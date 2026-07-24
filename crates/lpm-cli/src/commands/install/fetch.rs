@@ -1116,9 +1116,19 @@ pub(super) async fn run_online_fetch_phase(
             };
 
             for p in &packages {
+                let prior_verified = prior_verified_names.contains(p.name.as_str());
+                if !install_package_is_registry_source(p) {
+                    if trust_no_downgrade && prior_verified {
+                        return Err(provenance_downgrade_error(
+                            &p.name,
+                            &p.version,
+                            "the candidate is a registry-to-local source substitution",
+                        ));
+                    }
+                    continue;
+                }
                 let provenance_reference =
                     trusted.provenance_reference_for_candidate(&p.name, &p.version);
-                let prior_verified = prior_verified_names.contains(p.name.as_str());
                 if provenance_reference.is_none()
                     && !verification_scope.verifies_all()
                     && !trust_no_downgrade

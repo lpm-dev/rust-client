@@ -206,8 +206,13 @@ async fn build_document(
     } else {
         BTreeMap::new()
     };
-    let provenance_metadata =
-        collect_provenance_metadata(&registry_metadata, &lockfile.packages, registry).await?;
+    let provenance_metadata = collect_provenance_metadata(
+        &registry_metadata,
+        &lockfile.packages,
+        &lockfile.provenance,
+        registry,
+    )
+    .await?;
 
     let mut source_index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for package in &lockfile.packages {
@@ -294,12 +299,29 @@ fn attestation_registry_url(
     }
 }
 
+fn locked_registry_source(package: &LockedPackage) -> Option<String> {
+    match package.source_kind()? {
+        Ok(lpm_lockfile::Source::Registry { url }) => Some(url),
+        Ok(
+            lpm_lockfile::Source::Tarball { .. }
+            | lpm_lockfile::Source::Directory { .. }
+            | lpm_lockfile::Source::Link { .. }
+            | lpm_lockfile::Source::Git { .. },
+        )
+        | Err(_) => None,
+    }
+}
+
 async fn fetch_registry_metadata(
     client: &RegistryClient,
     project_dir: &Path,
     packages: &[LockedPackage],
 ) -> Result<BTreeMap<String, RegistryComponentMetadata>, LpmError> {
-    let names = packages
+    let registry_packages = packages
+        .iter()
+        .filter(|package| locked_registry_source(package).is_some())
+        .collect::<Vec<_>>();
+    let names = registry_packages
         .iter()
         .map(|package| package.name.clone())
         .collect::<Vec<_>>();
@@ -307,7 +329,7 @@ async fn fetch_registry_metadata(
     let mut by_key = BTreeMap::new();
 
     let mut fetched = BTreeMap::new();
-    for package in packages {
+    for package in registry_packages {
         if !fetched.contains_key(&package.name) {
             let fetched_metadata = fetch_routed_package_metadata(&context, &package.name)
                 .await
@@ -343,20 +365,24 @@ async fn fetch_registry_metadata(
 async fn collect_provenance_metadata(
     registry_metadata: &BTreeMap<String, RegistryComponentMetadata>,
     packages: &[LockedPackage],
+    locked_provenance: &BTreeMap<String, lpm_lockfile::LockedProvenance>,
     registry: bool,
 ) -> Result<BTreeMap<String, ProvenanceMetadata>, LpmError> {
-    let root = match LpmRoot::from_env() {
-        Ok(root) => root,
-        Err(_) => return Ok(BTreeMap::new()),
-    };
-    let cache_root = root.cache_metadata_attestations();
     let mut out = BTreeMap::new();
 
     if registry {
+        let root = match LpmRoot::from_env() {
+            Ok(root) => root,
+            Err(_) => return Ok(out),
+        };
+        let cache_root = root.cache_metadata_attestations();
         let http = crate::provenance_bundle::ProvenanceHttpClient::build().map_err(|error| {
             LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
         })?;
         for package in packages {
+            if locked_registry_source(package).is_none() {
+                continue;
+            }
             let key = package_metadata_key(package);
             let Some(metadata) = registry_metadata.get(&key) else {
                 continue;
@@ -383,9 +409,42 @@ async fn collect_provenance_metadata(
         return Ok(out);
     }
 
+    let mut cache_candidates = Vec::with_capacity(packages.len());
     for package in packages {
+        let Some(registry_source) = locked_registry_source(package) else {
+            continue;
+        };
+        if let Some(evidence) = locked_provenance.get(&package.package_key().lockfile_id()) {
+            crate::provenance_bundle::validate_locked_provenance(
+                &package.name,
+                &package.version,
+                package.integrity.as_deref(),
+                evidence,
+            )?;
+            out.insert(
+                package_metadata_key(package),
+                ProvenanceMetadata {
+                    status: "verified",
+                    snapshot: Some(evidence.snapshot.clone()),
+                    reason: None,
+                },
+            );
+            continue;
+        }
+        cache_candidates.push((package, registry_source));
+    }
+    if cache_candidates.is_empty() {
+        return Ok(out);
+    }
+    let root = match LpmRoot::from_env() {
+        Ok(root) => root,
+        Err(_) => return Ok(out),
+    };
+    let cache_root = root.cache_metadata_attestations();
+    for (package, registry_source) in cache_candidates {
         if let Some(snapshot) = provenance_fetch::read_cached_provenance_snapshot(
             &cache_root,
+            &registry_source,
             &package.name,
             &package.version,
             package.integrity.as_deref(),

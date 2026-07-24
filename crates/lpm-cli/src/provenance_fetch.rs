@@ -718,6 +718,12 @@ pub(crate) async fn fetch_provenance_evidence(
     };
     let expectation = NpmArtifactExpectation::from_package(name, version, integrity)?;
     let url_policy = AttestationUrlPolicy::for_registry(registry_url)?;
+    let validated_url = url_policy.validate(url).map_err(|error| match error {
+        FetchBundleError::Policy(reason) => LpmError::ProvenanceVerification(reason),
+        FetchBundleError::Transport => {
+            LpmError::ProvenanceVerification("attestation URL validation failed".into())
+        }
+    })?;
 
     // Cache hit + fresh → skip the network round-trip. Time only the
     // hit case: misses fall through and their downstream fetch is
@@ -725,7 +731,13 @@ pub(crate) async fn fetch_provenance_evidence(
     // is bounded small and intentionally not split out (see
     // [`ProvenanceTimings`] doc).
     let cache_start = Instant::now();
-    if let Some(cached) = read_cache(cache_root, name, version, &expectation)? {
+    if let Some(cached) = read_cache(
+        cache_root,
+        url_policy.registry_source(),
+        name,
+        version,
+        &expectation,
+    )? {
         if let Some(t) = timings {
             t.cache_hit_ns
                 .fetch_add(cache_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -739,7 +751,7 @@ pub(crate) async fn fetch_provenance_evidence(
     // error from either stage degrades to `Ok(None)` and is NOT
     // cached — the next install retries.
     let http_start = Instant::now();
-    let buf = match fetch_bundle_bytes(http, url, &url_policy).await {
+    let buf = match fetch_bundle_bytes(http, validated_url, &url_policy).await {
         Ok(b) => b,
         Err(FetchBundleError::Transport) => return Ok(ProvenanceFetch::TransportDegraded),
         Err(FetchBundleError::Policy(reason)) => {
@@ -767,7 +779,13 @@ pub(crate) async fn fetch_provenance_evidence(
     // are logged but not propagated: the snapshot is already
     // computed and usable; future invalidation is at worst one
     // extra fetch.
-    if let Err(e) = write_cache(cache_root, name, version, &buf) {
+    if let Err(e) = write_cache(
+        cache_root,
+        url_policy.registry_source(),
+        name,
+        version,
+        &buf,
+    ) {
         tracing::warn!(
             "provenance cache write failed for {name}@{version}: {e}; \
              continuing with fresh snapshot"
@@ -782,6 +800,7 @@ pub(crate) async fn fetch_provenance_evidence(
 /// artifact. Cache I/O failures still propagate after a valid binding exists.
 pub(crate) fn read_cached_provenance_snapshot(
     cache_root: &Path,
+    registry_url: &str,
     name: &str,
     version: &str,
     integrity: Option<&str>,
@@ -789,8 +808,15 @@ pub(crate) fn read_cached_provenance_snapshot(
     let Ok(expectation) = NpmArtifactExpectation::from_package(name, version, integrity) else {
         return Ok(None);
     };
-    read_cache(cache_root, name, version, &expectation)
-        .map(|entry| entry.map(|evidence| evidence.snapshot))
+    let url_policy = AttestationUrlPolicy::for_registry(registry_url)?;
+    read_cache(
+        cache_root,
+        url_policy.registry_source(),
+        name,
+        version,
+        &expectation,
+    )
+    .map(|entry| entry.map(|evidence| evidence.snapshot))
 }
 
 /// Map one [`fetch_provenance_snapshot`] outcome to a
@@ -1075,7 +1101,14 @@ pub async fn fetch_unverified_snapshot(
             };
         }
     };
-    let buf = match fetch_bundle_bytes(http, url, &url_policy).await {
+    let validated_url = match url_policy.validate(url) {
+        Ok(url) => url,
+        Err(FetchBundleError::Transport) => return ProvenanceStatus::TransportDegraded,
+        Err(FetchBundleError::Policy(reason)) => {
+            return ProvenanceStatus::VerificationRejected { reason };
+        }
+    };
+    let buf = match fetch_bundle_bytes(http, validated_url, &url_policy).await {
         Ok(b) => b,
         Err(FetchBundleError::Transport) => return ProvenanceStatus::TransportDegraded,
         Err(FetchBundleError::Policy(reason)) => {
@@ -1476,7 +1509,14 @@ mod tests {
     #[test]
     fn cached_snapshot_is_omitted_when_integrity_is_missing() {
         let cache = tempfile::tempdir().unwrap();
-        let snapshot = read_cached_provenance_snapshot(cache.path(), "pkg", "1.0.0", None).unwrap();
+        let snapshot = read_cached_provenance_snapshot(
+            cache.path(),
+            "https://registry.example.test",
+            "pkg",
+            "1.0.0",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(snapshot, None);
     }
@@ -1484,9 +1524,14 @@ mod tests {
     #[test]
     fn cached_snapshot_is_omitted_when_integrity_is_malformed() {
         let cache = tempfile::tempdir().unwrap();
-        let snapshot =
-            read_cached_provenance_snapshot(cache.path(), "pkg", "1.0.0", Some("not-an-integrity"))
-                .unwrap();
+        let snapshot = read_cached_provenance_snapshot(
+            cache.path(),
+            "https://registry.example.test",
+            "pkg",
+            "1.0.0",
+            Some("not-an-integrity"),
+        )
+        .unwrap();
 
         assert_eq!(snapshot, None);
     }
@@ -1496,6 +1541,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let snapshot = read_cached_provenance_snapshot(
             cache.path(),
+            "https://registry.example.test",
             "pkg",
             "1.0.0",
             Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
@@ -1578,8 +1624,11 @@ mod tests {
     #[tokio::test]
     async fn fetch_uses_cache_hit_without_network_roundtrip() {
         let cache = tempfile::tempdir().unwrap();
+        let registry_url = "http://localhost:1";
+        let url_policy = AttestationUrlPolicy::for_registry(registry_url).unwrap();
         write_cache(
             cache.path(),
+            url_policy.registry_source(),
             "axios",
             "1.14.0",
             include_bytes!("../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"),
@@ -1595,7 +1644,7 @@ mod tests {
             &http,
             cache.path(),
             ProvenanceFetchRequest::new(
-                "http://localhost:1",
+                registry_url,
                 "axios",
                 "1.14.0",
                 Some(AXIOS_1_14_0_INTEGRITY),
@@ -1610,6 +1659,137 @@ mod tests {
             snap.publisher.as_deref(),
             Some("github:axios/axios"),
             "cache hit must reverify the authentic bundle without an HTTP request"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_from_one_registry_cannot_satisfy_another_registry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry_a = MockServer::start().await;
+        let registry_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .expect(1)
+            .mount(&registry_a)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.2",
+                "verificationMaterial": {}
+            })))
+            .expect(1)
+            .mount(&registry_b)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let http = ProvenanceHttpClient::build().unwrap();
+        let registry_a_attestation = AttestationRef {
+            url: Some(format!("{}/att", registry_a.uri())),
+            provenance: None,
+        };
+        let first = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry_a.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&registry_a_attestation),
+            ),
+            None,
+        )
+        .await
+        .expect("registry A evidence must verify");
+        assert!(first.is_some());
+
+        let registry_b_attestation = AttestationRef {
+            url: Some(format!("{}/att", registry_b.uri())),
+            provenance: None,
+        };
+        let result = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry_b.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&registry_b_attestation),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(LpmError::ProvenanceVerification(_))),
+            "registry B must fetch and verify its own evidence, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_bypass_current_attestation_url_policy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .expect(1)
+            .mount(&registry)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let http = ProvenanceHttpClient::build().unwrap();
+        let valid_attestation = AttestationRef {
+            url: Some(format!("{}/att", registry.uri())),
+            provenance: None,
+        };
+        fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&valid_attestation),
+            ),
+            None,
+        )
+        .await
+        .expect("initial evidence must verify");
+
+        let cross_origin_attestation = AttestationRef {
+            url: Some("https://attacker.example/att".to_string()),
+            provenance: None,
+        };
+        let result = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&cross_origin_attestation),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(LpmError::ProvenanceVerification(_))),
+            "the current registry's attestation URL policy must run before cache acceptance"
         );
     }
 

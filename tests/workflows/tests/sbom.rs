@@ -190,6 +190,97 @@ fn sbom_spdx_includes_lockfile_relationships() {
 }
 
 #[test]
+fn sbom_uses_verified_lockfile_provenance_when_cache_is_empty() {
+    const PACKAGE: &str = "locked-provenance-pkg";
+    const VERSION: &str = "1.0.0";
+    const INTEGRITY: &str = "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==";
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name": "sbom-locked-provenance-test",
+            "version": "1.0.0",
+            "dependencies": {{ "{PACKAGE}": "{VERSION}" }}
+        }}"#
+    ));
+    let package = lpm_lockfile::LockedPackage {
+        name: PACKAGE.to_string(),
+        version: VERSION.to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some(INTEGRITY.to_string()),
+        ..Default::default()
+    };
+    let integrity = lpm_common::Integrity::parse(INTEGRITY).expect("valid fixture integrity");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(package.clone());
+    lockfile.set_verified_provenance(
+        &package.package_key(),
+        lpm_lockfile::LockedProvenance {
+            snapshot: lpm_common::ProvenanceSnapshot {
+                present: true,
+                publisher: Some("github:example/locked-provenance-pkg".to_string()),
+                workflow_path: Some(".github/workflows/publish.yml".to_string()),
+                workflow_ref: Some("refs/tags/v1.0.0".to_string()),
+                attestation_cert_sha256: Some(format!("sha256-{}", "11".repeat(32))),
+            },
+            subject_name: lpm_common::npm_package_purl(PACKAGE, VERSION),
+            subject_sha512: hex::encode(integrity.hash),
+            integrated_time_secs: 1_700_000_000,
+            log_id: "rekor-test-log".to_string(),
+            log_index: 42,
+            bundle_sha256: format!("sha256-{}", "22".repeat(32)),
+        },
+    );
+    lockfile
+        .write_all(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write lockfile with provenance");
+    project.write_file(
+        &format!("node_modules/{PACKAGE}/package.json"),
+        &format!(
+            r#"{{
+                "name": "{PACKAGE}",
+                "version": "{VERSION}"
+            }}"#
+        ),
+    );
+    assert!(
+        !project.cache_dir().join("metadata/attestations").exists(),
+        "test must start with a cold provenance cache"
+    );
+
+    let output = lpm(&project).args(["sbom"]).output().expect("run lpm sbom");
+    assert!(
+        output.status.success(),
+        "lpm sbom failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sbom stdout must be valid JSON");
+    let component = envelope["components"]
+        .as_array()
+        .expect("components array")
+        .iter()
+        .find(|component| component["name"] == PACKAGE)
+        .expect("locked package component");
+    let properties = component["properties"]
+        .as_array()
+        .expect("provenance properties");
+    assert!(
+        properties.iter().any(|property| {
+            property["name"] == "lpm:provenance:status" && property["value"] == "verified"
+        }),
+        "locked verified status must enrich the component: {component:#?}"
+    );
+    assert!(
+        properties.iter().any(|property| {
+            property["name"] == "lpm:provenance:publisher"
+                && property["value"] == "github:example/locked-provenance-pkg"
+        }),
+        "locked publisher identity must enrich the component: {component:#?}"
+    );
+}
+
+#[test]
 fn sbom_output_writes_file_without_stdout_payload() {
     let project = seed_project();
 

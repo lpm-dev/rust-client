@@ -55,16 +55,30 @@ impl ProvenanceHttpClient {
 #[derive(Debug, Clone)]
 pub(crate) struct AttestationUrlPolicy {
     registry_origin: String,
+    registry_source: RegistrySourceIdentity,
     allow_loopback_http: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistrySourceIdentity(String);
+
 impl AttestationUrlPolicy {
     pub(crate) fn for_registry(registry_url: &str) -> Result<Self, LpmError> {
-        let parsed = reqwest::Url::parse(registry_url).map_err(|error| {
+        let mut parsed = reqwest::Url::parse(registry_url).map_err(|error| {
             LpmError::ProvenanceVerification(format!(
                 "cannot validate attestation URL against invalid registry URL: {error}"
             ))
         })?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(LpmError::ProvenanceVerification(
+                "attestation registry URL must not contain credentials".into(),
+            ));
+        }
+        if parsed.fragment().is_some() {
+            return Err(LpmError::ProvenanceVerification(
+                "attestation registry URL must not contain a fragment".into(),
+            ));
+        }
         let allow_loopback_http =
             parsed.scheme() == "http" && lpm_registry::is_localhost_url(registry_url);
         if parsed.scheme() != "https" && !allow_loopback_http {
@@ -72,13 +86,24 @@ impl AttestationUrlPolicy {
                 "attestation registry origin must use HTTPS or loopback HTTP".into(),
             ));
         }
+        let normalized_path = parsed.path().trim_end_matches('/').to_string();
+        parsed.set_path(if normalized_path.is_empty() {
+            "/"
+        } else {
+            &normalized_path
+        });
         Ok(Self {
             registry_origin: parsed.origin().ascii_serialization(),
+            registry_source: RegistrySourceIdentity(parsed.to_string()),
             allow_loopback_http,
         })
     }
 
-    fn validate(&self, candidate: &str) -> Result<reqwest::Url, FetchBundleError> {
+    pub(crate) fn registry_source(&self) -> &RegistrySourceIdentity {
+        &self.registry_source
+    }
+
+    pub(crate) fn validate(&self, candidate: &str) -> Result<reqwest::Url, FetchBundleError> {
         let parsed = reqwest::Url::parse(candidate).map_err(|error| {
             FetchBundleError::Policy(format!("attestation URL is invalid: {error}"))
         })?;
@@ -178,24 +203,27 @@ pub(crate) fn validate_locked_provenance(
     Ok(())
 }
 
-/// Compute the on-disk cache filename for one `name@version`.
+/// Compute the on-disk cache filename for one registry and `name@version`.
 ///
-/// Strategy: SHA-256 of the canonical `name@version` string, hex-
-/// encoded. Deterministic, filesystem-safe (no `@` or `/` issues on
-/// Windows or case-insensitive volumes), collision-resistant, and
-/// keeps the cache dir a single flat directory — no per-scope
-/// sub-tree walking. The raw bundle's signed in-toto subject records
-/// the canonical package identity for debugging after verification.
-fn cache_filename(name: &str, version: &str) -> String {
+/// The canonical logical registry source is part of the digest so evidence
+/// from one registry can never satisfy another registry's lookup.
+fn cache_filename(registry_source: &RegistrySourceIdentity, name: &str, version: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(registry_source.0.as_bytes());
+    hasher.update(b"\0");
     hasher.update(name.as_bytes());
-    hasher.update(b"@");
+    hasher.update(b"\0");
     hasher.update(version.as_bytes());
     format!("{}.sigstore", hex::encode(hasher.finalize()))
 }
 
-fn cache_path(cache_root: &Path, name: &str, version: &str) -> PathBuf {
-    cache_root.join(cache_filename(name, version))
+fn cache_path(
+    cache_root: &Path,
+    registry_source: &RegistrySourceIdentity,
+    name: &str,
+    version: &str,
+) -> PathBuf {
+    cache_root.join(cache_filename(registry_source, name, version))
 }
 
 fn current_epoch_secs() -> u64 {
@@ -213,13 +241,14 @@ fn current_epoch_secs() -> u64 {
 /// local entry.
 pub(crate) fn read_cache(
     cache_root: &Path,
+    registry_source: &RegistrySourceIdentity,
     name: &str,
     version: &str,
     expectation: &NpmArtifactExpectation,
 ) -> Result<Option<VerifiedNpmProvenance>, LpmError> {
     use std::io::Read;
 
-    let path = cache_path(cache_root, name, version);
+    let path = cache_path(cache_root, registry_source, name, version);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -277,6 +306,7 @@ pub(crate) fn read_cache(
 /// Write a verified bundle atomically in the compact binary cache format.
 pub(crate) fn write_cache(
     cache_root: &Path,
+    registry_source: &RegistrySourceIdentity,
     name: &str,
     version: &str,
     bundle: &[u8],
@@ -293,7 +323,7 @@ pub(crate) fn write_cache(
     bytes.extend_from_slice(&current_epoch_secs().to_le_bytes());
     bytes.extend_from_slice(bundle);
 
-    let path = cache_path(cache_root, name, version);
+    let path = cache_path(cache_root, registry_source, name, version);
     let tmp = path.with_extension("sigstore.tmp");
     std::fs::write(&tmp, &bytes).map_err(LpmError::Io)?;
     std::fs::rename(&tmp, &path).map_err(LpmError::Io)?;
@@ -333,12 +363,12 @@ pub(crate) fn write_cache(
 /// identity-only parser go through the [`fetch_and_parse`] wrapper.
 pub(crate) async fn fetch_bundle_bytes(
     http: &ProvenanceHttpClient,
-    url: &str,
+    url: reqwest::Url,
     url_policy: &AttestationUrlPolicy,
 ) -> Result<Vec<u8>, FetchBundleError> {
     use futures::StreamExt;
 
-    let mut current_url = url_policy.validate(url)?;
+    let mut current_url = url;
     let mut redirect_count = 0usize;
     let response = loop {
         let response = http
@@ -544,7 +574,8 @@ async fn fetch_and_parse(
 ) -> Result<ProvenanceSnapshot, FetchBundleError> {
     let policy = AttestationUrlPolicy::for_registry(registry_url)
         .map_err(|error| FetchBundleError::Policy(error.to_string()))?;
-    let buf = fetch_bundle_bytes(http, url, &policy).await?;
+    let validated_url = policy.validate(url)?;
+    let buf = fetch_bundle_bytes(http, validated_url, &policy).await?;
     parse_sigstore_bundle(&buf)
         .map_err(|()| FetchBundleError::Policy("attestation bundle failed to parse".into()))
 }
@@ -1224,9 +1255,44 @@ mod tests {
     // ── Cache round-trip ─────────────────────────────────────────
 
     const AXIOS_INTEGRITY: &str = "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==";
+    const TEST_REGISTRY: &str = "https://registry.example.test";
 
     fn axios_bundle() -> &'static [u8] {
         include_bytes!("../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json")
+    }
+
+    fn test_registry_source() -> RegistrySourceIdentity {
+        AttestationUrlPolicy::for_registry(TEST_REGISTRY)
+            .unwrap()
+            .registry_source
+    }
+
+    fn cache_filename(name: &str, version: &str) -> String {
+        super::cache_filename(&test_registry_source(), name, version)
+    }
+
+    fn read_cache(
+        cache_root: &Path,
+        name: &str,
+        version: &str,
+        expectation: &NpmArtifactExpectation,
+    ) -> Result<Option<VerifiedNpmProvenance>, LpmError> {
+        super::read_cache(
+            cache_root,
+            &test_registry_source(),
+            name,
+            version,
+            expectation,
+        )
+    }
+
+    fn write_cache(
+        cache_root: &Path,
+        name: &str,
+        version: &str,
+        bundle: &[u8],
+    ) -> Result<(), LpmError> {
+        super::write_cache(cache_root, &test_registry_source(), name, version, bundle)
     }
 
     fn axios_expectation() -> NpmArtifactExpectation {
@@ -1416,6 +1482,11 @@ mod tests {
         let d = cache_filename("@a/b", "1");
         let e = cache_filename("@a/b-1", "");
         assert_ne!(d, e);
+
+        let other_registry =
+            AttestationUrlPolicy::for_registry("https://registry.other.test").unwrap();
+        let other = super::cache_filename(other_registry.registry_source(), "@scope/pkg", "1.0.0");
+        assert_ne!(a, other);
     }
 
     #[test]

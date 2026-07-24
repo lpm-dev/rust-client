@@ -331,6 +331,45 @@ async fn strict_availability_requires_an_attestation_for_scope_all() {
 }
 
 #[tokio::test]
+async fn strict_scope_all_skips_local_dependencies_without_registry_disclosure() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "local-provenance-scope-test",
+            "version": "1.0.0",
+            "dependencies": { "local-pkg": "file:./local-pkg" }
+        }"#,
+    );
+    project.write_file(
+        "local-pkg/package.json",
+        r#"{
+            "name": "local-pkg",
+            "version": "1.0.0",
+            "main": "index.js"
+        }"#,
+    );
+    project.write_file("local-pkg/index.js", "module.exports = 1;\n");
+    let mock = MockRegistry::start().await;
+    configure_custom_registry(&project, &mock);
+    write_sigstore_config(&project, Some("all"), Some("strict"), None, None);
+
+    let fresh = install(&project, &mock, &[]);
+    assert!(
+        fresh.status.success(),
+        "fresh strict install must ignore local provenance availability:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fresh.stdout),
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+
+    let requests = mock.server().received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.path().contains("local-pkg")),
+        "provenance checks must not disclose local package names to a registry: {requests:#?}"
+    );
+}
+
+#[tokio::test]
 async fn frozen_strict_install_replays_artifact_bound_lockfile_evidence() {
     let project = project_for_version(VERSION_1);
     let mock = MockRegistry::start().await;
@@ -425,6 +464,76 @@ async fn no_downgrade_blocks_new_version_after_verified_history() {
             && combined.contains(PACKAGE)
             && combined.contains(VERSION_2),
         "failure must identify the provenance downgrade: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn no_downgrade_blocks_registry_to_local_substitution_without_registry_lookup() {
+    let project = project_for_version(VERSION_1);
+    let mock = MockRegistry::start().await;
+    configure_custom_registry(&project, &mock);
+    mount_package_versions(&mock, &[(VERSION_1, Attestation::Absent)]).await;
+    let initial = install(&project, &mock, &[]);
+    assert!(initial.status.success(), "initial install must succeed");
+    seed_verified_lockfile_evidence(&project, VERSION_1);
+    write_sigstore_config(&project, None, None, Some("no-downgrade"), None);
+    project.write_file(
+        "package.json",
+        &format!(
+            r#"{{
+                "name": "provenance-lockfile-test",
+                "version": "1.0.0",
+                "dependencies": {{ "{PACKAGE}": "file:./local-pkg" }}
+            }}"#
+        ),
+    );
+    project.write_file(
+        "local-pkg/package.json",
+        &format!(
+            r#"{{
+                "name": "{PACKAGE}",
+                "version": "{VERSION_1}",
+                "main": "index.js"
+            }}"#
+        ),
+    );
+    project.write_file("local-pkg/index.js", "module.exports = 1;\n");
+    let requests_before = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("requests before substitution")
+        .len();
+    let metadata_cache = project.cache_dir().join("metadata");
+    if metadata_cache.exists() {
+        std::fs::remove_dir_all(&metadata_cache).expect("clear registry metadata cache");
+    }
+
+    let output = install(&project, &mock, &["--force"]);
+    assert!(
+        !output.status.success(),
+        "no-downgrade must reject registry-to-local source substitution"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("trust-policy no-downgrade")
+            && combined.contains(PACKAGE)
+            && combined.contains("registry-to-local source substitution"),
+        "failure must identify the source downgrade: {combined}"
+    );
+    let requests_after = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("requests after substitution");
+    assert_eq!(
+        requests_after.len(),
+        requests_before,
+        "rejecting a local source substitution must not make any registry request"
     );
 }
 
