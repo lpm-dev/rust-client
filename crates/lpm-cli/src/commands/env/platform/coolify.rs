@@ -813,21 +813,26 @@ impl CoolifyClient {
     ) -> Result<Vec<String>, LpmError> {
         let variables = self.fetch_variables().await?;
         let mut ids = Vec::new();
-        for variable in variables
-            .into_iter()
-            .filter(|variable| variable.key == key && variable.value.as_deref() == Some(value))
-        {
+        for variable in variables.into_iter().filter(|variable| variable.key == key) {
             let is_preview =
                 required_metadata_flag(variable.is_preview, "is_preview", &variable.key)?;
-            if is_preview == expected_preview {
-                if variable.uuid.is_empty() {
-                    return Err(LpmError::Script(format!(
-                        "Coolify value {} has an invalid UUID",
-                        variable.key
-                    )));
-                }
-                ids.push(variable.uuid);
+            if is_preview != expected_preview {
+                continue;
             }
+            let observed = variable
+                .value
+                .as_deref()
+                .ok_or_else(|| hidden_owned_value_error(&variable.key))?;
+            if observed != value {
+                continue;
+            }
+            if variable.uuid.is_empty() {
+                return Err(LpmError::Script(format!(
+                    "Coolify value {} has an invalid UUID",
+                    variable.key
+                )));
+            }
+            ids.push(variable.uuid);
         }
         ids.sort_unstable();
         ids.dedup();
@@ -872,7 +877,10 @@ impl CoolifyClient {
                 "Coolify value {id} no longer matches the owned {key} target"
             )));
         }
-        Ok(variable.value)
+        let value = variable
+            .value
+            .ok_or_else(|| hidden_owned_value_error(key))?;
+        Ok(Some(value))
     }
 
     async fn variable_exists(&self, id: &str) -> Result<bool, LpmError> {
@@ -970,6 +978,12 @@ fn required_metadata_flag(value: Option<bool>, field: &str, key: &str) -> Result
             "Coolify value {key} is missing {field}; refusing to sync incomplete deployment metadata"
         ))
     })
+}
+
+fn hidden_owned_value_error(key: &str) -> LpmError {
+    LpmError::Script(format!(
+        "Coolify raw value for {key} is hidden; authoritative ownership reconciliation is unavailable"
+    ))
 }
 
 fn is_shared_reference(value: &str) -> bool {
@@ -1433,6 +1447,71 @@ mod tests {
         server.await.expect("raw Coolify server");
     }
 
+    #[tokio::test]
+    async fn ambiguous_create_is_unknown_when_the_matching_value_is_hidden() {
+        let _env = crate::test_env::ScopedEnv::set([(
+            "ACCEPTANCE_RUN_ID",
+            "coolify-hidden-create-recovery".into(),
+        )]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/applications/application-123/envs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "uuid": "hidden-preview-uuid",
+                    "key": "NEW_SECRET",
+                    "is_preview": true
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            CoolifyClient::new("coolify-token".into(), config(server.uri())).expect("client");
+
+        let failure = client
+            .recover_ambiguous_owned_create(
+                "NEW_SECRET",
+                "__lpm_env_ownership_hidden",
+                true,
+                LpmError::Network("create response disconnected".into()),
+            )
+            .await
+            .expect_err("hidden matching value must remain ambiguous");
+
+        assert!(matches!(failure.committed, CoolifyCommitState::Unknown));
+    }
+
+    #[tokio::test]
+    async fn owned_value_read_fails_when_the_matching_value_is_hidden() {
+        let _env = crate::test_env::ScopedEnv::set([(
+            "ACCEPTANCE_RUN_ID",
+            "coolify-hidden-owned-read".into(),
+        )]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/applications/application-123/envs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "uuid": "hidden-production-uuid",
+                    "key": "NEW_SECRET",
+                    "is_preview": false
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            CoolifyClient::new("coolify-token".into(), config(server.uri())).expect("client");
+
+        let error = client
+            .read_owned_value("hidden-production-uuid", "NEW_SECRET", false)
+            .await
+            .expect_err("hidden owned value must not look absent");
+
+        assert!(error.to_string().contains("hidden"));
+    }
+
     #[test]
     fn release_url_requires_https() {
         let _env = crate::test_env::ScopedEnv::update([("ACCEPTANCE_RUN_ID", None)]);
@@ -1850,6 +1929,7 @@ mod tests {
                 {
                     "uuid": "legitimate-preview-uuid",
                     "key": "NEW_SECRET",
+                    "value": "legitimate-preview-value",
                     "is_preview": true
                 }
             ])))
