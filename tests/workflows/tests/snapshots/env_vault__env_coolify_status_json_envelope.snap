@@ -12,8 +12,8 @@ expression: status_json
       "env": "production",
       "status": "drifted",
       "added": 0,
-      "changed": 0,
-      "removed": 1,
+      "changed": 1,
+      "removed": 0,
       "driftKeys": [
         "APPLICATION_SECRET"
       ],

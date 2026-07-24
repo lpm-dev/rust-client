@@ -1036,6 +1036,17 @@ impl MockRegistry {
         vault_id: &str,
         response: serde_json::Value,
     ) -> &Self {
+        self.with_platform_credentials_success_calls(bearer_token, vault_id, response, 1)
+            .await
+    }
+
+    pub async fn with_platform_credentials_success_calls(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        response: serde_json::Value,
+        expected_calls: u64,
+    ) -> &Self {
         let body = serde_json::to_string(&response).expect("platform credentials should serialize");
         let signature = lpm_vault::signature::sign_body(body.as_bytes(), bearer_token);
         Mock::given(method("POST"))
@@ -1048,9 +1059,43 @@ impl MockRegistry {
                     .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
                     .set_body_string(body),
             )
-            .expect(1)
+            .expect(expected_calls)
             .mount(&self.server)
             .await;
+        self
+    }
+
+    pub async fn with_platform_audit_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        platform: &str,
+        operation: &str,
+        expected_body_fields: &[(&str, usize)],
+    ) -> &Self {
+        let mut mock = Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/audit"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!("\"platform\":\"{platform}\"")))
+            .and(body_string_contains(format!(
+                "\"operation\":\"{operation}\""
+            )));
+        for (field, value) in expected_body_fields {
+            mock = mock.and(body_string_contains(format!("\"{field}\":{value}")));
+        }
+        let body = serde_json::to_string(&serde_json::json!({ "success": true }))
+            .expect("platform audit response should serialize");
+        let signature = lpm_vault::signature::sign_body(body.as_bytes(), bearer_token);
+        mock.respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+                .set_body_string(body),
+        )
+        .expect(1)
+        .mount(&self.server)
+        .await;
         self
     }
 
@@ -1087,6 +1132,31 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(envs))
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_coolify_env_update(
+        &self,
+        token: &str,
+        application_id: &str,
+        key: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/applications/{application_id}/envs")))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains(format!("\"key\":\"{key}\"")))
+            .and(body_string_contains(format!("\"value\":\"{value}\"")))
+            .and(body_string_contains("\"is_preview\":false"))
+            .and(body_string_contains("\"is_literal\":false"))
+            .and(body_string_contains("\"is_multiline\":false"))
+            .and(body_string_contains("\"is_shown_once\":false"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "uuid": "updated-coolify-variable",
+            })))
+            .expect(1)
             .mount(&self.server)
             .await;
         self

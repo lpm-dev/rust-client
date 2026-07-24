@@ -1,7 +1,7 @@
 mod coolify;
 
 use super::prelude::*;
-use futures::TryStreamExt;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -84,7 +84,7 @@ struct VercelListResponse {
     pagination: Option<VercelPagination>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PlatformDiff {
     added: Vec<String>,
     changed: Vec<String>,
@@ -92,7 +92,7 @@ struct PlatformDiff {
     unchanged: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 struct PlatformPushResult {
     added: usize,
     updated: usize,
@@ -100,20 +100,70 @@ struct PlatformPushResult {
 }
 
 impl PlatformPushResult {
-    fn from_outcomes(outcomes: Vec<MutationKind>) -> Self {
-        let mut result = Self {
-            added: 0,
-            updated: 0,
-            removed: 0,
-        };
+    fn record(&mut self, kind: MutationKind) {
+        match kind {
+            MutationKind::Added => self.added += 1,
+            MutationKind::Updated => self.updated += 1,
+            MutationKind::Removed => self.removed += 1,
+        }
+    }
+
+    fn from_mutation_outcomes(outcomes: Vec<MutationOutcome>) -> Result<Self, PlatformApplyError> {
+        let mut result = Self::default();
+        let mut first_error = None;
+        let mut counts_known = true;
         for outcome in outcomes {
             match outcome {
-                MutationKind::Added => result.added += 1,
-                MutationKind::Updated => result.updated += 1,
-                MutationKind::Removed => result.removed += 1,
+                MutationOutcome::Applied(kind) => result.record(kind),
+                MutationOutcome::Failed { error, committed } => {
+                    if let Some(kind) = committed {
+                        result.record(kind);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                MutationOutcome::Unknown(error) => {
+                    counts_known = false;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        result
+        match first_error {
+            Some(error) if counts_known => Err(PlatformApplyError::tracked(error, result)),
+            Some(error) => Err(PlatformApplyError::untracked(error)),
+            None => Ok(result),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PlatformApplyError {
+    Untracked(Box<LpmError>),
+    Tracked {
+        error: Box<LpmError>,
+        applied: PlatformPushResult,
+    },
+}
+
+impl PlatformApplyError {
+    fn untracked(error: LpmError) -> Self {
+        Self::Untracked(Box::new(error))
+    }
+
+    fn tracked(error: LpmError, applied: PlatformPushResult) -> Self {
+        Self::Tracked {
+            error: Box::new(error),
+            applied,
+        }
+    }
+
+    fn into_error(self) -> LpmError {
+        match self {
+            Self::Untracked(error) | Self::Tracked { error, .. } => *error,
+        }
     }
 }
 
@@ -124,11 +174,33 @@ enum VercelMutation {
     Remove { id: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum MutationKind {
     Added,
     Updated,
     Removed,
+}
+
+#[derive(Debug)]
+enum MutationOutcome {
+    Applied(MutationKind),
+    Failed {
+        error: LpmError,
+        committed: Option<MutationKind>,
+    },
+    Unknown(LpmError),
+}
+
+impl From<Result<MutationKind, LpmError>> for MutationOutcome {
+    fn from(result: Result<MutationKind, LpmError>) -> Self {
+        match result {
+            Ok(kind) => Self::Applied(kind),
+            Err(error) => Self::Failed {
+                error,
+                committed: None,
+            },
+        }
+    }
 }
 
 struct VercelClient {
@@ -284,13 +356,14 @@ impl VercelClient {
         diff: &PlatformDiff,
         local: &HashMap<String, String>,
         remote: &HashMap<String, PlatformVariable>,
-    ) -> Result<PlatformPushResult, LpmError> {
+    ) -> Result<PlatformPushResult, PlatformApplyError> {
         let mut mutations =
             Vec::with_capacity(diff.added.len() + diff.changed.len() + diff.removed.len());
         for key in &diff.added {
             let value = local
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))?;
+                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))
+                .map_err(PlatformApplyError::untracked)?;
             mutations.push(VercelMutation::Add {
                 key: key.clone(),
                 value: value.clone(),
@@ -299,11 +372,14 @@ impl VercelClient {
         for key in &diff.changed {
             let value = local
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))?;
+                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))
+                .map_err(PlatformApplyError::untracked)?;
             let variable = remote
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing Vercel value for {key}")))?;
-            self.assert_mutation_targets(key, variable)?;
+                .ok_or_else(|| LpmError::Script(format!("missing Vercel value for {key}")))
+                .map_err(PlatformApplyError::untracked)?;
+            self.assert_mutation_targets(key, variable)
+                .map_err(PlatformApplyError::untracked)?;
             mutations.push(VercelMutation::Update {
                 id: variable.id.clone(),
                 value: value.clone(),
@@ -312,20 +388,22 @@ impl VercelClient {
         for key in &diff.removed {
             let variable = remote
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing Vercel value for {key}")))?;
-            self.assert_mutation_targets(key, variable)?;
+                .ok_or_else(|| LpmError::Script(format!("missing Vercel value for {key}")))
+                .map_err(PlatformApplyError::untracked)?;
+            self.assert_mutation_targets(key, variable)
+                .map_err(PlatformApplyError::untracked)?;
             mutations.push(VercelMutation::Remove {
                 id: variable.id.clone(),
             });
         }
 
-        let outcomes: Vec<MutationKind> = futures::stream::iter(mutations)
-            .map(|mutation| self.apply_one(mutation))
+        let outcomes = futures::stream::iter(mutations)
+            .map(|mutation| async move { self.apply_one(mutation).await.into() })
             .buffer_unordered(PLATFORM_MUTATION_CONCURRENCY)
-            .try_collect()
-            .await?;
+            .collect::<Vec<_>>()
+            .await;
 
-        Ok(PlatformPushResult::from_outcomes(outcomes))
+        PlatformPushResult::from_mutation_outcomes(outcomes)
     }
 
     fn assert_mutation_targets(
@@ -469,7 +547,7 @@ impl PlatformClient {
         diff: &PlatformDiff,
         local: &HashMap<String, String>,
         remote: &HashMap<String, PlatformVariable>,
-    ) -> Result<PlatformPushResult, LpmError> {
+    ) -> Result<PlatformPushResult, PlatformApplyError> {
         match self {
             Self::Vercel(client) => client.apply(diff, local, remote).await,
             Self::Coolify(client) => client.apply(diff, local, remote).await,
@@ -1029,8 +1107,29 @@ pub(super) async fn vars_platform_push(
         }
     }
 
-    let result = client.apply(&diff, &local, &remote).await?;
     let env_name = resolved_env.as_deref().unwrap_or("default");
+    let result = match client.apply(&diff, &local, &remote).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let PlatformApplyError::Tracked { applied, .. } = &error {
+                let _ = record_platform_audit(
+                    &registry_url,
+                    &auth_token,
+                    serde_json::json!({
+                        "vaultId": vault_id,
+                        "platform": platform,
+                        "operation": "push_failed",
+                        "env": env_name,
+                        "added": applied.added,
+                        "updated": applied.updated,
+                        "removed": applied.removed,
+                    }),
+                )
+                .await;
+            }
+            return Err(error.into_error());
+        }
+    };
     let audit = record_platform_audit(
         &registry_url,
         &auth_token,
@@ -1379,6 +1478,18 @@ mod tests {
 
     fn platform_client(targets: &[&str]) -> PlatformClient {
         PlatformClient::Vercel(vercel_client(targets))
+    }
+
+    #[test]
+    fn platform_apply_error_preserves_original_error_classification() {
+        let error = PlatformApplyError::tracked(
+            LpmError::Network("connection reset".into()),
+            PlatformPushResult::default(),
+        )
+        .into_error();
+
+        assert_eq!(error.error_code(), "network");
+        assert_eq!(error.to_string(), "network error: connection reset");
     }
 
     #[test]
