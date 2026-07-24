@@ -10,6 +10,5 @@ expression: push_json
   "added": 0,
   "updated": 1,
   "removed": 0,
-  "secretVerification": "exact",
   "auditRecorded": true
 }
