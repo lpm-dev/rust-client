@@ -2547,13 +2547,12 @@ mod tests {
 
     #[test]
     fn restarted_service_does_not_report_ready_after_readiness_failure() {
-        let ready_port = crate::ports::find_available_port(49000).unwrap();
         let mut services = HashMap::new();
         services.insert(
             "worker".to_string(),
             ServiceConfig {
                 command: "node -e \"setInterval(() => {}, 1000)\"".to_string(),
-                ready_port: Some(ready_port),
+                ready_url: Some("http://127.0.0.1:0".to_string()),
                 ready_timeout: 1,
                 ..Default::default()
             },
