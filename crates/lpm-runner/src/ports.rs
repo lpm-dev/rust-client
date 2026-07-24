@@ -382,6 +382,13 @@ pub(crate) fn descendant_process_ids(root_pid: u32) -> HashSet<u32> {
     }
 }
 
+#[cfg(windows)]
+fn windows_exit_code_is_active(exit_code: u32) -> bool {
+    use windows_sys::Win32::Foundation::STILL_ACTIVE;
+
+    exit_code == STILL_ACTIVE as u32
+}
+
 pub(crate) fn process_is_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -398,7 +405,7 @@ pub(crate) fn process_is_running(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
             GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
@@ -416,7 +423,7 @@ pub(crate) fn process_is_running(pid: u32) -> bool {
         unsafe {
             CloseHandle(handle);
         }
-        queried && exit_code == STILL_ACTIVE
+        queried && windows_exit_code_is_active(exit_code)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1900,6 +1907,14 @@ fn project_hash(project_dir: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exit_code_recognizes_still_active_value() {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+
+        assert!(windows_exit_code_is_active(STILL_ACTIVE as u32));
+    }
 
     #[cfg(unix)]
     #[test]
