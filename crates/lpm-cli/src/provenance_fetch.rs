@@ -776,13 +776,19 @@ pub(crate) async fn fetch_provenance_evidence(
     Ok(ProvenanceFetch::Verified(evidence))
 }
 
+/// Read optional cached provenance for non-install enrichment.
+///
+/// Evidence is omitted when the package integrity cannot bind it to an exact
+/// artifact. Cache I/O failures still propagate after a valid binding exists.
 pub(crate) fn read_cached_provenance_snapshot(
     cache_root: &Path,
     name: &str,
     version: &str,
     integrity: Option<&str>,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    let expectation = NpmArtifactExpectation::from_package(name, version, integrity)?;
+    let Ok(expectation) = NpmArtifactExpectation::from_package(name, version, integrity) else {
+        return Ok(None);
+    };
     read_cache(cache_root, name, version, &expectation)
         .map(|entry| entry.map(|evidence| evidence.snapshot))
 }
@@ -1465,6 +1471,38 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn cached_snapshot_is_omitted_when_integrity_is_missing() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = read_cached_provenance_snapshot(cache.path(), "pkg", "1.0.0", None).unwrap();
+
+        assert_eq!(snapshot, None);
+    }
+
+    #[test]
+    fn cached_snapshot_is_omitted_when_integrity_is_malformed() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot =
+            read_cached_provenance_snapshot(cache.path(), "pkg", "1.0.0", Some("not-an-integrity"))
+                .unwrap();
+
+        assert_eq!(snapshot, None);
+    }
+
+    #[test]
+    fn cached_snapshot_is_omitted_when_integrity_is_not_sha512() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = read_cached_provenance_snapshot(
+            cache.path(),
+            "pkg",
+            "1.0.0",
+            Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, None);
     }
 
     // ── fetch_provenance_snapshot (public API) — non-network paths ──

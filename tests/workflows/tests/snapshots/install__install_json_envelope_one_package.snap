@@ -9,7 +9,7 @@ expression: envelope
     {
       "name": "ms",
       "version": "2.1.3",
-      "source": "registry+https://lpm.dev",
+      "source": "registry+https://registry.npmjs.org",
       "direct": true
     }
   ],
