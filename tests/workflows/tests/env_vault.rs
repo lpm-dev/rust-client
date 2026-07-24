@@ -3354,7 +3354,7 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
                 }
             ]
         }),
-        2,
+        3,
     )
     .await;
     mock.with_fly_app(support::mock_registry::FlyAppFixture {
@@ -3367,8 +3367,18 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
             { "name": "APPLICATION_SECRET", "digest": "sha256:write-only" },
             { "name": "FLY_APP_NAME", "digest": "managed" }
         ]),
-        expected_calls: 4,
+        expected_calls: 7,
     })
+    .await;
+    mock.with_fly_set_secrets_success(platform_token, app, "APPLICATION_SECRET", "local-secret")
+        .await;
+    mock.with_platform_audit_success(
+        bearer_token,
+        vault_id,
+        "fly",
+        "push",
+        &[("added", 0), ("updated", 1), ("removed", 0)],
+    )
     .await;
     let command = || {
         let mut command = lpm(&project);
@@ -3433,6 +3443,22 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
     assert_eq!(pull_json["skippedSecrets"], 1);
     assert_eq!(pull_json["secretVerification"], "names_only");
     insta::assert_json_snapshot!("env_fly_pull_json_envelope", pull_json);
+
+    let push = command()
+        .args(["--json", "env", "push", "--to", "fly", "--yes"])
+        .output()
+        .expect("failed to run lpm env push --to fly");
+    assert!(
+        push.status.success(),
+        "env push failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+    );
+    let push_json = parse_clean_json_stdout(&push);
+    assert_eq!(push_json["added"], 0);
+    assert_eq!(push_json["updated"], 1);
+    assert_eq!(push_json["removed"], 0);
+    insta::assert_json_snapshot!("env_fly_push_json_envelope", push_json);
 }
 
 #[tokio::test]

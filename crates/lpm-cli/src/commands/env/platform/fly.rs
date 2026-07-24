@@ -773,7 +773,10 @@ mod tests {
             .await
             .expect_err("organization transfer must fail before mutation");
 
-        assert!(error.error().to_string().contains("identity changed"));
+        let PlatformApplyError::Untracked(error) = error else {
+            panic!("identity change must remain untracked");
+        };
+        assert!(error.to_string().contains("identity changed"));
         assert_eq!(server.received_requests().await.expect("requests").len(), 1);
     }
 
@@ -927,13 +930,10 @@ mod tests {
             .await
             .expect_err("stale comparison must fail before mutation");
 
-        assert!(
-            error
-                .error()
-                .to_string()
-                .contains("changed after comparison")
-        );
-        assert!(matches!(error, PlatformApplyError::Untracked(_)));
+        let PlatformApplyError::Untracked(error) = error else {
+            panic!("stale comparison must remain untracked");
+        };
+        assert!(error.to_string().contains("changed after comparison"));
     }
 
     #[tokio::test]

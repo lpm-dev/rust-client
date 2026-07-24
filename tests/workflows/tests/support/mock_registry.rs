@@ -1632,6 +1632,39 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_fly_set_secrets_success(
+        &self,
+        token: &str,
+        app: &str,
+        key: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(header("user-agent", "lpm-env-fly"))
+            .and(body_string_contains(
+                "mutation setSecrets($input: SetSecretsInput!)",
+            ))
+            .and(body_string_contains(format!("\"appId\":\"{app}\"")))
+            .and(body_string_contains(format!("\"key\":\"{key}\"")))
+            .and(body_string_contains(format!("\"value\":\"{value}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "setSecrets": {
+                        "release": {
+                            "id": "release-123",
+                            "version": 7
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a successful wrapping-key escrow upload.
     pub async fn with_escrow_upload_success(&self, bearer_token: &str, vault_id: &str) -> &Self {
         Mock::given(method("POST"))
