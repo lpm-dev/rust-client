@@ -59,6 +59,7 @@ pub type ServicePortMap = HashMap<String, u16>;
 pub type ServiceEndpointMap = HashMap<String, DevEndpoint>;
 pub type PortsAssignedCallback = Box<dyn Fn(&ServicePortMap) -> Result<(), LpmError> + Send>;
 pub type AllReadyCallback = Box<dyn FnOnce(ServiceEndpointMap) -> Result<(), LpmError> + Send>;
+pub type EndpointChangedCallback = Box<dyn Fn(DevEndpoint) -> Result<(), LpmError> + Send>;
 
 type PortReassignments = HashMap<String, PortReassignment>;
 
@@ -101,6 +102,8 @@ pub struct OrchestratorOptions {
     /// Called once after ALL initial services pass readiness checks.
     /// Used by dev.rs to open the browser at the right time.
     pub on_all_ready: Option<AllReadyCallback>,
+    /// Called after a restarted managed service publishes a newly verified endpoint.
+    pub on_endpoint_changed: Option<EndpointChangedCallback>,
     /// Called once after declared ports are checked and final service ports are assigned.
     pub on_ports_assigned: Option<PortsAssignedCallback>,
     /// CLI port override for the primary service.
@@ -295,21 +298,6 @@ fn service_exit_status(
     child.try_wait().ok().flatten()
 }
 
-fn wait_for_service_readiness(
-    ready_url: Option<String>,
-    ready_port: Option<u16>,
-    timeout_secs: u64,
-) -> Result<Option<Duration>, String> {
-    if let Some(url) = ready_url {
-        Ok(Some(ready::wait_for_url(&url, timeout_secs)?))
-    } else if let Some(port) = ready_port {
-        Ok(Some(ready::wait_for_port(port, timeout_secs)?))
-    } else {
-        std::thread::sleep(NO_READINESS_GRACE);
-        Ok(None)
-    }
-}
-
 struct InitialServiceReadiness {
     duration: Option<Duration>,
     endpoint: Option<DevEndpoint>,
@@ -383,11 +371,7 @@ fn command_with_managed_port(command: &str, cwd: &Path, port: Option<u16>) -> St
         return command.to_string();
     }
 
-    let separator = if command
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("npm run ")
-    {
+    let separator = if lpm_cert::framework::npm_script_requires_argument_separator(command) {
         " -- "
     } else {
         " "
@@ -1047,6 +1031,9 @@ pub fn run_services(
         // Schedule restarts with exponential backoff (non-blocking)
         for name in to_restart {
             all_done = false;
+            if pending_restarts.contains_key(&name) {
+                continue;
+            }
 
             let (attempts, last_crash) = restart_state
                 .entry(name.clone())
@@ -1190,6 +1177,8 @@ pub fn run_services(
                 }
                 let service_command =
                     command_with_managed_port(&config.command, &cwd, port_map.get(&name).copied());
+                let assigned_port = port_map.get(&name).copied();
+                let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
 
                 let mut cmd = Command::new(shell);
                 cmd.arg(flag)
@@ -1207,6 +1196,7 @@ pub fn run_services(
                 let color = color_map.get(name.as_str()).unwrap_or(&RESET);
                 match cmd.spawn() {
                     Ok(new_child) => {
+                        let child_pid = new_child.id();
                         let mut locked = children.lock();
                         // Remove old dead entry
                         locked.retain(|(n, _)| n != &name);
@@ -1220,6 +1210,7 @@ pub fn run_services(
                         // window but no data corruption or resource leak.
                         let service_index =
                             service_names.iter().position(|n| n == &name).unwrap_or(0);
+                        let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
                         spawn_output_readers(
                             &name,
                             color,
@@ -1227,22 +1218,37 @@ pub fn run_services(
                             &children,
                             &shutdown_state,
                             &options.event_tx,
-                            None,
+                            Some(endpoint_tx),
                         );
 
-                        let ready_result = wait_for_service_readiness(
-                            config.ready_url.clone(),
-                            service_ready_port(config, port_map.get(&name).copied()),
-                            config.ready_timeout,
-                        );
+                        let ready_result =
+                            wait_for_initial_service_readiness(InitialReadinessOptions {
+                                service_dir: &cwd,
+                                root_pid: child_pid,
+                                baseline: listener_baseline.as_ref(),
+                                assigned_port,
+                                candidates: &endpoint_rx,
+                                ready_url: config.ready_url.clone(),
+                                ready_port: service_ready_port(config, assigned_port),
+                                timeout_secs: config.ready_timeout,
+                            });
 
                         match ready_result {
-                            Ok(duration) => {
+                            Ok(mut readiness) => {
                                 if service_exit_status(&children, &name).is_some() {
                                     continue;
                                 }
 
-                                let timing = ui_readiness_timing(duration);
+                                if let Some(ref mut endpoint) = readiness.endpoint {
+                                    endpoint.service = Some(name.clone());
+                                }
+                                if let (Some(callback), Some(endpoint)) =
+                                    (&options.on_endpoint_changed, readiness.endpoint)
+                                {
+                                    callback(endpoint)?;
+                                }
+
+                                let timing = ui_readiness_timing(readiness.duration);
                                 ui_service_status(
                                     color,
                                     &name,
@@ -1267,12 +1273,6 @@ pub fn run_services(
                                         "restarted but not ready - {}",
                                         sanitize_terminal_inline(&error)
                                     ),
-                                );
-                                send_status(
-                                    &options.event_tx,
-                                    &service_names,
-                                    &name,
-                                    ServiceStatus::Ready,
                                 );
                             }
                         }
@@ -2127,6 +2127,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wrapped_npm_scripts_receive_managed_port_arguments_after_npm_separator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_with_managed_port("FOO=1 npm run dev", dir.path(), Some(5174)),
+            "FOO=1 npm run dev -- --port 5174 --strictPort"
+        );
+        assert_eq!(
+            command_with_managed_port("cross-env FOO=1 npm run dev", dir.path(), Some(5174)),
+            "cross-env FOO=1 npm run dev -- --port 5174 --strictPort"
+        );
+    }
+
     // ── Reverse topological shutdown ─────────────────────────────────
 
     #[test]
@@ -2482,6 +2501,101 @@ mod tests {
         assert!(
             ready_count >= 2,
             "should emit Ready at least twice (initial + restart), got {ready_count}"
+        );
+    }
+
+    #[test]
+    fn restarted_managed_service_republishes_its_verified_endpoint() {
+        let port = crate::ports::find_available_port(49000).unwrap();
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceConfig {
+                command: "node -e \"require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1')\"".to_string(),
+                port: Some(port),
+                ready_timeout: 3,
+                ..Default::default()
+            },
+        );
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (initial_tx, initial_rx) = std::sync::mpsc::channel();
+        let (restart_tx, restart_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            manage_primary_endpoint: true,
+            on_all_ready: Some(Box::new(move |mut endpoints| {
+                initial_tx.send(endpoints.remove("web").unwrap()).unwrap();
+                Ok(())
+            })),
+            on_endpoint_changed: Some(Box::new(move |endpoint| {
+                restart_tx.send(endpoint).unwrap();
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
+
+        let initial = initial_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
+        let restarted = restart_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = handle.join().unwrap();
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert_eq!(restarted.target, initial.target);
+        assert_ne!(restarted.owner_pid, initial.owner_pid);
+    }
+
+    #[test]
+    fn restarted_service_does_not_report_ready_after_readiness_failure() {
+        let ready_port = crate::ports::find_available_port(49000).unwrap();
+        let mut services = HashMap::new();
+        services.insert(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "node -e \"setInterval(() => {}, 1000)\"".to_string(),
+                ready_port: Some(ready_port),
+                ready_timeout: 1,
+                ..Default::default()
+            },
+        );
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let options = OrchestratorOptions {
+            command_rx: Some(cmd_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
+
+        std::thread::sleep(Duration::from_millis(1_500));
+        cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
+        std::thread::sleep(Duration::from_millis(1_500));
+        cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = handle.join().unwrap();
+
+        let ready_count = event_rx
+            .try_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    OrchestratorEvent::StatusChange {
+                        status: ServiceStatus::Ready,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert_eq!(
+            ready_count, 1,
+            "only the initial warning path may report Ready; the failed restart must not"
         );
     }
 

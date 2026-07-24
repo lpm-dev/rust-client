@@ -849,7 +849,7 @@ async fn route_lease_release_removes_registered_routes() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn route_lease_release_uses_connection_backed_control_stream() {
+async fn route_lease_replaces_and_releases_routes_on_its_control_stream() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("proxy.sock");
     let state_path = dir.path().join("proxy.json");
@@ -870,6 +870,19 @@ async fn route_lease_release_uses_connection_backed_control_stream() {
         connection: Some(LeaseConnection::Unix(stream)),
         socket_path: Some(socket_path.clone()),
     };
+
+    lease
+        .replace_routes(vec![route("app.localhost", 4000)])
+        .await
+        .unwrap();
+    let listed = send_request_to_path(&socket_path, ProxyRequest::List)
+        .await
+        .unwrap();
+    let ProxyResponse::Routes { routes } = listed else {
+        panic!("expected proxy routes after replacement");
+    };
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].upstream_port, 4000);
 
     let removed = lease.release().await.unwrap();
 
@@ -1123,6 +1136,29 @@ async fn http_frontend_forwards_any_local_host_to_the_resolved_upstream() {
     let body = response.text().await.unwrap();
     assert!(body.contains("GET /network"));
     assert!(body.contains("proto=http"));
+    frontend.shutdown();
+}
+
+#[tokio::test]
+async fn http_frontend_switches_to_a_republished_child_endpoint() {
+    let upstream_port = spawn_echo_upstream().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let initial = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port)
+        .with_base_path("/before");
+    let frontend = start_http_frontend_on_listener(listener, initial).unwrap();
+    let url = format!("http://127.0.0.1:{}/check", frontend.port());
+
+    let before = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    frontend
+        .update_upstream(
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port)
+                .with_base_path("/after"),
+        )
+        .unwrap();
+    let after = reqwest::get(&url).await.unwrap().text().await.unwrap();
+
+    assert!(before.contains("GET /before/check"));
+    assert!(after.contains("GET /after/check"));
     frontend.shutdown();
 }
 

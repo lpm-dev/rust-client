@@ -299,6 +299,7 @@ pub(crate) async fn run_start(
         relay_url: relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
         token: token.to_string(),
         local_target: local_target.clone(),
+        live_local_target: None,
         domain: domain.map(|s| s.to_string()),
         tunnel_auth: tunnel_auth_token.clone(),
         webhook_tx: Some(webhook_tx),
@@ -347,14 +348,15 @@ pub(crate) async fn run_start(
             if json_output {
                 println!(
                     "{}",
-                    tunnel_ready_json(
+                    serde_json::to_string_pretty(&tunnel_ready_json(
                         session,
                         &local_target_url,
                         usage.as_ref(),
                         tunnel_auth_display.as_deref(),
                         inspector_url.as_deref(),
                         auto_ack,
-                    )
+                    ))
+                    .unwrap()
                 );
             } else {
                 install_ui::phase("Tunnel ready");

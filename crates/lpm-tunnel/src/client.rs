@@ -13,7 +13,7 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -206,6 +206,8 @@ pub struct TunnelOptions {
     pub token: String,
     /// Validated local HTTP endpoint to tunnel.
     pub local_target: lpm_common::LocalTarget,
+    /// Live endpoint source for dev services that can restart.
+    pub live_local_target: Option<Arc<RwLock<lpm_common::LocalTarget>>>,
     /// Full tunnel domain (e.g., "acme-api.lpm.llc"). Pro/Org only.
     /// If None, relay assigns a random domain on lpm.fyi (free tier).
     /// If bare name without dot, ".lpm.fyi" is appended for backward compat.
@@ -245,6 +247,7 @@ impl TunnelOptions {
                 lpm_common::LocalScheme::Http,
                 local_port,
             ),
+            live_local_target: None,
             domain: None,
             tunnel_auth: None,
             webhook_tx: None,
@@ -263,6 +266,18 @@ impl TunnelOptions {
                 format!("{d}.{}", crate::DEFAULT_BASE_DOMAIN)
             }
         })
+    }
+
+    fn current_local_target(&self) -> lpm_common::LocalTarget {
+        self.live_local_target.as_ref().map_or_else(
+            || self.local_target.clone(),
+            |target| {
+                target
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            },
+        )
     }
 }
 
@@ -288,7 +303,7 @@ pub async fn connect_with_usage(
     on_disconnected: impl Fn(&str),
     on_usage: impl Fn(&TunnelUsageMetadata, bool),
 ) -> Result<(), LpmError> {
-    crate::validate_forward_target(&options.local_target)?;
+    crate::validate_forward_target(&options.current_local_target())?;
     let mut retry_count = 0;
     let max_retries = 10;
 
@@ -775,10 +790,11 @@ async fn try_connect(
     on_connected: &impl Fn(&TunnelSession),
     on_usage: &impl Fn(&TunnelUsageMetadata, bool),
 ) -> Result<(), TunnelConnectError> {
+    let connection_target = options.current_local_target();
     // Build connect URL — non-sensitive params only (token goes in Authorization header)
     let mut connect_url = format!(
         "{}?port={}&protocol=2",
-        options.relay_url, options.local_target.port
+        options.relay_url, connection_target.port
     );
     if let Some(domain) = options.resolved_domain() {
         let encoded = urlencoding::encode(&domain);
@@ -904,7 +920,7 @@ async fn try_connect(
                             tunnel_url,
                             domain,
                             session_id,
-                            local_port: options.local_target.port,
+                            local_port: connection_target.port,
                             plan,
                             base_domain,
                             domain_kind,
@@ -1024,9 +1040,10 @@ async fn try_connect(
 
                                 let forward_start = std::time::Instant::now();
                                 let mut was_auto_acked = false;
+                                let local_target = options.current_local_target();
                                 let response = match proxy::forward_request(
                                     &http_client,
-                                    &options.local_target,
+                                    &local_target,
                                     &server_msg,
                                 )
                                 .await
@@ -1156,8 +1173,9 @@ async fn try_connect(
 
                                 // Establish local WebSocket connection for HMR passthrough
                                 tracing::debug!("WebSocket upgrade request: {url}");
+                                let local_target = options.current_local_target();
                                 match proxy::connect_local_websocket(
-                                    &options.local_target,
+                                    &local_target,
                                     &url,
                                     &headers,
                                 ).await {
@@ -2018,6 +2036,7 @@ mod tests {
             relay_url: "wss://relay.lpm.fyi/connect".to_string(),
             token: "test-token".to_string(),
             local_target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3000),
+            live_local_target: None,
             domain: Some("myapp.lpm.fyi".to_string()),
             tunnel_auth: Some("secret-tunnel-auth".to_string()),
             webhook_tx: None,
@@ -2042,6 +2061,20 @@ mod tests {
             !connect_url.contains("secret-tunnel-auth"),
             "tunnel_auth value must not appear in URL: {connect_url}"
         );
+    }
+
+    #[test]
+    fn live_local_target_tracks_republished_dev_endpoint() {
+        let mut options = TunnelOptions::new("test-token".to_string(), 5173);
+        let live_target = Arc::new(RwLock::new(options.local_target.clone()));
+        options.live_local_target = Some(Arc::clone(&live_target));
+
+        *live_target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 5174);
+
+        assert_eq!(options.current_local_target().port, 5174);
     }
 
     #[test]

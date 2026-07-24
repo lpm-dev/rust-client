@@ -84,7 +84,8 @@ pub async fn start_tls_frontend_on_listener(
         .with_cert_resolver(Arc::new(FixedTlsCertResolver { key }));
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-    let state = HttpProxyState::for_upstream(upstream, "https");
+    let upstream = Arc::new(RwLock::new(upstream));
+    let state = HttpProxyState::for_upstream(Arc::clone(&upstream), "https");
 
     tokio::spawn(async move {
         loop {
@@ -109,6 +110,7 @@ pub async fn start_tls_frontend_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: Some(upstream),
     })
 }
 
@@ -152,6 +154,7 @@ fn start_tls_proxy_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: None,
     })
 }
 

@@ -94,6 +94,18 @@ pub fn explicit_port_args_for_command(project_dir: &Path, command: &str, port: u
         .map_or_else(Vec::new, |framework| explicit_port_args(&framework, port))
 }
 
+/// Return whether managed arguments must pass through npm's script separator.
+pub fn npm_script_requires_argument_separator(command: &str) -> bool {
+    let Some(words) = shlex::split(command) else {
+        return false;
+    };
+    let Some(executable_index) = first_executable_index(&words) else {
+        return false;
+    };
+    words.get(executable_index).map(String::as_str) == Some("npm")
+        && package_manager_script_name(&words, executable_index).is_some()
+}
+
 fn command_framework(project_dir: &Path, command: &str, depth: u8) -> Option<Framework> {
     if depth > 2 {
         return None;

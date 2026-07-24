@@ -117,7 +117,7 @@ pub fn resolve_spawned_endpoint(
             if child_exited.load(Ordering::Acquire) {
                 return Ok(None);
             }
-        } else if advertised.is_empty() {
+        } else {
             let owned = new_owned_listeners(&project_dir, baseline, &descendants);
             if owned.len() == 1 {
                 let listener = &owned[0];
@@ -137,8 +137,6 @@ pub fn resolve_spawned_endpoint(
             {
                 return Ok(None);
             }
-        } else if child_exited.load(Ordering::Acquire) || !ports::process_is_running(root_pid) {
-            return Ok(None);
         }
         if (child_exited.load(Ordering::Acquire) || !ports::process_is_running(root_pid))
             && new_owned_listeners(&project_dir, baseline, &descendants).is_empty()
@@ -152,7 +150,7 @@ pub fn resolve_spawned_endpoint(
                 ));
             }
             let owned = new_owned_listeners(&project_dir, baseline, &descendants);
-            if advertised.is_empty() && owned.len() > 1 {
+            if owned.len() > 1 {
                 let mut ports: Vec<u16> = owned.iter().map(|listener| listener.port).collect();
                 ports.sort_unstable();
                 ports.dedup();
@@ -179,27 +177,29 @@ fn new_owned_listener_for_port(
     descendants: &HashSet<u32>,
     port: u16,
 ) -> Option<ports::ListeningPort> {
-    let (pid, process) = ports::find_port_owner(port);
-    if baseline.contains(port, pid) {
-        return None;
-    }
-    if pid.is_some_and(|pid| descendants.contains(&pid)) {
-        return Some(ports::ListeningPort {
-            port,
-            address: None,
-            pid,
-            process,
-            command: None,
-            cwd: None,
-            project_dir: None,
-            project: None,
-            framework: None,
-            uptime: None,
-        });
-    }
-    new_owned_listeners(project_dir, baseline, descendants)
-        .into_iter()
-        .find(|listener| listener.port == port)
+    new_owned_listener_for_port_from_rows(
+        project_dir,
+        baseline,
+        descendants,
+        port,
+        ports::list_listening_ports(),
+    )
+}
+
+fn new_owned_listener_for_port_from_rows(
+    project_dir: &Path,
+    baseline: &ListenerSnapshot,
+    descendants: &HashSet<u32>,
+    port: u16,
+    rows: impl IntoIterator<Item = ports::ListeningPort>,
+) -> Option<ports::ListeningPort> {
+    rows.into_iter().find(|listener| {
+        listener.port == port && !baseline.contains(listener.port, listener.pid) && {
+            listener.pid.is_some_and(|pid| descendants.contains(&pid))
+                || listener_path_matches_project(listener.cwd.as_deref(), project_dir)
+                || listener_path_matches_project(listener.project_dir.as_deref(), project_dir)
+        }
+    })
 }
 
 /// Extract loopback HTTP and WebSocket targets from one child-output line.
@@ -376,6 +376,21 @@ fn listener_path_matches_project(listener_path: Option<&Path>, project_dir: &Pat
 mod tests {
     use super::*;
 
+    fn listening_port(address: &str, port: u16, pid: u32) -> ports::ListeningPort {
+        ports::ListeningPort {
+            port,
+            address: Some(address.to_string()),
+            pid: Some(pid),
+            process: Some("node".to_string()),
+            command: None,
+            cwd: None,
+            project_dir: None,
+            project: None,
+            framework: None,
+            uptime: None,
+        }
+    }
+
     #[test]
     fn parses_vite_local_url() {
         let targets = parse_local_targets("  ➜  Local:   http://localhost:5173/");
@@ -464,6 +479,64 @@ mod tests {
 
         assert_eq!(result.target.address, IpAddr::V6(Ipv6Addr::LOCALHOST));
         drop(listener);
+    }
+
+    #[test]
+    fn unverified_advertised_url_does_not_hide_the_unique_owned_listener() {
+        let project = tempfile::TempDir::new().unwrap();
+        let owned_port = ports::find_available_port(49000).unwrap();
+        let incidental_port = ports::find_available_port(owned_port.saturating_add(1)).unwrap();
+        let baseline = ListenerSnapshot::capture();
+        let script = "require('http').createServer((_, response) => response.end('ok')).listen(Number(process.argv[1]), '127.0.0.1')";
+        let mut child = std::process::Command::new("node")
+            .args(["-e", script, &owned_port.to_string()])
+            .current_dir(project.path())
+            .spawn()
+            .unwrap();
+        let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+        candidate_tx
+            .send(LocalTarget::loopback(LocalScheme::Http, incidental_port))
+            .unwrap();
+        let child_exited = Arc::new(AtomicBool::new(false));
+
+        let result = resolve_spawned_endpoint(
+            project.path(),
+            child.id(),
+            &baseline,
+            None,
+            &candidate_rx,
+            &child_exited,
+            Duration::from_secs(2),
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(result.unwrap().unwrap().target.port, owned_port);
+    }
+
+    #[test]
+    fn same_port_baseline_owner_does_not_hide_a_new_descendant_listener() {
+        let port = 5173;
+        let baseline = ListenerSnapshot {
+            listeners: HashSet::from([(port, Some(10))]),
+        };
+        let descendants = HashSet::from([20]);
+        let rows = vec![
+            listening_port("127.0.0.1", port, 10),
+            listening_port("::1", port, 20),
+        ];
+
+        let selected = new_owned_listener_for_port_from_rows(
+            Path::new("."),
+            &baseline,
+            &descendants,
+            port,
+            rows,
+        )
+        .unwrap();
+
+        assert_eq!(selected.pid, Some(20));
+        assert_eq!(selected.address.as_deref(), Some("::1"));
     }
 
     #[test]

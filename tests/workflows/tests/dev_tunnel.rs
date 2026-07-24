@@ -7,15 +7,19 @@
 //!   tunnel, dashboard) — only the parse-time / help / error paths are
 //!   testable hermetically.
 //! - `lpm tunnel` opens a network connection to the LPM tunnel
-//!   service. Like dev, only the parse-time paths are workflow-safe.
+//!   service. A local WebSocket relay covers the successful JSON handshake;
+//!   other tests stay on parse-time and local error paths.
 //! - `lpm internal-update-check` is a hidden subcommand that refreshes
 //!   the update cache — exits cleanly even when the network is down,
 //!   since the parent already checked staleness.
 
 mod support;
 
+use futures_util::SinkExt;
 use std::fs;
-use support::{TempProject, lpm};
+use std::time::{Duration, Instant};
+use support::{TempProject, lpm, lpm_spawnable};
+use tokio_tungstenite::tungstenite::Message;
 
 // ─── dev: --help dispatches and exits cleanly ─────────────────────────
 
@@ -89,6 +93,93 @@ fn dev_human_output_suppresses_nested_install_chatter_and_legacy_glyphs() {
     );
 }
 
+#[test]
+fn dev_restart_republishes_the_active_session_with_the_new_listener_owner() {
+    let project = TempProject::empty(r#"{"name":"dev-restart","version":"1.0.0"}"#);
+    project.write_file(
+        "restart-server.js",
+        r#"
+const fs = require("fs");
+const net = require("net");
+const marker = ".first-run-complete";
+const firstRun = !fs.existsSync(marker);
+if (firstRun) fs.writeFileSync(marker, "done");
+const server = net.createServer();
+server.listen(Number(process.env.PORT), "127.0.0.1", () => {
+  setTimeout(() => server.close(() => process.exit(firstRun ? 1 : 0)), 1200);
+});
+"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "web": {
+                    "command": "node restart-server.js",
+                    "primary": true,
+                    "restart": true,
+                    "readyTimeout": 3
+                }
+            }
+        }"#,
+    );
+
+    let child = lpm_spawnable(&project)
+        .args(["dev", "--no-open"])
+        .spawn()
+        .expect("failed to start restartable lpm dev fixture");
+    let sessions_dir = project.home().join(".lpm").join("dev-sessions");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first_owner = None;
+    let mut restarted_owner = None;
+    let mut target_port = None;
+    while Instant::now() < deadline {
+        if let Ok(entries) = fs::read_dir(&sessions_dir) {
+            for entry in entries.flatten() {
+                let Ok(bytes) = fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                let owner = record["ownerPid"].as_u64();
+                let port = record["target"]["port"].as_u64();
+                if first_owner.is_none() {
+                    first_owner = owner;
+                    target_port = port;
+                } else if owner != first_owner {
+                    restarted_owner = owner;
+                    assert_eq!(port, target_port);
+                    break;
+                }
+            }
+        }
+        if restarted_owner.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for restartable lpm dev fixture");
+    assert!(
+        output.status.success(),
+        "restartable lpm dev fixture failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        first_owner.is_some(),
+        "initial active session was not written"
+    );
+    assert!(
+        restarted_owner.is_some(),
+        "active session was not republished with the restarted listener owner:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(first_owner, restarted_owner);
+}
+
 // ─── tunnel: --help dispatches and exits cleanly ──────────────────────
 
 #[test]
@@ -138,6 +229,83 @@ fn tunnel_start_without_auth_under_json_emits_error_envelope_on_stdout() {
     });
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        let (socket, _) = relay.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "hello",
+                    "subdomain": "review-test.lpm.test",
+                    "tunnel_url": "https://review-test.lpm.test",
+                    "session_id": "session-review-test",
+                    "plan": "free",
+                    "base_domain": "lpm.test",
+                    "domain_kind": "random"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+
+    let output = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        lpm(&project)
+            .env("LPM_TUNNEL_RELAY", relay_url)
+            .args([
+                "--token",
+                "workflow-token",
+                "--json",
+                "tunnel",
+                "5173",
+                "--no-inspect",
+            ])
+            .output()
+            .expect("failed to run lpm --json tunnel 5173")
+    })
+    .await
+    .unwrap();
+    relay_task.await.unwrap();
+
+    assert!(
+        output.status.success(),
+        "tunnel command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("{\n  \"success\""),
+        "tunnel JSON must use the pretty JSON formatter, got:\n{stdout}"
+    );
+    let contract: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    insta::assert_json_snapshot!(contract, @r#"
+    {
+      "success": true,
+      "tunnel_url": "https://review-test.lpm.test",
+      "domain": "review-test.lpm.test",
+      "local_port": 5173,
+      "local_url": "http://127.0.0.1:5173/",
+      "session_id": "session-review-test",
+      "plan": "free",
+      "base_domain": "lpm.test",
+      "domain_kind": "random",
+      "session_expires_at": null,
+      "session_max_ms": null,
+      "limits": null,
+      "usage": null,
+      "tunnel_auth": null,
+      "inspector_url": null,
+      "auto_ack": false
+    }
+    "#);
 }
 
 #[test]

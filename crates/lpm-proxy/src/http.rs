@@ -1,5 +1,7 @@
 use super::*;
 
+type SharedUpstream = Arc<RwLock<lpm_common::LocalTarget>>;
+
 #[derive(Clone)]
 pub struct HttpProxyState {
     registry: Arc<tokio::sync::Mutex<RouteRegistry>>,
@@ -8,7 +10,7 @@ pub struct HttpProxyState {
         axum::body::Body,
     >,
     forwarded_proto: &'static str,
-    fallback_upstream: Option<lpm_common::LocalTarget>,
+    fallback_upstream: Option<SharedUpstream>,
 }
 
 impl HttpProxyState {
@@ -32,10 +34,7 @@ impl HttpProxyState {
         }
     }
 
-    pub(crate) fn for_upstream(
-        upstream: lpm_common::LocalTarget,
-        forwarded_proto: &'static str,
-    ) -> Self {
+    pub(crate) fn for_upstream(upstream: SharedUpstream, forwarded_proto: &'static str) -> Self {
         let mut state = Self::with_forwarded_proto(
             Arc::new(tokio::sync::Mutex::new(RouteRegistry::new())),
             forwarded_proto,
@@ -54,6 +53,7 @@ struct HttpRedirectState {
 pub struct HttpProxyHandle {
     pub(crate) addr: SocketAddr,
     pub(crate) shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) upstream: Option<SharedUpstream>,
 }
 
 impl HttpProxyHandle {
@@ -63,6 +63,17 @@ impl HttpProxyHandle {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    pub fn update_upstream(&self, upstream: lpm_common::LocalTarget) -> Result<(), ProxyError> {
+        validate_frontend_upstream(&upstream)?;
+        let target = self.upstream.as_ref().ok_or_else(|| {
+            ProxyError::Http("proxy handle does not have a direct upstream".to_string())
+        })?;
+        *target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = upstream;
+        Ok(())
     }
 
     pub fn shutdown(mut self) {
@@ -116,6 +127,7 @@ pub fn start_http_proxy_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: None,
     })
 }
 
@@ -132,9 +144,10 @@ pub fn start_http_frontend_on_listener(
         .local_addr()
         .map_err(|err| ProxyError::Http(format!("read HTTP frontend bind addr: {err}")))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = Arc::new(RwLock::new(upstream));
     let app = Router::new()
         .fallback(any(proxy_http_request))
-        .with_state(HttpProxyState::for_upstream(upstream, "http"));
+        .with_state(HttpProxyState::for_upstream(Arc::clone(&upstream), "http"));
 
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
@@ -147,6 +160,7 @@ pub fn start_http_frontend_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: Some(upstream),
     })
 }
 
@@ -209,6 +223,7 @@ fn start_http_redirect_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: None,
     })
 }
 
@@ -299,7 +314,14 @@ pub(crate) async fn proxy_http_request_inner(
         .map(|route| {
             lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, route.upstream_port)
         })
-        .or_else(|| state.fallback_upstream.clone());
+        .or_else(|| {
+            state.fallback_upstream.as_ref().map(|upstream| {
+                upstream
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+        });
     let Some(upstream) = upstream else {
         return Err((StatusCode::MISDIRECTED_REQUEST, "unknown local proxy host").into_response());
     };
