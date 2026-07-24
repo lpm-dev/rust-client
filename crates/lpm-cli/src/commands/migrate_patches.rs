@@ -475,6 +475,7 @@ mod tests {
             importers: lpm_lockfile::ImporterSnapshots::new(),
             patches: lpm_lockfile::LockfilePatches::new(),
             catalogs: lpm_lockfile::CatalogSnapshots::new(),
+            provenance: Default::default(),
             packages: packages
                 .iter()
                 .map(|(n, v, integ)| LockedPackage {

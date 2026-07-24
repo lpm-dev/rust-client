@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,17 @@ impl PackageKey {
     /// always has a `<prefix>-<hex>` shape), so it can't collide
     /// with a parsed source.
     pub const UNKNOWN_SOURCE_ID: &'static str = "unknown";
+
+    pub fn lockfile_id(&self) -> String {
+        let mut id =
+            String::with_capacity(self.name.len() + self.version.len() + self.source_id.len() + 2);
+        id.push_str(&self.name);
+        id.push('@');
+        id.push_str(&self.version);
+        id.push('#');
+        id.push_str(&self.source_id);
+        id
+    }
 }
 
 /// Current lockfile schema version.
@@ -81,6 +92,9 @@ impl PackageKey {
 /// - **v6**: per-package `engines.node` constraints. Warm and frozen installs
 ///   can revalidate dependency compatibility when the effective Node.js
 ///   version or `engine-strict` setting changes.
+/// - **v7**: artifact-bound Sigstore provenance evidence. Frozen installs can
+///   replay a previously verified publisher identity without fetching the
+///   attestation again.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -89,7 +103,8 @@ impl PackageKey {
 /// and a fresh resolve runs (which writes a current lockfile, restoring
 /// fast-path eligibility on subsequent installs).
 pub const LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES: u32 = 6;
-pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES;
+pub const LOCKFILE_VERSION_WITH_PROVENANCE: u32 = 7;
+pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_PROVENANCE;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -205,6 +220,23 @@ pub struct LockedRegistrySignature {
     pub sig: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedProvenance {
+    pub snapshot: lpm_common::ProvenanceSnapshot,
+    #[serde(rename = "subject-name")]
+    pub subject_name: String,
+    #[serde(rename = "subject-sha512")]
+    pub subject_sha512: String,
+    #[serde(rename = "integrated-time-secs")]
+    pub integrated_time_secs: u64,
+    #[serde(rename = "log-id")]
+    pub log_id: String,
+    #[serde(rename = "log-index")]
+    pub log_index: i64,
+    #[serde(rename = "bundle-sha256")]
+    pub bundle_sha256: String,
+}
+
 /// The full lockfile structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Lockfile {
@@ -218,6 +250,10 @@ pub struct Lockfile {
     /// Catalog protocol resolutions used by direct dependencies in this lockfile.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalogs: CatalogSnapshots,
+    /// Cryptographically verified provenance evidence, keyed by the
+    /// package's `(name, version, source_id)` identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provenance: BTreeMap<String, LockedProvenance>,
     /// Resolved packages, sorted by name for deterministic output.
     #[serde(default)]
     pub packages: Vec<LockedPackage>,
@@ -537,6 +573,7 @@ impl Lockfile {
             importers: ImporterSnapshots::new(),
             patches: LockfilePatches::new(),
             catalogs: CatalogSnapshots::new(),
+            provenance: BTreeMap::new(),
             packages: Vec::new(),
             root_aliases: BTreeMap::new(),
             // Populated by `install.rs` from
@@ -617,6 +654,123 @@ impl Lockfile {
             })
             .ok()
             .map(|idx| &self.packages[idx])
+    }
+
+    pub fn set_verified_provenance(
+        &mut self,
+        key: &PackageKey,
+        evidence: LockedProvenance,
+    ) -> Option<LockedProvenance> {
+        self.provenance.insert(key.lockfile_id(), evidence)
+    }
+
+    pub fn verified_provenance(&self, key: &PackageKey) -> Option<&LockedProvenance> {
+        self.provenance.get(&key.lockfile_id())
+    }
+
+    pub(crate) fn validate_provenance(&self) -> Result<(), String> {
+        if self.provenance.is_empty() {
+            return Ok(());
+        }
+        let mut packages_by_lockfile_id = HashMap::with_capacity(self.packages.len());
+        for package in &self.packages {
+            packages_by_lockfile_id.insert(package.package_key().lockfile_id(), package);
+        }
+
+        for (lockfile_id, evidence) in &self.provenance {
+            let Some(package) = packages_by_lockfile_id.get(lockfile_id) else {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} does not match any locked package"
+                ));
+            };
+            if !evidence.snapshot.present {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} is marked absent; only verified evidence may be locked"
+                ));
+            }
+            for (field, value) in [
+                ("subject-name", evidence.subject_name.as_str()),
+                ("subject-sha512", evidence.subject_sha512.as_str()),
+                ("log-id", evidence.log_id.as_str()),
+                ("bundle-sha256", evidence.bundle_sha256.as_str()),
+            ] {
+                if value.is_empty() {
+                    return Err(format!(
+                        "provenance entry {lockfile_id:?} has an empty required {field} field"
+                    ));
+                }
+            }
+            for (field, value) in [
+                ("publisher", evidence.snapshot.publisher.as_deref()),
+                ("workflow-path", evidence.snapshot.workflow_path.as_deref()),
+                ("workflow-ref", evidence.snapshot.workflow_ref.as_deref()),
+                (
+                    "attestation-cert-sha256",
+                    evidence.snapshot.attestation_cert_sha256.as_deref(),
+                ),
+            ] {
+                if value == Some("") {
+                    return Err(format!(
+                        "provenance entry {lockfile_id:?} has an empty optional {field} field"
+                    ));
+                }
+            }
+            if evidence.subject_sha512.len() != 128
+                || !evidence
+                    .subject_sha512
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} has an invalid subject-sha512 digest"
+                ));
+            }
+            if evidence.log_index < 0 {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} has an invalid log-index"
+                ));
+            }
+            let Some(bundle_digest) = evidence.bundle_sha256.strip_prefix("sha256-") else {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} has an invalid bundle-sha256 digest"
+                ));
+            };
+            if bundle_digest.len() != 64
+                || !bundle_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} has an invalid bundle-sha256 digest"
+                ));
+            }
+            let expected_subject = lpm_common::npm_package_purl(&package.name, &package.version);
+            if evidence.subject_name != expected_subject {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} is bound to subject {:?}, expected {expected_subject:?}",
+                    evidence.subject_name
+                ));
+            }
+            let integrity = package.integrity.as_deref().ok_or_else(|| {
+                format!(
+                    "provenance entry {lockfile_id:?} cannot be bound because the package has no integrity"
+                )
+            })?;
+            let parsed_integrity = lpm_common::Integrity::parse(integrity).map_err(|error| {
+                format!(
+                    "provenance entry {lockfile_id:?} cannot be bound to invalid package integrity: {error}"
+                )
+            })?;
+            if parsed_integrity.algorithm != lpm_common::integrity::HashAlgorithm::Sha512 {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} requires sha512 package integrity"
+                ));
+            }
+            if evidence.subject_sha512 != hex::encode(parsed_integrity.hash) {
+                return Err(format!(
+                    "provenance entry {lockfile_id:?} subject-sha512 does not match the locked package integrity"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

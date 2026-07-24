@@ -26,14 +26,15 @@ use io::{
 use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY, RELEASE_AGE_KEY,
     RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES, SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES,
-    SIGNATURES_KEY, SIGSTORE_VERIFY_VALUES, TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES,
-    TRUST_POLICY_VALUES, format_bool_enabled, format_current_firewall_mode,
-    format_current_integrity_policy, format_current_lpm_skills, format_current_release_age,
-    format_current_typosquat_guard, parse_config_bool, parse_firewall_mode_selection,
-    parse_integrity_policy_selection, parse_typosquat_guard_selection,
-    persist_firewall_mode_in_config_value, read_auto_install_lpm_skills, read_bool_value,
-    read_firewall_mode, read_integrity_policy, read_release_age_override,
-    read_release_age_policy_override, read_sandbox_mode, read_sigstore_verify, read_string_value,
+    SIGNATURES_KEY, SIGSTORE_AVAILABILITY_VALUES, SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES,
+    TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES, TRUST_POLICY_VALUES, format_bool_enabled,
+    format_current_firewall_mode, format_current_integrity_policy, format_current_lpm_skills,
+    format_current_release_age, format_current_typosquat_guard, parse_config_bool,
+    parse_firewall_mode_selection, parse_integrity_policy_selection,
+    parse_typosquat_guard_selection, persist_firewall_mode_in_config_value,
+    read_auto_install_lpm_skills, read_bool_value, read_firewall_mode, read_integrity_policy,
+    read_release_age_override, read_release_age_policy_override, read_sandbox_mode,
+    read_sigstore_availability, read_sigstore_scope, read_sigstore_verify, read_string_value,
     read_typosquat_guard_override, reject_looser_typosquat_guard_write, run_firewall_wizard,
     run_integrity_wizard, run_lpm_skills_wizard, run_release_age_policy_wizard,
     run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard,
@@ -53,8 +54,8 @@ use wizards::{
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
-/// - `lpm config sigstore` owns `[sigstore] verify = deny | warn | off`
-///   (operator persistent toggle for Sigstore provenance verification).
+/// - `lpm config sigstore` owns verification, package scope, and
+///   attestation-availability policy under `[sigstore]`.
 /// - `lpm config signatures` owns `signatures = true | false`
 ///   (operator persistent toggle for npm registry package signatures).
 /// - `lpm config trust-policy` owns `trust-policy = off | no-downgrade`
@@ -456,7 +457,10 @@ async fn run_guided_config_menu(
             .item(
                 "sigstore",
                 "Sigstore provenance",
-                format!("current: {}", summary.sigstore_verify),
+                format!(
+                    "verify={}, scope={}, availability={}",
+                    summary.sigstore_verify, summary.sigstore_scope, summary.sigstore_availability,
+                ),
             )
             .item(
                 "signatures",
@@ -545,6 +549,8 @@ struct GuidedConfigSummary {
     triage_advisor: String,
     sandbox_mode: String,
     sigstore_verify: String,
+    sigstore_scope: String,
+    sigstore_availability: String,
     signatures: &'static str,
     trust_policy: String,
     typosquat_guard: String,
@@ -571,6 +577,12 @@ fn read_guided_config_summary(
         sigstore_verify: read_sigstore_verify(config_path)?
             .filter(|value| SIGSTORE_VERIFY_VALUES.contains(&value.as_str()))
             .unwrap_or_else(|| "deny".to_string()),
+        sigstore_scope: read_sigstore_scope(config_path)?
+            .filter(|value| SIGSTORE_SCOPE_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "approved".to_string()),
+        sigstore_availability: read_sigstore_availability(config_path)?
+            .filter(|value| SIGSTORE_AVAILABILITY_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "best-effort".to_string()),
         signatures: format_bool_enabled(
             read_bool_value(config_path, SIGNATURES_KEY)?.unwrap_or(false),
         ),

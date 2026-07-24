@@ -2,14 +2,16 @@ use crate::commands::manifest_metadata::{
     ManifestMetadata, extract_manifest_metadata, package_metadata_key, read_json_file,
     read_local_metadata,
 };
-use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
+use crate::commands::registry_reads::{
+    RoutedPackageRef, RoutedReadContext, fetch_routed_package_metadata, prepare_routed_read_context,
+};
 use crate::install_ui;
 use crate::provenance_fetch;
 use clap::ValueEnum;
 use lpm_common::provenance::{ProvenanceSnapshot, ProvenanceStatus};
 use lpm_common::{LpmError, LpmRoot};
 use lpm_lockfile::{LockedPackage, Lockfile};
-use lpm_registry::{PackageMetadata, RegistryClient};
+use lpm_registry::{RegistryClient, UpstreamRoute};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -204,8 +206,13 @@ async fn build_document(
     } else {
         BTreeMap::new()
     };
-    let provenance_metadata =
-        collect_provenance_metadata(&registry_metadata, &lockfile.packages, registry).await?;
+    let provenance_metadata = collect_provenance_metadata(
+        &registry_metadata,
+        &lockfile.packages,
+        &lockfile.provenance,
+        registry,
+    )
+    .await?;
 
     let mut source_index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for package in &lockfile.packages {
@@ -271,6 +278,38 @@ async fn build_document(
 struct RegistryComponentMetadata {
     manifest: ManifestMetadata,
     attestation_ref: Option<lpm_registry::AttestationRef>,
+    registry_url: String,
+}
+
+fn attestation_registry_url(
+    context: &RoutedReadContext,
+    package_name: &str,
+    routed_package: &RoutedPackageRef,
+) -> String {
+    match routed_package {
+        RoutedPackageRef::Lpm(_) => context.client.base_url().to_string(),
+        RoutedPackageRef::Registry(_) => {
+            match context.route_table.route_for_package(package_name) {
+                UpstreamRoute::Custom { target, .. } => target.base_url.as_ref().to_string(),
+                UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => {
+                    context.client.npm_registry_url().to_string()
+                }
+            }
+        }
+    }
+}
+
+fn locked_registry_source(package: &LockedPackage) -> Option<String> {
+    match package.source_kind()? {
+        Ok(lpm_lockfile::Source::Registry { url }) => Some(url),
+        Ok(
+            lpm_lockfile::Source::Tarball { .. }
+            | lpm_lockfile::Source::Directory { .. }
+            | lpm_lockfile::Source::Link { .. }
+            | lpm_lockfile::Source::Git { .. },
+        )
+        | Err(_) => None,
+    }
 }
 
 async fn fetch_registry_metadata(
@@ -278,26 +317,29 @@ async fn fetch_registry_metadata(
     project_dir: &Path,
     packages: &[LockedPackage],
 ) -> Result<BTreeMap<String, RegistryComponentMetadata>, LpmError> {
-    let names = packages
+    let registry_packages = packages
+        .iter()
+        .filter(|package| locked_registry_source(package).is_some())
+        .collect::<Vec<_>>();
+    let names = registry_packages
         .iter()
         .map(|package| package.name.clone())
         .collect::<Vec<_>>();
     let context = prepare_routed_read_context(client, project_dir, &names, true)?;
     let mut by_key = BTreeMap::new();
 
-    let mut fetched: BTreeMap<String, Option<PackageMetadata>> = BTreeMap::new();
-    for package in packages {
+    let mut fetched = BTreeMap::new();
+    for package in registry_packages {
         if !fetched.contains_key(&package.name) {
             let fetched_metadata = fetch_routed_package_metadata(&context, &package.name)
                 .await
-                .ok()
-                .map(|(_, metadata)| metadata);
+                .ok();
             fetched.insert(package.name.clone(), fetched_metadata);
         }
-        let metadata = fetched
+        let Some((routed_package, metadata)) = fetched
             .get(&package.name)
-            .and_then(|metadata| metadata.as_ref());
-        let Some(metadata) = metadata else {
+            .and_then(|metadata| metadata.as_ref())
+        else {
             continue;
         };
         let Some(version) = metadata.versions.get(&package.version) else {
@@ -313,6 +355,7 @@ async fn fetch_registry_metadata(
                     .dist
                     .as_ref()
                     .and_then(|dist| dist.attestations.clone()),
+                registry_url: attestation_registry_url(&context, &package.name, routed_package),
             },
         );
     }
@@ -322,33 +365,41 @@ async fn fetch_registry_metadata(
 async fn collect_provenance_metadata(
     registry_metadata: &BTreeMap<String, RegistryComponentMetadata>,
     packages: &[LockedPackage],
+    locked_provenance: &BTreeMap<String, lpm_lockfile::LockedProvenance>,
     registry: bool,
 ) -> Result<BTreeMap<String, ProvenanceMetadata>, LpmError> {
-    let root = match LpmRoot::from_env() {
-        Ok(root) => root,
-        Err(_) => return Ok(BTreeMap::new()),
-    };
-    let cache_root = root.cache_metadata_attestations();
     let mut out = BTreeMap::new();
 
     if registry {
-        let http = lpm_http::client_builder().build().map_err(|error| {
+        let root = match LpmRoot::from_env() {
+            Ok(root) => root,
+            Err(_) => return Ok(out),
+        };
+        let cache_root = root.cache_metadata_attestations();
+        let http = crate::provenance_bundle::ProvenanceHttpClient::build().map_err(|error| {
             LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
         })?;
         for package in packages {
+            if locked_registry_source(package).is_none() {
+                continue;
+            }
             let key = package_metadata_key(package);
-            let attestation_ref = registry_metadata
-                .get(&key)
-                .and_then(|metadata| metadata.attestation_ref.as_ref());
+            let Some(metadata) = registry_metadata.get(&key) else {
+                continue;
+            };
             let status = provenance_fetch::map_fetch_result_to_status(
                 &package.name,
                 &package.version,
                 provenance_fetch::fetch_provenance_snapshot(
                     &http,
                     &cache_root,
-                    &package.name,
-                    &package.version,
-                    attestation_ref,
+                    provenance_fetch::ProvenanceFetchRequest::new(
+                        &metadata.registry_url,
+                        &package.name,
+                        &package.version,
+                        package.integrity.as_deref(),
+                        metadata.attestation_ref.as_ref(),
+                    ),
                     None,
                 )
                 .await,
@@ -358,11 +409,45 @@ async fn collect_provenance_metadata(
         return Ok(out);
     }
 
+    let mut cache_candidates = Vec::with_capacity(packages.len());
     for package in packages {
+        let Some(registry_source) = locked_registry_source(package) else {
+            continue;
+        };
+        if let Some(evidence) = locked_provenance.get(&package.package_key().lockfile_id()) {
+            crate::provenance_bundle::validate_locked_provenance(
+                &package.name,
+                &package.version,
+                package.integrity.as_deref(),
+                evidence,
+            )?;
+            out.insert(
+                package_metadata_key(package),
+                ProvenanceMetadata {
+                    status: "verified",
+                    snapshot: Some(evidence.snapshot.clone()),
+                    reason: None,
+                },
+            );
+            continue;
+        }
+        cache_candidates.push((package, registry_source));
+    }
+    if cache_candidates.is_empty() {
+        return Ok(out);
+    }
+    let root = match LpmRoot::from_env() {
+        Ok(root) => root,
+        Err(_) => return Ok(out),
+    };
+    let cache_root = root.cache_metadata_attestations();
+    for (package, registry_source) in cache_candidates {
         if let Some(snapshot) = provenance_fetch::read_cached_provenance_snapshot(
             &cache_root,
+            &registry_source,
             &package.name,
             &package.version,
+            package.integrity.as_deref(),
         )? {
             out.insert(
                 package_metadata_key(package),
@@ -865,24 +950,7 @@ fn split_dependency_pin(input: &str) -> Option<(String, String)> {
 }
 
 fn purl_for_package(name: &str, version: &str) -> String {
-    format!(
-        "pkg:npm/{}@{}",
-        encode_purl_name(name),
-        urlencoding::encode(version)
-    )
-}
-
-fn encode_purl_name(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix('@')
-        && let Some((scope, package)) = rest.split_once('/')
-    {
-        return format!(
-            "%40{}/{}",
-            urlencoding::encode(scope),
-            urlencoding::encode(package)
-        );
-    }
-    urlencoding::encode(name).to_string()
+    lpm_common::npm_package_purl(name, version)
 }
 
 fn bom_ref_for_package(package: &LockedPackage) -> String {
@@ -1005,6 +1073,7 @@ fn emit_sbom(value: &Value, output: Option<&Path>) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lpm_registry::{RouteMode, RouteTable};
 
     #[test]
     fn split_dependency_pin_handles_scoped_names() {
@@ -1024,6 +1093,41 @@ mod tests {
         assert_eq!(
             purl_for_package("@scope/pkg", "1.2.3"),
             "pkg:npm/%40scope/pkg@1.2.3"
+        );
+    }
+
+    #[test]
+    fn proxy_routed_npm_metadata_keeps_the_npm_attestation_origin() {
+        let context = RoutedReadContext {
+            client: RegistryClient::new()
+                .with_base_url("https://lpm.example.test")
+                .with_npm_registry_url("https://npm.example.test"),
+            route_table: RouteTable::from_mode_only(RouteMode::Proxy),
+        };
+        let routed = RoutedPackageRef::Registry("axios".to_string());
+
+        assert_eq!(
+            attestation_registry_url(&context, "axios", &routed),
+            "https://npm.example.test"
+        );
+    }
+
+    #[test]
+    fn lpm_metadata_uses_the_lpm_attestation_origin() {
+        let context = RoutedReadContext {
+            client: RegistryClient::new()
+                .with_base_url("https://lpm.example.test")
+                .with_npm_registry_url("https://npm.example.test"),
+            route_table: RouteTable::from_mode_only(RouteMode::Proxy),
+        };
+        let routed = RoutedPackageRef::Lpm(
+            lpm_common::PackageName::parse("@lpm.dev/acme.package")
+                .expect("valid LPM package name"),
+        );
+
+        assert_eq!(
+            attestation_registry_url(&context, "@lpm.dev/acme.package", &routed),
+            "https://lpm.example.test"
         );
     }
 

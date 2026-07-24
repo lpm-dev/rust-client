@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn locked_provenance_name_index_preserves_prefixes_and_scopes() {
+    let evidence = lpm_lockfile::LockedProvenance {
+        snapshot: lpm_common::ProvenanceSnapshot {
+            present: true,
+            ..Default::default()
+        },
+        subject_name: "pkg:npm/foobar@1.0.0".to_string(),
+        subject_sha512: "00".repeat(64),
+        integrated_time_secs: 1,
+        log_id: "log".to_string(),
+        log_index: 1,
+        bundle_sha256: format!("sha256-{}", "00".repeat(32)),
+    };
+    let provenance = std::collections::BTreeMap::from([
+        (
+            "foobar@1.0.0#r-0123456789abcdef".to_string(),
+            evidence.clone(),
+        ),
+        (
+            "@scope/widget@2.0.0#r-fedcba9876543210".to_string(),
+            evidence,
+        ),
+    ]);
+    let names = locked_provenance_names(&provenance);
+
+    assert!(names.contains("foobar"));
+    assert!(names.contains("@scope/widget"));
+    assert!(!names.contains("foo"));
+    assert!(!names.contains("widget"));
+}
+
+#[test]
 fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
     let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
         "name": "fixture",
@@ -481,7 +513,12 @@ fn registry_speculation_key_matches_install_package_key() {
     package.source = "registry+https://registry.npmjs.org".to_string();
 
     assert_eq!(
-        registry_install_pkg_key(&package.name, &package.version, &route_table),
+        registry_install_pkg_key(
+            &package.name,
+            &package.version,
+            &route_table,
+            &RegistryClient::new(),
+        ),
         install_pkg_key(&package)
     );
 }

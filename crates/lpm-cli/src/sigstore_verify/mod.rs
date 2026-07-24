@@ -31,10 +31,10 @@ mod sct;
 mod tests;
 mod trust_root;
 
-pub(crate) use self::bundle::extract_in_toto_subject_digest;
 pub use self::bundle::{
     IdentityExpectations, VerifiedProvenance, VerifyOptions, verify_sigstore_bundle,
 };
+pub(crate) use self::bundle::{extract_in_toto_subject_digest, extract_npm_subject_sha512};
 pub use self::chain::verify_cert_chain;
 pub(crate) use self::dsse::pae;
 pub use self::dsse::verify_dsse;

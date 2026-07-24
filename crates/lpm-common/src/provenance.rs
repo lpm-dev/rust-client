@@ -20,24 +20,21 @@ use serde::{Deserialize, Serialize};
 
 /// Outcome of fetching a single package's provenance bundle.
 ///
-/// Distinguishes the four states the install-time and approve-time
-/// paths must treat differently. introduced the
-/// cryptographic verifier and `LpmError::ProvenanceVerification`,
-/// but the batch caller in `provenance_fetch::fetch_provenance_for_pkgs`
-/// previously collapsed every result through `.ok().flatten()`,
-/// making a verifier rejection indistinguishable from a network
-/// failure. Recording the resulting `provenance_at_approval = None`
-/// would then disarm the drift comparator on every subsequent
-/// install (its `(None, _) => NoDrift` arm). `ProvenanceStatus`
-/// exists so the four states stay distinct end-to-end: the
-/// approval-capture path can refuse to record a binding on
-/// `VerificationRejected`, while still degrading to `NoDrift` on
-/// genuine `TransportDegraded` per the offline contract.
+/// Distinguishes the outcomes the install-time and approve-time
+/// paths must treat differently. The batch caller previously collapsed
+/// every result through `.ok().flatten()`, making a verifier rejection
+/// indistinguishable from a network failure. Recording the resulting
+/// `provenance_at_approval = None` would then disarm the drift comparator
+/// on every subsequent install (its `(None, _) => NoDrift` arm).
+/// `ProvenanceStatus` keeps those states distinct end-to-end so approval
+/// capture can refuse `VerificationRejected` while genuine
+/// `TransportDegraded` remains compatible with the offline contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvenanceStatus {
-    /// Bundle fetched, cryptographically verified, identity bound.
-    /// The contained snapshot has `present == true` and the SAN
-    /// fields populated.
+    /// Bundle fetched, cryptographically verified, and bound to the
+    /// package artifact. The contained snapshot has `present == true`;
+    /// publisher/workflow fields contain the verified certificate
+    /// identity when its SAN uses a recognized shape.
     Verified(ProvenanceSnapshot),
     /// Bundle fetched and identity extracted, but the cryptographic
     /// verifier was bypassed because the operator carved this
@@ -72,15 +69,15 @@ pub enum ProvenanceStatus {
     /// emits `ProvenanceDropped`.
     Absent,
     /// Transient failure post-attempt: network error, oversized body,
-    /// 4xx/5xx, malformed bundle JSON. The fetcher cannot produce a
+    /// or 4xx/5xx response. The fetcher cannot produce a
     /// definitive answer and the drift comparator degrades to
     /// `NoDrift` per the offline-mode contract documented at
     /// `provenance_fetch.rs:20`. The next install retries.
     TransportDegraded,
     /// Bundle was fetched successfully but the cryptographic verifier
-    /// rejected it (DSSE signature, X.509 chain, embedded SCT, Rekor
-    /// body match, Rekor SET, inclusion proof, or identity pin
-    /// failure). This is an attack signal distinct from
+    /// rejected it (bundle structure, DSSE signature, X.509 chain,
+    /// embedded SCT, Rekor body match, Rekor SET, inclusion proof,
+    /// or identity pin failure). This is an attack signal distinct from
     /// `TransportDegraded` — the approval-capture path refuses to
     /// record a binding rather than silently overwriting the prior
     /// `provenance_at_approval` with `None` and disarming the drift
@@ -252,6 +249,27 @@ pub struct ProvenanceSnapshot {
     pub attestation_cert_sha256: Option<String>,
 }
 
+pub fn npm_package_purl(package_name: &str, version: &str) -> String {
+    let encoded_version = urlencoding::encode(version);
+    if let Some((scope, name)) = package_name
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once('/'))
+    {
+        format!(
+            "pkg:npm/%40{}/{}@{}",
+            urlencoding::encode(scope),
+            urlencoding::encode(name),
+            encoded_version
+        )
+    } else {
+        format!(
+            "pkg:npm/{}@{}",
+            urlencoding::encode(package_name),
+            encoded_version
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +303,22 @@ mod tests {
             json, r#"{"present":false}"#,
             "absent snapshot should not emit null keys for optional \
              fields — smaller JSON + less noise in build-state.json"
+        );
+    }
+
+    #[test]
+    fn npm_package_purl_encodes_scoped_package_at_sign() {
+        assert_eq!(
+            npm_package_purl("@scope/pkg", "1.2.3"),
+            "pkg:npm/%40scope/pkg@1.2.3"
+        );
+    }
+
+    #[test]
+    fn npm_package_purl_encodes_version_build_metadata() {
+        assert_eq!(
+            npm_package_purl("pkg", "1.2.3+build.5"),
+            "pkg:npm/pkg@1.2.3%2Bbuild.5"
         );
     }
 

@@ -36,7 +36,7 @@ pub(crate) async fn prepare_npm_target_artifact(
     if let Some(provenance) = input.provenance_context {
         let final_hashes = publish_common::compute_hashes(&tarball_data);
         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
-        let expected_subject = provenance::npm_package_purl(input.npm_name, input.version);
+        let expected_subject = lpm_common::npm_package_purl(input.npm_name, input.version);
 
         match provenance {
             ResolvedProvenance::Generate(context) => {

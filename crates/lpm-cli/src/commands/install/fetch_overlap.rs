@@ -256,7 +256,7 @@ fn dispatch_selected_event(
     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
     stats: &mut FetchOverlapStats,
 ) {
-    let package = install_package_from_selected_event(event, route_table);
+    let package = install_package_from_selected_event(event, route_table, client.as_ref());
     if package.optional {
         stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
         return;
@@ -360,8 +360,9 @@ fn fetch_overlap_should_skip_auth(name: &str, route_table: &RouteTable) -> bool 
 fn install_package_from_selected_event(
     event: lpm_resolver::SelectedPackageEvent,
     route_table: &RouteTable,
+    registry_client: &RegistryClient,
 ) -> InstallPackage {
-    let registry_url = registry_source_url_for(&event.name, route_table);
+    let registry_url = registry_source_url_for(&event.name, route_table, registry_client);
     InstallPackage {
         name: event.name,
         version: event.version,

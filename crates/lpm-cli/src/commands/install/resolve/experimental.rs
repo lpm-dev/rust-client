@@ -296,6 +296,7 @@ pub(in crate::commands::install) async fn run(
                             &mut packages,
                             &node,
                             &route_table,
+                            client.as_ref(),
                             &store,
                             project_dir,
                         );
@@ -890,7 +891,7 @@ async fn compute_parity_if_requested(
             );
             let resolve_result =
                 lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy_roots(
-                    client,
+                    Arc::clone(&client),
                     root_dependencies,
                     override_set,
                     route_table.clone(),
@@ -911,6 +912,7 @@ async fn compute_parity_if_requested(
                 &resolve_result.ambient_peer_installs,
                 &resolve_result.cache,
                 &route_table,
+                client.as_ref(),
                 all_workspace_members,
                 project_dir,
             );

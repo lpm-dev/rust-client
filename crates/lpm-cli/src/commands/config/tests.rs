@@ -91,6 +91,8 @@ fn guided_config_summary_uses_product_defaults_when_unset() {
             triage_advisor: "none".to_string(),
             sandbox_mode: "default".to_string(),
             sigstore_verify: "deny".to_string(),
+            sigstore_scope: "approved".to_string(),
+            sigstore_availability: "best-effort".to_string(),
             signatures: "disabled",
             trust_policy: "off".to_string(),
             typosquat_guard: "default (enabled)".to_string(),
@@ -124,6 +126,8 @@ mode = "strict"
 
 [sigstore]
 verify = "warn"
+scope = "all"
+availability = "strict"
 
 [firewall]
 mode = "enforce"
@@ -140,6 +144,8 @@ mode = "enforce"
             triage_advisor: "codex".to_string(),
             sandbox_mode: "strict".to_string(),
             sigstore_verify: "warn".to_string(),
+            sigstore_scope: "all".to_string(),
+            sigstore_availability: "strict".to_string(),
             signatures: "enabled",
             trust_policy: "no-downgrade".to_string(),
             typosquat_guard: "off".to_string(),
@@ -1018,6 +1024,44 @@ async fn sigstore_wizard_set_persists_each_valid_value() {
             "value '{v}' must round-trip through [sigstore] verify",
         );
     }
+}
+
+#[tokio::test]
+async fn sigstore_wizard_set_persists_scope_and_availability() {
+    let (_dir, path, _env) = tmp_config();
+
+    run_sigstore_wizard(&path, Some("scope=all"), true)
+        .await
+        .unwrap();
+    run_sigstore_wizard(&path, Some("availability=strict"), true)
+        .await
+        .unwrap();
+
+    assert_eq!(read_sigstore_scope(&path).unwrap().as_deref(), Some("all"));
+    assert_eq!(
+        read_sigstore_availability(&path).unwrap().as_deref(),
+        Some("strict")
+    );
+    assert!(
+        read_sigstore_verify(&path).unwrap().is_none(),
+        "setting opt-in scope and availability must not materialize or change verify"
+    );
+}
+
+#[tokio::test]
+async fn sigstore_wizard_set_rejects_invalid_scope_without_mutating_config() {
+    let (_dir, path, _env) = tmp_config();
+
+    let error = run_sigstore_wizard(&path, Some("scope=trusted-ish"), true)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("invalid sigstore scope mode 'trusted-ish'")
+    );
+    assert!(read_sigstore_scope(&path).unwrap().is_none());
 }
 
 /// `--set <unknown>` errors with a message that lists the three

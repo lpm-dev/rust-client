@@ -11,8 +11,8 @@
 //!    `~/.lpm/cache/metadata/attestations/` (7-day TTL). Cache hits
 //!    skip the network round-trip.
 //! 3. On cache miss, we GET the attestation URL, verify the Sigstore
-//!    bundle, extract the verified provenance snapshot, cache it, and
-//!    return a populated [`ProvenanceSnapshot`].
+//!    bundle, extract verified evidence, cache the original bundle
+//!    bytes, and return a populated [`ProvenanceSnapshot`].
 //!
 //! **Fetch-failure semantics**:
 //! - `Ok(Some(snapshot))` — a definitive answer (either
@@ -33,6 +33,7 @@
 //! resolution paths.
 
 use crate::provenance_bundle::{
+    AttestationUrlPolicy, FetchBundleError, NpmArtifactExpectation, ProvenanceHttpClient,
     fetch_bundle_bytes, parse_sigstore_bundle, read_cache, verify_bundle_or_err, write_cache,
 };
 use lpm_common::LpmError;
@@ -159,6 +160,52 @@ pub enum EnforceMode {
     /// consumers can detect the posture-degrade without parsing
     /// log lines.
     Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum VerificationScope {
+    #[default]
+    Approved,
+    All,
+}
+
+impl VerificationScope {
+    pub(crate) fn from_config(value: Option<&str>) -> Result<Self, LpmError> {
+        match value {
+            None | Some("approved") => Ok(Self::Approved),
+            Some("all") => Ok(Self::All),
+            Some(other) => Err(LpmError::Registry(format!(
+                "invalid [sigstore] scope {other:?}; expected approved | all"
+            ))),
+        }
+    }
+
+    pub(crate) fn verifies_all(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum AvailabilityMode {
+    #[default]
+    BestEffort,
+    Strict,
+}
+
+impl AvailabilityMode {
+    pub(crate) fn from_config(value: Option<&str>) -> Result<Self, LpmError> {
+        match value {
+            None | Some("best-effort") => Ok(Self::BestEffort),
+            Some("strict") => Ok(Self::Strict),
+            Some(other) => Err(LpmError::Registry(format!(
+                "invalid [sigstore] availability {other:?}; expected best-effort | strict"
+            ))),
+        }
+    }
+
+    pub(crate) fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
 }
 
 impl EnforceMode {
@@ -483,8 +530,8 @@ impl VerifyPolicy {
 /// - `http_ns` — time inside the HTTP fetch from `send` through the
 ///   final body chunk being buffered. Includes status-check, content-
 ///   length-cap, and stream-cap rejections.
-/// - `parse_ns` — time inside JSON parse + cert lookup + base64
-///   decode + SAN extraction. Pure CPU.
+/// - `verify_ns` — time inside full Sigstore verification and npm
+///   artifact binding. Pure CPU.
 ///
 /// These three cover the dominant cost shapes (warm-cache /
 /// cold-fetch / cold-parse). Other paths (no-URL early return, the
@@ -495,7 +542,7 @@ impl VerifyPolicy {
 pub struct ProvenanceTimings {
     pub cache_hit_ns: AtomicU64,
     pub http_ns: AtomicU64,
-    pub parse_ns: AtomicU64,
+    pub verify_ns: AtomicU64,
     pub cache_hit_count: AtomicU64,
     pub http_count: AtomicU64,
     pub verify_count: AtomicU64,
@@ -506,7 +553,7 @@ pub struct ProvenanceTimings {
 impl ProvenanceTimings {
     fn record_verify(&self, name: &str, version: &str, elapsed: std::time::Duration) {
         let ns = elapsed.as_nanos() as u64;
-        self.parse_ns.fetch_add(ns, Ordering::Relaxed);
+        self.verify_ns.fetch_add(ns, Ordering::Relaxed);
         self.verify_count.fetch_add(1, Ordering::Relaxed);
         let mut current = self.verify_max_ns.load(Ordering::Relaxed);
         while ns > current {
@@ -541,7 +588,7 @@ impl ProvenanceTimings {
                 "count": self.http_count.load(Ordering::Relaxed),
             },
             "verify": {
-                "sum_ms": self.parse_ns.load(Ordering::Relaxed) / 1_000_000,
+                "sum_ms": self.verify_ns.load(Ordering::Relaxed) / 1_000_000,
                 "max_ms": self.verify_max_ns.load(Ordering::Relaxed) / 1_000_000,
                 "count": self.verify_count.load(Ordering::Relaxed),
             },
@@ -573,6 +620,57 @@ struct ProvenancePackageTiming {
     ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing verified evidence would add one allocation per verified package"
+)]
+pub(crate) enum ProvenanceFetch {
+    Verified(lpm_lockfile::LockedProvenance),
+    Absent,
+    TransportDegraded,
+}
+
+impl ProvenanceFetch {
+    fn into_snapshot(self) -> Option<ProvenanceSnapshot> {
+        match self {
+            Self::Verified(evidence) => Some(evidence.snapshot),
+            Self::Absent => Some(ProvenanceSnapshot {
+                present: false,
+                ..Default::default()
+            }),
+            Self::TransportDegraded => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProvenanceFetchRequest<'a> {
+    registry_url: &'a str,
+    name: &'a str,
+    version: &'a str,
+    integrity: Option<&'a str>,
+    attestation_ref: Option<&'a AttestationRef>,
+}
+
+impl<'a> ProvenanceFetchRequest<'a> {
+    pub(crate) fn new(
+        registry_url: &'a str,
+        name: &'a str,
+        version: &'a str,
+        integrity: Option<&'a str>,
+        attestation_ref: Option<&'a AttestationRef>,
+    ) -> Self {
+        Self {
+            registry_url,
+            name,
+            version,
+            integrity,
+            attestation_ref,
+        }
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────
 
 /// Fetch (or read from cache) the `ProvenanceSnapshot` for one
@@ -582,13 +680,29 @@ struct ProvenancePackageTiming {
 /// `None` result to cache — those are always transient and the next
 /// install should retry.
 pub async fn fetch_provenance_snapshot(
-    http: &reqwest::Client,
+    http: &ProvenanceHttpClient,
     cache_root: &Path,
-    name: &str,
-    version: &str,
-    attestation_ref: Option<&AttestationRef>,
+    request: ProvenanceFetchRequest<'_>,
     timings: Option<&ProvenanceTimings>,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    fetch_provenance_evidence(http, cache_root, request, timings)
+        .await
+        .map(ProvenanceFetch::into_snapshot)
+}
+
+pub(crate) async fn fetch_provenance_evidence(
+    http: &ProvenanceHttpClient,
+    cache_root: &Path,
+    request: ProvenanceFetchRequest<'_>,
+    timings: Option<&ProvenanceTimings>,
+) -> Result<ProvenanceFetch, LpmError> {
+    let ProvenanceFetchRequest {
+        registry_url,
+        name,
+        version,
+        integrity,
+        attestation_ref,
+    } = request;
     // Registry said "no attestation for this version" — that is the
     // axios signal. Return a definitive `present: false` snapshot.
     //
@@ -599,12 +713,17 @@ pub async fn fetch_provenance_snapshot(
     let url = match attestation_ref.and_then(|a| a.url.as_deref()) {
         Some(u) => u,
         None => {
-            return Ok(Some(ProvenanceSnapshot {
-                present: false,
-                ..Default::default()
-            }));
+            return Ok(ProvenanceFetch::Absent);
         }
     };
+    let expectation = NpmArtifactExpectation::from_package(name, version, integrity)?;
+    let url_policy = AttestationUrlPolicy::for_registry(registry_url)?;
+    let validated_url = url_policy.validate(url).map_err(|error| match error {
+        FetchBundleError::Policy(reason) => LpmError::ProvenanceVerification(reason),
+        FetchBundleError::Transport => {
+            LpmError::ProvenanceVerification("attestation URL validation failed".into())
+        }
+    })?;
 
     // Cache hit + fresh → skip the network round-trip. Time only the
     // hit case: misses fall through and their downstream fetch is
@@ -612,23 +731,32 @@ pub async fn fetch_provenance_snapshot(
     // is bounded small and intentionally not split out (see
     // [`ProvenanceTimings`] doc).
     let cache_start = Instant::now();
-    if let Some(cached) = read_cache(cache_root, name, version)? {
+    if let Some(cached) = read_cache(
+        cache_root,
+        url_policy.registry_source(),
+        name,
+        version,
+        &expectation,
+    )? {
         if let Some(t) = timings {
             t.cache_hit_ns
                 .fetch_add(cache_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             t.cache_hit_count.fetch_add(1, Ordering::Relaxed);
         }
-        return Ok(Some(cached));
+        return Ok(ProvenanceFetch::Verified(cached));
     }
 
-    // Cache miss → fetch (network) + parse (CPU), timed separately so
+    // Cache miss → fetch (network) + verify (CPU), timed separately so
     // the perf decomposition can attribute cold-install cost. Any
     // error from either stage degrades to `Ok(None)` and is NOT
     // cached — the next install retries.
     let http_start = Instant::now();
-    let buf = match fetch_bundle_bytes(http, url).await {
+    let buf = match fetch_bundle_bytes(http, validated_url, &url_policy).await {
         Ok(b) => b,
-        Err(()) => return Ok(None),
+        Err(FetchBundleError::Transport) => return Ok(ProvenanceFetch::TransportDegraded),
+        Err(FetchBundleError::Policy(reason)) => {
+            return Err(LpmError::ProvenanceVerification(reason));
+        }
     };
     if let Some(t) = timings {
         t.http_ns
@@ -641,31 +769,54 @@ pub async fn fetch_provenance_snapshot(
     // it represents an attack signal (registry served a bundle that
     // claimed signed provenance but failed crypto). Transport-class
     // failures are already absorbed above at `fetch_bundle_bytes`.
-    let parse_start = Instant::now();
-    let snapshot = verify_bundle_or_err(&buf, url)?;
+    let verify_start = Instant::now();
+    let evidence = verify_bundle_or_err(&buf, url, &expectation)?;
     if let Some(t) = timings {
-        t.record_verify(name, version, parse_start.elapsed());
+        t.record_verify(name, version, verify_start.elapsed());
     }
 
-    // Successful parse — cache it and return. Cache-write failures
+    // Successful verification — cache it and return. Cache-write failures
     // are logged but not propagated: the snapshot is already
     // computed and usable; future invalidation is at worst one
     // extra fetch.
-    if let Err(e) = write_cache(cache_root, name, version, &snapshot) {
+    if let Err(e) = write_cache(
+        cache_root,
+        url_policy.registry_source(),
+        name,
+        version,
+        &buf,
+    ) {
         tracing::warn!(
             "provenance cache write failed for {name}@{version}: {e}; \
              continuing with fresh snapshot"
         );
     }
-    Ok(Some(snapshot))
+    Ok(ProvenanceFetch::Verified(evidence))
 }
 
+/// Read optional cached provenance for non-install enrichment.
+///
+/// Evidence is omitted when the package integrity cannot bind it to an exact
+/// artifact. Cache I/O failures still propagate after a valid binding exists.
 pub(crate) fn read_cached_provenance_snapshot(
     cache_root: &Path,
+    registry_url: &str,
     name: &str,
     version: &str,
+    integrity: Option<&str>,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    read_cache(cache_root, name, version)
+    let Ok(expectation) = NpmArtifactExpectation::from_package(name, version, integrity) else {
+        return Ok(None);
+    };
+    let url_policy = AttestationUrlPolicy::for_registry(registry_url)?;
+    read_cache(
+        cache_root,
+        url_policy.registry_source(),
+        name,
+        version,
+        &expectation,
+    )
+    .map(|entry| entry.map(|evidence| evidence.snapshot))
 }
 
 /// Map one [`fetch_provenance_snapshot`] outcome to a
@@ -774,7 +925,7 @@ pub async fn fetch_provenance_for_pkgs(
                 .collect();
         }
     };
-    let http = match lpm_http::client_builder().build() {
+    let http = match ProvenanceHttpClient::build() {
         Ok(client) => client,
         Err(_) => {
             return pkgs
@@ -793,19 +944,30 @@ pub async fn fetch_provenance_for_pkgs(
     let futures = pkgs.iter().map(move |(name, version)| async move {
         // lpm vs npm dispatch by name prefix mirrors
         // `install.rs::build_blocked_set_metadata`.
-        let meta = if name.starts_with("@lpm.dev/") {
+        let (meta, registry_url) = if name.starts_with("@lpm.dev/") {
             match lpm_common::PackageName::parse(name) {
-                Ok(pkg_name) => registry_ref.get_package_metadata(&pkg_name).await.ok(),
-                Err(_) => None,
+                Ok(pkg_name) => (
+                    registry_ref.get_package_metadata(&pkg_name).await.ok(),
+                    registry_ref.base_url(),
+                ),
+                Err(_) => (None, registry_ref.base_url()),
             }
         } else {
-            registry_ref.get_npm_package_metadata(name).await.ok()
+            (
+                registry_ref.get_npm_package_metadata(name).await.ok(),
+                registry_ref.npm_registry_url(),
+            )
         };
         let attestation_ref = meta
             .as_ref()
             .and_then(|m| m.versions.get(version))
             .and_then(|v| v.dist.as_ref())
             .and_then(|d| d.attestations.clone());
+        let integrity = meta
+            .as_ref()
+            .and_then(|m| m.versions.get(version))
+            .and_then(lpm_registry::VersionMetadata::integrity_or_shasum)
+            .map(std::borrow::Cow::into_owned);
 
         // Skip path: operator opted out of cryptographic
         // verification for this name (CLI flag) OR fleet-wide
@@ -815,8 +977,14 @@ pub async fn fetch_provenance_for_pkgs(
         // downgrade explicitly instead of falsely claiming
         // verification.
         if verify_policy_ref.should_skip_verification_for(name) {
-            let raw =
-                fetch_unverified_snapshot(http_ref, name, version, attestation_ref.as_ref()).await;
+            let raw = fetch_unverified_snapshot(
+                http_ref,
+                registry_url,
+                name,
+                version,
+                attestation_ref.as_ref(),
+            )
+            .await;
             let status = relabel_skip_status_for_enforce_mode(raw, verify_policy_ref.enforce);
             return ((name.clone(), version.clone()), status);
         }
@@ -824,9 +992,13 @@ pub async fn fetch_provenance_for_pkgs(
         let raw = fetch_provenance_snapshot(
             http_ref,
             cache_root_ref,
-            name,
-            version,
-            attestation_ref.as_ref(),
+            ProvenanceFetchRequest::new(
+                registry_url,
+                name,
+                version,
+                integrity.as_deref(),
+                attestation_ref.as_ref(),
+            ),
             None,
         )
         .await;
@@ -894,9 +1066,8 @@ pub(crate) fn relabel_skip_status_for_enforce_mode(
 /// malformed bundle means we observed nothing; the drift comparator's
 /// `(_, None) => NoDrift` arm then absorbs it.
 ///
-/// Cache-bypass on purpose: cached entries are
-/// `CACHE_SCHEMA_VERSION = 2` and were written by the verifier path
-/// (`Verified` semantics). Reading them on the skip path would
+/// Cache-bypass on purpose: cached entries contain raw bundles written
+/// by the verifier path. Reading them on the skip path would
 /// silently upgrade an Unverified observation to "the operator opted
 /// out, but the cache says it was verified yesterday" — confusing
 /// the audit trail. The skip path is rare; the extra fetch is fine.
@@ -904,7 +1075,8 @@ pub(crate) fn relabel_skip_status_for_enforce_mode(
 /// must not be allowed to short-circuit through an entry that bypassed
 /// crypto.
 pub async fn fetch_unverified_snapshot(
-    http: &reqwest::Client,
+    http: &ProvenanceHttpClient,
+    registry_url: &str,
     name: &str,
     version: &str,
     attestation_ref: Option<&AttestationRef>,
@@ -921,9 +1093,27 @@ pub async fn fetch_unverified_snapshot(
             return ProvenanceStatus::Absent;
         }
     };
-    let buf = match fetch_bundle_bytes(http, url).await {
+    let url_policy = match AttestationUrlPolicy::for_registry(registry_url) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return ProvenanceStatus::VerificationRejected {
+                reason: error.to_string(),
+            };
+        }
+    };
+    let validated_url = match url_policy.validate(url) {
+        Ok(url) => url,
+        Err(FetchBundleError::Transport) => return ProvenanceStatus::TransportDegraded,
+        Err(FetchBundleError::Policy(reason)) => {
+            return ProvenanceStatus::VerificationRejected { reason };
+        }
+    };
+    let buf = match fetch_bundle_bytes(http, validated_url, &url_policy).await {
         Ok(b) => b,
-        Err(()) => return ProvenanceStatus::TransportDegraded,
+        Err(FetchBundleError::Transport) => return ProvenanceStatus::TransportDegraded,
+        Err(FetchBundleError::Policy(reason)) => {
+            return ProvenanceStatus::VerificationRejected { reason };
+        }
     };
     match parse_sigstore_bundle(&buf) {
         Ok(snap) => {
@@ -952,6 +1142,39 @@ pub async fn fetch_unverified_snapshot(
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+
+    const TEST_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    const AXIOS_1_14_0_INTEGRITY: &str = "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==";
+
+    #[test]
+    fn provenance_config_defaults_preserve_approved_best_effort_behavior() {
+        assert_eq!(
+            VerificationScope::from_config(None).unwrap(),
+            VerificationScope::Approved
+        );
+        assert_eq!(
+            AvailabilityMode::from_config(None).unwrap(),
+            AvailabilityMode::BestEffort
+        );
+    }
+
+    #[test]
+    fn provenance_config_accepts_opt_in_all_and_strict_modes() {
+        assert_eq!(
+            VerificationScope::from_config(Some("all")).unwrap(),
+            VerificationScope::All
+        );
+        assert_eq!(
+            AvailabilityMode::from_config(Some("strict")).unwrap(),
+            AvailabilityMode::Strict
+        );
+    }
+
+    #[test]
+    fn provenance_config_rejects_unknown_scope_and_availability() {
+        assert!(VerificationScope::from_config(Some("everything")).is_err());
+        assert!(AvailabilityMode::from_config(Some("required-ish")).is_err());
+    }
 
     // ── DriftIgnorePolicy::from_cli ─────────────────────────────
 
@@ -1283,14 +1506,49 @@ mod tests {
         })
     }
 
-    fn fresh_snapshot() -> ProvenanceSnapshot {
-        ProvenanceSnapshot {
-            present: true,
-            publisher: Some("github:axios/axios".into()),
-            workflow_path: Some(".github/workflows/publish.yml".into()),
-            workflow_ref: Some("refs/tags/v1.14.0".into()),
-            attestation_cert_sha256: Some("sha256-abc".into()),
-        }
+    #[test]
+    fn cached_snapshot_is_omitted_when_integrity_is_missing() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = read_cached_provenance_snapshot(
+            cache.path(),
+            "https://registry.example.test",
+            "pkg",
+            "1.0.0",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, None);
+    }
+
+    #[test]
+    fn cached_snapshot_is_omitted_when_integrity_is_malformed() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = read_cached_provenance_snapshot(
+            cache.path(),
+            "https://registry.example.test",
+            "pkg",
+            "1.0.0",
+            Some("not-an-integrity"),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, None);
+    }
+
+    #[test]
+    fn cached_snapshot_is_omitted_when_integrity_is_not_sha512() {
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = read_cached_provenance_snapshot(
+            cache.path(),
+            "https://registry.example.test",
+            "pkg",
+            "1.0.0",
+            Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, None);
     }
 
     // ── fetch_provenance_snapshot (public API) — non-network paths ──
@@ -1301,11 +1559,22 @@ mod tests {
     #[tokio::test]
     async fn fetch_returns_absent_snapshot_when_ref_is_none() {
         let cache = tempfile::tempdir().unwrap();
-        let http = reqwest::Client::new();
-        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", None, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let http = ProvenanceHttpClient::build().unwrap();
+        let snap = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                "https://registry.example.test",
+                "pkg",
+                "1.0.0",
+                None,
+                None,
+            ),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!snap.present);
         assert!(snap.publisher.is_none());
         assert!(snap.workflow_path.is_none());
@@ -1314,8 +1583,10 @@ mod tests {
         // Absent snapshots are returned in-memory only. A cached
         // "absent" marker would be unused while metadata still has no
         // URL, and stale if a later release adds an attestation URL.
-        let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
-        assert_eq!(cached, None, "absent snapshot must not be cached");
+        assert!(
+            std::fs::read_dir(cache.path()).unwrap().next().is_none(),
+            "absent snapshot must not be cached"
+        );
     }
 
     /// `attestation_ref.url = None` is semantically the same as
@@ -1323,15 +1594,26 @@ mod tests {
     #[tokio::test]
     async fn fetch_returns_absent_snapshot_when_url_is_none() {
         let cache = tempfile::tempdir().unwrap();
-        let http = reqwest::Client::new();
+        let http = ProvenanceHttpClient::build().unwrap();
         let att = AttestationRef {
             url: None,
             provenance: None,
         };
-        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
-            .await
-            .unwrap()
-            .unwrap();
+        let snap = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                "https://registry.example.test",
+                "pkg",
+                "1.0.0",
+                None,
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!snap.present);
     }
 
@@ -1342,22 +1624,173 @@ mod tests {
     #[tokio::test]
     async fn fetch_uses_cache_hit_without_network_roundtrip() {
         let cache = tempfile::tempdir().unwrap();
-        let pre = fresh_snapshot();
-        write_cache(cache.path(), "pkg", "1.0.0", &pre).unwrap();
+        let registry_url = "http://localhost:1";
+        let url_policy = AttestationUrlPolicy::for_registry(registry_url).unwrap();
+        write_cache(
+            cache.path(),
+            url_policy.registry_source(),
+            "axios",
+            "1.14.0",
+            include_bytes!("../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"),
+        )
+        .unwrap();
 
         let att = AttestationRef {
             url: Some("http://localhost:1/definitely-unreachable".into()),
             provenance: None,
         };
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(1))
-            .build()
-            .unwrap();
-        let snap = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(snap, pre, "cache hit must not perform an HTTP request");
+        let http = ProvenanceHttpClient::build().unwrap();
+        let snap = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                registry_url,
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            snap.publisher.as_deref(),
+            Some("github:axios/axios"),
+            "cache hit must reverify the authentic bundle without an HTTP request"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_from_one_registry_cannot_satisfy_another_registry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry_a = MockServer::start().await;
+        let registry_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .expect(1)
+            .mount(&registry_a)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.2",
+                "verificationMaterial": {}
+            })))
+            .expect(1)
+            .mount(&registry_b)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let http = ProvenanceHttpClient::build().unwrap();
+        let registry_a_attestation = AttestationRef {
+            url: Some(format!("{}/att", registry_a.uri())),
+            provenance: None,
+        };
+        let first = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry_a.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&registry_a_attestation),
+            ),
+            None,
+        )
+        .await
+        .expect("registry A evidence must verify");
+        assert!(first.is_some());
+
+        let registry_b_attestation = AttestationRef {
+            url: Some(format!("{}/att", registry_b.uri())),
+            provenance: None,
+        };
+        let result = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry_b.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&registry_b_attestation),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(LpmError::ProvenanceVerification(_))),
+            "registry B must fetch and verify its own evidence, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_bypass_current_attestation_url_policy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .expect(1)
+            .mount(&registry)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let http = ProvenanceHttpClient::build().unwrap();
+        let valid_attestation = AttestationRef {
+            url: Some(format!("{}/att", registry.uri())),
+            provenance: None,
+        };
+        fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&valid_attestation),
+            ),
+            None,
+        )
+        .await
+        .expect("initial evidence must verify");
+
+        let cross_origin_attestation = AttestationRef {
+            url: Some("https://attacker.example/att".to_string()),
+            provenance: None,
+        };
+        let result = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&cross_origin_attestation),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(LpmError::ProvenanceVerification(_))),
+            "the current registry's attestation URL policy must run before cache acceptance"
+        );
     }
 
     /// A structurally present but unverifiable bundle surfaces as a
@@ -1399,10 +1832,21 @@ mod tests {
             url: Some(format!("{}/att", server.uri())),
             provenance: None,
         };
-        let http = reqwest::Client::new();
-        let err = fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
-            .await
-            .expect_err("unverifiable bundle must surface as ProvenanceVerification error");
+        let http = ProvenanceHttpClient::build().unwrap();
+        let err = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &server.uri(),
+                "pkg",
+                "1.0.0",
+                Some(TEST_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .expect_err("unverifiable bundle must surface as ProvenanceVerification error");
         match err {
             LpmError::ProvenanceVerification(msg) => {
                 // Diagnostic must name a verify-side concern, not a
@@ -1420,8 +1864,185 @@ mod tests {
         // Cache MUST stay empty — we do not persist verification
         // failures (registry might be transiently compromised; the
         // next install retries with a fresh fetch).
-        let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
-        assert_eq!(cached, None, "verification failure must not be cached");
+        assert!(
+            std::fs::read_dir(cache.path()).unwrap().next().is_none(),
+            "verification failure must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_valid_attestation_for_different_package() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let att = AttestationRef {
+            url: Some(format!("{}/att", server.uri())),
+            provenance: None,
+        };
+        let http = ProvenanceHttpClient::build().unwrap();
+        let err = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &server.uri(),
+                "not-axios",
+                "9.9.9",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a valid bundle for another package must be rejected");
+
+        assert!(
+            matches!(err, LpmError::ProvenanceVerification(_)),
+            "subject mismatch must be a provenance verification error, got: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_valid_attestation_for_different_tarball_digest() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .mount(&server)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let att = AttestationRef {
+            url: Some(format!("{}/att", server.uri())),
+            provenance: None,
+        };
+        let http = ProvenanceHttpClient::build().unwrap();
+        let err = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &server.uri(),
+                "axios",
+                "1.14.0",
+                Some(TEST_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a valid bundle for different tarball bytes must be rejected");
+
+        assert!(
+            matches!(err, LpmError::ProvenanceVerification(_)),
+            "digest mismatch must be a provenance verification error, got: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_attestation_redirect_to_different_origin() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(include_bytes!(
+                "../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json"
+            )))
+            .mount(&target)
+            .await;
+
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/att", target.uri())),
+            )
+            .mount(&registry)
+            .await;
+
+        let cache = tempfile::tempdir().unwrap();
+        let att = AttestationRef {
+            url: Some(format!("{}/redirect", registry.uri())),
+            provenance: None,
+        };
+        let http = ProvenanceHttpClient::build().unwrap();
+        let err = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .expect_err("an attestation redirect must not change network origin");
+
+        assert!(
+            matches!(err, LpmError::ProvenanceVerification(_)),
+            "cross-origin redirect must be a provenance verification error, got: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_cross_origin_attestation_url_without_requesting_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/att"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&target)
+            .await;
+        let registry = MockServer::start().await;
+        let cache = tempfile::tempdir().unwrap();
+        let att = AttestationRef {
+            url: Some(format!("{}/att", target.uri())),
+            provenance: None,
+        };
+        let http = ProvenanceHttpClient::build().unwrap();
+
+        let err = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &registry.uri(),
+                "axios",
+                "1.14.0",
+                Some(AXIOS_1_14_0_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .expect_err("an attestation URL from another origin must be rejected");
+
+        assert!(
+            matches!(err, LpmError::ProvenanceVerification(_)),
+            "cross-origin URL must be a provenance verification error, got: {err:?}",
+        );
+        target.verify().await;
     }
 
     /// Skip-list pin: `fetch_unverified_snapshot` must succeed on
@@ -1453,13 +2074,14 @@ mod tests {
             url: Some(format!("{}/att", server.uri())),
             provenance: None,
         };
-        let http = reqwest::Client::new();
+        let http = ProvenanceHttpClient::build().unwrap();
 
         // Same bundle that the verifier rejects via
         // `fetch_provenance_snapshot` (see the test above) — but the
         // skip-list path bypasses the verifier and lands on Unverified
         // with the identity intact.
-        let status = fetch_unverified_snapshot(&http, "axios", "1.14.1", Some(&att)).await;
+        let status =
+            fetch_unverified_snapshot(&http, &server.uri(), "axios", "1.14.1", Some(&att)).await;
         match status {
             ProvenanceStatus::Unverified(snap) => {
                 assert!(snap.present, "unverified snapshot must be present:true");
@@ -1487,8 +2109,15 @@ mod tests {
     /// direction).
     #[tokio::test]
     async fn fetch_unverified_snapshot_returns_absent_when_url_missing() {
-        let http = reqwest::Client::new();
-        let status = fetch_unverified_snapshot(&http, "no-prov", "1.0.0", None).await;
+        let http = ProvenanceHttpClient::build().unwrap();
+        let status = fetch_unverified_snapshot(
+            &http,
+            "https://registry.example.test",
+            "no-prov",
+            "1.0.0",
+            None,
+        )
+        .await;
         assert!(
             matches!(status, ProvenanceStatus::Absent),
             "skip-list with no attestation URL must record Absent, got: {status:?}",
@@ -1600,14 +2229,21 @@ mod tests {
             url: Some("http://127.0.0.1:1/never-listens".into()),
             provenance: None,
         };
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(1))
-            .build()
-            .unwrap();
-        let result =
-            fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
-                .await
-                .unwrap();
+        let http = ProvenanceHttpClient::build().unwrap();
+        let result = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                "http://127.0.0.1:1",
+                "pkg",
+                "1.0.0",
+                Some(TEST_INTEGRITY),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result, None,
             "network failure must degrade to unknown (Ok(None))"
@@ -1616,8 +2252,10 @@ mod tests {
         // Most importantly: the failure must not have written a
         // stub entry to cache. The drift-rule contract depends on
         // `None` never being persisted.
-        let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
-        assert_eq!(cached, None, "network failure must not be cached");
+        assert!(
+            std::fs::read_dir(cache.path()).unwrap().next().is_none(),
+            "network failure must not be cached"
+        );
     }
 
     // ── map_fetch_result_to_status ──────

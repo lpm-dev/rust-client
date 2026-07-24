@@ -124,6 +124,20 @@ impl GlobalConfig {
         }
     }
 
+    pub fn get_sigstore_scope(&self) -> Option<String> {
+        self.get_table("sigstore")?
+            .get("scope")?
+            .as_str()
+            .map(String::from)
+    }
+
+    pub fn get_sigstore_availability(&self) -> Option<String> {
+        self.get_table("sigstore")?
+            .get("availability")?
+            .as_str()
+            .map(String::from)
+    }
+
     pub fn get_trust_policy(&self) -> Option<String> {
         let raw = self.get_str(TRUST_POLICY_KEY)?.to_string();
         match raw.as_str() {

@@ -151,6 +151,8 @@ pub(super) struct OnlineLockfileWritePhaseInput<'a> {
     pub(super) applied_overrides: &'a [OverrideHit],
     pub(super) current_lockfile_patches: &'a lpm_lockfile::LockfilePatches,
     pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
+    pub(super) verified_provenance:
+        &'a std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
     pub(super) frozen_lockfile_active: bool,
     pub(super) fast_path_lockfile: Option<lpm_lockfile::Lockfile>,
     pub(super) fresh_urls: &'a HashMap<String, String>,
@@ -238,6 +240,7 @@ fn fresh_resolved_lockfile(
     lockfile.catalogs =
         catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, &persisted_packages)?;
     lockfile.patches = input.current_lockfile_patches.clone();
+    lockfile.provenance = input.verified_provenance.clone();
     lockfile
         .importers
         .insert(".".to_string(), input.current_importer_snapshot.clone());
@@ -2034,6 +2037,7 @@ pub(super) fn resolved_to_install_packages(
     // exactly this reason; without route-awareness here, the type
     // system's granularity wasn't reaching the install pipeline.
     route_table: &RouteTable,
+    registry_client: &RegistryClient,
 ) -> Vec<InstallPackage> {
     // Targets the root either declares directly OR reaches via an
     // npm-alias: each such target's (any version's) resolved package
@@ -2139,10 +2143,10 @@ pub(super) fn resolved_to_install_packages(
                 .map(|dist| (dist.signatures.clone(), dist.published_at.clone()))
                 .unwrap_or_default();
             let is_lpm = r.package.is_lpm();
-            // (reviewed): derive the wire-format source
-            // string from the active route table, so a `.npmrc`-mapped
+            // Derive the wire-format source string from the active
+            // route table, so a `.npmrc`-mapped
             // private mirror gets filed under its real URL.
-            let registry_url = registry_source_url_for(&name, route_table);
+            let registry_url = registry_source_url_for(&name, route_table, registry_client);
             let source = format!("registry+{registry_url}");
             let root_link_names = root_link_map.get(&rlk(&name, &version)).cloned();
             let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
@@ -2182,6 +2186,7 @@ pub(super) fn resolved_to_install_packages_with_workspace_members(
     ambient_peer_installs: &[String],
     resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     route_table: &RouteTable,
+    registry_client: &RegistryClient,
     all_workspace_members: &[WorkspaceMemberLink],
     project_dir: &Path,
 ) -> Vec<InstallPackage> {
@@ -2192,6 +2197,7 @@ pub(super) fn resolved_to_install_packages_with_workspace_members(
         ambient_peer_installs,
         resolver_cache,
         route_table,
+        registry_client,
     );
     rewrite_workspace_resolved_sources(&mut packages, all_workspace_members, project_dir);
     packages

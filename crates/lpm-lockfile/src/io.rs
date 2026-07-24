@@ -13,6 +13,8 @@ impl Lockfile {
     /// [`Lockfile::from_toml`]'s reader gate; together they make a
     /// bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
+        self.validate_provenance()
+            .map_err(LockfileError::Serialize)?;
         for pkg in &self.packages {
             if !pkg.tarball_field_hint_is_consistent() {
                 return Err(LockfileError::InvalidTarballHint {
@@ -94,6 +96,9 @@ impl Lockfile {
             }
         }
 
+        lockfile
+            .validate_provenance()
+            .map_err(LockfileError::Deserialize)?;
         Ok(lockfile)
     }
 

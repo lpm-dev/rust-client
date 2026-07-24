@@ -1,6 +1,39 @@
 use super::prelude::*;
 
 pub(in crate::commands::config) const SIGSTORE_VERIFY_VALUES: &[&str] = &["deny", "warn", "off"];
+pub(in crate::commands::config) const SIGSTORE_SCOPE_VALUES: &[&str] = &["approved", "all"];
+pub(in crate::commands::config) const SIGSTORE_AVAILABILITY_VALUES: &[&str] =
+    &["best-effort", "strict"];
+
+#[derive(Clone, Copy)]
+enum SigstoreSetting {
+    Verify,
+    Scope,
+    Availability,
+}
+
+impl SigstoreSetting {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::Scope => "scope",
+            Self::Availability => "availability",
+        }
+    }
+
+    fn values(self) -> &'static [&'static str] {
+        match self {
+            Self::Verify => SIGSTORE_VERIFY_VALUES,
+            Self::Scope => SIGSTORE_SCOPE_VALUES,
+            Self::Availability => SIGSTORE_AVAILABILITY_VALUES,
+        }
+    }
+}
+
+struct SigstoreAssignment<'a> {
+    setting: SigstoreSetting,
+    value: &'a str,
+}
 
 pub(in crate::commands::config) async fn run_sigstore_wizard(
     config_path: &std::path::Path,
@@ -9,55 +42,58 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
 ) -> Result<(), LpmError> {
     let existing_cfg = read_config(config_path)?;
     let global = global_config_view_from_value(&existing_cfg);
-    if let Some(v) = set {
-        if !SIGSTORE_VERIFY_VALUES.contains(&v) {
-            return Err(LpmError::Registry(format!(
-                "invalid sigstore verify mode '{v}'; must be one of: {}",
-                SIGSTORE_VERIFY_VALUES.join(" | ")
-            )));
-        }
-        let requested = parse_sigstore_enforce_mode(v)?;
-        crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
-        crate::security_approval::authorize_persistent_sigstore(
-            requested,
-            json_output,
-            &format!("lpm config sigstore --set {v}"),
-        )?;
-        persist_sigstore_verify(config_path, v)?;
-        announce_sigstore_set(v, json_output);
+    if let Some(raw) = set {
+        let assignment = parse_sigstore_assignment(raw)?;
+        authorize_sigstore_assignment(&global, assignment.setting, assignment.value, json_output)?;
+        persist_sigstore_value(config_path, assignment.setting.key(), assignment.value)?;
+        announce_sigstore_set(assignment.setting.key(), assignment.value, json_output);
         return Ok(());
     }
 
     if !std::io::stdin().is_terminal() {
         return Err(LpmError::Registry(
-            "lpm config sigstore requires a TTY; use `--set deny|warn|off` instead".to_string(),
+            "lpm config sigstore requires a TTY; use `--set deny|warn|off`, \
+             `--set scope=approved|all`, or \
+             `--set availability=best-effort|strict` instead"
+                .to_string(),
         ));
     }
 
-    let current = read_sigstore_verify(config_path)?.unwrap_or_else(|| "deny".to_string());
+    let current_verify = read_sigstore_verify(config_path)?.unwrap_or_else(|| "deny".to_string());
+    let current_scope = read_sigstore_scope(config_path)?.unwrap_or_else(|| "approved".to_string());
+    let current_availability =
+        read_sigstore_availability(config_path)?.unwrap_or_else(|| "best-effort".to_string());
     println!();
-    println!("  current: {}", current.cyan());
-    let new_value: &str =
-        cliclack::select("How should LPM handle Sigstore provenance verification?")
-            .item(
-                "deny",
-                "deny — verify every attestation, fail-closed on errors",
-                "recommended",
-            )
-            .item("warn", "warn — verify, but only log on failure", "degraded")
-            .item(
-                "off",
-                "off  — skip verification entirely",
-                "NOT recommended",
-            )
-            .initial_value(current.as_str())
-            .interact()
-            .map_err(prompt_err)?;
+    println!(
+        "  current: verify={}, scope={}, availability={}",
+        current_verify.cyan(),
+        current_scope.cyan(),
+        current_availability.cyan(),
+    );
+    let setting = match cliclack::select("Which Sigstore setting do you want to change?")
+        .item("verify", "Verification failures", current_verify.as_str())
+        .item("scope", "Packages to verify", current_scope.as_str())
+        .item(
+            "availability",
+            "Missing or unreachable attestations",
+            current_availability.as_str(),
+        )
+        .interact()
+        .map_err(prompt_err)?
+    {
+        "verify" => SigstoreSetting::Verify,
+        "scope" => SigstoreSetting::Scope,
+        "availability" => SigstoreSetting::Availability,
+        _ => unreachable!("sigstore setting selector returned an unknown value"),
+    };
 
-    // Confirm when the user picks `off` in the interactive wizard.
-    // The `--set off` form trusts the operator (no TTY check); only
-    // the wizard prompts. Matches the sandbox=none confirm shape.
-    if new_value == "off" {
+    let new_value = select_sigstore_value(
+        setting,
+        &current_verify,
+        &current_scope,
+        &current_availability,
+    )?;
+    if matches!(setting, SigstoreSetting::Verify) && new_value == "off" {
         println!();
         println!(
             "  {}: setting sigstore.verify = {} means every Sigstore attestation \
@@ -81,16 +117,99 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
         }
     }
 
-    let requested = parse_sigstore_enforce_mode(new_value)?;
-    crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
+    authorize_sigstore_assignment(&global, setting, new_value, json_output)?;
+    persist_sigstore_value(config_path, setting.key(), new_value)?;
+    announce_sigstore_set(setting.key(), new_value, json_output);
+    Ok(())
+}
+
+fn select_sigstore_value<'a>(
+    setting: SigstoreSetting,
+    current_verify: &'a str,
+    current_scope: &'a str,
+    current_availability: &'a str,
+) -> Result<&'a str, LpmError> {
+    match setting {
+        SigstoreSetting::Verify => {
+            cliclack::select("How should LPM handle Sigstore verification failures?")
+                .item(
+                    "deny",
+                    "deny — reject attestations that fail verification",
+                    "recommended",
+                )
+                .item("warn", "warn — log verification failures", "degraded")
+                .item("off", "off — skip verification entirely", "NOT recommended")
+                .initial_value(current_verify)
+                .interact()
+                .map_err(prompt_err)
+        }
+        SigstoreSetting::Scope => cliclack::select("Which packages should LPM verify?")
+            .item(
+                "approved",
+                "approved — packages with an existing rich-trust binding",
+                "default",
+            )
+            .item("all", "all — every registry package", "stricter opt-in")
+            .initial_value(current_scope)
+            .interact()
+            .map_err(prompt_err),
+        SigstoreSetting::Availability => {
+            cliclack::select("How should unavailable attestations be handled?")
+                .item(
+                    "best-effort",
+                    "best-effort — tolerate missing or unreachable attestations",
+                    "default",
+                )
+                .item(
+                    "strict",
+                    "strict — require attestation evidence in the selected scope",
+                    "stricter opt-in",
+                )
+                .initial_value(current_availability)
+                .interact()
+                .map_err(prompt_err)
+        }
+    }
+}
+
+fn parse_sigstore_assignment(raw: &str) -> Result<SigstoreAssignment<'_>, LpmError> {
+    let (setting, value) = match raw.split_once('=') {
+        Some(("verify", value)) => (SigstoreSetting::Verify, value),
+        Some(("scope", value)) => (SigstoreSetting::Scope, value),
+        Some(("availability", value)) => (SigstoreSetting::Availability, value),
+        Some((key, _)) => {
+            return Err(LpmError::Registry(format!(
+                "invalid sigstore setting '{key}'; expected verify, scope, or availability"
+            )));
+        }
+        None => (SigstoreSetting::Verify, raw),
+    };
+    if !setting.values().contains(&value) {
+        return Err(LpmError::Registry(format!(
+            "invalid sigstore {} mode '{value}'; must be one of: {}",
+            setting.key(),
+            setting.values().join(" | ")
+        )));
+    }
+    Ok(SigstoreAssignment { setting, value })
+}
+
+fn authorize_sigstore_assignment(
+    global: &GlobalConfig,
+    setting: SigstoreSetting,
+    value: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if !matches!(setting, SigstoreSetting::Verify) {
+        return Ok(());
+    }
+    let requested = parse_sigstore_enforce_mode(value)?;
+    crate::security_floor::reject_looser_sigstore_write(global, requested)?;
     crate::security_approval::authorize_persistent_sigstore(
         requested,
         json_output,
-        &format!("lpm config sigstore --set {new_value}"),
-    )?;
-    persist_sigstore_verify(config_path, new_value)?;
-    announce_sigstore_set(new_value, json_output);
-    Ok(())
+        &format!("lpm config sigstore --set {value}"),
+    )
 }
 
 pub(in crate::commands::config) fn parse_sigstore_enforce_mode(
@@ -106,20 +225,40 @@ pub(in crate::commands::config) fn parse_sigstore_enforce_mode(
     }
 }
 
-pub(in crate::commands::config) fn read_sigstore_verify(
+fn read_sigstore_value(
     config_path: &std::path::Path,
+    key: &str,
 ) -> Result<Option<String>, LpmError> {
     let cfg = read_config(config_path)?;
     Ok(cfg
         .get("sigstore")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get("verify"))
-        .and_then(|v| v.as_str())
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_str)
         .map(String::from))
 }
 
-pub(in crate::commands::config) fn persist_sigstore_verify(
+pub(in crate::commands::config) fn read_sigstore_verify(
     config_path: &std::path::Path,
+) -> Result<Option<String>, LpmError> {
+    read_sigstore_value(config_path, "verify")
+}
+
+pub(in crate::commands::config) fn read_sigstore_scope(
+    config_path: &std::path::Path,
+) -> Result<Option<String>, LpmError> {
+    read_sigstore_value(config_path, "scope")
+}
+
+pub(in crate::commands::config) fn read_sigstore_availability(
+    config_path: &std::path::Path,
+) -> Result<Option<String>, LpmError> {
+    read_sigstore_value(config_path, "availability")
+}
+
+fn persist_sigstore_value(
+    config_path: &std::path::Path,
+    key: &str,
     value: &str,
 ) -> Result<(), LpmError> {
     let mut cfg = read_config(config_path)?;
@@ -135,23 +274,28 @@ pub(in crate::commands::config) fn persist_sigstore_verify(
             config_path.display(),
         ))
     })?;
-    sigstore_table.insert("verify".to_string(), toml::Value::String(value.to_string()));
+    sigstore_table.insert(key.to_string(), toml::Value::String(value.to_string()));
     write_config(config_path, &cfg)
 }
 
-pub(in crate::commands::config) fn announce_sigstore_set(value: &str, json_output: bool) {
+pub(in crate::commands::config) fn announce_sigstore_set(
+    key: &str,
+    value: &str,
+    json_output: bool,
+) {
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "success": true,
-                "sigstore": { "verify": value },
+                "sigstore": { (key): value },
             }))
             .unwrap()
         );
     } else {
         install_ui::done_line(crate::install_ui::terminal_line!(
-            "Set [sigstore] verify = {}",
+            "Set [sigstore] {} = {}",
+            key,
             install_ui::bold(value),
         ));
     }

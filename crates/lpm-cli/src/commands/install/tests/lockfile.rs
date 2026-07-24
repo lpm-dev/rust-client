@@ -114,6 +114,7 @@ fn resolved_to_install_packages_dedups_p4_split_duplicates() {
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     assert_eq!(
@@ -210,7 +211,7 @@ fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
 fn fresh_lockfiles_use_current_schema_version() {
     assert_eq!(
         lpm_lockfile::LOCKFILE_VERSION,
-        lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
+        lpm_lockfile::LOCKFILE_VERSION_WITH_PROVENANCE
     );
     let lf = lpm_lockfile::Lockfile::new();
     assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
@@ -234,6 +235,7 @@ fn resolved_to_install_packages_keeps_distinct_versions() {
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     assert_eq!(installed.len(), 2, "distinct versions must be preserved");
@@ -263,6 +265,7 @@ fn resolved_to_install_packages_keeps_direct_root_link_when_ambient_peer_has_sam
         &ambient_peer_installs,
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     let direct = installed
@@ -303,6 +306,7 @@ fn resolved_to_install_packages_prefers_unscoped_root_candidate_for_non_semver_d
         &[],
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     let direct = installed
@@ -343,6 +347,7 @@ fn resolved_to_install_packages_dedups_preserves_first_order() {
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     assert_eq!(installed.len(), 1);
@@ -360,7 +365,7 @@ fn resolved_to_install_packages_dedups_preserves_first_order() {
 fn registry_source_url_for_uses_lpm_dev_for_lpm_scope() {
     let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
     assert_eq!(
-        registry_source_url_for("@lpm.dev/foo.bar", &route_table),
+        registry_source_url_for("@lpm.dev/foo.bar", &route_table, &RegistryClient::new()),
         "https://lpm.dev"
     );
 }
@@ -369,8 +374,39 @@ fn registry_source_url_for_uses_lpm_dev_for_lpm_scope() {
 fn registry_source_url_for_uses_npmjs_default_for_unscoped() {
     let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
     assert_eq!(
-        registry_source_url_for("react", &route_table),
+        registry_source_url_for("react", &route_table, &RegistryClient::new()),
         "https://registry.npmjs.org"
+    );
+}
+
+#[test]
+fn registry_source_url_for_uses_active_client_origins() {
+    let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.internal.example/api")
+        .with_npm_registry_url("https://npm.internal.example");
+
+    assert_eq!(
+        registry_source_url_for("@lpm.dev/foo.bar", &route_table, &client),
+        "https://lpm.internal.example/api"
+    );
+    assert_eq!(
+        registry_source_url_for("react", &route_table, &client),
+        "https://npm.internal.example"
+    );
+}
+
+#[test]
+fn registry_source_url_for_treats_worker_proxy_as_npm_transport() {
+    let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.internal.example")
+        .with_npm_registry_url("https://npm.internal.example");
+
+    assert_eq!(
+        registry_source_url_for("react", &route_table, &client),
+        "https://npm.internal.example",
+        "the Worker proxy and its direct fallback are transports for one logical npm source"
     );
 }
 
@@ -387,6 +423,7 @@ fn resolved_to_install_packages_uses_lpm_dev_for_lpm_scope() {
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     assert_eq!(installed.len(), 1);
@@ -407,6 +444,7 @@ fn resolved_to_install_packages_default_npmjs_for_non_lpm_no_npmrc() {
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     assert_eq!(installed.len(), 1);
@@ -466,6 +504,7 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
         &[],
         &resolver_cache,
         &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        &RegistryClient::new(),
     );
 
     assert_eq!(installed.len(), 1);
@@ -499,6 +538,7 @@ fn resolved_to_install_packages_uses_npmrc_override_when_present() {
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
         &route_table,
+        &RegistryClient::new(),
     );
 
     assert_eq!(installed.len(), 1);

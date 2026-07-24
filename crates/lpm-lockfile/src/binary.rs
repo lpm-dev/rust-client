@@ -1,10 +1,10 @@
 //! Binary lockfile format (`lpm.lockb`) for generated cache validation.
 //!
-//! Layout (v2):
+//! Layout (v3):
 //! ```text
 //! [Header: 16 bytes]
 //!   magic:              [u8; 4]  = b"LPMB"
-//!   version:            u32 LE   = 2
+//!   version:            u32 LE   = 3
 //!   package_count:      u32 LE
 //!   string_table_off:   u32 LE   — byte offset where string table starts
 //!
@@ -25,6 +25,16 @@
 //! [DepsEntry × total_deps: 6 bytes each]
 //!   str_off:            u32 LE   — offset into string table
 //!   str_len:            u16 LE
+//!
+//! [ProvenanceEntry × M: 68 bytes each] (v3+; sparse)
+//!   package_index:       u32 LE
+//!   evidence:            8 × (u32 offset, u16 length)
+//!   integrated_time:     u64 LE
+//!   rekor_log_index:     i64 LE
+//!
+//! [ProvenanceFooter: 8 bytes] (v3+)
+//!   magic:               [u8; 4] = b"PRV3"
+//!   evidence_count:      u32 LE
 //!
 //! [String table: packed UTF-8]
 //! ```
@@ -57,16 +67,18 @@ use crate::{LockedPackage, Lockfile, LockfileError};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"LPMB";
-/// Binary lockfile wire-format version. Bumped 1 → 2 when the
-/// `(tarball_off, tarball_len)` pair was appended to every
-/// `PackageEntry` (see layout docstring above). `pub` so
+const PROVENANCE_MAGIC: &[u8; 4] = b"PRV3";
+/// Binary lockfile wire-format version. v3 adds a sparse artifact-bound
+/// provenance section. `pub` so
 /// install writeback can report the generated binary format version.
-pub const BINARY_VERSION: u32 = 2;
+pub const BINARY_VERSION: u32 = 3;
 const HEADER_SIZE: usize = 16;
-/// Per-package entry size. v1 was 30 bytes; v2 adds 6 bytes
-/// (u32 tarball_off + u16 tarball_len).
+/// v3 keeps the v2 per-package layout so packages without provenance
+/// pay no per-entry size penalty.
 const ENTRY_SIZE: usize = 36;
 const DEP_ENTRY_SIZE: usize = 6;
+const PROVENANCE_ENTRY_SIZE: usize = 68;
+const PROVENANCE_FOOTER_SIZE: usize = 8;
 
 /// Binary lockfile filename.
 pub const BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
@@ -91,6 +103,22 @@ fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
         .try_into()
         .expect("read_u16_le: caller validated 2-byte window");
     u16::from_le_bytes(chunk)
+}
+
+#[inline]
+fn read_u64_le(bytes: &[u8], off: usize) -> u64 {
+    let chunk: [u8; 8] = bytes[off..off + 8]
+        .try_into()
+        .expect("read_u64_le: caller validated 8-byte window");
+    u64::from_le_bytes(chunk)
+}
+
+#[inline]
+fn read_i64_le(bytes: &[u8], off: usize) -> i64 {
+    let chunk: [u8; 8] = bytes[off..off + 8]
+        .try_into()
+        .expect("read_i64_le: caller validated 8-byte window");
+    i64::from_le_bytes(chunk)
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────────
@@ -160,6 +188,9 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
                 .to_string(),
         ));
     }
+    lockfile
+        .validate_provenance()
+        .map_err(LockfileError::Serialize)?;
 
     let mut strings = StringTable::new();
     let mut dep_entries: Vec<(u32, u16)> = Vec::new();
@@ -178,9 +209,31 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         tarball: (u32, u16),
     }
 
-    let mut pkg_infos = Vec::with_capacity(lockfile.packages.len());
+    struct ProvenanceInfo {
+        package_index: u32,
+        publisher: (u32, u16),
+        workflow_path: (u32, u16),
+        workflow_ref: (u32, u16),
+        cert_sha256: (u32, u16),
+        subject_name: (u32, u16),
+        subject_sha512: (u32, u16),
+        log_id: (u32, u16),
+        bundle_sha256: (u32, u16),
+        integrated_time_secs: u64,
+        log_index: i64,
+    }
 
-    for pkg in &lockfile.packages {
+    let mut pkg_infos = Vec::with_capacity(lockfile.packages.len());
+    let mut provenance_infos = Vec::with_capacity(lockfile.provenance.len());
+
+    if lockfile.packages.len() > u32::MAX as usize {
+        return Err(LockfileError::Serialize(format!(
+            "too many packages for binary lockfile (max {})",
+            u32::MAX
+        )));
+    }
+
+    for (package_index, pkg) in lockfile.packages.iter().enumerate() {
         let name = strings.insert(&pkg.name)?;
         let version = strings.insert(&pkg.version)?;
         let source = insert_optional(&mut strings, pkg.source.as_deref(), "source", &pkg.name)?;
@@ -191,6 +244,41 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
             &pkg.name,
         )?;
         let tarball = insert_optional(&mut strings, pkg.tarball.as_deref(), "tarball", &pkg.name)?;
+        if let Some(evidence) = lockfile.verified_provenance(&pkg.package_key()) {
+            provenance_infos.push(ProvenanceInfo {
+                package_index: package_index as u32,
+                publisher: insert_optional(
+                    &mut strings,
+                    evidence.snapshot.publisher.as_deref(),
+                    "provenance publisher",
+                    &pkg.name,
+                )?,
+                workflow_path: insert_optional(
+                    &mut strings,
+                    evidence.snapshot.workflow_path.as_deref(),
+                    "provenance workflow path",
+                    &pkg.name,
+                )?,
+                workflow_ref: insert_optional(
+                    &mut strings,
+                    evidence.snapshot.workflow_ref.as_deref(),
+                    "provenance workflow ref",
+                    &pkg.name,
+                )?,
+                cert_sha256: insert_optional(
+                    &mut strings,
+                    evidence.snapshot.attestation_cert_sha256.as_deref(),
+                    "provenance certificate digest",
+                    &pkg.name,
+                )?,
+                subject_name: strings.insert(&evidence.subject_name)?,
+                subject_sha512: strings.insert(&evidence.subject_sha512)?,
+                log_id: strings.insert(&evidence.log_id)?,
+                bundle_sha256: strings.insert(&evidence.bundle_sha256)?,
+                integrated_time_secs: evidence.integrated_time_secs,
+                log_index: evidence.log_index,
+            });
+        }
 
         let new_total = dep_entries.len() + pkg.dependencies.len();
         if new_total > u32::MAX as usize {
@@ -226,16 +314,31 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         });
     }
 
-    if lockfile.packages.len() > u32::MAX as usize {
-        return Err(LockfileError::Serialize(format!(
-            "too many packages for binary lockfile (max {})",
-            u32::MAX
-        )));
-    }
-
     let pkg_count = lockfile.packages.len();
     let deps_section_offset = HEADER_SIZE + pkg_count * ENTRY_SIZE;
-    let string_table_offset = deps_section_offset + dep_entries.len() * DEP_ENTRY_SIZE;
+    let provenance_section_offset = deps_section_offset + dep_entries.len() * DEP_ENTRY_SIZE;
+    let provenance_entries_len = provenance_infos
+        .len()
+        .checked_mul(PROVENANCE_ENTRY_SIZE)
+        .ok_or_else(|| {
+            LockfileError::Serialize("provenance section size exceeds platform limits".to_string())
+        })?;
+    let string_table_offset = provenance_section_offset
+        .checked_add(provenance_entries_len)
+        .and_then(|offset| offset.checked_add(PROVENANCE_FOOTER_SIZE))
+        .ok_or_else(|| {
+            LockfileError::Serialize("binary lockfile section layout overflows".to_string())
+        })?;
+    if string_table_offset > u32::MAX as usize {
+        return Err(LockfileError::Serialize(
+            "binary lockfile section layout exceeds 32-bit offsets".to_string(),
+        ));
+    }
+    if provenance_infos.len() > u32::MAX as usize {
+        return Err(LockfileError::Serialize(
+            "too many provenance entries for binary lockfile".to_string(),
+        ));
+    }
 
     let total_size = string_table_offset + strings.data.len();
     let mut buf = Vec::with_capacity(total_size);
@@ -268,6 +371,27 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
         buf.extend_from_slice(&off.to_le_bytes());
         buf.extend_from_slice(&len.to_le_bytes());
     }
+
+    for provenance in &provenance_infos {
+        buf.extend_from_slice(&provenance.package_index.to_le_bytes());
+        for (off, len) in [
+            provenance.publisher,
+            provenance.workflow_path,
+            provenance.workflow_ref,
+            provenance.cert_sha256,
+            provenance.subject_name,
+            provenance.subject_sha512,
+            provenance.log_id,
+            provenance.bundle_sha256,
+        ] {
+            buf.extend_from_slice(&off.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+        }
+        buf.extend_from_slice(&provenance.integrated_time_secs.to_le_bytes());
+        buf.extend_from_slice(&provenance.log_index.to_le_bytes());
+    }
+    buf.extend_from_slice(PROVENANCE_MAGIC);
+    buf.extend_from_slice(&(provenance_infos.len() as u32).to_le_bytes());
 
     // String table
     buf.extend_from_slice(&strings.data);
@@ -333,11 +457,11 @@ impl BinaryLockfileReader {
         let version = read_u32_le(&mmap, 4);
         // Strict version match — not `version > BINARY_VERSION`.
         // Per-entry layout differs across versions (v1 = 30B,
-        // v2 = 36B), so decoding a v1 file as v2 (or vice versa)
-        // produces garbage. `read_fast` catches this error and
-        // falls through to TOML; the next `write_all` rewrites
-        // `lpm.lockb` at the current version, completing the
-        // migration transparently.
+        // v2/v3 = 36B), and v3 adds a sparse section plus footer.
+        // Decoding under the wrong version produces garbage.
+        // `read_fast` catches this error and falls through to TOML;
+        // the next `write_all` rewrites `lpm.lockb` at the current
+        // version, completing the migration transparently.
         if version != BINARY_VERSION {
             return Err(LockfileError::UnsupportedVersion {
                 found: version,
@@ -372,7 +496,37 @@ impl BinaryLockfileReader {
             ));
         }
 
-        let deps_section_len = string_table_off - entries_end;
+        let footer_start = string_table_off
+            .checked_sub(PROVENANCE_FOOTER_SIZE)
+            .ok_or_else(|| {
+                LockfileError::Deserialize("binary lockfile has no provenance footer".into())
+            })?;
+        if footer_start < entries_end {
+            return Err(LockfileError::Deserialize(
+                "package entries overlap with provenance footer".into(),
+            ));
+        }
+        if &mmap[footer_start..footer_start + 4] != PROVENANCE_MAGIC {
+            return Err(LockfileError::Deserialize(
+                "invalid binary provenance footer magic".into(),
+            ));
+        }
+        let provenance_count = read_u32_le(&mmap, footer_start + 4) as usize;
+        let provenance_section_len = provenance_count
+            .checked_mul(PROVENANCE_ENTRY_SIZE)
+            .ok_or_else(|| {
+                LockfileError::Deserialize("provenance entry count overflows layout".into())
+            })?;
+        let provenance_section_start = footer_start
+            .checked_sub(provenance_section_len)
+            .filter(|start| *start >= entries_end)
+            .ok_or_else(|| {
+                LockfileError::Deserialize(
+                    "provenance section overlaps package entries or exceeds file".into(),
+                )
+            })?;
+
+        let deps_section_len = provenance_section_start - entries_end;
         if !deps_section_len.is_multiple_of(DEP_ENTRY_SIZE) {
             return Err(LockfileError::Deserialize(
                 "dependency table is not aligned to entry size".into(),
@@ -431,8 +585,8 @@ impl BinaryLockfileReader {
                 }
             }
 
-            // M68: eagerly validate name / version / source /
-            // integrity ranges so a crafted `lpm.lockb` can't
+            // Eagerly validate name / version / source / integrity
+            // ranges so a crafted `lpm.lockb` can't
             // silently surface `Some("")` for any of them via
             // `read_str`'s OOB fallback. Per the lockfile contract:
             //   - `name` / `version` MUST be non-empty (every
@@ -489,6 +643,53 @@ impl BinaryLockfileReader {
             }
         }
 
+        let mut previous_package_index = None;
+        for record_index in 0..provenance_count {
+            let base = provenance_section_start + record_index * PROVENANCE_ENTRY_SIZE;
+            let package_index = read_u32_le(&mmap, base) as usize;
+            if package_index >= pkg_count {
+                return Err(LockfileError::Deserialize(
+                    "provenance entry references a package outside the package table".into(),
+                ));
+            }
+            if previous_package_index.is_some_and(|previous| package_index <= previous) {
+                return Err(LockfileError::Deserialize(
+                    "provenance entries must reference unique packages in ascending order".into(),
+                ));
+            }
+            previous_package_index = Some(package_index);
+
+            for (field, slot, required) in [
+                ("provenance publisher", 4usize, false),
+                ("provenance workflow path", 10, false),
+                ("provenance workflow ref", 16, false),
+                ("provenance certificate digest", 22, false),
+                ("provenance subject name", 28, true),
+                ("provenance subject sha512", 34, true),
+                ("provenance log id", 40, true),
+                ("provenance bundle sha256", 46, true),
+            ] {
+                let off = read_u32_le(&mmap, base + slot) as usize;
+                let len = read_u16_le(&mmap, base + slot + 4) as usize;
+                if len == 0 {
+                    if off != 0 || required {
+                        return Err(LockfileError::Deserialize(format!(
+                            "provenance entry has invalid {field} slot"
+                        )));
+                    }
+                    continue;
+                }
+                let end = off.checked_add(len).ok_or_else(|| {
+                    LockfileError::Deserialize(format!("{field} range overflows string table"))
+                })?;
+                if end > string_table_len {
+                    return Err(LockfileError::Deserialize(format!(
+                        "{field} range extends past string table"
+                    )));
+                }
+            }
+        }
+
         Ok(Some(Self { mmap }))
     }
 
@@ -498,6 +699,19 @@ impl BinaryLockfileReader {
 
     fn string_table_off(&self) -> usize {
         read_u32_le(&self.mmap, 12) as usize
+    }
+
+    fn provenance_count(&self) -> usize {
+        read_u32_le(
+            &self.mmap,
+            self.string_table_off() - PROVENANCE_FOOTER_SIZE + 4,
+        ) as usize
+    }
+
+    fn provenance_section_start(&self) -> usize {
+        self.string_table_off()
+            - PROVENANCE_FOOTER_SIZE
+            - self.provenance_count() * PROVENANCE_ENTRY_SIZE
     }
 
     fn read_str(&self, off: u32, len: u16) -> &str {
@@ -550,6 +764,45 @@ impl BinaryLockfileReader {
             tarball_off: read_u32_le(b, 30),
             tarball_len: read_u16_le(b, 34),
         })
+    }
+
+    fn provenance_at(&self, idx: usize) -> Option<(usize, crate::LockedProvenance)> {
+        if idx >= self.provenance_count() {
+            return None;
+        }
+        let base = self
+            .provenance_section_start()
+            .checked_add(idx.checked_mul(PROVENANCE_ENTRY_SIZE)?)?;
+        let end = base.checked_add(PROVENANCE_ENTRY_SIZE)?;
+        if end > self.string_table_off() {
+            return None;
+        }
+        let bytes = &self.mmap[base..end];
+        let slot = |offset| (read_u32_le(bytes, offset), read_u16_le(bytes, offset + 4));
+        let optional_str = |value: (u32, u16)| {
+            (value != (0, 0)).then(|| self.read_str(value.0, value.1).to_string())
+        };
+        let required_str =
+            |offset| self.read_str(read_u32_le(bytes, offset), read_u16_le(bytes, offset + 4));
+
+        Some((
+            read_u32_le(bytes, 0) as usize,
+            crate::LockedProvenance {
+                snapshot: lpm_common::ProvenanceSnapshot {
+                    present: true,
+                    publisher: optional_str(slot(4)),
+                    workflow_path: optional_str(slot(10)),
+                    workflow_ref: optional_str(slot(16)),
+                    attestation_cert_sha256: optional_str(slot(22)),
+                },
+                subject_name: required_str(28).to_string(),
+                subject_sha512: required_str(34).to_string(),
+                integrated_time_secs: read_u64_le(bytes, 52),
+                log_id: required_str(40).to_string(),
+                log_index: read_i64_le(bytes, 60),
+                bundle_sha256: required_str(46).to_string(),
+            },
+        ))
     }
 
     /// Binary search for a package by name. O(log n), zero-copy.
@@ -632,7 +885,19 @@ impl BinaryLockfileReader {
             }
         }
         crate::Lockfile::validate_loaded_packages(&packages)?;
-        Ok(Lockfile {
+        let mut provenance = std::collections::BTreeMap::new();
+        for record_index in 0..self.provenance_count() {
+            let (package_index, evidence) = self.provenance_at(record_index).ok_or_else(|| {
+                LockfileError::Deserialize(
+                    "validated provenance record could not be decoded".into(),
+                )
+            })?;
+            provenance.insert(
+                packages[package_index].package_key().lockfile_id(),
+                evidence,
+            );
+        }
+        let lockfile = Lockfile {
             metadata: crate::LockfileMetadata {
                 lockfile_version: crate::LOCKFILE_VERSION,
                 resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
@@ -641,6 +906,7 @@ impl BinaryLockfileReader {
             importers: crate::ImporterSnapshots::new(),
             patches: crate::LockfilePatches::new(),
             catalogs: crate::CatalogSnapshots::new(),
+            provenance,
             packages,
             // The binary format cannot represent alias metadata; any
             // project with aliases skips the binary write (see
@@ -653,7 +919,11 @@ impl BinaryLockfileReader {
             // `to_lockfile()` we'd reach is for a binary-representable
             // lockfile, which by construction has no ambient peers.
             ambient_peer_installs: Vec::new(),
-        })
+        };
+        lockfile
+            .validate_provenance()
+            .map_err(LockfileError::Deserialize)?;
+        Ok(lockfile)
     }
 
     /// Number of packages in the lockfile.
@@ -725,7 +995,7 @@ impl<'a> PackageEntryView<'a> {
 
     pub fn dependencies(&self) -> Vec<&'a str> {
         let deps_section_start = HEADER_SIZE + self.reader.pkg_count() as usize * ENTRY_SIZE;
-        let string_table_off = self.reader.string_table_off();
+        let provenance_section_start = self.reader.provenance_section_start();
         let mmap_len = self.reader.mmap.len();
         let mut deps = Vec::with_capacity(self.deps_count as usize);
         for i in 0..self.deps_count as usize {
@@ -745,7 +1015,7 @@ impl<'a> PackageEntryView<'a> {
                 Some(v) => v,
                 None => break,
             };
-            if base_end > string_table_off || base_end > mmap_len {
+            if base_end > provenance_section_start || base_end > mmap_len {
                 break;
             }
             let b = &self.reader.mmap[base..base + DEP_ENTRY_SIZE];
@@ -1766,14 +2036,12 @@ mod tests {
         );
     }
 
-    // ── Binary v2: tarball URL round-trip ─────────────────────────────────
+    // ── Binary v3: sparse provenance with v2-sized package entries ─────────
 
     #[test]
-    fn entry_size_is_36_bytes() {
-        // Wire-format invariant: v2 entries are 36 bytes (v1 was 30).
-        // Guards against accidentally mis-sizing the writer/reader.
-        assert_eq!(ENTRY_SIZE, 36, "v2 entry size must be 36 bytes");
-        assert_eq!(BINARY_VERSION, 2, "current BINARY_VERSION must be 2");
+    fn package_entry_size_remains_36_bytes_with_sparse_provenance() {
+        assert_eq!(ENTRY_SIZE, 36, "package entry size must remain 36 bytes");
+        assert_eq!(BINARY_VERSION, 3, "current BINARY_VERSION must be 3");
     }
 
     #[test]
@@ -1995,15 +2263,15 @@ mod tests {
     }
 
     #[test]
-    fn v2_reader_rejects_future_version_3() {
-        // Forward-incompat — a hypothetical v3 file must be rejected
-        // by today's v2 reader (strict match, not `<= max`).
+    fn v3_reader_rejects_future_version_4() {
+        // Forward-incompat — a hypothetical v4 file must be rejected
+        // by today's v3 reader (strict match, not `<= max`).
         let mut binary = sample_binary();
-        binary[4..8].copy_from_slice(&3u32.to_le_bytes());
+        binary[4..8].copy_from_slice(&4u32.to_le_bytes());
         let (_dir, result) = open_bytes(&binary);
         match result {
-            Err(LockfileError::UnsupportedVersion { found: 3, .. }) => {}
-            other => panic!("expected UnsupportedVersion with found=3, got: {other:?}"),
+            Err(LockfileError::UnsupportedVersion { found: 4, .. }) => {}
+            other => panic!("expected UnsupportedVersion with found=4, got: {other:?}"),
         }
     }
 

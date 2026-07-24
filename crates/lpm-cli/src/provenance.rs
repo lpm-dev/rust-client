@@ -9,7 +9,7 @@ pub fn build_slsa_statement(
     version: &str,
     sha512_hex: &str,
 ) -> serde_json::Value {
-    let purl = npm_package_purl(package_name, version);
+    let purl = lpm_common::npm_package_purl(package_name, version);
     match ci {
         CiEnvironment::GitHubActions => build_github_actions_statement(purl, sha512_hex),
         CiEnvironment::GitLabCI => build_gitlab_ci_statement(purl, sha512_hex),
@@ -242,14 +242,6 @@ fn gitlab_parameters() -> serde_json::Map<String, serde_json::Value> {
     parameters
 }
 
-pub(crate) fn npm_package_purl(package_name: &str, version: &str) -> String {
-    if let Some(rest) = package_name.strip_prefix('@') {
-        format!("pkg:npm/%40{rest}@{version}")
-    } else {
-        format!("pkg:npm/{package_name}@{version}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,14 +392,6 @@ mod tests {
                 "environment": true,
                 "materials": false,
             })
-        );
-    }
-
-    #[test]
-    fn npm_package_purl_encodes_scoped_package_at_sign() {
-        assert_eq!(
-            npm_package_purl("@scope/pkg", "1.2.3"),
-            "pkg:npm/%40scope/pkg@1.2.3"
         );
     }
 

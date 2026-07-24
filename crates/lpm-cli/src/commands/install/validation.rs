@@ -44,6 +44,8 @@ pub(super) struct LockfileValidationState {
     pub(super) current_patch_fingerprint: String,
     pub(super) current_lockfile_patches: lpm_lockfile::LockfilePatches,
     pub(super) current_importer_snapshot: lpm_lockfile::ImporterSnapshot,
+    pub(super) prior_verified_provenance:
+        std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
 }
 
 fn peer_rules_fingerprint(pkg: &lpm_workspace::PackageJson) -> Option<String> {
@@ -145,11 +147,16 @@ pub(super) fn validate_install_lockfile_state(
         )?;
     }
 
+    let prior_verified_provenance = lockfile_for_validation
+        .map(|lockfile| lockfile.provenance)
+        .unwrap_or_default();
+
     Ok(LockfileValidationState {
         current_patches,
         current_patch_fingerprint,
         current_lockfile_patches,
         current_importer_snapshot,
+        prior_verified_provenance,
     })
 }
 

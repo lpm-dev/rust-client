@@ -109,10 +109,16 @@ pub(super) fn parse_integrated_time(s: &str) -> Result<SystemTime, VerifyError> 
     Ok(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
 }
 
-fn parse_log_index(s: &str) -> Result<i64, VerifyError> {
-    s.parse::<i64>().map_err(|e| {
+pub(super) fn parse_log_index(s: &str) -> Result<i64, VerifyError> {
+    let log_index = s.parse::<i64>().map_err(|e| {
         VerifyError::RekorSet(format!("TlogEntry.logIndex `{s}` is not a valid i64: {e}"))
-    })
+    })?;
+    if log_index < 0 {
+        return Err(VerifyError::RekorSet(format!(
+            "TlogEntry.logIndex `{log_index}` is negative"
+        )));
+    }
+    Ok(log_index)
 }
 
 fn integrated_time_secs(t: &SystemTime) -> i64 {

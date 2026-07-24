@@ -267,12 +267,6 @@ fn parse_metadata_to_cache_info_inner(
 }
 
 fn detect_trust_evidence(ver_meta: &lpm_registry::VersionMetadata) -> Option<TrustEvidence> {
-    let has_provenance = ver_meta
-        .dist
-        .as_ref()
-        .and_then(|dist| dist.attestations.as_ref())
-        .and_then(|att| att.provenance.as_ref())
-        .is_some();
     if ver_meta
         .npm_user
         .as_ref()
@@ -280,15 +274,14 @@ fn detect_trust_evidence(ver_meta: &lpm_registry::VersionMetadata) -> Option<Tru
     {
         return Some(TrustEvidence::StagedPublish);
     }
-    if has_provenance
-        && ver_meta
-            .npm_user
-            .as_ref()
-            .is_some_and(lpm_registry::NpmUserMetadata::has_trusted_publisher)
+    if ver_meta
+        .npm_user
+        .as_ref()
+        .is_some_and(lpm_registry::NpmUserMetadata::has_trusted_publisher)
     {
         return Some(TrustEvidence::TrustedPublisher);
     }
-    has_provenance.then_some(TrustEvidence::Provenance)
+    None
 }
 
 /// Validate a dependency name from registry metadata.

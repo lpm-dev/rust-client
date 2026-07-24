@@ -42,6 +42,41 @@ fn invalid_version_strings() {
     assert!(!is_valid_version_string("1.0.0\0"));
 }
 
+#[test]
+fn registry_attestation_pointer_is_not_trust_evidence_before_verification() {
+    let metadata: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "claimed-provenance",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "claimed-provenance",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/claimed-provenance/-/claimed-provenance-1.0.0.tgz",
+                    "integrity": "sha512-YWJj",
+                    "attestations": {
+                        "url": "https://registry.npmjs.org/-/npm/v1/attestations/claimed-provenance@1.0.0",
+                        "provenance": {
+                            "predicateType": "https://slsa.dev/provenance/v1"
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .expect("valid registry metadata fixture");
+
+    let info = parse_full_metadata_to_cache_info(&metadata);
+    assert_eq!(
+        info.dist
+            .get("1.0.0")
+            .expect("parsed version")
+            .trust_evidence,
+        None,
+        "a registry-controlled URL and predicate marker are only a claim; install must verify the bundle before recording provenance"
+    );
+}
+
 // === Peer deps are stored per-version in cache for post-resolution checking ===
 
 #[test]

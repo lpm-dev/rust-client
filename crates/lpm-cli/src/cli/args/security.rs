@@ -21,6 +21,8 @@ pub(crate) struct ConfigArgs {
     ///   `lpm config triage --set claude-cli`
     ///   `lpm config sandbox --set strict`
     ///   `lpm config sigstore --set deny`
+    ///   `lpm config sigstore --set scope=all`
+    ///   `lpm config sigstore --set availability=strict`
     ///   `lpm config signatures --set true`
     ///   `lpm config trust-policy --set no-downgrade`
     ///   `lpm config typosquat --set default`
