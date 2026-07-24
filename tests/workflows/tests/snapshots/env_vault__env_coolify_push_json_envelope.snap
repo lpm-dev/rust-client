@@ -1,0 +1,15 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: push_json
+---
+{
+  "success": true,
+  "status": "synced",
+  "platform": "coolify",
+  "env": "production",
+  "added": 0,
+  "updated": 1,
+  "removed": 0,
+  "secretVerification": "exact",
+  "auditRecorded": true
+}

@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: failed_json
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error": "script error: GitHub Actions variable update failed with HTTP 403 Forbidden: workflow denied",
+  "error_code": "script"
+}

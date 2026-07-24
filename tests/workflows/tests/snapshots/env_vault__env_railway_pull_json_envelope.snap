@@ -1,0 +1,17 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: pull_json
+---
+{
+  "success": true,
+  "status": "imported",
+  "platform": "railway",
+  "env": "production",
+  "count": 1,
+  "keys": [
+    "APPLICATION_SECRET"
+  ],
+  "skippedSecrets": 0,
+  "secretVerification": "exact",
+  "auditRecorded": true
+}

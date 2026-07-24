@@ -99,6 +99,7 @@ sha2 = "0.10"
 # Content integrity remains SHA-512 SRI per the registry contract.
 blake3 = "1"
 base64 = "0.22"
+crypto_box = { version = "0.9.1", features = ["seal"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 hmac = "0.12"
