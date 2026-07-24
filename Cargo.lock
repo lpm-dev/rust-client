@@ -3354,6 +3354,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "urlencoding",
  "windows-sys 0.60.2",
 ]
 
@@ -3487,6 +3488,7 @@ name = "lpm-lockfile"
 version = "0.69.0"
 dependencies = [
  "criterion",
+ "hex",
  "lpm-common",
  "memmap2",
  "serde",

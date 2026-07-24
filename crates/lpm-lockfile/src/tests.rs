@@ -50,6 +50,130 @@ fn serialize_roundtrip() {
     assert_eq!(lf, parsed);
 }
 
+fn lockfile_with_verified_provenance() -> (Lockfile, PackageKey, LockedProvenance) {
+    let mut lockfile = Lockfile::new();
+    let package = LockedPackage {
+        name: "axios".to_string(),
+        version: "1.14.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some(
+            "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ=="
+                .to_string(),
+        ),
+        ..LockedPackage::default()
+    };
+    let key = package.package_key();
+    lockfile.add_package(package);
+    let evidence = LockedProvenance {
+        snapshot: lpm_common::ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:axios/axios".to_string()),
+            workflow_path: Some(".github/workflows/publish.yml".to_string()),
+            workflow_ref: Some("refs/tags/v1.14.0".to_string()),
+            attestation_cert_sha256: Some("sha256-leaf".to_string()),
+        },
+        subject_name: "pkg:npm/axios@1.14.0".to_string(),
+        subject_sha512: "dd8f32aea2d2c23bb3a57b99d2821867f5c680bc14201537b8bbdb7296f4a62743f5cb694a125de3729294412455083a0d2d06f4d2b2ccebc17d4b43284c87bd".to_string(),
+        integrated_time_secs: 1_700_000_000,
+        log_id: "rekor-log".to_string(),
+        log_index: 42,
+        bundle_sha256: format!("sha256-{}", "ab".repeat(32)),
+    };
+    lockfile.set_verified_provenance(&key, evidence.clone());
+    (lockfile, key, evidence)
+}
+
+#[test]
+fn verified_provenance_round_trips_through_toml_and_binary() {
+    let (lockfile, key, evidence) = lockfile_with_verified_provenance();
+
+    let toml = lockfile.to_toml().expect("serialize provenance evidence");
+    let from_toml = Lockfile::from_toml(&toml).expect("parse provenance evidence");
+    assert_eq!(from_toml.verified_provenance(&key), Some(&evidence));
+
+    let binary = binary::to_binary(&lockfile).expect("serialize binary provenance evidence");
+    let dir = tempfile::tempdir().unwrap();
+    let binary_path = dir.path().join(binary::BINARY_LOCKFILE_NAME);
+    std::fs::write(&binary_path, binary).unwrap();
+    let reader = BinaryLockfileReader::open(&binary_path)
+        .unwrap()
+        .expect("open binary lockfile");
+    let from_binary = reader
+        .to_lockfile()
+        .expect("parse binary provenance evidence");
+    assert_eq!(from_binary.verified_provenance(&key), Some(&evidence));
+}
+
+#[test]
+fn from_toml_rejects_orphan_provenance_entry() {
+    let (lockfile, key, _) = lockfile_with_verified_provenance();
+    let toml = lockfile
+        .to_toml()
+        .expect("serialize valid provenance evidence")
+        .replace(&key.lockfile_id(), "orphan@9.9.9#r-deadbeefdeadbeef");
+
+    let error = Lockfile::from_toml(&toml).expect_err("orphan evidence must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match any locked package"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn from_toml_rejects_empty_required_provenance_field() {
+    let (lockfile, _, _) = lockfile_with_verified_provenance();
+    let toml = lockfile
+        .to_toml()
+        .expect("serialize valid provenance evidence")
+        .replace(
+            "subject-name = \"pkg:npm/axios@1.14.0\"",
+            "subject-name = \"\"",
+        );
+
+    let error = Lockfile::from_toml(&toml).expect_err("empty subject must be rejected");
+    assert!(
+        error.to_string().contains("empty required subject-name"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn from_toml_rejects_negative_provenance_log_index() {
+    let (lockfile, _, _) = lockfile_with_verified_provenance();
+    let toml = lockfile
+        .to_toml()
+        .expect("serialize valid provenance evidence")
+        .replace("log-index = 42", "log-index = -1");
+
+    let error = Lockfile::from_toml(&toml).expect_err("negative log index must be rejected");
+    assert!(
+        error.to_string().contains("invalid log-index"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn from_toml_rejects_provenance_bound_to_wrong_tarball_digest() {
+    let (lockfile, _, _) = lockfile_with_verified_provenance();
+    let toml = lockfile
+        .to_toml()
+        .expect("serialize valid provenance evidence")
+        .replace(
+            "dd8f32aea2d2c23bb3a57b99d2821867f5c680bc14201537b8bbdb7296f4a62743f5cb694a125de3729294412455083a0d2d06f4d2b2ccebc17d4b43284c87bd",
+            &"00".repeat(64),
+        );
+
+    let error = Lockfile::from_toml(&toml).expect_err("mismatched digest must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("subject-sha512 does not match the locked package integrity"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn dependency_node_engine_round_trips_through_toml() {
     let mut lf = sample_lockfile();

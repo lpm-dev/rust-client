@@ -37,7 +37,7 @@ pub use paths::{
     is_local_fs, project_install_lock, try_with_exclusive_lock, with_exclusive_lock,
     with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
 };
-pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
+pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use symlink::{
     create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,
 };

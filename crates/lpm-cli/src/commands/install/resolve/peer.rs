@@ -114,7 +114,14 @@ pub(super) async fn drain_ambient_peer_installs(
                 stats.reused_existing_versions += 1;
             }
             let identity = (node.request.target_name.clone(), node.version.clone());
-            let merge = merge_node_into_packages(packages, &node, route_table, store, project_dir);
+            let merge = merge_node_into_packages(
+                packages,
+                &node,
+                route_table,
+                client.as_ref(),
+                store,
+                project_dir,
+            );
             if merge.became_required {
                 let draft = packages.get(&identity).ok_or_else(|| {
                     LpmError::Registry(format!(

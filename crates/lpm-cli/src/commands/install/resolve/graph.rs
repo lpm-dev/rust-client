@@ -327,6 +327,7 @@ pub(super) fn merge_node_into_packages(
     packages: &mut HashMap<PackageIdentity, PackageDraft>,
     node: &ResolvedNode,
     route_table: &RouteTable,
+    registry_client: &RegistryClient,
     store: &PackageStore,
     project_dir: &Path,
 ) -> MergeOutcome {
@@ -352,7 +353,7 @@ pub(super) fn merge_node_into_packages(
             outcome.inserted = true;
             let name = node.request.target_name.clone();
             let version = node.version.clone();
-            let registry_url = registry_source_url_for(&name, route_table);
+            let registry_url = registry_source_url_for(&name, route_table, registry_client);
             let source = format!("registry+{registry_url}");
             let is_lpm = name.starts_with("@lpm.dev/");
             let dist = node.info.dist.get(&version);

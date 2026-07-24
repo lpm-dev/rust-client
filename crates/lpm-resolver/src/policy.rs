@@ -317,7 +317,6 @@ pub enum ReleaseTimeStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TrustEvidence {
-    Provenance,
     TrustedPublisher,
     StagedPublish,
 }
@@ -326,7 +325,6 @@ impl TrustEvidence {
     #[inline]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Provenance => "provenance attestation",
             Self::TrustedPublisher => "trusted publisher",
             Self::StagedPublish => "staged publish approval",
         }

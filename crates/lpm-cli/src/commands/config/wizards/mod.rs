@@ -77,7 +77,8 @@ pub(in crate::commands::config) use scripts::persist_script_policy;
 pub(in crate::commands::config) use scripts::run_scripts_wizard;
 pub(in crate::commands::config) use signatures::run_signatures_wizard;
 pub(in crate::commands::config) use sigstore::{
-    SIGSTORE_VERIFY_VALUES, read_sigstore_verify, run_sigstore_wizard,
+    SIGSTORE_AVAILABILITY_VALUES, SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES,
+    read_sigstore_availability, read_sigstore_scope, read_sigstore_verify, run_sigstore_wizard,
 };
 pub(in crate::commands::config) use triage::run_triage_wizard;
 pub(crate) use trust_policy::TRUST_POLICY_KEY;

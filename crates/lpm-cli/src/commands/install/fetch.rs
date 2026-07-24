@@ -127,6 +127,9 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) spec_tracker: SpeculativeKeyTracker,
     pub(super) gate_stats: Arc<GateStats>,
     pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
+    pub(super) lockfile_provenance:
+        &'a std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
+    pub(super) trust_no_downgrade: bool,
     pub(super) used_lockfile: bool,
     pub(super) lockfile_peer_context_authoritative: bool,
     pub(super) force: bool,
@@ -172,7 +175,44 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) min_release_age_secs: u64,
     pub(super) install_provenance_status_map:
         HashMap<(String, String), lpm_common::ProvenanceStatus>,
+    pub(super) verified_provenance_for_lockfile:
+        std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
     pub(super) fresh_urls: HashMap<String, String>,
+}
+
+fn provenance_lockfile_id(package: &InstallPackage) -> Result<String, LpmError> {
+    let source = lpm_lockfile::Source::parse(&package.source).map_err(|error| {
+        LpmError::ProvenanceVerification(format!(
+            "cannot record provenance for {}@{} with invalid source: {error}",
+            package.name, package.version
+        ))
+    })?;
+    Ok(
+        lpm_lockfile::PackageKey::new(&package.name, &package.version, source.source_id())
+            .lockfile_id(),
+    )
+}
+
+pub(super) fn locked_provenance_names(
+    provenance: &std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
+) -> HashSet<&str> {
+    let mut names = HashSet::with_capacity(provenance.len());
+    for lockfile_id in provenance.keys() {
+        let Some((package_and_version, _source)) = lockfile_id.rsplit_once('#') else {
+            continue;
+        };
+        let Some((name, _version)) = package_and_version.rsplit_once('@') else {
+            continue;
+        };
+        names.insert(name);
+    }
+    names
+}
+
+fn provenance_downgrade_error(name: &str, version: &str, reason: &str) -> LpmError {
+    LpmError::ProvenanceVerification(format!(
+        "trust-policy no-downgrade blocked {name}@{version} because an earlier locked version had verified provenance and {reason}"
+    ))
 }
 
 pub(super) async fn run_online_fetch_phase(
@@ -195,6 +235,8 @@ pub(super) async fn run_online_fetch_phase(
         spec_tracker,
         gate_stats,
         current_patches,
+        lockfile_provenance,
+        trust_no_downgrade,
         used_lockfile,
         lockfile_peer_context_authoritative,
         force,
@@ -979,12 +1021,12 @@ pub(super) async fn run_online_fetch_phase(
     // "provenance dropped" (axios signal) or "identity changed"
     // (publisher rotation without explicit re-approval).
     //
-    // **Gating:** fires only on fresh resolution — lockfile fast-path
-    // is skipped by design (the lockfile locks integrity, not
-    // attestation identity). `--allow-new`
-    // does NOT bypass this gate because provenance and cooldown
-    // are orthogonal signals, and the cooldown override doesn't
-    // imply acknowledgement of publisher drift. The caller wires the
+    // **Gating:** fresh resolution fetches and verifies candidate
+    // attestations; lockfile replay validates and reuses artifact-bound
+    // evidence without network access. `--allow-new` does NOT bypass
+    // this gate because provenance and cooldown are orthogonal signals,
+    // and the cooldown override doesn't imply acknowledgement of
+    // publisher drift. The caller wires the
     // `--ignore-provenance-drift[-all]` override below.
     //
     // **Performance:** sequential fetches per package. The fetcher's
@@ -1013,7 +1055,30 @@ pub(super) async fn run_online_fetch_phase(
     // `provenance` block when the key is absent.
     let mut install_provenance_status_map: HashMap<(String, String), lpm_common::ProvenanceStatus> =
         HashMap::new();
-    if !used_lockfile && !drift_ignore_policy.ignores_all() {
+    let mut verified_provenance_for_lockfile = std::collections::BTreeMap::new();
+    if !lockfile_provenance.is_empty() {
+        for package in &packages {
+            let lockfile_id = provenance_lockfile_id(package)?;
+            let Some(evidence) = lockfile_provenance.get(&lockfile_id) else {
+                continue;
+            };
+            crate::provenance_bundle::validate_locked_provenance(
+                &package.name,
+                &package.version,
+                package.integrity.as_deref(),
+                evidence,
+            )?;
+            verified_provenance_for_lockfile.insert(lockfile_id, evidence.clone());
+        }
+    }
+    let verification_scope = crate::provenance_fetch::VerificationScope::from_config(
+        global_config.get_sigstore_scope().as_deref(),
+    )?;
+    let availability_mode = crate::provenance_fetch::AvailabilityMode::from_config(
+        global_config.get_sigstore_availability().as_deref(),
+    )?;
+    if !drift_ignore_policy.ignores_all() || verification_scope.verifies_all() || trust_no_downgrade
+    {
         let trusted =
             lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
                 .trusted_dependencies;
@@ -1027,11 +1092,14 @@ pub(super) async fn run_online_fetch_phase(
             lpm_workspace::TrustedDependencies::Rich(map) if !map.is_empty()
         );
 
-        if has_rich_approvals {
+        if has_rich_approvals || verification_scope.verifies_all() || trust_no_downgrade {
             let cache_root = lpm_root.cache_metadata_attestations();
-            let http = lpm_http::client_builder().build().map_err(|error| {
-                LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
-            })?;
+            let http = (!used_lockfile)
+                .then(crate::provenance_bundle::ProvenanceHttpClient::build)
+                .transpose()
+                .map_err(|error| {
+                    LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
+                })?;
 
             // (name, version, verdict, approved_version, approved_snapshot)
             let mut drifted: Vec<(
@@ -1041,41 +1109,115 @@ pub(super) async fn run_online_fetch_phase(
                 String,
                 Option<lpm_workspace::ProvenanceSnapshot>,
             )> = Vec::new();
+            let prior_verified_names = if trust_no_downgrade {
+                locked_provenance_names(lockfile_provenance)
+            } else {
+                HashSet::new()
+            };
 
             for p in &packages {
-                let Some((approved_version, reference_binding)) =
-                    trusted.provenance_reference_for_candidate(&p.name, &p.version)
-                else {
+                let provenance_reference =
+                    trusted.provenance_reference_for_candidate(&p.name, &p.version);
+                let prior_verified = prior_verified_names.contains(p.name.as_str());
+                if provenance_reference.is_none()
+                    && !verification_scope.verifies_all()
+                    && !trust_no_downgrade
+                {
                     continue;
-                };
+                }
 
                 // Per-package override: user explicitly waived this
                 // name. Emit a one-line advisory so the opt-out is
                 // visible in the install log, then skip the fetch +
                 // compare.
-                if drift_ignore_policy.ignores_name(&p.name) {
-                    if !json_output {
-                        let name = lpm_common::sanitize_terminal_inline(&p.name);
-                        let version = lpm_common::sanitize_terminal_inline(&p.version);
-                        let approved_version =
-                            lpm_common::sanitize_terminal_inline(approved_version);
-                        output::warn(&format!(
-                            "{name}@{version} — provenance-drift check waived by \
-                             --ignore-provenance-drift (approved reference: v{approved_version})",
-                        ));
+                let drift_waived = if let Some((approved_version, _)) =
+                    provenance_reference.as_ref()
+                {
+                    if !drift_ignore_policy.ignores_name(&p.name) {
+                        false
+                    } else {
+                        if !json_output {
+                            let name = lpm_common::sanitize_terminal_inline(&p.name);
+                            let version = lpm_common::sanitize_terminal_inline(&p.version);
+                            let approved_version =
+                                lpm_common::sanitize_terminal_inline(approved_version);
+                            output::warn(&format!(
+                                "{name}@{version} — provenance-drift check waived by \
+                                 --ignore-provenance-drift (approved reference: v{approved_version})",
+                            ));
+                        }
+                        true
                     }
+                } else {
+                    false
+                };
+                if drift_waived && !verification_scope.verifies_all() && !trust_no_downgrade {
                     continue;
                 }
-                let approved_snapshot = reference_binding.provenance_at_approval.as_ref();
+                let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if used_lockfile {
+                    let provenance_key = provenance_lockfile_id(p)?;
+                    let Some(evidence) = lockfile_provenance.get(&provenance_key) else {
+                        if trust_no_downgrade && prior_verified {
+                            return Err(provenance_downgrade_error(
+                                &p.name,
+                                &p.version,
+                                "this version has no matching lockfile evidence",
+                            ));
+                        }
+                        if availability_mode.is_strict() {
+                            return Err(LpmError::ProvenanceVerification(format!(
+                                "strict provenance availability requires lockfile evidence for {}@{}",
+                                p.name, p.version
+                            )));
+                        }
+                        continue;
+                    };
+                    crate::provenance_bundle::validate_locked_provenance(
+                        &p.name,
+                        &p.version,
+                        p.integrity.as_deref(),
+                        evidence,
+                    )?;
+                    let snapshot = evidence.snapshot.clone();
+                    install_provenance_status_map.insert(
+                        (p.name.clone(), p.version.clone()),
+                        lpm_common::ProvenanceStatus::Verified(snapshot.clone()),
+                    );
+                    Some(snapshot)
+                } else {
+                    let http = http.as_ref().ok_or_else(|| {
+                        LpmError::Network(
+                            "provenance HTTP client unavailable during fresh resolution"
+                                .to_string(),
+                        )
+                    })?;
+                    let registry_url =
+                        registry_source_url_for(&p.name, &route_table, arc_client.as_ref());
 
-                // Extract the candidate version's attestation ref
-                // from the resolver's TTL cache (same pattern as the
-                // cooldown gate above).
-                let attestation_ref = if p.is_lpm {
-                    match lpm_common::PackageName::parse(&p.name) {
-                        Ok(pkg_name) => lpm_registry::timing::with_metadata_purpose(
+                    // Extract the candidate version's attestation ref
+                    // from the resolver's TTL cache (same pattern as the
+                    // cooldown gate above).
+                    let attestation_ref = if p.is_lpm {
+                        match lpm_common::PackageName::parse(&p.name) {
+                            Ok(pkg_name) => lpm_registry::timing::with_metadata_purpose(
+                                lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                                arc_client.get_package_metadata(&pkg_name),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|meta| {
+                                meta.versions
+                                    .get(&p.version)
+                                    .and_then(|v| v.dist.as_ref())
+                                    .and_then(|d| d.attestations.clone())
+                            }),
+                            Err(_) => None,
+                        }
+                    } else {
+                        let route = route_table.route_for_package(&p.name);
+                        lpm_registry::timing::with_metadata_purpose(
                             lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
-                            arc_client.get_package_metadata(&pkg_name),
+                            arc_client.get_npm_metadata_routed(&p.name, route),
                         )
                         .await
                         .ok()
@@ -1084,164 +1226,200 @@ pub(super) async fn run_online_fetch_phase(
                                 .get(&p.version)
                                 .and_then(|v| v.dist.as_ref())
                                 .and_then(|d| d.attestations.clone())
-                        }),
-                        Err(_) => None,
-                    }
-                } else {
-                    // follow-up: route via RouteTable so
-                    // the provenance-drift gate doesn't fall through to
-                    // public npm for a custom-registry package.
-                    let route = route_table.route_for_package(&p.name);
-                    lpm_registry::timing::with_metadata_purpose(
-                        lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
-                        arc_client.get_npm_metadata_routed(&p.name, route),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|meta| {
-                        meta.versions
-                            .get(&p.version)
-                            .and_then(|v| v.dist.as_ref())
-                            .and_then(|d| d.attestations.clone())
-                    })
-                };
+                        })
+                    };
 
-                // When the operator skip-listed this name (CLI
-                // `--unverified-provenance`) OR set the fleet-wide
-                // enforce mode to `Off` (env / config), route the
-                // fetch through the `Unverified` path — bytes
-                // through the legacy identity-only parser, no
-                // cryptographic checks. The drift gate still gets
-                // a populated snapshot so publisher / workflow_path
-                // identity drift is detected even when the operator
-                // opted out of crypto.
-                let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
-                    .should_skip_verification_for(&p.name)
-                {
-                    let raw = crate::provenance_fetch::fetch_unverified_snapshot(
-                        &http,
-                        &p.name,
-                        &p.version,
-                        attestation_ref.as_ref(),
-                    )
-                    .await;
-                    // Re-label `Unverified` → `Disabled` when fleet-
-                    // wide `EnforceMode::Off` was the trigger, so the
-                    // JSON envelope distinguishes wholesale opt-out
-                    // (`"disabled"`) from per-package CLI carve-out
-                    // (`"skipped"`). Logic shared with the batch
-                    // caller in `provenance_fetch.rs` so the two
-                    // sites cannot drift on the labeling rule.
-                    let status = crate::provenance_fetch::relabel_skip_status_for_enforce_mode(
-                        raw,
-                        verify_policy.enforce,
-                    );
-                    // Record for the install --json envelope
-                    // before consuming for the drift gate.
-                    install_provenance_status_map
-                        .insert((p.name.clone(), p.version.clone()), status.clone());
-                    // Projection: `Unverified(snap)` / `Disabled(snap)`
-                    // → Some(snap), `Absent` → Some(present:false),
-                    // `TransportDegraded` → None. `VerificationRejected`
-                    // is unreachable on the skip path (the verifier
-                    // didn't run).
-                    status.into_snapshot_for_binding(&p.name, &p.version)?
-                } else {
-                    let raw = crate::provenance_fetch::fetch_provenance_snapshot(
-                        &http,
-                        &cache_root,
-                        &p.name,
-                        &p.version,
-                        attestation_ref.as_ref(),
-                        provenance_timings.as_ref(),
-                    )
-                    .await;
-                    // Branch arms:
-                    // - `Ok(Some(snap))`: Verified (snap.present)
-                    // or Absent (registry served no attestation).
-                    // - `Ok(None)`: transport-degraded; drift
-                    // comparator absorbs as NoDrift.
-                    // - `Err(ProvenanceVerification)`: policy
-                    // decision per `verify_policy.enforce`.
-                    // Warn degrades to None + loud log; Deny
-                    // propagates the typed error and `?`
-                    // refuses the install.
-                    // - `Err(other)`: infrastructure failure
-                    // (cache unwritable, etc.) — propagate
-                    // as-is so the user sees a real diagnostic,
-                    // not a silent degrade.
-                    let (snapshot_for_drift, status_for_map) = match raw {
-                        Ok(Some(snap)) if snap.present => {
-                            let status = lpm_common::ProvenanceStatus::Verified(snap.clone());
-                            (Some(snap), status)
+                    if verify_policy.should_skip_verification_for(&p.name) {
+                        if trust_no_downgrade && prior_verified {
+                            return Err(provenance_downgrade_error(
+                                &p.name,
+                                &p.version,
+                                "verification is disabled or explicitly skipped for this version",
+                            ));
                         }
-                        Ok(Some(_)) => (
-                            Some(lpm_workspace::ProvenanceSnapshot {
-                                present: false,
-                                ..Default::default()
-                            }),
-                            lpm_common::ProvenanceStatus::Absent,
-                        ),
-                        Ok(None) => (None, lpm_common::ProvenanceStatus::TransportDegraded),
-                        Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {
-                            let status = lpm_common::ProvenanceStatus::VerificationRejected {
-                                reason: reason.clone(),
-                            };
-                            let snapshot = match verify_policy.enforce {
-                                crate::provenance_fetch::EnforceMode::Warn => {
-                                    if !json_output {
-                                        let pkg = lpm_common::sanitize_terminal_inline(&p.name);
-                                        let ver = lpm_common::sanitize_terminal_inline(&p.version);
-                                        let reason = lpm_common::sanitize_terminal_inline(&reason);
-                                        crate::output::warn(&format!(
-                                            "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
+                        let raw = crate::provenance_fetch::fetch_unverified_snapshot(
+                            http,
+                            &registry_url,
+                            &p.name,
+                            &p.version,
+                            attestation_ref.as_ref(),
+                        )
+                        .await;
+                        // Re-label `Unverified` → `Disabled` when fleet-
+                        // wide `EnforceMode::Off` was the trigger, so the
+                        // JSON envelope distinguishes wholesale opt-out
+                        // (`"disabled"`) from per-package CLI carve-out
+                        // (`"skipped"`). Logic shared with the batch
+                        // caller in `provenance_fetch.rs` so the two
+                        // sites cannot drift on the labeling rule.
+                        let status = crate::provenance_fetch::relabel_skip_status_for_enforce_mode(
+                            raw,
+                            verify_policy.enforce,
+                        );
+                        // Record for the install --json envelope
+                        // before consuming for the drift gate.
+                        install_provenance_status_map
+                            .insert((p.name.clone(), p.version.clone()), status.clone());
+                        // Projection: `Unverified(snap)` / `Disabled(snap)`
+                        // → Some(snap), `Absent` → Some(present:false),
+                        // `TransportDegraded` → None. `VerificationRejected`
+                        // is unreachable on the skip path (the verifier
+                        // didn't run).
+                        status.into_snapshot_for_binding(&p.name, &p.version)?
+                    } else {
+                        let raw = crate::provenance_fetch::fetch_provenance_evidence(
+                            http,
+                            &cache_root,
+                            crate::provenance_fetch::ProvenanceFetchRequest::new(
+                                &registry_url,
+                                &p.name,
+                                &p.version,
+                                p.integrity.as_deref(),
+                                attestation_ref.as_ref(),
+                            ),
+                            provenance_timings.as_ref(),
+                        )
+                        .await;
+                        // Branch arms:
+                        // - `Ok(Verified(evidence))`: verified snapshot
+                        // plus artifact-bound lockfile evidence.
+                        // - `Ok(Absent)`: registry served no attestation.
+                        // - `Ok(TransportDegraded)`: drift comparator
+                        // absorbs as NoDrift unless stricter policy applies.
+                        // - `Err(ProvenanceVerification)`: policy
+                        // decision per `verify_policy.enforce`.
+                        // Warn degrades to None + loud log; Deny
+                        // propagates the typed error and `?`
+                        // refuses the install.
+                        // - `Err(other)`: infrastructure failure
+                        // (cache unwritable, etc.) — propagate
+                        // as-is so the user sees a real diagnostic,
+                        // not a silent degrade.
+                        let (snapshot_for_drift, status_for_map) = match raw {
+                            Ok(crate::provenance_fetch::ProvenanceFetch::Verified(evidence)) => {
+                                verified_provenance_for_lockfile
+                                    .insert(provenance_lockfile_id(p)?, evidence.clone());
+                                let snap = evidence.snapshot;
+                                let status = lpm_common::ProvenanceStatus::Verified(snap.clone());
+                                (Some(snap), status)
+                            }
+                            Ok(crate::provenance_fetch::ProvenanceFetch::Absent) => {
+                                if trust_no_downgrade && prior_verified {
+                                    return Err(provenance_downgrade_error(
+                                        &p.name,
+                                        &p.version,
+                                        "this version has no attestation",
+                                    ));
+                                }
+                                if availability_mode.is_strict() {
+                                    return Err(LpmError::ProvenanceVerification(format!(
+                                        "strict provenance availability requires an attestation for {}@{}",
+                                        p.name, p.version
+                                    )));
+                                }
+                                (
+                                    Some(lpm_workspace::ProvenanceSnapshot {
+                                        present: false,
+                                        ..Default::default()
+                                    }),
+                                    lpm_common::ProvenanceStatus::Absent,
+                                )
+                            }
+                            Ok(crate::provenance_fetch::ProvenanceFetch::TransportDegraded) => {
+                                if trust_no_downgrade && prior_verified {
+                                    return Err(provenance_downgrade_error(
+                                        &p.name,
+                                        &p.version,
+                                        "this version's attestation could not be retrieved",
+                                    ));
+                                }
+                                if availability_mode.is_strict() {
+                                    return Err(LpmError::ProvenanceVerification(format!(
+                                        "strict provenance availability could not verify {}@{} because the attestation was unavailable",
+                                        p.name, p.version
+                                    )));
+                                }
+                                (None, lpm_common::ProvenanceStatus::TransportDegraded)
+                            }
+                            Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {
+                                if trust_no_downgrade && prior_verified {
+                                    return Err(provenance_downgrade_error(
+                                        &p.name,
+                                        &p.version,
+                                        &format!(
+                                            "this version's attestation failed verification: {reason}"
+                                        ),
+                                    ));
+                                }
+                                let status = lpm_common::ProvenanceStatus::VerificationRejected {
+                                    reason: reason.clone(),
+                                };
+                                let snapshot = match verify_policy.enforce {
+                                    crate::provenance_fetch::EnforceMode::Warn => {
+                                        if !json_output {
+                                            let pkg = lpm_common::sanitize_terminal_inline(&p.name);
+                                            let ver =
+                                                lpm_common::sanitize_terminal_inline(&p.version);
+                                            let reason =
+                                                lpm_common::sanitize_terminal_inline(&reason);
+                                            crate::output::warn(&format!(
+                                                "provenance verification FAILED for {pkg}@{ver}: {reason}\n  \
                                              LPM_PROVENANCE_ENFORCE=warn — install proceeds without \
                                              verified provenance for this package. Re-run with \
                                              LPM_PROVENANCE_ENFORCE=deny (default) to refuse, or pass \
                                              `--unverified-provenance {pkg}` to opt out explicitly.",
-                                        ));
+                                            ));
+                                        }
+                                        tracing::warn!(
+                                            target = "lpm::provenance",
+                                            pkg = %p.name,
+                                            version = %p.version,
+                                            reason = %reason,
+                                            enforce_mode = "warn",
+                                            "install drift gate: verifier rejected bundle \
+                                             under warn enforce-mode — degrading to NoDrift",
+                                        );
+                                        None
                                     }
-                                    tracing::warn!(
-                                        target = "lpm::provenance",
-                                        pkg = %p.name,
-                                        version = %p.version,
-                                        reason = %reason,
-                                        enforce_mode = "warn",
-                                        "install drift gate: verifier rejected bundle \
-                                         under warn enforce-mode — degrading to NoDrift",
-                                    );
-                                    None
-                                }
-                                // `Off` short-circuits the verifier
-                                // upstream via `should_skip_verification_for`,
-                                // so the verifier-rejection path is
-                                // unreachable in `Off` mode. Defensive
-                                // arm to keep the match exhaustive if
-                                // a future refactor accidentally
-                                // bypasses the skip-route — degrade
-                                // identically to Warn so the install
-                                // doesn't fail on a state that the
-                                // operator already declared "fleet-wide
-                                // off".
-                                crate::provenance_fetch::EnforceMode::Off => None,
-                                crate::provenance_fetch::EnforceMode::Deny => {
-                                    // Surface the status in the map before
-                                    // returning so a `--json` consumer that
-                                    // tees stderr can correlate the failure
-                                    // with the per-package envelope.
-                                    install_provenance_status_map
-                                        .insert((p.name.clone(), p.version.clone()), status);
-                                    return Err(LpmError::ProvenanceVerification(reason));
-                                }
-                            };
-                            (snapshot, status)
-                        }
-                        Err(other) => return Err(other),
-                    };
-                    install_provenance_status_map
-                        .insert((p.name.clone(), p.version.clone()), status_for_map);
-                    snapshot_for_drift
+                                    // `Off` short-circuits the verifier
+                                    // upstream via `should_skip_verification_for`,
+                                    // so the verifier-rejection path is
+                                    // unreachable in `Off` mode. Defensive
+                                    // arm to keep the match exhaustive if
+                                    // a future refactor accidentally
+                                    // bypasses the skip-route — degrade
+                                    // identically to Warn so the install
+                                    // doesn't fail on a state that the
+                                    // operator already declared "fleet-wide
+                                    // off".
+                                    crate::provenance_fetch::EnforceMode::Off => None,
+                                    crate::provenance_fetch::EnforceMode::Deny => {
+                                        // Surface the status in the map before
+                                        // returning so a `--json` consumer that
+                                        // tees stderr can correlate the failure
+                                        // with the per-package envelope.
+                                        install_provenance_status_map
+                                            .insert((p.name.clone(), p.version.clone()), status);
+                                        return Err(LpmError::ProvenanceVerification(reason));
+                                    }
+                                };
+                                (snapshot, status)
+                            }
+                            Err(other) => return Err(other),
+                        };
+                        install_provenance_status_map
+                            .insert((p.name.clone(), p.version.clone()), status_for_map);
+                        snapshot_for_drift
+                    }
                 };
+
+                let Some((approved_version, reference_binding)) = provenance_reference else {
+                    continue;
+                };
+                if drift_waived {
+                    continue;
+                }
+                let approved_snapshot = reference_binding.provenance_at_approval.as_ref();
 
                 let verdict = lpm_security::provenance::check_provenance_drift(
                     approved_snapshot,
@@ -1260,8 +1438,6 @@ pub(super) async fn run_online_fetch_phase(
             }
 
             if !drifted.is_empty() {
-                // UX. extends the footer with the
-                // `--ignore-provenance-drift` override suggestion.
                 if !json_output {
                     output::warn(&format!(
                         "{} package(s) blocked by provenance drift:",
@@ -1847,6 +2023,7 @@ pub(super) async fn run_online_fetch_phase(
         publish_ages,
         min_release_age_secs: cooldown_policy.minimum_release_age_secs,
         install_provenance_status_map,
+        verified_provenance_for_lockfile,
         fresh_urls,
     })
 }
@@ -1989,8 +2166,9 @@ pub(super) fn registry_install_pkg_key(
     name: &str,
     version: &str,
     route_table: &RouteTable,
+    registry_client: &RegistryClient,
 ) -> String {
-    let registry_url = registry_source_url_for(name, route_table);
+    let registry_url = registry_source_url_for(name, route_table, registry_client);
     let source = format!("registry+{registry_url}");
     let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + source.len());
     key.push_str(name);
@@ -2235,7 +2413,12 @@ pub(super) fn spawn_speculation_dispatcher(
                 if !already_dispatched.insert(key) {
                     return;
                 }
-                let package_key = registry_install_pkg_key(&name, &version, &route_table_spec);
+                let package_key = registry_install_pkg_key(
+                    &name,
+                    &version,
+                    &route_table_spec,
+                    client_spec.as_ref(),
+                );
 
                 let skip_auth_bearing_custom_speculation = matches!(
                     route_table_spec.route_for_package(&name),
@@ -2461,7 +2644,7 @@ pub(super) async fn speculative_download_and_store(
     // package to a private mirror. Tarball-URL packages have a
     // different source_id and naturally don't share locks with
     // speculation — that's correct (speculation never targets them).
-    let speculation_key = registry_install_pkg_key(name, version, route_table);
+    let speculation_key = registry_install_pkg_key(name, version, route_table, client.as_ref());
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 

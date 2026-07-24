@@ -9,30 +9,18 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use lpm_common::LpmError;
 use lpm_workspace::ProvenanceSnapshot;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 7-day TTL for verified attestation snapshots.
+/// 7-day TTL for verified attestation bundles.
 const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Schema version for the on-disk cache entries. Bump if the parsed
-/// `ProvenanceSnapshot` shape changes OR the SAN extractor's
-/// behaviour changes in a way that invalidates prior captures, OR
-/// the verification posture for cached entries changes. Entries
-/// with a mismatched version are treated as misses (re-fetch).
-///
-/// **Version 2**: cache entries are now produced by the FULL
-/// cryptographic verifier ([`verify_sigstore_bundle`]),
-/// not by identity-only extraction. Every cached snapshot has had
-/// chain + DSSE + SCT + Rekor body + SET (and possibly inclusion
-/// proof) verified at write time. Schema-1 entries are produced by
-/// the legacy `parse_sigstore_bundle` identity-only extractor and
-/// MUST NOT be returned by the new code path — they would silently
-/// admit unverified attestations into the drift gate. The bump
-/// invalidates every legacy entry on first read.
-const CACHE_SCHEMA_VERSION: u32 = 2;
+/// Version 4 stores the original Sigstore bundle instead of derived
+/// evidence, so every cache hit is cryptographically reverified and
+/// rebound to the current package integrity before use.
+const CACHE_MAGIC: &[u8; 8] = b"LPMPRV4\0";
+const CACHE_HEADER_BYTES: usize = CACHE_MAGIC.len() + std::mem::size_of::<u64>();
 
 /// Max attestation-bundle response size we'll read. Defends against
 /// a hostile / broken registry serving an unbounded body that would
@@ -48,21 +36,146 @@ const FETCH_TIMEOUT_SECS: u64 = 15;
 /// Maximum bytes we will read from one on-disk cache entry. A local
 /// attacker who can write under `~/.lpm/cache/metadata/attestations/`
 /// should not be able to OOM the install by planting a multi-GiB file
-/// — every legitimate entry is well under 4 KiB and the same 1 MiB
-/// bound applies on the fetch side via [`MAX_BUNDLE_BYTES`].
-const MAX_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
+const MAX_CACHE_ENTRY_BYTES: u64 = (CACHE_HEADER_BYTES + MAX_BUNDLE_BYTES) as u64;
+
+#[derive(Clone)]
+pub(crate) struct ProvenanceHttpClient {
+    inner: reqwest::Client,
+}
+
+impl ProvenanceHttpClient {
+    pub(crate) fn build() -> Result<Self, reqwest::Error> {
+        lpm_http::client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map(|inner| Self { inner })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttestationUrlPolicy {
+    registry_origin: String,
+    allow_loopback_http: bool,
+}
+
+impl AttestationUrlPolicy {
+    pub(crate) fn for_registry(registry_url: &str) -> Result<Self, LpmError> {
+        let parsed = reqwest::Url::parse(registry_url).map_err(|error| {
+            LpmError::ProvenanceVerification(format!(
+                "cannot validate attestation URL against invalid registry URL: {error}"
+            ))
+        })?;
+        let allow_loopback_http =
+            parsed.scheme() == "http" && lpm_registry::is_localhost_url(registry_url);
+        if parsed.scheme() != "https" && !allow_loopback_http {
+            return Err(LpmError::ProvenanceVerification(
+                "attestation registry origin must use HTTPS or loopback HTTP".into(),
+            ));
+        }
+        Ok(Self {
+            registry_origin: parsed.origin().ascii_serialization(),
+            allow_loopback_http,
+        })
+    }
+
+    fn validate(&self, candidate: &str) -> Result<reqwest::Url, FetchBundleError> {
+        let parsed = reqwest::Url::parse(candidate).map_err(|error| {
+            FetchBundleError::Policy(format!("attestation URL is invalid: {error}"))
+        })?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(FetchBundleError::Policy(
+                "attestation URL must not contain credentials".into(),
+            ));
+        }
+        if parsed.fragment().is_some() {
+            return Err(FetchBundleError::Policy(
+                "attestation URL must not contain a fragment".into(),
+            ));
+        }
+        if parsed.origin().ascii_serialization() != self.registry_origin {
+            return Err(FetchBundleError::Policy(
+                "attestation URL must use the selected registry origin".into(),
+            ));
+        }
+        if parsed.scheme() != "https"
+            && !(self.allow_loopback_http
+                && parsed.scheme() == "http"
+                && lpm_registry::is_localhost_url(parsed.as_str()))
+        {
+            return Err(FetchBundleError::Policy(
+                "attestation URL must use HTTPS or configured loopback HTTP".into(),
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum FetchBundleError {
+    Transport,
+    Policy(String),
+}
 
 // ── Cache primitives ────────────────────────────────────────────
 
-/// Cache entry schema on disk.
-#[derive(Serialize, Deserialize)]
-struct CacheEntry {
-    /// Schema version — mismatches are treated as misses.
-    version: u32,
-    /// Unix timestamp (secs) when the entry was written.
-    cached_at_secs: u64,
-    /// The extracted provenance snapshot.
-    snapshot: ProvenanceSnapshot,
+pub(crate) type VerifiedNpmProvenance = lpm_lockfile::LockedProvenance;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NpmArtifactExpectation {
+    subject_name: String,
+    subject_sha512: String,
+}
+
+impl NpmArtifactExpectation {
+    pub(crate) fn from_package(
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+    ) -> Result<Self, LpmError> {
+        let integrity = integrity.ok_or_else(|| {
+            LpmError::ProvenanceVerification(format!(
+                "cannot bind provenance for {name}@{version}: package metadata has no integrity"
+            ))
+        })?;
+        let parsed = lpm_common::Integrity::parse(integrity).map_err(|error| {
+            LpmError::ProvenanceVerification(format!(
+                "cannot bind provenance for {name}@{version}: invalid package integrity: {error}"
+            ))
+        })?;
+        if parsed.algorithm != lpm_common::integrity::HashAlgorithm::Sha512 {
+            return Err(LpmError::ProvenanceVerification(format!(
+                "cannot bind provenance for {name}@{version}: expected sha512 integrity, got {integrity}"
+            )));
+        }
+        Ok(Self {
+            subject_name: lpm_common::npm_package_purl(name, version),
+            subject_sha512: hex::encode(parsed.hash),
+        })
+    }
+
+    fn matches(&self, evidence: &VerifiedNpmProvenance) -> bool {
+        self.subject_name == evidence.subject_name && self.subject_sha512 == evidence.subject_sha512
+    }
+}
+
+pub(crate) fn validate_locked_provenance(
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    evidence: &VerifiedNpmProvenance,
+) -> Result<(), LpmError> {
+    let expectation = NpmArtifactExpectation::from_package(name, version, integrity)?;
+    if !evidence.snapshot.present {
+        return Err(LpmError::ProvenanceVerification(format!(
+            "lockfile provenance for {name}@{version} is marked absent"
+        )));
+    }
+    if !expectation.matches(evidence) {
+        return Err(LpmError::ProvenanceVerification(format!(
+            "lockfile provenance is not bound to {name}@{version} and its package integrity"
+        )));
+    }
+    Ok(())
 }
 
 /// Compute the on-disk cache filename for one `name@version`.
@@ -71,15 +184,14 @@ struct CacheEntry {
 /// encoded. Deterministic, filesystem-safe (no `@` or `/` issues on
 /// Windows or case-insensitive volumes), collision-resistant, and
 /// keeps the cache dir a single flat directory — no per-scope
-/// sub-tree walking. The full `name@version` is recorded inside the
-/// cache entry's `snapshot` doc comment so a human debugging a bad
-/// cache entry can cross-reference by content if needed.
+/// sub-tree walking. The raw bundle's signed in-toto subject records
+/// the canonical package identity for debugging after verification.
 fn cache_filename(name: &str, version: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.as_bytes());
     hasher.update(b"@");
     hasher.update(version.as_bytes());
-    format!("{}.json", hex::encode(hasher.finalize()))
+    format!("{}.sigstore", hex::encode(hasher.finalize()))
 }
 
 fn cache_path(cache_root: &Path, name: &str, version: &str) -> PathBuf {
@@ -92,20 +204,19 @@ fn current_epoch_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Read a cache entry if it exists AND is fresh AND has the expected
-/// schema version. Returns `Ok(None)` for every other condition
-/// (stale, corrupt, missing, version mismatch). Returns `Err` only
-/// for genuine I/O failures the caller would want to surface.
+/// Read and reverify a cached bundle if it exists and is fresh.
 ///
-/// We deliberately swallow corrupt-file errors (bad JSON, wrong
-/// schema) as misses rather than failing the install — a single bad
-/// cache entry should not block a build, and the next write overwrites
-/// it.
+/// The artifact expectation is mandatory: returning cached provenance
+/// without rebinding the signed subject to the current package would turn
+/// the user-writable cache into a trust database. Invalid cache contents
+/// are misses so the registry gets one opportunity to replace a corrupt
+/// local entry.
 pub(crate) fn read_cache(
     cache_root: &Path,
     name: &str,
     version: &str,
-) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    expectation: &NpmArtifactExpectation,
+) -> Result<Option<VerifiedNpmProvenance>, LpmError> {
     use std::io::Read;
 
     let path = cache_path(cache_root, name, version);
@@ -133,50 +244,57 @@ pub(crate) fn read_cache(
         .read_to_end(&mut bytes)
         .map_err(LpmError::Io)?;
 
-    let entry: CacheEntry = match serde_json::from_slice(&bytes) {
-        Ok(e) => e,
-        Err(e) => {
+    if bytes.len() < CACHE_HEADER_BYTES || &bytes[..CACHE_MAGIC.len()] != CACHE_MAGIC {
+        return Ok(None);
+    }
+    let cached_at_secs = u64::from_le_bytes(
+        bytes[CACHE_MAGIC.len()..CACHE_HEADER_BYTES]
+            .try_into()
+            .map_err(|_| LpmError::Registry("invalid provenance cache header".into()))?,
+    );
+    if current_epoch_secs().saturating_sub(cached_at_secs) >= CACHE_TTL_SECS {
+        return Ok(None);
+    }
+    let bundle = &bytes[CACHE_HEADER_BYTES..];
+    if bundle.is_empty() || bundle.len() > MAX_BUNDLE_BYTES {
+        return Ok(None);
+    }
+
+    match verify_bundle_or_err(bundle, "cached Sigstore bundle", expectation) {
+        Ok(evidence) => Ok(Some(evidence)),
+        Err(error) => {
             tracing::warn!(
                 target: "lpm_cli::provenance_fetch",
                 path = %path.display(),
-                error = %e,
-                "provenance cache entry failed to parse; treating as miss",
+                error = %error,
+                "provenance cache bundle failed verification; treating as miss",
             );
-            return Ok(None);
+            Ok(None)
         }
-    };
-
-    if entry.version != CACHE_SCHEMA_VERSION {
-        return Ok(None);
     }
-    if current_epoch_secs().saturating_sub(entry.cached_at_secs) >= CACHE_TTL_SECS {
-        return Ok(None);
-    }
-
-    Ok(Some(entry.snapshot))
 }
 
-/// Write a cache entry atomically: serialize to a temp file in the
-/// same directory, then `rename`. Creates the cache directory if
-/// absent.
+/// Write a verified bundle atomically in the compact binary cache format.
 pub(crate) fn write_cache(
     cache_root: &Path,
     name: &str,
     version: &str,
-    snapshot: &ProvenanceSnapshot,
+    bundle: &[u8],
 ) -> Result<(), LpmError> {
+    if bundle.is_empty() || bundle.len() > MAX_BUNDLE_BYTES {
+        return Err(LpmError::Registry(
+            "refusing to cache an empty or oversized provenance bundle".into(),
+        ));
+    }
     std::fs::create_dir_all(cache_root).map_err(LpmError::Io)?;
 
-    let entry = CacheEntry {
-        version: CACHE_SCHEMA_VERSION,
-        cached_at_secs: current_epoch_secs(),
-        snapshot: snapshot.clone(),
-    };
-    let bytes = serde_json::to_vec(&entry)
-        .map_err(|e| LpmError::Registry(format!("failed to serialize provenance cache: {e}")))?;
+    let mut bytes = Vec::with_capacity(CACHE_HEADER_BYTES + bundle.len());
+    bytes.extend_from_slice(CACHE_MAGIC);
+    bytes.extend_from_slice(&current_epoch_secs().to_le_bytes());
+    bytes.extend_from_slice(bundle);
 
     let path = cache_path(cache_root, name, version);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension("sigstore.tmp");
     std::fs::write(&tmp, &bytes).map_err(LpmError::Io)?;
     std::fs::rename(&tmp, &path).map_err(LpmError::Io)?;
     Ok(())
@@ -186,9 +304,9 @@ pub(crate) fn write_cache(
 
 /// Fetch the Sigstore attestation bundle bytes from `url`.
 ///
-/// Any error from the HTTP stage degrades to `Err(())`; the caller maps
-/// that to `Ok(None)` (unknown) so the install proceeds without falsely
-/// claiming drift.
+/// Transport errors degrade to [`FetchBundleError::Transport`]; URL-policy
+/// violations return [`FetchBundleError::Policy`] and must remain a hard
+/// security failure.
 ///
 /// Body-size defense is enforced in two stages:
 ///
@@ -213,35 +331,67 @@ pub(crate) fn write_cache(
 /// Keeping this as an HTTP-only helper lets the production path time
 /// network and verification separately. Tests that need the legacy
 /// identity-only parser go through the [`fetch_and_parse`] wrapper.
-pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, ()> {
+pub(crate) async fn fetch_bundle_bytes(
+    http: &ProvenanceHttpClient,
+    url: &str,
+    url_policy: &AttestationUrlPolicy,
+) -> Result<Vec<u8>, FetchBundleError> {
     use futures::StreamExt;
 
-    let response = http
-        .get(url)
-        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .send()
-        .await
-        .map_err(|e| {
-            // Preserve the fetch-stage failure in traces even though
-            // the caller degrades the install path to unknown.
-            tracing::debug!(
-                target: "lpm_cli::provenance_fetch",
-                error = %lpm_http::display_error(&e),
-                stage = "send",
-                "attestation fetch send/timeout error",
-            );
+    let mut current_url = url_policy.validate(url)?;
+    let mut redirect_count = 0usize;
+    let response = loop {
+        let response = http
+            .inner
+            .get(current_url.clone())
+            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::debug!(
+                    target: "lpm_cli::provenance_fetch",
+                    error = %lpm_http::display_error(&e),
+                    stage = "send",
+                    "attestation fetch send/timeout error",
+                );
+                FetchBundleError::Transport
+            })?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        if redirect_count >= lpm_http::DEFAULT_REDIRECT_LIMIT {
+            return Err(FetchBundleError::Policy(
+                "attestation URL exceeded the redirect limit".into(),
+            ));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                FetchBundleError::Policy(
+                    "attestation redirect response has no Location header".into(),
+                )
+            })?
+            .to_str()
+            .map_err(|_| {
+                FetchBundleError::Policy("attestation redirect Location is not valid text".into())
+            })?;
+        let next = current_url.join(location).map_err(|error| {
+            FetchBundleError::Policy(format!("attestation redirect Location is invalid: {error}"))
         })?;
+        current_url = url_policy.validate(next.as_str())?;
+        redirect_count += 1;
+    };
 
     if !response.status().is_success() {
         let status = response.status();
         tracing::debug!(
             target: "lpm_cli::provenance_fetch",
-            url = %url,
             status = status.as_u16(),
             stage = "status",
             "attestation fetch returned non-2xx",
         );
-        return Err(());
+        return Err(FetchBundleError::Transport);
     }
 
     // Stage 1: early-reject on oversized declared Content-Length.
@@ -253,13 +403,12 @@ pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Res
     {
         tracing::debug!(
             target: "lpm_cli::provenance_fetch",
-            url = %url,
             declared_bytes = declared,
             cap_bytes = MAX_BUNDLE_BYTES,
             stage = "content_length_cap",
             "attestation bundle exceeds declared size cap",
         );
-        return Err(());
+        return Err(FetchBundleError::Transport);
     }
 
     // Stage 2: streaming bound. Initial capacity is generous enough
@@ -272,12 +421,12 @@ pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Res
         let chunk = chunk.map_err(|e| {
             tracing::debug!(
                 target: "lpm_cli::provenance_fetch",
-                url = %url,
                 error = %e,
                 buffered_bytes = buf.len(),
                 stage = "chunk",
                 "attestation body chunk read error",
             );
+            FetchBundleError::Transport
         })?;
         // Reject BEFORE copying the chunk into `buf`: the check is
         // `buf.len() + chunk.len()` so even a single oversized chunk
@@ -285,14 +434,13 @@ pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Res
         if buf.len().saturating_add(chunk.len()) > MAX_BUNDLE_BYTES {
             tracing::debug!(
                 target: "lpm_cli::provenance_fetch",
-                url = %url,
                 buffered_bytes = buf.len(),
                 chunk_bytes = chunk.len(),
                 cap_bytes = MAX_BUNDLE_BYTES,
                 stage = "stream_cap",
                 "attestation bundle exceeded streaming size cap",
             );
-            return Err(());
+            return Err(FetchBundleError::Transport);
         }
         buf.extend_from_slice(&chunk);
     }
@@ -304,10 +452,10 @@ pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Res
 /// AFTER cryptographic verification under [`verify_sigstore_bundle`].
 ///
 /// Failure semantics:
-/// - `Ok(snapshot)` — bundle verified end-to-end (chain + DSSE +
+/// - `Ok(evidence)` — bundle verified end-to-end (chain + DSSE +
 ///   SCT + Rekor body + SET; inclusion proof per policy). The
-///   returned snapshot is safe to cache and feed into the drift
-///   gate.
+///   raw bundle is safe to cache for later re-verification, and the
+///   returned evidence is safe to record in the lockfile.
 /// - `Err(LpmError::ProvenanceVerification(...))` — bundle bytes
 ///   were structurally present but verification rejected them.
 ///   The caller MUST surface this as a hard error (NOT degrade to
@@ -317,14 +465,57 @@ pub(crate) async fn fetch_bundle_bytes(http: &reqwest::Client, url: &str) -> Res
 /// `url` is forwarded only for the outer "verify failed" debug log
 /// so the trace stream's "which package failed how" pair stays
 /// adjacent.
-pub(crate) fn verify_bundle_or_err(body: &[u8], url: &str) -> Result<ProvenanceSnapshot, LpmError> {
-    use crate::sigstore_verify::{IdentityExpectations, VerifyOptions, verify_sigstore_bundle};
+pub(crate) fn verify_bundle_or_err(
+    body: &[u8],
+    url: &str,
+    expectation: &NpmArtifactExpectation,
+) -> Result<VerifiedNpmProvenance, LpmError> {
+    use crate::sigstore_verify::{
+        IdentityExpectations, VerifyOptions, extract_npm_subject_sha512, verify_sigstore_bundle,
+    };
     match verify_sigstore_bundle(
         body,
         &IdentityExpectations::none(),
         VerifyOptions::npm_attestation(),
     ) {
-        Ok(verified) => Ok(verified.snapshot),
+        Ok(verified) => {
+            let (subject_name, subject_sha512) =
+                extract_npm_subject_sha512(body).map_err(|error| {
+                    LpmError::ProvenanceVerification(format!(
+                        "verified bundle has invalid npm subject: {error}"
+                    ))
+                })?;
+            if subject_name != expectation.subject_name {
+                return Err(LpmError::ProvenanceVerification(format!(
+                    "attestation subject {subject_name:?} does not match package {:?}",
+                    expectation.subject_name
+                )));
+            }
+            if subject_sha512 != expectation.subject_sha512 {
+                return Err(LpmError::ProvenanceVerification(format!(
+                    "attestation subject digest does not match the package tarball for {}",
+                    expectation.subject_name
+                )));
+            }
+            let integrated_time_secs = verified
+                .integrated_time
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| {
+                    LpmError::ProvenanceVerification(format!(
+                        "attestation integrated time predates the Unix epoch: {error}"
+                    ))
+                })?
+                .as_secs();
+            Ok(VerifiedNpmProvenance {
+                snapshot: verified.snapshot,
+                subject_name,
+                subject_sha512,
+                integrated_time_secs,
+                log_id: verified.log_id,
+                log_index: verified.log_index,
+                bundle_sha256: format!("sha256-{}", hex::encode(Sha256::digest(body))),
+            })
+        }
         Err(verify_err) => {
             tracing::debug!(
                 target: "lpm_cli::provenance_fetch",
@@ -346,10 +537,16 @@ pub(crate) fn verify_bundle_or_err(body: &[u8], url: &str) -> Result<ProvenanceS
 /// [`verify_bundle_or_err`] so HTTP and verification can be timed
 /// independently.
 #[cfg(test)]
-async fn fetch_and_parse(http: &reqwest::Client, url: &str) -> Result<ProvenanceSnapshot, ()> {
-    let buf = fetch_bundle_bytes(http, url).await?;
-    let _ = url;
+async fn fetch_and_parse(
+    http: &ProvenanceHttpClient,
+    registry_url: &str,
+    url: &str,
+) -> Result<ProvenanceSnapshot, FetchBundleError> {
+    let policy = AttestationUrlPolicy::for_registry(registry_url)
+        .map_err(|error| FetchBundleError::Policy(error.to_string()))?;
+    let buf = fetch_bundle_bytes(http, url, &policy).await?;
     parse_sigstore_bundle(&buf)
+        .map_err(|()| FetchBundleError::Policy("attestation bundle failed to parse".into()))
 }
 
 /// Legacy identity-only Sigstore-bundle parser. The production
@@ -615,7 +812,7 @@ fn parse_github_actions_uri(uri: &str) -> Option<SanIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provenance_fetch::fetch_provenance_snapshot;
+    use crate::provenance_fetch::{ProvenanceFetchRequest, fetch_provenance_snapshot};
     use lpm_registry::AttestationRef;
     use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
 
@@ -1026,29 +1223,86 @@ mod tests {
 
     // ── Cache round-trip ─────────────────────────────────────────
 
-    fn fresh_snapshot() -> ProvenanceSnapshot {
-        ProvenanceSnapshot {
-            present: true,
-            publisher: Some("github:axios/axios".into()),
-            workflow_path: Some(".github/workflows/publish.yml".into()),
-            workflow_ref: Some("refs/tags/v1.14.0".into()),
-            attestation_cert_sha256: Some("sha256-abc".into()),
-        }
+    const AXIOS_INTEGRITY: &str = "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==";
+
+    fn axios_bundle() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json")
+    }
+
+    fn axios_expectation() -> NpmArtifactExpectation {
+        NpmArtifactExpectation::from_package("axios", "1.14.0", Some(AXIOS_INTEGRITY)).unwrap()
+    }
+
+    fn pkg_expectation() -> NpmArtifactExpectation {
+        NpmArtifactExpectation::from_package(
+            "pkg",
+            "1.0.0",
+            Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="),
+        )
+        .unwrap()
+    }
+
+    fn raw_cache_entry(cached_at_secs: u64, bundle: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(CACHE_HEADER_BYTES + bundle.len());
+        bytes.extend_from_slice(CACHE_MAGIC);
+        bytes.extend_from_slice(&cached_at_secs.to_le_bytes());
+        bytes.extend_from_slice(bundle);
+        bytes
     }
 
     #[test]
     fn cache_write_read_round_trips_within_ttl() {
         let dir = tempfile::tempdir().unwrap();
-        let snap = fresh_snapshot();
-        write_cache(dir.path(), "@lpm.dev/acme.widget", "1.0.0", &snap).unwrap();
-        let got = read_cache(dir.path(), "@lpm.dev/acme.widget", "1.0.0").unwrap();
-        assert_eq!(got, Some(snap));
+        write_cache(dir.path(), "axios", "1.14.0", axios_bundle()).unwrap();
+
+        let got = read_cache(dir.path(), "axios", "1.14.0", &axios_expectation()).unwrap();
+
+        assert_eq!(
+            got.expect("fresh authentic bundle must hit").subject_name,
+            "pkg:npm/axios@1.14.0"
+        );
+    }
+
+    #[test]
+    fn cache_entry_is_missed_when_expected_tarball_digest_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache(dir.path(), "axios", "1.14.0", axios_bundle()).unwrap();
+        let expectation = NpmArtifactExpectation::from_package(
+            "axios",
+            "1.14.0",
+            Some("sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg=="),
+        )
+        .unwrap();
+
+        let got = read_cache(dir.path(), "axios", "1.14.0", &expectation).unwrap();
+
+        assert_eq!(got, None, "cache binding must include the tarball digest");
+    }
+
+    #[test]
+    fn cache_rejects_locally_forged_verified_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache(dir.path(), "axios", "1.14.0", axios_bundle()).unwrap();
+        let path = dir.path().join(cache_filename("axios", "1.14.0"));
+        let mut entry = std::fs::read(&path).unwrap();
+        let last = entry
+            .last_mut()
+            .expect("cache entry contains a Sigstore bundle");
+        *last ^= 1;
+        std::fs::write(&path, entry).unwrap();
+
+        let got = read_cache(dir.path(), "axios", "1.14.0", &axios_expectation()).unwrap();
+
+        assert_eq!(
+            got, None,
+            "cache evidence must be reverified rather than trusted as derived data"
+        );
     }
 
     #[test]
     fn cache_miss_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let got = read_cache(dir.path(), "missing", "0.0.0").unwrap();
+        let got = read_cache(dir.path(), "missing", "0.0.0", &pkg_expectation()).unwrap();
         assert_eq!(got, None);
     }
 
@@ -1058,10 +1312,10 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(
             dir.path().join(cache_filename("pkg", "1.0.0")),
-            b"not json at all",
+            b"not a provenance cache entry",
         )
         .unwrap();
-        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        let got = read_cache(dir.path(), "pkg", "1.0.0", &pkg_expectation()).unwrap();
         assert_eq!(got, None, "corrupt cache must degrade to miss, not error");
     }
 
@@ -1075,13 +1329,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
         let path = dir.path().join(cache_filename("pkg", "1.0.0"));
-        // 2 MiB > the 1 MiB cap. The bytes deliberately look like
-        // valid JSON prefix to prove the size check fires *before* the
-        // parser runs.
-        let mut payload = b"{\"version\":1,\"cached_at_secs\":0,\"snapshot\":".to_vec();
-        payload.extend(std::iter::repeat_n(b'a', 2 * 1024 * 1024));
+        let payload = vec![b'a'; 2 * 1024 * 1024];
         std::fs::write(&path, &payload).unwrap();
-        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        let got = read_cache(dir.path(), "pkg", "1.0.0", &pkg_expectation()).unwrap();
         assert_eq!(
             got, None,
             "oversized cache file must degrade to miss, not OOM the install",
@@ -1096,23 +1346,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_schema_version_mismatch_treated_as_miss() {
+    fn cache_legacy_schema_treated_as_miss() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
         let bad = serde_json::json!({
-            "version": CACHE_SCHEMA_VERSION + 1,
+            "version": 3,
             "cached_at_secs": current_epoch_secs(),
-            "snapshot": fresh_snapshot(),
+            "evidence": {
+                "subject_name": "pkg:npm/pkg@1.0.0",
+                "subject_sha512": "00"
+            },
         });
         std::fs::write(
             dir.path().join(cache_filename("pkg", "1.0.0")),
             bad.to_string(),
         )
         .unwrap();
-        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        let got = read_cache(dir.path(), "pkg", "1.0.0", &pkg_expectation()).unwrap();
         assert_eq!(
             got, None,
-            "future-version cache entries must be treated as misses",
+            "derived-evidence cache entries must be treated as misses",
         );
     }
 
@@ -1120,18 +1373,15 @@ mod tests {
     fn cache_stale_entry_past_ttl_treated_as_miss() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
-        // Write an entry whose `cached_at_secs` is older than TTL.
-        let stale = CacheEntry {
-            version: CACHE_SCHEMA_VERSION,
-            cached_at_secs: current_epoch_secs().saturating_sub(CACHE_TTL_SECS + 1),
-            snapshot: fresh_snapshot(),
-        };
         std::fs::write(
-            dir.path().join(cache_filename("pkg", "1.0.0")),
-            serde_json::to_vec(&stale).unwrap(),
+            dir.path().join(cache_filename("axios", "1.14.0")),
+            raw_cache_entry(
+                current_epoch_secs().saturating_sub(CACHE_TTL_SECS + 1),
+                axios_bundle(),
+            ),
         )
         .unwrap();
-        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        let got = read_cache(dir.path(), "axios", "1.14.0", &axios_expectation()).unwrap();
         assert_eq!(got, None);
     }
 
@@ -1140,9 +1390,9 @@ mod tests {
         // Cache root doesn't exist yet — write_cache must create it.
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a/b/c/attestations");
-        write_cache(&nested, "pkg", "1.0.0", &fresh_snapshot()).unwrap();
+        write_cache(&nested, "axios", "1.14.0", axios_bundle()).unwrap();
         assert!(nested.exists());
-        let got = read_cache(&nested, "pkg", "1.0.0").unwrap();
+        let got = read_cache(&nested, "axios", "1.14.0", &axios_expectation()).unwrap();
         assert!(got.is_some());
     }
 
@@ -1169,31 +1419,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_schema_v1_entry_treated_as_miss_under_v2_verification_posture() {
-        // schema bump pin: an on-disk entry with the
-        // pre-verification schema version (1) must be treated as a
-        // miss by the new code, even if the JSON is structurally
-        // valid. Without this invalidation, the new verifier would
-        // silently return a snapshot produced by the LEGACY
-        // identity-only parser — defeating the entire verifier
-        // wire-in.
+    fn cache_entry_without_artifact_binding_is_treated_as_miss() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
         let stale = serde_json::json!({
-            "version": 1u32,
+            "version": 2u32,
             "cached_at_secs": current_epoch_secs(),
-            "snapshot": fresh_snapshot(),
+            "snapshot": {
+                "present": true,
+                "publisher": "github:axios/axios"
+            },
         });
         std::fs::write(
             dir.path().join(cache_filename("pkg", "1.0.0")),
             stale.to_string(),
         )
         .unwrap();
-        let got = read_cache(dir.path(), "pkg", "1.0.0").unwrap();
+        let got = read_cache(dir.path(), "pkg", "1.0.0", &pkg_expectation()).unwrap();
         assert_eq!(
             got, None,
-            "schema-1 (legacy identity-only) entries must be invalidated under schema-2 \
-             (post-verification) — accepting them would defeat the verifier wire-in"
+            "cache entries verified without artifact binding must be invalidated"
         );
     }
 
@@ -1223,9 +1468,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = ProvenanceHttpClient::build().unwrap();
         let url = format!("{}/att", server.uri());
-        let snap = fetch_and_parse(&http, &url).await.unwrap();
+        let snap = fetch_and_parse(&http, &server.uri(), &url).await.unwrap();
         assert!(snap.present);
         assert_eq!(snap.publisher.as_deref(), Some("github:axios/axios"));
     }
@@ -1238,7 +1483,7 @@ mod tests {
     /// wiremock by default sends a truthful `Content-Length`, so
     /// this case exercises the stage-1 pre-stream check. A
     /// chunked-transfer variant would hit stage 2; both stages
-    /// reject with the same `Err(())` sentinel, so a single test
+    /// reject with the same transport error, so a single test
     /// covers the user-visible contract.
     #[tokio::test]
     async fn fetch_and_parse_rejects_oversized_body() {
@@ -1256,9 +1501,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = ProvenanceHttpClient::build().unwrap();
         let url = format!("{}/att", server.uri());
-        let result = fetch_and_parse(&http, &url).await;
+        let result = fetch_and_parse(&http, &server.uri(), &url).await;
         assert!(
             result.is_err(),
             "oversized body (2 MiB > 1 MiB cap) must be rejected"
@@ -1284,22 +1529,31 @@ mod tests {
             .await;
 
         let cache = tempfile::tempdir().unwrap();
-        let http = reqwest::Client::new();
+        let http = ProvenanceHttpClient::build().unwrap();
         let att = AttestationRef {
             url: Some(format!("{}/att", server.uri())),
             provenance: None,
         };
-        let result =
-            fetch_provenance_snapshot(&http, cache.path(), "pkg", "1.0.0", Some(&att), None)
-                .await
-                .unwrap();
+        let result = fetch_provenance_snapshot(
+            &http,
+            cache.path(),
+            ProvenanceFetchRequest::new(
+                &server.uri(),
+                "pkg",
+                "1.0.0",
+                Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="),
+                Some(&att),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result, None,
             "oversized body must degrade to unknown (Ok(None))"
         );
-        let cached = read_cache(cache.path(), "pkg", "1.0.0").unwrap();
-        assert_eq!(
-            cached, None,
+        assert!(
+            !cache.path().join(cache_filename("pkg", "1.0.0")).exists(),
             "oversized-body rejection must not write a poisoned cache entry"
         );
     }
@@ -1345,9 +1599,10 @@ mod tests {
             }
         });
 
-        let http = reqwest::Client::new();
+        let http = ProvenanceHttpClient::build().unwrap();
         let url = format!("http://{addr}/");
-        let result = fetch_and_parse(&http, &url).await;
+        let registry_url = format!("http://{addr}");
+        let result = fetch_and_parse(&http, &registry_url, &url).await;
         assert!(
             result.is_err(),
             "declared Content-Length > cap must reject pre-stream",

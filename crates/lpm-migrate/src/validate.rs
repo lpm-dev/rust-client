@@ -270,6 +270,7 @@ mod tests {
             importers: lpm_lockfile::ImporterSnapshots::new(),
             patches: lpm_lockfile::LockfilePatches::new(),
             catalogs: lpm_lockfile::CatalogSnapshots::new(),
+            provenance: std::collections::BTreeMap::new(),
             packages,
             root_aliases: std::collections::BTreeMap::new(),
             ambient_peer_installs: Vec::new(),

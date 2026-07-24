@@ -847,6 +847,7 @@ mod tests {
             },
             importers: Default::default(),
             patches: Default::default(),
+            provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
@@ -981,6 +982,7 @@ mod tests {
             },
             importers: Default::default(),
             patches: Default::default(),
+            provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
@@ -1023,6 +1025,7 @@ mod tests {
             },
             importers: Default::default(),
             patches: Default::default(),
+            provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
@@ -1062,6 +1065,7 @@ mod tests {
             },
             importers: Default::default(),
             patches: Default::default(),
+            provenance: Default::default(),
             packages: vec![],
             catalogs: Default::default(),
             root_aliases: Default::default(),

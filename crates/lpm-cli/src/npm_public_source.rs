@@ -97,6 +97,7 @@ mod tests {
             importers: Default::default(),
             patches: Default::default(),
             catalogs: Default::default(),
+            provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "ms".into(),
                 version: "2.1.3".into(),

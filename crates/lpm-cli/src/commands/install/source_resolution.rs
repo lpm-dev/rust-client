@@ -414,13 +414,20 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
 /// granularity in the type system wasn't realized in practice.
 ///
 /// Resolution order matches [`RouteTable::route_for_package`]:
-/// - `@lpm.dev/*` → `"https://lpm.dev"` (LPM Worker, by invariant)
+/// - `@lpm.dev/*` → the active client's LPM registry URL
 /// - npmrc-mapped (scope-mapped or default-registry) → `target.base_url`
-/// - Otherwise → `"https://registry.npmjs.org"` (NpmDirect / Proxy)
-pub(super) fn registry_source_url_for(name: &str, route_table: &RouteTable) -> String {
+/// - Otherwise → the active client's npm registry URL, including when
+///   the LPM Worker is the selected transport proxy
+pub(super) fn registry_source_url_for(
+    name: &str,
+    route_table: &RouteTable,
+    client: &RegistryClient,
+) -> String {
     match route_table.route_for_package(name) {
-        UpstreamRoute::LpmWorker => "https://lpm.dev".to_string(),
-        UpstreamRoute::NpmDirect => "https://registry.npmjs.org".to_string(),
+        UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => client.base_url().to_string(),
+        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => {
+            client.npm_registry_url().to_string()
+        }
         UpstreamRoute::Custom { target, .. } => target.base_url.as_ref().to_string(),
     }
 }

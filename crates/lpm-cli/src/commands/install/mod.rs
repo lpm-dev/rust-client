@@ -726,6 +726,7 @@ async fn run_with_options_under_store_lock(
         current_patch_fingerprint,
         current_lockfile_patches,
         current_importer_snapshot,
+        prior_verified_provenance,
     } = validate_install_lockfile_state(LockfileValidationInput {
         project_dir,
         lockfile_path: &lockfile_path,
@@ -1189,6 +1190,7 @@ async fn run_with_options_under_store_lock(
         )
         .await?;
     }
+    let lockfile_provenance = prior_verified_provenance;
 
     let OnlineFetchPhaseResult {
         packages,
@@ -1213,6 +1215,7 @@ async fn run_with_options_under_store_lock(
         publish_ages,
         min_release_age_secs,
         install_provenance_status_map,
+        verified_provenance_for_lockfile,
         fresh_urls,
     } = run_online_fetch_phase(OnlineFetchPhaseInput {
         start,
@@ -1231,6 +1234,8 @@ async fn run_with_options_under_store_lock(
         spec_tracker,
         gate_stats: gate_stats.clone(),
         current_patches: &current_patches,
+        lockfile_provenance: &lockfile_provenance,
+        trust_no_downgrade: resolver_trust_policy.is_no_downgrade(),
         used_lockfile,
         lockfile_peer_context_authoritative,
         force,
@@ -1530,6 +1535,7 @@ async fn run_with_options_under_store_lock(
         applied_overrides: &applied_overrides,
         current_lockfile_patches: &current_lockfile_patches,
         current_importer_snapshot: &current_importer_snapshot,
+        verified_provenance: &verified_provenance_for_lockfile,
         frozen_lockfile_active,
         fast_path_lockfile,
         fresh_urls: &fresh_urls,

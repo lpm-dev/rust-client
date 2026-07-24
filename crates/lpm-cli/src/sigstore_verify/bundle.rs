@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 use x509_parser::prelude::*;
 
-use super::rekor_set::parse_integrated_time;
+use super::rekor_set::{parse_integrated_time, parse_log_index};
 use super::sct::der_decode_length;
 use super::{
     FulcioRoot, RekorInclusionProofPolicy, TrustRoot, VerifyError, trust_root, verify_cert_chain,
@@ -87,8 +87,8 @@ impl IdentityExpectations {
 /// The structured result of a successful bundle verification.
 /// `snapshot` carries the per-package identity for the drift gate;
 /// the trail of `integrated_time`, `leaf_cert_sha256`, `log_id`,
-/// `log_index` is the audit pin recorded into the on-disk
-/// provenance cache (`CACHE_SCHEMA_VERSION = 2`).
+/// and `log_index` becomes verified lockfile evidence. The cache
+/// stores the raw bundle so every hit can re-run these checks.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct VerifiedProvenance {
@@ -128,6 +128,7 @@ pub fn verify_sigstore_bundle(
     let trust = trust_root()?;
 
     let at_time = parse_integrated_time(&components.tlog_entry.integrated_time)?;
+    let log_index = parse_log_index(&components.tlog_entry.log_index)?;
 
     // SET first — its successful run also doubles as a sanity check
     // that the trust root carries an active Rekor key for the log
@@ -224,7 +225,6 @@ pub fn verify_sigstore_bundle(
         "sha256-{}",
         hex::encode(Sha256::digest(&components.leaf_cert_der))
     );
-    let log_index = components.tlog_entry.log_index.parse::<i64>().unwrap_or(-1);
     let snapshot = build_provenance_snapshot(&leaf_parsed, &leaf_cert_sha256);
 
     Ok(VerifiedProvenance {
@@ -385,6 +385,18 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
 ///
 /// Returns `(subject_name, subject_sha256)`. Hex digest is lowercase.
 pub(crate) fn extract_in_toto_subject_digest(body: &[u8]) -> Result<(String, String), VerifyError> {
+    extract_in_toto_subject_digest_for_algorithm(body, "sha256", false)
+}
+
+pub(crate) fn extract_npm_subject_sha512(body: &[u8]) -> Result<(String, String), VerifyError> {
+    extract_in_toto_subject_digest_for_algorithm(body, "sha512", true)
+}
+
+fn extract_in_toto_subject_digest_for_algorithm(
+    body: &[u8],
+    algorithm: &str,
+    require_exactly_one_subject: bool,
+) -> Result<(String, String), VerifyError> {
     let components = parse_bundle_components(body)?;
     let payload_bytes = BASE64
         .decode(components.dsse_envelope.payload.as_bytes())
@@ -398,6 +410,12 @@ pub(crate) fn extract_in_toto_subject_digest(body: &[u8]) -> Result<(String, Str
         .ok_or_else(|| {
             VerifyError::BundleParse("in-toto statement has no `subject` array".into())
         })?;
+    if require_exactly_one_subject && subjects.len() != 1 {
+        return Err(VerifyError::BundleParse(format!(
+            "in-toto statement must contain exactly one subject, got {}",
+            subjects.len()
+        )));
+    }
     let subject = subjects
         .first()
         .ok_or_else(|| VerifyError::BundleParse("in-toto statement `subject` is empty".into()))?;
@@ -409,18 +427,18 @@ pub(crate) fn extract_in_toto_subject_digest(body: &[u8]) -> Result<(String, Str
             VerifyError::BundleParse("in-toto statement subject[0] has no string `name`".into())
         })?
         .to_string();
-    let digest_sha256 = subject
+    let digest = subject
         .get("digest")
-        .and_then(|d| d.get("sha256"))
+        .and_then(|d| d.get(algorithm))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            VerifyError::BundleParse(
-                "in-toto statement subject[0].digest.sha256 missing or not a string".into(),
-            )
+            VerifyError::BundleParse(format!(
+                "in-toto statement subject[0].digest.{algorithm} missing or not a string"
+            ))
         })?
         .to_ascii_lowercase();
 
-    Ok((name, digest_sha256))
+    Ok((name, digest))
 }
 
 /// Find the SPKI DER of the leaf cert's immediate issuer. Tries:

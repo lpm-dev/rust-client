@@ -3456,6 +3456,47 @@ fn verifies_real_npm_attestation_for_axios_1_14_0() {
     );
 }
 
+#[test]
+fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value =
+        serde_json::from_slice(&body).expect("fixture must be valid JSON");
+    let mut changed_entries = 0;
+    for attestation in root["attestations"]
+        .as_array_mut()
+        .expect("npm wrapper must contain attestations")
+    {
+        let Some(entries) =
+            attestation["bundle"]["verificationMaterial"]["tlogEntries"].as_array_mut()
+        else {
+            continue;
+        };
+        for entry in entries {
+            entry
+                .as_object_mut()
+                .expect("tlog entry must be an object")
+                .remove("inclusionPromise");
+            entry["logIndex"] = serde_json::json!("not-an-index");
+            changed_entries += 1;
+        }
+    }
+    assert!(changed_entries > 0, "fixture must contain tlog entries");
+    let body = serde_json::to_vec(&root).expect("serialize modified fixture");
+
+    let error = verify_sigstore_bundle(
+        &body,
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+    )
+    .expect_err("a verified proof still requires a valid outer Rekor log index");
+    match error {
+        VerifyError::RekorSet(message) => {
+            assert!(message.contains("logIndex"), "unexpected error: {message}");
+        }
+        other => panic!("expected a Rekor log-index error, got {other:?}"),
+    }
+}
+
 /// Same fixture, but assert the bundle exercises the v0.3
 /// single-cert wire shape inside the npm wrapper. npm currently
 /// ships its SLSA provenance attestation in this shape; if it

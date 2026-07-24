@@ -531,6 +531,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     &resolve_result.ambient_peer_installs,
                     &resolve_result.cache,
                     &route_table,
+                    arc_client.as_ref(),
                     all_workspace_members,
                     project_dir,
                 );
