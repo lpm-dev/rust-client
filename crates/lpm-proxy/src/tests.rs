@@ -849,7 +849,7 @@ async fn route_lease_release_removes_registered_routes() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn route_lease_release_uses_connection_backed_control_stream() {
+async fn route_lease_replaces_and_releases_routes_on_its_control_stream() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("proxy.sock");
     let state_path = dir.path().join("proxy.json");
@@ -870,6 +870,19 @@ async fn route_lease_release_uses_connection_backed_control_stream() {
         connection: Some(LeaseConnection::Unix(stream)),
         socket_path: Some(socket_path.clone()),
     };
+
+    lease
+        .replace_routes(vec![route("app.localhost", 4000)])
+        .await
+        .unwrap();
+    let listed = send_request_to_path(&socket_path, ProxyRequest::List)
+        .await
+        .unwrap();
+    let ProxyResponse::Routes { routes } = listed else {
+        panic!("expected proxy routes after replacement");
+    };
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].upstream_port, 4000);
 
     let removed = lease.release().await.unwrap();
 
@@ -1106,6 +1119,80 @@ async fn http_proxy_routes_registered_host_to_upstream() {
 }
 
 #[tokio::test]
+async fn http_frontend_forwards_any_local_host_to_the_resolved_upstream() {
+    let upstream_port = spawn_echo_upstream().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port);
+    let frontend = start_http_frontend_on_listener(listener, upstream).unwrap();
+
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/network", frontend.port()))
+        .header("host", format!("192.0.2.10:{}", frontend.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("GET /network"));
+    assert!(body.contains("proto=http"));
+    frontend.shutdown();
+}
+
+#[tokio::test]
+async fn http_frontend_switches_to_a_republished_child_endpoint() {
+    let upstream_port = spawn_echo_upstream().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let initial = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port)
+        .with_base_path("/before");
+    let frontend = start_http_frontend_on_listener(listener, initial).unwrap();
+    let url = format!("http://127.0.0.1:{}/check", frontend.port());
+
+    let before = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    frontend
+        .update_upstream(
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port)
+                .with_base_path("/after"),
+        )
+        .unwrap();
+    let after = reqwest::get(&url).await.unwrap().text().await.unwrap();
+
+    assert!(before.contains("GET /before/check"));
+    assert!(after.contains("GET /after/check"));
+    frontend.shutdown();
+}
+
+#[tokio::test]
+async fn http_frontend_forwards_to_an_ipv6_loopback_upstream() {
+    use axum::Router;
+    use axum::routing::any;
+
+    let upstream_listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(any(echo_upstream));
+    tokio::spawn(async move {
+        axum::serve(upstream_listener, app).await.unwrap();
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = lpm_common::LocalTarget {
+        scheme: lpm_common::LocalScheme::Http,
+        address: std::net::Ipv6Addr::LOCALHOST.into(),
+        port: upstream_port,
+        base_path: "/".to_string(),
+    };
+    let frontend = start_http_frontend_on_listener(listener, upstream).unwrap();
+
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/ipv6", frontend.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    frontend.shutdown();
+}
+
+#[tokio::test]
 async fn http_proxy_rejects_unknown_host_without_open_proxy_fallback() {
     let registry = Arc::new(tokio::sync::Mutex::new(RouteRegistry::new()));
     let proxy = start_http_proxy(Arc::clone(&registry), 0).await.unwrap();
@@ -1212,6 +1299,38 @@ async fn tls_proxy_routes_registered_host_to_upstream_and_marks_https() {
         )
     );
     proxy.shutdown();
+}
+
+#[tokio::test]
+async fn tls_frontend_terminates_https_for_a_plain_http_upstream() {
+    let project = tempfile::tempdir().unwrap();
+    write_project_cert(project.path(), &["localhost"]);
+    let upstream_port = spawn_echo_upstream().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cert_dir = project.path().join(".lpm").join("certs");
+    let frontend = start_tls_frontend_on_listener(
+        listener,
+        &cert_dir.join("cert.pem"),
+        &cert_dir.join("key.pem"),
+        lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port),
+    )
+    .await
+    .unwrap();
+
+    let response = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("https://localhost:{}/secure", frontend.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("GET /secure"));
+    assert!(body.contains("proto=https"));
+    frontend.shutdown();
 }
 
 #[tokio::test]

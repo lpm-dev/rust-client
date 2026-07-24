@@ -23,6 +23,16 @@ impl RouteLease {
         self.lease_id
     }
 
+    pub async fn replace_routes(&mut self, routes: Vec<Route>) -> Result<(), ProxyError> {
+        let lease_id = self.lease_id.ok_or_else(|| {
+            ProxyError::RequestRejected("proxy route lease is no longer active".to_string())
+        })?;
+        if let Some(connection) = self.connection.as_mut() {
+            return replace_lease_on_connection(connection, lease_id, routes).await;
+        }
+        self.replace_via_endpoint(lease_id, routes).await
+    }
+
     pub async fn release(&mut self) -> Result<usize, ProxyError> {
         let Some(lease_id) = self.lease_id else {
             return Ok(0);
@@ -67,6 +77,22 @@ impl RouteLease {
             return release_lease_to_pipe(pipe_name, lease_id).await;
         }
         release_lease(lease_id).await
+    }
+
+    async fn replace_via_endpoint(
+        &self,
+        lease_id: RouteLeaseId,
+        routes: Vec<Route>,
+    ) -> Result<(), ProxyError> {
+        #[cfg(unix)]
+        if let Some(socket_path) = self.socket_path.as_deref() {
+            return replace_lease_to_path(socket_path, lease_id, routes).await;
+        }
+        #[cfg(windows)]
+        if let Some(pipe_name) = self.pipe_name.as_deref() {
+            return replace_lease_to_pipe(pipe_name, lease_id, routes).await;
+        }
+        replace_lease(lease_id, routes).await
     }
 }
 
@@ -144,6 +170,16 @@ pub(crate) async fn release_lease(lease_id: RouteLeaseId) -> Result<usize, Proxy
     }
 }
 
+async fn replace_lease(lease_id: RouteLeaseId, routes: Vec<Route>) -> Result<(), ProxyError> {
+    match send_request(ProxyRequest::Replace { lease_id, routes }).await? {
+        ProxyResponse::Replaced => Ok(()),
+        ProxyResponse::Error { message } => Err(ProxyError::RequestRejected(message)),
+        other => Err(ProxyError::IpcProtocol(format!(
+            "expected replace response, got {other:?}"
+        ))),
+    }
+}
+
 #[cfg(unix)]
 pub(crate) async fn release_lease_to_path(
     socket_path: &Path,
@@ -158,6 +194,21 @@ pub(crate) async fn release_lease_to_path(
     }
 }
 
+#[cfg(unix)]
+async fn replace_lease_to_path(
+    socket_path: &Path,
+    lease_id: RouteLeaseId,
+    routes: Vec<Route>,
+) -> Result<(), ProxyError> {
+    match send_request_to_path(socket_path, ProxyRequest::Replace { lease_id, routes }).await? {
+        ProxyResponse::Replaced => Ok(()),
+        ProxyResponse::Error { message } => Err(ProxyError::RequestRejected(message)),
+        other => Err(ProxyError::IpcProtocol(format!(
+            "expected replace response, got {other:?}"
+        ))),
+    }
+}
+
 #[cfg(windows)]
 pub(crate) async fn release_lease_to_pipe(
     pipe_name: &str,
@@ -168,6 +219,21 @@ pub(crate) async fn release_lease_to_pipe(
         ProxyResponse::Error { message } => Err(ProxyError::RequestRejected(message)),
         other => Err(ProxyError::IpcProtocol(format!(
             "expected release response, got {other:?}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+async fn replace_lease_to_pipe(
+    pipe_name: &str,
+    lease_id: RouteLeaseId,
+    routes: Vec<Route>,
+) -> Result<(), ProxyError> {
+    match send_request_to_pipe(pipe_name, ProxyRequest::Replace { lease_id, routes }).await? {
+        ProxyResponse::Replaced => Ok(()),
+        ProxyResponse::Error { message } => Err(ProxyError::RequestRejected(message)),
+        other => Err(ProxyError::IpcProtocol(format!(
+            "expected replace response, got {other:?}"
         ))),
     }
 }
@@ -236,6 +302,21 @@ pub(crate) async fn release_lease_on_connection(
     }
 }
 
+async fn replace_lease_on_connection(
+    connection: &mut LeaseConnection,
+    lease_id: RouteLeaseId,
+    routes: Vec<Route>,
+) -> Result<(), ProxyError> {
+    match connection {
+        #[cfg(unix)]
+        LeaseConnection::Unix(stream) => replace_lease_on_stream(stream, lease_id, routes).await,
+        #[cfg(windows)]
+        LeaseConnection::NamedPipe(client) => {
+            replace_lease_on_stream(client, lease_id, routes).await
+        }
+    }
+}
+
 pub(crate) async fn release_lease_on_stream<S>(
     stream: &mut S,
     lease_id: RouteLeaseId,
@@ -248,6 +329,23 @@ where
         ProxyResponse::Error { message } => Err(ProxyError::RequestRejected(message)),
         other => Err(ProxyError::IpcProtocol(format!(
             "expected release response, got {other:?}"
+        ))),
+    }
+}
+
+async fn replace_lease_on_stream<S>(
+    stream: &mut S,
+    lease_id: RouteLeaseId,
+    routes: Vec<Route>,
+) -> Result<(), ProxyError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match send_request_on_stream_ref(stream, ProxyRequest::Replace { lease_id, routes }).await? {
+        ProxyResponse::Replaced => Ok(()),
+        ProxyResponse::Error { message } => Err(ProxyError::RequestRejected(message)),
+        other => Err(ProxyError::IpcProtocol(format!(
+            "expected replace response, got {other:?}"
         ))),
     }
 }

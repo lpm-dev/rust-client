@@ -2071,6 +2071,24 @@ fn tunnel_tunnel_auth_flag_parses() {
 }
 
 #[test]
+fn tunnel_without_a_port_requests_active_dev_endpoint_discovery() {
+    let cli = Cli::try_parse_from(["lpm", "tunnel"]).unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Tunnel(network::TunnelArgs { action, .. }) => {
+            assert_eq!(action, "start");
+        }
+        _ => panic!("expected Tunnel command"),
+    }
+}
+
+#[test]
+fn dev_and_inspector_explicit_ports_reject_zero() {
+    assert!(Cli::try_parse_from(["lpm", "dev", "--port", "0"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "dev", "--inspect-port", "0"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "tunnel", "--inspect-port", "0"]).is_err());
+}
+
+#[test]
 fn tunnel_inspect_port_default_is_none() {
     // No `--inspect-port` → `None` → call site auto-picks via bind(0).
     // Distinguishing "user didn't pass" from "user passed 4400" is the

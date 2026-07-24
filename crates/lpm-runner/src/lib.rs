@@ -21,6 +21,8 @@
 
 pub mod bin_path;
 pub mod dag;
+pub mod dev_endpoint;
+pub mod dev_session;
 pub mod dlx;
 pub mod dotenv;
 pub mod exec;

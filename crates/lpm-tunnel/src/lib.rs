@@ -1,7 +1,7 @@
-//! WebSocket tunnel client for exposing localhost to the internet via LPM.
+//! WebSocket tunnel client for exposing a verified local endpoint via LPM.
 //!
 //! Connects to the LPM tunnel relay service, which assigns a public URL
-//! (e.g., `https://acme-api.lpm.llc`) and proxies HTTP requests to the local port.
+//! (e.g., `https://acme-api.lpm.llc`) and proxies HTTP requests to the endpoint.
 //!
 //! Supports multiple base domains (lpm.fyi, lpm.llc).
 //! Free users get ephemeral random domains on lpm.fyi.
@@ -25,6 +25,29 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use relay::resolve_relay_url;
+
+pub(crate) fn validate_forward_target(
+    target: &lpm_common::LocalTarget,
+) -> Result<(), lpm_common::LpmError> {
+    if target.port == 0 {
+        return Err(lpm_common::LpmError::Tunnel(
+            "local target port must be between 1 and 65535".to_string(),
+        ));
+    }
+    if !target.is_loopback() {
+        return Err(lpm_common::LpmError::Tunnel(format!(
+            "refusing to forward a tunnel to non-loopback target {}",
+            target.url()
+        )));
+    }
+    if target.scheme == lpm_common::LocalScheme::Https {
+        return Err(lpm_common::LpmError::Tunnel(
+            "tunnels and webhook replay require a plain HTTP child endpoint; disable framework HTTPS and let LPM terminate TLS with `lpm dev --https`"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Plan and relay limits advertised by the tunnel service.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,7 +116,7 @@ pub struct TunnelSession {
     pub domain: String,
     /// Session ID for reconnection.
     pub session_id: String,
-    /// Local port being tunneled.
+    /// Local endpoint port being tunneled.
     pub local_port: u16,
     /// Account plan used by the relay for this session.
     pub plan: Option<String>,

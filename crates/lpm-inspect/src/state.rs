@@ -9,7 +9,7 @@ use lpm_tunnel::webhook::CapturedWebhook;
 use lpm_tunnel::webhook_buffer::WebhookBuffer;
 use lpm_tunnel::ws_capture::WsEvent;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as SyncRwLock};
 use tokio::sync::{RwLock, broadcast};
 
 /// Maximum number of requests held in the in-memory ring buffer.
@@ -48,8 +48,8 @@ struct Inner {
     ws_sse_tx: broadcast::Sender<Arc<WsEvent>>,
     /// Active session ID for tagging requests.
     session_id: RwLock<Option<String>>,
-    /// The local port being tunneled (for display purposes).
-    pub local_port: u16,
+    /// The local endpoint being tunneled and replayed.
+    local_target: SyncRwLock<lpm_common::LocalTarget>,
     /// The tunnel URL (set after connection).
     pub tunnel_url: RwLock<Option<String>>,
     /// Per-process random auth token gating every `/api/*` route — closes
@@ -70,8 +70,21 @@ fn generate_auth_token() -> String {
 }
 
 impl InspectorState {
+    /// Create inspector state whose local endpoint is not resolved yet.
+    pub fn pending() -> Self {
+        Self::new(0)
+    }
+
     /// Create a new inspector state without persistence.
     pub fn new(local_port: u16) -> Self {
+        Self::new_for_target(lpm_common::LocalTarget::loopback(
+            lpm_common::LocalScheme::Http,
+            local_port,
+        ))
+    }
+
+    /// Create in-memory inspector state for a complete local endpoint.
+    pub fn new_for_target(local_target: lpm_common::LocalTarget) -> Self {
         let (sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         let (ws_sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         Self {
@@ -82,7 +95,7 @@ impl InspectorState {
                 ws_events: RwLock::new(VecDeque::with_capacity(WS_EVENT_CAPACITY)),
                 ws_sse_tx,
                 session_id: RwLock::new(None),
-                local_port,
+                local_target: SyncRwLock::new(local_target),
                 tunnel_url: RwLock::new(None),
                 auth_token: generate_auth_token(),
             }),
@@ -91,6 +104,19 @@ impl InspectorState {
 
     /// Create a new inspector state with SQLite persistence.
     pub fn with_db(local_port: u16, db: InspectorDb) -> Self {
+        Self::with_db_for_target(
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, local_port),
+            db,
+        )
+    }
+
+    /// Create persistent inspector state whose local endpoint is not resolved yet.
+    pub fn with_db_pending(db: InspectorDb) -> Self {
+        Self::with_db(0, db)
+    }
+
+    /// Create persistent inspector state for a complete local endpoint.
+    pub fn with_db_for_target(local_target: lpm_common::LocalTarget, db: InspectorDb) -> Self {
         let (sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         let (ws_sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         Self {
@@ -101,7 +127,7 @@ impl InspectorState {
                 ws_events: RwLock::new(VecDeque::with_capacity(WS_EVENT_CAPACITY)),
                 ws_sse_tx,
                 session_id: RwLock::new(None),
-                local_port,
+                local_target: SyncRwLock::new(local_target),
                 tunnel_url: RwLock::new(None),
                 auth_token: generate_auth_token(),
             }),
@@ -169,7 +195,33 @@ impl InspectorState {
 
     /// Get the local port being tunneled.
     pub fn local_port(&self) -> u16 {
-        self.inner.local_port
+        self.local_target().port
+    }
+
+    /// Replace the replay endpoint with a plain IPv4-loopback port.
+    pub fn set_local_port(&self, local_port: u16) {
+        self.set_local_target(lpm_common::LocalTarget::loopback(
+            lpm_common::LocalScheme::Http,
+            local_port,
+        ));
+    }
+
+    /// Return the endpoint currently used for replay.
+    pub fn local_target(&self) -> lpm_common::LocalTarget {
+        self.inner
+            .local_target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replace the endpoint used for replay after child discovery completes.
+    pub fn set_local_target(&self, local_target: lpm_common::LocalTarget) {
+        *self
+            .inner
+            .local_target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = local_target;
     }
 
     /// Push a WebSocket event into the buffer and broadcast to SSE subscribers.

@@ -97,9 +97,9 @@ const SIGNATURE_HEADERS: &[&str] = &[
 pub async fn replay_with_options(
     webhook: &CapturedWebhook,
     options: &ReplayOptions,
-    default_port: u16,
+    default_target: &lpm_common::LocalTarget,
 ) -> Result<ReplayStudioResult, LpmError> {
-    let port = options.port.unwrap_or(default_port);
+    let target = replay_target(default_target, options.port)?;
 
     // Build the modified webhook for replay
     let modified = apply_modifications(webhook, options);
@@ -111,7 +111,7 @@ pub async fn replay_with_options(
         .build()
         .map_err(|e| LpmError::Tunnel(format!("failed to create replay client: {e}")))?;
 
-    let result = lpm_tunnel::webhook_replay::replay_webhook(&client, &modified, port).await?;
+    let result = lpm_tunnel::webhook_replay::replay_webhook(&client, &modified, &target).await?;
 
     // Diff the original and new response bodies
     let response_diff = diff_response_bodies(&webhook.response_body, &result.response_body);
@@ -137,13 +137,13 @@ pub async fn replay_with_options(
 pub async fn replay_sequence(
     state: &InspectorState,
     options: &SequenceReplayOptions,
-    default_port: u16,
+    default_target: &lpm_common::LocalTarget,
 ) -> Result<SequenceReplayResult, LpmError> {
-    let port = options.port.unwrap_or(default_port);
+    let target = replay_target(default_target, options.port)?;
     let delay = std::time::Duration::from_millis(options.delay_ms.unwrap_or(500));
 
     let single_opts = ReplayOptions {
-        port: Some(port),
+        port: options.port,
         path: None,
         method: None,
         headers: HashMap::new(),
@@ -161,7 +161,7 @@ pub async fn replay_sequence(
             .await
             .ok_or_else(|| LpmError::Tunnel(format!("request '{id}' not found")))?;
 
-        let result = replay_with_options(&webhook, &single_opts, port).await?;
+        let result = replay_with_options(&webhook, &single_opts, &target).await?;
         results.push(result);
 
         // Delay between requests (but not after the last one)
@@ -182,6 +182,22 @@ pub async fn replay_sequence(
         failed,
         total_duration_ms,
     })
+}
+
+fn replay_target(
+    default_target: &lpm_common::LocalTarget,
+    port_override: Option<u16>,
+) -> Result<lpm_common::LocalTarget, LpmError> {
+    let target = port_override.map_or_else(
+        || default_target.clone(),
+        |port| lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+    );
+    if target.port == 0 {
+        return Err(LpmError::Tunnel(
+            "replay port must be between 1 and 65535".to_string(),
+        ));
+    }
+    Ok(target)
 }
 
 /// Apply modifications to a webhook before replaying.
@@ -295,6 +311,15 @@ mod tests {
             body: None,
             skip_signatures: false,
         }
+    }
+
+    #[test]
+    fn replay_target_preserves_the_default_endpoint_and_rejects_port_zero() {
+        let default = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Https, 8443)
+            .with_base_path("/hooks/");
+
+        assert_eq!(replay_target(&default, None).unwrap(), default);
+        assert!(replay_target(&default, Some(0)).is_err());
     }
 
     // ── Modification tests ──────────────────────────────────

@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 #[cfg(unix)]
 use std::process::Command;
 
@@ -367,6 +368,162 @@ pub fn list_listening_ports() -> Vec<ListeningPort> {
     rows
 }
 
+pub(crate) fn descendant_process_ids(root_pid: u32) -> HashSet<u32> {
+    #[cfg(unix)]
+    {
+        descendant_process_ids_unix(root_pid)
+    }
+    #[cfg(windows)]
+    {
+        descendant_process_ids_windows(root_pid)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        HashSet::from([root_pid])
+    }
+}
+
+pub(crate) fn terminate_child_process_tree(
+    child: &mut Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    let root_pid = child.id();
+    for pid in descendant_process_ids(root_pid)
+        .into_iter()
+        .filter(|pid| *pid != root_pid)
+    {
+        let _ = kill_pid(pid);
+    }
+    let _ = child.kill();
+    child.wait()
+}
+
+#[cfg(windows)]
+fn windows_exit_code_is_active(exit_code: u32) -> bool {
+    use windows_sys::Win32::Foundation::STILL_ACTIVE;
+
+    exit_code == STILL_ACTIVE as u32
+}
+
+pub(crate) fn process_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 performs an existence/permission check and does not
+        // deliver a signal to the target process.
+        let status = unsafe { libc::kill(pid, 0) };
+        status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: the call has no input pointers; a successful owned handle is
+        // closed below after querying its exit code.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        // SAFETY: `exit_code` is writable and `handle` is live on this path.
+        let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+        // SAFETY: `handle` is a valid owned process handle.
+        unsafe {
+            CloseHandle(handle);
+        }
+        queried && windows_exit_code_is_active(exit_code)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(unix)]
+fn descendant_process_ids_unix(root_pid: u32) -> HashSet<u32> {
+    let output = match Command::new("ps").args(["-axo", "pid=,ppid="]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return HashSet::from([root_pid]),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    descendant_process_ids_from_pairs(
+        root_pid,
+        stdout.lines().filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let parent = fields.next()?.parse::<u32>().ok()?;
+            Some((pid, parent))
+        }),
+    )
+}
+
+#[cfg(windows)]
+fn descendant_process_ids_windows(root_pid: u32) -> HashSet<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    // SAFETY: the snapshot has no input pointers and is closed on every
+    // successful handle path below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return HashSet::from([root_pid]);
+    }
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut pairs = Vec::new();
+    // SAFETY: `entry.dwSize` is initialized as required by ToolHelp, and the
+    // snapshot remains open for the complete iteration.
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: same initialized entry and live snapshot as above.
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: `snapshot` is a valid owned handle on this path.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+
+    descendant_process_ids_from_pairs(root_pid, pairs)
+}
+
+pub(crate) fn descendant_process_ids_from_pairs(
+    root_pid: u32,
+    pairs: impl IntoIterator<Item = (u32, u32)>,
+) -> HashSet<u32> {
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, parent) in pairs {
+        children_by_parent.entry(parent).or_default().push(pid);
+    }
+
+    let mut descendants = HashSet::from([root_pid]);
+    let mut pending = vec![root_pid];
+    while let Some(parent) = pending.pop() {
+        if let Some(children) = children_by_parent.get(&parent) {
+            for &child in children {
+                if descendants.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    descendants
+}
+
 /// Build cross-service environment variables.
 ///
 /// For each service with a declared port, injects `{SERVICE}_URL` and `{SERVICE}_PORT`
@@ -406,7 +563,7 @@ pub fn build_cross_service_env(
 }
 
 /// Find the PID and process name using a port.
-fn find_port_owner(port: u16) -> (Option<u32>, Option<String>) {
+pub(crate) fn find_port_owner(port: u16) -> (Option<u32>, Option<String>) {
     #[cfg(target_os = "linux")]
     {
         find_port_owner_from_list(port)
@@ -1659,8 +1816,12 @@ fn read_port_overrides_from(
 
     if let Some(project) = doc.get(&project_key).and_then(|p| p.as_table()) {
         for (name, value) in project {
-            if let Some(port) = value.as_integer() {
-                result.insert(name.clone(), port as u16);
+            if let Some(port) = value
+                .as_integer()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+            {
+                result.insert(name.clone(), port);
             }
         }
     }
@@ -1761,6 +1922,21 @@ fn project_hash(project_dir: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exit_code_recognizes_still_active_value() {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+
+        assert!(windows_exit_code_is_active(STILL_ACTIVE as u32));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_liveness_rejects_pids_that_do_not_fit_positive_pid_t() {
+        assert!(!process_is_running(u32::MAX));
+        assert!(!process_is_running(0));
+    }
 
     #[test]
     fn check_port_reports_ipv6_loopback_listener_as_in_use() {
@@ -2125,6 +2301,24 @@ nTCP 127.0.0.1:6379 (LISTEN)
         allocation.write_override(&project_dir, "web", 4001);
 
         assert_eq!(allocation.read_overrides(&project_dir)["web"], 4001);
+    }
+
+    #[test]
+    fn persisted_port_overrides_reject_values_outside_the_tcp_port_range() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("my-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_key = project_hash(&project_dir);
+        let path = tmp.path().join("ports.toml");
+        std::fs::write(
+            &path,
+            format!("[{project_key}]\nwrapped = 70000\nnegative = -1\nzero = 0\nvalid = 65535\n"),
+        )
+        .unwrap();
+
+        let overrides = read_port_overrides_from(&path, &project_dir);
+
+        assert_eq!(overrides, HashMap::from([("valid".to_string(), 65535)]));
     }
 
     #[test]

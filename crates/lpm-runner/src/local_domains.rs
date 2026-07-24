@@ -1,6 +1,7 @@
 //! Local-domain route planning for the dev proxy.
 
 use crate::lpm_json::LpmJsonConfig;
+use lpm_common::LocalTarget;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -8,8 +9,8 @@ use std::path::{Path, PathBuf};
 pub struct LocalDomainRoute {
     /// Hostname requested by `lpm.json`.
     pub host: String,
-    /// Final loopback service port after conflict reassignment.
-    pub upstream_port: u16,
+    /// Verified loopback endpoint owned by the child service.
+    pub upstream: LocalTarget,
     /// Service name for multi-service routes; `None` for single-script `lpm dev`.
     pub service: Option<String>,
 }
@@ -555,10 +556,10 @@ fn parse_managed_hosts_begin(line: &str) -> Option<&str> {
     (!block_id.is_empty()).then_some(block_id)
 }
 
-/// Build route registrations for `lpm.json` services using final assigned ports.
+/// Build route registrations for `lpm.json` services using verified child endpoints.
 pub fn plan_multi_service_routes(
     config: &LpmJsonConfig,
-    final_ports: &HashMap<String, u16>,
+    final_targets: &HashMap<String, LocalTarget>,
 ) -> Result<LocalDomainRoutePlan, String> {
     let mut routes = Vec::new();
 
@@ -569,28 +570,28 @@ pub fn plan_multi_service_routes(
         let Some(host) = service.host.as_ref() else {
             continue;
         };
-        let Some(&upstream_port) = final_ports.get(service_name) else {
+        let Some(upstream) = final_targets.get(service_name) else {
             return Err(format!(
-                "service `{service_name}` declares host `{host}` but has no final assigned port"
+                "service `{service_name}` declares host `{host}` but has no verified child endpoint"
             ));
         };
         routes.push(LocalDomainRoute {
             host: host.clone(),
-            upstream_port,
+            upstream: upstream.clone(),
             service: Some(service_name.clone()),
         });
     }
 
     if let Some(proxy_host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref()) {
         let service_name = primary_proxy_service(config)?;
-        let Some(&upstream_port) = final_ports.get(service_name) else {
+        let Some(upstream) = final_targets.get(service_name) else {
             return Err(format!(
-                "proxy.host `{proxy_host}` targets service `{service_name}` but that service has no final assigned port"
+                "proxy.host `{proxy_host}` targets service `{service_name}` but that service has no verified child endpoint"
             ));
         };
         routes.push(LocalDomainRoute {
             host: proxy_host.clone(),
-            upstream_port,
+            upstream: upstream.clone(),
             service: Some(service_name.to_string()),
         });
     }
@@ -604,12 +605,12 @@ pub fn plan_multi_service_routes(
 /// Build the top-level proxy route for single-script `lpm dev`.
 pub fn plan_single_service_route(
     config: &LpmJsonConfig,
-    upstream_port: u16,
+    upstream: LocalTarget,
 ) -> Option<LocalDomainRoutePlan> {
     let proxy_host = config.proxy.as_ref()?.host.as_ref()?;
     let routes = vec![LocalDomainRoute {
         host: proxy_host.clone(),
-        upstream_port,
+        upstream,
         service: None,
     }];
     Some(LocalDomainRoutePlan {
@@ -670,7 +671,7 @@ mod tests {
     use crate::lpm_json::{LpmJsonConfig, ProxyConfig, ServiceConfig};
 
     #[test]
-    fn plan_multi_service_routes_uses_final_assigned_ports() {
+    fn plan_multi_service_routes_preserves_the_verified_child_endpoint() {
         let config = LpmJsonConfig {
             services: HashMap::from([(
                 "web".to_string(),
@@ -683,15 +684,17 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let final_ports = HashMap::from([("web".to_string(), 3001)]);
+        let upstream =
+            LocalTarget::loopback(lpm_common::LocalScheme::Http, 3001).with_base_path("/app/");
+        let final_targets = HashMap::from([("web".to_string(), upstream.clone())]);
 
-        let plan = plan_multi_service_routes(&config, &final_ports).unwrap();
+        let plan = plan_multi_service_routes(&config, &final_targets).unwrap();
 
         assert_eq!(
             plan.routes,
             vec![LocalDomainRoute {
                 host: "web.app.localhost".to_string(),
-                upstream_port: 3001,
+                upstream,
                 service: Some("web".to_string()),
             }]
         );
@@ -699,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_multi_service_routes_errors_when_host_service_has_no_final_port() {
+    fn plan_multi_service_routes_errors_when_host_service_has_no_verified_endpoint() {
         let config = LpmJsonConfig {
             services: HashMap::from([(
                 "web".to_string(),
@@ -716,7 +719,7 @@ mod tests {
         let err = plan_multi_service_routes(&config, &HashMap::new()).unwrap_err();
 
         assert!(err.contains("web"), "got {err}");
-        assert!(err.contains("final assigned port"), "got {err}");
+        assert!(err.contains("verified child endpoint"), "got {err}");
     }
 
     #[test]
@@ -747,15 +750,22 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let final_ports = HashMap::from([("web".to_string(), 3001), ("api".to_string(), 4000)]);
+        let web_target = LocalTarget::loopback(lpm_common::LocalScheme::Http, 3001);
+        let final_targets = HashMap::from([
+            ("web".to_string(), web_target.clone()),
+            (
+                "api".to_string(),
+                LocalTarget::loopback(lpm_common::LocalScheme::Http, 4000),
+            ),
+        ]);
 
-        let plan = plan_multi_service_routes(&config, &final_ports).unwrap();
+        let plan = plan_multi_service_routes(&config, &final_targets).unwrap();
 
         assert_eq!(
             plan.routes,
             vec![LocalDomainRoute {
                 host: "app.localhost".to_string(),
-                upstream_port: 3001,
+                upstream: web_target,
                 service: Some("web".to_string()),
             }]
         );
@@ -819,13 +829,14 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = plan_single_service_route(&config, 5173).unwrap();
+        let upstream = LocalTarget::loopback(lpm_common::LocalScheme::Http, 5173);
+        let plan = plan_single_service_route(&config, upstream.clone()).unwrap();
 
         assert_eq!(
             plan.routes,
             vec![LocalDomainRoute {
                 host: "app.localhost".to_string(),
-                upstream_port: 5173,
+                upstream,
                 service: None,
             }]
         );

@@ -26,9 +26,9 @@ pub struct ReplayResult {
 
 /// Validate that a path is safe to use in a replay URL.
 ///
-/// Prevents SSRF attacks where a crafted path like `@evil.com/path` would make
-/// `http://localhost:3000@evil.com/path` resolve to `evil.com` (localhost becomes
-/// the userinfo). Also rejects `//` which could be interpreted as authority.
+/// Prevents SSRF attacks where a crafted path like `@evil.com/path` could turn
+/// the verified loopback authority into URL userinfo. Also rejects `//`, which
+/// could be interpreted as an authority.
 fn is_safe_replay_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.starts_with("//")
@@ -39,18 +39,19 @@ fn is_safe_replay_path(path: &str) -> bool {
 
 /// Replay a captured webhook against the local dev server.
 ///
-/// Sends the original request (method, path, headers, body) to
-/// `localhost:{local_port}`. Headers like `host`, `content-length`,
-/// and `transfer-encoding` are excluded since they are hop-by-hop
-/// or will be set by the HTTP client automatically.
+/// Sends the original request (method, path, headers, body) to the complete
+/// verified loopback endpoint. Headers like `host`, `content-length`, and
+/// `transfer-encoding` are excluded since they are hop-by-hop or will be set by
+/// the HTTP client automatically.
 ///
 /// Accepts a shared `reqwest::Client` to avoid creating a new client per replay
 /// (connection pool reuse, TLS session caching, etc.).
 pub async fn replay_webhook(
     client: &reqwest::Client,
     webhook: &CapturedWebhook,
-    local_port: u16,
+    local_target: &lpm_common::LocalTarget,
 ) -> Result<ReplayResult, LpmError> {
+    crate::validate_forward_target(local_target)?;
     if !is_safe_replay_path(&webhook.path) {
         return Err(LpmError::Tunnel(format!(
             "unsafe replay path rejected: {:?}",
@@ -58,7 +59,13 @@ pub async fn replay_webhook(
         )));
     }
 
-    let url = format!("http://localhost:{local_port}{}", webhook.path);
+    let path = local_target.upstream_path(&webhook.path);
+    let url = format!(
+        "{}://{}{}",
+        local_target.scheme,
+        local_target.authority(),
+        path
+    );
     let method: reqwest::Method = webhook
         .method
         .parse()
@@ -170,6 +177,33 @@ mod tests {
         assert!(result.status >= 400);
     }
 
+    #[tokio::test]
+    async fn replay_rejects_an_https_child_without_disabling_certificate_verification() {
+        let captured = CapturedWebhook {
+            id: "test".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "POST".into(),
+            path: "/api/webhook".into(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: vec![],
+            response_status: 0,
+            response_headers: std::collections::HashMap::new(),
+            response_body: vec![],
+            duration_ms: 0,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+        };
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Https, 5173);
+
+        let error = replay_webhook(&reqwest::Client::new(), &captured, &target)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("plain HTTP child"));
+    }
+
     /// Replay against a local listener whose `Content-Length` header
     /// claims more bytes than the cap allows. The stage-1 pre-stream
     /// check rejects before any body bytes are read.
@@ -211,7 +245,8 @@ mod tests {
         };
 
         let client = reqwest::Client::new();
-        let result = replay_webhook(&client, &captured, port).await;
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port);
+        let result = replay_webhook(&client, &captured, &target).await;
         server.await.unwrap();
 
         let err = result.expect_err("oversized declared length must be rejected");
@@ -275,7 +310,8 @@ mod tests {
         };
 
         let client = reqwest::Client::new();
-        let result = replay_webhook(&client, &captured, port).await;
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port);
+        let result = replay_webhook(&client, &captured, &target).await;
         let _ = server.await;
 
         let err = result.expect_err("streamed body past cap must be rejected");

@@ -496,7 +496,7 @@ pub(crate) struct DevArgs {
     pub(crate) network: bool,
 
     /// Override the dev server port.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub(crate) port: Option<u16>,
 
     /// Custom hostname for the HTTPS certificate.
@@ -563,7 +563,7 @@ pub(crate) struct DevArgs {
     /// unused port — race-free against the dev server's own port. Pass an
     /// explicit value to bind that exact port strictly. No-op without
     /// `--tunnel`.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub(crate) inspect_port: Option<u16>,
 
     /// Pre-approve the trust-store install for `--https` (skips the prompt).
@@ -571,9 +571,9 @@ pub(crate) struct DevArgs {
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,
 
-    /// Serve the root CA over plain HTTP on `port+1` so mobile devices on the
-    /// LAN can bootstrap trust. Off by default — anyone on the LAN can grab
-    /// the CA, so the flag is explicit.
+    /// Serve the root CA over plain HTTP on an OS-assigned port so mobile
+    /// devices on the LAN can bootstrap trust. Off by default — anyone on the
+    /// LAN can grab the CA, so the flag is explicit.
     #[arg(long)]
     pub(crate) allow_ca_bootstrap: bool,
 

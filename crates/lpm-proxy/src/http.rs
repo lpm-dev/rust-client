@@ -1,5 +1,7 @@
 use super::*;
 
+type SharedUpstream = Arc<RwLock<lpm_common::LocalTarget>>;
+
 #[derive(Clone)]
 pub struct HttpProxyState {
     registry: Arc<tokio::sync::Mutex<RouteRegistry>>,
@@ -8,6 +10,7 @@ pub struct HttpProxyState {
         axum::body::Body,
     >,
     forwarded_proto: &'static str,
+    fallback_upstream: Option<SharedUpstream>,
 }
 
 impl HttpProxyState {
@@ -27,7 +30,17 @@ impl HttpProxyState {
             )
             .build(connector),
             forwarded_proto,
+            fallback_upstream: None,
         }
+    }
+
+    pub(crate) fn for_upstream(upstream: SharedUpstream, forwarded_proto: &'static str) -> Self {
+        let mut state = Self::with_forwarded_proto(
+            Arc::new(tokio::sync::Mutex::new(RouteRegistry::new())),
+            forwarded_proto,
+        );
+        state.fallback_upstream = Some(upstream);
+        state
     }
 }
 
@@ -40,6 +53,7 @@ struct HttpRedirectState {
 pub struct HttpProxyHandle {
     pub(crate) addr: SocketAddr,
     pub(crate) shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) upstream: Option<SharedUpstream>,
 }
 
 impl HttpProxyHandle {
@@ -49,6 +63,17 @@ impl HttpProxyHandle {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    pub fn update_upstream(&self, upstream: lpm_common::LocalTarget) -> Result<(), ProxyError> {
+        validate_frontend_upstream(&upstream)?;
+        let target = self.upstream.as_ref().ok_or_else(|| {
+            ProxyError::Http("proxy handle does not have a direct upstream".to_string())
+        })?;
+        *target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = upstream;
+        Ok(())
     }
 
     pub fn shutdown(mut self) {
@@ -102,7 +127,59 @@ pub fn start_http_proxy_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: None,
     })
+}
+
+/// Start an HTTP frontend on an already-bound listener for a verified loopback target.
+pub fn start_http_frontend_on_listener(
+    listener: tokio::net::TcpListener,
+    upstream: lpm_common::LocalTarget,
+) -> Result<HttpProxyHandle, ProxyError> {
+    use axum::Router;
+    use axum::routing::any;
+
+    validate_frontend_upstream(&upstream)?;
+    let addr = listener
+        .local_addr()
+        .map_err(|err| ProxyError::Http(format!("read HTTP frontend bind addr: {err}")))?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = Arc::new(RwLock::new(upstream));
+    let app = Router::new()
+        .fallback(any(proxy_http_request))
+        .with_state(HttpProxyState::for_upstream(Arc::clone(&upstream), "http"));
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    Ok(HttpProxyHandle {
+        addr,
+        shutdown: Some(shutdown_tx),
+        upstream: Some(upstream),
+    })
+}
+
+pub(crate) fn validate_frontend_upstream(
+    upstream: &lpm_common::LocalTarget,
+) -> Result<(), ProxyError> {
+    if !upstream.is_loopback() {
+        return Err(ProxyError::Http(format!(
+            "dev frontend upstream must be loopback, got {}",
+            upstream.authority()
+        )));
+    }
+    if upstream.scheme != lpm_common::LocalScheme::Http {
+        return Err(ProxyError::Http(format!(
+            "dev frontend requires an HTTP upstream, got {}",
+            upstream.url()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) async fn start_http_redirect(
@@ -146,6 +223,7 @@ fn start_http_redirect_on_listener(
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
+        upstream: None,
     })
 }
 
@@ -228,24 +306,39 @@ pub(crate) async fn proxy_http_request_inner(
     else {
         return Err((StatusCode::MISDIRECTED_REQUEST, "missing Host header").into_response());
     };
-    let Some(route) = state
+    let upstream = state
         .registry
         .lock()
         .await
         .lookup_host_header(&host_header)
-        .cloned()
-    else {
+        .map(|route| {
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, route.upstream_port)
+        })
+        .or_else(|| {
+            state.fallback_upstream.as_ref().map(|upstream| {
+                upstream
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+        });
+    let Some(upstream) = upstream else {
         return Err((StatusCode::MISDIRECTED_REQUEST, "unknown local proxy host").into_response());
     };
 
     if is_upgrade_request(request.headers()) {
-        return proxy_upgrade_request(request, route, host_header, state.forwarded_proto).await;
+        return proxy_upgrade_request(request, upstream, host_header, state.forwarded_proto).await;
     }
 
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-    let upstream_url = format!("http://127.0.0.1:{}{path}", route.upstream_port);
+    let upstream_url = format!(
+        "{}://{}{}",
+        upstream.scheme,
+        upstream.authority(),
+        upstream.upstream_path(path)
+    );
     let mut builder = axum::http::Request::builder()
         .method(method)
         .uri(upstream_url);
@@ -256,7 +349,7 @@ pub(crate) async fn proxy_http_request_inner(
         }
     }
     builder = builder
-        .header(header::HOST, format!("127.0.0.1:{}", route.upstream_port))
+        .header(header::HOST, upstream.authority())
         .header("x-forwarded-host", host_header)
         .header("x-forwarded-proto", state.forwarded_proto);
 
@@ -285,7 +378,7 @@ pub(crate) async fn proxy_http_request_inner(
 
 async fn proxy_upgrade_request(
     mut request: axum::extract::Request,
-    route: RegisteredRoute,
+    upstream: lpm_common::LocalTarget,
     host_header: String,
     forwarded_proto: &'static str,
 ) -> Result<axum::response::Response, axum::response::Response> {
@@ -296,8 +389,8 @@ async fn proxy_upgrade_request(
 
     let on_upgrade = hyper::upgrade::on(&mut request);
     let upstream_request =
-        build_upgrade_request_bytes(&request, &route, &host_header, forwarded_proto);
-    let mut upstream = tokio::net::TcpStream::connect(("127.0.0.1", route.upstream_port))
+        build_upgrade_request_bytes(&request, &upstream, &host_header, forwarded_proto);
+    let mut upstream_stream = tokio::net::TcpStream::connect((upstream.address, upstream.port))
         .await
         .map_err(|_| {
             (
@@ -306,11 +399,14 @@ async fn proxy_upgrade_request(
             )
                 .into_response()
         })?;
-    upstream.write_all(&upstream_request).await.map_err(|_| {
-        (StatusCode::BAD_GATEWAY, "upstream upgrade request failed").into_response()
-    })?;
+    upstream_stream
+        .write_all(&upstream_request)
+        .await
+        .map_err(|_| {
+            (StatusCode::BAD_GATEWAY, "upstream upgrade request failed").into_response()
+        })?;
 
-    let (head, leftover) = read_http_head(&mut upstream)
+    let (head, leftover) = read_http_head(&mut upstream_stream)
         .await
         .map_err(bad_gateway_response)?;
     let (status, headers) = parse_http_response_head(&head).map_err(bad_gateway_response)?;
@@ -329,7 +425,7 @@ async fn proxy_upgrade_request(
         if !leftover.is_empty() && downstream.write_all(&leftover).await.is_err() {
             return;
         }
-        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream_stream).await;
     });
 
     response_builder
@@ -339,13 +435,14 @@ async fn proxy_upgrade_request(
 
 fn build_upgrade_request_bytes(
     request: &axum::extract::Request,
-    route: &RegisteredRoute,
+    upstream: &lpm_common::LocalTarget,
     host_header: &str,
     forwarded_proto: &str,
 ) -> Vec<u8> {
     use axum::http::header;
 
-    let path = request.uri().path_and_query().map_or("/", |p| p.as_str());
+    let request_path = request.uri().path_and_query().map_or("/", |p| p.as_str());
+    let path = upstream.upstream_path(request_path);
     let mut bytes = Vec::with_capacity(1024);
     bytes.extend_from_slice(request.method().as_str().as_bytes());
     bytes.extend_from_slice(b" ");
@@ -361,8 +458,8 @@ fn build_upgrade_request_bytes(
         }
     }
 
-    bytes.extend_from_slice(b"host: 127.0.0.1:");
-    bytes.extend_from_slice(route.upstream_port.to_string().as_bytes());
+    bytes.extend_from_slice(b"host: ");
+    bytes.extend_from_slice(upstream.authority().as_bytes());
     bytes.extend_from_slice(b"\r\nx-forwarded-host: ");
     bytes.extend_from_slice(host_header.as_bytes());
     bytes.extend_from_slice(b"\r\nx-forwarded-proto: ");

@@ -98,7 +98,7 @@ pub enum ServerMessage {
         limits: Option<crate::TunnelLimitMetadata>,
     },
 
-    /// Incoming HTTP request to be proxied to localhost.
+    /// Incoming HTTP request to be proxied to the verified local endpoint.
     #[serde(rename = "http_request")]
     HttpRequest {
         /// Unique request ID.
