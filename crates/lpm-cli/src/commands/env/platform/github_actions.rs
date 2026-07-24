@@ -623,12 +623,12 @@ impl GitHubActionsClient {
                 .await
                 .map_err(|error| GitHubMutationFailure {
                     error,
-                    ambiguous: response_status.is_success(),
+                    ambiguous: response_status.is_success() || response_status.is_server_error(),
                 })?;
         if !status.is_success() {
             return Err(GitHubMutationFailure {
                 error: github_api_error(operation, status, &body),
-                ambiguous: false,
+                ambiguous: status.is_server_error(),
             });
         }
         Ok(())
@@ -1004,6 +1004,7 @@ mod tests {
         Json(serde_json::Value),
         Status(u16, serde_json::Value),
         TruncatedSuccess,
+        TruncatedStatus(u16),
     }
 
     async fn write_raw_response(stream: &mut tokio::net::TcpStream, response: RawResponse) {
@@ -1020,6 +1021,16 @@ mod tests {
                     )
                     .await
                     .expect("write truncated GitHub response");
+                return;
+            }
+            RawResponse::TruncatedStatus(status) => {
+                let headers = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{}}"
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("write truncated GitHub error response");
                 return;
             }
         };
@@ -1550,6 +1561,66 @@ mod tests {
             .apply(&diff, &local, &PlatformState::default(), false)
             .await
             .expect("authoritative final state must recover the committed create");
+
+        assert_eq!(result.added, 1);
+        server.await.expect("raw GitHub server");
+    }
+
+    #[tokio::test]
+    async fn committed_variable_create_is_counted_after_a_server_error_response() {
+        let (api_url, server) = spawn_committed_variable_server(RawResponse::Status(
+            503,
+            serde_json::json!({ "message": "temporarily unavailable" }),
+        ))
+        .await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "github-create-server-error".into()),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let local = LocalPlatformValues {
+            readable: values(&[("PUBLIC_ORIGIN", "https://example.test")]),
+            write_only: HashMap::new(),
+        };
+        let diff = PlatformDiff {
+            added: vec!["PUBLIC_ORIGIN".into()],
+            ..PlatformDiff::default()
+        };
+
+        let result = client
+            .apply(&diff, &local, &PlatformState::default(), false)
+            .await
+            .expect("server-error response must be reconciled authoritatively");
+
+        assert_eq!(result.added, 1);
+        server.await.expect("raw GitHub server");
+    }
+
+    #[tokio::test]
+    async fn committed_variable_create_is_counted_after_a_truncated_server_error_response() {
+        let (api_url, server) =
+            spawn_committed_variable_server(RawResponse::TruncatedStatus(503)).await;
+        let _env = crate::test_env::ScopedEnv::set([
+            (
+                "ACCEPTANCE_RUN_ID",
+                "github-create-truncated-server-error".into(),
+            ),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let local = LocalPlatformValues {
+            readable: values(&[("PUBLIC_ORIGIN", "https://example.test")]),
+            write_only: HashMap::new(),
+        };
+        let diff = PlatformDiff {
+            added: vec!["PUBLIC_ORIGIN".into()],
+            ..PlatformDiff::default()
+        };
+
+        let result = client
+            .apply(&diff, &local, &PlatformState::default(), false)
+            .await
+            .expect("truncated server-error response must be reconciled authoritatively");
 
         assert_eq!(result.added, 1);
         server.await.expect("raw GitHub server");
