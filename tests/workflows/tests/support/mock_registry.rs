@@ -6,7 +6,7 @@
 //! tests can validate install, publish, health, and auth flows without
 //! any external network calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
@@ -19,6 +19,22 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 pub struct MockRegistry {
     server: MockServer,
     tarball_integrities: Arc<Mutex<HashMap<(String, String), String>>>,
+}
+
+struct JsonResponseSequence {
+    bodies: Arc<Mutex<VecDeque<serde_json::Value>>>,
+}
+
+impl Respond for JsonResponseSequence {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().expect("response sequence lock");
+        let body = if bodies.len() > 1 {
+            bodies.pop_front().expect("response sequence body")
+        } else {
+            bodies.front().cloned().expect("response sequence body")
+        };
+        ResponseTemplate::new(200).set_body_json(body)
+    }
 }
 
 pub struct RegistrySigningFixture {
@@ -1188,6 +1204,78 @@ impl MockRegistry {
                 "data": { "variables": variables },
             })))
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_railway_variables_sequence(
+        &self,
+        token: &str,
+        project_id: &str,
+        environment_id: &str,
+        service_id: &str,
+        variables: Vec<serde_json::Value>,
+    ) -> &Self {
+        let expected_calls = variables.len() as u64;
+        let bodies = variables
+            .into_iter()
+            .map(|variables| {
+                serde_json::json!({
+                    "data": { "variables": variables },
+                })
+            })
+            .collect::<VecDeque<_>>();
+        Mock::given(method("POST"))
+            .and(path("/graphql/v2"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"unrendered\":true"))
+            .and(body_string_contains(format!(
+                "\"projectId\":\"{project_id}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"environmentId\":\"{environment_id}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"serviceId\":\"{service_id}\""
+            )))
+            .respond_with(JsonResponseSequence {
+                bodies: Arc::new(Mutex::new(bodies)),
+            })
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_railway_variables_upsert(
+        &self,
+        token: &str,
+        project_id: &str,
+        environment_id: &str,
+        service_id: &str,
+        key: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/graphql/v2"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("variableCollectionUpsert"))
+            .and(body_string_contains(format!(
+                "\"projectId\":\"{project_id}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"environmentId\":\"{environment_id}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"serviceId\":\"{service_id}\""
+            )))
+            .and(body_string_contains(format!("\"{key}\":\"{value}\"")))
+            .and(body_string_contains("\"replace\":false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "variableCollectionUpsert": true },
+            })))
+            .expect(1)
             .mount(&self.server)
             .await;
         self
