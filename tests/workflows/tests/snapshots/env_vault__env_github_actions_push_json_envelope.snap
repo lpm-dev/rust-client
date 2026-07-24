@@ -5,11 +5,11 @@ expression: push_json
 {
   "success": true,
   "status": "synced",
-  "platform": "railway",
+  "platform": "github-actions",
   "env": "production",
   "added": 0,
-  "updated": 1,
+  "updated": 2,
   "removed": 0,
-  "secretVerification": "exact",
+  "secretVerification": "names_only",
   "auditRecorded": true
 }

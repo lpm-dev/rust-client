@@ -1046,6 +1046,32 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_github_actions_platform_connect_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        repository: &str,
+        repository_id: &str,
+        response: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/connect"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains("\"platform\":\"github-actions\""))
+            .and(body_string_contains(format!(
+                "\"repository\":\"{repository}\""
+            )))
+            .and(body_string_contains(format!(
+                "\"repositoryId\":\"{repository_id}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_platform_credentials_success(
         &self,
         bearer_token: &str,
@@ -1076,6 +1102,266 @@ impl MockRegistry {
                     .set_body_string(body),
             )
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_repository(
+        &self,
+        token: &str,
+        repository: &str,
+        repository_id: u64,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{repository}")))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(header("accept", "application/vnd.github+json"))
+            .and(header("x-github-api-version", "2022-11-28"))
+            .and(header("user-agent", "lpm-env-github-actions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": repository_id,
+                "full_name": repository,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_environment_lists(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        variables: serde_json::Value,
+        secrets: serde_json::Value,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables"
+            )))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": variables.as_array().map_or(0, Vec::len),
+                "variables": variables,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/secrets"
+            )))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": secrets.as_array().map_or(0, Vec::len),
+                "secrets": secrets,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_environment_list_sequences(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        variables: Vec<serde_json::Value>,
+        secrets: Vec<serde_json::Value>,
+    ) -> &Self {
+        let variable_calls = variables.len() as u64;
+        let variable_bodies = variables
+            .into_iter()
+            .map(|variables| {
+                serde_json::json!({
+                    "total_count": variables.as_array().map_or(0, Vec::len),
+                    "variables": variables,
+                })
+            })
+            .collect::<VecDeque<_>>();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables"
+            )))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(JsonResponseSequence {
+                bodies: Arc::new(Mutex::new(variable_bodies)),
+            })
+            .expect(variable_calls)
+            .mount(&self.server)
+            .await;
+
+        let secret_calls = secrets.len() as u64;
+        let secret_bodies = secrets
+            .into_iter()
+            .map(|secrets| {
+                serde_json::json!({
+                    "total_count": secrets.as_array().map_or(0, Vec::len),
+                    "secrets": secrets,
+                })
+            })
+            .collect::<VecDeque<_>>();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/secrets"
+            )))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(JsonResponseSequence {
+                bodies: Arc::new(Mutex::new(secret_bodies)),
+            })
+            .expect(secret_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_public_key(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+    ) -> &Self {
+        self.with_github_actions_public_key_calls(token, repository_id, environment, 1)
+            .await
+    }
+
+    pub async fn with_github_actions_public_key_calls(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        use base64::Engine;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/secrets/public-key"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "key_id": "workflow-key",
+                "key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_variable_update_success(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables/{name}"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .and(body_string_contains(format!("\"value\":\"{value}\"")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_variable_delete_success(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+    ) -> &Self {
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables/{name}"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_secret_upsert_success(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/secrets/{name}"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"encrypted_value\":"))
+            .and(body_string_contains("\"key_id\":\"workflow-key\""))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_secret_delete_success(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+    ) -> &Self {
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/secrets/{name}"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_variable_update_failure(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+    ) -> &Self {
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables/{name}"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(serde_json::json!({ "message": "workflow denied" })),
+            )
+            .expect(1)
             .mount(&self.server)
             .await;
         self

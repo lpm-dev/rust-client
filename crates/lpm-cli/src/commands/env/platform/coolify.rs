@@ -1778,6 +1778,7 @@ mod tests {
             changed: vec!["CHANGED".into()],
             removed: vec!["REMOVED".into()],
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let result = client
@@ -1878,6 +1879,7 @@ mod tests {
             changed: Vec::new(),
             removed: Vec::new(),
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let result = client
@@ -1960,6 +1962,7 @@ mod tests {
             changed: Vec::new(),
             removed: Vec::new(),
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let result = client
@@ -2152,6 +2155,7 @@ mod tests {
             changed: Vec::new(),
             removed: Vec::new(),
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let result = client

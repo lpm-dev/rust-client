@@ -7,20 +7,18 @@ expression: status_json
   "count": 1,
   "platforms": [
     {
-      "platform": "railway",
+      "platform": "github-actions",
       "label": "production",
       "env": "production",
-      "status": "drifted",
+      "status": "names_only",
       "added": 0,
-      "changed": 1,
+      "changed": 0,
       "removed": 0,
-      "secretVerification": "exact",
-      "secretNamesPresent": 0,
+      "secretVerification": "names_only",
+      "secretNamesPresent": 1,
       "secretNamesMissing": 0,
       "secretNamesExtra": 0,
-      "driftKeys": [
-        "APPLICATION_SECRET"
-      ],
+      "driftKeys": [],
       "lastPushAt": null
     }
   ]

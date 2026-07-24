@@ -5,13 +5,13 @@ expression: pull_json
 {
   "success": true,
   "status": "imported",
-  "platform": "coolify",
+  "platform": "github-actions",
   "env": "production",
   "count": 1,
   "keys": [
-    "APPLICATION_SECRET"
+    "PUBLIC_ORIGIN"
   ],
-  "skippedSecrets": 0,
-  "secretVerification": "exact",
+  "skippedSecrets": 1,
+  "secretVerification": "names_only",
   "auditRecorded": true
 }

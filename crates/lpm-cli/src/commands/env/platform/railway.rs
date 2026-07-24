@@ -702,6 +702,7 @@ mod tests {
             changed: vec!["CHANGED".into()],
             removed: Vec::new(),
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let result = client
@@ -785,6 +786,7 @@ mod tests {
             changed: Vec::new(),
             removed: vec!["REMOTE_ONLY".into()],
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let result = client
@@ -831,6 +833,7 @@ mod tests {
             changed: Vec::new(),
             removed: Vec::new(),
             unchanged: Vec::new(),
+            ..PlatformDiff::default()
         };
 
         let error = client
