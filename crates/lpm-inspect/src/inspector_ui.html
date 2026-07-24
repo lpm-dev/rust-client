@@ -291,7 +291,7 @@ async function loadAll() {
 async function loadStatus() {
 	const resp = await fetch("/api/status"); const data = await resp.json()
 	if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
-	$("#sb-port").textContent = `localhost:${data.local_port}`
+	$("#sb-port").textContent = data.local_ready ? data.local_url : "waiting for dev server…"
 }
 async function loadSessions() {
 	try { const resp = await fetch("/api/sessions"); if (resp.ok) { sessions = await resp.json(); renderSessions() } } catch {}

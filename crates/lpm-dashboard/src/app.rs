@@ -112,6 +112,13 @@ impl DashboardApp {
         }
     }
 
+    /// Replace the displayed port after the service owns its assigned listener.
+    pub fn set_service_port(&mut self, service: &str, port: u16) {
+        if let Some(state) = self.services.iter_mut().find(|state| state.name == service) {
+            state.port = Some(port);
+        }
+    }
+
     /// Scroll up = further back in history = increase offset from bottom.
     pub fn scroll_up(&mut self) {
         match self.active_tab {
@@ -199,6 +206,15 @@ mod tests {
         assert_eq!(app.scroll_offset, 1);
         app.scroll_up();
         assert_eq!(app.scroll_offset, 2);
+    }
+
+    #[test]
+    fn assigned_port_replaces_the_dashboard_config_port_by_service_name() {
+        let mut app = make_app(100, 0);
+
+        app.set_service_port("test", 5174);
+
+        assert_eq!(app.services[0].port, Some(5174));
     }
 
     #[test]

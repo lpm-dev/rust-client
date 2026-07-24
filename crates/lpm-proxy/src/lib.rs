@@ -54,7 +54,10 @@ pub use control::{serve_control_at_pipe, serve_control_at_pipe_with_options};
 pub use control::{serve_control_default, serve_control_default_with_options};
 pub use error::ProxyError;
 pub use host::{canonical_host, canonical_host_from_header};
-pub use http::{HttpProxyHandle, HttpProxyState, start_http_proxy, start_http_proxy_on_listener};
+pub use http::{
+    HttpProxyHandle, HttpProxyState, start_http_frontend_on_listener, start_http_proxy,
+    start_http_proxy_on_listener,
+};
 #[cfg(windows)]
 pub use paths::proxy_pipe_name_from_env;
 #[cfg(unix)]
@@ -68,6 +71,7 @@ pub use tcp_forward::{
 };
 #[cfg(unix)]
 pub use tcp_forward::{UnixForwarderGuard, start_guarded_tcp_forwarder};
+pub use tls::start_tls_frontend_on_listener;
 pub use types::{
     ProxyDaemonOptions, ProxyDaemonState, ProxyRequest, ProxyResponse, ProxyStatus,
     RegisteredRoute, Route, RouteLeaseId, RouteStatus,

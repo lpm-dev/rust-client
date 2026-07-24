@@ -1,12 +1,19 @@
 use super::dev_ui;
 use crate::install_ui;
-use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_common::{LocalScheme, LocalTarget, LpmError};
 use std::io::IsTerminal;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-type ProxyLeaseSlot = Arc<Mutex<Option<lpm_proxy::RouteLease>>>;
+struct LocalProxyRuntime {
+    lease: lpm_proxy::RouteLease,
+    _bridges: Vec<lpm_proxy::HttpProxyHandle>,
+}
+
+type ProxyLeaseSlot = Arc<Mutex<Option<LocalProxyRuntime>>>;
 
 fn show_tunnel_notice(message: &str) {
     dev_ui::warn(message);
@@ -22,6 +29,12 @@ fn show_tunnel_notice(message: &str) {
 struct DevCertSetup {
     setup: lpm_cert::HttpsSetup,
     inject_env: bool,
+}
+
+struct DevFrontends {
+    local_target: LocalTarget,
+    network_port: Option<u16>,
+    _handles: Vec<lpm_proxy::HttpProxyHandle>,
 }
 
 /// Build the consent value for `ensure_https_with_consent` based on the dev flags.
@@ -133,6 +146,7 @@ pub async fn run(
         lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
     };
     let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
+    let requested_port = port;
     let port = resolve_dev_port(port, has_services);
 
     // Warn about privileged ports that may require elevated permissions
@@ -156,7 +170,7 @@ pub async fn run(
         .unwrap_or_default();
     let startup_proxy_lines = lpm_config
         .as_ref()
-        .map(|config| startup_proxy_lines_from_config(config, port))
+        .map(startup_proxy_lines_from_config)
         .unwrap_or_default();
     if !local_domain_hostnames.is_empty() {
         ensure_local_proxy_running(project_dir).await?;
@@ -189,6 +203,7 @@ pub async fn run(
     let env_dir = project_dir.to_path_buf();
     let https_dir = project_dir.to_path_buf();
     let host_owned = host.map(|h| h.to_string());
+    let local_display_host = host.unwrap_or("localhost").to_string();
 
     // Pre-compute network info once (used for both cert SANs and display)
     let network_info = if network {
@@ -239,14 +254,14 @@ pub async fn run(
                 let host_clone = host_owned.clone();
                 let net_info = network_info_for_cert;
                 let yes_local = yes;
-                let inject_env = https;
+                let inject_env = false;
                 let setup = tokio::task::spawn_blocking(move || {
                     let mut extra_hostnames: Vec<String> = Vec::new();
-                    if inject_env && let Some(h) = host_clone {
+                    if let Some(h) = host_clone {
                         push_unique_hostname(&mut extra_hostnames, h);
                     }
                     extend_unique_hostnames(&mut extra_hostnames, local_domain_hostnames_for_cert);
-                    if inject_env && let Some(ref info) = net_info {
+                    if let Some(ref info) = net_info {
                         for addr in &info.addresses {
                             if !addr.is_ipv6 {
                                 push_unique_hostname(&mut extra_hostnames, addr.ip.clone());
@@ -291,111 +306,18 @@ pub async fn run(
         }
         if cert_setup.inject_env {
             extra_env.extend(setup.env_vars);
-            startup.https_active = true;
         }
     }
+    startup.https_active = https;
 
-    // ── Network info (reuse pre-computed result) ────────────────────
-    if let Some(ref net_info) = network_info {
-        let scheme = if https { "https" } else { "http" };
-
-        if let Some(ref primary) = net_info.primary {
-            let addr_str = if primary.is_ipv6 {
-                format!("[{}]:{port}", primary.ip)
-            } else {
-                format!("{}:{port}", primary.ip)
-            };
-            startup.network_addr = Some(addr_str);
-
-            let url = if primary.is_ipv6 {
-                format!("{scheme}://[{}]:{port}", primary.ip)
-            } else {
-                format!("{scheme}://{}:{port}", primary.ip)
-            };
-            dev_ui::blank_line();
-            dev_ui::trusted_detail_with_hint(
-                "Network",
-                &install_ui::url(&url),
-                &format!("({})", primary.interface_type),
-            );
-
-            // Show additional addresses
-            for addr in &net_info.addresses {
-                if !addr.is_preferred {
-                    let url = if addr.is_ipv6 {
-                        format!("{scheme}://[{}]:{port}", addr.ip)
-                    } else {
-                        format!("{scheme}://{}:{port}", addr.ip)
-                    };
-                    dev_ui::trusted_hint_line(install_ui::terminal_line!(
-                        "{} {}",
-                        install_ui::url(&url),
-                        install_ui::dim(&format!("({})", addr.interface_type)),
-                    ));
-                }
-            }
-        } else {
-            dev_ui::warn("no network interfaces found");
+    // The public HMR hostname can differ from the loopback child endpoint.
+    if let Some(ref net_info) = network_info
+        && let Some(ref primary) = net_info.primary
+    {
+        let framework = lpm_cert::framework::detect_framework(project_dir);
+        if framework == lpm_cert::framework::Framework::Vite {
+            extra_env.push(("VITE_HMR_HOST".to_string(), primary.ip.clone()));
         }
-
-        // QR code
-        if !net_info.qr_code.is_empty() {
-            dev_ui::blank_line();
-            dev_ui::untrusted_block(&net_info.qr_code);
-        }
-
-        // Warnings
-        for warning in &net_info.warnings {
-            dev_ui::warn(warning);
-        }
-
-        if https
-            && let Some(ref primary) = net_info.primary
-            && let Ok(ca_cert_path) = lpm_cert::paths::ca_cert_path()
-            && ca_cert_path.exists()
-        {
-            if allow_ca_bootstrap {
-                let ca_cert_data = lpm_common::read_file_capped(
-                    &ca_cert_path,
-                    lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
-                )?;
-                if !ca_cert_data.is_empty() {
-                    let ca_port = port + 1;
-                    tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
-                    dev_ui::blank_line();
-                    dev_ui::trusted_detail_line(
-                        "Mobile",
-                        install_ui::terminal_line!(
-                            "First time on mobile? Visit {} to install the CA certificate",
-                            install_ui::url(&format!("http://{}:{ca_port}", primary.ip)),
-                        ),
-                    );
-                }
-            } else {
-                dev_ui::blank_line();
-                dev_ui::trusted_detail_line(
-                    "Mobile",
-                    install_ui::terminal_line!(
-                        "enable with {} or copy {} to the device manually",
-                        install_ui::cyan("--allow-ca-bootstrap"),
-                        install_ui::cyan("rootCA.pem"),
-                    ),
-                );
-            }
-        }
-
-        // Inject HMR host for framework
-        if let Some(ref primary) = net_info.primary {
-            extra_env.push(("HOSTNAME".to_string(), "0.0.0.0".to_string()));
-
-            // Detect framework for HMR-specific vars
-            let framework = lpm_cert::framework::detect_framework(project_dir);
-            if framework == lpm_cert::framework::Framework::Vite {
-                extra_env.push(("VITE_HMR_HOST".to_string(), primary.ip.clone()));
-            }
-        }
-
-        dev_ui::blank_line();
     }
 
     // ── Dashboard event channel ─────────────────────────────────────
@@ -411,7 +333,14 @@ pub async fn run(
     // ── Tunnel setup ───────────────────────────────────────────────────
     let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut inspector_handle: Option<lpm_inspect::InspectorHandle> = None;
-    if tunnel {
+    let mut multi_inspector_state = None;
+    let (mut multi_tunnel_target_tx, mut multi_tunnel_target_rx) = if tunnel && has_services {
+        let (tx, rx) = tokio::sync::oneshot::channel::<LocalTarget>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    if tunnel && has_services {
         let token = token.ok_or_else(|| {
             LpmError::Tunnel("authentication required for tunnel. Run `lpm login` first.".into())
         })?;
@@ -433,14 +362,15 @@ pub async fn run(
         // text-only) so the user can pick whichever fits the moment.
         // Quiet by default — we never auto-open a browser tab here.
         let inspector_state = match lpm_inspect::db::InspectorDb::open(project_dir) {
-            Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
+            Ok(db) => lpm_inspect::state::InspectorState::with_db_pending(db),
             Err(e) => {
                 if !quiet {
                     dev_ui::warn(&format!("inspector db failed: {e} — using in-memory only"));
                 }
-                lpm_inspect::state::InspectorState::new(port)
+                lpm_inspect::state::InspectorState::pending()
             }
         };
+        multi_inspector_state = Some(inspector_state.clone());
         if !no_inspect {
             // `Some(n)` → strict bind, fatal on AddrInUse (matches the
             // `--inspect-port N` user contract). `None` → auto-pick a
@@ -497,15 +427,7 @@ pub async fn run(
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.
         let dashboard_webhook_tx: Option<std::sync::mpsc::Sender<lpm_dashboard::DashboardEvent>> =
-            if dashboard {
-                Some(
-                    dashboard_event_tx
-                        .clone()
-                        .expect("dashboard_event_tx must be set when --dashboard is active"),
-                )
-            } else {
-                None
-            };
+            dashboard_event_tx.clone();
 
         // Generate tunnel auth token if requested (random 32-byte hex, one per session)
         let tunnel_auth_token = if tunnel_auth {
@@ -521,7 +443,7 @@ pub async fn run(
         let options = lpm_tunnel::client::TunnelOptions {
             relay_url: tunnel_relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
             token: token.to_string(),
-            local_port: port,
+            local_target: LocalTarget::loopback(LocalScheme::Http, port),
             domain: tunnel_domain.map(|s| s.to_string()),
             tunnel_auth: tunnel_auth_token.clone(),
             webhook_tx: Some(webhook_tx),
@@ -586,7 +508,12 @@ pub async fn run(
         });
 
         // Start tunnel in background task, storing the handle for clean shutdown
-        let options_clone = options;
+        let mut options_clone = options;
+        let target_rx = multi_tunnel_target_rx.take().ok_or_else(|| {
+            LpmError::Tunnel(
+                "multi-service tunnel endpoint channel was not initialized".to_string(),
+            )
+        })?;
         let tunnel_auth_display = tunnel_auth_token;
         // Mirror commands/tunnel.rs: hand the connect callback a clone of the
         // inspector state so the live tunnel URL + session id are pushed to
@@ -600,6 +527,11 @@ pub async fn run(
         let usage_for_connect = latest_usage.clone();
         let usage_for_notices = latest_usage;
         tunnel_handle = Some(tokio::spawn(async move {
+            let Ok(local_target) = target_rx.await else {
+                return;
+            };
+            let local_target_url = local_target.url();
+            options_clone.local_target = local_target;
             let result = lpm_tunnel::client::connect_with_usage(
                 &options_clone,
                 move |session| {
@@ -618,9 +550,9 @@ pub async fn run(
                     dev_ui::trusted_detail_line(
                         "Tunnel",
                         install_ui::terminal_line!(
-                            "{} → localhost:{}",
+                            "{} → {}",
                             install_ui::url(&session.tunnel_url),
-                            session.local_port,
+                            local_target_url,
                         ),
                     );
                     if let Some(expiry) =
@@ -672,19 +604,25 @@ pub async fn run(
         }));
     }
 
-    // ── Print startup banner ────────────────────────────────────────
-    print_startup_banner(&startup, project_dir);
-
     // ── Check for multi-service orchestration ──────────────────────────
     if has_services {
-        let services = &lpm_config.as_ref().unwrap().services;
-
-        let open_browser = should_open_browser(true, no_open, is_ci());
-        let open_url = if https {
-            format!("https://localhost:{port}")
-        } else {
-            format!("http://localhost:{port}")
-        };
+        print_startup_banner(&startup, project_dir);
+        let config = lpm_config.as_ref().ok_or_else(|| {
+            LpmError::Script("multi-service configuration disappeared before startup".to_string())
+        })?;
+        let services = &config.services;
+        let primary_service = primary_proxy_service_for_display(config).map(str::to_string);
+        if primary_service.is_none() && (requested_port.is_some() || https || network || tunnel) {
+            return Err(LpmError::Script(
+                "multi-service dev features require exactly one service marked `primary`"
+                    .to_string(),
+            ));
+        }
+        let open_browser = primary_service.is_some() && should_open_browser(true, no_open, is_ci());
+        let frontend_slot = Arc::new(Mutex::new(None::<DevFrontends>));
+        let dev_session_slot =
+            Arc::new(Mutex::new(None::<lpm_runner::dev_session::DevSessionLease>));
+        let multi_started = std::time::Instant::now();
 
         // Bridge orchestrator events to the dashboard when --dashboard is active.
         // The orchestrator sends OrchestratorEvent, the dashboard receives DashboardEvent.
@@ -729,27 +667,138 @@ pub async fn run(
         };
 
         let proxy_lease = Arc::new(Mutex::new(None));
-        let on_ports_assigned = build_proxy_ports_assigned_callback(
-            lpm_config.as_ref().unwrap(),
-            project_dir,
-            Arc::clone(&proxy_lease),
-            tokio::runtime::Handle::current(),
-        );
+        let dashboard_ports_tx = dashboard_event_tx.clone();
+        let on_ports_assigned = dashboard_ports_tx.map(|tx| {
+            Box::new(move |ports: &lpm_runner::orchestrator::ServicePortMap| {
+                for (service, port) in ports {
+                    let _ = tx.send(lpm_dashboard::DashboardEvent::PortAssigned {
+                        service: service.clone(),
+                        port: *port,
+                    });
+                }
+                Ok(())
+            }) as lpm_runner::orchestrator::PortsAssignedCallback
+        });
+
+        let manage_primary_endpoint = primary_service.is_some();
+        let register_local_proxy = !local_domain_hostnames.is_empty();
+        let on_all_ready = (manage_primary_endpoint || register_local_proxy).then(|| {
+            let primary_service = primary_service.clone();
+            let project_dir = project_dir.to_path_buf();
+            let proxy_config = config.clone();
+            let proxy_lease = Arc::clone(&proxy_lease);
+            let runtime_handle = tokio::runtime::Handle::current();
+            let frontend_slot = Arc::clone(&frontend_slot);
+            let dev_session_slot = Arc::clone(&dev_session_slot);
+            let inspector_state = multi_inspector_state.clone();
+            let tunnel_target_tx = multi_tunnel_target_tx.take();
+            let local_display_host = local_display_host.clone();
+            Box::new(
+                move |mut endpoints: lpm_runner::orchestrator::ServiceEndpointMap| {
+                    if register_local_proxy {
+                        let final_targets = endpoints
+                            .iter()
+                            .map(|(service, endpoint)| {
+                                (service.clone(), endpoint.target.clone())
+                            })
+                            .collect();
+                        let plan = lpm_runner::local_domains::plan_multi_service_routes(
+                            &proxy_config,
+                            &final_targets,
+                        )
+                        .map_err(LpmError::Script)?;
+                        runtime_handle.block_on(register_proxy_route_plan(
+                            &project_dir,
+                            plan.routes,
+                            Arc::clone(&proxy_lease),
+                        ))?;
+                    }
+
+                    let Some(primary_service) = primary_service else {
+                        return Ok(());
+                    };
+                    let endpoint = endpoints.remove(&primary_service).ok_or_else(|| {
+                        LpmError::Script(format!(
+                            "primary service `{primary_service}` did not open its assigned local endpoint"
+                        ))
+                    })?;
+                    let child_target = endpoint.target;
+                    let active_frontends = runtime_handle.block_on(
+                        start_single_service_frontends(
+                            &project_dir,
+                            child_target.clone(),
+                            https,
+                            network,
+                            requested_port,
+                        ),
+                    )?;
+                    let local_target = active_frontends.local_target.clone();
+
+                    if let Some(network_port) = active_frontends.network_port {
+                        let network_info =
+                            lpm_network::get_network_info(network_port, local_target.scheme == LocalScheme::Https)?;
+                        runtime_handle.block_on(display_network_access(
+                            &network_info,
+                            network_port,
+                            local_target.scheme == LocalScheme::Https,
+                            &local_target.base_path,
+                            allow_ca_bootstrap,
+                        ))?;
+                    }
+
+                    let local_url = format!(
+                        "{}://{}:{}{}",
+                        local_target.scheme,
+                        local_display_host,
+                        local_target.port,
+                        local_target.base_path
+                    );
+                    dev_ui::trusted_detail("Local", &install_ui::url(&local_url));
+                    dev_ui::blank_line();
+                    dev_ui::done_ready("Local server", multi_started.elapsed());
+
+                    if let Some(ref state) = inspector_state {
+                        state.set_local_target(child_target.clone());
+                    }
+                    let session_lease = lpm_runner::dev_session::DevSessionLease::register(
+                        &project_dir,
+                        child_target.clone(),
+                        endpoint.owner_pid,
+                        Some(primary_service.clone()),
+                    )?;
+                    *dev_session_slot.lock().map_err(|_| {
+                        LpmError::Script("dev session state is poisoned".to_string())
+                    })? = Some(session_lease);
+                    *frontend_slot.lock().map_err(|_| {
+                        LpmError::Script("dev frontend state is poisoned".to_string())
+                    })? = Some(active_frontends);
+
+                    if let Some(sender) = tunnel_target_tx {
+                        sender.send(child_target).map_err(|_| {
+                            LpmError::Tunnel(
+                                "tunnel stopped before the primary service became ready".to_string(),
+                            )
+                        })?;
+                    }
+                    if open_browser {
+                        let _ = open::that(local_url);
+                    }
+                    Ok(())
+                },
+            ) as lpm_runner::orchestrator::AllReadyCallback
+        });
 
         let options = lpm_runner::orchestrator::OrchestratorOptions {
-            https,
+            https: false,
             filter: extra_args.to_vec(), // lpm dev web api → filter to web + api
             extra_envs: extra_env.clone(),
             event_tx: orchestrator_event_tx,
             command_rx: orch_cmd_rx,
             on_ports_assigned,
-            on_all_ready: if open_browser {
-                Some(Box::new(move || {
-                    let _ = open::that(&open_url);
-                }))
-            } else {
-                None
-            },
+            on_all_ready,
+            primary_port: requested_port.filter(|_| !https),
+            manage_primary_endpoint,
+            reserved_frontend_port: requested_port.filter(|_| https),
         };
 
         let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
@@ -773,8 +822,9 @@ pub async fn run(
             });
 
             // Dashboard → orchestrator command bridge
-            let orch_cmd_tx =
-                orch_cmd_tx.expect("orch_cmd_tx must be set when --dashboard is active");
+            let orch_cmd_tx = orch_cmd_tx.ok_or_else(|| {
+                LpmError::Script("dashboard command channel was not initialized".to_string())
+            })?;
             // Keep a clone so we can send StopAll when the dashboard exits
             let orch_cmd_tx_for_shutdown = orch_cmd_tx.clone();
             let (dash_cmd_tx, dash_cmd_rx) =
@@ -808,7 +858,7 @@ pub async fn run(
                     lpm_dashboard::ServiceState {
                         name: (*name).clone(),
                         port: svc.port,
-                        hosts: dashboard_service_hosts(lpm_config.as_ref().unwrap(), name),
+                        hosts: dashboard_service_hosts(config, name),
                         status: lpm_dashboard::ServiceStatus::Starting,
                         logs: lpm_dashboard::LogBuffer::new(5000),
                     }
@@ -849,13 +899,15 @@ pub async fn run(
                 Ok(())
             };
 
+            let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
             let result = release_proxy_lease_after(result, &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
 
             // Clean shutdown: tunnel task, then inspector. Inspector last so
             // any in-flight push from the webhook consumer can drain.
             if let Some(handle) = tunnel_handle {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+                handle.abort();
+                let _ = handle.await;
             }
             if let Some(handle) = inspector_handle {
                 handle.shutdown();
@@ -865,73 +917,216 @@ pub async fn run(
         }
 
         let result = lpm_runner::orchestrator::run_services(project_dir, services, options);
+        let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
         let result = release_proxy_lease_after(result, &proxy_lease).await;
-        return release_hosts_file_after(result, hosts_file_lease);
+        let result = release_hosts_file_after(result, hosts_file_lease);
+        if let Some(handle) = tunnel_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = inspector_handle {
+            handle.shutdown();
+        }
+        return result;
     }
 
     // ── Single service: start dev server ────────────────────────────
     let proxy_lease = Arc::new(Mutex::new(None));
     let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
-    let route_registration = if let Some(config) = lpm_config.as_ref()
-        && let Some(plan) = lpm_runner::local_domains::plan_single_service_route(config, port)
-    {
-        register_proxy_route_plan(project_dir, plan.routes, Arc::clone(&proxy_lease)).await
-    } else {
-        Ok(())
-    };
-    if let Err(err) = route_registration {
-        return release_hosts_file_after(Err(err), hosts_file_lease);
-    }
-
-    let scheme = if https { "https" } else { "http" };
-    let url = format!("{scheme}://localhost:{port}");
-    dev_ui::trusted_detail("Local", &install_ui::url(&url));
-    dev_ui::blank_line();
-
-    // Start readiness check + browser open in background thread (non-blocking)
-    {
-        let open_url = url.clone();
-        let port_check = port;
-        let open_browser = should_open_browser(true, no_open, is_ci());
-        std::thread::spawn(move || {
-            // Wait for port to be ready (up to 30s)
-            match lpm_runner::ready::wait_for_port(port_check, 30) {
-                Ok(duration) => {
-                    dev_ui::done_ready("Local server", duration);
-                }
-                Err(msg) => {
-                    dev_ui::warn("Service not ready after 30s — opening browser anyway");
-                    dev_ui::hint_line(&msg);
-                }
-            }
-            // Open browser regardless of readiness outcome — on timeout the user
-            // sees the warning above and the browser shows the error page, which is
-            // more actionable than nothing happening at all.
-            if open_browser {
-                let _ = open::that(&open_url);
-            }
-        });
-    }
-
-    // Run the "dev" script with extra env vars injected safely (no unsafe set_var).
-    // `runtime_hint` was resolved during the parallel-startup join above.
     let mut script_env = extra_env.clone();
-    upsert_extra_env(&mut script_env, "PORT", port.to_string());
-    let script_result = lpm_runner::script::run_script_with_envs(
-        project_dir,
-        "dev",
-        extra_args,
-        env_mode,
-        &script_env,
-        &runtime_hint,
-    );
+    let child_requested_port = requested_port.filter(|_| !https);
+    let child_port_hint = if https {
+        find_internal_dev_port(port)?
+    } else {
+        port
+    };
+    upsert_extra_env(&mut script_env, "PORT", child_port_hint.to_string());
+    let mut script_args = extra_args.to_vec();
+    if let Some(requested_port) = child_requested_port {
+        let command = lpm_runner::script::script_command(project_dir, "dev")?;
+        script_args.extend(lpm_cert::framework::explicit_port_args_for_command(
+            project_dir,
+            &command,
+            requested_port,
+        ));
+    }
+
+    let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
+    let script_project_dir = project_dir.to_path_buf();
+    let script_env_mode = env_mode.map(str::to_string);
+    let script_runtime_hint = runtime_hint.clone();
+    let startup_started = std::time::Instant::now();
+    let script_stop_requested = Arc::new(AtomicBool::new(false));
+    let script_stop_for_runner = Arc::clone(&script_stop_requested);
+    let mut script_handle = tokio::task::spawn_blocking(move || {
+        lpm_runner::script::run_dev_script_with_envs(
+            &script_project_dir,
+            &script_args,
+            script_env_mode.as_deref(),
+            &script_env,
+            &script_runtime_hint,
+            lpm_runner::script::DevScriptEndpointOptions {
+                requested_port: child_requested_port,
+                stop_requested: script_stop_for_runner,
+                on_endpoint: Box::new(move |result| {
+                    let _ = endpoint_tx.send(result);
+                }),
+            },
+        )
+    });
+
+    let endpoint_result = tokio::select! {
+        endpoint = endpoint_rx => endpoint.ok(),
+        script_result = &mut script_handle => {
+            let script_result = script_result
+                .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
+            let result = release_proxy_lease_after(script_result, &proxy_lease).await;
+            return release_hosts_file_after(result, hosts_file_lease);
+        }
+    };
+
+    let endpoint = match endpoint_result {
+        Some(Ok(Some(endpoint))) => Some(endpoint),
+        Some(Ok(None)) | None => None,
+        Some(Err(error)) => {
+            let _ = script_handle.await;
+            let result =
+                release_proxy_lease_after(Err(LpmError::Script(error)), &proxy_lease).await;
+            return release_hosts_file_after(result, hosts_file_lease);
+        }
+    };
+
+    let setup_result = async {
+        let mut frontends = None;
+        let mut dev_session_lease = None;
+        if let Some(endpoint) = endpoint {
+            let endpoint_owner_pid = endpoint.owner_pid;
+            let child_target = endpoint.target;
+            let active_frontends = start_single_service_frontends(
+                project_dir,
+                child_target.clone(),
+                https,
+                network,
+                requested_port,
+            )
+            .await?;
+            let target = active_frontends.local_target.clone();
+            if tunnel {
+                let tunnel_token = token
+                    .ok_or_else(|| {
+                        LpmError::Tunnel(
+                            "authentication required for tunnel. Run `lpm login` first.".into(),
+                        )
+                    })?
+                    .to_string();
+                let tunnel_project_dir = project_dir.to_path_buf();
+                let tunnel_domain = tunnel_domain.map(str::to_string);
+                let tunnel_relay_url = tunnel_relay_url.map(str::to_string);
+                let tunnel_target = child_target.clone();
+                startup.tunnel_source = tunnel_source.map(str::to_string);
+                if let Some(domain) = tunnel_domain.as_deref()
+                    && !quiet
+                {
+                    dev_ui::trusted_detail("Tunnel domain", &install_ui::cyan(domain));
+                }
+                tunnel_handle = Some(tokio::spawn(async move {
+                    let result = crate::commands::tunnel::run_start(
+                        Some(&tunnel_token),
+                        tunnel_target,
+                        tunnel_domain.as_deref(),
+                        false,
+                        &tunnel_project_dir,
+                        tunnel_auth,
+                        no_inspect,
+                        inspect_port,
+                        false,
+                        None,
+                        tunnel_relay_url.as_deref(),
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        show_tunnel_notice(&format!("Tunnel failed: {error}"));
+                    }
+                }));
+            }
+            if let Some(network_port) = active_frontends.network_port {
+                let current_network_info = lpm_network::get_network_info(network_port, https)?;
+                startup.network_addr = display_network_access(
+                    &current_network_info,
+                    network_port,
+                    https,
+                    &target.base_path,
+                    allow_ca_bootstrap,
+                )
+                .await?;
+            }
+            print_startup_banner(&startup, project_dir);
+            let url = format!(
+                "{}://{}:{}{}",
+                target.scheme, local_display_host, target.port, target.base_path
+            );
+            dev_ui::trusted_detail("Local", &install_ui::url(&url));
+            dev_ui::blank_line();
+            dev_ui::done_ready("Local server", startup_started.elapsed());
+
+            if let Some(config) = lpm_config.as_ref()
+                && let Some(plan) = lpm_runner::local_domains::plan_single_service_route(
+                    config,
+                    child_target.clone(),
+                )
+            {
+                register_proxy_route_plan(project_dir, plan.routes, Arc::clone(&proxy_lease))
+                    .await?;
+            }
+
+            dev_session_lease = Some(lpm_runner::dev_session::DevSessionLease::register(
+                project_dir,
+                child_target,
+                endpoint_owner_pid,
+                None,
+            )?);
+            if should_open_browser(true, no_open, is_ci()) {
+                let _ = open::that(&url);
+            }
+            frontends = Some(active_frontends);
+        } else {
+            print_startup_banner(&startup, project_dir);
+        }
+        Ok::<_, LpmError>((frontends, dev_session_lease))
+    }
+    .await;
+
+    let (frontends, dev_session_lease) = match setup_result {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            script_stop_requested.store(true, Ordering::Release);
+            let _ = script_handle.await;
+            let result = release_proxy_lease_after(Err(error), &proxy_lease).await;
+            let result = release_hosts_file_after(result, hosts_file_lease);
+            if let Some(handle) = tunnel_handle.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+            if let Some(handle) = inspector_handle.take() {
+                handle.shutdown();
+            }
+            return result;
+        }
+    };
+
+    let script_result = script_handle
+        .await
+        .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
+    drop(frontends);
+    drop(dev_session_lease);
     let result = release_proxy_lease_after(script_result, &proxy_lease).await;
     let result = release_hosts_file_after(result, hosts_file_lease);
 
     // Clean shutdown: tunnel first, then inspector (lets in-flight webhook
     // pushes drain into the inspector state before the server closes).
     if let Some(handle) = tunnel_handle {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        handle.abort();
+        let _ = handle.await;
     }
     if let Some(handle) = inspector_handle {
         handle.shutdown();
@@ -942,13 +1137,12 @@ pub async fn run(
 
 fn startup_proxy_lines_from_config(
     config: &lpm_runner::lpm_json::LpmJsonConfig,
-    single_service_port: u16,
 ) -> Vec<StartupProxyLine> {
     let mut lines = Vec::new();
 
     if config.services.is_empty() {
         if let Some(host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref()) {
-            push_startup_proxy_line(&mut lines, host, Some(single_service_port), None);
+            push_startup_proxy_line(&mut lines, host, None);
         }
         return lines;
     }
@@ -958,20 +1152,15 @@ fn startup_proxy_lines_from_config(
     for service_name in service_names {
         let service = &config.services[service_name];
         if let Some(host) = service.host.as_ref() {
-            push_startup_proxy_line(&mut lines, host, service.port, Some(service_name.clone()));
+            push_startup_proxy_line(&mut lines, host, Some(service_name.clone()));
         }
     }
 
     if let Some(host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref()) {
         match primary_proxy_service_for_display(config) {
             Some(service_name) => {
-                if let Some(service) = config.services.get(service_name) {
-                    push_startup_proxy_line(
-                        &mut lines,
-                        host,
-                        service.port,
-                        Some(service_name.to_string()),
-                    );
+                if config.services.contains_key(service_name) {
+                    push_startup_proxy_line(&mut lines, host, Some(service_name.to_string()));
                 }
             }
             None => lines.push(StartupProxyLine {
@@ -1020,51 +1209,18 @@ fn primary_proxy_service_for_display(config: &lpm_runner::lpm_json::LpmJsonConfi
     None
 }
 
-fn push_startup_proxy_line(
-    lines: &mut Vec<StartupProxyLine>,
-    host: &str,
-    port: Option<u16>,
-    service: Option<String>,
-) {
+fn push_startup_proxy_line(lines: &mut Vec<StartupProxyLine>, host: &str, service: Option<String>) {
     if lines
         .iter()
         .any(|line| line.host.eq_ignore_ascii_case(host))
     {
         return;
     }
-    let target = port.map_or_else(
-        || "auto port".to_string(),
-        |port| format!("localhost:{port}"),
-    );
     lines.push(StartupProxyLine {
         host: host.to_string(),
-        target,
+        target: "resolving endpoint".to_string(),
         service,
     });
-}
-
-fn build_proxy_ports_assigned_callback(
-    config: &lpm_runner::lpm_json::LpmJsonConfig,
-    project_dir: &Path,
-    proxy_lease: ProxyLeaseSlot,
-    runtime_handle: tokio::runtime::Handle,
-) -> Option<lpm_runner::orchestrator::PortsAssignedCallback> {
-    if lpm_runner::local_domains::configured_hostnames(config).is_empty() {
-        return None;
-    }
-
-    let config = config.clone();
-    let project_dir = project_dir.to_path_buf();
-    Some(Box::new(move |ports| {
-        let plan = lpm_runner::local_domains::plan_multi_service_routes(&config, ports)
-            .map_err(LpmError::Script)?;
-        register_proxy_route_plan_on_runtime(
-            &project_dir,
-            plan.routes,
-            Arc::clone(&proxy_lease),
-            runtime_handle.clone(),
-        )
-    }))
 }
 
 async fn ensure_local_proxy_running(project_dir: &Path) -> Result<(), LpmError> {
@@ -1175,54 +1331,81 @@ async fn register_proxy_route_plan(
         return Ok(());
     }
 
-    let proxy_routes: Vec<lpm_proxy::Route> = routes
-        .into_iter()
-        .map(|route| lpm_proxy::Route {
-            host: route.host,
-            upstream_port: route.upstream_port,
-            project_dir: project_dir.to_path_buf(),
-            service: route.service,
-        })
-        .collect();
+    let (proxy_routes, bridges) = prepare_proxy_routes(project_dir, &routes).await?;
     let lease = register_proxy_routes(proxy_routes.clone()).await?;
-    store_proxy_lease(proxy_lease, lease)?;
-    print_registered_proxy_routes(&proxy_routes);
+    store_proxy_lease(
+        proxy_lease,
+        LocalProxyRuntime {
+            lease,
+            _bridges: bridges,
+        },
+    )?;
+    print_registered_proxy_routes(&routes);
     Ok(())
 }
 
-fn register_proxy_route_plan_on_runtime(
+async fn prepare_proxy_routes(
     project_dir: &Path,
-    routes: Vec<lpm_runner::local_domains::LocalDomainRoute>,
-    proxy_lease: ProxyLeaseSlot,
-    runtime_handle: tokio::runtime::Handle,
-) -> Result<(), LpmError> {
-    if routes.is_empty() {
-        return Ok(());
-    }
-
-    let proxy_routes: Vec<lpm_proxy::Route> = routes
-        .into_iter()
-        .map(|route| lpm_proxy::Route {
-            host: route.host,
-            upstream_port: route.upstream_port,
+    routes: &[lpm_runner::local_domains::LocalDomainRoute],
+) -> Result<(Vec<lpm_proxy::Route>, Vec<lpm_proxy::HttpProxyHandle>), LpmError> {
+    let mut proxy_routes = Vec::with_capacity(routes.len());
+    let mut bridges = Vec::with_capacity(routes.len());
+    for route in routes {
+        if route.upstream.scheme != LocalScheme::Http {
+            return Err(LpmError::Script(format!(
+                "local-domain proxy host `{}` requires a plain HTTP child, but service {} reported {}; disable framework HTTPS and let the LPM proxy terminate TLS",
+                route.host,
+                route.service.as_deref().unwrap_or("dev"),
+                route.upstream.url(),
+            )));
+        }
+        let upstream_port = if proxy_can_reach_target_directly(&route.upstream) {
+            route.upstream.port
+        } else {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| {
+                    LpmError::Script(format!(
+                        "bind local proxy bridge for `{}`: {error}",
+                        route.host
+                    ))
+                })?;
+            let bridge =
+                lpm_proxy::start_http_frontend_on_listener(listener, route.upstream.clone())
+                    .map_err(|error| {
+                        LpmError::Script(format!(
+                            "start local proxy bridge for `{}`: {error}",
+                            route.host
+                        ))
+                    })?;
+            let port = bridge.port();
+            bridges.push(bridge);
+            port
+        };
+        proxy_routes.push(lpm_proxy::Route {
+            host: route.host.clone(),
+            upstream_port,
             project_dir: project_dir.to_path_buf(),
-            service: route.service,
-        })
-        .collect();
-    let lease = register_proxy_routes_blocking(proxy_routes.clone(), runtime_handle)?;
-    store_proxy_lease(proxy_lease, lease)?;
-    print_registered_proxy_routes(&proxy_routes);
-    Ok(())
+            service: route.service.clone(),
+        });
+    }
+    Ok((proxy_routes, bridges))
+}
+
+fn proxy_can_reach_target_directly(target: &LocalTarget) -> bool {
+    target.scheme == LocalScheme::Http
+        && target.address == IpAddr::V4(Ipv4Addr::LOCALHOST)
+        && target.base_path == "/"
 }
 
 fn store_proxy_lease(
     proxy_lease: ProxyLeaseSlot,
-    lease: lpm_proxy::RouteLease,
+    runtime: LocalProxyRuntime,
 ) -> Result<(), LpmError> {
     let mut guard = proxy_lease
         .lock()
         .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?;
-    *guard = Some(lease);
+    *guard = Some(runtime);
     Ok(())
 }
 
@@ -1232,19 +1415,6 @@ async fn register_proxy_routes(
     lpm_proxy::register(routes)
         .await
         .map_err(map_proxy_register_error)
-}
-
-fn register_proxy_routes_blocking(
-    routes: Vec<lpm_proxy::Route>,
-    runtime_handle: tokio::runtime::Handle,
-) -> Result<lpm_proxy::RouteLease, LpmError> {
-    let worker = std::thread::Builder::new()
-        .name("lpm-proxy-register".to_string())
-        .spawn(move || runtime_handle.block_on(register_proxy_routes(routes)))
-        .map_err(|err| LpmError::Script(format!("start local proxy registration thread: {err}")))?;
-    worker
-        .join()
-        .map_err(|_| LpmError::Script("local proxy registration thread panicked".into()))?
 }
 
 fn map_proxy_register_error(err: lpm_proxy::ProxyError) -> LpmError {
@@ -1279,6 +1449,35 @@ async fn release_proxy_lease_after(
     }
 }
 
+fn release_multi_service_runtime(
+    result: Result<(), LpmError>,
+    frontend_slot: &Arc<Mutex<Option<DevFrontends>>>,
+    dev_session_slot: &Arc<Mutex<Option<lpm_runner::dev_session::DevSessionLease>>>,
+) -> Result<(), LpmError> {
+    let release_result = (|| {
+        let frontends = frontend_slot
+            .lock()
+            .map_err(|_| LpmError::Script("dev frontend state is poisoned".to_string()))?
+            .take();
+        let session = dev_session_slot
+            .lock()
+            .map_err(|_| LpmError::Script("dev session state is poisoned".to_string()))?
+            .take();
+        drop(frontends);
+        drop(session);
+        Ok(())
+    })();
+    match (result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(release_err)) => Err(release_err),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(release_err)) => {
+            dev_ui::warn(&format!("dev runtime cleanup failed: {release_err}"));
+            Err(primary)
+        }
+    }
+}
+
 fn release_hosts_file_after(
     result: Result<(), LpmError>,
     hosts_file: Option<lpm_runner::local_domains::ManagedHostsFile>,
@@ -1306,14 +1505,15 @@ fn release_hosts_file(
 }
 
 async fn release_proxy_lease(proxy_lease: &ProxyLeaseSlot) -> Result<(), LpmError> {
-    let mut lease = {
+    let mut runtime = {
         let mut guard = proxy_lease
             .lock()
             .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?;
         guard.take()
     };
-    if let Some(ref mut lease) = lease {
-        lease
+    if let Some(ref mut runtime) = runtime {
+        runtime
+            .lease
             .release()
             .await
             .map_err(|err| LpmError::Script(format!("local proxy route release failed: {err}")))?;
@@ -1321,9 +1521,14 @@ async fn release_proxy_lease(proxy_lease: &ProxyLeaseSlot) -> Result<(), LpmErro
     Ok(())
 }
 
-fn print_registered_proxy_routes(routes: &[lpm_proxy::Route]) {
+fn print_registered_proxy_routes(routes: &[lpm_runner::local_domains::LocalDomainRoute]) {
     for route in routes {
-        let target = format!("{} -> localhost:{}", route.host, route.upstream_port);
+        let upstream = if proxy_can_reach_target_directly(&route.upstream) {
+            format!("localhost:{}", route.upstream.port)
+        } else {
+            route.upstream.url()
+        };
+        let target = format!("{} -> {upstream}", route.host);
         if let Some(ref service) = route.service {
             dev_ui::trusted_detail_with_hint("Proxy", &install_ui::yellow(&target), service);
         } else {
@@ -1837,6 +2042,231 @@ fn resolve_dev_port(requested: Option<u16>, has_services: bool) -> u16 {
     lpm_runner::ports::find_available_port(3000).unwrap_or(3000)
 }
 
+fn find_internal_dev_port(public_port: u16) -> Result<u16, LpmError> {
+    public_port
+        .checked_add(1)
+        .and_then(lpm_runner::ports::find_available_port)
+        .or_else(|| lpm_runner::ports::find_available_port(3000))
+        .ok_or_else(|| LpmError::Script("no available internal dev-server port found".to_string()))
+}
+
+async fn start_single_service_frontends(
+    project_dir: &Path,
+    child_target: LocalTarget,
+    https: bool,
+    network: bool,
+    requested_port: Option<u16>,
+) -> Result<DevFrontends, LpmError> {
+    if child_target.scheme == LocalScheme::Https {
+        if https {
+            let port_context = requested_port
+                .filter(|port| *port != child_target.port)
+                .map_or_else(String::new, |public_port| {
+                    format!(" or remap it to requested public port {public_port}")
+                });
+            return Err(LpmError::Script(format!(
+                "the child already serves HTTPS on port {}, so LPM CLI cannot terminate TLS{port_context}; configure the child to serve plain HTTP",
+                child_target.port
+            )));
+        }
+        if network {
+            return Err(LpmError::Network(
+                "the HTTPS child is loopback-only, so `--network` cannot publish it without a TLS-aware frontend; configure the child to serve plain HTTP and let LPM CLI terminate HTTPS"
+                    .to_string(),
+            ));
+        }
+        return Ok(DevFrontends {
+            local_target: child_target.clone(),
+            network_port: network.then_some(child_target.port),
+            _handles: Vec::new(),
+        });
+    }
+
+    if https {
+        let public_port = requested_port.unwrap_or(0);
+        let bind_address = if network {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
+        let listener = tokio::net::TcpListener::bind((bind_address, public_port))
+            .await
+            .map_err(|error| {
+                LpmError::Script(format!(
+                    "bind LPM HTTPS frontend on {bind_address}:{public_port}: {error}"
+                ))
+            })?;
+        let cert_dir = project_dir.join(".lpm").join("certs");
+        let handle = lpm_proxy::start_tls_frontend_on_listener(
+            listener,
+            &cert_dir.join("cert.pem"),
+            &cert_dir.join("key.pem"),
+            child_target.clone(),
+        )
+        .await
+        .map_err(|error| LpmError::Script(format!("start LPM HTTPS frontend: {error}")))?;
+        return Ok(DevFrontends {
+            local_target: LocalTarget::loopback(LocalScheme::Https, handle.port())
+                .with_base_path(child_target.base_path),
+            network_port: network.then_some(handle.port()),
+            _handles: vec![handle],
+        });
+    }
+
+    let mut handles = Vec::new();
+    if network {
+        let network_info = lpm_network::get_network_info(child_target.port, false)?;
+        for address in network_info
+            .addresses
+            .iter()
+            .filter(|address| !address.is_ipv6)
+        {
+            let Ok(ip) = address.ip.parse::<IpAddr>() else {
+                continue;
+            };
+            match tokio::net::TcpListener::bind((ip, child_target.port)).await {
+                Ok(listener) => {
+                    let handle =
+                        lpm_proxy::start_http_frontend_on_listener(listener, child_target.clone())
+                            .map_err(|error| {
+                                LpmError::Network(format!(
+                                    "start LPM network frontend on {ip}:{}: {error}",
+                                    child_target.port
+                                ))
+                            })?;
+                    handles.push(handle);
+                }
+                Err(error) => {
+                    let reachable = tokio::time::timeout(
+                        std::time::Duration::from_millis(300),
+                        tokio::net::TcpStream::connect((ip, child_target.port)),
+                    )
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                    if !reachable {
+                        return Err(LpmError::Network(format!(
+                            "bind LPM network frontend on {ip}:{}: {error}",
+                            child_target.port
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(DevFrontends {
+        network_port: network.then_some(child_target.port),
+        local_target: child_target,
+        _handles: handles,
+    })
+}
+
+async fn display_network_access(
+    network_info: &lpm_network::NetworkInfo,
+    port: u16,
+    https: bool,
+    base_path: &str,
+    allow_ca_bootstrap: bool,
+) -> Result<Option<String>, LpmError> {
+    let scheme = if https { "https" } else { "http" };
+    let mut network_addr = None;
+    let primary = network_info
+        .primary
+        .as_ref()
+        .filter(|address| !address.is_ipv6)
+        .or_else(|| {
+            network_info
+                .addresses
+                .iter()
+                .find(|address| !address.is_ipv6)
+        });
+    if let Some(primary) = primary {
+        network_addr = Some(format!("{}:{port}", primary.ip));
+        let url = format_network_url(scheme, &primary.ip, primary.is_ipv6, port, base_path);
+        dev_ui::blank_line();
+        dev_ui::trusted_detail_with_hint(
+            "Network",
+            &install_ui::url(&url),
+            &format!("({})", primary.interface_type),
+        );
+        for address in network_info
+            .addresses
+            .iter()
+            .filter(|address| !address.is_preferred && !address.is_ipv6)
+        {
+            let url = format_network_url(scheme, &address.ip, address.is_ipv6, port, base_path);
+            dev_ui::trusted_hint_line(install_ui::terminal_line!(
+                "{} {}",
+                install_ui::url(&url),
+                install_ui::dim(&format!("({})", address.interface_type)),
+            ));
+        }
+
+        if https
+            && let Ok(ca_cert_path) = lpm_cert::paths::ca_cert_path()
+            && ca_cert_path.exists()
+        {
+            if allow_ca_bootstrap {
+                let ca_cert_data = lpm_common::read_file_capped(
+                    &ca_cert_path,
+                    lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+                )?;
+                if !ca_cert_data.is_empty() {
+                    let ca_port = start_ca_cert_server(ca_cert_data).await?;
+                    dev_ui::blank_line();
+                    dev_ui::trusted_detail_line(
+                        "Mobile",
+                        install_ui::terminal_line!(
+                            "First time on mobile? Visit {} to install the CA certificate",
+                            install_ui::url(&format!("http://{}:{ca_port}", primary.ip)),
+                        ),
+                    );
+                }
+            } else {
+                dev_ui::blank_line();
+                dev_ui::trusted_detail_line(
+                    "Mobile",
+                    install_ui::terminal_line!(
+                        "enable with {} or copy {} to the device manually",
+                        install_ui::cyan("--allow-ca-bootstrap"),
+                        install_ui::cyan("rootCA.pem"),
+                    ),
+                );
+            }
+        }
+    } else {
+        dev_ui::warn("no IPv4 network interfaces found");
+    }
+
+    let qr_code = primary
+        .map(|address| format_network_url(scheme, &address.ip, address.is_ipv6, port, base_path))
+        .and_then(|url| lpm_network::qr::render_qr_code(&url).ok())
+        .unwrap_or_default();
+    if !qr_code.is_empty() {
+        dev_ui::blank_line();
+        dev_ui::untrusted_block(&qr_code);
+    }
+    for warning in &network_info.warnings {
+        dev_ui::warn(warning);
+    }
+    dev_ui::blank_line();
+    Ok(network_addr)
+}
+
+fn format_network_url(
+    scheme: &str,
+    address: &str,
+    is_ipv6: bool,
+    port: u16,
+    base_path: &str,
+) -> String {
+    if is_ipv6 {
+        format!("{scheme}://[{address}]:{port}{base_path}")
+    } else {
+        format!("{scheme}://{address}:{port}{base_path}")
+    }
+}
+
 fn upsert_extra_env(extra_env: &mut Vec<(String, String)>, key: &str, value: String) {
     if let Some((_, existing)) = extra_env.iter_mut().find(|(env_key, _)| env_key == key) {
         *existing = value;
@@ -1882,24 +2312,20 @@ fn is_ci() -> bool {
         || std::env::var("GITHUB_ACTIONS").is_ok()
 }
 
-/// Lightweight HTTP server that serves the root CA certificate for mobile device setup.
-///
-/// Listens on the given port and responds to any request with the CA certificate
-/// in PEM format with `Content-Type: application/x-pem-file`. This triggers the
-/// certificate install flow on iOS and Android when visited from a mobile browser.
-///
-/// Runs until the dev server shuts down (task is dropped).
-async fn serve_ca_cert(port: u16, ca_cert_data: Vec<u8>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn start_ca_cert_server(ca_cert_data: Vec<u8>) -> Result<u16, LpmError> {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(|error| LpmError::Network(format!("bind mobile CA bootstrap server: {error}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| LpmError::Network(format!("read CA bootstrap address: {error}")))?
+        .port();
+    tokio::spawn(serve_ca_cert(listener, ca_cert_data));
+    Ok(port)
+}
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::debug!("CA cert server failed to bind on port {port}: {e}");
-            return;
-        }
-    };
+async fn serve_ca_cert(listener: tokio::net::TcpListener, ca_cert_data: Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     loop {
         let (mut stream, _) = match listener.accept().await {
@@ -1951,6 +2377,18 @@ mod tests {
     }
 
     #[test]
+    fn network_urls_preserve_base_paths_and_bracket_ipv6_addresses() {
+        assert_eq!(
+            format_network_url("http", "192.0.2.10", false, 5173, "/app/"),
+            "http://192.0.2.10:5173/app/"
+        );
+        assert_eq!(
+            format_network_url("https", "2001:db8::1", true, 8443, "/app/"),
+            "https://[2001:db8::1]:8443/app/"
+        );
+    }
+
+    #[test]
     fn is_ci_detects_ci_env() {
         // Verify the function exists and returns bool — value depends on environment
         let _result: bool = is_ci();
@@ -1984,6 +2422,67 @@ mod tests {
             first_script_binary_name("./node_modules/.bin/next dev"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn an_https_child_rejects_a_different_requested_public_port() {
+        let project = TempDir::new().unwrap();
+        let child = LocalTarget::loopback(LocalScheme::Https, 5173);
+
+        let result =
+            start_single_service_frontends(project.path(), child, true, false, Some(4000)).await;
+        let Err(error) = result else {
+            panic!("an existing HTTPS child cannot be remapped without a TLS-aware frontend");
+        };
+
+        assert!(error.to_string().contains("already serves HTTPS"));
+        assert!(error.to_string().contains("5173"));
+        assert!(error.to_string().contains("4000"));
+    }
+
+    #[tokio::test]
+    async fn an_https_child_rejects_lpm_tls_termination_mode() {
+        let project = TempDir::new().unwrap();
+        let child = LocalTarget::loopback(LocalScheme::Https, 5173);
+
+        let result = start_single_service_frontends(project.path(), child, true, false, None).await;
+        let Err(error) = result else {
+            panic!("LPM TLS termination requires a plain HTTP child");
+        };
+
+        assert!(error.to_string().contains("already serves HTTPS"));
+        assert!(error.to_string().contains("plain HTTP"));
+    }
+
+    #[tokio::test]
+    async fn an_https_child_does_not_claim_unavailable_lan_forwarding() {
+        let project = TempDir::new().unwrap();
+        let child = LocalTarget::loopback(LocalScheme::Https, 5173);
+
+        let result = start_single_service_frontends(project.path(), child, false, true, None).await;
+        let Err(error) = result else {
+            panic!("an HTTPS loopback child cannot be advertised on the LAN without forwarding");
+        };
+
+        assert!(error.to_string().contains("HTTPS child"));
+        assert!(error.to_string().contains("--network"));
+    }
+
+    #[tokio::test]
+    async fn a_local_domain_route_rejects_an_https_child() {
+        let project = TempDir::new().unwrap();
+        let routes = vec![lpm_runner::local_domains::LocalDomainRoute {
+            host: "app.localhost".to_string(),
+            upstream: LocalTarget::loopback(LocalScheme::Https, 5173),
+            service: Some("web".to_string()),
+        }];
+
+        let Err(error) = prepare_proxy_routes(project.path(), &routes).await else {
+            panic!("the local-domain proxy cannot safely forward to a framework HTTPS child");
+        };
+
+        assert!(error.to_string().contains("requires a plain HTTP child"));
+        assert!(error.to_string().contains("https://127.0.0.1:5173/"));
     }
 
     #[test]
@@ -2192,7 +2691,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_proxy_lines_map_service_hosts_to_configured_or_auto_ports() {
+    fn startup_proxy_lines_do_not_publish_service_ports_before_assignment() {
         let config = lpm_runner::lpm_json::LpmJsonConfig {
             services: HashMap::from([
                 (
@@ -2217,16 +2716,16 @@ mod tests {
         };
 
         assert_eq!(
-            startup_proxy_lines_from_config(&config, 3000),
+            startup_proxy_lines_from_config(&config),
             vec![
                 StartupProxyLine {
                     host: "api.localhost".to_string(),
-                    target: "localhost:4000".to_string(),
+                    target: "resolving endpoint".to_string(),
                     service: Some("api".to_string()),
                 },
                 StartupProxyLine {
                     host: "web.localhost".to_string(),
-                    target: "auto port".to_string(),
+                    target: "resolving endpoint".to_string(),
                     service: Some("web".to_string()),
                 },
             ]
@@ -2234,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_proxy_lines_map_top_level_host_to_single_script_port() {
+    fn startup_proxy_lines_do_not_publish_the_single_script_port_before_discovery() {
         let config = lpm_runner::lpm_json::LpmJsonConfig {
             proxy: Some(lpm_runner::lpm_json::ProxyConfig {
                 host: Some("app.localhost".to_string()),
@@ -2244,10 +2743,10 @@ mod tests {
         };
 
         assert_eq!(
-            startup_proxy_lines_from_config(&config, 5173),
+            startup_proxy_lines_from_config(&config),
             vec![StartupProxyLine {
                 host: "app.localhost".to_string(),
-                target: "localhost:5173".to_string(),
+                target: "resolving endpoint".to_string(),
                 service: None,
             }]
         );

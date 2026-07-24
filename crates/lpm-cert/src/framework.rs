@@ -74,6 +74,158 @@ pub fn detect_framework(project_dir: &Path) -> Framework {
     }
 }
 
+/// Return framework CLI arguments that enforce an explicitly managed dev port.
+pub fn explicit_port_args(framework: &Framework, port: u16) -> Vec<String> {
+    let port = port.to_string();
+    match framework {
+        Framework::Vite => vec!["--port".to_string(), port, "--strictPort".to_string()],
+        Framework::NextJs
+        | Framework::Nuxt
+        | Framework::SvelteKit
+        | Framework::Remix
+        | Framework::Astro => vec!["--port".to_string(), port],
+        Framework::CreateReactApp | Framework::Express | Framework::Unknown => Vec::new(),
+    }
+}
+
+/// Return managed port arguments only when the command launches a compatible framework.
+pub fn explicit_port_args_for_command(project_dir: &Path, command: &str, port: u16) -> Vec<String> {
+    command_framework(project_dir, command, 0)
+        .map_or_else(Vec::new, |framework| explicit_port_args(&framework, port))
+}
+
+fn command_framework(project_dir: &Path, command: &str, depth: u8) -> Option<Framework> {
+    if depth > 2 {
+        return None;
+    }
+    let words = shlex::split(command)?;
+    let executable_index = first_executable_index(&words)?;
+    let executable = words[executable_index].as_str();
+
+    if let Some(script_name) = package_manager_script_name(&words, executable_index) {
+        let script = package_script(project_dir, script_name)?;
+        return command_framework(project_dir, &script, depth + 1);
+    }
+
+    let executable = package_runner_executable(&words, executable_index).unwrap_or(executable);
+    let detected = detect_framework(project_dir);
+    match executable {
+        "vite" => Some(match detected {
+            Framework::SvelteKit => Framework::SvelteKit,
+            _ => Framework::Vite,
+        }),
+        "next" => Some(Framework::NextJs),
+        "nuxt" | "nuxi" => Some(Framework::Nuxt),
+        "svelte-kit" => Some(Framework::SvelteKit),
+        "remix" | "react-router" => Some(Framework::Remix),
+        "astro" => Some(Framework::Astro),
+        "react-scripts" => Some(Framework::CreateReactApp),
+        _ => None,
+    }
+}
+
+fn first_executable_index(words: &[String]) -> Option<usize> {
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if is_shell_assignment(word) || matches!(word, "env" | "command") {
+            index += 1;
+            continue;
+        }
+        if matches!(word, "cross-env" | "cross-env-shell") {
+            index += 1;
+            while index < words.len() && is_shell_assignment(&words[index]) {
+                index += 1;
+            }
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn is_shell_assignment(word: &str) -> bool {
+    let Some((key, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = key.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn package_manager_script_name(words: &[String], executable_index: usize) -> Option<&str> {
+    let executable = words.get(executable_index)?.as_str();
+    let arguments = words.get(executable_index + 1..)?;
+    match executable {
+        "npm" | "lpm" => {
+            if arguments.first().map(String::as_str) == Some("run") {
+                arguments.get(1).map(String::as_str)
+            } else {
+                None
+            }
+        }
+        "pnpm" | "yarn" | "bun" => {
+            if matches!(
+                arguments.first().map(String::as_str),
+                Some("exec" | "dlx" | "x")
+            ) {
+                return None;
+            }
+            let arguments = if arguments.first().map(String::as_str) == Some("run") {
+                &arguments[1..]
+            } else {
+                arguments
+            };
+            arguments
+                .first()
+                .filter(|argument| !argument.starts_with('-'))
+                .map(String::as_str)
+        }
+        _ => None,
+    }
+}
+
+fn package_runner_executable(words: &[String], executable_index: usize) -> Option<&str> {
+    let executable = words.get(executable_index)?.as_str();
+    let arguments = words.get(executable_index + 1..)?;
+    match executable {
+        "npx" | "bunx" => arguments
+            .iter()
+            .find(|argument| !argument.starts_with('-'))
+            .map(String::as_str),
+        "pnpm" | "yarn" | "bun"
+            if matches!(
+                arguments.first().map(String::as_str),
+                Some("exec" | "dlx" | "x")
+            ) =>
+        {
+            arguments
+                .iter()
+                .skip(1)
+                .find(|argument| !argument.starts_with('-'))
+                .map(String::as_str)
+        }
+        _ => None,
+    }
+}
+
+fn package_script(project_dir: &Path, name: &str) -> Option<String> {
+    let contents = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
+    let package: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    package
+        .get("scripts")?
+        .get(name)?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Get framework-specific environment variables for HTTPS.
 fn get_framework_env(
     framework: &Framework,
@@ -164,6 +316,44 @@ mod tests {
     fn detect_unknown_no_package_json() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(detect_framework(tmp.path()), Framework::Unknown);
+    }
+
+    #[test]
+    fn vite_explicit_port_is_strict() {
+        assert_eq!(
+            explicit_port_args(&Framework::Vite, 5174),
+            ["--port", "5174", "--strictPort"]
+        );
+    }
+
+    #[test]
+    fn generic_servers_receive_explicit_ports_through_the_port_environment() {
+        assert!(explicit_port_args(&Framework::Express, 4000).is_empty());
+        assert!(explicit_port_args(&Framework::Unknown, 4000).is_empty());
+    }
+
+    #[test]
+    fn command_specific_port_args_do_not_follow_unrelated_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+                "scripts":{"web":"vite","api":"node api.js"},
+                "devDependencies":{"vite":"^7.0.0"}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(explicit_port_args_for_command(tmp.path(), "node api.js", 4000).is_empty());
+        assert!(explicit_port_args_for_command(tmp.path(), "npm run api", 4000).is_empty());
+        assert_eq!(
+            explicit_port_args_for_command(tmp.path(), "npm run web", 5174),
+            ["--port", "5174", "--strictPort"]
+        );
+        assert_eq!(
+            explicit_port_args_for_command(tmp.path(), "npx vite", 5175),
+            ["--port", "5175", "--strictPort"]
+        );
     }
 
     #[test]

@@ -94,6 +94,34 @@ mod integration_tests {
         assert_eq!(state.local_port(), 8080);
     }
 
+    #[tokio::test]
+    async fn pending_state_does_not_claim_a_local_endpoint_before_discovery() {
+        let state = InspectorState::pending();
+
+        assert_eq!(state.local_port(), 0);
+        let pending_status = crate::api::status(axum::extract::State(state.clone()))
+            .await
+            .0;
+        assert!(!pending_status.local_ready);
+        assert!(pending_status.local_url.is_none());
+
+        state.set_local_target(lpm_common::LocalTarget::loopback(
+            lpm_common::LocalScheme::Http,
+            5173,
+        ));
+        assert_eq!(state.local_port(), 5173);
+    }
+
+    #[tokio::test]
+    async fn state_preserves_the_complete_local_replay_target() {
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Https, 8443)
+            .with_base_path("/hooks/");
+        let state = InspectorState::new_for_target(target.clone());
+
+        assert_eq!(state.local_target(), target);
+        assert_eq!(state.local_port(), 8443);
+    }
+
     // ── API response conversion tests ───────────────────────────
 
     #[test]
@@ -239,6 +267,8 @@ mod integration_tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["inspector"], true);
         assert_eq!(body["local_port"], 3000);
+        assert_eq!(body["local_url"], "http://127.0.0.1:3000/");
+        assert_eq!(body["local_ready"], true);
         assert_eq!(body["captured_count"], 0);
 
         handle.shutdown();

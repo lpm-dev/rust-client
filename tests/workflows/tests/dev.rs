@@ -1,7 +1,11 @@
 mod support;
 
+use std::net::{TcpListener, TcpStream};
+
 use support::mock_registry::MockRegistry;
-use support::{TempProject, configure_fake_node, lpm, lpm_with_registry, write_repeated_file};
+use support::{
+    TempProject, configure_fake_node, lpm, lpm_spawnable, lpm_with_registry, write_repeated_file,
+};
 
 struct FrameworkBinCase {
     label: &'static str,
@@ -140,6 +144,363 @@ if (process.env.PORT !== '4567') {
         "lpm dev should pass the selected port into single-service scripts\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn dev_reports_the_endpoint_selected_by_the_child_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve child server port");
+    let actual_port = listener.local_addr().expect("read reserved port").port();
+    drop(listener);
+
+    let project = TempProject::empty(
+        r#"{"name":"dev-detected-port","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const port = Number(process.env.LPM_TEST_ACTUAL_PORT);
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  console.log(`  ➜  Local: http://localhost:${port}/`);
+  setTimeout(() => server.close(), 750);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TEST_ACTUAL_PORT", actual_port.to_string())
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run lpm dev with a child-selected port");
+
+    assert!(
+        output.status.success(),
+        "lpm dev should preserve the child exit status\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("  Local http://localhost:{actual_port}")),
+        "LPM must report the endpoint owned by the child server\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        !stderr.contains("  Local http://localhost:3000"),
+        "LPM must not report its fallback guess as the running server\nstderr:\n{stderr}",
+    );
+}
+
+#[test]
+fn dev_reports_an_explicit_port_only_after_the_child_owns_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve explicit dev port");
+    let port = listener
+        .local_addr()
+        .expect("read explicit dev port")
+        .port();
+    drop(listener);
+    let project = TempProject::empty(
+        r#"{"name":"dev-explicit-port","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const port = Number(process.env.PORT);
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Local: http://localhost:${port}/`);
+  setTimeout(() => server.close(), 750);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "dev",
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+            "--port",
+            &port.to_string(),
+        ])
+        .output()
+        .expect("run lpm dev with an explicit port");
+
+    assert!(
+        output.status.success(),
+        "explicit-port fixture should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("  Local http://localhost:{port}/")),
+        "LPM must publish the owned explicit endpoint\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn dev_rejects_a_child_endpoint_that_ignores_the_explicit_port() {
+    let requested_listener = TcpListener::bind("127.0.0.1:0").expect("reserve requested port");
+    let requested_port = requested_listener
+        .local_addr()
+        .expect("read requested port")
+        .port();
+    let actual_listener = TcpListener::bind("127.0.0.1:0").expect("reserve actual port");
+    let actual_port = actual_listener
+        .local_addr()
+        .expect("read actual port")
+        .port();
+    drop(requested_listener);
+    drop(actual_listener);
+    let project = TempProject::empty(
+        r#"{"name":"dev-ignored-port","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const port = Number(process.env.LPM_TEST_ACTUAL_PORT);
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Local: http://localhost:${port}/`);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TEST_ACTUAL_PORT", actual_port.to_string())
+        .args([
+            "dev",
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+            "--port",
+            &requested_port.to_string(),
+        ])
+        .output()
+        .expect("run lpm dev with an ignored explicit port");
+
+    assert!(!output.status.success(), "ignored explicit port must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("ignored `--port {requested_port}`"))
+            && stderr.contains(&format!("port {actual_port}")),
+        "error must identify requested and actual ports\nstderr:\n{stderr}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn dev_stops_the_child_when_https_frontend_setup_fails() {
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy HTTPS frontend port");
+    let frontend_port = occupied
+        .local_addr()
+        .expect("read occupied HTTPS frontend port")
+        .port();
+    let child_listener = TcpListener::bind("127.0.0.1:0").expect("reserve child server port");
+    let child_port = child_listener
+        .local_addr()
+        .expect("read child server port")
+        .port();
+    drop(child_listener);
+
+    let project = TempProject::empty(
+        r#"{"name":"dev-frontend-failure","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const port = Number(process.env.LPM_TEST_ACTUAL_PORT);
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Local: http://localhost:${port}/`);
+  setTimeout(() => server.close(), 8000);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TEST_ACTUAL_PORT", child_port.to_string())
+        .env(
+            "LPM_CERT_TEST_TRUST_STORE_DIR",
+            project.home().join(".lpm").join("test-trust-store"),
+        )
+        .env(
+            "LPM_CERT_AUDIT_DIR",
+            project.home().join(".lpm").join("audit"),
+        )
+        .args([
+            "dev",
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+            "--https",
+            "--yes",
+            "--port",
+            &frontend_port.to_string(),
+        ])
+        .output()
+        .expect("run lpm dev with an occupied HTTPS frontend port");
+
+    assert!(!output.status.success(), "occupied HTTPS port must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bind LPM HTTPS frontend") && stderr.contains(&frontend_port.to_string()),
+        "fixture must reach the post-discovery frontend failure\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let child_released = (0..20).any(|_| {
+        if TcpStream::connect(("127.0.0.1", child_port)).is_err() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(
+        child_released,
+        "frontend setup failure must stop the child listener on port {child_port}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn concurrent_vite_like_projects_report_their_own_child_endpoints() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").expect("reserve first Vite port");
+    let first_port = first_listener.local_addr().expect("read first port").port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").expect("reserve second Vite port");
+    let second_port = second_listener
+        .local_addr()
+        .expect("read second port")
+        .port();
+    drop(first_listener);
+    drop(second_listener);
+
+    let package_json = r#"{
+        "name":"concurrent-vite",
+        "version":"1.0.0",
+        "scripts":{"dev":"node server.js"},
+        "devDependencies":{"vite":"^7.0.0"}
+    }"#;
+    let first = TempProject::empty(package_json);
+    let second = TempProject::empty(package_json);
+    let server = r#"
+const http = require('http');
+const port = Number(process.env.LPM_TEST_ACTUAL_PORT);
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  console.log(`  ➜  Local: http://localhost:${port}/`);
+  setTimeout(() => server.close(), 1000);
+});
+"#;
+    first.write_file("server.js", server);
+    second.write_file("server.js", server);
+
+    let mut first_command = lpm_spawnable(&first);
+    first_command
+        .env("LPM_TEST_ACTUAL_PORT", first_port.to_string())
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"]);
+    let mut second_command = lpm_spawnable(&second);
+    second_command
+        .env("LPM_TEST_ACTUAL_PORT", second_port.to_string())
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"]);
+
+    let first_child = first_command.spawn().expect("start first lpm dev");
+    let second_child = second_command.spawn().expect("start second lpm dev");
+    let first_output = first_child
+        .wait_with_output()
+        .expect("wait for first lpm dev");
+    let second_output = second_child
+        .wait_with_output()
+        .expect("wait for second lpm dev");
+
+    assert!(first_output.status.success(), "first dev session failed");
+    assert!(second_output.status.success(), "second dev session failed");
+    let first_stderr = String::from_utf8_lossy(&first_output.stderr);
+    let second_stderr = String::from_utf8_lossy(&second_output.stderr);
+    assert!(first_stderr.contains(&format!("  Local http://localhost:{first_port}/")));
+    assert!(!first_stderr.contains(&format!("  Local http://localhost:{second_port}/")));
+    assert!(second_stderr.contains(&format!("  Local http://localhost:{second_port}/")));
+    assert!(!second_stderr.contains(&format!("  Local http://localhost:{first_port}/")));
+}
+
+#[test]
+fn multi_service_reports_its_conflict_reassigned_port() {
+    let occupied = (41_000..45_000)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .expect("occupy configured service port");
+    let occupied_port = occupied.local_addr().expect("read occupied port").port();
+    let project = TempProject::empty(
+        r#"{
+            "name":"multi-service-port",
+            "version":"1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+                "services": {{
+                    "web": {{
+                        "command": "node server.js",
+                        "port": {occupied_port},
+                        "primary": true,
+                        "readyTimeout": 3
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const port = Number(process.env.PORT);
+if (!Number.isInteger(port) || port === 0) {
+  console.error(`invalid managed PORT: ${process.env.PORT}`);
+  process.exit(42);
+}
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Local: http://localhost:${port}/`);
+  setTimeout(() => server.close(), 750);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run multi-service dev");
+
+    assert!(
+        output.status.success(),
+        "multi-service fixture should exit cleanly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let marker = "  Local http://localhost:";
+    let local_port = stderr
+        .find(marker)
+        .and_then(|start| {
+            stderr[start + marker.len()..]
+                .split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("resolved Local endpoint missing from stderr:\n{stderr}"));
+    assert_ne!(
+        local_port, occupied_port,
+        "an unrelated listener must not satisfy primary-service readiness"
+    );
+    assert!(
+        stderr.contains(&format!("-> :{local_port}")),
+        "service banner and Local endpoint must use the same final port\nstderr:\n{stderr}"
     );
 }
 

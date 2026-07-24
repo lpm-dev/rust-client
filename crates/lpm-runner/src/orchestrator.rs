@@ -3,15 +3,17 @@
 //! Starts multiple dev services with dependency ordering, readiness checks,
 //! cross-service env injection, colored output, and graceful shutdown.
 
+use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
 use crate::lpm_json::ServiceConfig;
 use crate::{ports, ready, service_graph};
-use lpm_common::{LpmError, sanitize_terminal_inline};
+use lpm_common::{LocalTarget, LpmError, sanitize_terminal_inline};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -54,7 +56,9 @@ pub struct PortReassignment {
 }
 
 pub type ServicePortMap = HashMap<String, u16>;
+pub type ServiceEndpointMap = HashMap<String, DevEndpoint>;
 pub type PortsAssignedCallback = Box<dyn Fn(&ServicePortMap) -> Result<(), LpmError> + Send>;
+pub type AllReadyCallback = Box<dyn FnOnce(ServiceEndpointMap) -> Result<(), LpmError> + Send>;
 
 type PortReassignments = HashMap<String, PortReassignment>;
 
@@ -96,9 +100,15 @@ pub struct OrchestratorOptions {
     pub command_rx: Option<std::sync::mpsc::Receiver<OrchestratorCommand>>,
     /// Called once after ALL initial services pass readiness checks.
     /// Used by dev.rs to open the browser at the right time.
-    pub on_all_ready: Option<Box<dyn FnOnce() + Send>>,
+    pub on_all_ready: Option<AllReadyCallback>,
     /// Called once after declared ports are checked and final service ports are assigned.
     pub on_ports_assigned: Option<PortsAssignedCallback>,
+    /// CLI port override for the primary service.
+    pub primary_port: Option<u16>,
+    /// Allocate and verify an endpoint for the configured or implicit primary service.
+    pub manage_primary_endpoint: bool,
+    /// Public frontend port that child services must not bind.
+    pub reserved_frontend_port: Option<u16>,
 }
 
 /// Maximum number of restart attempts before marking a service as permanently failed.
@@ -300,8 +310,95 @@ fn wait_for_service_readiness(
     }
 }
 
+struct InitialServiceReadiness {
+    duration: Option<Duration>,
+    endpoint: Option<DevEndpoint>,
+}
+
+struct InitialReadinessOptions<'a> {
+    service_dir: &'a Path,
+    root_pid: u32,
+    baseline: Option<&'a ListenerSnapshot>,
+    assigned_port: Option<u16>,
+    candidates: &'a Receiver<LocalTarget>,
+    ready_url: Option<String>,
+    ready_port: Option<u16>,
+    timeout_secs: u64,
+}
+
+fn wait_for_initial_service_readiness(
+    options: InitialReadinessOptions<'_>,
+) -> Result<InitialServiceReadiness, String> {
+    let started = std::time::Instant::now();
+    let endpoint = if let (Some(port), Some(baseline)) = (options.assigned_port, options.baseline) {
+        let child_exited = Arc::new(AtomicBool::new(false));
+        crate::dev_endpoint::resolve_spawned_endpoint(
+            options.service_dir,
+            options.root_pid,
+            baseline,
+            Some(port),
+            options.candidates,
+            &child_exited,
+            Duration::from_secs(options.timeout_secs),
+        )?
+    } else {
+        None
+    };
+
+    let explicit_readiness = if let Some(url) = options.ready_url {
+        Some(ready::wait_for_url(&url, options.timeout_secs)?)
+    } else if let Some(port) = options
+        .ready_port
+        .filter(|port| Some(*port) != options.assigned_port)
+    {
+        Some(ready::wait_for_port(port, options.timeout_secs)?)
+    } else {
+        None
+    };
+
+    if endpoint.is_none() && explicit_readiness.is_none() {
+        std::thread::sleep(NO_READINESS_GRACE);
+        return Ok(InitialServiceReadiness {
+            duration: None,
+            endpoint: None,
+        });
+    }
+
+    Ok(InitialServiceReadiness {
+        duration: Some(started.elapsed()),
+        endpoint,
+    })
+}
+
 fn service_ready_port(config: &ServiceConfig, assigned_port: Option<u16>) -> Option<u16> {
     config.ready_port.or(assigned_port).or(config.port)
+}
+
+fn command_with_managed_port(command: &str, cwd: &Path, port: Option<u16>) -> String {
+    let Some(port) = port else {
+        return command.to_string();
+    };
+    let args = lpm_cert::framework::explicit_port_args_for_command(cwd, command, port);
+    if args.is_empty() {
+        return command.to_string();
+    }
+
+    let separator = if command
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("npm run ")
+    {
+        " -- "
+    } else {
+        " "
+    };
+    let mut managed = String::with_capacity(
+        command.len() + separator.len() + args.iter().map(String::len).sum::<usize>() + args.len(),
+    );
+    managed.push_str(command);
+    managed.push_str(separator);
+    managed.push_str(&args.join(" "));
+    managed
 }
 
 fn port_conflict_reason(port: u16, reserved_ports: &HashMap<u16, String>) -> Option<String> {
@@ -359,24 +456,63 @@ fn find_available_service_port(
     }
 }
 
+fn primary_service_name(
+    services: &HashMap<String, ServiceConfig>,
+) -> Result<Option<&str>, LpmError> {
+    let mut primary_services = services
+        .iter()
+        .filter(|(_, service)| service.primary)
+        .map(|(name, _)| name.as_str());
+    if let Some(primary) = primary_services.next() {
+        if primary_services.next().is_some() {
+            return Err(LpmError::Script(
+                "multiple services are marked `primary`; exactly one primary service is allowed"
+                    .to_string(),
+            ));
+        }
+        return Ok(Some(primary));
+    }
+    if services.len() == 1 {
+        return Ok(services.keys().next().map(String::as_str));
+    }
+    Ok(None)
+}
+
 fn assign_service_ports(
     project_dir: &Path,
     active_services: &HashMap<String, ServiceConfig>,
     port_allocation: &mut ports::PortAllocation,
+    primary_port: Option<u16>,
+    manage_primary_endpoint: bool,
+    reserved_frontend_port: Option<u16>,
 ) -> Result<AssignedServicePorts, LpmError> {
     let port_overrides = port_allocation.read_overrides(project_dir);
+    let primary_service = if manage_primary_endpoint {
+        primary_service_name(active_services)?
+    } else {
+        None
+    };
     let mut port_map: ServicePortMap = HashMap::with_capacity(active_services.len());
     let mut reassignments: PortReassignments = HashMap::new();
     let mut reserved_ports: HashMap<u16, String> = HashMap::with_capacity(active_services.len());
+    if let Some(port) = reserved_frontend_port {
+        reserved_ports.insert(port, "LPM public frontend".to_string());
+    }
     let mut leases = Vec::with_capacity(active_services.len());
 
     let mut service_names: Vec<&String> = active_services.keys().collect();
     service_names.sort_unstable();
     for name in service_names {
         let config = &active_services[name];
-        let requested_port = port_overrides.get(name).copied().or(config.port);
+        let is_primary = primary_service == Some(name.as_str());
+        let requested_port = is_primary
+            .then_some(primary_port)
+            .flatten()
+            .or_else(|| port_overrides.get(name).copied())
+            .or(config.port);
+        let needs_managed_port = is_primary || config.host.is_some();
         let Some(port) =
-            requested_port.or_else(|| config.host.as_ref().map(|_| HOST_ONLY_DEFAULT_PORT_START))
+            requested_port.or_else(|| needs_managed_port.then_some(HOST_ONLY_DEFAULT_PORT_START))
         else {
             continue;
         };
@@ -500,7 +636,14 @@ pub fn run_services(
         port_map,
         reassignments: port_reassignments,
         leases: port_leases,
-    } = assign_service_ports(project_dir, &active_services, &mut port_allocation)?;
+    } = assign_service_ports(
+        project_dir,
+        &active_services,
+        &mut port_allocation,
+        options.primary_port,
+        options.manage_primary_endpoint,
+        options.reserved_frontend_port,
+    )?;
     drop(port_allocation);
     let _port_leases = port_leases;
 
@@ -598,6 +741,7 @@ pub fn run_services(
 
     // Start services in dependency order
     let mut startup_interrupted = false;
+    let mut service_endpoints = ServiceEndpointMap::with_capacity(port_map.len());
 
     for group in &groups {
         if shutdown_state.load(Ordering::Relaxed) > 0 {
@@ -640,6 +784,10 @@ pub fn run_services(
             } else {
                 project_dir.to_path_buf()
             };
+            let service_command =
+                command_with_managed_port(&config.command, &cwd, port_map.get(name).copied());
+            let assigned_port = port_map.get(name).copied();
+            let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
 
             // Spawn the service process
             let (shell, flag) = if cfg!(windows) {
@@ -650,7 +798,7 @@ pub fn run_services(
 
             let mut cmd = Command::new(shell);
             cmd.arg(flag)
-                .arg(&config.command)
+                .arg(&service_command)
                 .current_dir(&cwd)
                 .env("PATH", &path)
                 .envs(&env)
@@ -665,6 +813,7 @@ pub fn run_services(
             let child = cmd
                 .spawn()
                 .map_err(|e| LpmError::Script(format!("failed to start service '{name}': {e}")))?;
+            let child_pid = child.id();
 
             children.lock().push((name.clone(), child));
 
@@ -672,6 +821,7 @@ pub fn run_services(
             let service_index = service_names.iter().position(|n| n == name).unwrap_or(0);
 
             // Spawn output readers in background threads
+            let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
             spawn_output_readers(
                 name,
                 color,
@@ -679,15 +829,26 @@ pub fn run_services(
                 &children,
                 &shutdown_state,
                 &options.event_tx,
+                Some(endpoint_tx),
             );
 
             // Wait for readiness (in a background thread)
             let ready_port = service_ready_port(config, port_map.get(name).copied());
             let ready_url = config.ready_url.clone();
             let timeout = config.ready_timeout;
+            let service_dir = cwd;
 
             let handle = std::thread::spawn(move || {
-                wait_for_service_readiness(ready_url, ready_port, timeout)
+                wait_for_initial_service_readiness(InitialReadinessOptions {
+                    service_dir: &service_dir,
+                    root_pid: child_pid,
+                    baseline: listener_baseline.as_ref(),
+                    assigned_port,
+                    candidates: &endpoint_rx,
+                    ready_url,
+                    ready_port,
+                    timeout_secs: timeout,
+                })
             });
 
             handles.push((name.clone(), handle));
@@ -696,14 +857,18 @@ pub fn run_services(
         // Wait for all services in this group to be ready
         for (name, handle) in handles {
             match handle.join() {
-                Ok(Ok(duration)) => {
+                Ok(Ok(readiness)) => {
                     if service_exit_status(&children, &name).is_some() {
                         startup_interrupted = true;
                         break;
                     }
 
+                    if let Some(mut endpoint) = readiness.endpoint {
+                        endpoint.service = Some(name.clone());
+                        service_endpoints.insert(name.clone(), endpoint);
+                    }
                     let color = color_map[&name];
-                    let timing = ui_readiness_timing(duration);
+                    let timing = ui_readiness_timing(readiness.duration);
                     ui_service_status(color, &name, GREEN, "✓", &format!("ready{timing}"));
                     send_status(
                         &options.event_tx,
@@ -758,7 +923,15 @@ pub fn run_services(
 
     // All initial services are ready — fire callback (e.g., open browser)
     if !startup_interrupted && let Some(callback) = options.on_all_ready {
-        std::thread::spawn(callback);
+        let callback = std::thread::spawn(move || callback(service_endpoints));
+        match callback.join() {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(LpmError::Script(
+                    "all-services-ready callback panicked".to_string(),
+                ));
+            }
+        }
     }
 
     // Track restart backoff per service: name → (attempt_count, last_crash_time)
@@ -1015,10 +1188,12 @@ pub fn run_services(
                 if let Some(&port) = port_map.get(&name) {
                     env.insert("PORT".to_string(), port.to_string());
                 }
+                let service_command =
+                    command_with_managed_port(&config.command, &cwd, port_map.get(&name).copied());
 
                 let mut cmd = Command::new(shell);
                 cmd.arg(flag)
-                    .arg(&config.command)
+                    .arg(&service_command)
                     .current_dir(&cwd)
                     .env("PATH", &path)
                     .envs(&env)
@@ -1052,6 +1227,7 @@ pub fn run_services(
                             &children,
                             &shutdown_state,
                             &options.event_tx,
+                            None,
                         );
 
                         let ready_result = wait_for_service_readiness(
@@ -1207,7 +1383,9 @@ fn spawn_output_readers(
     children: &Arc<Mutex<Vec<(String, Child)>>>,
     shutdown_state: &Arc<AtomicU8>,
     event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    endpoint_tx: Option<std::sync::mpsc::Sender<LocalTarget>>,
 ) {
+    let stderr_endpoint_tx = endpoint_tx.clone();
     // stdout reader
     {
         let name = name.to_string();
@@ -1233,6 +1411,11 @@ fn spawn_output_readers(
                         break;
                     }
                     if let Ok(line) = line {
+                        if let Some(ref tx) = endpoint_tx {
+                            for target in crate::dev_endpoint::parse_local_targets(&line) {
+                                let _ = tx.send(target);
+                            }
+                        }
                         let safe_name = sanitize_terminal_inline(&name);
                         let safe_line = sanitize_terminal_inline(&line);
                         println!("  {color}[{safe_name}]{RESET} {safe_line}");
@@ -1274,6 +1457,11 @@ fn spawn_output_readers(
                         break;
                     }
                     if let Ok(line) = line {
+                        if let Some(ref tx) = stderr_endpoint_tx {
+                            for target in crate::dev_endpoint::parse_local_targets(&line) {
+                                let _ = tx.send(target);
+                            }
+                        }
                         let safe_name = sanitize_terminal_inline(&name);
                         let safe_line = sanitize_terminal_inline(&line);
                         eprintln!("  {color}[{safe_name}]{RESET} {safe_line}");
@@ -1563,6 +1751,58 @@ mod tests {
     }
 
     #[test]
+    fn vite_service_command_receives_the_managed_port_strictly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_with_managed_port("vite", dir.path(), Some(5174)),
+            "vite --port 5174 --strictPort"
+        );
+    }
+
+    #[test]
+    fn npm_script_receives_framework_args_after_argument_separator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_with_managed_port("npm run dev", dir.path(), Some(5174)),
+            "npm run dev -- --port 5174 --strictPort"
+        );
+    }
+
+    #[test]
+    fn managed_port_args_do_not_leak_from_a_vite_dependency_to_a_node_service() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "scripts":{"web":"vite","api":"node api.js"},
+                "devDependencies":{"vite":"^7.0.0"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_with_managed_port("node api.js", dir.path(), Some(4000)),
+            "node api.js"
+        );
+        assert_eq!(
+            command_with_managed_port("npm run api", dir.path(), Some(4000)),
+            "npm run api"
+        );
+    }
+
+    #[test]
     fn port_conflict_reason_reports_same_run_service_reservation() {
         let mut reserved_ports = HashMap::new();
         reserved_ports.insert(3000, "api".to_string());
@@ -1595,7 +1835,9 @@ mod tests {
             dir.path().join("port-leases"),
         )
         .unwrap();
-        let assigned_ports = assign_service_ports(dir.path(), &services, &mut allocation).unwrap();
+        let assigned_ports =
+            assign_service_ports(dir.path(), &services, &mut allocation, None, false, None)
+                .unwrap();
 
         assert_eq!(assigned_ports.port_map.get("web"), Some(&port));
         assert!(assigned_ports.reassignments.is_empty());
@@ -1622,12 +1864,57 @@ mod tests {
             dir.path().join("port-leases"),
         )
         .unwrap();
-        let assigned_ports = assign_service_ports(dir.path(), &services, &mut allocation).unwrap();
+        let assigned_ports =
+            assign_service_ports(dir.path(), &services, &mut allocation, None, false, None)
+                .unwrap();
 
         let assigned = assigned_ports.port_map["web"];
         assert_ne!(assigned, port);
         assert_eq!(assigned_ports.reassignments["web"].original, port);
         assert_eq!(assigned_ports.reassignments["web"].new, assigned);
+    }
+
+    #[test]
+    fn assign_service_ports_manages_the_implicit_primary_service_without_configured_port() {
+        let mut services = HashMap::new();
+        services.insert("web".to_string(), simple_service("true"));
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+            lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
+            dir.path().join("port-leases"),
+        )
+        .unwrap();
+        let assigned_ports =
+            assign_service_ports(dir.path(), &services, &mut allocation, None, true, None).unwrap();
+
+        assert!(assigned_ports.port_map.contains_key("web"));
+    }
+
+    #[test]
+    fn assign_service_ports_manages_an_explicit_primary_without_configured_port() {
+        let mut services = HashMap::new();
+        services.insert("api".to_string(), simple_service("true"));
+        services.insert(
+            "web".to_string(),
+            ServiceConfig {
+                command: "true".to_string(),
+                primary: true,
+                ..Default::default()
+            },
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+            lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
+            dir.path().join("port-leases"),
+        )
+        .unwrap();
+        let assigned_ports =
+            assign_service_ports(dir.path(), &services, &mut allocation, None, true, None).unwrap();
+
+        assert!(assigned_ports.port_map.contains_key("web"));
+        assert!(!assigned_ports.port_map.contains_key("api"));
     }
 
     #[test]
@@ -1721,6 +2008,7 @@ mod tests {
             &children,
             &shutdown,
             &Some(tx),
+            None,
         );
 
         // Wait for the child to finish and readers to flush

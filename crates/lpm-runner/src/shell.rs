@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
+use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
+
 /// Inherited-env names that MUST be stripped from any `lpm run` /
 /// `lpm exec` child before spawn.
 ///
@@ -157,6 +159,9 @@ pub struct ShellCommand<'a> {
     pub envs: &'a HashMap<String, String>,
 }
 
+pub type EndpointResultCallback =
+    Box<dyn FnOnce(Result<Option<DevEndpoint>, String>) + Send + 'static>;
+
 /// Spawn a shell command and wait for it to complete.
 ///
 /// Returns the exit status. Stdio is inherited so the child process
@@ -188,6 +193,134 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
     command
         .status()
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))
+}
+
+pub fn spawn_shell_with_endpoint(
+    cmd: &ShellCommand,
+    requested_port: Option<u16>,
+    stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_endpoint: EndpointResultCallback,
+) -> Result<ExitStatus, LpmError> {
+    let (shell, flag) = shell_and_flag();
+    let baseline = ListenerSnapshot::capture();
+    let mut command = Command::new(shell);
+    command
+        .arg(flag)
+        .arg(cmd.command)
+        .current_dir(cmd.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    strip_inherited_env_hooks(&mut command);
+    if !cmd.envs.is_empty() {
+        command.envs(cmd.envs);
+    }
+    command.env("PATH", cmd.path);
+
+    let mut child = command.spawn().map_err(|error| {
+        LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
+    })?;
+    let root_pid = child.id();
+    let child_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+    let stdout_handle =
+        spawn_endpoint_output_reader(child.stdout.take(), false, candidate_tx.clone());
+    let stderr_handle = spawn_endpoint_output_reader(child.stderr.take(), true, candidate_tx);
+
+    let resolver_project_dir = cmd.cwd.to_path_buf();
+    let resolver_child_exited = std::sync::Arc::clone(&child_exited);
+    let resolution_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resolver_failed = std::sync::Arc::clone(&resolution_failed);
+    // Script runners can reparent the listener process after discovery, so
+    // cancellation retains the verified PID and port instead of relying only
+    // on a fresh descendant walk from the original shell.
+    let resolved_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<(u32, u16)>));
+    let resolver_owner = std::sync::Arc::clone(&resolved_owner);
+    let resolver_handle = std::thread::spawn(move || {
+        let result = crate::dev_endpoint::resolve_spawned_endpoint(
+            &resolver_project_dir,
+            root_pid,
+            &baseline,
+            requested_port,
+            &candidate_rx,
+            &resolver_child_exited,
+            std::time::Duration::from_secs(30),
+        );
+        if result.is_err() {
+            resolver_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Ok(Some(endpoint)) = &result
+            && let Some(owner_pid) = endpoint.owner_pid
+            && let Ok(mut owner) = resolver_owner.lock()
+        {
+            *owner = Some((owner_pid, endpoint.target.port));
+        }
+        on_endpoint(result);
+    });
+
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            LpmError::Script(format!("failed to wait for '{}': {error}", cmd.command))
+        })? {
+            break status;
+        }
+        if resolution_failed.load(std::sync::atomic::Ordering::Acquire)
+            || stop_requested.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let owner = resolved_owner.lock().ok().and_then(|owner| *owner);
+            if let Some((owner_pid, owner_port)) = owner
+                && owner_pid != root_pid
+            {
+                let _ = crate::ports::kill_pid_if_owns_ports(owner_pid, &[owner_port]);
+            }
+            terminate_spawned_process_tree(root_pid);
+            let _ = child.kill();
+            break child.wait().map_err(|error| {
+                LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
+            })?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    child_exited.store(true, std::sync::atomic::Ordering::Release);
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+    let _ = resolver_handle.join();
+    Ok(status)
+}
+
+fn spawn_endpoint_output_reader<R>(
+    stream: Option<R>,
+    is_stderr: bool,
+    candidate_tx: std::sync::mpsc::Sender<lpm_common::LocalTarget>,
+) -> std::thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let Some(stream) = stream else {
+            return;
+        };
+        let reader = std::io::BufReader::new(stream);
+        use std::io::BufRead;
+        for line in reader.lines().map_while(Result::ok) {
+            for target in crate::dev_endpoint::parse_local_targets(&line) {
+                let _ = candidate_tx.send(target);
+            }
+            let safe = sanitize_terminal_inline(&line);
+            if is_stderr {
+                eprintln!("{safe}");
+            } else {
+                println!("{safe}");
+            }
+        }
+    })
+}
+
+fn terminate_spawned_process_tree(root_pid: u32) {
+    let descendants = crate::ports::descendant_process_ids(root_pid);
+    for pid in descendants.into_iter().filter(|pid| *pid != root_pid) {
+        let _ = crate::ports::kill_pid(pid);
+    }
 }
 
 /// Extract the exit code from an ExitStatus.

@@ -53,10 +53,14 @@ pub async fn get_request(
 pub async fn status(State(state): State<InspectorState>) -> Json<StatusResponse> {
     let count = state.count().await;
     let tunnel_url = state.get_tunnel_url().await;
+    let local_target = state.local_target();
+    let local_ready = local_target.port != 0;
 
     Json(StatusResponse {
         inspector: true,
-        local_port: state.local_port(),
+        local_port: local_target.port,
+        local_url: local_ready.then(|| local_target.url()),
+        local_ready,
         tunnel_url,
         captured_count: count,
     })
@@ -148,9 +152,9 @@ pub async fn replay_request(
     Json(options): Json<crate::replay::ReplayOptions>,
 ) -> Result<Json<crate::replay::ReplayStudioResult>, StatusCode> {
     let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
-    let port = state.local_port();
+    let target = state.local_target();
 
-    let result = crate::replay::replay_with_options(&webhook, &options, port)
+    let result = crate::replay::replay_with_options(&webhook, &options, &target)
         .await
         .map_err(|e| {
             tracing::warn!("replay failed for {id}: {e}");
@@ -175,9 +179,9 @@ pub async fn replay_sequence(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let port = state.local_port();
+    let target = state.local_target();
 
-    let result = crate::replay::replay_sequence(&state, &options, port)
+    let result = crate::replay::replay_sequence(&state, &options, &target)
         .await
         .map_err(|e| {
             tracing::warn!("sequence replay failed: {e}");
@@ -716,6 +720,8 @@ pub enum BodyPayload {
 pub struct StatusResponse {
     pub inspector: bool,
     pub local_port: u16,
+    pub local_url: Option<String>,
+    pub local_ready: bool,
     pub tunnel_url: Option<String>,
     pub captured_count: usize,
 }

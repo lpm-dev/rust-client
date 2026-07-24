@@ -11,6 +11,7 @@ pub mod color;
 pub mod error;
 pub mod integrity;
 pub mod known_projects;
+pub mod local_target;
 pub mod package_name;
 pub mod paths;
 pub mod platform;
@@ -28,6 +29,7 @@ pub use error::{
     TyposquatErrorFinding,
 };
 pub use integrity::Integrity;
+pub use local_target::{LocalScheme, LocalTarget};
 pub use package_name::PackageName;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,

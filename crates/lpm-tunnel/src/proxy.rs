@@ -1,15 +1,15 @@
 //! Local HTTP proxy.
 //!
 //! Forwards incoming tunnel requests to the local dev server running
-//! on `localhost:{port}`. Preserves headers, handles connection errors
-//! gracefully (returns 502 if local server is down).
+//! at a verified loopback endpoint. Preserves headers and handles
+//! connection errors gracefully (returns 502 if the local server is down).
 
 use crate::protocol::{ClientMessage, ServerMessage};
 use lpm_common::LpmError;
 use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// Maximum response body size from localhost before returning 502 (50 MB).
+/// Maximum local response body size before returning 502 (50 MB).
 const MAX_RESPONSE_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// Allowed request headers (whitelist). Only these headers are forwarded from
@@ -43,7 +43,7 @@ const ALLOWED_HEADERS: &[&str] = &[
 fn is_header_allowed(name: &str) -> bool {
     let lower = name.to_lowercase();
 
-    // Always block these — host is set to localhost, transfer-encoding
+    // Always block these — host is set to the verified target authority, transfer-encoding
     // is hop-by-hop and must not be forwarded.
     if lower == "host" || lower == "transfer-encoding" {
         return false;
@@ -61,9 +61,10 @@ fn is_header_allowed(name: &str) -> bool {
 /// Forward an HTTP request to the local dev server and return the response.
 pub async fn forward_request(
     http_client: &reqwest::Client,
-    local_port: u16,
+    local_target: &lpm_common::LocalTarget,
     request: &ServerMessage,
 ) -> Result<ClientMessage, LpmError> {
+    crate::validate_forward_target(local_target)?;
     let (id, method, url, headers, body) = match request {
         ServerMessage::HttpRequest {
             id,
@@ -75,7 +76,13 @@ pub async fn forward_request(
         _ => return Err(LpmError::Tunnel("expected HttpRequest message".into())),
     };
 
-    let local_url = format!("http://localhost:{local_port}{url}");
+    let local_path = local_target.upstream_path(url);
+    let local_url = format!(
+        "{}://{}{}",
+        local_target.scheme,
+        local_target.authority(),
+        local_path
+    );
 
     // Build the request
     let req_method = method
@@ -92,7 +99,7 @@ pub async fn forward_request(
             builder = builder.header(key.as_str(), value.as_str());
         }
     }
-    builder = builder.header("host", format!("localhost:{local_port}"));
+    builder = builder.header("host", local_target.authority());
 
     // Decode and attach body
     if !body.is_empty() {
@@ -110,10 +117,14 @@ pub async fn forward_request(
         .map_err(|e| {
             if e.is_connect() {
                 LpmError::Tunnel(format!(
-                    "local server not reachable at localhost:{local_port} — is it running?"
+                    "local server not reachable at {} — is it running?",
+                    local_target.url()
                 ))
             } else if e.is_timeout() {
-                LpmError::Tunnel(format!("request to localhost:{local_port}{url} timed out"))
+                LpmError::Tunnel(format!(
+                    "request to {}{local_path} timed out",
+                    local_target.authority()
+                ))
             } else {
                 LpmError::Tunnel(format!("failed to forward request: {e}"))
             }
@@ -216,10 +227,10 @@ fn response_too_large(request_id: &str, size: u64) -> ClientMessage {
 
 /// Establish a WebSocket connection to the local dev server for upgrade passthrough.
 ///
-/// Connects to `ws://localhost:{port}{url}`, returning the WebSocket stream split.
-/// Used by the tunnel client to forward HMR WebSocket frames.
+/// Connects to the target's complete WebSocket endpoint, including its address
+/// and base path, and returns the split stream used for HMR frame forwarding.
 pub async fn connect_local_websocket(
-    local_port: u16,
+    local_target: &lpm_common::LocalTarget,
     url: &str,
     headers: &HashMap<String, String>,
 ) -> Result<
@@ -238,7 +249,8 @@ pub async fn connect_local_websocket(
     ),
     LpmError,
 > {
-    let request = build_local_websocket_request(local_port, url, headers)?;
+    crate::validate_forward_target(local_target)?;
+    let request = build_local_websocket_request(local_target, url, headers)?;
 
     let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
@@ -249,11 +261,17 @@ pub async fn connect_local_websocket(
 }
 
 fn build_local_websocket_request(
-    local_port: u16,
+    local_target: &lpm_common::LocalTarget,
     url: &str,
     headers: &HashMap<String, String>,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, LpmError> {
-    let ws_url = format!("ws://localhost:{local_port}{url}");
+    let local_path = local_target.upstream_path(url);
+    let ws_url = format!(
+        "{}://{}{}",
+        local_target.scheme.websocket(),
+        local_target.authority(),
+        local_path
+    );
     tracing::debug!("connecting local WebSocket: {ws_url}");
 
     // Use IntoClientRequest so tungstenite generates the required upgrade headers.
@@ -263,10 +281,8 @@ fn build_local_websocket_request(
 
     request.headers_mut().insert(
         "host",
-        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
-            "localhost:{local_port}"
-        ))
-        .map_err(|e| LpmError::Tunnel(format!("invalid Host header: {e}")))?,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&local_target.authority())
+            .map_err(|e| LpmError::Tunnel(format!("invalid Host header: {e}")))?,
     );
 
     for (key, value) in headers {
@@ -389,7 +405,8 @@ mod tests {
 
     #[test]
     fn local_websocket_request_includes_upgrade_headers() {
-        let request = build_local_websocket_request(3005, "/ws-test", &HashMap::new()).unwrap();
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3005);
+        let request = build_local_websocket_request(&target, "/ws-test", &HashMap::new()).unwrap();
 
         assert!(
             request.headers().contains_key("sec-websocket-key"),
@@ -417,6 +434,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn target_base_path_is_not_duplicated_when_request_already_contains_it() {
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 5173)
+            .with_base_path("/app/");
+
+        assert_eq!(
+            target.upstream_path("/app/assets/main.js"),
+            "/app/assets/main.js"
+        );
+    }
+
     #[tokio::test]
     async fn local_websocket_connect_sends_single_sec_websocket_key_header() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -440,8 +468,8 @@ mod tests {
             request
         });
 
-        let request =
-            build_local_websocket_request(addr.port(), "/ws-test", &HashMap::new()).unwrap();
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, addr.port());
+        let request = build_local_websocket_request(&target, "/ws-test", &HashMap::new()).unwrap();
 
         let _ = tokio_tungstenite::connect_async(request).await;
 

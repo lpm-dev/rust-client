@@ -20,6 +20,7 @@ use lpm_workspace::read_package_json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global flag to skip env schema validation (set by `--no-env-check`).
@@ -184,6 +185,78 @@ pub fn run_script_with_envs(
         }
     }
 
+    Ok(())
+}
+
+pub struct DevScriptEndpointOptions {
+    pub requested_port: Option<u16>,
+    pub stop_requested: Arc<AtomicBool>,
+    pub on_endpoint: shell::EndpointResultCallback,
+}
+
+pub fn run_dev_script_with_envs(
+    project_dir: &Path,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+    endpoint_options: DevScriptEndpointOptions,
+) -> Result<(), LpmError> {
+    let (script_cmd, scripts) = resolve_script_command(project_dir, "dev")?;
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
+    let loaded = resolve_and_load_env(project_dir, "dev", env_mode)?;
+    print_env_context(&loaded);
+    let mut env_vars = loaded.vars;
+    for (key, value) in extra_envs {
+        env_vars.insert(key.clone(), value.clone());
+    }
+    mark_script_child_env(&mut env_vars);
+
+    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, "dev") {
+        let status = shell::spawn_shell(&ShellCommand {
+            command: pre_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        })?;
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            return Err(LpmError::Script(format!(
+                "pre-hook 'predev' exited with code {code}"
+            )));
+        }
+    }
+
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
+    let status = shell::spawn_shell_with_endpoint(
+        &ShellCommand {
+            command: &full_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        },
+        endpoint_options.requested_port,
+        endpoint_options.stop_requested,
+        endpoint_options.on_endpoint,
+    )?;
+    if !status.success() {
+        return Err(LpmError::ExitCode(shell::exit_code(&status)));
+    }
+
+    if let Some(post_cmd) = hooks::find_post_hook(&scripts, "dev") {
+        let status = shell::spawn_shell(&ShellCommand {
+            command: post_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        })?;
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            return Err(LpmError::Script(format!(
+                "post-hook 'postdev' exited with code {code}"
+            )));
+        }
+    }
     Ok(())
 }
 

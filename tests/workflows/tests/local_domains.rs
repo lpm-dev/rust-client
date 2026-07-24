@@ -80,7 +80,7 @@ server.listen(process.env.PORT, '127.0.0.1', () => {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("https://web.localhost -> auto port"),
+        stderr.contains("https://web.localhost -> resolving endpoint"),
         "startup banner should show the configured host before port assignment, got:\n{stderr}"
     );
     assert!(
@@ -91,6 +91,152 @@ server.listen(process.env.PORT, '127.0.0.1', () => {
     assert_proxy_cert_covers_host(&project, "web.localhost");
 
     wait_for_proxy_route_absent(&project, "web.localhost");
+    stop_proxy(&project, &mut proxy);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_proxy_routes_an_ipv6_child_and_preserves_its_base_path() {
+    let project = TempProject::empty(r#"{"name":"local-domain-ipv6","version":"1.0.0"}"#);
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const port = Number(process.env.PORT);
+const server = http.createServer((request, response) => {
+  if (request.url !== '/app/health') {
+    response.statusCode = 404;
+    response.end(request.url);
+    return;
+  }
+  response.end('ipv6-ok');
+});
+server.listen({ port, host: '::1', ipv6Only: true }, () => {
+  console.log(`Local: http://[::1]:${port}/app/`);
+  setTimeout(() => server.close(() => process.exit(0)), 8000);
+});
+"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "web": {
+                    "command": "node server.js",
+                    "host": "ipv6.localhost"
+                }
+            }
+        }"#,
+    );
+
+    let mut proxy = lpm_spawnable(&project)
+        .args(["proxy", "start", "--tls-port", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn lpm proxy start");
+    wait_for_proxy_running(&project, &mut proxy);
+
+    let mut dev_command = lpm_spawnable(&project);
+    dev_command
+        .args(["dev", "--no-install", "--no-open", "--yes"])
+        .env("LPM_CERT_TEST_TRUST_STORE_DIR", trust_store_dir(&project))
+        .stdin(Stdio::null());
+    let dev = dev_command.spawn().expect("spawn lpm dev");
+
+    let (_route, dev) = wait_for_proxy_route_or_dev_exit(&project, "ipv6.localhost", dev);
+    assert_proxy_tls_path_routes_to_service(&project, "ipv6.localhost", "/health", "ipv6-ok");
+
+    let output = dev.wait_with_output().expect("wait for lpm dev to finish");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    wait_for_proxy_route_absent(&project, "ipv6.localhost");
+    stop_proxy(&project, &mut proxy);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_does_not_register_a_proxy_route_until_the_child_owns_its_endpoint() {
+    let project = TempProject::empty(r#"{"name":"local-domain-readiness","version":"1.0.0"}"#);
+    project.write_file(
+        "server.js",
+        r#"
+const fs = require('fs');
+const http = require('http');
+const port = Number(process.env.PORT);
+fs.writeFileSync('child-started', 'yes');
+setTimeout(() => {
+  const server = http.createServer((_, response) => response.end('ok'));
+  server.listen(port, '127.0.0.1', () => {
+    setTimeout(() => server.close(() => process.exit(0)), 1500);
+  });
+}, 750);
+"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "web": {
+                    "command": "node server.js",
+                    "host": "readiness.localhost"
+                }
+            }
+        }"#,
+    );
+
+    let mut proxy = lpm_spawnable(&project)
+        .args(["proxy", "start", "--tls-port", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn lpm proxy start");
+    wait_for_proxy_running(&project, &mut proxy);
+
+    let mut dev_command = lpm_spawnable(&project);
+    dev_command
+        .args(["dev", "--no-install", "--no-open", "--yes"])
+        .env("LPM_CERT_TEST_TRUST_STORE_DIR", trust_store_dir(&project))
+        .stdin(Stdio::null());
+    let dev = dev_command.spawn().expect("spawn lpm dev");
+
+    let marker = project.path().join("child-started");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !marker.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        marker.exists(),
+        "child process should start before readiness"
+    );
+    let routes = proxy_status(&project)["routes"]
+        .as_array()
+        .expect("routes should be an array")
+        .clone();
+    assert!(
+        routes
+            .iter()
+            .all(|route| route["host"] != "readiness.localhost"),
+        "proxy route must not publish an unowned endpoint: {routes:?}"
+    );
+
+    wait_for_proxy_route(&project, "readiness.localhost");
+    let output = dev.wait_with_output().expect("wait for lpm dev to finish");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    wait_for_proxy_route_absent(&project, "readiness.localhost");
     stop_proxy(&project, &mut proxy);
 }
 
@@ -700,6 +846,16 @@ fn wait_for_proxy_route_absent(project: &TempProject, host: &str) {
 
 #[cfg(unix)]
 fn assert_proxy_tls_routes_to_service(project: &TempProject, host: &str) {
+    assert_proxy_tls_path_routes_to_service(project, host, "/", "ok");
+}
+
+#[cfg(unix)]
+fn assert_proxy_tls_path_routes_to_service(
+    project: &TempProject,
+    host: &str,
+    path: &str,
+    expected_body: &str,
+) {
     let route = wait_for_proxy_route(project, host);
     let upstream_port = route["upstreamPort"]
         .as_u64()
@@ -712,7 +868,7 @@ fn assert_proxy_tls_routes_to_service(project: &TempProject, host: &str) {
         .build()
         .expect("build TLS client");
 
-    let url = format!("https://{host}:{tls_port}/");
+    let url = format!("https://{host}:{tls_port}{path}");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_status = None;
     let mut last_error = None;
@@ -721,7 +877,7 @@ fn assert_proxy_tls_routes_to_service(project: &TempProject, host: &str) {
             Ok(response) if response.status() == reqwest::StatusCode::OK => {
                 let body = response.text().expect("read TLS proxy response");
                 assert_eq!(
-                    body, "ok",
+                    body, expected_body,
                     "TLS proxy route {host} forwarded to unexpected service on localhost:{upstream_port}"
                 );
                 return;

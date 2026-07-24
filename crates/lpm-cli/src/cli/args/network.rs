@@ -226,7 +226,7 @@ pub(crate) struct ProxyArgs {
 pub(crate) struct TunnelArgs {
     /// Action or port number. Actions: claim, unclaim, list, domains, inspect, replay, log.
     /// If a number, starts a tunnel on that port.
-    #[arg(default_value = "3000")]
+    #[arg(default_value = "start")]
     pub(crate) action: String,
 
     /// Full tunnel domain (e.g., acme-api.lpm.llc) for claim/unclaim/start.
@@ -259,7 +259,7 @@ pub(crate) struct TunnelArgs {
     /// unused port — race-free against `lpm dev`'s service ports or any
     /// other local server. Pass an explicit value to bind that exact port
     /// strictly (fails with a clear diagnostic if the port is in use).
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub(crate) inspect_port: Option<u16>,
 
     /// Extra arguments for webhook subcommands (--last, --filter, --status, etc.).

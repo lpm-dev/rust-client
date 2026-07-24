@@ -2886,9 +2886,9 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
-                ("start", p)
+                ("start", Some(p))
             } else {
-                (action.as_str(), 3000u16)
+                (action.as_str(), None)
             };
             // Only relay-facing tunnel actions need auth. Local log inspection
             // and replay stay useful on a fresh machine and should not depend

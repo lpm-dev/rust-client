@@ -26,6 +26,8 @@ pub enum DashboardEvent {
     ServiceLog { index: usize, line: String },
     /// Service status changed.
     StatusChange { index: usize, status: ServiceStatus },
+    /// Final managed port assigned to a named service.
+    PortAssigned { service: String, port: u16 },
     /// A webhook was captured by the tunnel.
     WebhookCaptured(Box<lpm_tunnel::webhook::CapturedWebhook>),
 }
@@ -165,6 +167,9 @@ pub fn run_dashboard(
                     if index < app.services.len() {
                         app.services[index].status = status;
                     }
+                }
+                DashboardEvent::PortAssigned { service, port } => {
+                    app.set_service_port(&service, port);
                 }
                 DashboardEvent::WebhookCaptured(webhook) => {
                     app.push_webhook(*webhook);

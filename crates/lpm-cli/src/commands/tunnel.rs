@@ -23,7 +23,7 @@ pub async fn run(
     client: &RegistryClient,
     action: &str,
     token: Option<&str>,
-    port: u16,
+    port: Option<u16>,
     domain: Option<&str>,
     org: Option<&str>,
     json_output: bool,
@@ -63,11 +63,13 @@ pub async fn run(
             run_log(project_dir, &local_args, json_output).await
         }
         "start" | "" => {
+            let local_target = resolve_local_target(port)?;
             run_start(
                 token,
-                port,
+                local_target,
                 domain,
                 json_output,
+                project_dir,
                 tunnel_auth,
                 no_inspect,
                 inspect_port,
@@ -80,11 +82,13 @@ pub async fn run(
         _ => {
             // If action looks like a port number, treat as start
             if let Ok(p) = action.parse::<u16>() {
+                let local_target = resolve_local_target(Some(p))?;
                 return run_start(
                     token,
-                    p,
+                    local_target,
                     domain,
                     json_output,
+                    project_dir,
                     tunnel_auth,
                     no_inspect,
                     inspect_port,
@@ -101,6 +105,42 @@ pub async fn run(
     }
 }
 
+fn resolve_local_target(port: Option<u16>) -> Result<lpm_common::LocalTarget, LpmError> {
+    if let Some(port) = port {
+        if port == 0 {
+            return Err(LpmError::Tunnel(
+                "port must be between 1 and 65535".to_string(),
+            ));
+        }
+        return Ok(lpm_common::LocalTarget::loopback(
+            lpm_common::LocalScheme::Http,
+            port,
+        ));
+    }
+    let sessions = lpm_runner::dev_session::discover_active_sessions()?;
+    select_active_target(&sessions)
+}
+
+fn select_active_target(
+    sessions: &[lpm_runner::dev_session::ActiveDevSession],
+) -> Result<lpm_common::LocalTarget, LpmError> {
+    match sessions {
+        [session] => Ok(session.target.clone()),
+        [] => Err(LpmError::Tunnel(
+            "no active `lpm dev` endpoint found; pass a port, for example `lpm tunnel 5173`"
+                .to_string(),
+        )),
+        _ => Err(LpmError::Tunnel(format!(
+            "multiple active `lpm dev` endpoints found ({}); pass the intended port explicitly",
+            sessions
+                .iter()
+                .map(|session| session.target.port.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> Vec<String> {
     let mut normalized_args =
         Vec::with_capacity(extra_args.len() + usize::from(second_positional.is_some()));
@@ -111,6 +151,34 @@ fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> 
     normalized_args
 }
 
+fn tunnel_ready_json(
+    session: &lpm_tunnel::TunnelSession,
+    local_url: &str,
+    usage: Option<&lpm_tunnel::TunnelUsageMetadata>,
+    tunnel_auth: Option<&str>,
+    inspector_url: Option<&str>,
+    auto_ack: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "success": true,
+        "tunnel_url": session.tunnel_url,
+        "domain": session.domain,
+        "local_port": session.local_port,
+        "local_url": local_url,
+        "session_id": session.session_id,
+        "plan": session.plan,
+        "base_domain": session.base_domain,
+        "domain_kind": session.domain_kind,
+        "session_expires_at": session.session_expires_at,
+        "session_max_ms": session.session_max_ms,
+        "limits": session.limits,
+        "usage": usage,
+        "tunnel_auth": tunnel_auth,
+        "inspector_url": inspector_url,
+        "auto_ack": auto_ack,
+    })
+}
+
 /// Start a tunnel to expose a local port.
 ///
 /// `inspect_port` carries the user's intent: `Some(n)` → bind that exact
@@ -118,11 +186,12 @@ fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> 
 /// (best-effort, warns and continues without an inspector on the rare
 /// failure).
 #[allow(clippy::too_many_arguments)]
-async fn run_start(
+pub(crate) async fn run_start(
     token: Option<&str>,
-    port: u16,
+    local_target: lpm_common::LocalTarget,
     domain: Option<&str>,
     json_output: bool,
+    project_dir: &Path,
     tunnel_auth: bool,
     no_inspect: bool,
     inspect_port: Option<u16>,
@@ -164,16 +233,15 @@ async fn run_start(
     };
 
     // Start the inspector server (unless --no-inspect)
-    let project_dir = std::env::current_dir().map_err(LpmError::Io)?;
-    let inspector_state = match lpm_inspect::db::InspectorDb::open(&project_dir) {
-        Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
+    let inspector_state = match lpm_inspect::db::InspectorDb::open(project_dir) {
+        Ok(db) => lpm_inspect::state::InspectorState::with_db_for_target(local_target.clone(), db),
         Err(e) => {
             if !json_output {
                 install_ui::warn_untrusted(&format!(
                     "inspector db failed: {e} — using in-memory only"
                 ));
             }
-            lpm_inspect::state::InspectorState::new(port)
+            lpm_inspect::state::InspectorState::new_for_target(local_target.clone())
         }
     };
     let inspector_handle = if no_inspect {
@@ -230,7 +298,7 @@ async fn run_start(
     let options = lpm_tunnel::client::TunnelOptions {
         relay_url: relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
         token: token.to_string(),
-        local_port: port,
+        local_target: local_target.clone(),
         domain: domain.map(|s| s.to_string()),
         tunnel_auth: tunnel_auth_token.clone(),
         webhook_tx: Some(webhook_tx),
@@ -242,7 +310,7 @@ async fn run_start(
     if !json_output {
         install_ui::phase_line(crate::install_ui::terminal_line!(
             "Opening tunnel for {}",
-            install_ui::yellow(&format!("localhost:{port}"))
+            install_ui::yellow(&local_target.url())
         ));
     }
 
@@ -251,6 +319,7 @@ async fn run_start(
     let control_inspector_url = inspector_url.clone();
     let inspector_state_for_connect = inspector_state.clone();
     let session_name_owned = session_name.map(|s| s.to_string());
+    let local_target_url = local_target.url();
     let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
     let usage_for_connect = latest_usage.clone();
     let usage_for_notices = latest_usage.clone();
@@ -278,23 +347,14 @@ async fn run_start(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "tunnel_url": session.tunnel_url,
-                        "domain": session.domain,
-                        "local_port": session.local_port,
-                        "session_id": session.session_id,
-                        "plan": session.plan,
-                        "base_domain": session.base_domain,
-                        "domain_kind": session.domain_kind,
-                        "session_expires_at": session.session_expires_at,
-                        "session_max_ms": session.session_max_ms,
-                        "limits": session.limits,
-                        "usage": usage,
-                        "tunnel_auth": tunnel_auth_display,
-                        "inspector_url": inspector_url,
-                        "auto_ack": auto_ack,
-                    })
+                    tunnel_ready_json(
+                        session,
+                        &local_target_url,
+                        usage.as_ref(),
+                        tunnel_auth_display.as_deref(),
+                        inspector_url.as_deref(),
+                        auto_ack,
+                    )
                 );
             } else {
                 install_ui::phase("Tunnel ready");
@@ -315,7 +375,7 @@ async fn run_start(
                     tunnel_detail("usage", usage);
                 }
                 tunnel_detail("session", &session.session_id);
-                tunnel_detail("local", format!("localhost:{}", session.local_port));
+                tunnel_detail("local", &local_target_url);
                 if auto_ack {
                     tunnel_detail("auto-ack", "on (200 OK returned when server is down)");
                 }
@@ -648,10 +708,13 @@ async fn run_inspect(
 async fn run_replay(
     project_dir: &Path,
     args: &[String],
-    default_port: u16,
+    default_port: Option<u16>,
 ) -> Result<(), LpmError> {
     let logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
-    let port = parse_flag_usize(args, "--port", "-p").map_or(default_port, |p| p as u16);
+    let local_target = match parse_flag_u16(args, "--port", "-p")? {
+        Some(port) => lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+        None => resolve_local_target(default_port)?,
+    };
 
     let is_last = args.contains(&"--last".to_string());
     let number = args
@@ -707,7 +770,8 @@ async fn run_replay(
         .no_proxy()
         .build()
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
-    let result = lpm_tunnel::webhook_replay::replay_webhook(&replay_client, &webhook, port).await?;
+    let result =
+        lpm_tunnel::webhook_replay::replay_webhook(&replay_client, &webhook, &local_target).await?;
 
     let status = style_http_status_fragment(result.status);
     let ok_suffix = if result.status < 300 { " OK" } else { "" };
@@ -1113,6 +1177,30 @@ fn parse_flag_usize(args: &[String], long: &str, short: &str) -> Option<usize> {
     None
 }
 
+fn parse_flag_u16(args: &[String], long: &str, short: &str) -> Result<Option<u16>, LpmError> {
+    for (index, arg) in args.iter().enumerate() {
+        let value = if arg == long || arg == short {
+            args.get(index + 1).map(String::as_str).ok_or_else(|| {
+                LpmError::Tunnel(format!("{arg} requires a port between 1 and 65535"))
+            })?
+        } else if let Some(value) = arg.strip_prefix(&format!("{long}=")) {
+            value
+        } else {
+            continue;
+        };
+        let port = value
+            .parse::<u16>()
+            .map_err(|_| LpmError::Tunnel(format!("{long} must be a port between 1 and 65535")))?;
+        if port == 0 {
+            return Err(LpmError::Tunnel(format!(
+                "{long} must be a port between 1 and 65535"
+            )));
+        }
+        return Ok(Some(port));
+    }
+    Ok(None)
+}
+
 /// Parse a flag with a string value from the args list.
 fn parse_flag_str(args: &[String], flag: &str) -> Option<String> {
     for (i, arg) in args.iter().enumerate() {
@@ -1438,6 +1526,132 @@ mod tests {
             tunnel_control_from_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             TunnelControl::Ignore
         );
+    }
+
+    #[test]
+    fn replay_port_parser_rejects_values_outside_the_tcp_port_range() {
+        for invalid in ["0", "-1", "70000"] {
+            let error =
+                parse_flag_u16(&["--port".to_string(), invalid.to_string()], "--port", "-p")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("between 1 and 65535"),
+                "unexpected error for {invalid}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_port_parser_accepts_the_complete_tcp_port_range() {
+        assert_eq!(
+            parse_flag_u16(&["--port=1".to_string()], "--port", "-p").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            parse_flag_u16(&["-p".to_string(), "65535".to_string()], "--port", "-p").unwrap(),
+            Some(65535)
+        );
+    }
+
+    #[test]
+    fn active_dev_target_selection_requires_exactly_one_session() {
+        let session = |port| lpm_runner::dev_session::ActiveDevSession {
+            lpm_pid: 1,
+            owner_pid: Some(2),
+            project_dir: std::path::PathBuf::from(format!("/project-{port}")),
+            service: None,
+            target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+        };
+
+        let none = select_active_target(&[]).unwrap_err();
+        assert!(none.to_string().contains("no active `lpm dev` endpoint"));
+
+        let one = select_active_target(&[session(5173)]).unwrap();
+        assert_eq!(one.port, 5173);
+
+        let multiple = select_active_target(&[session(5173), session(5174)]).unwrap_err();
+        assert!(multiple.to_string().contains("multiple active"));
+        assert!(multiple.to_string().contains("5173, 5174"));
+    }
+
+    #[test]
+    fn explicit_tunnel_target_rejects_port_zero() {
+        let error = resolve_local_target(Some(0)).unwrap_err();
+        assert!(error.to_string().contains("between 1 and 65535"));
+    }
+
+    #[test]
+    fn tunnel_ready_json_preserves_the_complete_local_endpoint() {
+        let session = lpm_tunnel::TunnelSession {
+            tunnel_url: "https://orange-moon.lpm.fyi".to_string(),
+            domain: "orange-moon.lpm.fyi".to_string(),
+            session_id: "session-1".to_string(),
+            local_port: 5173,
+            plan: Some("free".to_string()),
+            base_domain: Some("lpm.fyi".to_string()),
+            domain_kind: Some("random".to_string()),
+            session_expires_at: Some(1_800_000),
+            session_max_ms: Some(3_600_000),
+            limits: None,
+        };
+
+        let output = tunnel_ready_json(
+            &session,
+            "http://[::1]:5173/app/",
+            None,
+            None,
+            Some("http://127.0.0.1:4400/?token=redacted"),
+            false,
+        );
+
+        assert_eq!(output["local_port"], 5173);
+        assert_eq!(output["local_url"], "http://[::1]:5173/app/");
+        insta::assert_json_snapshot!(output, @r###"
+        {
+          "success": true,
+          "tunnel_url": "https://orange-moon.lpm.fyi",
+          "domain": "orange-moon.lpm.fyi",
+          "local_port": 5173,
+          "local_url": "http://[::1]:5173/app/",
+          "session_id": "session-1",
+          "plan": "free",
+          "base_domain": "lpm.fyi",
+          "domain_kind": "random",
+          "session_expires_at": 1800000,
+          "session_max_ms": 3600000,
+          "limits": null,
+          "usage": null,
+          "tunnel_auth": null,
+          "inspector_url": "http://127.0.0.1:4400/?token=redacted",
+          "auto_ack": false
+        }
+        "###);
+    }
+
+    #[tokio::test]
+    async fn numeric_tunnel_action_rejects_port_zero_before_starting() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = run(
+            &lpm_registry::RegistryClient::new(),
+            "0",
+            None,
+            None,
+            None,
+            None,
+            false,
+            temp.path(),
+            &[],
+            false,
+            true,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("between 1 and 65535"));
     }
 
     #[test]

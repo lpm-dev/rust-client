@@ -23,6 +23,25 @@ struct TlsCertResolver {
     store: TlsCertificateStore,
 }
 
+#[derive(Clone)]
+struct FixedTlsCertResolver {
+    key: Arc<CertifiedKey>,
+}
+
+impl fmt::Debug for FixedTlsCertResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FixedTlsCertResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for FixedTlsCertResolver {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.key))
+    }
+}
+
 impl fmt::Debug for TlsCertResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsCertResolver").finish_non_exhaustive()
@@ -44,6 +63,53 @@ pub(crate) async fn start_tls_proxy(
         .await
         .map_err(|err| ProxyError::Tls(format_loopback_bind_error("TLS proxy", port, &err)))?;
     start_tls_proxy_on_listener(registry, cert_store, listener)
+}
+
+/// Terminate TLS on an already-bound listener and forward to a plain HTTP loopback target.
+pub async fn start_tls_frontend_on_listener(
+    listener: tokio::net::TcpListener,
+    cert_path: &Path,
+    key_path: &Path,
+    upstream: lpm_common::LocalTarget,
+) -> Result<HttpProxyHandle, ProxyError> {
+    super::http::validate_frontend_upstream(&upstream)?;
+    let key = load_certified_key(cert_path, key_path)?;
+    let addr = listener
+        .local_addr()
+        .map_err(|err| ProxyError::Tls(format!("read TLS frontend bind addr: {err}")))?;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(FixedTlsCertResolver { key }));
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let state = HttpProxyState::for_upstream(upstream, "https");
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else {
+                        continue;
+                    };
+                    let acceptor = acceptor.clone();
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        serve_tls_http_connection(acceptor, stream, state).await;
+                    });
+                }
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(HttpProxyHandle {
+        addr,
+        shutdown: Some(shutdown_tx),
+    })
 }
 
 fn start_tls_proxy_on_listener(

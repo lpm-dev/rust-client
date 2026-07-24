@@ -215,6 +215,11 @@ impl LpmRoot {
         self.home.join(".ports.lock")
     }
 
+    /// Active `lpm dev` endpoint records used by standalone tunnel discovery.
+    pub fn dev_sessions_dir(&self) -> PathBuf {
+        self.home.join("dev-sessions")
+    }
+
     /// Machine-global local proxy daemon state at `~/.lpm/proxy.json`.
     pub fn proxy_state(&self) -> PathBuf {
         self.home.join("proxy.json")
