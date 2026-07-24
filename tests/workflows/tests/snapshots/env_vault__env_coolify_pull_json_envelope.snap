@@ -11,5 +11,7 @@ expression: pull_json
   "keys": [
     "APPLICATION_SECRET"
   ],
+  "skippedSecrets": 0,
+  "secretVerification": "exact",
   "auditRecorded": true
 }
