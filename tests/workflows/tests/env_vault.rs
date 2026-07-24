@@ -3282,6 +3282,186 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
 }
 
 #[tokio::test]
+async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
+    let project = TempProject::empty(r#"{"name":"fly-platform","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer_token = "fly-platform-session-token";
+    let platform_token = "fo1_fly-platform-token";
+    let vault_id = "vault-fly-platform-123";
+    let app = "lpm-example";
+    let app_id = "app_123";
+    let organization_id = "org_123";
+    let organization_slug = "personal";
+
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(bearer_token),
+            refresh_token: Some("fly-platform-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let seeded = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "set",
+            "--env",
+            "production",
+            "APPLICATION_SECRET=local-secret",
+        ])
+        .output()
+        .expect("failed to seed Fly.io env values");
+    assert!(
+        seeded.status.success(),
+        "env set failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr),
+    );
+
+    mock.with_fly_platform_connect_success(
+        bearer_token,
+        vault_id,
+        app,
+        app_id,
+        organization_id,
+        serde_json::json!({
+            "status": "connected",
+            "platform": "fly",
+        }),
+    )
+    .await;
+    mock.with_platform_credentials_success_calls(
+        bearer_token,
+        vault_id,
+        serde_json::json!({
+            "connections": [
+                {
+                    "id": "connection-fly",
+                    "platform": "fly",
+                    "token": platform_token,
+                    "connectionConfig": {
+                        "app": app,
+                        "appId": app_id,
+                        "organizationId": organization_id,
+                        "organizationSlug": organization_slug,
+                        "linkedEnv": "production"
+                    },
+                    "label": "production",
+                    "lastPushAt": null
+                }
+            ]
+        }),
+        3,
+    )
+    .await;
+    mock.with_fly_app(support::mock_registry::FlyAppFixture {
+        token: platform_token,
+        app,
+        app_id,
+        organization_id,
+        organization_slug,
+        secrets: serde_json::json!([
+            { "name": "APPLICATION_SECRET", "digest": "sha256:write-only" },
+            { "name": "FLY_APP_NAME", "digest": "managed" }
+        ]),
+        expected_calls: 7,
+    })
+    .await;
+    mock.with_fly_set_secrets_success(platform_token, app, "APPLICATION_SECRET", "local-secret")
+        .await;
+    mock.with_platform_audit_success(
+        bearer_token,
+        vault_id,
+        "fly",
+        "push",
+        &[("added", 0), ("updated", 1), ("removed", 0)],
+    )
+    .await;
+    let command = || {
+        let mut command = lpm(&project);
+        command
+            .env("LPM_REGISTRY_URL", mock.url())
+            .env("ACCEPTANCE_RUN_ID", "workflow-platform-fly")
+            .env(
+                "LPM_ACCEPTANCE_FLY_API_URL",
+                format!("{}/graphql", mock.url()),
+            );
+        command
+    };
+    let connect = command()
+        .args([
+            "--json",
+            "env",
+            "connect",
+            "fly",
+            "--app",
+            app,
+            "--token",
+            platform_token,
+            "--linked-env",
+            "production",
+            "--label",
+            "production",
+        ])
+        .output()
+        .expect("failed to run lpm env connect fly --json");
+    assert!(
+        connect.status.success(),
+        "env connect fly failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&connect.stdout),
+        String::from_utf8_lossy(&connect.stderr),
+    );
+    let connect_json = parse_clean_json_stdout(&connect);
+    assert_eq!(connect_json["platform"], "fly");
+    insta::assert_json_snapshot!("env_fly_connect_json_envelope", connect_json);
+
+    let status = command()
+        .args(["--json", "env", "status"])
+        .output()
+        .expect("failed to run lpm env status --json");
+    assert!(status.status.success(), "env status failed");
+    let status_json = parse_clean_json_stdout(&status);
+    assert_eq!(status_json["platforms"][0]["platform"], "fly");
+    assert_eq!(status_json["platforms"][0]["status"], "names_only");
+    assert_eq!(
+        status_json["platforms"][0]["secretVerification"],
+        "names_only"
+    );
+    assert_eq!(status_json["platforms"][0]["secretNamesPresent"], 1);
+    insta::assert_json_snapshot!("env_fly_status_json_envelope", status_json);
+
+    let pull = command()
+        .args(["--json", "env", "pull", "--from", "fly", "--yes"])
+        .output()
+        .expect("failed to run lpm env pull --from fly");
+    assert!(pull.status.success(), "env pull failed");
+    let pull_json = parse_clean_json_stdout(&pull);
+    assert_eq!(pull_json["status"], "no_readable_values");
+    assert_eq!(pull_json["skippedSecrets"], 1);
+    assert_eq!(pull_json["secretVerification"], "names_only");
+    insta::assert_json_snapshot!("env_fly_pull_json_envelope", pull_json);
+
+    let push = command()
+        .args(["--json", "env", "push", "--to", "fly", "--yes"])
+        .output()
+        .expect("failed to run lpm env push --to fly");
+    assert!(
+        push.status.success(),
+        "env push failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+    );
+    let push_json = parse_clean_json_stdout(&push);
+    assert_eq!(push_json["added"], 0);
+    assert_eq!(push_json["updated"], 1);
+    assert_eq!(push_json["removed"], 0);
+    insta::assert_json_snapshot!("env_fly_push_json_envelope", push_json);
+}
+
+#[tokio::test]
 async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes() {
     let project = TempProject::empty(r#"{"name":"github-actions-platform","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

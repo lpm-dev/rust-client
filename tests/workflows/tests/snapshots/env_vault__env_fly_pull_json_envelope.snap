@@ -1,0 +1,13 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: pull_json
+---
+{
+  "success": true,
+  "status": "no_readable_values",
+  "platform": "fly",
+  "env": "production",
+  "count": 0,
+  "skippedSecrets": 1,
+  "secretVerification": "names_only"
+}

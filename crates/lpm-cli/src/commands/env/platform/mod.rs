@@ -1,4 +1,5 @@
 mod coolify;
+mod fly;
 mod github_actions;
 mod railway;
 
@@ -21,7 +22,7 @@ const RAILWAY_ID_MAX_CHARS: usize = 128;
 fn is_supported_platform(platform: &str) -> bool {
     matches!(
         platform,
-        "vercel" | "coolify" | "railway" | "github-actions"
+        "vercel" | "coolify" | "fly" | "railway" | "github-actions"
     )
 }
 
@@ -643,6 +644,7 @@ fn append_platform_error_context(error: LpmError, context: String) -> LpmError {
 enum PlatformClient {
     Vercel(VercelClient),
     Coolify(coolify::CoolifyClient),
+    Fly(fly::FlyClient),
     GitHubActions(github_actions::GitHubActionsClient),
     Railway(railway::RailwayClient),
 }
@@ -672,6 +674,16 @@ impl PlatformClient {
                     config,
                 )?))
             }
+            "fly" => {
+                let config = serde_json::from_value::<fly::FlyConnectionConfig>(
+                    connection.connection_config.clone(),
+                )
+                .map_err(|error| LpmError::Script(format!("invalid Fly.io connection: {error}")))?;
+                Ok(Self::Fly(fly::FlyClient::new(
+                    connection.token.clone(),
+                    config,
+                )?))
+            }
             "github-actions" => {
                 let config =
                     serde_json::from_value::<github_actions::GitHubActionsConnectionConfig>(
@@ -697,7 +709,7 @@ impl PlatformClient {
                 )?))
             }
             platform => Err(LpmError::Script(format!(
-                "unsupported env platform '{platform}'; use vercel, coolify, railway, or github-actions"
+                "unsupported env platform '{platform}'; use vercel, coolify, fly, railway, or github-actions"
             ))),
         }
     }
@@ -706,6 +718,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(_) => "Vercel",
             Self::Coolify(_) => "Coolify",
+            Self::Fly(_) => "Fly.io",
             Self::GitHubActions(_) => "GitHub Actions",
             Self::Railway(_) => "Railway",
         }
@@ -715,6 +728,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(client) => client.config.linked_env.as_deref(),
             Self::Coolify(client) => client.config().linked_env.as_deref(),
+            Self::Fly(client) => client.config().linked_env.as_deref(),
             Self::GitHubActions(client) => client.config().linked_env.as_deref(),
             Self::Railway(client) => client.config().linked_env.as_deref(),
         }
@@ -724,6 +738,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(_) => is_vercel_managed_variable(key),
             Self::Coolify(_) => coolify::CoolifyClient::is_managed(key),
+            Self::Fly(_) => fly::FlyClient::is_managed(key),
             Self::GitHubActions(_) => false,
             Self::Railway(_) => railway::RailwayClient::is_managed(key),
         }
@@ -735,6 +750,7 @@ impl PlatformClient {
         local: &HashMap<String, String>,
     ) -> Result<LocalPlatformValues, LpmError> {
         match self {
+            Self::Fly(_) => Ok(fly::partition_local_values(local)),
             Self::GitHubActions(_) => {
                 let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(|error| {
                     LpmError::Script(format!(
@@ -757,7 +773,7 @@ impl PlatformClient {
 
     fn secret_verification(&self) -> &'static str {
         match self {
-            Self::GitHubActions(_) => "names_only",
+            Self::Fly(_) | Self::GitHubActions(_) => "names_only",
             _ => "exact",
         }
     }
@@ -766,6 +782,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(client) => client.list().await.map(PlatformState::from_readable),
             Self::Coolify(client) => client.list().await.map(PlatformState::from_readable),
+            Self::Fly(client) => client.list().await,
             Self::GitHubActions(client) => client.list().await,
             Self::Railway(client) => client.list().await.map(PlatformState::from_readable),
         }
@@ -781,6 +798,7 @@ impl PlatformClient {
         match self {
             Self::Vercel(client) => client.apply(diff, &local.readable, &remote.readable).await,
             Self::Coolify(client) => client.apply(diff, &local.readable, &remote.readable).await,
+            Self::Fly(client) => client.apply(diff, local, remote, clean).await,
             Self::GitHubActions(client) => client.apply(diff, local, remote, clean).await,
             Self::Railway(client) => client
                 .apply(diff, &local.readable, &remote.readable, clean)
@@ -1104,7 +1122,7 @@ pub(super) async fn vars_connect(
 ) -> Result<(), LpmError> {
     let platform = args.first().copied().ok_or_else(|| {
         LpmError::Script(
-            "usage: lpm env connect <vercel|coolify|railway|github-actions> [platform options] [--token=<token>]"
+            "usage: lpm env connect <vercel|coolify|fly|railway|github-actions> [platform options] [--token=<token>]"
                 .into(),
         )
     })?;
@@ -1113,11 +1131,12 @@ pub(super) async fn vars_connect(
     let display_name = match platform {
         "vercel" => "Vercel",
         "coolify" => "Coolify",
+        "fly" => "Fly.io",
         "github-actions" => "GitHub Actions",
         "railway" => "Railway",
         _ => {
             return Err(LpmError::Script(format!(
-                "unsupported env platform '{platform}'; use vercel, coolify, railway, or github-actions"
+                "unsupported env platform '{platform}'; use vercel, coolify, fly, railway, or github-actions"
             )));
         }
     };
@@ -1193,6 +1212,23 @@ pub(super) async fn vars_connect(
             })?;
             let client = PlatformClient::Coolify(coolify_client);
             (client, config, format!("application: {application_id}"))
+        }
+        "fly" => {
+            let app = parse_flag(args, "--app")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LpmError::Script("missing --app flag".into()))?;
+            fly::validate_app_name(app)?;
+            let fly_client =
+                fly::FlyClient::discover_config(platform_token.clone(), app, linked_env).await?;
+            let config = serde_json::to_value(fly_client.config()).map_err(|error| {
+                LpmError::Script(format!("failed to serialize Fly.io connection: {error}"))
+            })?;
+            let target = format!(
+                "app: {}, organization: {}",
+                fly_client.config().app,
+                fly_client.config().organization_slug
+            );
+            (PlatformClient::Fly(fly_client), config, target)
         }
         "github-actions" => {
             let repository = parse_flag(args, "--repository")
@@ -1326,7 +1362,7 @@ pub(super) async fn vars_platform_push(
     })?;
     if !is_supported_platform(platform) {
         return Err(LpmError::Script(
-            "unsupported env platform; use vercel, coolify, railway, or github-actions".into(),
+            "unsupported env platform; use vercel, coolify, fly, railway, or github-actions".into(),
         ));
     }
     let clean = args.contains(&"--clean");
@@ -1560,7 +1596,7 @@ pub(super) async fn vars_platform_status(
             }));
         } else {
             output::warn(
-                "no platform connections. Run `lpm env connect vercel`, `lpm env connect coolify`, `lpm env connect railway`, or `lpm env connect github-actions` first.",
+                "no platform connections. Run `lpm env connect vercel`, `lpm env connect coolify`, `lpm env connect fly`, `lpm env connect railway`, or `lpm env connect github-actions` first.",
             );
         }
         return Ok(());
@@ -1728,7 +1764,7 @@ pub(super) async fn vars_platform_pull(
     })?;
     if !is_supported_platform(platform) {
         return Err(LpmError::Script(
-            "unsupported env platform; use vercel, coolify, railway, or github-actions".into(),
+            "unsupported env platform; use vercel, coolify, fly, railway, or github-actions".into(),
         ));
     }
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
@@ -1849,7 +1885,7 @@ pub(super) async fn vars_platform_pull(
         ));
         if skipped_secrets > 0 {
             output::warn(&format!(
-                "{skipped_secrets} write-only GitHub Actions secret name(s) were not imported"
+                "{skipped_secrets} write-only {display_name} secret name(s) were not imported"
             ));
         }
         if let Err(error) = audit {
@@ -1993,6 +2029,11 @@ mod tests {
 
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn fly_is_a_supported_env_platform() {
+        assert!(is_supported_platform("fly"));
     }
 
     #[test]

@@ -43,6 +43,16 @@ pub struct RegistrySigningFixture {
     signing_key: p256::ecdsa::SigningKey,
 }
 
+pub struct FlyAppFixture<'a> {
+    pub token: &'a str,
+    pub app: &'a str,
+    pub app_id: &'a str,
+    pub organization_id: &'a str,
+    pub organization_slug: &'a str,
+    pub secrets: serde_json::Value,
+    pub expected_calls: u64,
+}
+
 impl RegistrySigningFixture {
     pub fn new() -> Self {
         use p256::pkcs8::{EncodePublicKey, LineEnding};
@@ -1072,6 +1082,32 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_fly_platform_connect_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        app: &str,
+        app_id: &str,
+        organization_id: &str,
+        response: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/connect"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains("\"platform\":\"fly\""))
+            .and(body_string_contains(format!("\"app\":\"{app}\"")))
+            .and(body_string_contains(format!("\"appId\":\"{app_id}\"")))
+            .and(body_string_contains(format!(
+                "\"organizationId\":\"{organization_id}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_platform_credentials_success(
         &self,
         bearer_token: &str,
@@ -1560,6 +1596,68 @@ impl MockRegistry {
             .and(body_string_contains("\"replace\":false"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": { "variableCollectionUpsert": true },
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_fly_app(&self, fixture: FlyAppFixture<'_>) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(header("authorization", format!("Bearer {}", fixture.token)))
+            .and(header("user-agent", "lpm-env-fly"))
+            .and(body_string_contains("query app($appName: String!)"))
+            .and(body_string_contains(format!(
+                "\"appName\":\"{}\"",
+                fixture.app
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "app": {
+                        "id": fixture.app_id,
+                        "name": fixture.app,
+                        "organization": {
+                            "id": fixture.organization_id,
+                            "slug": fixture.organization_slug,
+                        },
+                        "secrets": fixture.secrets,
+                    }
+                }
+            })))
+            .expect(fixture.expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_fly_set_secrets_success(
+        &self,
+        token: &str,
+        app: &str,
+        key: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(header("user-agent", "lpm-env-fly"))
+            .and(body_string_contains(
+                "mutation setSecrets($input: SetSecretsInput!)",
+            ))
+            .and(body_string_contains(format!("\"appId\":\"{app}\"")))
+            .and(body_string_contains(format!("\"key\":\"{key}\"")))
+            .and(body_string_contains(format!("\"value\":\"{value}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "setSecrets": {
+                        "release": {
+                            "id": "release-123",
+                            "version": 7
+                        }
+                    }
+                }
             })))
             .expect(1)
             .mount(&self.server)
