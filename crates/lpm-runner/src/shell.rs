@@ -273,9 +273,7 @@ pub fn spawn_shell_with_endpoint(
             {
                 let _ = crate::ports::kill_pid_if_owns_ports(owner_pid, &[owner_port]);
             }
-            terminate_spawned_process_tree(root_pid);
-            let _ = child.kill();
-            break child.wait().map_err(|error| {
+            break crate::ports::terminate_child_process_tree(&mut child).map_err(|error| {
                 LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
             })?;
         }
@@ -314,13 +312,6 @@ where
             }
         }
     })
-}
-
-fn terminate_spawned_process_tree(root_pid: u32) {
-    let descendants = crate::ports::descendant_process_ids(root_pid);
-    for pid in descendants.into_iter().filter(|pid| *pid != root_pid) {
-        let _ = crate::ports::kill_pid(pid);
-    }
 }
 
 /// Extract the exit code from an ExitStatus.

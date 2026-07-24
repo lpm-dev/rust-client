@@ -1002,8 +1002,7 @@ pub fn run_services(
                 for dep_name in &dependents {
                     if let Some(pos) = locked.iter().position(|(n, _)| n == dep_name) {
                         let (name, mut child) = locked.remove(pos);
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        let _ = ports::terminate_child_process_tree(&mut child);
                         tracing::warn!("stopped {name} (depends on crashed {crashed_name})");
                         ui_service_status(
                             RESET,
@@ -1075,8 +1074,7 @@ pub fn run_services(
                     for dep_name in &dependents {
                         if let Some(pos) = locked.iter().position(|(n, _)| n == dep_name) {
                             let (dname, mut child) = locked.remove(pos);
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            let _ = ports::terminate_child_process_tree(&mut child);
                             tracing::warn!(
                                 "stopped {dname} (depends on permanently failed {name})"
                             );
@@ -1307,8 +1305,7 @@ pub fn run_services(
                             let mut locked = children.lock();
                             if let Some(pos) = locked.iter().position(|(n, _)| n == name) {
                                 let (sname, mut child) = locked.remove(pos);
-                                let _ = child.kill();
-                                let _ = child.wait();
+                                let _ = ports::terminate_child_process_tree(&mut child);
                                 ui_service_status(RESET, &sname, YELLOW, "!", "stopped by user");
                                 send_status(
                                     &options.event_tx,
@@ -1327,8 +1324,7 @@ pub fn run_services(
                                 let mut locked = children.lock();
                                 if let Some(pos) = locked.iter().position(|(n, _)| n == &name) {
                                     let (_, mut child) = locked.remove(pos);
-                                    let _ = child.kill();
-                                    let _ = child.wait();
+                                    let _ = ports::terminate_child_process_tree(&mut child);
                                 }
                             }
                             // Schedule immediate restart

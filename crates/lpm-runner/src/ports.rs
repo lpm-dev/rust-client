@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 #[cfg(unix)]
 use std::process::Command;
 
@@ -380,6 +381,20 @@ pub(crate) fn descendant_process_ids(root_pid: u32) -> HashSet<u32> {
     {
         HashSet::from([root_pid])
     }
+}
+
+pub(crate) fn terminate_child_process_tree(
+    child: &mut Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    let root_pid = child.id();
+    for pid in descendant_process_ids(root_pid)
+        .into_iter()
+        .filter(|pid| *pid != root_pid)
+    {
+        let _ = kill_pid(pid);
+    }
+    let _ = child.kill();
+    child.wait()
 }
 
 #[cfg(windows)]
