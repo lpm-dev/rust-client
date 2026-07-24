@@ -9,8 +9,9 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    LocalPlatformValues, PLATFORM_TIMEOUT, PlatformApplyError, PlatformDiff, PlatformPushResult,
-    PlatformState, PlatformVariable, VariableScope, read_platform_response,
+    LocalPlatformValues, MutationKind, MutationOutcome, PLATFORM_TIMEOUT, PlatformApplyError,
+    PlatformDiff, PlatformPushResult, PlatformState, PlatformVariable, VariableScope,
+    append_platform_error_context, read_platform_response,
 };
 
 const GITHUB_API_URL: &str = "https://api.github.com";
@@ -69,6 +70,21 @@ struct ActionsVariableList {
     total_count: usize,
     #[serde(default)]
     variables: Vec<ActionsVariable>,
+}
+
+#[derive(Debug)]
+struct GitHubMutationFailure {
+    error: LpmError,
+    ambiguous: bool,
+}
+
+impl From<LpmError> for GitHubMutationFailure {
+    fn from(error: LpmError) -> Self {
+        Self {
+            error,
+            ambiguous: false,
+        }
+    }
 }
 
 pub(super) struct GitHubActionsClient {
@@ -175,10 +191,16 @@ impl GitHubActionsClient {
                     applied,
                 )
             })?;
-            if let Err(error) = self.create_variable(key, value).await {
-                return Err(PlatformApplyError::tracked(error, applied));
-            }
-            applied.added += 1;
+            record_outcome(
+                &mut applied,
+                self.reconcile_variable_mutation(
+                    self.create_variable(key, value).await,
+                    key,
+                    Some(value),
+                    MutationKind::Added,
+                )
+                .await,
+            )?;
         }
         for key in &diff.changed {
             let value = local.readable.get(key).ok_or_else(|| {
@@ -187,32 +209,56 @@ impl GitHubActionsClient {
                     applied,
                 )
             })?;
-            if let Err(error) = self.update_variable(key, value).await {
-                return Err(PlatformApplyError::tracked(error, applied));
-            }
-            applied.updated += 1;
+            record_outcome(
+                &mut applied,
+                self.reconcile_variable_mutation(
+                    self.update_variable(key, value).await,
+                    key,
+                    Some(value),
+                    MutationKind::Updated,
+                )
+                .await,
+            )?;
         }
         for (key, encrypted_value, key_id, is_new) in encrypted_secrets {
-            if let Err(error) = self.upsert_secret(&key, &encrypted_value, &key_id).await {
-                return Err(PlatformApplyError::tracked(error, applied));
-            }
-            if is_new {
-                applied.added += 1;
+            let kind = if is_new {
+                MutationKind::Added
             } else {
-                applied.updated += 1;
-            }
+                MutationKind::Updated
+            };
+            record_outcome(
+                &mut applied,
+                self.reconcile_secret_upsert(
+                    self.upsert_secret(&key, &encrypted_value, &key_id).await,
+                    &key,
+                    is_new,
+                    kind,
+                )
+                .await,
+            )?;
         }
         for key in &diff.removed {
-            if let Err(error) = self.delete_variable(key).await {
-                return Err(PlatformApplyError::tracked(error, applied));
-            }
-            applied.removed += 1;
+            record_outcome(
+                &mut applied,
+                self.reconcile_variable_mutation(
+                    self.delete_variable(key).await,
+                    key,
+                    None,
+                    MutationKind::Removed,
+                )
+                .await,
+            )?;
         }
         for key in &diff.write_only_removed {
-            if let Err(error) = self.delete_secret(key).await {
-                return Err(PlatformApplyError::tracked(error, applied));
-            }
-            applied.removed += 1;
+            record_outcome(
+                &mut applied,
+                self.reconcile_secret_delete(
+                    self.delete_secret(key).await,
+                    key,
+                    MutationKind::Removed,
+                )
+                .await,
+            )?;
         }
 
         let observed = self
@@ -229,6 +275,120 @@ impl GitHubActionsClient {
             ));
         }
         Ok(applied)
+    }
+
+    async fn reconcile_variable_mutation(
+        &self,
+        result: Result<(), GitHubMutationFailure>,
+        name: &str,
+        expected_value: Option<&str>,
+        kind: MutationKind,
+    ) -> MutationOutcome {
+        let failure = match result {
+            Ok(()) => return MutationOutcome::Applied(kind),
+            Err(failure) if !failure.ambiguous => {
+                return MutationOutcome::Failed {
+                    error: failure.error,
+                    committed: None,
+                };
+            }
+            Err(failure) => failure,
+        };
+        match self.list_variables().await {
+            Ok(variables) => {
+                let applied = match expected_value {
+                    Some(value) => variables
+                        .get(name)
+                        .is_some_and(|variable| variable.value == value),
+                    None => !variables.contains_key(name),
+                };
+                if applied {
+                    MutationOutcome::Applied(kind)
+                } else {
+                    MutationOutcome::Failed {
+                        error: failure.error,
+                        committed: None,
+                    }
+                }
+            }
+            Err(reconciliation_error) => MutationOutcome::Unknown(append_platform_error_context(
+                failure.error,
+                format!(
+                    "GitHub Actions final-state reconciliation for {name} failed: {reconciliation_error}"
+                ),
+            )),
+        }
+    }
+
+    async fn reconcile_secret_upsert(
+        &self,
+        result: Result<(), GitHubMutationFailure>,
+        name: &str,
+        is_new: bool,
+        kind: MutationKind,
+    ) -> MutationOutcome {
+        let failure = match result {
+            Ok(()) => return MutationOutcome::Applied(kind),
+            Err(failure) if !failure.ambiguous => {
+                return MutationOutcome::Failed {
+                    error: failure.error,
+                    committed: None,
+                };
+            }
+            Err(failure) => failure,
+        };
+        if !is_new {
+            return MutationOutcome::Unknown(append_platform_error_context(
+                failure.error,
+                format!(
+                    "GitHub Actions secret {name} is write-only, so its final value cannot be reconciled"
+                ),
+            ));
+        }
+        match self.list_secret_names().await {
+            Ok(secrets) if secrets.contains(name) => MutationOutcome::Applied(kind),
+            Ok(_) => MutationOutcome::Failed {
+                error: failure.error,
+                committed: None,
+            },
+            Err(reconciliation_error) => MutationOutcome::Unknown(append_platform_error_context(
+                failure.error,
+                format!(
+                    "GitHub Actions final-state reconciliation for secret {name} failed: {reconciliation_error}"
+                ),
+            )),
+        }
+    }
+
+    async fn reconcile_secret_delete(
+        &self,
+        result: Result<(), GitHubMutationFailure>,
+        name: &str,
+        kind: MutationKind,
+    ) -> MutationOutcome {
+        let failure = match result {
+            Ok(()) => return MutationOutcome::Applied(kind),
+            Err(failure) if !failure.ambiguous => {
+                return MutationOutcome::Failed {
+                    error: failure.error,
+                    committed: None,
+                };
+            }
+            Err(failure) => failure,
+        };
+        match self.list_secret_names().await {
+            Ok(secrets) if !secrets.contains(name) => MutationOutcome::Applied(kind),
+            Ok(_) => MutationOutcome::Failed {
+                error: failure.error,
+                committed: None,
+            },
+            Err(reconciliation_error) => MutationOutcome::Unknown(append_platform_error_context(
+                failure.error,
+                format!(
+                    "GitHub Actions final-state reconciliation for secret {name} failed: {reconciliation_error}"
+                ),
+            )),
+        }
     }
 
     async fn fetch_repository(&self) -> Result<RepositoryResponse, LpmError> {
@@ -363,7 +523,7 @@ impl GitHubActionsClient {
         Ok(encrypted)
     }
 
-    async fn create_variable(&self, name: &str, value: &str) -> Result<(), LpmError> {
+    async fn create_variable(&self, name: &str, value: &str) -> Result<(), GitHubMutationFailure> {
         let url = self.variables_url()?;
         self.send_mutation(
             "variable create",
@@ -373,7 +533,7 @@ impl GitHubActionsClient {
         .await
     }
 
-    async fn update_variable(&self, name: &str, value: &str) -> Result<(), LpmError> {
+    async fn update_variable(&self, name: &str, value: &str) -> Result<(), GitHubMutationFailure> {
         let url = format!("{}/{}", self.variables_url()?, urlencoding::encode(name));
         self.send_mutation(
             "variable update",
@@ -383,7 +543,7 @@ impl GitHubActionsClient {
         .await
     }
 
-    async fn delete_variable(&self, name: &str) -> Result<(), LpmError> {
+    async fn delete_variable(&self, name: &str) -> Result<(), GitHubMutationFailure> {
         let url = format!("{}/{}", self.variables_url()?, urlencoding::encode(name));
         self.send_mutation(
             "variable delete",
@@ -397,7 +557,7 @@ impl GitHubActionsClient {
         name: &str,
         encrypted_value: &str,
         key_id: &str,
-    ) -> Result<(), LpmError> {
+    ) -> Result<(), GitHubMutationFailure> {
         let url = format!("{}/{}", self.secrets_url()?, urlencoding::encode(name));
         self.send_mutation(
             "secret upsert",
@@ -410,7 +570,7 @@ impl GitHubActionsClient {
         .await
     }
 
-    async fn delete_secret(&self, name: &str) -> Result<(), LpmError> {
+    async fn delete_secret(&self, name: &str) -> Result<(), GitHubMutationFailure> {
         let url = format!("{}/{}", self.secrets_url()?, urlencoding::encode(name));
         self.send_mutation("secret delete", self.request(reqwest::Method::DELETE, &url))
             .await
@@ -446,16 +606,30 @@ impl GitHubActionsClient {
         &self,
         operation: &str,
         request: reqwest::RequestBuilder,
-    ) -> Result<(), LpmError> {
-        let response = request.send().await.map_err(|error| {
-            LpmError::Network(format!(
-                "GitHub Actions {operation} failed: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-        let (status, body) = read_platform_response(response).await?;
+    ) -> Result<(), GitHubMutationFailure> {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| GitHubMutationFailure {
+                error: LpmError::Network(format!(
+                    "GitHub Actions {operation} failed: {}",
+                    lpm_http::display_error(&error)
+                )),
+                ambiguous: true,
+            })?;
+        let response_status = response.status();
+        let (status, body) =
+            read_platform_response(response)
+                .await
+                .map_err(|error| GitHubMutationFailure {
+                    error,
+                    ambiguous: response_status.is_success(),
+                })?;
         if !status.is_success() {
-            return Err(github_api_error(operation, status, &body));
+            return Err(GitHubMutationFailure {
+                error: github_api_error(operation, status, &body),
+                ambiguous: false,
+            });
         }
         Ok(())
     }
@@ -503,6 +677,25 @@ impl GitHubActionsClient {
             )),
             None => Ok(format!("{}/actions/secrets", self.repository_url()?)),
         }
+    }
+}
+
+fn record_outcome(
+    applied: &mut PlatformPushResult,
+    outcome: MutationOutcome,
+) -> Result<(), PlatformApplyError> {
+    match outcome {
+        MutationOutcome::Applied(kind) => {
+            applied.record(kind);
+            Ok(())
+        }
+        MutationOutcome::Failed { error, committed } => {
+            if let Some(kind) = committed {
+                applied.record(kind);
+            }
+            Err(PlatformApplyError::tracked(error, *applied))
+        }
+        MutationOutcome::Unknown(error) => Err(PlatformApplyError::untracked(error)),
     }
 }
 
@@ -744,6 +937,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use crypto_box::SecretKey;
     use lpm_env::{EnvSchema, EnvVarRule};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -774,6 +968,132 @@ mod tests {
 
     fn repository_response(id: u64, full_name: &str) -> serde_json::Value {
         serde_json::json!({ "id": id, "full_name": full_name })
+    }
+
+    async fn read_raw_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut expected_len = None;
+        loop {
+            let mut chunk = [0_u8; 2048];
+            let read = stream.read(&mut chunk).await.expect("read raw request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if expected_len.is_none()
+                && let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+                expected_len = Some(header_end + 4 + content_length.unwrap_or_default());
+            }
+            if expected_len.is_some_and(|expected| request.len() >= expected) {
+                break;
+            }
+        }
+        request
+    }
+
+    enum RawResponse {
+        Disconnect,
+        Json(serde_json::Value),
+        Status(u16, serde_json::Value),
+        TruncatedSuccess,
+    }
+
+    async fn write_raw_response(stream: &mut tokio::net::TcpStream, response: RawResponse) {
+        let (status, body) = match response {
+            RawResponse::Disconnect => return,
+            RawResponse::Json(body) => (200, serde_json::to_vec(&body).expect("serialize JSON")),
+            RawResponse::Status(status, body) => {
+                (status, serde_json::to_vec(&body).expect("serialize JSON"))
+            }
+            RawResponse::TruncatedSuccess => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .expect("write truncated GitHub response");
+                return;
+            }
+        };
+        let headers = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write raw GitHub headers");
+        stream
+            .write_all(&body)
+            .await
+            .expect("write raw GitHub body");
+    }
+
+    async fn spawn_raw_github_server<F>(
+        request_count: usize,
+        mut response_for: F,
+    ) -> (String, tokio::task::JoinHandle<()>)
+    where
+        F: FnMut(&str) -> RawResponse + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw GitHub server");
+        let address = listener.local_addr().expect("raw GitHub address");
+        let task = tokio::spawn(async move {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().await.expect("accept GitHub request");
+                let request = read_raw_request(&mut stream).await;
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .expect("raw GitHub request line")
+                    .to_owned();
+                write_raw_response(&mut stream, response_for(&request_line)).await;
+            }
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn spawn_committed_variable_server(
+        mutation_response: RawResponse,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let mut mutation_response = Some(mutation_response);
+        spawn_raw_github_server(6, move |request_line| {
+            if request_line.starts_with("POST ") && request_line.contains("/actions/variables ") {
+                return mutation_response
+                    .take()
+                    .expect("single GitHub variable create");
+            }
+            if request_line.contains("/actions/variables?") {
+                return RawResponse::Json(serde_json::json!({
+                    "total_count": 1,
+                    "variables": [{
+                        "name": "PUBLIC_ORIGIN",
+                        "value": "https://example.test"
+                    }]
+                }));
+            }
+            if request_line.contains("/actions/secrets?") {
+                return RawResponse::Json(serde_json::json!({
+                    "total_count": 0,
+                    "secrets": []
+                }));
+            }
+            if request_line.contains("/repos/lpm-dev/example ") {
+                return RawResponse::Json(repository_response(123, "lpm-dev/example"));
+            }
+            panic!("unexpected raw GitHub request: {request_line}");
+        })
+        .await
     }
 
     #[test]
@@ -1180,6 +1500,212 @@ mod tests {
         assert_eq!(result.added, 1);
         assert_eq!(decrypted, b"plaintext-must-not-leak");
         assert!(!String::from_utf8_lossy(&request.body).contains("plaintext-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn committed_variable_create_is_counted_after_the_response_disconnects() {
+        let (api_url, server) = spawn_committed_variable_server(RawResponse::Disconnect).await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "github-create-disconnect".into()),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let local = LocalPlatformValues {
+            readable: values(&[("PUBLIC_ORIGIN", "https://example.test")]),
+            write_only: HashMap::new(),
+        };
+        let diff = PlatformDiff {
+            added: vec!["PUBLIC_ORIGIN".into()],
+            ..PlatformDiff::default()
+        };
+
+        let result = client
+            .apply(&diff, &local, &PlatformState::default(), false)
+            .await
+            .expect("authoritative final state must recover the committed create");
+
+        assert_eq!(result.added, 1);
+        server.await.expect("raw GitHub server");
+    }
+
+    #[tokio::test]
+    async fn committed_variable_create_is_counted_after_success_body_read_fails() {
+        let (api_url, server) =
+            spawn_committed_variable_server(RawResponse::TruncatedSuccess).await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "github-create-truncated".into()),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let local = LocalPlatformValues {
+            readable: values(&[("PUBLIC_ORIGIN", "https://example.test")]),
+            write_only: HashMap::new(),
+        };
+        let diff = PlatformDiff {
+            added: vec!["PUBLIC_ORIGIN".into()],
+            ..PlatformDiff::default()
+        };
+
+        let result = client
+            .apply(&diff, &local, &PlatformState::default(), false)
+            .await
+            .expect("authoritative final state must recover the committed create");
+
+        assert_eq!(result.added, 1);
+        server.await.expect("raw GitHub server");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_existing_secret_update_suppresses_exact_counts() {
+        let recipient = SecretKey::generate(&mut crypto_box::aead::OsRng);
+        let public_key = BASE64.encode(recipient.public_key().as_bytes());
+        let mut secret_update_pending = true;
+        let (api_url, server) = spawn_raw_github_server(3, move |request_line| {
+            if request_line.contains("/repos/lpm-dev/example ") {
+                return RawResponse::Json(repository_response(123, "lpm-dev/example"));
+            }
+            if request_line.contains("/actions/secrets/public-key ") {
+                return RawResponse::Json(serde_json::json!({
+                    "key_id": "key-123",
+                    "key": public_key
+                }));
+            }
+            if request_line.starts_with("PUT ")
+                && request_line.contains("/actions/secrets/API_TOKEN ")
+                && secret_update_pending
+            {
+                secret_update_pending = false;
+                return RawResponse::Disconnect;
+            }
+            panic!("unexpected raw GitHub request: {request_line}");
+        })
+        .await;
+        let _env = crate::test_env::ScopedEnv::set([
+            (
+                "ACCEPTANCE_RUN_ID",
+                "github-secret-update-disconnect".into(),
+            ),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let local = LocalPlatformValues {
+            readable: HashMap::new(),
+            write_only: values(&[("API_TOKEN", "rotated-secret")]),
+        };
+        let diff = PlatformDiff {
+            write_only_present: vec!["API_TOKEN".into()],
+            ..PlatformDiff::default()
+        };
+
+        let error = client
+            .apply(&diff, &local, &PlatformState::default(), false)
+            .await
+            .expect_err("a write-only update cannot be reconciled by name");
+
+        assert!(matches!(error, PlatformApplyError::Untracked(_)));
+        server.await.expect("raw GitHub server");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_variable_delete_is_counted_when_final_state_confirms_absence() {
+        let mut delete_pending = true;
+        let (api_url, server) = spawn_raw_github_server(6, move |request_line| {
+            if request_line.starts_with("DELETE ")
+                && request_line.contains("/actions/variables/REMOVED ")
+                && delete_pending
+            {
+                delete_pending = false;
+                return RawResponse::Disconnect;
+            }
+            if request_line.contains("/actions/variables?") {
+                return RawResponse::Json(serde_json::json!({
+                    "total_count": 0,
+                    "variables": []
+                }));
+            }
+            if request_line.contains("/actions/secrets?") {
+                return RawResponse::Json(serde_json::json!({
+                    "total_count": 0,
+                    "secrets": []
+                }));
+            }
+            if request_line.contains("/repos/lpm-dev/example ") {
+                return RawResponse::Json(repository_response(123, "lpm-dev/example"));
+            }
+            panic!("unexpected raw GitHub request: {request_line}");
+        })
+        .await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "github-delete-disconnect".into()),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let diff = PlatformDiff {
+            removed: vec!["REMOVED".into()],
+            ..PlatformDiff::default()
+        };
+        let remote = PlatformState::from_readable(HashMap::from([(
+            "REMOVED".into(),
+            PlatformVariable {
+                id: "REMOVED".into(),
+                value: "old-value".into(),
+                scope: VariableScope::GitHubActions,
+            },
+        )]));
+
+        let result = client
+            .apply(&diff, &LocalPlatformValues::default(), &remote, false)
+            .await
+            .expect("authoritative final state must recover the committed delete");
+
+        assert_eq!(result.removed, 1);
+        server.await.expect("raw GitHub server");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_variable_create_suppresses_counts_when_reconciliation_fails() {
+        let mut create_pending = true;
+        let (api_url, server) = spawn_raw_github_server(3, move |request_line| {
+            if request_line.starts_with("POST ")
+                && request_line.contains("/actions/variables ")
+                && create_pending
+            {
+                create_pending = false;
+                return RawResponse::Disconnect;
+            }
+            if request_line.contains("/actions/variables?") {
+                return RawResponse::Status(
+                    503,
+                    serde_json::json!({ "message": "temporarily unavailable" }),
+                );
+            }
+            if request_line.contains("/repos/lpm-dev/example ") {
+                return RawResponse::Json(repository_response(123, "lpm-dev/example"));
+            }
+            panic!("unexpected raw GitHub request: {request_line}");
+        })
+        .await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "github-reconciliation-failure".into()),
+            ("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", api_url.into()),
+        ]);
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+        let local = LocalPlatformValues {
+            readable: values(&[("PUBLIC_ORIGIN", "https://example.test")]),
+            write_only: HashMap::new(),
+        };
+        let diff = PlatformDiff {
+            added: vec!["PUBLIC_ORIGIN".into()],
+            ..PlatformDiff::default()
+        };
+
+        let error = client
+            .apply(&diff, &local, &PlatformState::default(), false)
+            .await
+            .expect_err("unreadable final state must suppress exact mutation counts");
+
+        assert!(matches!(error, PlatformApplyError::Untracked(_)));
+        server.await.expect("raw GitHub server");
     }
 
     #[tokio::test]

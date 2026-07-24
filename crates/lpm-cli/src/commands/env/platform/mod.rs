@@ -2111,7 +2111,7 @@ mod tests {
         let remote = remote(&[("CHANGED", "old-value")]);
 
         let result = client
-            .apply(&diff, &local, &remote)
+            .apply(&diff, &local, &remote.readable)
             .await
             .expect("final provider state proves the update committed");
 
@@ -2143,7 +2143,7 @@ mod tests {
         let remote = remote(&[("REMOVED", "old-value")]);
 
         let result = client
-            .apply(&diff, &HashMap::new(), &remote)
+            .apply(&diff, &HashMap::new(), &remote.readable)
             .await
             .expect("final provider state proves the delete committed");
 
@@ -2173,7 +2173,7 @@ mod tests {
         let remote = remote(&[("REMOVED", "old-value")]);
 
         let error = client
-            .apply(&diff, &HashMap::new(), &remote)
+            .apply(&diff, &HashMap::new(), &remote.readable)
             .await
             .expect_err("unreadable final state must suppress exact mutation counts");
 
