@@ -1,0 +1,25 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: status_json
+---
+{
+  "success": true,
+  "count": 1,
+  "platforms": [
+    {
+      "platform": "github-actions",
+      "label": "production",
+      "env": "production",
+      "status": "names_only",
+      "added": 0,
+      "changed": 0,
+      "removed": 0,
+      "secretVerification": "names_only",
+      "secretNamesPresent": 1,
+      "secretNamesMissing": 0,
+      "secretNamesExtra": 0,
+      "driftKeys": [],
+      "lastPushAt": null
+    }
+  ]
+}

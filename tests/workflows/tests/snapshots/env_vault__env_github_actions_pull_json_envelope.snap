@@ -1,0 +1,17 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: pull_json
+---
+{
+  "success": true,
+  "status": "imported",
+  "platform": "github-actions",
+  "env": "production",
+  "count": 1,
+  "keys": [
+    "PUBLIC_ORIGIN"
+  ],
+  "skippedSecrets": 1,
+  "secretVerification": "names_only",
+  "auditRecorded": true
+}
