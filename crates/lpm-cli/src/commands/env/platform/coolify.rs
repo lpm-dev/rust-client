@@ -501,8 +501,7 @@ impl CoolifyClient {
                         owned_ids.push(guard_id);
                     }
                     let cleanup = self.cleanup_owned_ids(owned_ids).await;
-                    let target_removed =
-                        cleanup.first().is_some_and(|(_, result)| result.is_ok());
+                    let target_removed = cleanup.first().is_some_and(|(_, result)| result.is_ok());
                     let committed = match observed {
                         Ok(_) => CoolifyCommitState::NotCommitted,
                         Err(_) if target_removed => CoolifyCommitState::NotCommitted,
