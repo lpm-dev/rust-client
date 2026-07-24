@@ -169,9 +169,21 @@ impl PlatformApplyError {
 
 #[derive(Debug)]
 enum VercelMutation {
-    Add { key: String, value: String },
-    Update { id: String, value: String },
-    Remove { id: String },
+    Add {
+        key: String,
+        value: String,
+        targets: Vec<String>,
+    },
+    Update {
+        id: String,
+        key: String,
+        value: String,
+        targets: Vec<String>,
+    },
+    Remove {
+        id: String,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -367,6 +379,7 @@ impl VercelClient {
             mutations.push(VercelMutation::Add {
                 key: key.clone(),
                 value: value.clone(),
+                targets: self.selected_targets(),
             });
         }
         for key in &diff.changed {
@@ -380,9 +393,16 @@ impl VercelClient {
                 .map_err(PlatformApplyError::untracked)?;
             self.assert_mutation_targets(key, variable)
                 .map_err(PlatformApplyError::untracked)?;
+            let VariableScope::Vercel { targets } = &variable.scope else {
+                return Err(PlatformApplyError::untracked(LpmError::Script(format!(
+                    "Vercel value {key} does not match the configured deployment targets"
+                ))));
+            };
             mutations.push(VercelMutation::Update {
                 id: variable.id.clone(),
+                key: key.clone(),
                 value: value.clone(),
+                targets: targets.clone(),
             });
         }
         for key in &diff.removed {
@@ -394,11 +414,12 @@ impl VercelClient {
                 .map_err(PlatformApplyError::untracked)?;
             mutations.push(VercelMutation::Remove {
                 id: variable.id.clone(),
+                key: key.clone(),
             });
         }
 
         let outcomes = futures::stream::iter(mutations)
-            .map(|mutation| async move { self.apply_one(mutation).await.into() })
+            .map(|mutation| self.apply_one(mutation))
             .buffer_unordered(PLATFORM_MUTATION_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
@@ -429,38 +450,54 @@ impl VercelClient {
         Ok(())
     }
 
-    async fn apply_one(&self, mutation: VercelMutation) -> Result<MutationKind, LpmError> {
-        let (operation, kind, request) = match mutation {
-            VercelMutation::Add { key, value } => {
-                let targets = self.selected_targets();
-                (
-                    "create",
-                    MutationKind::Added,
-                    self.http
-                        .post(self.collection_url("v10"))
-                        .bearer_auth(&self.token)
-                        .json(&serde_json::json!({
-                            "key": key,
-                            "value": value,
-                            "type": "encrypted",
-                            "target": targets,
-                        })),
-                )
-            }
-            VercelMutation::Update { id, value } => (
-                "update",
-                MutationKind::Updated,
+    async fn apply_one(&self, mutation: VercelMutation) -> MutationOutcome {
+        let kind = mutation.kind();
+        match self.send_mutation(&mutation).await {
+            Ok(()) => MutationOutcome::Applied(kind),
+            Err(error) => match self.mutation_is_applied(&mutation).await {
+                Ok(true) => MutationOutcome::Applied(kind),
+                Ok(false) => MutationOutcome::Failed {
+                    error,
+                    committed: None,
+                },
+                Err(reconciliation_error) => {
+                    MutationOutcome::Unknown(append_platform_error_context(
+                        error,
+                        format!("Vercel final-state reconciliation failed: {reconciliation_error}"),
+                    ))
+                }
+            },
+        }
+    }
+
+    async fn send_mutation(&self, mutation: &VercelMutation) -> Result<(), LpmError> {
+        let (operation, request) = match mutation {
+            VercelMutation::Add {
+                key,
+                value,
+                targets,
+            } => (
+                "create",
                 self.http
-                    .patch(self.item_url(&id))
+                    .post(self.collection_url("v10"))
+                    .bearer_auth(&self.token)
+                    .json(&serde_json::json!({
+                        "key": key,
+                        "value": value,
+                        "type": "encrypted",
+                        "target": targets,
+                    })),
+            ),
+            VercelMutation::Update { id, value, .. } => (
+                "update",
+                self.http
+                    .patch(self.item_url(id))
                     .bearer_auth(&self.token)
                     .json(&serde_json::json!({ "value": value })),
             ),
-            VercelMutation::Remove { id } => (
+            VercelMutation::Remove { id, .. } => (
                 "delete",
-                MutationKind::Removed,
-                self.http
-                    .delete(self.item_url(&id))
-                    .bearer_auth(&self.token),
+                self.http.delete(self.item_url(id)).bearer_auth(&self.token),
             ),
         };
 
@@ -474,7 +511,59 @@ impl VercelClient {
         if !status.is_success() {
             return Err(vercel_api_error(operation, status, &body));
         }
-        Ok(kind)
+        Ok(())
+    }
+
+    async fn mutation_is_applied(&self, mutation: &VercelMutation) -> Result<bool, LpmError> {
+        let variables = self.list().await?;
+        Ok(match mutation {
+            VercelMutation::Add {
+                key,
+                value,
+                targets,
+            } => variables.get(key).is_some_and(|variable| {
+                variable.value == *value && variable_has_targets(variable, targets)
+            }),
+            VercelMutation::Update {
+                id,
+                key,
+                value,
+                targets,
+            } => variables.get(key).is_some_and(|variable| {
+                variable.id == *id
+                    && variable.value == *value
+                    && variable_has_targets(variable, targets)
+            }),
+            VercelMutation::Remove { key, .. } => !variables.contains_key(key),
+        })
+    }
+}
+
+impl VercelMutation {
+    fn kind(&self) -> MutationKind {
+        match self {
+            Self::Add { .. } => MutationKind::Added,
+            Self::Update { .. } => MutationKind::Updated,
+            Self::Remove { .. } => MutationKind::Removed,
+        }
+    }
+}
+
+fn variable_has_targets(variable: &PlatformVariable, expected: &[String]) -> bool {
+    let VariableScope::Vercel { targets } = &variable.scope else {
+        return false;
+    };
+    if targets.len() != expected.len() {
+        return false;
+    }
+    expected.iter().all(|target| targets.contains(target))
+}
+
+fn append_platform_error_context(error: LpmError, context: String) -> LpmError {
+    match error {
+        LpmError::Network(message) => LpmError::Network(format!("{message}; {context}")),
+        LpmError::Script(message) => LpmError::Script(format!("{message}; {context}")),
+        other => other,
     }
 }
 
@@ -1443,6 +1532,8 @@ pub(super) async fn vars_platform_pull(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn remote(entries: &[(&str, &str)]) -> HashMap<String, PlatformVariable> {
         entries
@@ -1471,6 +1562,20 @@ mod tests {
                 project_id: "test-project".into(),
                 team_id: None,
                 target: Some(targets.iter().map(|target| (*target).into()).collect()),
+                linked_env: None,
+            },
+        }
+    }
+
+    fn vercel_client_at(api_url: String) -> VercelClient {
+        VercelClient {
+            http: reqwest::Client::new(),
+            api_url,
+            token: "test-token".into(),
+            config: VercelConnectionConfig {
+                project_id: "test-project".into(),
+                team_id: None,
+                target: Some(vec!["production".into()]),
                 linked_env: None,
             },
         }
@@ -1578,6 +1683,143 @@ mod tests {
             .expect_err("a production sync must not mutate a preview value");
 
         assert!(error.to_string().contains("configured deployment targets"));
+    }
+
+    #[tokio::test]
+    async fn vercel_add_response_failure_is_counted_when_the_desired_value_exists() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "envs": [{
+                    "id": "new-id",
+                    "key": "NEW_SECRET",
+                    "value": "new-value",
+                    "target": ["production"]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = vercel_client_at(server.uri());
+        let diff = PlatformDiff {
+            added: vec!["NEW_SECRET".into()],
+            ..PlatformDiff::default()
+        };
+        let local = HashMap::from([("NEW_SECRET".into(), "new-value".into())]);
+
+        let result = client
+            .apply(&diff, &local, &HashMap::new())
+            .await
+            .expect("final provider state proves the add committed");
+
+        assert_eq!(result.added, 1);
+    }
+
+    #[tokio::test]
+    async fn vercel_update_response_failure_is_counted_when_the_desired_value_exists() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v9/projects/test-project/env/id-CHANGED"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "envs": [{
+                    "id": "id-CHANGED",
+                    "key": "CHANGED",
+                    "value": "new-value",
+                    "target": ["production"]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = vercel_client_at(server.uri());
+        let diff = PlatformDiff {
+            changed: vec!["CHANGED".into()],
+            ..PlatformDiff::default()
+        };
+        let local = HashMap::from([("CHANGED".into(), "new-value".into())]);
+        let remote = remote(&[("CHANGED", "old-value")]);
+
+        let result = client
+            .apply(&diff, &local, &remote)
+            .await
+            .expect("final provider state proves the update committed");
+
+        assert_eq!(result.updated, 1);
+    }
+
+    #[tokio::test]
+    async fn vercel_delete_response_failure_is_counted_when_the_value_is_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v9/projects/test-project/env/id-REMOVED"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "envs": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = vercel_client_at(server.uri());
+        let diff = PlatformDiff {
+            removed: vec!["REMOVED".into()],
+            ..PlatformDiff::default()
+        };
+        let remote = remote(&[("REMOVED", "old-value")]);
+
+        let result = client
+            .apply(&diff, &HashMap::new(), &remote)
+            .await
+            .expect("final provider state proves the delete committed");
+
+        assert_eq!(result.removed, 1);
+    }
+
+    #[tokio::test]
+    async fn vercel_mutation_suppresses_exact_counts_when_final_state_cannot_be_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v9/projects/test-project/env/id-REMOVED"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = vercel_client_at(server.uri());
+        let diff = PlatformDiff {
+            removed: vec!["REMOVED".into()],
+            ..PlatformDiff::default()
+        };
+        let remote = remote(&[("REMOVED", "old-value")]);
+
+        let error = client
+            .apply(&diff, &HashMap::new(), &remote)
+            .await
+            .expect_err("unreadable final state must suppress exact mutation counts");
+
+        assert!(matches!(error, PlatformApplyError::Untracked(_)));
     }
 
     #[test]
