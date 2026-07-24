@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     LocalPlatformValues, PLATFORM_TIMEOUT, PlatformApplyError, PlatformDiff, PlatformPushResult,
-    PlatformState, read_platform_response,
+    PlatformState, append_platform_error_context, read_platform_response,
 };
 
 pub(super) const FLY_API_URL: &str = "https://api.fly.io/graphql";
@@ -254,10 +254,32 @@ impl FlyClient {
                     applied,
                 ));
             }
-            self.unset_secrets(&diff.write_only_removed)
-                .await
-                .map_err(|error| PlatformApplyError::tracked(error, applied))?;
-            applied.removed = diff.write_only_removed.len();
+            match self.unset_secrets(&diff.write_only_removed).await {
+                Ok(()) => applied.removed = diff.write_only_removed.len(),
+                Err(error) => {
+                    let after_unset = match self.list().await {
+                        Ok(after_unset) => after_unset,
+                        Err(reconciliation_error) => {
+                            return Err(PlatformApplyError::untracked(
+                                append_platform_error_context(
+                                    error,
+                                    format!(
+                                        "Fly.io final-state reconciliation after unset failed: {reconciliation_error}"
+                                    ),
+                                ),
+                            ));
+                        }
+                    };
+                    applied.removed = diff
+                        .write_only_removed
+                        .iter()
+                        .filter(|key| !after_unset.write_only.contains(*key))
+                        .count();
+                    if applied.removed != diff.write_only_removed.len() {
+                        return Err(PlatformApplyError::tracked(error, applied));
+                    }
+                }
+            }
         }
 
         let observed = self
@@ -546,6 +568,7 @@ fn fly_http_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -602,6 +625,95 @@ mod tests {
                 }
             }
         })
+    }
+
+    async fn read_raw_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut expected_len = None;
+        loop {
+            let mut chunk = [0_u8; 2048];
+            let read = stream.read(&mut chunk).await.expect("read raw request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if expected_len.is_none()
+                && let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+                expected_len = Some(header_end + 4 + content_length.unwrap_or_default());
+            }
+            if expected_len.is_some_and(|expected| request.len() >= expected) {
+                break;
+            }
+        }
+        request
+    }
+
+    async fn write_raw_json(stream: &mut tokio::net::TcpStream, body: serde_json::Value) {
+        let body = serde_json::to_vec(&body).expect("serialize Fly.io response");
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write Fly.io headers");
+        stream.write_all(&body).await.expect("write Fly.io body");
+    }
+
+    async fn spawn_unset_disconnect_server(
+        request_count: usize,
+        before_names: Vec<&'static str>,
+        final_names: Option<Vec<&'static str>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw Fly.io server");
+        let address = listener.local_addr().expect("raw Fly.io address");
+        let task = tokio::spawn(async move {
+            let mut unset_seen = false;
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().await.expect("accept Fly.io request");
+                let request = read_raw_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                if request.contains("mutation unsetSecrets") {
+                    unset_seen = true;
+                    drop(stream);
+                    continue;
+                }
+                if request.contains("query app") {
+                    let names = if unset_seen {
+                        let Some(names) = &final_names else {
+                            drop(stream);
+                            continue;
+                        };
+                        names
+                    } else {
+                        &before_names
+                    };
+                    let secrets = names
+                        .iter()
+                        .map(|name| serde_json::json!({ "name": name, "digest": "observed" }))
+                        .collect::<Vec<_>>();
+                    write_raw_json(
+                        &mut stream,
+                        app_response("app_123", "org_123", serde_json::Value::Array(secrets)),
+                    )
+                    .await;
+                    continue;
+                }
+                panic!("unexpected raw Fly.io request");
+            }
+        });
+        (format!("http://{address}/graphql"), task)
     }
 
     #[test]
@@ -991,5 +1103,92 @@ mod tests {
         assert_eq!(applied.added, 1);
         assert_eq!(applied.updated, 0);
         assert_eq!(applied.removed, 0);
+    }
+
+    #[tokio::test]
+    async fn committed_unset_is_counted_after_the_response_disconnects() {
+        let (api_url, server) =
+            spawn_unset_disconnect_server(5, vec!["REMOVED"], Some(Vec::new())).await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "fly-unset-disconnect".into()),
+            ("LPM_ACCEPTANCE_FLY_API_URL", api_url.into()),
+        ]);
+        let client = FlyClient::new("fo1_acceptance-token".into(), config()).expect("client");
+        let remote = PlatformState {
+            readable: HashMap::new(),
+            write_only: HashSet::from(["REMOVED".into()]),
+        };
+        let diff = PlatformDiff {
+            write_only_removed: vec!["REMOVED".into()],
+            ..PlatformDiff::default()
+        };
+
+        let result = client
+            .apply(&diff, &LocalPlatformValues::default(), &remote, true)
+            .await
+            .expect("authoritative final state must recover the committed unset");
+
+        assert_eq!(result.removed, 1);
+        server.await.expect("raw Fly.io server");
+    }
+
+    #[tokio::test]
+    async fn partially_committed_unset_reports_the_authoritative_removed_count() {
+        let (api_url, server) =
+            spawn_unset_disconnect_server(4, vec!["ONE", "TWO"], Some(vec!["TWO"])).await;
+        let _env = crate::test_env::ScopedEnv::set([
+            ("ACCEPTANCE_RUN_ID", "fly-partial-unset-disconnect".into()),
+            ("LPM_ACCEPTANCE_FLY_API_URL", api_url.into()),
+        ]);
+        let client = FlyClient::new("fo1_acceptance-token".into(), config()).expect("client");
+        let remote = PlatformState {
+            readable: HashMap::new(),
+            write_only: HashSet::from(["ONE".into(), "TWO".into()]),
+        };
+        let diff = PlatformDiff {
+            write_only_removed: vec!["ONE".into(), "TWO".into()],
+            ..PlatformDiff::default()
+        };
+
+        let error = client
+            .apply(&diff, &LocalPlatformValues::default(), &remote, true)
+            .await
+            .expect_err("partial unset must retain its provider error");
+
+        let PlatformApplyError::Tracked { error, applied } = error else {
+            panic!("authoritative partial completion must retain exact counts");
+        };
+        assert!(matches!(*error, LpmError::Network(_)));
+        assert_eq!(applied.removed, 1);
+        server.await.expect("raw Fly.io server");
+    }
+
+    #[tokio::test]
+    async fn unset_suppresses_counts_when_final_state_cannot_be_read() {
+        let (api_url, server) = spawn_unset_disconnect_server(4, vec!["REMOVED"], None).await;
+        let _env = crate::test_env::ScopedEnv::set([
+            (
+                "ACCEPTANCE_RUN_ID",
+                "fly-unset-reconciliation-failure".into(),
+            ),
+            ("LPM_ACCEPTANCE_FLY_API_URL", api_url.into()),
+        ]);
+        let client = FlyClient::new("fo1_acceptance-token".into(), config()).expect("client");
+        let remote = PlatformState {
+            readable: HashMap::new(),
+            write_only: HashSet::from(["REMOVED".into()]),
+        };
+        let diff = PlatformDiff {
+            write_only_removed: vec!["REMOVED".into()],
+            ..PlatformDiff::default()
+        };
+
+        let error = client
+            .apply(&diff, &LocalPlatformValues::default(), &remote, true)
+            .await
+            .expect_err("unreadable final state must suppress exact counts");
+
+        assert!(matches!(error, PlatformApplyError::Untracked(_)));
+        server.await.expect("raw Fly.io server");
     }
 }
