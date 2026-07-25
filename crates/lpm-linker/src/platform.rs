@@ -162,7 +162,7 @@ fn detach_hardlinks_recursive(dir: &Path) -> Result<usize, LpmError> {
         lpm_common::write_file_atomic_with(
             &path,
             lpm_common::AtomicWriteOptions::new(),
-            |destination| {
+            |destination| -> std::io::Result<()> {
                 let mut source = std::fs::File::open(&path)?;
                 std::io::copy(&mut source, destination)?;
                 Ok(())
