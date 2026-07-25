@@ -58,7 +58,7 @@ pub(crate) struct PublishArgs {
     #[arg(long)]
     pub(crate) dry_run: bool,
 
-    /// Only show quality report, don't publish.
+    /// Prepare and validate locally without publishing: pack files, validate skills and provenance files, run quality checks, and scan for secrets.
     #[arg(long)]
     pub(crate) check: bool,
 

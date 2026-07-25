@@ -14,6 +14,18 @@ pub struct TarballFile {
     pub size: u64,
 }
 
+pub(crate) struct PreparedTarball {
+    pub(crate) data: Vec<u8>,
+    pub(crate) files: Vec<TarballFile>,
+    pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TarballOptions<'a> {
+    pub(crate) package_json_content: Option<&'a [u8]>,
+    pub(crate) scan_secrets: bool,
+}
+
 /// Precomputed hashes for a tarball.
 pub struct TarballHashes {
     /// SHA-1 hex digest.
@@ -96,20 +108,31 @@ const MAX_TARBALL_FILE_BYTES: u64 = 200 * 1024 * 1024;
 /// Respects `files` field in package.json if present.
 /// Falls back to including everything except common ignores.
 /// Rejects symlinks and paths that escape the project directory (S2).
+#[cfg(test)]
 pub fn create_tarball(
     project_dir: &Path,
     pkg_json: &serde_json::Value,
 ) -> Result<(Vec<u8>, Vec<TarballFile>), LpmError> {
+    let prepared = prepare_tarball(project_dir, pkg_json, TarballOptions::default())?;
+    Ok((prepared.data, prepared.files))
+}
+
+pub(crate) fn prepare_tarball(
+    project_dir: &Path,
+    pkg_json: &serde_json::Value,
+    options: TarballOptions<'_>,
+) -> Result<PreparedTarball, LpmError> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::borrow::Cow;
     use std::io::Write;
 
     let canonical_root = project_dir
         .canonicalize()
         .map_err(|e| LpmError::Registry(format!("cannot canonicalize project directory: {e}")))?;
 
-    let files = collect_package_files(project_dir, pkg_json, &canonical_root)?;
-    if files.is_empty() {
+    let candidates = collect_package_files(project_dir, pkg_json, &canonical_root)?;
+    if candidates.is_empty() {
         return Err(LpmError::Registry(
             "no files to pack (check package.json 'files' field)".to_string(),
         ));
@@ -117,11 +140,15 @@ pub fn create_tarball(
 
     let mut tar_data = Vec::new();
     let mut accumulated: u64 = 0;
+    let mut files = Vec::with_capacity(candidates.len());
+    let mut secret_scan = options
+        .scan_secrets
+        .then(lpm_security::behavioral::secrets::SecretScanResult::default);
     {
         let mut builder = tar::Builder::new(&mut tar_data);
 
-        for file in &files {
-            let full_path = project_dir.join(&file.path);
+        for candidate in candidates {
+            let full_path = project_dir.join(&candidate.path);
 
             // S2: Symlink escape prevention — double-check before reading.
             // Files were already validated during collection, but a TOCTOU
@@ -136,35 +163,73 @@ pub fn create_tarball(
             // the 500 MB ceiling. Pre-fix the check ran only after
             // `create_tarball` returned, by which time the bytes were
             // already in memory.
-            let file_size = std::fs::metadata(&full_path).map_or(0, |m| m.len());
+            let file_size = if candidate.path == "package.json" {
+                options.package_json_content.map_or_else(
+                    || std::fs::metadata(&full_path).map_or(0, |metadata| metadata.len()),
+                    |content| content.len() as u64,
+                )
+            } else {
+                std::fs::metadata(&full_path).map_or(0, |metadata| metadata.len())
+            };
             if file_size > MAX_TARBALL_FILE_BYTES {
                 return Err(LpmError::Registry(format!(
                     "file `{}` size {} exceeds per-file cap of {} bytes — \
                      remove it from the publish set or add an exclusion in \
                      package.json `files`",
-                    file.path, file_size, MAX_TARBALL_FILE_BYTES,
+                    candidate.path, file_size, MAX_TARBALL_FILE_BYTES,
                 )));
             }
-            accumulated = accumulated.saturating_add(file_size);
+
+            let content = if candidate.path == "package.json" {
+                options.package_json_content.map_or_else(
+                    || std::fs::read(&full_path).map(Cow::Owned),
+                    |content| Ok(Cow::Borrowed(content)),
+                )?
+            } else {
+                Cow::Owned(std::fs::read(&full_path)?)
+            };
+            let actual_size = content.len() as u64;
+            if actual_size > MAX_TARBALL_FILE_BYTES {
+                return Err(LpmError::Registry(format!(
+                    "file `{}` size {} exceeds per-file cap of {} bytes — \
+                     remove it from the publish set or add an exclusion in \
+                     package.json `files`",
+                    candidate.path, actual_size, MAX_TARBALL_FILE_BYTES,
+                )));
+            }
+
+            accumulated = accumulated.saturating_add(actual_size);
             if accumulated > MAX_UNCOMPRESSED_TARBALL_BYTES {
                 return Err(LpmError::Registry(format!(
                     "uncompressed tarball payload would exceed {} bytes (already at {} after `{}`) — \
                      reduce the publish set or split the package",
-                    MAX_UNCOMPRESSED_TARBALL_BYTES, accumulated, file.path,
+                    MAX_UNCOMPRESSED_TARBALL_BYTES, accumulated, candidate.path,
                 )));
             }
 
-            let content = std::fs::read(&full_path)?;
             let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
+            header.set_size(actual_size);
             header.set_mode(0o644);
             header.set_cksum();
 
             // npm tarballs have a `package/` prefix
-            let tar_path = format!("package/{}", file.path);
+            let tar_path = format!("package/{}", candidate.path);
             builder
-                .append_data(&mut header, &tar_path, &content[..])
+                .append_data(&mut header, &tar_path, content.as_ref())
                 .map_err(LpmError::Io)?;
+
+            if let Some(scan) = secret_scan.as_mut() {
+                let mut file_scan = lpm_security::behavioral::secrets::scan_file_content(
+                    content.as_ref(),
+                    &candidate.path,
+                );
+                scan.matches.append(&mut file_scan.matches);
+                scan.files_scanned += file_scan.files_scanned;
+            }
+            files.push(TarballFile {
+                path: candidate.path,
+                size: actual_size,
+            });
         }
 
         builder.finish().map_err(LpmError::Io)?;
@@ -175,7 +240,11 @@ pub fn create_tarball(
     encoder.write_all(&tar_data)?;
     let gzipped = encoder.finish()?;
 
-    Ok((gzipped, files))
+    Ok(PreparedTarball {
+        data: gzipped,
+        files,
+        secret_scan,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +654,68 @@ pub fn rewrite_tarball_name(
     Ok(gzipped)
 }
 
+pub(crate) fn rewrite_workspace_deps_in_package_json(
+    package_json_content: &[u8],
+    workspace: &lpm_workspace::Workspace,
+) -> Result<Option<Vec<u8>>, LpmError> {
+    let content_str = String::from_utf8_lossy(package_json_content);
+    if !content_str.contains("\"workspace:") && !content_str.contains("\"catalog:") {
+        return Ok(None);
+    }
+
+    let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(package_json_content) else {
+        return Ok(Some(package_json_content.to_vec()));
+    };
+    let dep_fields = [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ];
+
+    for field in &dep_fields {
+        let Some(deps_obj) = pkg.get(field).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        let mut deps_map: std::collections::HashMap<String, String> = deps_obj
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("*").to_string()))
+            .collect();
+
+        lpm_workspace::resolve_workspace_protocol(&mut deps_map, workspace).map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to resolve workspace: protocol in {field}: {error}"
+            ))
+        })?;
+
+        if !workspace.root_package.catalogs.is_empty() {
+            lpm_workspace::resolve_catalog_protocol(
+                &mut deps_map,
+                &workspace.root_package.catalogs,
+            )
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to resolve catalog: protocol in {field}: {error}"
+                ))
+            })?;
+        }
+
+        let mut resolved_deps = serde_json::Map::with_capacity(deps_obj.len());
+        for name in deps_obj.keys() {
+            if let Some(value) = deps_map.get(name) {
+                resolved_deps.insert(name.clone(), serde_json::Value::String(value.clone()));
+            }
+        }
+        pkg[field] = serde_json::Value::Object(resolved_deps);
+    }
+
+    serde_json::to_vec_pretty(&pkg).map(Some).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to serialize rewritten package.json: {error}"
+        ))
+    })
+}
+
 /// Rewrite `workspace:` and `catalog:` protocol references in the tarball's `package.json`.
 ///
 /// Monorepo packages use `"workspace:*"`, `"workspace:^"`, etc. in their
@@ -594,6 +725,7 @@ pub fn rewrite_tarball_name(
 ///
 /// Must be called BEFORE hash computation and provenance generation.
 /// Returns the original tarball unchanged if no protocols are found.
+#[cfg(test)]
 pub fn rewrite_workspace_deps_in_tarball(
     tarball_data: &[u8],
     workspace: &lpm_workspace::Workspace,
@@ -610,10 +742,9 @@ pub fn rewrite_workspace_deps_in_tarball(
         .read_to_end(&mut tar_data)
         .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
 
-    // Check if rewriting is needed
-    let needs_rewrite = {
+    let rewritten_package_json = {
         let mut archive = tar::Archive::new(tar_data.as_slice());
-        let mut found = false;
+        let mut rewritten = None;
         for entry_result in archive.entries().map_err(LpmError::Io)? {
             let mut entry = entry_result.map_err(LpmError::Io)?;
             let path = entry
@@ -624,17 +755,16 @@ pub fn rewrite_workspace_deps_in_tarball(
             if path == "package/package.json" {
                 let mut content = Vec::new();
                 entry.read_to_end(&mut content).map_err(LpmError::Io)?;
-                let content_str = String::from_utf8_lossy(&content);
-                found = content_str.contains("\"workspace:") || content_str.contains("\"catalog:");
+                rewritten = rewrite_workspace_deps_in_package_json(&content, workspace)?;
                 break;
             }
         }
-        found
+        rewritten
     };
 
-    if !needs_rewrite {
+    let Some(mut rewritten_package_json) = rewritten_package_json else {
         return Ok(tarball_data.to_vec());
-    }
+    };
 
     // Rewrite: decompress → patch → recompress
     let mut new_tar_data = Vec::new();
@@ -653,54 +783,8 @@ pub fn rewrite_workspace_deps_in_tarball(
             let mut content = Vec::new();
             entry.read_to_end(&mut content).map_err(LpmError::Io)?;
 
-            if path == "package/package.json"
-                && let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(&content)
-            {
-                let dep_fields = [
-                    "dependencies",
-                    "devDependencies",
-                    "peerDependencies",
-                    "optionalDependencies",
-                ];
-
-                for field in &dep_fields {
-                    if let Some(deps_obj) = pkg.get(field).and_then(|v| v.as_object()).cloned() {
-                        let mut resolved_deps: serde_json::Map<String, serde_json::Value> =
-                            serde_json::Map::new();
-                        let mut deps_map: std::collections::HashMap<String, String> = deps_obj
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("*").to_string()))
-                            .collect();
-
-                        // Resolve workspace: protocol
-                        if let Err(e) =
-                            lpm_workspace::resolve_workspace_protocol(&mut deps_map, workspace)
-                        {
-                            return Err(LpmError::Registry(format!(
-                                "failed to resolve workspace: protocol in {field}: {e}"
-                            )));
-                        }
-
-                        // Resolve catalog: protocol
-                        if !workspace.root_package.catalogs.is_empty()
-                            && let Err(e) = lpm_workspace::resolve_catalog_protocol(
-                                &mut deps_map,
-                                &workspace.root_package.catalogs,
-                            )
-                        {
-                            return Err(LpmError::Registry(format!(
-                                "failed to resolve catalog: protocol in {field}: {e}"
-                            )));
-                        }
-
-                        for (k, v) in &deps_map {
-                            resolved_deps.insert(k.clone(), serde_json::Value::String(v.clone()));
-                        }
-                        pkg[field] = serde_json::Value::Object(resolved_deps);
-                    }
-                }
-
-                content = serde_json::to_vec_pretty(&pkg).unwrap_or(content);
+            if path == "package/package.json" {
+                std::mem::swap(&mut content, &mut rewritten_package_json);
             }
 
             let mut header = tar::Header::new_gnu();

@@ -12,7 +12,7 @@ use super::provenance::{
 };
 use super::quality_gate::run_publish_quality_gate;
 use super::secret_scan::run_publish_secret_scan;
-use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
+use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
 use super::target::resolve_targets;
 use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublishProject,
@@ -137,12 +137,12 @@ pub async fn run(
                     validation.valid_files.len()
                 ));
             }
-            if ensure_lpm_in_files(
-                &publish_manifest.package_json_path,
-                &publish_manifest.pkg_json,
-            )? {
-                publish_manifest = read_publish_manifest(project_dir)?;
-            }
+            let write_mode = if dry_run || check_only {
+                ManifestWriteMode::ReadOnly
+            } else {
+                ManifestWriteMode::Persist
+            };
+            ensure_lpm_in_files(&mut publish_manifest, write_mode)?;
         }
         has_authored_skills
     } else {
@@ -157,10 +157,11 @@ pub async fn run(
         readme,
         tarball_data,
         tarball_files,
+        secret_scan,
         tarball_size,
         detected_ecosystem,
         swift_manifest,
-    } = prepare_publish_project_from_manifest(project_dir, publish_manifest)?;
+    } = prepare_publish_project_from_manifest(project_dir, publish_manifest, !allow_secrets)?;
     let publish_config = publish_config.as_ref();
 
     let targets_gitlab = targets.iter().any(|t| matches!(t, PublishTarget::GitLab));
@@ -290,7 +291,7 @@ pub async fn run(
         })
         .await?;
 
-    run_publish_secret_scan(project_dir, json_output, allow_secrets)?;
+    run_publish_secret_scan(secret_scan.as_ref(), json_output, allow_secrets)?;
 
     // Quality checks are required only for the LPM target.
     let quality_result = if targets_lpm {

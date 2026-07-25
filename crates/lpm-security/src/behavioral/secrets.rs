@@ -235,6 +235,8 @@ const BLOCKED_FILES: &[&str] = &[
     "gcloud-key.json",
 ];
 
+const MAX_SCANNABLE_FILE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Get the compiled RegexSet (singleton, thread-safe).
 fn secret_regex_set() -> &'static RegexSet {
     static SET: OnceLock<RegexSet> = OnceLock::new();
@@ -282,6 +284,79 @@ pub fn is_blocked_file(filename: &str) -> bool {
     BLOCKED_FILES.iter().any(|b| name.eq_ignore_ascii_case(b))
 }
 
+/// Scan one prepared package file without rediscovering it from the filesystem.
+///
+/// Blocked filenames are reported even when their contents are binary or empty.
+/// Other binary, unsupported, and oversized files are skipped consistently with
+/// [`scan_directory`].
+pub fn scan_file_content(content: &[u8], file_path: &str) -> SecretScanResult {
+    let mut result = SecretScanResult::default();
+    if is_blocked_file(file_path) {
+        result.matches.push(SecretMatch {
+            pattern_name: "blocked_file".to_string(),
+            description: format!("'{file_path}' should not be included in a published package"),
+            matched_text: file_path.to_string(),
+            line: 0,
+            severity: "critical".to_string(),
+        });
+        result.files_scanned = 1;
+        return result;
+    }
+
+    if content.len() > MAX_SCANNABLE_FILE_BYTES || !is_scannable_file(file_path) {
+        return result;
+    }
+
+    let Ok(content) = std::str::from_utf8(content) else {
+        return result;
+    };
+    result.matches = scan_content(content, file_path);
+    result.files_scanned = 1;
+    result
+}
+
+fn is_scannable_file(file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    let ext = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    matches!(
+        ext,
+        "js" | "mjs"
+            | "cjs"
+            | "ts"
+            | "mts"
+            | "cts"
+            | "jsx"
+            | "tsx"
+            | "json"
+            | "yml"
+            | "yaml"
+            | "toml"
+            | "env"
+            | "cfg"
+            | "conf"
+            | "ini"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "py"
+            | "rb"
+            | "rs"
+            | "go"
+            | "java"
+            | "kt"
+            | "swift"
+            | "md"
+            | "txt"
+            | "xml"
+            | "pem"
+    ) || file_path.starts_with(".env")
+        || file_path.ends_with("rc")
+        || file_path.ends_with(".npmrc")
+}
+
 /// Truncate a secret value for safe display: show first 8 and last 4 chars.
 fn truncate_secret(value: &str) -> String {
     let char_count = value.chars().count();
@@ -326,69 +401,28 @@ pub fn scan_directory(dir: &std::path::Path) -> SecretScanResult {
             .to_string_lossy()
             .to_string();
 
-        // Check for blocked filenames
         if is_blocked_file(&rel_path) {
-            result.matches.push(SecretMatch {
-                pattern_name: "blocked_file".to_string(),
-                description: format!("'{rel_path}' should not be included in a published package"),
-                matched_text: rel_path.clone(),
-                line: 0,
-                severity: "critical".to_string(),
-            });
-            result.files_scanned += 1;
+            let mut file_scan = scan_file_content(&[], &rel_path);
+            result.matches.append(&mut file_scan.matches);
+            result.files_scanned += file_scan.files_scanned;
             continue;
         }
 
-        // Only scan text files (skip binaries, images, etc.)
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let scannable = matches!(
-            ext,
-            "js" | "mjs"
-                | "cjs"
-                | "ts"
-                | "mts"
-                | "cts"
-                | "jsx"
-                | "tsx"
-                | "json"
-                | "yml"
-                | "yaml"
-                | "toml"
-                | "env"
-                | "cfg"
-                | "conf"
-                | "ini"
-                | "sh"
-                | "bash"
-                | "zsh"
-                | "py"
-                | "rb"
-                | "rs"
-                | "go"
-                | "java"
-                | "kt"
-                | "swift"
-                | "md"
-                | "txt"
-                | "xml"
-                | "pem"
-        ) || rel_path.starts_with(".env")
-            || rel_path.ends_with("rc")
-            || rel_path.ends_with(".npmrc");
-
-        if !scannable {
+        if !is_scannable_file(&rel_path) {
             continue;
         }
 
-        // Size guard: skip files > 2MB
-        if path.metadata().is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        if path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > MAX_SCANNABLE_FILE_BYTES as u64)
+        {
             continue;
         }
 
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let matches = scan_content(&content, &rel_path);
-            result.matches.extend(matches);
-            result.files_scanned += 1;
+        if let Ok(content) = std::fs::read(path) {
+            let mut file_scan = scan_file_content(&content, &rel_path);
+            result.matches.append(&mut file_scan.matches);
+            result.files_scanned += file_scan.files_scanned;
         }
     }
 
@@ -545,6 +579,42 @@ mod tests {
         assert!(!is_blocked_file("app.js"));
         assert!(!is_blocked_file(".env.example"));
         assert!(!is_blocked_file("package.json"));
+    }
+
+    #[test]
+    fn scan_file_content_reports_blocked_filename_without_readable_content() {
+        let result = scan_file_content(&[0xff, 0xfe], "config/credentials.json");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].pattern_name, "blocked_file");
+        assert_eq!(result.matches[0].line, 0);
+        assert_eq!(result.files_scanned, 1);
+    }
+
+    #[test]
+    fn scan_file_content_preserves_path_and_line_for_detected_secret() {
+        let secret = format!(
+            "first line\npassword = \"{}\"\n",
+            "fixture-secret".repeat(2)
+        );
+        let result = scan_file_content(secret.as_bytes(), "ignored/selected.js");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].pattern_name, "generic_password");
+        assert_eq!(result.matches[0].line, 2);
+        assert!(
+            result.matches[0]
+                .description
+                .contains("ignored/selected.js")
+        );
+    }
+
+    #[test]
+    fn scan_file_content_skips_clean_selected_file() {
+        let result = scan_file_content(b"module.exports = {}", "index.js");
+
+        assert!(!result.has_secrets());
+        assert_eq!(result.files_scanned, 1);
     }
 
     #[test]

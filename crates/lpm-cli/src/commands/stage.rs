@@ -23,7 +23,7 @@ pub(crate) async fn publish_current_project(
     options: StagePublishOptions<'_>,
 ) -> Result<(), LpmError> {
     let started_at = std::time::Instant::now();
-    let prepared = publish::prepare_publish_project(project_dir)?;
+    let prepared = publish::prepare_publish_project(project_dir, !options.allow_secrets)?;
     let npm_config = prepared
         .publish_config
         .as_ref()
@@ -75,7 +75,11 @@ pub(crate) async fn publish_current_project(
         None
     };
 
-    publish::run_publish_secret_scan(project_dir, options.json_output, options.allow_secrets)?;
+    publish::run_publish_secret_scan(
+        prepared.secret_scan.as_ref(),
+        options.json_output,
+        options.allow_secrets,
+    )?;
     let quality = publish::run_publish_quality_gate(publish::PublishQualityGateInput {
         pkg_json: &prepared.pkg_json,
         readme: prepared.readme.as_deref(),

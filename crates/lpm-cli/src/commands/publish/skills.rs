@@ -1,7 +1,13 @@
+use super::prepare::PublishManifest;
 use crate::install_ui;
 use lpm_common::LpmError;
 use serde::Serialize;
-use std::path::Path;
+
+#[derive(Clone, Copy)]
+pub(super) enum ManifestWriteMode {
+    ReadOnly,
+    Persist,
+}
 
 /// Compute a digest from previously published skills for staleness comparison.
 pub(super) fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
@@ -36,21 +42,17 @@ pub(super) fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) ->
 /// directory also contains certs, webhook logs, install hashes, and other
 /// project-local data that must NEVER be published in the tarball.
 pub(super) fn ensure_lpm_in_files(
-    pkg_json_path: &Path,
-    pkg_json: &serde_json::Value,
+    manifest: &mut PublishManifest,
+    write_mode: ManifestWriteMode,
 ) -> Result<bool, LpmError> {
-    if let Some(files) = pkg_json.get("files").and_then(|f| f.as_array()) {
+    if let Some(files) = manifest.pkg_json.get("files").and_then(|f| f.as_array()) {
         let has_skills = files.iter().any(|f| {
             let s = f.as_str().unwrap_or("");
             s == ".lpm/skills" || s == ".lpm/skills/" || s == ".lpm"
         });
         if !has_skills {
-            let content = lpm_common::read_text_file_capped(
-                pkg_json_path,
-                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-            )?;
-            let mut updated = pkg_json.clone();
-            let updated_files = updated
+            let updated_files = manifest
+                .pkg_json
                 .get_mut("files")
                 .and_then(serde_json::Value::as_array_mut)
                 .ok_or_else(|| {
@@ -60,19 +62,36 @@ pub(super) fn ensure_lpm_in_files(
                 })?;
             updated_files.push(serde_json::Value::String(".lpm/skills".into()));
 
-            let indent = package_json_indent(&content);
+            let indent = package_json_indent(&manifest.package_json_content);
             let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent);
-            let mut serialized = Vec::with_capacity(content.len() + 32);
+            let mut serialized = Vec::with_capacity(manifest.package_json_content.len() + 32);
             let mut serializer = serde_json::Serializer::with_formatter(&mut serialized, formatter);
-            updated.serialize(&mut serializer).map_err(|error| {
-                LpmError::Registry(format!("failed to serialize package.json: {error}"))
-            })?;
+            manifest
+                .pkg_json
+                .serialize(&mut serializer)
+                .map_err(|error| {
+                    LpmError::Registry(format!("failed to serialize package.json: {error}"))
+                })?;
             serialized.push(b'\n');
-            lpm_common::write_file_atomic(pkg_json_path, serialized)?;
 
-            install_ui::warn(
-                "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
-            );
+            if matches!(write_mode, ManifestWriteMode::Persist) {
+                let current = lpm_common::read_text_file_capped(
+                    &manifest.package_json_path,
+                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                )?;
+                if current != manifest.package_json_content {
+                    return Err(LpmError::Registry(format!(
+                        "{} changed while preparing the publish tarball",
+                        manifest.package_json_path.display()
+                    )));
+                }
+                lpm_common::write_file_atomic(&manifest.package_json_path, &serialized)?;
+                install_ui::warn(
+                    "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
+                );
+            }
+
+            manifest.package_json_override = Some(serialized);
             return Ok(true);
         }
     }

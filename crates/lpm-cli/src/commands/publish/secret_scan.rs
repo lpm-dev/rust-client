@@ -1,7 +1,6 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_security::behavioral::secrets::SecretScanResult;
-use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum SecretScanLine {
@@ -11,7 +10,7 @@ pub(super) enum SecretScanLine {
 }
 
 pub(crate) fn run_publish_secret_scan(
-    project_dir: &Path,
+    secret_scan: Option<&SecretScanResult>,
     json_output: bool,
     allow_secrets: bool,
 ) -> Result<(), LpmError> {
@@ -19,12 +18,14 @@ pub(crate) fn run_publish_secret_scan(
         return Ok(());
     }
 
-    let secret_scan = lpm_security::behavioral::secrets::scan_directory(project_dir);
+    let secret_scan = secret_scan.ok_or_else(|| {
+        LpmError::Registry("publish artifact was prepared without a secret scan".into())
+    })?;
     if secret_scan.has_secrets() {
         if json_output {
-            println!("{}", secret_scan_json(&secret_scan));
+            println!("{}", secret_scan_json(secret_scan));
         } else {
-            emit_secret_scan_human(&secret_scan);
+            emit_secret_scan_human(secret_scan);
         }
         return Err(LpmError::ExitCode(1));
     }
