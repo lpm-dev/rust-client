@@ -67,8 +67,8 @@ pub(super) fn extract_trusted_dependencies(manifest: &serde_json::Value) -> Trus
 
 /// Write the updated `trustedDependencies` back to `package.json`.
 ///
-/// Atomic via temp-file rename. Preserves the rest of the manifest
-/// untouched (we mutate only the `lpm.trustedDependencies` subtree).
+/// Preserves the rest of the manifest untouched (we mutate only the
+/// `lpm.trustedDependencies` subtree).
 pub(super) fn write_back(
     pkg_json_path: &Path,
     manifest: &mut serde_json::Value,
@@ -91,21 +91,10 @@ pub(super) fn write_back(
     let updated = serde_json::to_string_pretty(manifest)
         .map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
 
-    // Atomic write: temp file + rename. Mirrors build_state::write_build_state.
-    let parent = pkg_json_path.parent().unwrap_or(Path::new("."));
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp = parent.join(format!(".package.json.{pid}.{nanos}.tmp"));
-    std::fs::write(&tmp, format!("{updated}\n")).map_err(LpmError::Io)?;
-    std::fs::rename(&tmp, pkg_json_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+    lpm_common::write_file_atomic(pkg_json_path, format!("{updated}\n")).map_err(|e| {
         LpmError::Io(std::io::Error::new(
             e.kind(),
-            format!("failed to rename package.json tempfile into place: {e}"),
+            format!("failed to atomically write package.json: {e}"),
         ))
-    })?;
-
-    Ok(())
+    })
 }

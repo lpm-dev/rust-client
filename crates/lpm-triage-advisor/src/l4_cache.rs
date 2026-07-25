@@ -33,8 +33,8 @@
 //! ```
 //!
 //! JSON with a top-level `version` (schema) and an `entries` map.
-//! Atomic write-then-rename so a crash mid-persist doesn't corrupt
-//! the file. Reads are tolerant of an unparseable file (treat as
+//! Atomic same-directory replacement keeps a crash mid-persist from
+//! corrupting the file. Reads are tolerant of an unparseable file (treat as
 //! empty cache and overwrite on next persist).
 //!
 //! # Concurrency
@@ -277,8 +277,8 @@ impl L4Cache {
 
     /// Atomically write the in-memory map to disk. No-op if disabled.
     ///
-    /// Writes to `<path>.tmp` then renames over `<path>`, so a crash
-    /// mid-write leaves the prior file intact. Creates the parent
+    /// Writes through an exclusively created same-directory temporary file,
+    /// so a crash mid-write leaves the prior file intact. Creates the parent
     /// directory if missing.
     pub fn persist(&self) -> io::Result<()> {
         if self.disabled {
@@ -295,10 +295,11 @@ fn persist_snapshot(path: &Path, file: &CacheFile) -> io::Result<()> {
     }
     let bytes = serde_json::to_vec_pretty(file)
         .map_err(|e| io::Error::other(format!("serialize l4 cache: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        path,
+        bytes,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
 }
 
 fn load_or_default(path: &Path) -> CacheFile {

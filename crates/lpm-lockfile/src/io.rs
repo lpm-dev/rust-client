@@ -102,24 +102,11 @@ impl Lockfile {
         Ok(lockfile)
     }
 
-    /// Write lockfile to disk atomically (write to .tmp, then rename).
+    /// Write the lockfile with an atomic same-directory replacement.
     pub fn write_to_file(&self, path: &Path) -> Result<(), LockfileError> {
         let content = self.to_toml()?;
-        let tmp_path = path.with_extension("lock.tmp");
-
-        std::fs::write(&tmp_path, &content).map_err(|e| {
-            LockfileError::Io(format!("failed to write {}: {e}", tmp_path.display()))
-        })?;
-
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(LockfileError::Io(format!(
-                "failed to rename to {}: {e}",
-                path.display()
-            )));
-        }
-
-        Ok(())
+        lpm_common::write_file_atomic(path, content)
+            .map_err(|e| LockfileError::Io(format!("failed to write {}: {e}", path.display())))
     }
 
     /// Read lockfile from disk.

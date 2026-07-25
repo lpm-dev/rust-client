@@ -57,8 +57,7 @@ impl InstallReadyMarker {
     }
 }
 
-/// Write `marker` into `<install_root>/.lpm-install-ready` atomically
-/// (tempfile + rename + parent fsync on Unix).
+/// Write `marker` into `<install_root>/.lpm-install-ready` atomically.
 ///
 /// The install pipeline calls this **only after** every step-2
 /// deliverable is in place: tarballs extracted with integrity verified,
@@ -75,38 +74,16 @@ pub fn write_marker(install_root: &Path, marker: &InstallReadyMarker) -> Result<
     let parent = as_extended_path(install_root);
     std::fs::create_dir_all(&parent)?;
     let target: PathBuf = as_extended_path(&install_root.join(INSTALL_READY_MARKER));
-    let tmp_name = format!(".{INSTALL_READY_MARKER}.tmp.{}", std::process::id());
-    let tmp: PathBuf = as_extended_path(&install_root.join(tmp_name));
     let serialized = serde_json::to_vec_pretty(marker)
         .map_err(|e| LpmError::Io(std::io::Error::other(format!("marker serialize: {e}"))))?;
-    {
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Marker carries install metadata (commands, paths,
-            // package list) — not raw secrets, but on shared hosts
-            // it lets other local uids enumerate what global tools
-            // a user has installed. 0o600 matches the broader
-            // credential-metadata posture established in the
-            // H4/L14 batch.
-            open_opts.mode(0o600);
-        }
-        let mut f = open_opts.open(&tmp)?;
-        std::io::Write::write_all(&mut f, &serialized)?;
-        f.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LpmError::Io(e));
-    }
-    #[cfg(unix)]
-    {
-        if let Ok(parent_fd) = std::fs::File::open(install_root) {
-            let _ = parent_fd.sync_all();
-        }
-    }
+    lpm_common::write_file_atomic_with_options(
+        &target,
+        &serialized,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
+    )?;
     Ok(())
 }
 

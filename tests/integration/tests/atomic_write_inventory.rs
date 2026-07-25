@@ -1,0 +1,343 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use syn::visit::Visit;
+
+#[derive(Default)]
+struct RawAtomicOperations {
+    writes: Vec<&'static str>,
+    replacements: Vec<&'static str>,
+}
+
+impl<'ast> Visit<'ast> for RawAtomicOperations {
+    fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = expression.func.as_ref() {
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|part| part.ident.to_string())
+                .collect();
+            match segments.last().map(String::as_str) {
+                Some("write") if segments.iter().any(|part| part == "fs") => {
+                    self.writes.push("fs::write");
+                }
+                Some("create") if segments.iter().any(|part| part == "File") => {
+                    self.writes.push("File::create");
+                }
+                Some("to_writer") => self.writes.push("serde to_writer"),
+                Some("rename") if segments.iter().any(|part| part == "fs") => {
+                    self.replacements.push("fs::rename");
+                }
+                Some("MoveFileExW") => self.replacements.push("MoveFileExW"),
+                _ => {}
+            }
+        }
+        syn::visit::visit_expr_call(self, expression);
+    }
+
+    fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
+        match expression.method.to_string().as_str() {
+            "write_all" | "write_fmt" => self.writes.push("Write method"),
+            "create" | "truncate" if boolean_argument(expression, true) => {
+                self.writes.push("OpenOptions write configuration");
+            }
+            "persist" | "persist_noclobber" => self.replacements.push("tempfile persist"),
+            _ => {}
+        }
+        syn::visit::visit_expr_method_call(self, expression);
+    }
+
+    fn visit_item_fn(&mut self, _function: &'ast syn::ItemFn) {}
+
+    fn visit_impl_item_fn(&mut self, _function: &'ast syn::ImplItemFn) {}
+}
+
+fn boolean_argument(expression: &syn::ExprMethodCall, expected: bool) -> bool {
+    matches!(
+        expression.args.first(),
+        Some(syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(value),
+            ..
+        })) if value.value == expected
+    )
+}
+
+struct ProductionFunctionVisitor<'a> {
+    relative_path: &'a Path,
+    findings: Vec<String>,
+    reviewed: Vec<String>,
+    in_test_module: bool,
+}
+
+impl<'a> ProductionFunctionVisitor<'a> {
+    fn inspect(&mut self, name: &syn::Ident, block: &syn::Block, attributes: &[syn::Attribute]) {
+        if self.in_test_module || attributes_are_test_only(attributes) {
+            return;
+        }
+
+        let mut operations = RawAtomicOperations::default();
+        operations.visit_block(block);
+        if operations.replacements.is_empty() {
+            return;
+        }
+
+        let key = format!("{}::{name}", self.relative_path.display());
+        if reviewed_raw_atomic_writer(&key) {
+            self.reviewed.push(key);
+            return;
+        }
+        operations.writes.sort_unstable();
+        operations.writes.dedup();
+        operations.replacements.sort_unstable();
+        operations.replacements.dedup();
+        self.findings.push(format!(
+            "{key}: writes [{}], replacements [{}]",
+            operations.writes.join(", "),
+            operations.replacements.join(", ")
+        ));
+    }
+}
+
+impl<'ast> Visit<'ast> for ProductionFunctionVisitor<'_> {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        let was_in_test_module = self.in_test_module;
+        self.in_test_module |= attributes_are_test_only(&module.attrs);
+        if let Some((_, items)) = &module.content {
+            for item in items {
+                self.visit_item(item);
+            }
+        }
+        self.in_test_module = was_in_test_module;
+    }
+
+    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+        self.inspect(&function.sig.ident, &function.block, &function.attrs);
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+        self.inspect(&function.sig.ident, &function.block, &function.attrs);
+    }
+}
+
+fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("test")
+            || (attribute.path().is_ident("cfg")
+                && match &attribute.meta {
+                    syn::Meta::List(list) => {
+                        list.tokens.to_string().split_whitespace().any(|part| {
+                            part.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                                == "test"
+                        })
+                    }
+                    _ => false,
+                })
+    })
+}
+
+fn reviewed_raw_atomic_writer(key: &str) -> bool {
+    REVIEWED_RAW_ATOMIC_WRITERS
+        .iter()
+        .any(|(reviewed, _reason)| *reviewed == key)
+}
+
+const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
+    (
+        "crates/lpm-audit-corpus/src/layers/l4.rs::enrich_advisor_in_place",
+        "the persist method belongs to L4Cache and delegates to the shared secure writer",
+    ),
+    (
+        "crates/lpm-cert/src/rotate.rs::stage_and_run",
+        "promotes certificate and key staging files that were themselves installed by the shared secure writer",
+    ),
+    (
+        "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
+        "NamedTempFile exclusively creates a randomized sibling before persist",
+    ),
+    (
+        "crates/lpm-cli/src/commands/self_update.rs::swap_current_binary",
+        "NamedTempFile exclusively creates the executable sibling; Windows needs a custom running-binary swap",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::write_state",
+        "NamedTempFile exclusively creates a randomized sibling before persist",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::commit_staged_install",
+        "publishes an exclusively created skill directory transaction",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::rollback_staged_install",
+        "restores directories owned by the skill transaction",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::stage_owned_removal",
+        "moves an owned skill directory into the transaction for rollback",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::commit_target_stages",
+        "publishes exclusively created skill target directories",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::rollback_target_stages",
+        "restores directories owned by the skill target transaction",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/managed.rs::rollback_removed_targets",
+        "restores directories owned by the skill removal transaction",
+    ),
+    (
+        "crates/lpm-cli/src/commands/skills/package.rs::materialize",
+        "writes are inside an exclusively created temporary directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-cli/src/security_approval/signed_store.rs::quarantine_security_state_file",
+        "moves an existing unverified state file to a fresh quarantine name without writing a temporary leaf",
+    ),
+    (
+        "crates/lpm-cli/src/triage_advisor_session.rs::classify_amber",
+        "the persist method belongs to L4Cache and delegates to the shared secure writer",
+    ),
+    (
+        "crates/lpm-common/src/atomic_write.rs::replace_file",
+        "this is the platform replacement boundary of the shared secure writer",
+    ),
+    (
+        "crates/lpm-linker/src/v2/compat_island.rs::ensure_store_compat_island",
+        "writes are inside a newly created staging directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-linker/src/v2/compat_island.rs::ensure_compatibility_package_copy",
+        "publishes a package directory staged by the compatibility-island transaction",
+    ),
+    (
+        "crates/lpm-plugin/src/engine.rs::install_under_lock_at",
+        "publishes an engine directory created under the engine installation lock",
+    ),
+    (
+        "crates/lpm-runner/src/dlx.rs::migrate_legacy_dlx_cache",
+        "moves existing package directories during a cache-layout migration",
+    ),
+    (
+        "crates/lpm-runtime/src/download.rs::install_bun_with_report",
+        "moves the extracted Bun executable within a private staging directory",
+    ),
+    (
+        "crates/lpm-runtime/src/download.rs::rename_with_fallback",
+        "performs a cross-filesystem move with copy fallback rather than an atomic file rewrite",
+    ),
+    (
+        "crates/lpm-store/src/extraction.rs::store_at_dir",
+        "writes are inside an extraction directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/extraction.rs::store_package_from_file_timed",
+        "writes are inside an extraction directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/extraction.rs::stream_and_store_package",
+        "writes are inside an extraction directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/v2/build_cache.rs::publish_build_artifact",
+        "writes are inside a build-artifact directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/v2/build_cache.rs::replace_with_staged_tree",
+        "swaps complete package directory trees with rollback",
+    ),
+    (
+        "crates/lpm-store/src/v2/integrity.rs::claim_unusable_object_dir",
+        "moves an object directory to a random removal claim before deletion",
+    ),
+    (
+        "crates/lpm-store/src/v2/integrity.rs::finish_object_rename_after_collision",
+        "publishes or discards a complete object directory after a concurrent directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/v2/local_source.rs::replace_local_source_object",
+        "swaps complete local-source object directories with rollback",
+    ),
+    (
+        "crates/lpm-store/src/v2/local_source.rs::finish_local_source_object_rename",
+        "publishes or discards a complete local-source object directory after a concurrent transaction",
+    ),
+    (
+        "crates/lpm-store/src/v2/store.rs::extract_object_with_timings_and_policy",
+        "writes are inside an object staging directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/v2/store.rs::populate_object_from_v1",
+        "writes are inside an object staging directory that is published as a directory transaction",
+    ),
+    (
+        "crates/lpm-store/src/v2/store.rs::populate_link_entry_inner",
+        "publishes a complete link-entry directory after staging",
+    ),
+    (
+        "crates/lpm-tunnel/src/webhook_log.rs::perform_rotation",
+        "rotates existing log files without writing through temporary leaf paths",
+    ),
+];
+
+fn rust_sources(root: &Path, sources: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            rust_sources(&path, sources)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn production_atomic_rewrites_use_exclusive_temporary_files() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("integration crate must live under tests/integration");
+    let crates = repository.join("crates");
+    let mut sources = Vec::new();
+    rust_sources(&crates, &mut sources).expect("enumerate Rust sources");
+    sources.sort_unstable();
+
+    let mut findings = Vec::new();
+    let mut reviewed = std::collections::BTreeSet::new();
+    for source in sources {
+        let relative_path = source
+            .strip_prefix(repository)
+            .expect("source must be below repository root");
+        let contents = fs::read_to_string(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", relative_path.display()));
+        let syntax = syn::parse_file(&contents)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", relative_path.display()));
+        let mut visitor = ProductionFunctionVisitor {
+            relative_path,
+            findings: Vec::new(),
+            reviewed: Vec::new(),
+            in_test_module: false,
+        };
+        visitor.visit_file(&syntax);
+        findings.extend(visitor.findings);
+        reviewed.extend(visitor.reviewed);
+    }
+
+    let stale_allowlist: Vec<_> = REVIEWED_RAW_ATOMIC_WRITERS
+        .iter()
+        .filter(|(key, reason)| reason.is_empty() || !reviewed.contains(*key))
+        .map(|(key, _)| *key)
+        .collect();
+    assert!(
+        stale_allowlist.is_empty(),
+        "reviewed raw-replacement inventory contains stale or unexplained entries:\n{}",
+        stale_allowlist.join("\n")
+    );
+    assert!(
+        findings.is_empty(),
+        "production code contains raw replacements outside the reviewed inventory:\n{}",
+        findings.join("\n")
+    );
+}

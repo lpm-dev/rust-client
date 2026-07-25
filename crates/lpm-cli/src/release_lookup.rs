@@ -297,23 +297,16 @@ pub fn read_cache_at(path: &Path) -> Option<UpdateCache> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Atomic write via `<path>.tmp` + rename. Best-effort directory
-/// creation. Errors are returned so the caller can decide whether to
-/// surface them — banner path swallows, self-update path may want to
-/// log on failure.
+/// Atomic replacement with best-effort directory creation. Errors are
+/// returned so the caller can decide whether to surface them — banner path
+/// swallows, self-update path may want to log on failure.
 pub fn write_cache_at(path: &Path, cache: &UpdateCache) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let json = serde_json::to_string(cache)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    lpm_common::write_file_atomic(path, json)
 }
 
 /// Best-effort cache delete. Used after a successful upgrade through a

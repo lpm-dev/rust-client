@@ -199,14 +199,11 @@ pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, L
     let releases: Vec<NodeRelease> = serde_json::from_str(&body)
         .map_err(|e| LpmError::Script(format!("failed to parse node index: {e}")))?;
 
-    // Cache it (atomic: write to temp, then rename — prevents corrupted cache on crash)
+    // Cache it without exposing a truncate-then-write window.
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let temp_cache = cache_path.with_extension("json.tmp");
-    if download::write_restricted_file(&temp_cache, body.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&temp_cache, &cache_path);
-    }
+    let _ = download::write_restricted_file(&cache_path, body.as_bytes());
 
     Ok(releases)
 }
@@ -656,22 +653,18 @@ mod tests {
         );
     }
 
-    // Atomic cache write: temp file should not persist after rename
+    // Atomic cache write leaves only the destination.
     #[test]
     fn atomic_cache_write_cleans_up_temp() {
         let dir = tempfile::tempdir().unwrap();
         let cache_path = dir.path().join("index-cache.json");
         let temp_path = cache_path.with_extension("json.tmp");
 
-        // Simulate the atomic write pattern
         let body = r#"[{"version":"v22.5.0","date":"2024-07-17","lts":false}]"#;
-        download::write_restricted_file(&temp_path, body.as_bytes()).unwrap();
-        assert!(temp_path.exists(), "temp file should exist before rename");
-
-        std::fs::rename(&temp_path, &cache_path).unwrap();
+        download::write_restricted_file(&cache_path, body.as_bytes()).unwrap();
         assert!(
             !temp_path.exists(),
-            "temp file should not exist after rename"
+            "predictable legacy temp file must not be created"
         );
         assert!(cache_path.exists(), "cache file should exist after rename");
 

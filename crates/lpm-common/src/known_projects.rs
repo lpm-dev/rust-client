@@ -28,11 +28,11 @@
 //!
 //! ## Atomic rewrite contract
 //!
-//! All writes go through a `<path>.tmp.<pid>` staging file then
-//! `rename` into place. Concurrent writers serialize naturally — a
-//! second writer overwrites the first's atomic-final result; no
-//! partial-write corruption is observable. Readers see either the old
-//! file or the new file.
+//! All writes go through an exclusively created, random same-directory
+//! staging file and atomic replacement. Concurrent writers serialize
+//! naturally — a second writer overwrites the first's atomic-final
+//! result; no partial-write corruption is observable. Readers see
+//! either the old file or the new file.
 //!
 //! ## Missing / unreadable registry policy
 //!
@@ -184,10 +184,9 @@ pub fn try_load(path: &Path) -> Result<Registry, LoadError> {
     }
 }
 
-/// Write `registry` to `path` atomically via `<path>.tmp.<pid>` →
-/// `rename`. Sorts `projects` by canonical path before serializing so
-/// the on-disk file is deterministic (helps human review and a
-/// dotfiles-checked-in registry's `git diff`).
+/// Write `registry` to `path` atomically. Sorts `projects` by canonical
+/// path before serializing so the on-disk file is deterministic (helps
+/// human review and a dotfiles-checked-in registry's `git diff`).
 ///
 /// Creates the parent directory if missing.
 ///
@@ -206,9 +205,11 @@ pub fn write(path: &Path, registry: &Registry) -> Result<(), LpmError> {
             "known-projects: failed to serialize registry: {e}"
         )))
     })?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
+    crate::write_file_atomic_with_options(
+        path,
+        &bytes,
+        crate::AtomicWriteOptions::new().unix_mode(0o600),
+    )?;
     Ok(())
 }
 

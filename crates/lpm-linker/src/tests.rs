@@ -3262,13 +3262,7 @@ fn link_dir_recursive_rejects_symlinked_directory_entries() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn detach_sweeps_leftover_temp_files_from_a_prior_failed_run() {
-    // Simulate the post-crash state where a previous detach pass
-    // got interrupted between `fs::copy` and `fs::rename`: a
-    // `.lpm-detach-tmp-<ino>` file is left in the package dir.
-    // The next pass must remove it (otherwise Node `readdir`
-    // calls inside the package would see it and could break
-    // packages that enumerate their own files).
+fn detach_preserves_preexisting_files_that_resemble_legacy_temps() {
     let dir = tempfile::tempdir().unwrap();
     let stale = dir.path().join(".lpm-detach-tmp-99999");
     std::fs::write(&stale, b"orphaned").unwrap();
@@ -3276,7 +3270,7 @@ fn detach_sweeps_leftover_temp_files_from_a_prior_failed_run() {
 
     detach_package_hardlinks(dir.path()).unwrap();
 
-    assert!(!stale.exists(), "stale temp file must be swept");
+    assert_eq!(std::fs::read(&stale).unwrap(), b"orphaned");
     assert!(
         dir.path().join("real.json").exists(),
         "non-temp files must be left alone"

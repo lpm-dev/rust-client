@@ -403,20 +403,8 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
 /// Write binary lockfile to disk atomically.
 pub fn write_binary(lockfile: &Lockfile, path: &Path) -> Result<(), LockfileError> {
     let data = to_binary(lockfile)?;
-    let tmp_path = path.with_extension("lockb.tmp");
-
-    std::fs::write(&tmp_path, &data)
-        .map_err(|e| LockfileError::Io(format!("failed to write {}: {e}", tmp_path.display())))?;
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(LockfileError::Io(format!(
-            "failed to rename to {}: {e}",
-            path.display()
-        )));
-    }
-
-    Ok(())
+    lpm_common::write_file_atomic(path, &data)
+        .map_err(|e| LockfileError::Io(format!("failed to write {}: {e}", path.display())))
 }
 
 // ── Reader (mmap) ───────────────────────────────────────────────────────────
@@ -1473,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn write_binary_rename_failure_cleans_temp_file() {
+    fn write_binary_cleans_temporary_file_when_replacement_fails() {
         let lf = sample_lockfile();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("lpm.lockb");
@@ -1481,13 +1469,15 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
 
         let result = write_binary(&lf, &target);
-        let tmp_path = target.with_extension("lockb.tmp");
 
-        assert!(result.is_err(), "rename into a directory should fail");
+        assert!(result.is_err(), "replacement of a directory should fail");
         assert!(
-            !tmp_path.exists(),
-            "failed atomic write should clean its temp file: {}",
-            tmp_path.display()
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lpm-")),
+            "failed atomic write should clean its temporary file"
         );
     }
 

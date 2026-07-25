@@ -299,14 +299,8 @@ async fn run_patch_commit_inner(
     let patch_file_rel = format!("patches/{safe_key}.patch");
     let patch_file_abs = project_dir.join(&patch_file_rel);
 
-    // Write atomically so a crash mid-write doesn't leave a partial
-    // patch file.
-    let tmp_patch = project_dir.join(format!("{patch_file_rel}.tmp"));
-    std::fs::write(&tmp_patch, generated.diff.as_bytes()).map_err(LpmError::Io)?;
-    if let Err(e) = std::fs::rename(&tmp_patch, &patch_file_abs) {
-        let _ = std::fs::remove_file(&tmp_patch);
-        return Err(LpmError::Io(e));
-    }
+    lpm_common::write_file_atomic(&patch_file_abs, generated.diff.as_bytes())
+        .map_err(LpmError::Io)?;
 
     // 6. Update package.json — JSON Value mutation pattern, mirror of
     //    add.rs. Roll back the patch file write if package.json fails.
@@ -689,7 +683,7 @@ fn remove_patch_entries_from_value(
 /// Inject `lpm.patchedDependencies.<key>` into `package.json` using the
 /// JSON Value mutation pattern. Same approach as `add.rs` — `serde_json`
 /// has `preserve_order` enabled at the workspace level, so existing key
-/// order is preserved. Atomic write via `.tmp` rename.
+/// order is preserved.
 fn update_package_json_patches(
     project_dir: &Path,
     key: &str,
@@ -820,13 +814,7 @@ fn write_package_json_value(project_dir: &Path, value: &serde_json::Value) -> Re
     }
 
     let pkg_path = project_dir.join("package.json");
-    let tmp = project_dir.join("package.json.tmp");
-    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
-    if let Err(e) = std::fs::rename(&tmp, &pkg_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LpmError::Io(e));
-    }
-    Ok(())
+    lpm_common::write_file_atomic(&pkg_path, output.as_bytes()).map_err(LpmError::Io)
 }
 
 #[cfg(test)]

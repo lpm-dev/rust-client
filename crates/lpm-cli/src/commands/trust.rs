@@ -554,15 +554,9 @@ fn remove_stale_from_manifest(manifest: &mut serde_json::Value, stale: &[String]
 }
 
 fn write_manifest(path: &Path, manifest: &serde_json::Value) -> Result<(), LpmError> {
-    // Atomic write via temp-then-rename, same pattern as the snapshot
-    // writer. Pretty-print with 2-space indent to match the npm/pnpm
-    // convention most projects use.
     let body = serde_json::to_string_pretty(manifest)
         .map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{body}\n")).map_err(LpmError::Io)?;
-    std::fs::rename(&tmp, path).map_err(LpmError::Io)?;
-    Ok(())
+    lpm_common::write_file_atomic(path, format!("{body}\n")).map_err(LpmError::Io)
 }
 
 /// Render the stale-entry preview list (human mode only).

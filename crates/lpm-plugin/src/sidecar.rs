@@ -436,8 +436,7 @@ fn read_sidecar(path: &Path) -> Result<Sidecar, MissReason> {
     serde_json::from_slice(&bytes).map_err(|e| MissReason::SidecarMalformed(e.to_string()))
 }
 
-/// Write a sidecar atomically (temp file + rename). The temp file name
-/// includes the PID so concurrent installers can't collide.
+/// Write a sidecar atomically.
 pub fn write_atomic(sidecar_path: &Path, sidecar: &Sidecar) -> Result<(), LpmError> {
     if let Some(parent) = sidecar_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -445,13 +444,12 @@ pub fn write_atomic(sidecar_path: &Path, sidecar: &Sidecar) -> Result<(), LpmErr
     let json = serde_json::to_string_pretty(sidecar)
         .map_err(|e| LpmError::Plugin(format!("failed to serialize sidecar: {e}")))?;
 
-    let tmp = sidecar_path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes())
-        .map_err(|e| LpmError::Plugin(format!("failed to write sidecar tmp: {e}")))?;
-    std::fs::rename(&tmp, sidecar_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        LpmError::Plugin(format!("failed to finalize sidecar: {e}"))
-    })?;
+    lpm_common::write_file_atomic_with_options(
+        sidecar_path,
+        json.as_bytes(),
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(|e| LpmError::Plugin(format!("failed to write sidecar: {e}")))?;
     Ok(())
 }
 

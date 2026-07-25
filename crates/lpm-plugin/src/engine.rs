@@ -629,13 +629,12 @@ fn approve_engine_version(
     }
     let json = serde_json::to_string_pretty(&cache)
         .map_err(|e| LpmError::Engine(format!("failed to serialize engine version cache: {e}")))?;
-    let tmp = cache_path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes())
-        .map_err(|e| LpmError::Engine(format!("failed to write engine version cache: {e}")))?;
-    std::fs::rename(&tmp, &cache_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        LpmError::Engine(format!("failed to finalize engine version cache: {e}"))
-    })?;
+    lpm_common::write_file_atomic_with_options(
+        &cache_path,
+        json.as_bytes(),
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(|e| LpmError::Engine(format!("failed to write engine version cache: {e}")))?;
     Ok(())
 }
 
@@ -1230,13 +1229,12 @@ fn write_sidecar_atomic(sidecar_path: &Path, sidecar: &EngineSidecar) -> Result<
     }
     let json = serde_json::to_string_pretty(sidecar)
         .map_err(|e| LpmError::Engine(format!("failed to serialize engine sidecar: {e}")))?;
-    let tmp = sidecar_path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes())
-        .map_err(|e| LpmError::Engine(format!("failed to write engine sidecar tmp: {e}")))?;
-    std::fs::rename(&tmp, sidecar_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        LpmError::Engine(format!("failed to finalize engine sidecar: {e}"))
-    })?;
+    lpm_common::write_file_atomic_with_options(
+        sidecar_path,
+        json.as_bytes(),
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(|e| LpmError::Engine(format!("failed to write engine sidecar: {e}")))?;
     Ok(())
 }
 

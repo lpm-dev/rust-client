@@ -22,7 +22,7 @@
 
 mod support;
 
-use support::mock_registry::make_tarball;
+use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm_with_registry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -456,4 +456,71 @@ fn offline_install_succeeds_when_overrides_fingerprint_matches() {
         state_path.exists(),
         "state file must be preserved when fingerprints match"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn install_does_not_follow_preplanted_overrides_state_temp_hardlink() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("lodash", "4.17.20");
+    mock.with_package("lodash", "4.17.20", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "lodash",
+        "dist-tags": { "latest": "4.17.20" },
+        "versions": {
+            "4.17.20": {
+                "name": "lodash",
+                "version": "4.17.20",
+                "dist": {
+                    "tarball": format!(
+                        "{}/tarballs/lodash/-/lodash-4.17.20.tgz",
+                        mock.url()
+                    ),
+                    "integrity": "sha512-placeholder",
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "4.17.20": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "state-hardlink",
+  "version": "0.0.0",
+  "dependencies": { "lodash": "^4.17.0" },
+  "lpm": { "overrides": { "lodash": "4.17.20" } }
+}"#,
+    );
+    std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+
+    let external = tempfile::tempdir().unwrap();
+    let sentinel = external.path().join("sentinel");
+    let original = b"external sentinel";
+    std::fs::write(&sentinel, original).unwrap();
+    std::fs::hard_link(
+        &sentinel,
+        project.path().join(".lpm").join("overrides-state.json.tmp"),
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        output.status.success(),
+        "install with override must succeed; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), original);
 }

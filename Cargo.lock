@@ -3343,6 +3343,7 @@ dependencies = [
  "chrono",
  "dirs",
  "fd-lock",
+ "getrandom 0.3.4",
  "libc",
  "miette",
  "serde",

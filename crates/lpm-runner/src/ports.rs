@@ -1894,20 +1894,7 @@ fn atomic_write_toml(path: &std::path::Path, doc: &toml::value::Table) {
 
     let content = toml::to_string_pretty(doc).unwrap_or_default();
 
-    // Write to a temp file in the same directory, then rename.
-    // Same-directory ensures we stay on the same filesystem (rename is atomic).
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let tmp_path = parent.join(format!(".ports.toml.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp_path, &content).is_ok() {
-        if std::fs::rename(&tmp_path, path).is_err() {
-            // rename failed (cross-device?), fall back to direct write
-            let _ = std::fs::write(path, content);
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-    } else {
-        // Fallback: direct write
-        let _ = std::fs::write(path, content);
-    }
+    let _ = lpm_common::write_file_atomic(path, content);
 }
 
 fn ports_toml_path() -> Option<std::path::PathBuf> {

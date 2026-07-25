@@ -276,37 +276,22 @@ impl LinkMeta {
 
     /// Serialize and atomically write to `<link_dir>/.lpm-link-meta.json`.
     ///
-    /// The write is staged at `<link_dir>/.lpm-link-meta.json.tmp.<pid>`
-    /// then renamed into place — concurrent installs pointing at the
-    /// same graph-key see either the old payload or the new payload,
-    /// never a half-written one.
+    /// The write uses an exclusively created same-directory staging file
+    /// and atomic replacement. Concurrent installs pointing at the same
+    /// graph-key see either the old payload or the new payload, never a
+    /// half-written one.
     ///
     /// Use [`Self::write_to_unpublished`] when the caller already holds an
     /// unpublished staging directory (e.g. cold population): the outer
-    /// atomic-rename of the staging dir provides the visibility boundary,
-    /// so the inner tmp+rename is pure overhead.
+    /// atomic rename of the staging dir provides the visibility boundary,
+    /// so an inner atomic file replacement is pure overhead.
     pub fn write_to(&self, link_dir: &Path) -> Result<PathBuf, LpmError> {
         let final_path = link_dir.join(LINK_META_FILENAME);
-        let tmp_path = link_dir.join(format!("{LINK_META_FILENAME}.tmp.{}", std::process::id()));
 
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| LpmError::Store(format!("failed to serialize v2 link sidecar: {e}")))?;
 
-        // Best-effort cleanup of stale tmp-file from a previous crash.
-        if tmp_path.exists() {
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-
-        std::fs::write(&tmp_path, &bytes).map_err(|e| {
-            LpmError::Store(format!(
-                "failed to stage v2 link sidecar at {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-
-        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-            // Best-effort tmp cleanup if the rename failed.
-            let _ = std::fs::remove_file(&tmp_path);
+        lpm_common::write_file_atomic(&final_path, &bytes).map_err(|e| {
             LpmError::Store(format!(
                 "failed to atomically install v2 link sidecar at {}: {e}",
                 final_path.display()

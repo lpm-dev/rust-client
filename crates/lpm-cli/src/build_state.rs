@@ -26,9 +26,9 @@
 //!
 //! ## Atomic writes
 //!
-//! [`write_build_state`] writes to a tempfile alongside the target and
-//! renames it into place. A crash mid-write leaves the previous state file
-//! intact rather than producing a half-written file the reader chokes on.
+//! [`write_build_state`] uses an exclusively created same-directory staging
+//! file and atomic replacement. A crash mid-write leaves the previous state
+//! file intact rather than producing a half-written file the reader chokes on.
 
 use lpm_common::LpmError;
 use lpm_security::{
@@ -278,35 +278,21 @@ pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
 
 /// Atomically write `state` to `<project_dir>/.lpm/build-state.json`.
 ///
-/// Writes to a tempfile alongside the target then renames it into place.
-/// A crash between the write and the rename leaves the previous state file
-/// intact rather than corrupting it.
+/// A crash before replacement leaves the previous state file intact rather
+/// than corrupting it.
 pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), LpmError> {
     let write_start = std::time::Instant::now();
     let lpm_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&lpm_dir).map_err(LpmError::Io)?;
 
     let target = build_state_path(project_dir);
-    // Use a unique tempfile name (PID + nanos) so concurrent installs of
-    // the same project don't clobber each other's tempfiles. The rename
-    // is still the consistency boundary — last writer wins.
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp = lpm_dir.join(format!(".{BUILD_STATE_FILENAME}.{pid}.{nanos}.tmp"));
-
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| LpmError::Registry(format!("failed to serialize build state: {e}")))?;
-    std::fs::write(&tmp, format!("{json}\n")).map_err(LpmError::Io)?;
-    std::fs::rename(&tmp, &target).map_err(|e| {
-        // Best-effort cleanup of the tempfile if the rename failed.
-        let _ = std::fs::remove_file(&tmp);
+    lpm_common::write_file_atomic(&target, format!("{json}\n")).map_err(|e| {
         LpmError::Io(std::io::Error::new(
             e.kind(),
             format!(
-                "failed to rename build-state tempfile into place: {e} \
-                 (target: {})",
+                "failed to atomically write build state: {e} (target: {})",
                 target.display()
             ),
         ))
@@ -1348,22 +1334,16 @@ mod tests {
     }
 
     #[test]
-    fn write_build_state_atomic_write_via_temp_file_rename() {
-        // Verify the temp file is gone after a successful write — i.e.,
-        // the rename happened. We can't easily simulate a crash mid-write
-        // in a unit test, but we CAN assert that the temp file artifact
-        // isn't left behind on the happy path.
+    fn write_build_state_leaves_only_destination_after_success() {
         let dir = tempdir().unwrap();
         write_build_state(dir.path(), &make_state(vec![])).unwrap();
 
         let lpm_dir = dir.path().join(".lpm");
-        let entries: Vec<_> = std::fs::read_dir(&lpm_dir).unwrap().collect();
-        // Only the final file should remain — no `.tmp` artifacts
-        for entry in entries {
-            let name = entry.unwrap().file_name();
-            let name_str = name.to_string_lossy();
-            assert!(!name_str.ends_with(".tmp"), "temp file leaked: {name_str}");
-        }
+        let entries: Vec<_> = std::fs::read_dir(&lpm_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from(BUILD_STATE_FILENAME)]);
     }
 
     #[test]

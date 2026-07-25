@@ -579,14 +579,11 @@ pub async fn run(
     let updated_content = serde_json::to_string_pretty(&doc)
         .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
 
-    let tmp_path = pkg_json_path.with_extension("json.tmp");
     let lockfile_backup = read_optional_file(&project_dir.join("lpm.lock"))?;
     let lockfile_binary_backup = read_optional_file(&project_dir.join("lpm.lockb"))?;
 
-    std::fs::write(&tmp_path, format!("{updated_content}\n"))
-        .map_err(|e| LpmError::Script(format!("failed to write temp package.json: {e}")))?;
-    std::fs::rename(&tmp_path, &pkg_json_path)
-        .map_err(|e| LpmError::Script(format!("failed to rename temp package.json: {e}")))?;
+    lpm_common::write_file_atomic(&pkg_json_path, format!("{updated_content}\n"))
+        .map_err(|e| LpmError::Script(format!("failed to write package.json: {e}")))?;
 
     // ── Run install with backup-and-restore ──────────────────────────
 

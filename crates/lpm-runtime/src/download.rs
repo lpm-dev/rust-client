@@ -513,25 +513,12 @@ pub(crate) fn create_restricted_dir(path: &Path) -> Result<(), LpmError> {
 
 /// Write data to a file with restricted permissions (0o600 on Unix).
 pub(crate) fn write_restricted_file(path: &Path, data: &[u8]) -> Result<(), LpmError> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, data)?;
-        Ok(())
-    }
+    lpm_common::write_file_atomic_with_options(
+        path,
+        data,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )?;
+    Ok(())
 }
 
 /// Rename a directory to a target path with TOCTOU race recovery.

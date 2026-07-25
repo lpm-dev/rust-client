@@ -312,31 +312,7 @@ pub fn artifacts_complete(bin_dir: &Path, command_name: &str) -> bool {
 
 #[cfg(unix)]
 fn atomic_replace_symlink_unix(link_path: &Path, target: &Path) -> Result<(), ShimError> {
-    // Write a fresh symlink alongside the existing one and rename over it.
-    // POSIX rename across the same dir is atomic; observers see either the
-    // old link or the new link, never neither.
-    let parent = link_path.parent().ok_or_else(|| {
-        ShimError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "bin path has no parent directory",
-        ))
-    })?;
-    let tmp_name = format!(
-        ".{}.{}.tmp",
-        link_path
-            .file_name()
-            .map_or_else(|| "shim".to_string(), |n| n.to_string_lossy().into_owned()),
-        std::process::id()
-    );
-    let tmp_path = parent.join(tmp_name);
-    // Defensive: if a previous run left a tempfile (PID reused), nuke it.
-    let _ = std::fs::remove_file(&tmp_path);
-    std::os::unix::fs::symlink(target, &tmp_path)?;
-    if let Err(e) = std::fs::rename(&tmp_path, link_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(ShimError::Io(e));
-    }
-    Ok(())
+    lpm_common::replace_symlink_atomic(link_path, target).map_err(ShimError::Io)
 }
 
 // ─── Windows internals ────────────────────────────────────────────────
@@ -386,70 +362,31 @@ fn bash_template(target: &str) -> String {
 #[cfg(windows)]
 fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimError> {
     use lpm_common::as_extended_path;
-    use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
 
     // Route every Windows fs op through the
     // extended-length helper so a deeply-nested `~/.lpm/global/installs/`
     // hierarchy doesn't truncate at the legacy 260-char ceiling.
     let path_ext = as_extended_path(path);
-    let parent = path_ext.parent().ok_or_else(|| {
-        ShimError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "shim path has no parent directory",
-        ))
-    })?;
-    let tmp_name = format!(
-        ".{}.{}.tmp",
-        path_ext
-            .file_name()
-            .map_or_else(|| "shim".to_string(), |n| n.to_string_lossy().into_owned()),
-        std::process::id()
-    );
-    let tmp_path = parent.join(tmp_name);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .share_mode(0)
-            .open(&tmp_path)?;
-        std::io::Write::write_all(&mut f, contents)?;
-        f.sync_all()?;
-    }
-
-    // Retry the rename on transient EBUSY: AV scanners and Explorer
-    // preview can briefly hold a handle on a .cmd / .ps1 right when
-    // we're trying to overwrite it. Backoff matches the plan's spec.
-    let mut last_err = None;
-    let mut attempts = 0u32;
-    for sleep_ms in BACKOFF_STEPS_MS {
-        match std::fs::rename(&tmp_path, &path_ext) {
-            Ok(()) => {
-                return Ok(());
+    lpm_common::write_file_atomic_with_options(
+        &path_ext,
+        contents,
+        lpm_common::AtomicWriteOptions::new().sync_file(),
+    )
+    .map_err(|source| {
+        let raw = source.raw_os_error().map(|code| code as u32);
+        if matches!(
+            raw,
+            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
+        ) {
+            ShimError::SwapTimeout {
+                path: path.to_path_buf(),
+                attempts: MAX_BACKOFF_RETRIES + 1,
+                source,
             }
-            Err(e) => {
-                attempts += 1;
-                let raw = e.raw_os_error().map(|c| c as u32);
-                let is_transient = matches!(
-                    raw,
-                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
-                );
-                last_err = Some(e);
-                if !is_transient {
-                    let e = last_err.take().unwrap();
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return Err(ShimError::Io(e));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-            }
+        } else {
+            ShimError::Io(source)
         }
-    }
-    let _ = std::fs::remove_file(&tmp_path);
-    Err(ShimError::SwapTimeout {
-        path: path.to_path_buf(),
-        attempts,
-        source: last_err.unwrap_or_else(|| io::Error::other("no source error captured")),
     })
 }
 

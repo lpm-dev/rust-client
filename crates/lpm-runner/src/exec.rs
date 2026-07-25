@@ -11,7 +11,6 @@ use lpm_common::LpmError;
 use lpm_common::paths::LpmRoot;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 #[cfg(unix)]
@@ -484,26 +483,7 @@ fn ensure_lpm_ts_runtime_asset(
     };
 
     if needs_write {
-        let tmp_path = runtime_root.join(format!(
-            ".lpm-ts-runtime-{label}.{}.tmp",
-            std::process::id()
-        ));
-        {
-            let mut file = fs::File::create(&tmp_path).map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to stage LPM TS runtime {label} at {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.write_all(source.as_bytes()).map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to write LPM TS runtime {label} at {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-        }
-        fs::rename(&tmp_path, &asset_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
+        lpm_common::write_file_atomic(&asset_path, source.as_bytes()).map_err(|e| {
             LpmError::Script(format!(
                 "failed to install LPM TS runtime {label} at {}: {e}",
                 asset_path.display()

@@ -20,42 +20,13 @@ use lpm_store::v2::{ObjectIntegrityPolicy, PlatformTuple};
 /// rename + 0o600 closes both shapes; on non-Unix the rename is
 /// still atomic but the perms knob is a no-op.
 fn write_state_file_owner_only(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "state file has no parent directory",
-        )
-    })?;
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "state file path has no file name",
-        )
-    })?;
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        file_name.to_string_lossy(),
-        std::process::id()
-    );
-    let tmp = parent.join(tmp_name);
-
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
-    {
-        let mut f = open_opts.open(&tmp)?;
-        std::io::Write::write_all(&mut f, content)?;
-        f.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        path,
+        content,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file(),
+    )
 }
 
 pub(crate) fn is_node_runtime_fingerprint(value: &str) -> bool {

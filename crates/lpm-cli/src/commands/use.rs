@@ -694,10 +694,7 @@ fn write_runtime_pin(
         .map_err(|e| LpmError::Script(format!("failed to serialize lpm.json: {e}")))?
         + "\n";
 
-    let tmp_path = lpm_json_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &content)?;
-    std::fs::rename(&tmp_path, &lpm_json_path)?;
-    Ok(())
+    lpm_common::write_file_atomic(&lpm_json_path, content).map_err(LpmError::Io)
 }
 
 /// Validate a pin version string.
