@@ -563,20 +563,10 @@ fn find_block_end(content: &str) -> Option<usize> {
     None
 }
 
-/// Write pbxproj content atomically: write to temp file, then rename.
+/// Write pbxproj content atomically.
 fn write_pbxproj_atomic(pbxproj_path: &Path, content: &str) -> Result<(), LpmError> {
-    let dir = pbxproj_path
-        .parent()
-        .ok_or_else(|| LpmError::Registry("Invalid pbxproj path".into()))?;
-
-    let tmp_path = dir.join(".project.pbxproj.lpm-tmp");
-    std::fs::write(&tmp_path, content)
-        .map_err(|e| LpmError::Registry(format!("failed to write temp pbxproj: {e}")))?;
-
-    std::fs::rename(&tmp_path, pbxproj_path)
-        .map_err(|e| LpmError::Registry(format!("failed to rename pbxproj: {e}")))?;
-
-    Ok(())
+    lpm_common::write_file_atomic(pbxproj_path, content)
+        .map_err(|e| LpmError::Registry(format!("failed to write pbxproj: {e}")))
 }
 
 #[cfg(test)]

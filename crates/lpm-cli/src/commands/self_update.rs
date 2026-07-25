@@ -883,13 +883,8 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 
 /// Atomically swap the running binary at `current_exe` for `new_bytes`.
 ///
-/// The tmp file is written next to `current_exe` (same filesystem),
-/// which keeps the eventual `rename` on Unix atomic and avoids the
-/// EXDEV mode-cross-FS case.
-///
-/// **Failure cleanup:** any error after we materialised the tmp file
-/// removes it on the way out so the install dir doesn't accumulate
-/// `lpm.tmp.*` stragglers from a half-succeeded update.
+/// The temporary file is exclusively created next to `current_exe`, which
+/// keeps the eventual replacement on the same filesystem.
 ///
 /// **Windows EBUSY:** the OS holds an exclusive handle on the running
 /// `current_exe()`, so a direct `rename(new, current_exe)` fails.
@@ -898,11 +893,6 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 /// then best-effort delete the `.old` (OS releases the handle when
 /// this process exits, so the delete will succeed on the next run).
 fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Result<(), LpmError> {
-    // Tmp path: same dir + same extension as the current binary, with a
-    // pid suffix so concurrent updaters on the same install don't
-    // collide on the staging filename. `with_extension("tmp")` would
-    // strip a Windows `.exe` extension and break the rename — keep
-    // the original extension and append `.new.<pid>` as a suffix.
     let file_name = current_exe.file_name().ok_or_else(|| {
         LpmError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -915,8 +905,6 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
             "current_exe has no parent directory",
         ))
     })?;
-    let tmp_name = format!("{}.new.{}", file_name.to_string_lossy(), std::process::id());
-    let tmp_path = parent.join(tmp_name);
 
     // L20: save a backup copy of the running binary next to itself BEFORE
     // we install the new one, so a user who discovers the new binary is
@@ -931,7 +919,7 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
     // and would get a confusing "can't update" error otherwise.
     let backup_name = format!("{}.previous", file_name.to_string_lossy());
     let backup_path = parent.join(backup_name);
-    if let Err(e) = std::fs::copy(current_exe, &backup_path) {
+    if let Err(e) = copy_executable_atomic(current_exe, &backup_path) {
         tracing::warn!(
             target: "lpm_cli::self_update",
             current_exe = %current_exe.display(),
@@ -953,10 +941,8 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
                 .map_or(0, |d| d.as_secs()),
             "previous_binary_version": env!("CARGO_PKG_VERSION"),
         });
-        if let Err(e) = std::fs::write(
-            &journal_path,
-            serde_json::to_string_pretty(&journal).unwrap_or_default(),
-        ) {
+        let journal_bytes = serde_json::to_vec_pretty(&journal).unwrap_or_default();
+        if let Err(e) = lpm_common::write_file_atomic(&journal_path, journal_bytes) {
             tracing::warn!(
                 target: "lpm_cli::self_update",
                 journal_path = %journal_path.display(),
@@ -966,29 +952,45 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
         }
     }
 
-    std::fs::write(&tmp_path, new_bytes).map_err(|e| {
-        LpmError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to write temp binary: {e}"),
-        ))
-    })?;
+    let mut prefix = std::ffi::OsString::from(".");
+    prefix.push(file_name);
+    prefix.push(".new-");
+    let suffix = current_exe.extension().map(|extension| {
+        let mut suffix = std::ffi::OsString::from(".");
+        suffix.push(extension);
+        suffix
+    });
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    if let Some(suffix) = &suffix {
+        builder.suffix(suffix);
+    }
+    let mut temporary = builder.tempfile_in(parent).map_err(LpmError::Io)?;
+    {
+        use std::io::Write as _;
+        temporary.as_file_mut().write_all(new_bytes).map_err(|e| {
+            LpmError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to write temp binary: {e}"),
+            ))
+        })?;
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-        {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(LpmError::Io(e));
-        }
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(LpmError::Io)?;
     }
+    let tmp_path = temporary.into_temp_path();
 
     #[cfg(windows)]
     {
         let old_name = format!("{}.old.{}", file_name.to_string_lossy(), std::process::id());
         let old_path = parent.join(&old_name);
         if let Err(e) = std::fs::rename(current_exe, &old_path) {
-            let _ = std::fs::remove_file(&tmp_path);
             return Err(LpmError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to move running binary aside: {e}"),
@@ -998,7 +1000,6 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
             // Try to restore the original binary so we don't leave the
             // install in a broken state.
             let _ = std::fs::rename(&old_path, current_exe);
-            let _ = std::fs::remove_file(&tmp_path);
             return Err(LpmError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to install new binary: {e}"),
@@ -1014,13 +1015,27 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
     #[cfg(unix)]
     {
         std::fs::rename(&tmp_path, current_exe).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
             LpmError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to replace binary: {e}"),
             ))
         })
     }
+}
+
+fn copy_executable_atomic(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    lpm_common::write_file_atomic_with(
+        destination,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o755),
+        |output| {
+            let mut input = std::fs::File::open(source)?;
+            std::io::copy(&mut input, output)?;
+            Ok(())
+        },
+    )
 }
 
 /// Detect the current platform for GitHub Release binary names.

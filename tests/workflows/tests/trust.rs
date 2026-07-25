@@ -618,6 +618,41 @@ fn trust_prune_yes_removes_stale_entries_and_preserves_active_ones() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn trust_prune_does_not_follow_preplanted_manifest_temp_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(r#"{}"#);
+    let external = tempfile::tempdir().unwrap();
+    let sentinel = external.path().join("sentinel");
+    let original = b"external sentinel";
+    std::fs::write(&sentinel, original).unwrap();
+    symlink(&sentinel, project.path().join("package.json.tmp")).unwrap();
+
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "removed-pkg@1.0.0": { "integrity": "sha512-r" }
+        }),
+    );
+    write_lockfile(&project, &[("esbuild", "0.25.1")]);
+
+    let output = lpm(&project)
+        .args(["trust", "prune", "--yes", "--json"])
+        .output()
+        .expect("failed to run lpm trust prune --yes --json");
+
+    assert!(
+        output.status.success(),
+        "trust prune --yes failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), original);
+}
+
 #[test]
 fn trust_prune_no_stale_entries_reports_success_without_mutation() {
     let project = TempProject::empty(r#"{}"#);

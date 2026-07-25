@@ -49,7 +49,6 @@ use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 /// Binding metadata for one entry in the global trusted-deps map.
@@ -326,34 +325,14 @@ pub fn write_at(path: &Path, value: &GlobalTrustedDependencies) -> Result<(), Lp
     let mut body = serde_json::to_string_pretty(value)
         .map_err(|e| LpmError::Script(format!("serialize trusted-deps: {e}")))?;
     body.push('\n');
-    // Per-pid tmp suffix avoids racing concurrent lpm invocations on
-    // the same trust file; the parent .tx.lock serializes the
-    // logical write, but a crashed prior run could leave a stale
-    // `*.json.tmp` and the next start should not be tripped by it.
-    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let tmp_path = lpm_common::as_extended_path(&tmp_path);
-    let mut open_opts = fs::OpenOptions::new();
-    open_opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // The file lists private package names/versions plus
-        // approval hashes/provenance and drives lifecycle-script
-        // authorization. Owner-only matches the broader credential-
-        // metadata posture; it must not land world-readable on
-        // permissive umasks.
-        open_opts.mode(0o600);
-    }
-    {
-        let mut f = open_opts.open(&tmp_path).map_err(LpmError::Io)?;
-        f.write_all(body.as_bytes()).map_err(LpmError::Io)?;
-        f.sync_all().map_err(LpmError::Io)?;
-    }
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(LpmError::Io(e));
-    }
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        path,
+        body.as_bytes(),
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file(),
+    )
+    .map_err(LpmError::Io)
 }
 
 #[cfg(test)]

@@ -21,9 +21,9 @@
 //!    override (so the trust downgrade does not silently stick across
 //!    runs).
 //!
-//! Downloads use atomic writes: binary is written to a `.tmp` file
-//! first, then renamed to the final path. The sidecar is written
-//! atomically AFTER the binary rename so a half-installed binary is
+//! Downloads stream the binary through an exclusively created sibling
+//! before atomically replacing the final path. The sidecar is written
+//! atomically AFTER the binary replacement so a half-installed binary is
 //! never paired with a sidecar declaring it valid.
 
 use crate::registry::{self, PluginDef};
@@ -32,6 +32,7 @@ use crate::store;
 use lpm_common::LpmError;
 use lpm_runtime::platform::Platform;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadReport {
@@ -188,50 +189,26 @@ pub async fn download_plugin(
     std::fs::create_dir_all(&platform_dir)?;
 
     let bin_path = platform_dir.join(def.binary_name);
-    let tmp_path = platform_dir.join(format!(".{}.{}.tmp", def.binary_name, std::process::id()));
-    let _ = std::fs::remove_file(&tmp_path);
+    let binary_sha256 = lpm_common::write_file_atomic_with(
+        &bin_path,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o755),
+        |temporary| -> Result<String, LpmError> {
+            if def.is_archive {
+                if asset_name.ends_with(".zip") || is_zip_magic(&bytes) {
+                    extract_binary_from_zip(&bytes, temporary, def.binary_name)?;
+                } else {
+                    extract_binary_from_tarball(&bytes, temporary, def.binary_name)?;
+                }
+            } else {
+                temporary
+                    .write_all(&bytes)
+                    .map_err(|e| LpmError::Plugin(format!("failed to write plugin binary: {e}")))?;
+            }
+            hash_open_file(temporary)
+        },
+    )?;
 
-    let extract_result = if def.is_archive {
-        if asset_name.ends_with(".zip") || is_zip_magic(&bytes) {
-            extract_binary_from_zip(&bytes, &tmp_path, def.binary_name)
-        } else {
-            extract_binary_from_tarball(&bytes, &tmp_path, def.binary_name)
-        }
-    } else {
-        std::fs::write(&tmp_path, &bytes)
-            .map_err(|e| LpmError::Plugin(format!("failed to write plugin binary: {e}")))
-    };
-
-    if let Err(e) = extract_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // Compute on-disk binary hash before the rename so we can record
-    // it on the sidecar. For non-archive plugins this matches
-    // `asset_sha256`; for archive plugins it differs.
-    let binary_sha256 = match sidecar::hash_file(&tmp_path) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(LpmError::Plugin(format!(
-                "failed to hash extracted binary: {e}"
-            )));
-        }
-    };
-
-    std::fs::rename(&tmp_path, &bin_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        LpmError::Plugin(format!("failed to finalize plugin binary: {e}"))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    // --- Write sidecar AFTER binary rename succeeds ---
+    // --- Write sidecar AFTER binary replacement succeeds ---
     let sidecar_path = store::plugin_sidecar_path(def.name, version, &platform_str)?;
     let sidecar = Sidecar::new(
         def.name,
@@ -270,6 +247,21 @@ pub async fn download_plugin(
         asset_sha256,
         verification_source: verification,
     })
+}
+
+fn hash_open_file(file: &mut std::fs::File) -> Result<String, LpmError> {
+    file.flush()?;
+    file.rewind()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Decide how this download is verified — bundled, upstream-fetched, or
@@ -458,7 +450,7 @@ fn is_zip_magic(data: &[u8]) -> bool {
 /// Extract a specific binary from a .tar.gz archive.
 fn extract_binary_from_tarball(
     data: &[u8],
-    dest_path: &std::path::Path,
+    destination: &mut impl Write,
     binary_name: &str,
 ) -> Result<(), LpmError> {
     let decoder = flate2::read::GzDecoder::new(data);
@@ -500,12 +492,10 @@ fn extract_binary_from_tarball(
         found_files.push(file_name.clone());
 
         if file_name == binary_name || file_name.starts_with(&format!("{binary_name}-")) {
-            let mut output = std::fs::File::create(dest_path)?;
             let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
-            let copied = std::io::copy(&mut bounded, &mut output)
+            let copied = std::io::copy(&mut bounded, destination)
                 .map_err(|e| LpmError::Plugin(format!("failed to extract {binary_name}: {e}")))?;
             if copied >= MAX_PLUGIN_EXTRACTED_BYTES {
-                let _ = std::fs::remove_file(dest_path);
                 return Err(LpmError::Plugin(format!(
                     "plugin archive entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
                 )));
@@ -524,7 +514,7 @@ fn extract_binary_from_tarball(
 /// Extract a specific binary from a .zip archive.
 fn extract_binary_from_zip(
     data: &[u8],
-    dest_path: &std::path::Path,
+    destination: &mut impl Write,
     binary_name: &str,
 ) -> Result<(), LpmError> {
     let cursor = std::io::Cursor::new(data);
@@ -570,13 +560,11 @@ fn extract_binary_from_zip(
             || file_name.starts_with(&format!("{binary_name}-"));
 
         if is_match && !entry.is_dir() {
-            let mut output = std::fs::File::create(dest_path)?;
             let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
-            let copied = std::io::copy(&mut bounded, &mut output).map_err(|e| {
+            let copied = std::io::copy(&mut bounded, destination).map_err(|e| {
                 LpmError::Plugin(format!("failed to extract {binary_name} from ZIP: {e}"))
             })?;
             if copied >= MAX_PLUGIN_EXTRACTED_BYTES {
-                let _ = std::fs::remove_file(dest_path);
                 return Err(LpmError::Plugin(format!(
                     "plugin ZIP entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
                 )));
@@ -669,9 +657,8 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("binary");
-        let err = extract_binary_from_tarball(&gz_data, &dest, "oxlint").unwrap_err();
+        let mut destination = Vec::new();
+        let err = extract_binary_from_tarball(&gz_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found in tar.gz archive"), "error: {msg}");
         assert!(
@@ -690,9 +677,8 @@ mod tests {
         let buf = writer.finish().unwrap();
         let zip_data = buf.into_inner();
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("binary");
-        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let mut destination = Vec::new();
+        let err = extract_binary_from_zip(&zip_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found in ZIP archive"), "error: {msg}");
         assert!(msg.contains("readme.txt"), "should list found files: {msg}");
@@ -747,15 +733,14 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("oxlint");
-        let err = extract_binary_from_tarball(&gz_data, &dest, "oxlint").unwrap_err();
+        let mut destination = Vec::new();
+        let err = extract_binary_from_tarball(&gz_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds per-entry cap"),
             "must refuse with per-entry cap: {msg}"
         );
-        assert!(!dest.exists(), "no partial extract on refusal");
+        assert!(destination.is_empty(), "no partial extract on refusal");
     }
 
     /// A tarball with too many entries is refused before any entry is
@@ -776,9 +761,8 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("oxlint");
-        let err = extract_binary_from_tarball(&gz_data, &dest, "oxlint").unwrap_err();
+        let mut destination = Vec::new();
+        let err = extract_binary_from_tarball(&gz_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds") && msg.contains("entries"),
@@ -789,7 +773,7 @@ mod tests {
     #[test]
     fn zip_extraction_rejects_path_traversal() {
         let root = tempfile::tempdir().unwrap();
-        let dest = root.path().join("oxlint");
+        let mut destination = Vec::new();
         let buf = std::io::Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(buf);
         writer
@@ -798,14 +782,17 @@ mod tests {
         std::io::Write::write_all(&mut writer, b"pwned").unwrap();
         let zip_data = writer.finish().unwrap().into_inner();
 
-        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let err = extract_binary_from_zip(&zip_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
 
         assert!(
             msg.contains("path traversal"),
             "zip traversal rejection should be explicit: {msg}"
         );
-        assert!(!dest.exists(), "no binary should be extracted on refusal");
+        assert!(
+            destination.is_empty(),
+            "no binary should be extracted on refusal"
+        );
         assert!(
             !root.path().join("oxlint").exists(),
             "zip traversal must not write outside the destination"
@@ -822,9 +809,8 @@ mod tests {
         }
         let zip_data = writer.finish().unwrap().into_inner();
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("oxlint");
-        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let mut destination = Vec::new();
+        let err = extract_binary_from_zip(&zip_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds") && msg.contains("entries"),
@@ -839,25 +825,14 @@ mod tests {
         let zip_data =
             forged_zip_with_declared_file("oxlint", (MAX_PLUGIN_EXTRACTED_BYTES + 1) as u32);
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("oxlint");
-        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let mut destination = Vec::new();
+        let err = extract_binary_from_zip(&zip_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("per-entry cap"),
             "must refuse with per-entry cap: {msg}"
         );
-        assert!(!dest.exists(), "no partial extract on refusal");
-    }
-
-    // --- Unique temp file names ---
-
-    #[test]
-    fn temp_file_name_contains_pid() {
-        let pid = std::process::id();
-        let tmp_name = format!(".oxlint.{}.tmp", pid);
-        assert!(tmp_name.contains(&pid.to_string()));
-        assert_ne!(tmp_name, ".oxlint.tmp");
+        assert!(destination.is_empty(), "no partial extract on refusal");
     }
 
     // --- SHA-256 computation ---

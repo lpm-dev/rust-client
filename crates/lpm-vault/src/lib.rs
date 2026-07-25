@@ -452,45 +452,14 @@ fn format_env_file_content(secrets: &HashMap<String, String>) -> String {
 /// system may also race the write — atomic rename + 0o600 closes
 /// both the perms shape and the read-during-write window.
 fn write_env_file_owner_only(output_path: &Path, content: &[u8]) -> Result<(), String> {
-    let parent = output_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
-    let file_name = output_path
-        .file_name()
-        .ok_or_else(|| format!("export path has no file name: {}", output_path.display()))?;
-
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        file_name.to_string_lossy(),
-        std::process::id()
-    );
-    let tmp = parent.join(tmp_name);
-
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
-
-    {
-        let mut f = open_opts
-            .open(&tmp)
-            .map_err(|e| format!("failed to open {}: {e}", tmp.display()))?;
-        use std::io::Write as _;
-        f.write_all(content)
-            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("failed to sync {}: {e}", tmp.display()))?;
-    }
-
-    if let Err(e) = std::fs::rename(&tmp, output_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("failed to write {}: {e}", output_path.display()));
-    }
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        output_path,
+        content,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file(),
+    )
+    .map_err(|e| format!("failed to write {}: {e}", output_path.display()))
 }
 
 /// Export secrets from a specific environment to a .env file.

@@ -217,39 +217,13 @@ pub fn write_manifest(path: &Path, manifest: &GlobalManifest) -> Result<(), LpmE
     let serialized = toml::to_string_pretty(manifest)
         .map_err(|e| manifest_parse_error(format!("manifest serialize error: {e}")))?;
 
-    // Tempfile name includes the PID so two interleaved writers (which
-    // shouldn't happen — caller must hold .tx.lock — but defence in
-    // depth) can't clobber each other's tempfiles before either rename.
-    let tmp_path = parent.join(format!(".{MANIFEST_FILENAME}.tmp.{}", std::process::id()));
-
-    // Write + fsync the tempfile.
-    {
-        let mut tmp = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        std::io::Write::write_all(&mut tmp, serialized.as_bytes())?;
-        tmp.sync_all()?;
-    }
-
-    // Rename into place (atomic on POSIX, MoveFileEx on Windows).
-    if let Err(e) = std::fs::rename(&tmp_path, &path) {
-        // Best-effort cleanup so a failed rename doesn't leak debris.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(LpmError::Io(e));
-    }
-
-    // fsync the parent directory so the rename itself survives a crash.
-    // On Windows opening a directory as a file is not supported and the
-    // rename's durability comes from the file system rather than an
-    // explicit fsync; skip there.
-    #[cfg(unix)]
-    {
-        if let Ok(parent_fd) = std::fs::File::open(parent) {
-            let _ = parent_fd.sync_all();
-        }
-    }
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        serialized.as_bytes(),
+        lpm_common::AtomicWriteOptions::new()
+            .sync_file()
+            .sync_parent(),
+    )?;
 
     Ok(())
 }

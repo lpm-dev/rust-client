@@ -892,8 +892,8 @@ fn render_overrides_plan_errors(plan: &super::migrate_overrides::PnpmOverridesPl
 /// Mirrors the JSON-Value-mutation pattern used by
 /// `commands::patch::update_package_json_patches` so existing key
 /// ordering is preserved (the workspace enables `serde_json`'s
-/// `preserve_order` feature). Atomic via `.tmp` + rename so a partial
-/// write can't leave the manifest corrupted.
+/// `preserve_order` feature). Atomic replacement prevents a partial
+/// write from leaving the manifest corrupted.
 fn apply_overrides_to_package_json(
     pkg_path: &Path,
     to_apply: &std::collections::HashMap<String, String>,
@@ -935,13 +935,7 @@ fn apply_overrides_to_package_json(
         output.push('\n');
     }
 
-    let tmp = pkg_path.with_extension("json.tmp");
-    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
-    if let Err(e) = std::fs::rename(&tmp, pkg_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LpmError::Io(e));
-    }
-    Ok(())
+    lpm_common::write_file_atomic(pkg_path, output.as_bytes()).map_err(LpmError::Io)
 }
 
 /// Render a structured `pnpm.patchedDependencies` translation-plan
@@ -1191,7 +1185,7 @@ fn render_peer_rules_plan_errors(plan: &super::migrate_peer_rules::PnpmPeerRules
 ///   existing object. The planner already filtered out same-name
 ///   same-range no-ops and same-name different-range conflicts.
 ///
-/// Atomic via `.tmp` + rename so a partial write can't corrupt the
+/// Atomic replacement prevents a partial write from corrupting the
 /// manifest. The caller is responsible for rolling back via
 /// `migration_backup.rollback()` on failure — `package.json` is
 /// already in the backup chain by the time this runs.
@@ -1275,13 +1269,7 @@ fn apply_peer_rules_to_package_json(
         output.push('\n');
     }
 
-    let tmp = pkg_path.with_extension("json.tmp");
-    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
-    if let Err(e) = std::fs::rename(&tmp, pkg_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LpmError::Io(e));
-    }
-    Ok(())
+    lpm_common::write_file_atomic(pkg_path, output.as_bytes()).map_err(LpmError::Io)
 }
 
 /// Apply a validated patches plan: copy each patch file into LPM's
@@ -1422,13 +1410,7 @@ fn apply_patches(
         output.push('\n');
     }
 
-    let tmp = pkg_path.with_extension("json.tmp");
-    std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
-    if let Err(e) = std::fs::rename(&tmp, pkg_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(LpmError::Io(e));
-    }
-    Ok(())
+    lpm_common::write_file_atomic(pkg_path, output.as_bytes()).map_err(LpmError::Io)
 }
 
 fn record_migrated_patch_records(

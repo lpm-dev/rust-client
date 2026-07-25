@@ -197,10 +197,8 @@ pub fn read_snapshot(project_dir: &Path) -> Option<TrustSnapshot> {
 }
 
 /// Atomically write the snapshot to
-/// `<project_dir>/.lpm/trust-snapshot.json`. Writes to a temp file
-/// alongside the target and renames; a crash between write and rename
-/// preserves the previous snapshot rather than producing a truncated
-/// file.
+/// `<project_dir>/.lpm/trust-snapshot.json`. A crash before replacement
+/// preserves the previous snapshot rather than producing a truncated file.
 pub fn write_snapshot(project_dir: &Path, snap: &TrustSnapshot) -> Result<(), LpmError> {
     let path = snapshot_path(project_dir);
     if let Some(parent) = path.parent() {
@@ -210,10 +208,12 @@ pub fn write_snapshot(project_dir: &Path, snap: &TrustSnapshot) -> Result<(), Lp
     let body = serde_json::to_string_pretty(snap)
         .map_err(|e| LpmError::Registry(format!("failed to serialize trust-snapshot: {e}")))?;
 
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).map_err(LpmError::Io)?;
-    std::fs::rename(&tmp, &path).map_err(LpmError::Io)?;
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        body,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(LpmError::Io)
 }
 
 /// Format the new-bindings notice

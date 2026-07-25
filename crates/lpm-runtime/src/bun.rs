@@ -163,10 +163,7 @@ pub async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<BunRelease>,
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let temp_cache = cache_path.with_extension("json.tmp");
-    if download::write_restricted_file(&temp_cache, body.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&temp_cache, &cache_path);
-    }
+    let _ = download::write_restricted_file(&cache_path, body.as_bytes());
 
     Ok(releases)
 }

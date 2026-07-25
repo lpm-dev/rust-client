@@ -165,7 +165,7 @@ fn stage_and_run(
 ) -> Result<RotateResult, LpmError> {
     let (new_cert_pem, new_key_pem) =
         ca::generate_ca().map_err(|e| LpmError::Cert(format!("failed to generate new CA: {e}")))?;
-    std::fs::write(staged_cert, &new_cert_pem)
+    lpm_common::write_file_atomic(staged_cert, &new_cert_pem)
         .map_err(|e| LpmError::Cert(format!("failed to write staged CA cert: {e}")))?;
     write_key_file(staged_key, new_key_pem.as_bytes())
         .map_err(|e| LpmError::Cert(format!("failed to write staged CA key: {e}")))?;
@@ -279,7 +279,7 @@ fn stage_and_run(
                 e.to_string(),
             );
         }
-        if let Err(e) = std::fs::write(&leaf_cert, cert_pem.as_bytes()) {
+        if let Err(e) = lpm_common::write_file_atomic(&leaf_cert, cert_pem.as_bytes()) {
             return rotate_abort_after_staged_install(
                 staged_cert,
                 staged_key,
@@ -326,9 +326,9 @@ fn stage_and_run(
     // Step 5: promote staged → active.
     let prev_cert = ca_dir.join("rootCA.pem.previous");
     let prev_key = ca_dir.join("rootCA-key.pem.previous");
-    std::fs::copy(active_cert, &prev_cert)
+    copy_cert_file(active_cert, &prev_cert, 0o644)
         .map_err(|e| LpmError::Cert(format!("failed to back up active CA cert: {e}")))?;
-    std::fs::copy(active_key, &prev_key)
+    copy_cert_file(active_key, &prev_key, 0o600)
         .map_err(|e| LpmError::Cert(format!("failed to back up active CA key: {e}")))?;
     std::fs::rename(staged_cert, active_cert)
         .map_err(|e| LpmError::Cert(format!("failed to promote staged CA cert: {e}")))?;
@@ -402,6 +402,18 @@ fn stage_and_run(
         old_ca_uninstalled: old_uninstalled,
         old_ca_removal_scheduled: removal_scheduled,
     })
+}
+
+fn copy_cert_file(source: &Path, destination: &Path, unix_mode: u32) -> std::io::Result<()> {
+    lpm_common::write_file_atomic_with(
+        destination,
+        lpm_common::AtomicWriteOptions::new().unix_mode(unix_mode),
+        |output| {
+            let mut input = std::fs::File::open(source)?;
+            std::io::copy(&mut input, output)?;
+            Ok(())
+        },
+    )
 }
 
 fn rotate_abort_after_staged_install(

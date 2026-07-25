@@ -324,10 +324,12 @@ pub(crate) fn write_cache(
     bytes.extend_from_slice(bundle);
 
     let path = cache_path(cache_root, registry_source, name, version);
-    let tmp = path.with_extension("sigstore.tmp");
-    std::fs::write(&tmp, &bytes).map_err(LpmError::Io)?;
-    std::fs::rename(&tmp, &path).map_err(LpmError::Io)?;
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        &bytes,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(LpmError::Io)
 }
 
 // ── Fetch + parse ───────────────────────────────────────────────

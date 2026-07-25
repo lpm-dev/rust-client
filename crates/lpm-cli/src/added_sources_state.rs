@@ -134,10 +134,7 @@ pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), 
         LpmError::Registry(format!("failed to serialize added-sources state: {error}"))
     })?;
 
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{body}\n")).map_err(LpmError::Io)?;
-    std::fs::rename(&tmp, &path).map_err(LpmError::Io)?;
-    Ok(())
+    lpm_common::write_file_atomic(&path, format!("{body}\n")).map_err(LpmError::Io)
 }
 
 #[cfg(test)]

@@ -323,13 +323,8 @@ fn write_lpm_json_value(lpm_json_path: &Path, config: &serde_json::Value) -> Res
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("failed to serialize lpm.json: {e}"))?
         + "\n";
-    let tmp_path = lpm_json_path.with_extension("json.tmp");
-
-    std::fs::write(&tmp_path, content).map_err(|e| format!("failed to write lpm.json: {e}"))?;
-    std::fs::rename(&tmp_path, lpm_json_path)
-        .map_err(|e| format!("failed to write lpm.json: {e}"))?;
-
-    Ok(())
+    lpm_common::write_file_atomic(lpm_json_path, content)
+        .map_err(|e| format!("failed to write lpm.json: {e}"))
 }
 
 fn ensure_object_entry<'a>(

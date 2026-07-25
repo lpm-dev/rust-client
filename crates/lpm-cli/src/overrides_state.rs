@@ -27,10 +27,10 @@
 //!
 //! ## Atomic writes
 //!
-//! [`write_state`] writes to a sibling tempfile and renames into place,
-//! mirroring the [`crate::build_state`] writer. A crash mid-write
-//! leaves the previous state file intact rather than producing a
-//! partially-written file the reader chokes on.
+//! [`write_state`] uses an exclusively created same-directory staging file
+//! and atomic replacement, mirroring the [`crate::build_state`] writer. A
+//! crash mid-write leaves the previous state file intact rather than
+//! producing a partially-written file the reader chokes on.
 
 use lpm_common::LpmError;
 use lpm_resolver::{
@@ -218,25 +218,17 @@ pub fn read_state(project_dir: &Path) -> Option<OverridesState> {
 }
 
 /// Atomically write the state file to `<project_dir>/.lpm/`. Creates
-/// the `.lpm/` directory if it doesn't exist. The write goes to a
-/// sibling tempfile and renames into place so a crash mid-write leaves
-/// the previous state intact.
+/// the `.lpm/` directory if it doesn't exist. A crash before replacement
+/// leaves the previous state intact.
 pub fn write_state(project_dir: &Path, state: &OverridesState) -> Result<(), LpmError> {
     let lpm_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&lpm_dir).map_err(LpmError::Io)?;
 
-    let final_path = lpm_dir.join(OVERRIDES_STATE_FILENAME);
-    let tmp_path = lpm_dir.join(format!("{OVERRIDES_STATE_FILENAME}.tmp"));
-
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| LpmError::Script(format!("failed to serialize overrides state: {e}")))?;
 
-    std::fs::write(&tmp_path, json.as_bytes()).map_err(LpmError::Io)?;
-    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(LpmError::Io(e));
-    }
-    Ok(())
+    let final_path = lpm_dir.join(OVERRIDES_STATE_FILENAME);
+    lpm_common::write_file_atomic(&final_path, json.as_bytes()).map_err(LpmError::Io)
 }
 
 /// Delete the state file if it exists. Used when the user removes all

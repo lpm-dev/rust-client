@@ -761,34 +761,60 @@ fn write_and_read_file() {
 }
 
 #[test]
-fn atomic_write_no_partial_file() {
+fn write_to_file_leaves_no_temporary_file_after_success() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lpm.lock");
-    let tmp_path = path.with_extension("lock.tmp");
 
     let lf = sample_lockfile();
     lf.write_to_file(&path).unwrap();
 
-    // tmp file should be gone after successful write
-    assert!(!tmp_path.exists());
     assert!(path.exists());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".lpm-")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn write_to_file_does_not_follow_preplanted_temp_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let path = project.path().join("lpm.lock");
+    let tmp_path = path.with_extension("lock.tmp");
+    let sentinel = external.path().join("sentinel");
+    let original = b"external sentinel";
+    std::fs::write(&sentinel, original).unwrap();
+    symlink(&sentinel, &tmp_path).unwrap();
+
+    sample_lockfile().write_to_file(&path).unwrap();
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), original);
 }
 
 #[test]
-fn write_to_file_rename_failure_cleans_temp_file() {
+fn write_to_file_cleans_temporary_file_when_replacement_fails() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lpm.lock");
-    let tmp_path = path.with_extension("lock.tmp");
     let lf = sample_lockfile();
 
     std::fs::create_dir(&path).unwrap();
 
     let result = lf.write_to_file(&path);
 
-    assert!(result.is_err(), "rename into a directory should fail");
+    assert!(result.is_err(), "replacement of a directory should fail");
     assert!(
-        !tmp_path.exists(),
-        "failed write should clean its temp file"
+        std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".lpm-")),
+        "failed write should clean its temporary file"
     );
 }
 

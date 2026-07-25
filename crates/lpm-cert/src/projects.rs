@@ -55,12 +55,12 @@ fn write_index(idx: &IndexFile) -> Result<(), LpmError> {
     }
     let serialized = serde_json::to_vec_pretty(idx)
         .map_err(|e| LpmError::Cert(format!("failed to serialize projects index: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &serialized)
-        .map_err(|e| LpmError::Cert(format!("failed to write projects-index temp: {e}")))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| LpmError::Cert(format!("failed to promote projects index: {e}")))?;
-    Ok(())
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        &serialized,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(|e| LpmError::Cert(format!("failed to write projects index: {e}")))
 }
 
 /// Record `project_dir` as a project we've issued a leaf for. Idempotent.

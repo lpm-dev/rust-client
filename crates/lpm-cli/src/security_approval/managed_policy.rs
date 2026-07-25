@@ -269,49 +269,15 @@ fn write_managed_policy_value(path: &Path, value: &toml::Value) -> Result<(), Lp
     }
     let content = toml::to_string_pretty(value)
         .map_err(|e| managed_policy_error(path, format!("serialize error: {e}")))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| managed_policy_error(path, "must have a managed parent directory"))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("security-policy.toml");
-    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let write_result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o644);
-        }
-        let mut file = options
-            .open(&temp_path)
-            .map_err(|err| privileged_policy_io_error(path, "write", err))?;
-        file.write_all(content.as_bytes())
-            .map_err(|err| privileged_policy_io_error(path, "write", err))?;
-        file.sync_all()
-            .map_err(|err| privileged_policy_io_error(path, "flush", err))?;
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o644))
-                .map_err(|err| privileged_policy_io_error(path, "secure", err))?;
-        }
-        #[cfg(windows)]
-        if path.exists() {
-            std::fs::remove_file(path)
-                .map_err(|err| privileged_policy_io_error(path, "replace", err))?;
-        }
-        std::fs::rename(&temp_path, path)
-            .map_err(|err| privileged_policy_io_error(path, "replace", err))?;
-        validate_managed_policy_authority(path)
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    write_result
+    lpm_common::write_file_atomic_with_options(
+        path,
+        content,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o644)
+            .sync_file(),
+    )
+    .map_err(|err| privileged_policy_io_error(path, "write", err))?;
+    validate_managed_policy_authority(path)
 }
 
 pub(crate) fn install_managed_firewall_protection(

@@ -24,35 +24,13 @@ pub(crate) fn test_env_overrides_enabled() -> bool {
     cfg!(debug_assertions)
 }
 
-/// Write sensitive key material to a file with restricted permissions (0o600) from creation.
-///
-/// On Unix, the existing file (if any) is removed before `create_new` opens it with
-/// mode 0o600. This is the contract callers depend on: a stale 0o644 file from an
-/// earlier broken install gets replaced, not truncated-in-place with its old mode kept.
-/// `OpenOptionsExt::mode()` only applies on create — `truncate(true)` over an existing
-/// file would silently preserve the old permission bits.
-/// On non-Unix, falls back to `std::fs::write` (no permission control available).
-#[cfg(unix)]
+/// Atomically replace sensitive key material with owner-only permissions on Unix.
 pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    lpm_common::write_file_atomic_with_options(
+        path,
+        contents,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
 }
 
 /// Static label for the platform's trust store, used as the `store` field in audit

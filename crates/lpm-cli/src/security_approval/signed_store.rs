@@ -281,7 +281,11 @@ pub(super) fn write_signed_json<T: Serialize + Clone>(
         signature: sign_payload_value(&payload_value)?,
     };
     let body = serde_json::to_string_pretty(&envelope)?;
-    std::fs::write(path, body)?;
+    lpm_common::write_file_atomic_with_options(
+        path,
+        body,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )?;
     Ok(())
 }
 

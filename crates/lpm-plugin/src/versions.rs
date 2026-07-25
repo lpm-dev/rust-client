@@ -109,12 +109,12 @@ fn write_cached_version_at(
     let json = serde_json::to_string(&cache)
         .map_err(|e| LpmError::Plugin(format!("failed to serialize version cache: {e}")))?;
 
-    let tmp = cache_path.with_extension("tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, cache_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        LpmError::Plugin(format!("failed to rename version cache: {e}"))
-    })?;
+    lpm_common::write_file_atomic_with_options(
+        cache_path,
+        json,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(|e| LpmError::Plugin(format!("failed to write version cache: {e}")))?;
 
     Ok(())
 }

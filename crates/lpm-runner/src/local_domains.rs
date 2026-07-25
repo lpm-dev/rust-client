@@ -369,63 +369,8 @@ fn write_hosts_file_atomic(path: &Path, content: &str) -> Result<(), String> {
             .map_err(|err| format!("create hosts file directory {}: {err}", parent.display()))?;
     }
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("hosts");
-    let tmp_path = path.with_file_name(format!(".{file_name}.lpm-tmp-{}", std::process::id()));
-    std::fs::write(&tmp_path, content)
-        .map_err(|err| format!("write temporary hosts file {}: {err}", tmp_path.display()))?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        std::fs::set_permissions(&tmp_path, metadata.permissions()).map_err(|err| {
-            let _ = std::fs::remove_file(&tmp_path);
-            format!(
-                "copy hosts file permissions to {}: {err}",
-                tmp_path.display()
-            )
-        })?;
-    }
-    replace_file(&tmp_path, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("replace hosts file {}: {err}", path.display())
-    })
-}
-
-#[cfg(not(windows))]
-fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp_path, path)
-}
-
-#[cfg(windows)]
-fn replace_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    let from = wide(tmp_path);
-    let to = wide(path);
-    // SAFETY: both paths are nul-terminated UTF-16 buffers that live for the
-    // duration of the call; MoveFileExW reports failure through its return code.
-    let result = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    lpm_common::write_file_atomic(path, content)
+        .map_err(|err| format!("replace hosts file {}: {err}", path.display()))
 }
 
 fn upsert_managed_hosts_block(content: &str, block_id: &str, hosts: &[String]) -> String {
