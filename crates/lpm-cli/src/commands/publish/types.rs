@@ -48,6 +48,38 @@ impl PublishTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LpmPublicationStatus {
+    Active,
+    PendingReview,
+    Other(String),
+}
+
+impl LpmPublicationStatus {
+    pub(super) fn from_registry_response(response: &serde_json::Value) -> Option<Self> {
+        response
+            .get("publicationStatus")
+            .and_then(serde_json::Value::as_str)
+            .map(Self::from_registry_value)
+    }
+
+    pub(super) fn from_registry_value(value: &str) -> Self {
+        match value {
+            "active" => Self::Active,
+            "pending_review" => Self::PendingReview,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        match self {
+            Self::Active => "active",
+            Self::PendingReview => "pending_review",
+            Self::Other(value) => value,
+        }
+    }
+}
+
 /// Result of publishing to a single registry.
 #[derive(Debug)]
 pub struct PublishResult {
@@ -55,6 +87,7 @@ pub struct PublishResult {
     pub success: bool,
     pub error: Option<String>,
     pub auth: Option<&'static str>,
+    pub publication_status: Option<LpmPublicationStatus>,
     pub duration: std::time::Duration,
 }
 

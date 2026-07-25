@@ -1,10 +1,18 @@
-use super::output::{format_dry_run_files_value, format_publish_retry_detail};
-use super::prepare::{prepare_publish_project_from_manifest, read_publish_manifest};
+use super::orchestrator::lpm_package_url;
+use super::output::{
+    format_dry_run_files_value, format_lpm_publication_notice,
+    format_multi_publish_success_summary, format_publish_retry_detail,
+    format_single_publish_success_summary, publish_result_json,
+};
+use super::prepare::{
+    MAX_PUBLISH_TARBALL_BYTES, prepare_publish_project_from_manifest, read_publish_manifest,
+    validate_publish_tarball_size,
+};
 use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_json};
 use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets};
-use super::types::PublishTarget;
+use super::types::{LpmPublicationStatus, PublishResult, PublishTarget};
 use super::version_data::integrity_to_sha512_hex;
 use crate::commands::publish_common;
 use crate::commands::skills::author;
@@ -419,6 +427,175 @@ fn publish_retry_detail_uses_slim_detail_shape() {
         console::strip_ansi_codes(&format_publish_retry_detail(&PublishTarget::Npm)).into_owned(),
         "  Retry: lpm publish --npm"
     );
+}
+
+#[test]
+fn publish_tarball_size_accepts_the_500_mib_boundary() {
+    assert!(validate_publish_tarball_size(MAX_PUBLISH_TARBALL_BYTES).is_ok());
+}
+
+#[test]
+fn publish_tarball_size_rejects_one_byte_over_with_mib_wording() {
+    let error = validate_publish_tarball_size(MAX_PUBLISH_TARBALL_BYTES + 1).unwrap_err();
+
+    assert!(
+        error.to_string().contains("(max 500 MiB)"),
+        "unexpected tarball limit error: {error}"
+    );
+}
+
+#[test]
+fn lpm_package_url_preserves_the_canonical_dotted_name() {
+    assert_eq!(
+        lpm_package_url("@lpm.dev/acme.widget").as_deref(),
+        Some("https://lpm.dev/acme.widget")
+    );
+}
+
+#[test]
+fn lpm_package_url_rejects_malformed_names_without_panicking() {
+    assert_eq!(lpm_package_url("@lpm.dev/"), None);
+}
+
+#[test]
+fn pending_review_is_exposed_in_lpm_publish_result_json() {
+    let publication_status = LpmPublicationStatus::from_registry_response(&serde_json::json!({
+        "publicationStatus": "pending_review"
+    }));
+    let result = PublishResult {
+        target: "lpm".into(),
+        success: true,
+        error: None,
+        auth: None,
+        publication_status,
+        duration: std::time::Duration::ZERO,
+    };
+
+    let json = publish_result_json(&result);
+
+    assert_eq!(json["publication_status"], "pending_review");
+    assert_eq!(json["success"], true);
+}
+
+#[test]
+fn missing_publication_status_remains_absent_from_lpm_publish_result_json() {
+    let publication_status =
+        LpmPublicationStatus::from_registry_response(&serde_json::json!({ "success": true }));
+    let result = PublishResult {
+        target: "lpm".into(),
+        success: true,
+        error: None,
+        auth: None,
+        publication_status,
+        duration: std::time::Duration::ZERO,
+    };
+
+    let json = publish_result_json(&result);
+
+    assert!(json.get("publication_status").is_none());
+}
+
+#[test]
+fn unrelated_publish_result_does_not_gain_lpm_publication_status() {
+    let result = PublishResult {
+        target: "npm".into(),
+        success: true,
+        error: None,
+        auth: Some("token"),
+        publication_status: None,
+        duration: std::time::Duration::ZERO,
+    };
+
+    let json = publish_result_json(&result);
+
+    assert!(json.get("publication_status").is_none());
+}
+
+#[test]
+fn pending_review_human_notice_says_upload_succeeded_and_review_is_pending() {
+    let notice = format_lpm_publication_notice(&LpmPublicationStatus::PendingReview).unwrap();
+    let notice = console::strip_ansi_codes(&notice).into_owned();
+
+    assert_eq!(
+        notice,
+        "Upload succeeded. The public version is awaiting LPM.dev Registry publication review."
+    );
+}
+
+#[test]
+fn pending_review_single_target_summary_does_not_claim_publication() {
+    let summary = format_single_publish_success_summary(
+        "@lpm.dev/acme.widget",
+        "1.0.0",
+        "10ms",
+        Some(&LpmPublicationStatus::PendingReview),
+    );
+    let summary = console::strip_ansi_codes(&summary).into_owned();
+
+    assert_eq!(
+        summary,
+        "Done · uploaded @lpm.dev/acme.widget@1.0.0 in 10ms; awaiting LPM.dev Registry publication review"
+    );
+}
+
+#[test]
+fn pending_review_multi_target_summary_does_not_claim_full_publication() {
+    let summary =
+        format_multi_publish_success_summary(2, "10ms", Some(&LpmPublicationStatus::PendingReview));
+    let summary = console::strip_ansi_codes(&summary).into_owned();
+
+    assert_eq!(
+        summary,
+        "Done · completed 2 registry uploads in 10ms; LPM.dev Registry publication review pending"
+    );
+}
+
+#[test]
+fn active_publication_retains_the_normal_success_summary() {
+    let status = LpmPublicationStatus::from_registry_response(&serde_json::json!({
+        "publicationStatus": "active"
+    }))
+    .expect("active Registry response has a publication status");
+    let summary = format_single_publish_success_summary(
+        "@lpm.dev/acme.widget",
+        "1.0.0",
+        "10ms",
+        Some(&status),
+    );
+    let summary = console::strip_ansi_codes(&summary).into_owned();
+
+    assert_eq!(
+        summary,
+        "Done · published @lpm.dev/acme.widget@1.0.0 in 10ms"
+    );
+}
+
+#[test]
+fn unknown_publication_status_stays_successful_without_rendering_registry_text() {
+    let status = LpmPublicationStatus::from_registry_value("future\u{1b}[31mstatus");
+    let result = PublishResult {
+        target: "lpm".into(),
+        success: true,
+        error: None,
+        auth: None,
+        publication_status: Some(status),
+        duration: std::time::Duration::ZERO,
+    };
+
+    let notice = format_lpm_publication_notice(
+        result
+            .publication_status
+            .as_ref()
+            .expect("test result has publication status"),
+    )
+    .expect("unknown status has a safe human notice");
+    let notice = console::strip_ansi_codes(&notice).into_owned();
+    let json = publish_result_json(&result);
+
+    assert!(result.success);
+    assert_eq!(json["publication_status"], "future\u{1b}[31mstatus");
+    assert!(!notice.contains("future"));
+    assert!(!notice.contains('\u{1b}'));
 }
 
 #[test]

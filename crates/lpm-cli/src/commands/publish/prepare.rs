@@ -4,6 +4,8 @@ use lpm_common::LpmError;
 use lpm_runner::lpm_json;
 use std::path::Path;
 
+pub(super) const MAX_PUBLISH_TARBALL_BYTES: usize = 500 * 1024 * 1024;
+
 pub(super) struct PublishManifest {
     pub(super) package_json_path: std::path::PathBuf,
     pub(super) pkg_json: serde_json::Value,
@@ -80,12 +82,7 @@ pub(super) fn prepare_publish_project_from_manifest(
     }
 
     let tarball_size = tarball_data.len();
-    if tarball_size > 500 * 1024 * 1024 {
-        return Err(LpmError::Registry(format!(
-            "tarball too large: {} (max 500MB)",
-            lpm_common::format_bytes(tarball_size as u64)
-        )));
-    }
+    validate_publish_tarball_size(tarball_size)?;
 
     let (detected_ecosystem, swift_manifest) = detect_publish_ecosystem(project_dir)?;
 
@@ -101,6 +98,16 @@ pub(super) fn prepare_publish_project_from_manifest(
         detected_ecosystem,
         swift_manifest,
     })
+}
+
+pub(super) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
+    if tarball_size > MAX_PUBLISH_TARBALL_BYTES {
+        return Err(LpmError::Registry(format!(
+            "tarball too large: {} (max 500 MiB)",
+            lpm_common::format_bytes(tarball_size as u64)
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn read_optional_lpm_config(
