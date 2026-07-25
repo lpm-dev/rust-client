@@ -1,6 +1,8 @@
 use super::npm_artifact::{load_provenance_file, prepare_npm_target_artifact};
 use super::output::{
-    DryRunSummary, format_publish_retry_detail, format_upload_message, lpm_visibility,
+    DryRunSummary, format_lpm_publication_notice, format_multi_publish_partial_summary,
+    format_multi_publish_success_summary, format_publish_retry_detail,
+    format_single_publish_success_summary, format_upload_message, lpm_visibility,
     print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
     publish_result_json, visibility_from_access,
 };
@@ -13,8 +15,8 @@ use super::secret_scan::run_publish_secret_scan;
 use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
 use super::target::resolve_targets;
 use super::types::{
-    NpmTargetArtifact, NpmTargetArtifactInput, PublishProject, PublishQualityGateInput,
-    PublishResult, PublishTarget, ResolvedProvenance,
+    LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublishProject,
+    PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
 };
 use super::upload_lpm::publish_to_lpm;
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
@@ -556,13 +558,17 @@ pub async fn run(
                     .map_or(name.as_str(), |s| s.as_str());
                 match lpm_result {
                     Ok(resp) => {
+                        let publication_status =
+                            LpmPublicationStatus::from_registry_response(&resp);
                         if !json_output {
-                            let owner_pkg = lpm_name.strip_prefix("@lpm.dev/").unwrap_or(lpm_name);
-                            if let Some((owner, pkg)) = owner_pkg.split_once('.') {
-                                publish_detail(
-                                    "url",
-                                    install_ui::url(&format!("https://lpm.dev/{owner}/{pkg}")),
-                                );
+                            if let Some(url) = lpm_package_url(lpm_name) {
+                                publish_detail("url", install_ui::url(&url));
+                            }
+                            if let Some(notice) = publication_status
+                                .as_ref()
+                                .and_then(format_lpm_publication_notice)
+                            {
+                                install_ui::warn_line(notice);
                             }
                             if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array())
                             {
@@ -580,6 +586,7 @@ pub async fn run(
                             success: true,
                             error: None,
                             auth: None,
+                            publication_status,
                             duration,
                         });
                     }
@@ -596,6 +603,7 @@ pub async fn run(
                             success: false,
                             error: Some(e.to_string()),
                             auth: None,
+                            publication_status: None,
                             duration,
                         });
                     }
@@ -821,6 +829,7 @@ pub async fn run(
                         success: npm_result.success,
                         error: npm_result.error,
                         auth: auth_source,
+                        publication_status: None,
                         duration: npm_result.duration,
                     })
                 }
@@ -845,6 +854,7 @@ pub async fn run(
                             success: false,
                             error: Some(e.to_string()),
                             auth: None,
+                            publication_status: None,
                             duration,
                         });
                     }
@@ -856,6 +866,10 @@ pub async fn run(
     // Final summary after every target has had a chance to publish.
     let any_failed = results.iter().any(|r| !r.success);
     let succeeded = results.iter().filter(|r| r.success).count();
+    let lpm_publication_status = results
+        .iter()
+        .find(|result| result.target == "lpm" && result.success)
+        .and_then(|result| result.publication_status.as_ref());
 
     if json_output {
         let json = serde_json::json!({
@@ -865,9 +879,10 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if targets.len() > 1 {
         if any_failed {
-            install_ui::warn_untrusted(&format!(
-                "Published to {succeeded} of {} registries.",
-                targets.len()
+            install_ui::warn_line(format_multi_publish_partial_summary(
+                succeeded,
+                targets.len(),
+                lpm_publication_status,
             ));
             for (target, result) in targets.iter().zip(results.iter()) {
                 if !result.success {
@@ -875,23 +890,23 @@ pub async fn run(
                 }
             }
         } else {
-            let elapsed =
-                install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
-            install_ui::done_line(crate::install_ui::terminal_line!(
-                "Done · published to {} registries in {}",
+            let elapsed = install_ui::format_duration(publish_started.elapsed());
+            install_ui::done_line(format_multi_publish_success_summary(
                 targets.len(),
-                elapsed
+                &elapsed,
+                lpm_publication_status,
             ));
         }
     } else if !any_failed {
         let target = &targets[0];
         let key = target.key();
         let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());
-        let elapsed = install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
-        install_ui::done_line(crate::install_ui::terminal_line!(
-            "Done · published {} in {}",
-            install_ui::yellow(&format!("{published_name}@{version}")),
-            elapsed,
+        let elapsed = install_ui::format_duration(publish_started.elapsed());
+        install_ui::done_line(format_single_publish_success_summary(
+            published_name,
+            &version,
+            &elapsed,
+            lpm_publication_status,
         ));
     }
 
@@ -956,4 +971,18 @@ fn is_npm_compatible_target(target: &PublishTarget) -> bool {
             | PublishTarget::GitLab
             | PublishTarget::Custom(_)
     )
+}
+
+pub(super) fn lpm_package_url(name: &str) -> Option<String> {
+    let package = name.strip_prefix("@lpm.dev/")?;
+    let (owner, package_name) = package.split_once('.')?;
+    if owner.is_empty()
+        || package_name.is_empty()
+        || !package
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(format!("https://lpm.dev/{package}"))
 }
