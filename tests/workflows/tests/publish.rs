@@ -444,6 +444,107 @@ fn publish_allow_secrets_bypasses_selected_file_scan() {
 }
 
 #[test]
+fn publish_scans_manifest_bytes_after_lpm_target_name_rewrite() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "source-package",
+  "version": "1.0.0",
+  "description": "sk_liv\u0065_FAKEFAKEFAKEFAKEFAKE",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.rewritten-secret"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish with target-specific name rewrite");
+
+    assert!(
+        !output.status.success(),
+        "a secret materialized by the final manifest rewrite must block publish\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stripe_live_secret"),
+        "the final rewritten manifest secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_scans_manifest_bytes_after_npm_target_name_rewrite() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "source-package",
+  "version": "1.0.0",
+  "description": "sk_liv\u0065_FAKEFAKEFAKEFAKEFAKE",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"renamed-package"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run npm publish with target-specific name rewrite");
+
+    assert!(
+        !output.status.success(),
+        "a secret materialized by the final npm manifest rewrite must block publish\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stripe_live_secret"),
+        "the final npm manifest secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_scans_selected_javascript_larger_than_two_mib() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "large-selected-secret",
+  "version": "1.0.0",
+  "files": ["bundle.js"]
+}"#,
+    );
+    let mut bundle = "x".repeat(2 * 1024 * 1024);
+    bundle.push_str("\nconst token = \"");
+    bundle.push_str("sk_live_");
+    bundle.push_str("FAKEFAKEFAKEFAKEFAKE\";\n");
+    project.write_file("bundle.js", &bundle);
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run publish with a large selected JavaScript bundle");
+
+    assert!(
+        !output.status.success(),
+        "a selected scannable file larger than 2 MiB must not bypass the publish scan\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle.js") && stderr.contains("stripe_live_secret"),
+        "the large selected file and secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
 fn publish_check_help_describes_local_preparation_and_validation() {
     let project = TempProject::empty(r#"{"name":"help-contract","version":"1.0.0"}"#);
 

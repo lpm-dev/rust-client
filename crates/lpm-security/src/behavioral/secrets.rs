@@ -256,9 +256,7 @@ pub fn scan_content(content: &str, file_path: &str) -> Vec<SecretMatch> {
 
     // Check each line for pattern matches
     for (line_idx, line) in content.lines().enumerate() {
-        let line_matches: Vec<usize> = set.matches(line).into_iter().collect();
-
-        for pattern_idx in line_matches {
+        for pattern_idx in set.matches(line).into_iter() {
             let (_, name, desc, severity) = SECRET_PATTERNS[pattern_idx];
 
             // Extract the matched text for display (truncated)
@@ -287,8 +285,9 @@ pub fn is_blocked_file(filename: &str) -> bool {
 /// Scan one prepared package file without rediscovering it from the filesystem.
 ///
 /// Blocked filenames are reported even when their contents are binary or empty.
-/// Other binary, unsupported, and oversized files are skipped consistently with
-/// [`scan_directory`].
+/// Other binary and unsupported files are skipped consistently with
+/// [`scan_directory`]. Publishing callers already enforce artifact size limits,
+/// so selected text files are scanned regardless of size.
 pub fn scan_file_content(content: &[u8], file_path: &str) -> SecretScanResult {
     let mut result = SecretScanResult::default();
     if is_blocked_file(file_path) {
@@ -303,7 +302,7 @@ pub fn scan_file_content(content: &[u8], file_path: &str) -> SecretScanResult {
         return result;
     }
 
-    if content.len() > MAX_SCANNABLE_FILE_BYTES || !is_scannable_file(file_path) {
+    if !is_scannable_file(file_path) {
         return result;
     }
 
@@ -420,6 +419,9 @@ pub fn scan_directory(dir: &std::path::Path) -> SecretScanResult {
         }
 
         if let Ok(content) = std::fs::read(path) {
+            if content.len() > MAX_SCANNABLE_FILE_BYTES {
+                continue;
+            }
             let mut file_scan = scan_file_content(&content, &rel_path);
             result.matches.append(&mut file_scan.matches);
             result.files_scanned += file_scan.files_scanned;
@@ -615,6 +617,35 @@ mod tests {
 
         assert!(!result.has_secrets());
         assert_eq!(result.files_scanned, 1);
+    }
+
+    #[test]
+    fn scan_file_content_scans_selected_text_larger_than_directory_audit_limit() {
+        let mut content = vec![b'x'; MAX_SCANNABLE_FILE_BYTES];
+        content.push(b'\n');
+        content.extend_from_slice(b"sk_live_");
+        content.extend_from_slice(b"FAKEFAKEFAKEFAKEFAKE\n");
+
+        let result = scan_file_content(&content, "bundle.js");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].pattern_name, "stripe_live_secret");
+        assert_eq!(result.files_scanned, 1);
+    }
+
+    #[test]
+    fn scan_directory_retains_large_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut content = vec![b'x'; MAX_SCANNABLE_FILE_BYTES];
+        content.push(b'\n');
+        content.extend_from_slice(b"sk_live_");
+        content.extend_from_slice(b"FAKEFAKEFAKEFAKEFAKE\n");
+        std::fs::write(dir.path().join("bundle.js"), content).unwrap();
+
+        let result = scan_directory(dir.path());
+
+        assert!(!result.has_secrets());
+        assert_eq!(result.files_scanned, 0);
     }
 
     #[test]

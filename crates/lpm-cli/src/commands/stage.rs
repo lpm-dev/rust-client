@@ -1,4 +1,4 @@
-use crate::commands::{npm_auth, npm_stage, publish, publish_npm};
+use crate::commands::{npm_auth, npm_stage, publish, publish_common, publish_npm};
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::{self, NpmPublishConfig};
@@ -31,6 +31,23 @@ pub(crate) async fn publish_current_project(
     let npm_name = npm_config
         .and_then(|config| config.name.clone())
         .map_or_else(|| publish_npm::resolve_npm_name(&prepared.name, None), Ok)?;
+    let rewritten_tarball = publish_common::rewrite_tarball_name_for_publish(
+        &prepared.tarball_data,
+        &prepared.name,
+        &npm_name,
+        !options.allow_secrets,
+    )?;
+    if let Some(rewritten) = &rewritten_tarball {
+        publish::validate_publish_tarball_size(rewritten.data.len())?;
+    }
+    let final_tarball_data = rewritten_tarball
+        .as_ref()
+        .map_or(&prepared.tarball_data, |tarball| &tarball.data);
+    let final_secret_scan = rewritten_tarball
+        .as_ref()
+        .map_or(prepared.secret_scan.as_ref(), |tarball| {
+            tarball.secret_scan.as_ref()
+        });
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config, options.npm_registry)?;
     let access = resolve_stage_access(options.access, &npm_name, npm_config)?;
@@ -60,11 +77,10 @@ pub(crate) async fn publish_current_project(
             publish::materialize_provenance_request(provenance_request.clone()).await?;
         Some(
             publish::prepare_npm_target_artifact(publish::NpmTargetArtifactInput {
-                package_json_name: &prepared.name,
                 npm_name: &npm_name,
                 version: &prepared.version,
                 base_version_data: &version_data,
-                base_tarball_data: &prepared.tarball_data,
+                final_tarball_data: std::sync::Arc::clone(final_tarball_data),
                 provenance_context: provenance_context.as_ref(),
                 target_label: "npm",
                 json_output: options.json_output,
@@ -76,7 +92,7 @@ pub(crate) async fn publish_current_project(
     };
 
     publish::run_publish_secret_scan(
-        prepared.secret_scan.as_ref(),
+        final_secret_scan.into_iter(),
         options.json_output,
         options.allow_secrets,
     )?;
@@ -151,11 +167,10 @@ pub(crate) async fn publish_current_project(
         let provenance_context =
             publish::materialize_provenance_request(provenance_request).await?;
         publish::prepare_npm_target_artifact(publish::NpmTargetArtifactInput {
-            package_json_name: &prepared.name,
             npm_name: &npm_name,
             version: &prepared.version,
             base_version_data: &version_data,
-            base_tarball_data: &prepared.tarball_data,
+            final_tarball_data: std::sync::Arc::clone(final_tarball_data),
             provenance_context: provenance_context.as_ref(),
             target_label: "npm",
             json_output: options.json_output,

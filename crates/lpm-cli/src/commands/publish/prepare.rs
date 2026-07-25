@@ -102,7 +102,7 @@ pub(super) fn prepare_publish_project_from_manifest(
             scan_secrets,
         },
     )?;
-    let tarball_data = prepared_tarball.data;
+    let tarball_data = std::sync::Arc::new(prepared_tarball.data);
     let tarball_size = tarball_data.len();
     validate_publish_tarball_size(tarball_size)?;
 
@@ -123,7 +123,7 @@ pub(super) fn prepare_publish_project_from_manifest(
     })
 }
 
-pub(super) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
+pub(crate) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
     if tarball_size > MAX_PUBLISH_TARBALL_BYTES {
         return Err(LpmError::Registry(format!(
             "tarball too large: {} (max 500 MiB)",

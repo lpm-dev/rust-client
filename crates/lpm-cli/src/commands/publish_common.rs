@@ -20,6 +20,11 @@ pub(crate) struct PreparedTarball {
     pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
 }
 
+pub(crate) struct RewrittenTarball {
+    pub(crate) data: std::sync::Arc<Vec<u8>>,
+    pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct TarballOptions<'a> {
     pub(crate) package_json_content: Option<&'a [u8]>,
@@ -588,13 +593,28 @@ fn is_materialized_package_skill_path(path: &Path, project_root: &Path) -> bool 
 /// top-level payload name. When publishing with a different name (e.g.,
 /// `@lpm.dev/neo.multiple` → `publish-multiple-registry`), the tarball must
 /// be patched. Returns the original tarball unchanged if names already match.
+#[cfg(test)]
 pub fn rewrite_tarball_name(
     tarball_data: &[u8],
     original_name: &str,
     target_name: &str,
 ) -> Result<Vec<u8>, LpmError> {
+    let rewritten =
+        rewrite_tarball_name_for_publish(tarball_data, original_name, target_name, false)?;
+    Ok(rewritten.map_or_else(
+        || tarball_data.to_vec(),
+        |tarball| tarball.data.as_ref().clone(),
+    ))
+}
+
+pub(crate) fn rewrite_tarball_name_for_publish(
+    tarball_data: &[u8],
+    original_name: &str,
+    target_name: &str,
+    scan_secrets: bool,
+) -> Result<Option<RewrittenTarball>, LpmError> {
     if original_name == target_name {
-        return Ok(tarball_data.to_vec());
+        return Ok(None);
     }
 
     use flate2::Compression;
@@ -611,6 +631,9 @@ pub fn rewrite_tarball_name(
 
     // Read tar entries, patch package.json, rebuild
     let mut new_tar_data = Vec::new();
+    let mut secret_scan =
+        scan_secrets.then(lpm_security::behavioral::secrets::SecretScanResult::default);
+    let mut manifest_rewritten = false;
     {
         let mut archive = tar::Archive::new(tar_data.as_slice());
         let mut builder = tar::Builder::new(&mut new_tar_data);
@@ -626,12 +649,20 @@ pub fn rewrite_tarball_name(
             let mut content = Vec::new();
             entry.read_to_end(&mut content).map_err(LpmError::Io)?;
 
-            // Patch package.json at the root of the tarball (package/package.json)
-            if path == "package/package.json"
-                && let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(&content)
-            {
+            if path == "package/package.json" {
+                let mut pkg =
+                    serde_json::from_slice::<serde_json::Value>(&content).map_err(|error| {
+                        LpmError::Registry(format!(
+                            "failed to parse package.json while preparing target tarball: {error}"
+                        ))
+                    })?;
                 pkg["name"] = serde_json::json!(target_name);
-                content = serde_json::to_vec_pretty(&pkg).unwrap_or(content);
+                content = serde_json::to_vec_pretty(&pkg).map_err(|error| {
+                    LpmError::Registry(format!(
+                        "failed to serialize package.json for target {target_name}: {error}"
+                    ))
+                })?;
+                manifest_rewritten = true;
             }
 
             let mut header = tar::Header::new_gnu();
@@ -641,9 +672,22 @@ pub fn rewrite_tarball_name(
             builder
                 .append_data(&mut header, &path, content.as_slice())
                 .map_err(LpmError::Io)?;
+
+            if let Some(scan) = secret_scan.as_mut() {
+                let scan_path = path.strip_prefix("package/").unwrap_or(&path);
+                let mut file_scan =
+                    lpm_security::behavioral::secrets::scan_file_content(&content, scan_path);
+                scan.matches.append(&mut file_scan.matches);
+                scan.files_scanned += file_scan.files_scanned;
+            }
         }
 
         builder.finish().map_err(LpmError::Io)?;
+    }
+    if !manifest_rewritten {
+        return Err(LpmError::Registry(
+            "publish tarball is missing package/package.json".into(),
+        ));
     }
 
     // Recompress
@@ -651,7 +695,10 @@ pub fn rewrite_tarball_name(
     encoder.write_all(&new_tar_data)?;
     let gzipped = encoder.finish()?;
 
-    Ok(gzipped)
+    Ok(Some(RewrittenTarball {
+        data: std::sync::Arc::new(gzipped),
+        secret_scan,
+    }))
 }
 
 pub(crate) fn rewrite_workspace_deps_in_package_json(
