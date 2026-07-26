@@ -178,32 +178,31 @@ fn helper_supports_concurrent_first_use_of_same_appcontainer_profile() {
     ));
     let start = std::sync::Arc::new(std::sync::Barrier::new(HELPER_COUNT));
 
-    let helpers = (0..HELPER_COUNT)
-        .map(|_| {
-            let appcontainer_name = std::sync::Arc::clone(&appcontainer_name);
-            let start = std::sync::Arc::clone(&start);
-            std::thread::spawn(move || {
-                let mut command =
-                    Command::cargo_bin("lpm-sandbox-helper").expect("locate built helper");
-                command.args([
-                    "--protocol-version",
-                    "1",
-                    "--appcontainer-name",
-                    appcontainer_name.as_str(),
-                    "--stdio-stdin",
-                    "null",
-                    "--stdio-stdout",
-                    "null",
-                    "--stdio-stderr",
-                    "null",
-                    "--",
-                    r"C:\Windows\System32\whoami.exe",
-                ]);
-                start.wait();
-                command.output().expect("run concurrent helper")
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut helpers = Vec::with_capacity(HELPER_COUNT);
+    for _ in 0..HELPER_COUNT {
+        let appcontainer_name = std::sync::Arc::clone(&appcontainer_name);
+        let start = std::sync::Arc::clone(&start);
+        helpers.push(std::thread::spawn(move || {
+            let mut command =
+                Command::cargo_bin("lpm-sandbox-helper").expect("locate built helper");
+            command.args([
+                "--protocol-version",
+                "1",
+                "--appcontainer-name",
+                appcontainer_name.as_str(),
+                "--stdio-stdin",
+                "null",
+                "--stdio-stdout",
+                "null",
+                "--stdio-stderr",
+                "null",
+                "--",
+                r"C:\Windows\System32\whoami.exe",
+            ]);
+            start.wait();
+            command.output().expect("run concurrent helper")
+        }));
+    }
 
     let failures = helpers
         .into_iter()

@@ -4,7 +4,8 @@
 //!
 //! 1. **SID create-or-reuse.** Call
 //!    [`CreateAppContainerProfile`] for the stable
-//!    [`helper_protocol::APPCONTAINER_NAME`]; on
+//!    [`helper_protocol::APPCONTAINER_NAME`] while holding a
+//!    cross-process creation lock; on
 //!    `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` fall back to
 //!    [`DeriveAppContainerSidFromAppContainerName`] for the same
 //!    name. Both paths yield the same SID (the SID is derived from
@@ -55,7 +56,7 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    HLOCAL, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+    HLOCAL, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
@@ -82,10 +83,10 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ReleaseMutex, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -101,6 +102,7 @@ use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
 /// which we don't otherwise need; inlining the literal mirrors the
 /// `SE_GROUP_INTEGRITY` pattern in [`crate::windows`].
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+const PROFILE_CREATION_MUTEX_NAME: &str = r"Local\LpmSandboxAppContainerProfileCreation";
 
 // ── Error type ───────────────────────────────────────────────────────
 
@@ -110,6 +112,22 @@ const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 /// debugger.
 #[derive(Debug, thiserror::Error)]
 pub enum AppContainerError {
+    /// `CreateMutexW` failed opening the cross-process profile creation lock.
+    #[error("CreateMutexW(AppContainer profile creation) failed with Win32 error {last_error}")]
+    CreateProfileMutex {
+        /// `GetLastError` reading.
+        last_error: u32,
+    },
+    /// Waiting for the cross-process profile creation lock failed.
+    #[error(
+        "WaitForSingleObject(AppContainer profile creation mutex) returned unexpected value 0x{wait_result:08X} with Win32 error {last_error}"
+    )]
+    WaitProfileMutex {
+        /// Raw value returned by `WaitForSingleObject`.
+        wait_result: u32,
+        /// `GetLastError` reading.
+        last_error: u32,
+    },
     /// `CreateAppContainerProfile` returned an HRESULT other than
     /// `S_OK` or `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`.
     #[error("CreateAppContainerProfile({name}) failed with HRESULT 0x{hresult:08X}")]
@@ -280,6 +298,17 @@ impl Drop for HandleGuard {
 impl HandleGuard {
     fn as_raw(&self) -> HANDLE {
         self.0
+    }
+}
+
+struct ProfileCreationLock(HandleGuard);
+
+impl Drop for ProfileCreationLock {
+    fn drop(&mut self) {
+        // SAFETY: acquiring the mutex succeeded on this thread and
+        // the handle remains open through `self.0`.
+        let released = unsafe { ReleaseMutex(self.0.as_raw()) };
+        debug_assert_ne!(released, 0, "profile creation mutex must be owned");
     }
 }
 
@@ -561,6 +590,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
 /// reboots until explicitly deleted via `DeleteAppContainerProfile`,
 /// which we deliberately don't call (the profile persists until explicitly deleted).
 fn create_or_reuse_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainerError> {
+    let _creation_lock = acquire_profile_creation_lock()?;
     let wide_name = str_to_wide_with_nul(name);
     // Display name + description show up in the per-user
     // AppContainer profile registry; keep them descriptive so an
@@ -607,6 +637,30 @@ fn create_or_reuse_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainer
         name: name.to_owned(),
         hresult: hr,
     })
+}
+
+fn acquire_profile_creation_lock() -> Result<ProfileCreationLock, AppContainerError> {
+    let wide_name = str_to_wide_with_nul(PROFILE_CREATION_MUTEX_NAME);
+    // SAFETY: the name is null-terminated and lives through the call.
+    let handle = unsafe { CreateMutexW(ptr::null(), 0, wide_name.as_ptr()) };
+    if handle.is_null() {
+        return Err(AppContainerError::CreateProfileMutex {
+            last_error: unsafe { GetLastError() },
+        });
+    }
+
+    let handle = HandleGuard(handle);
+    // SAFETY: `handle` owns a valid mutex handle. An abandoned mutex
+    // grants ownership to this thread, so both success values may proceed.
+    let wait_result = unsafe { WaitForSingleObject(handle.as_raw(), INFINITE) };
+    if wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED {
+        Ok(ProfileCreationLock(handle))
+    } else {
+        Err(AppContainerError::WaitProfileMutex {
+            wait_result,
+            last_error: unsafe { GetLastError() },
+        })
+    }
 }
 
 /// Resolve a well-known capability SID into a `SID_AND_ATTRIBUTES`
