@@ -72,7 +72,7 @@ pub async fn run(
     // so the explicit `or_else(LPM_TOKEN)` step is no longer needed
     // here — `bearer_string_for` returns it as `EnvVar` source.
     let token: Option<ResolvedSetupBearer> = if use_oidc {
-        match oidc::exchange_oidc_token(registry_url, None, "install").await {
+        match oidc::exchange_oidc_token(registry_url, None, "read").await {
             Ok(oidc_token) => Some(ResolvedSetupBearer::oidc(oidc_token.token)),
             Err(e) => {
                 if !json_output {

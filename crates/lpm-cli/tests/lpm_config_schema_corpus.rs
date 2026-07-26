@@ -136,6 +136,7 @@ fn corpus_covers_the_documented_field_surface() {
     // Update this list AND add a fixture whenever the consumer
     // surface grows.
     const REQUIRED_KEYS: &[&str] = &[
+        "type",
         "ecosystem",
         "configSchema",
         "defaultConfig",

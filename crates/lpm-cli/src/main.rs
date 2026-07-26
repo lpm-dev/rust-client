@@ -21,6 +21,7 @@ pub mod install_ui;
 pub mod intelligence;
 mod json_contract;
 mod linker_config;
+mod lpm_config;
 mod lpm_skills_config;
 mod manifest_tx;
 pub mod migration_warnings;

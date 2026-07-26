@@ -627,6 +627,17 @@ impl RegistryClient {
         self
     }
 
+    /// Replace session-backed authentication with an explicit bearer token.
+    ///
+    /// Use this for short-lived credentials minted by an OIDC exchange. An
+    /// attached session otherwise takes precedence over `self.token`, which
+    /// would cause subsequent requests to keep using the pre-exchange bearer.
+    pub fn with_token_override(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(SecretString::from(token.into()));
+        self.session = None;
+        self
+    }
+
     /// Attach the shared `SessionManager` so request methods can fetch a
     /// token / trigger silent refresh on demand. Idempotent — subsequent
     /// calls replace the prior session reference.

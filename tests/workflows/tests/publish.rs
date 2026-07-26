@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use support::assertions::parse_json_output;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const NPM_ID_TOKEN: &str = "publish-oidc-id-token";
@@ -757,6 +757,60 @@ async fn publish_to_mock_registry_succeeds() {
             && !combined.contains("Uploading..."),
         "publish human output should not include old chatter, got:\n{combined}"
     );
+}
+
+#[tokio::test]
+async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
+    const RESOLVED_NAME: &str = "@lpm.dev/testuser.resolved-upload";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "message": "Package published"
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "source-package",
+        "version": "1.0.0",
+        "description": "A package with a resolved LPM.dev publication name",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}}}}}}"#),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish with a resolved LPM.dev name");
+
+    assert!(
+        output.status.success(),
+        "resolved-name publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must send one Registry PUT");
+    assert_eq!(
+        upload.url.path(),
+        "/api/registry/%40lpm.dev%2Ftestuser.resolved-upload"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    assert_eq!(payload["_id"], RESOLVED_NAME);
+    assert_eq!(payload["name"], RESOLVED_NAME);
 }
 
 #[tokio::test]

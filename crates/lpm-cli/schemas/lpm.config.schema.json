@@ -11,6 +11,11 @@
       "format": "uri",
       "description": "Optional pointer to this schema for editor autocomplete. Recommended value: https://cli.lpm.dev/schemas/lpm.config.json"
     },
+    "type": {
+      "type": "string",
+      "enum": ["package", "source"],
+      "description": "Optional LPM.dev Registry classification. Only `package` and `source` are supported; when omitted, the Registry infers classification from the published contents. A valid lpm.config.json still activates LPM CLI's configured `lpm add` path, including when this field is `package`."
+    },
     "ecosystem": {
       "type": "string",
       "enum": ["js", "swift"],

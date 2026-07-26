@@ -127,6 +127,7 @@ ecdsa = { workspace = true }
 # Phase 46 P4: x509 cert parsing for Sigstore attestation SAN extraction
 # (identity-only, not full Sigstore verification — see plan §7.1 / D5).
 x509-parser = "0.16"
+jsonschema = { version = "0.46", default-features = false }
 
 # Typed errors for the C1 Sigstore verifier (`sigstore_verify.rs`).
 # Matches the workspace-wide convention (`lpm_common::LpmError`).
@@ -219,11 +220,6 @@ insta = { version = "1", features = ["json"] }
 # unit tests so the SAN-extractor is exercised against deterministic
 # inputs. Same version as lpm-cert already uses.
 rcgen = { version = "0.13", features = ["pem"] }
-
-# Schema corpus validation: load real lpm.config.json fixtures and
-# validate them against the hand-authored schema so the schema cannot
-# silently drift from the consumer code in `commands/add/`.
-jsonschema = { version = "0.46", default-features = false }
 
 [lints]
 workspace = true

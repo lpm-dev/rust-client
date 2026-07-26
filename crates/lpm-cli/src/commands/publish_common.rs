@@ -5,13 +5,21 @@
 
 use crate::install_ui;
 use lpm_common::LpmError;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A file entry in the tarball.
 #[derive(Debug, Clone)]
 pub struct TarballFile {
     pub path: String,
     pub size: u64,
+}
+
+#[derive(Debug)]
+struct TarballCandidate {
+    source_path: PathBuf,
+    source_root: Arc<Path>,
+    archive_path: String,
 }
 
 pub(crate) struct PreparedTarball {
@@ -136,7 +144,19 @@ pub(crate) fn prepare_tarball(
         .canonicalize()
         .map_err(|e| LpmError::Registry(format!("cannot canonicalize project directory: {e}")))?;
 
-    let candidates = collect_package_files(project_dir, pkg_json, &canonical_root)?;
+    let project_files = collect_package_files(project_dir, pkg_json, &canonical_root)?;
+    let mut candidates = Vec::with_capacity(project_files.len());
+    let project_source_root = Arc::<Path>::from(canonical_root.clone());
+    for file in project_files {
+        candidates.push(TarballCandidate {
+            source_path: project_dir.join(&file.path),
+            source_root: Arc::clone(&project_source_root),
+            archive_path: file.path,
+        });
+    }
+    collect_bundled_dependencies(project_dir, pkg_json, &canonical_root, &mut candidates)?;
+    candidates.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
+    candidates.dedup_by(|left, right| left.archive_path == right.archive_path);
     if candidates.is_empty() {
         return Err(LpmError::Registry(
             "no files to pack (check package.json 'files' field)".to_string(),
@@ -153,14 +173,12 @@ pub(crate) fn prepare_tarball(
         let mut builder = tar::Builder::new(&mut tar_data);
 
         for candidate in candidates {
-            let full_path = project_dir.join(&candidate.path);
-
-            // S2: Symlink escape prevention — double-check before reading.
-            // Files were already validated during collection, but a TOCTOU
-            // race could replace a regular file with a symlink between
-            // collection and reading. Defence in depth.
-            if !is_safe_entry(&full_path, &canonical_root) || !full_path.is_file() {
-                continue;
+            let full_path = &candidate.source_path;
+            if !is_safe_candidate_file(full_path, candidate.source_root.as_ref())? {
+                return Err(LpmError::Registry(format!(
+                    "publish file changed or became unsafe while packing `{}`",
+                    candidate.archive_path
+                )));
             }
 
             // M49: enforce per-file AND running-total caps incrementally
@@ -168,30 +186,30 @@ pub(crate) fn prepare_tarball(
             // the 500 MB ceiling. Pre-fix the check ran only after
             // `create_tarball` returned, by which time the bytes were
             // already in memory.
-            let file_size = if candidate.path == "package.json" {
+            let file_size = if candidate.archive_path == "package.json" {
                 options.package_json_content.map_or_else(
-                    || std::fs::metadata(&full_path).map_or(0, |metadata| metadata.len()),
+                    || std::fs::metadata(full_path).map_or(0, |metadata| metadata.len()),
                     |content| content.len() as u64,
                 )
             } else {
-                std::fs::metadata(&full_path).map_or(0, |metadata| metadata.len())
+                std::fs::metadata(full_path).map_or(0, |metadata| metadata.len())
             };
             if file_size > MAX_TARBALL_FILE_BYTES {
                 return Err(LpmError::Registry(format!(
                     "file `{}` size {} exceeds per-file cap of {} bytes — \
                      remove it from the publish set or add an exclusion in \
                      package.json `files`",
-                    candidate.path, file_size, MAX_TARBALL_FILE_BYTES,
+                    candidate.archive_path, file_size, MAX_TARBALL_FILE_BYTES,
                 )));
             }
 
-            let content = if candidate.path == "package.json" {
+            let content = if candidate.archive_path == "package.json" {
                 options.package_json_content.map_or_else(
-                    || std::fs::read(&full_path).map(Cow::Owned),
+                    || std::fs::read(full_path).map(Cow::Owned),
                     |content| Ok(Cow::Borrowed(content)),
                 )?
             } else {
-                Cow::Owned(std::fs::read(&full_path)?)
+                Cow::Owned(std::fs::read(full_path)?)
             };
             let actual_size = content.len() as u64;
             if actual_size > MAX_TARBALL_FILE_BYTES {
@@ -199,7 +217,7 @@ pub(crate) fn prepare_tarball(
                     "file `{}` size {} exceeds per-file cap of {} bytes — \
                      remove it from the publish set or add an exclusion in \
                      package.json `files`",
-                    candidate.path, actual_size, MAX_TARBALL_FILE_BYTES,
+                    candidate.archive_path, actual_size, MAX_TARBALL_FILE_BYTES,
                 )));
             }
 
@@ -208,7 +226,7 @@ pub(crate) fn prepare_tarball(
                 return Err(LpmError::Registry(format!(
                     "uncompressed tarball payload would exceed {} bytes (already at {} after `{}`) — \
                      reduce the publish set or split the package",
-                    MAX_UNCOMPRESSED_TARBALL_BYTES, accumulated, candidate.path,
+                    MAX_UNCOMPRESSED_TARBALL_BYTES, accumulated, candidate.archive_path,
                 )));
             }
 
@@ -218,7 +236,7 @@ pub(crate) fn prepare_tarball(
             header.set_cksum();
 
             // npm tarballs have a `package/` prefix
-            let tar_path = format!("package/{}", candidate.path);
+            let tar_path = format!("package/{}", candidate.archive_path);
             builder
                 .append_data(&mut header, &tar_path, content.as_ref())
                 .map_err(LpmError::Io)?;
@@ -226,13 +244,13 @@ pub(crate) fn prepare_tarball(
             if let Some(scan) = secret_scan.as_mut() {
                 let mut file_scan = lpm_security::behavioral::secrets::scan_file_content(
                     content.as_ref(),
-                    &candidate.path,
+                    &candidate.archive_path,
                 );
                 scan.matches.append(&mut file_scan.matches);
                 scan.files_scanned += file_scan.files_scanned;
             }
             files.push(TarballFile {
-                path: candidate.path,
+                path: candidate.archive_path,
                 size: actual_size,
             });
         }
@@ -250,6 +268,15 @@ pub(crate) fn prepare_tarball(
         files,
         secret_scan,
     })
+}
+
+fn is_safe_candidate_file(path: &Path, source_root: &Path) -> Result<bool, LpmError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let canonical = path.canonicalize()?;
+    Ok(canonical.starts_with(source_root))
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +653,360 @@ fn is_materialized_package_skill_path(path: &Path, project_root: &Path) -> bool 
     crate::commands::skills::package::is_materialized_directory(
         &project_root.join(".lpm").join("skills").join(package),
     )
+}
+
+fn collect_bundled_dependencies(
+    project_dir: &Path,
+    pkg_json: &serde_json::Value,
+    canonical_project_root: &Path,
+    result: &mut Vec<TarballCandidate>,
+) -> Result<(), LpmError> {
+    let names = bundled_dependency_names(pkg_json)?;
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let links_root = lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root())
+        .and_then(|root| root.canonicalize().ok());
+    let wrappers_root = project_dir
+        .join(".lpm")
+        .join("wrappers")
+        .canonicalize()
+        .ok();
+    let mut collector = BundledDependencyCollector {
+        project_dir,
+        canonical_project_root,
+        wrappers_root: wrappers_root.as_deref(),
+        links_root: links_root.as_deref(),
+        packed: std::collections::HashMap::with_capacity(names.len()),
+        active_roots: std::collections::HashSet::with_capacity(names.len()),
+        result,
+    };
+    for name in names {
+        let source = resolve_installed_dependency(
+            project_dir,
+            None,
+            &name,
+            canonical_project_root,
+            wrappers_root.as_deref(),
+            links_root.as_deref(),
+        )?
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "bundled dependency `{name}` is not installed in a verified project or LPM store layout; run `lpm install` before publishing"
+            ))
+        })?;
+        collector.pack(&source.package_root, &name, &format!("node_modules/{name}"))?;
+    }
+    Ok(())
+}
+
+fn bundled_dependency_names(pkg_json: &serde_json::Value) -> Result<Vec<String>, LpmError> {
+    let Some(raw) = pkg_json
+        .get("bundledDependencies")
+        .or_else(|| pkg_json.get("bundleDependencies"))
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut names = match raw {
+        serde_json::Value::Bool(false) => Vec::new(),
+        serde_json::Value::Bool(true) => {
+            let mut names = Vec::new();
+            if let Some(dependencies) = pkg_json
+                .get("dependencies")
+                .and_then(serde_json::Value::as_object)
+            {
+                names.extend(dependencies.keys().cloned());
+            }
+            names
+        }
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .map(|entry| {
+                entry.as_str().map(str::to_string).ok_or_else(|| {
+                    LpmError::Registry(
+                        "package.json bundledDependencies entries must be package-name strings"
+                            .into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(LpmError::Registry(
+                "package.json bundledDependencies must be an array or boolean".into(),
+            ));
+        }
+    };
+    names.sort();
+    names.dedup();
+    for name in &names {
+        validate_bundle_name(name)?;
+    }
+    Ok(names)
+}
+
+fn validate_bundle_name(name: &str) -> Result<(), LpmError> {
+    let segments = name.split('/').collect::<Vec<_>>();
+    let valid = match segments.as_slice() {
+        [plain] => !plain.is_empty() && *plain != "." && *plain != "..",
+        [scope, package] => {
+            scope.starts_with('@')
+                && scope.len() > 1
+                && !package.is_empty()
+                && *package != "."
+                && *package != ".."
+        }
+        _ => false,
+    };
+    if !valid || name.contains('\\') {
+        return Err(LpmError::Registry(format!(
+            "invalid bundled dependency name `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+struct ResolvedDependency {
+    package_root: PathBuf,
+    package_local: bool,
+}
+
+fn resolve_installed_dependency(
+    project_dir: &Path,
+    parent_package: Option<&Path>,
+    name: &str,
+    canonical_project_root: &Path,
+    wrappers_root: Option<&Path>,
+    links_root: Option<&Path>,
+) -> Result<Option<ResolvedDependency>, LpmError> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(parent) = parent_package {
+        candidates.push((parent.join("node_modules").join(name), true));
+    }
+    candidates.push((project_dir.join("node_modules").join(name), false));
+
+    for (candidate, package_local) in candidates {
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(LpmError::Io(error)),
+        };
+        let canonical = candidate.canonicalize().map_err(|error| {
+            LpmError::Registry(format!(
+                "bundled dependency `{name}` has an unreadable installed path {}: {error}",
+                candidate.display()
+            ))
+        })?;
+        if !canonical.starts_with(canonical_project_root)
+            && links_root.is_none_or(|root| !canonical.starts_with(root))
+        {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{name}` resolves outside the verified project and LPM store roots: {}",
+                candidate.display()
+            )));
+        }
+        if metadata.file_type().is_symlink()
+            && !wrappers_root.is_some_and(|root| canonical.starts_with(root))
+            && !links_root.is_some_and(|root| canonical.starts_with(root))
+        {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{name}` uses an unverified project symlink: {}",
+                candidate.display()
+            )));
+        }
+        if !canonical.is_dir() {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{name}` is not an installed package directory: {}",
+                candidate.display()
+            )));
+        }
+        let manifest_path = canonical.join("package.json");
+        let content = lpm_common::read_text_file_capped(
+            &manifest_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )?;
+        let manifest = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
+            LpmError::Registry(format!(
+                "bundled dependency `{name}` has an invalid package.json: {error}"
+            ))
+        })?;
+        if manifest.get("name").and_then(|value| value.as_str()) != Some(name) {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{name}` resolved to a package with a different identity"
+            )));
+        }
+        return Ok(Some(ResolvedDependency {
+            package_root: canonical,
+            package_local,
+        }));
+    }
+
+    Ok(None)
+}
+
+struct BundledDependencyCollector<'a> {
+    project_dir: &'a Path,
+    canonical_project_root: &'a Path,
+    wrappers_root: Option<&'a Path>,
+    links_root: Option<&'a Path>,
+    packed: std::collections::HashMap<String, PathBuf>,
+    active_roots: std::collections::HashSet<PathBuf>,
+    result: &'a mut Vec<TarballCandidate>,
+}
+
+impl BundledDependencyCollector<'_> {
+    fn pack(
+        &mut self,
+        package_root: &Path,
+        expected_name: &str,
+        archive_root: &str,
+    ) -> Result<(), LpmError> {
+        if let Some(existing) = self.packed.get(archive_root) {
+            if existing != package_root {
+                return Err(LpmError::Registry(format!(
+                    "bundled dependency archive path `{archive_root}` resolves to multiple installed packages"
+                )));
+            }
+            return Ok(());
+        }
+        if self.active_roots.contains(package_root) {
+            return Ok(());
+        }
+        self.packed
+            .insert(archive_root.to_string(), package_root.to_path_buf());
+        self.active_roots.insert(package_root.to_path_buf());
+        let result = self.pack_active(package_root, expected_name, archive_root);
+        self.active_roots.remove(package_root);
+        result
+    }
+
+    fn pack_active(
+        &mut self,
+        package_root: &Path,
+        expected_name: &str,
+        archive_root: &str,
+    ) -> Result<(), LpmError> {
+        let manifest_path = package_root.join("package.json");
+        let manifest_content = lpm_common::read_text_file_capped(
+            &manifest_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )?;
+        let manifest =
+            serde_json::from_str::<serde_json::Value>(&manifest_content).map_err(|error| {
+                LpmError::Registry(format!(
+                    "bundled dependency `{expected_name}` has an invalid package.json: {error}"
+                ))
+            })?;
+        if manifest.get("name").and_then(|value| value.as_str()) != Some(expected_name) {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{expected_name}` resolved to a package with a different identity"
+            )));
+        }
+
+        let source_root = Arc::<Path>::from(package_root);
+        collect_bundle_tree(
+            package_root,
+            package_root,
+            &source_root,
+            archive_root,
+            self.result,
+        )?;
+
+        let mut children = std::collections::BTreeMap::<String, bool>::new();
+        if let Some(dependencies) = manifest
+            .get("dependencies")
+            .and_then(serde_json::Value::as_object)
+        {
+            children.extend(dependencies.keys().cloned().map(|name| (name, true)));
+        }
+        if let Some(optional_dependencies) = manifest
+            .get("optionalDependencies")
+            .and_then(serde_json::Value::as_object)
+        {
+            children.extend(
+                optional_dependencies
+                    .keys()
+                    .cloned()
+                    .map(|name| (name, false)),
+            );
+        }
+
+        for (child, required) in children {
+            validate_bundle_name(&child)?;
+            let source = resolve_installed_dependency(
+                self.project_dir,
+                Some(package_root),
+                &child,
+                self.canonical_project_root,
+                self.wrappers_root,
+                self.links_root,
+            )?;
+            let Some(source) = source else {
+                if required {
+                    return Err(LpmError::Registry(format!(
+                        "bundled dependency `{expected_name}` requires `{child}`, but it is not installed; run `lpm install` before publishing"
+                    )));
+                }
+                continue;
+            };
+            let nested_archive = if source.package_local {
+                format!("{archive_root}/node_modules/{child}")
+            } else {
+                format!("node_modules/{child}")
+            };
+            self.pack(&source.package_root, &child, &nested_archive)?;
+        }
+        Ok(())
+    }
+}
+
+fn collect_bundle_tree(
+    dir: &Path,
+    package_root: &Path,
+    source_root: &Arc<Path>,
+    archive_root: &str,
+    result: &mut Vec<TarballCandidate>,
+) -> Result<(), LpmError> {
+    let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency contains an unsupported symlink: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            if name == "node_modules" || name == ".git" || name == ".lpm" {
+                continue;
+            }
+            collect_bundle_tree(&path, package_root, source_root, archive_root, result)?;
+        } else if metadata.is_file() {
+            let relative = path.strip_prefix(package_root).map_err(|_| {
+                LpmError::Registry(format!(
+                    "bundled dependency file escaped its package root: {}",
+                    path.display()
+                ))
+            })?;
+            let portable = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            result.push(TarballCandidate {
+                source_path: path,
+                source_root: Arc::clone(source_root),
+                archive_path: format!("{archive_root}/{portable}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1407,24 @@ fn javascript_string_length(value: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn tarball_contents(data: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+        use std::io::Read;
+
+        let mut decoder = flate2::read::GzDecoder::new(data);
+        let mut tar_data = Vec::new();
+        decoder.read_to_end(&mut tar_data).unwrap();
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let mut contents = std::collections::BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            contents.insert(path, bytes);
+        }
+        contents
+    }
+
     fn valid_authored_skill() -> String {
         format!(
             "---\nname: package-usage\ndescription: Use the package through its supported public API.\n---\n# Package usage\n\n{}",
@@ -1356,6 +1755,298 @@ mod tests {
     }
 
     #[test]
+    fn implicit_publish_keeps_only_valid_authored_skills_from_project_lpm_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".lpm/skills/nested")).unwrap();
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"@lpm.dev/test.pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/authored.md"),
+            format!(
+                "---\nname: authored\ndescription: Complete authored guidance\n---\n# Usage\n\n{}",
+                "Use this package safely with concrete steps and examples. ".repeat(4)
+            ),
+        )
+        .unwrap();
+        std::fs::write(project.join(".lpm/skills/nested/ignored.md"), "ignored").unwrap();
+        std::fs::write(project.join(".lpm/certs/lpm.der"), "private certificate").unwrap();
+        std::fs::write(project.join(".lpm/install-hash"), "state").unwrap();
+        std::fs::write(project.join(".lpm/webhook.log"), "runtime log").unwrap();
+        std::fs::create_dir_all(project.join("fixtures/.lpm/skills")).unwrap();
+        std::fs::write(project.join("fixtures/.lpm/skills/example.txt"), "fixture").unwrap();
+
+        let pkg = serde_json::json!({"name":"@lpm.dev/test.pkg","version":"1.0.0"});
+        let (tarball, files) = create_tarball(project, &pkg).unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let archive = tarball_contents(&tarball);
+
+        assert!(paths.contains(&".lpm/skills/authored.md"));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| { path.starts_with(".lpm/") && *path != ".lpm/skills/authored.md" })
+        );
+        assert!(paths.contains(&"fixtures/.lpm/skills/example.txt"));
+        assert!(archive.contains_key("package/.lpm/skills/authored.md"));
+        assert!(
+            archive.keys().all(|path| !path.starts_with("package/.lpm/")
+                || path == "package/.lpm/skills/authored.md")
+        );
+    }
+
+    #[test]
+    fn bundled_dependencies_include_direct_and_transitive_installed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join("node_modules/foo")).unwrap();
+        std::fs::create_dir_all(project.join("node_modules/bar")).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("node_modules/foo/package.json"),
+            r#"{"name":"foo","version":"1.0.0","dependencies":{"bar":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("node_modules/foo/index.js"), "foo").unwrap();
+        std::fs::write(
+            project.join("node_modules/bar/package.json"),
+            r#"{"name":"bar","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("node_modules/bar/index.js"), "bar").unwrap();
+
+        let (tarball, files) = create_tarball(project, &manifest).unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"node_modules/foo/package.json"));
+        assert!(paths.contains(&"node_modules/foo/index.js"));
+        assert!(paths.contains(&"node_modules/bar/package.json"));
+        assert!(paths.contains(&"node_modules/bar/index.js"));
+        let archive = tarball_contents(&tarball);
+        assert_eq!(archive["package/node_modules/foo/index.js"], b"foo");
+        assert_eq!(archive["package/node_modules/bar/index.js"], b"bar");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_dependency_supports_the_v2_isolated_links_layout() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        let store_paths =
+            lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_common::LpmRoot::from_dir(&lpm_home));
+        let package_root = store_paths
+            .links_root()
+            .join("foo@1.0.0+0000000000000000")
+            .join("node_modules")
+            .join("foo");
+        std::fs::create_dir_all(&package_root).unwrap();
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(package_root.join("index.js"), "isolated").unwrap();
+        symlink(&package_root, project.join("node_modules/foo")).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.as_os_str().to_owned())]);
+
+        let (tarball, _) = create_tarball(&project, &manifest).unwrap();
+
+        assert_eq!(
+            tarball_contents(&tarball)["package/node_modules/foo/index.js"],
+            b"isolated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_transitive_bundles_preserve_package_local_dependency_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        let store_paths =
+            lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_common::LpmRoot::from_dir(&lpm_home));
+        let foo_root = store_paths
+            .links_root()
+            .join("foo@1.0.0+0000000000000000")
+            .join("node_modules")
+            .join("foo");
+        let bar_root = store_paths
+            .links_root()
+            .join("bar@2.0.0+0000000000000000")
+            .join("node_modules")
+            .join("bar");
+        std::fs::create_dir_all(foo_root.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&bar_root).unwrap();
+        std::fs::write(
+            foo_root.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0","dependencies":{"bar":"2.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bar_root.join("package.json"),
+            r#"{"name":"bar","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(bar_root.join("index.js"), "nested isolated").unwrap();
+        symlink(&bar_root, foo_root.join("node_modules/bar")).unwrap();
+        symlink(&foo_root, project.join("node_modules/foo")).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.as_os_str().to_owned())]);
+
+        let (tarball, _) = create_tarball(&project, &manifest).unwrap();
+        let archive = tarball_contents(&tarball);
+
+        assert_eq!(
+            archive["package/node_modules/foo/node_modules/bar/index.js"],
+            b"nested isolated"
+        );
+        assert!(!archive.contains_key("package/node_modules/bar/index.js"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_cyclic_bundled_dependencies_terminate_without_duplicate_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        let store_paths =
+            lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_common::LpmRoot::from_dir(&lpm_home));
+        let foo_root = store_paths
+            .links_root()
+            .join("foo@1.0.0+0000000000000000")
+            .join("node_modules")
+            .join("foo");
+        let bar_root = store_paths
+            .links_root()
+            .join("bar@1.0.0+0000000000000000")
+            .join("node_modules")
+            .join("bar");
+        std::fs::create_dir_all(foo_root.join("node_modules")).unwrap();
+        std::fs::create_dir_all(bar_root.join("node_modules")).unwrap();
+        std::fs::write(
+            foo_root.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0","dependencies":{"bar":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(foo_root.join("index.js"), "foo").unwrap();
+        std::fs::write(
+            bar_root.join("package.json"),
+            r#"{"name":"bar","version":"1.0.0","dependencies":{"foo":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(bar_root.join("index.js"), "bar").unwrap();
+        symlink(&bar_root, foo_root.join("node_modules/bar")).unwrap();
+        symlink(&foo_root, bar_root.join("node_modules/foo")).unwrap();
+        symlink(&foo_root, project.join("node_modules/foo")).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.as_os_str().to_owned())]);
+
+        let (tarball, _) = create_tarball(&project, &manifest).unwrap();
+        let archive = tarball_contents(&tarball);
+
+        assert_eq!(archive["package/node_modules/foo/index.js"], b"foo");
+        assert_eq!(
+            archive["package/node_modules/foo/node_modules/bar/index.js"],
+            b"bar"
+        );
+        assert!(
+            archive
+                .keys()
+                .all(|path| !path.contains("node_modules/bar/node_modules/foo/"))
+        );
+    }
+
+    #[test]
+    fn unavailable_optional_transitive_dependency_does_not_break_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let package_root = project.join("node_modules/foo");
+        std::fs::create_dir_all(&package_root).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0","optionalDependencies":{"native-addon":"1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package_root.join("index.js"), "foo").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == "node_modules/foo/index.js")
+        );
+    }
+
+    #[test]
     fn implicit_publish_does_not_filter_nested_lpm_named_fixture_paths() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
@@ -1380,6 +2071,194 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "fixtures/.lpm/certs/cert.pem")
         );
+    }
+
+    #[test]
+    fn bundled_dependency_bytes_are_included_in_final_secret_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let package_root = project.join("node_modules/foo");
+        std::fs::create_dir_all(&package_root).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package_root.join("index.js"),
+            r#"const password = "not-a-real-bundled-secret-fixture";"#,
+        )
+        .unwrap();
+
+        let prepared = prepare_tarball(
+            project,
+            &manifest,
+            TarballOptions {
+                package_json_content: None,
+                scan_secrets: true,
+            },
+        )
+        .unwrap();
+        let scan = prepared.secret_scan.unwrap();
+
+        assert!(
+            scan.matches
+                .iter()
+                .any(|secret| secret.description.contains("node_modules/foo/index.js"))
+        );
+    }
+
+    #[test]
+    fn target_name_rewrites_preserve_bundled_archive_paths_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let package_root = project.join("node_modules/foo");
+        std::fs::create_dir_all(&package_root).unwrap();
+        let manifest = serde_json::json!({
+            "name": "@lpm.dev/owner.publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(package_root.join("index.js"), "portable bundle").unwrap();
+        let (tarball, _) = create_tarball(project, &manifest).unwrap();
+
+        for target_name in ["npm-publisher", "@lpm.dev/owner.renamed"] {
+            let rewritten =
+                rewrite_tarball_name(&tarball, "@lpm.dev/owner.publisher", target_name).unwrap();
+            assert_eq!(
+                tarball_contents(&rewritten)["package/node_modules/foo/index.js"],
+                b"portable bundle"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_dependency_boolean_and_legacy_alias_forms_follow_npm_semantics() {
+        let pkg = serde_json::json!({
+            "dependencies": {"z": "1", "a": "1"},
+            "optionalDependencies": {"optional": "1"},
+            "bundledDependencies": true
+        });
+        assert_eq!(bundled_dependency_names(&pkg).unwrap(), vec!["a", "z"]);
+        assert!(
+            bundled_dependency_names(&serde_json::json!({
+                "dependencies": {"a": "1"},
+                "bundledDependencies": false
+            }))
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            bundled_dependency_names(&serde_json::json!({
+                "bundleDependencies": ["legacy"]
+            }))
+            .unwrap(),
+            vec!["legacy"]
+        );
+    }
+
+    #[test]
+    fn missing_requested_bundle_fails_actionably() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["missing"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = create_tarball(project, &manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("missing") && error.contains("lpm install"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_dependency_rejects_internal_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let dependency = project.join("node_modules/foo");
+        std::fs::create_dir_all(&dependency).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        symlink(project.join("package.json"), dependency.join("leak.json")).unwrap();
+
+        let error = create_tarball(project, &manifest).unwrap_err().to_string();
+        assert!(error.contains("unsupported symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_dependency_rejects_a_project_symlink_to_an_unverified_root() {
+        use std::os::unix::fs::symlink;
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let project = project_dir.path();
+        let outside = outside_dir.path().join("foo");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        symlink(&outside, project.join("node_modules/foo")).unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = create_tarball(project, &manifest).unwrap_err().to_string();
+
+        assert!(error.contains("outside the verified"), "{error}");
     }
 
     #[test]
