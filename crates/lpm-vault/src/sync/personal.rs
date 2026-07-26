@@ -143,8 +143,8 @@ pub async fn push_raw(
     let secrets_json = secrets_json.to_string();
 
     let (encrypted_blob, wrapped_key) = crypto::encrypt_vault_for_sync(&secrets_json)?;
-
     let client = sync_http_client_builder()
+        .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!(
@@ -269,6 +269,26 @@ pub async fn pull_raw(
     auth_token: &str,
     vault_id: &str,
 ) -> Result<(String, i32), String> {
+    pull_raw_with_migration(registry_url, auth_token, vault_id, true).await
+}
+
+/// Pull the authoritative plaintext and version without an implicit migration
+/// write. Rotation must perform exactly one CAS write against the version it
+/// just read.
+pub async fn pull_raw_for_rotation(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+) -> Result<(String, i32), String> {
+    pull_raw_with_migration(registry_url, auth_token, vault_id, false).await
+}
+
+async fn pull_raw_with_migration(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+    migrate_legacy: bool,
+) -> Result<(String, i32), String> {
     let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
@@ -303,7 +323,7 @@ pub async fn pull_raw(
 
     let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
 
-    if result.needs_reencrypt {
+    if migrate_legacy && result.needs_reencrypt {
         attempt_legacy_reencrypt_push(
             registry_url,
             auth_token,
@@ -886,6 +906,61 @@ mod tests {
         assert!(
             result.is_err(),
             "pull_raw should fail when the sync endpoint stalls"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn push_raw_times_out_when_server_stalls() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        let original_timeout = std::env::var_os("LPM_TEST_SYNC_TIMEOUT_MS");
+
+        unsafe { std::env::set_var("LPM_TEST_SYNC_TIMEOUT_MS", "50") };
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(
+                signed_ok_response(
+                    serde_json::json!({
+                        "status": "updated",
+                        "version": 4
+                    }),
+                    "auth-token",
+                )
+                .set_delay(std::time::Duration::from_secs(2)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let started_at = std::time::Instant::now();
+        let result = push_raw(
+            &server.uri(),
+            "auth-token",
+            "vault-123",
+            r#"{"environments":{"default":{"KEY":"value"}}}"#,
+            Some(3),
+            false,
+            None,
+        )
+        .await;
+        let elapsed = started_at.elapsed();
+
+        match original_timeout {
+            Some(value) => unsafe { std::env::set_var("LPM_TEST_SYNC_TIMEOUT_MS", value) },
+            None => unsafe { std::env::remove_var("LPM_TEST_SYNC_TIMEOUT_MS") },
+        }
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "push_raw should respect the configured request timeout, took {elapsed:?}"
+        );
+        assert!(
+            result.is_err(),
+            "push_raw should fail when the sync endpoint stalls"
         );
     }
 

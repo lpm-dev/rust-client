@@ -1446,7 +1446,7 @@ async fn async_main() -> Result<()> {
                     .registry
                     .as_deref()
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-                commands::logout::run(&client, registry, revoke, cli.json).await?;
+                commands::logout::run(&client, &session, registry, revoke, cli.json).await?;
             }
 
             if all || npm {
@@ -1512,7 +1512,6 @@ async fn async_main() -> Result<()> {
                 env,
                 registry: setup_registry,
                 oidc,
-                scoped: _,
             } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 let target = target.as_deref().ok_or_else(|| {
@@ -1539,7 +1538,7 @@ async fn async_main() -> Result<()> {
                     ))),
                 }
             }
-            SetupAction::Local { days, scoped: _ } => {
+            SetupAction::Local { days } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 commands::npmrc::run(&client, &cwd, registry_url, days, cli.json).await
             }

@@ -330,20 +330,17 @@ pub(crate) enum SetupAction {
         /// Use OIDC token exchange instead of stored token.
         #[arg(long)]
         oidc: bool,
-
-        /// Use scoped registry (`@lpm.dev:registry=`). This is the default.
-        #[arg(long)]
-        scoped: bool,
     },
 
     /// Generate a read-only `.npmrc` token for local development.
     Local {
         /// Token validity in days (default: 30).
-        #[arg(short = 'd', long, default_value = "30")]
+        #[arg(
+            short = 'd',
+            long,
+            default_value = "30",
+            value_parser = clap::value_parser!(u32).range(1..=90)
+        )]
         days: u32,
-
-        /// Use scoped registry (`@lpm.dev:registry=`). This is the default.
-        #[arg(long)]
-        scoped: bool,
     },
 }

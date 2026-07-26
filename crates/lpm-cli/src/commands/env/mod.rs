@@ -42,8 +42,6 @@ pub async fn run(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-
     let raw_args: Vec<String> = std::env::args().collect();
     let cmd_pos = raw_args.iter().position(|a| a == "env");
     let args: Vec<&str> = match cmd_pos {
@@ -67,7 +65,9 @@ pub async fn run(
         "pull" => return pull::vars_pull(&args, project_dir, json_output).await,
         "log" => return remote::env_log(project_dir, json_output).await,
         "share" => return remote::env_share(&args, project_dir, json_output).await,
-        "rotate-key" => return rotation::env_rotate_key(project_dir, json_output).await,
+        "rotate-key" => {
+            return rotation::env_rotate_key(&args[1..], project_dir, json_output).await;
+        }
         "rotate-sharing-key" => return rotation::env_rotate_sharing_key(&args, json_output).await,
         "list-remote" | "ls-remote" => {
             let org_flag = args

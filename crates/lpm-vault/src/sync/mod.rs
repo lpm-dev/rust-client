@@ -25,7 +25,7 @@ pub use org::{list_org_vaults, pull_org, push_org, push_org_with_keys};
 pub use pairing::{PairingSession, approve_pairing, get_pairing_session, unpair_all};
 pub use personal::{
     ListVaultsResponse, PullResponse, PushMetadata, PushResponse, RemoteVault, list_remote, pull,
-    pull_env, pull_raw, push, push_raw,
+    pull_env, pull_raw, pull_raw_for_rotation, push, push_raw,
 };
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, PendingPublicKey, PublicKeyRegistrationState,

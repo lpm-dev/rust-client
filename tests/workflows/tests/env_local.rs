@@ -12,6 +12,36 @@ mod support;
 
 use support::{TempProject, lpm};
 
+#[test]
+fn env_config_independent_list_ignores_malformed_lpm_json_but_validate_fails() {
+    let project = TempProject::empty(r#"{"name":"env-config-matrix","version":"1.0.0"}"#);
+    project.write_file("lpm.json", "{ not valid json");
+
+    let list = lpm(&project)
+        .args(["--json", "env", "list"])
+        .output()
+        .expect("run config-independent env list");
+    assert!(
+        list.status.success(),
+        "env list should not depend on lpm.json:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+
+    let validate = lpm(&project)
+        .args(["--json", "env", "validate"])
+        .output()
+        .expect("run config-dependent env validate");
+    assert!(!validate.status.success());
+    assert_eq!(
+        serde_json::Deserializer::from_slice(&validate.stdout)
+            .into_iter::<serde_json::Value>()
+            .count(),
+        1,
+        "JSON mode must emit exactly one document"
+    );
+}
+
 fn write_dotenv(project: &TempProject, file: &str, content: &str) {
     project.write_file(file, content);
 }

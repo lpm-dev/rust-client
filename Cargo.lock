@@ -3888,6 +3888,7 @@ dependencies = [
  "lpm-global",
  "lpm-linker",
  "lpm-lockfile",
+ "lpm-registry",
  "lpm-runner",
  "lpm-runtime",
  "lpm-security",

@@ -595,7 +595,7 @@ async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
 }
 
 #[tokio::test]
-async fn env_pair_then_logout_revokes_pairings_and_blocks_future_pairing_commands() {
+async fn env_pair_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_commands() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     let project = TempProject::empty(r#"{"name":"vault-pair-logout-test","version":"1.0.0"}"#);
@@ -613,6 +613,7 @@ async fn env_pair_then_logout_revokes_pairings_and_blocks_future_pairing_command
     mock.with_pairing_approval("PAIR01", "session-access-token")
         .await;
     mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_token("session-access-token").await;
 
     seed_sessions(
         project.home(),
@@ -643,7 +644,7 @@ async fn env_pair_then_logout_revokes_pairings_and_blocks_future_pairing_command
 
     let logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout"])
+        .args(["logout", "--revoke"])
         .output()
         .expect("failed to run logout after pairing");
 
@@ -705,7 +706,7 @@ async fn env_pair_then_logout_revokes_pairings_and_blocks_future_pairing_command
 }
 
 #[tokio::test]
-async fn env_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_future_pairing_commands()
+async fn env_pair_refresh_only_session_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_commands()
  {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -734,6 +735,7 @@ async fn env_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_f
     mock.with_pairing_approval("RLG123", "access-from-refresh")
         .await;
     mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
         project.home(),
@@ -770,7 +772,7 @@ async fn env_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_f
 
     let logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout"])
+        .args(["logout", "--revoke"])
         .output()
         .expect("failed to run logout after refresh-only pairing");
 
@@ -814,7 +816,7 @@ async fn env_pair_refresh_only_session_then_logout_revokes_pairings_and_blocks_f
 }
 
 #[tokio::test]
-async fn env_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_state_and_blocks_future_vault_commands()
+async fn env_pair_unpair_then_logout_revoke_on_refresh_backed_session_keeps_normalized_state_and_blocks_future_vault_commands()
  {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -844,6 +846,7 @@ async fn env_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_
     mock.with_pairing_approval("UPL123", "access-from-refresh")
         .await;
     mock.with_revoke_all_pairings_expected(2).await;
+    mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
         project.home(),
@@ -899,7 +902,7 @@ async fn env_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_
 
     let logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout"])
+        .args(["logout", "--revoke"])
         .output()
         .expect("failed to run logout in refresh-backed chain");
 
@@ -956,7 +959,7 @@ async fn env_pair_unpair_then_logout_on_refresh_backed_session_keeps_normalized_
 }
 
 #[tokio::test]
-async fn env_pair_unpair_then_logout_all_on_refresh_backed_session_clears_auth_state_and_blocks_future_vault_commands()
+async fn env_pair_unpair_then_logout_all_revoke_on_refresh_backed_session_clears_auth_state_and_blocks_future_vault_commands()
  {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -986,6 +989,7 @@ async fn env_pair_unpair_then_logout_all_on_refresh_backed_session_clears_auth_s
     mock.with_pairing_approval("UAL123", "access-from-refresh")
         .await;
     mock.with_revoke_all_pairings_expected(2).await;
+    mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
         project.home(),
@@ -1032,7 +1036,7 @@ async fn env_pair_unpair_then_logout_all_on_refresh_backed_session_clears_auth_s
 
     let logout_all = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout", "--all"])
+        .args(["logout", "--all", "--revoke"])
         .output()
         .expect("failed to run logout --all in refresh-backed vault chain");
 
@@ -2055,6 +2059,382 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
 }
 
 #[tokio::test]
+async fn env_oidc_allow_gitlab_uses_numeric_project_subject_without_github_fields() {
+    let project = TempProject::empty(r#"{"name":"gitlab-oidc","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-gitlab-123"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_gitlab_oidc_policy_create(
+        "session-access-token",
+        "vault-gitlab-123",
+        "12345",
+        &["main"],
+        &["production"],
+    )
+    .await;
+    mock.with_escrow_upload_success("session-access-token", "vault-gitlab-123")
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "env",
+            "oidc",
+            "allow",
+            "--provider=gitlab",
+            "--project-id=12345",
+            "--branch=main",
+            "--env=production",
+        ])
+        .output()
+        .expect("run GitLab OIDC policy creation");
+
+    assert!(
+        output.status.success(),
+        "GitLab OIDC policy failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("project ID 12345"));
+    assert!(
+        !combined.contains("workflows") && !combined.contains("events"),
+        "GitLab output must not describe GitHub-only policy fields: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn env_oidc_allow_gitlab_rejects_github_only_flags_before_network() {
+    for flag in [
+        "--repo=group/project",
+        "--workflow=.github/workflows/deploy.yml",
+        "--events=push",
+        "--allow-forks",
+    ] {
+        let project = TempProject::empty(r#"{"name":"gitlab-oidc","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args([
+                "env",
+                "oidc",
+                "allow",
+                "--provider=gitlab",
+                "--project-id=12345",
+                "--env=production",
+                flag,
+            ])
+            .output()
+            .expect("run rejected GitLab OIDC policy");
+
+        assert!(!output.status.success());
+        assert!(mock.server().received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn env_oidc_allow_github_rejects_empty_repository_segments_before_network() {
+    for repo in ["/repository", "owner/", "/"] {
+        let project = TempProject::empty(r#"{"name":"github-oidc","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file("lpm.json", r#"{"vault":"vault-github-invalid-repo"}"#);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("session-access-token"),
+                refresh_token: Some("refresh-token"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args([
+                "env",
+                "oidc",
+                "allow",
+                &format!("--repo={repo}"),
+                "--workflow=.github/workflows/deploy.yml",
+                "--env=production",
+            ])
+            .output()
+            .expect("run rejected GitHub OIDC policy");
+
+        assert!(!output.status.success(), "{repo:?} should be rejected");
+        assert!(
+            mock.server().received_requests().await.unwrap().is_empty(),
+            "{repo:?} should fail before authentication or policy creation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
+    let project = TempProject::empty(r#"{"name":"rotate-key","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-rotate-123"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let original_wrapping_key = [0x11; 32];
+    let wrapping_key_path = project.home().join(".lpm").join(".vault-key");
+    std::fs::write(&wrapping_key_path, hex::encode(original_wrapping_key))
+        .expect("seed original wrapping key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapping_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict original wrapping key");
+    }
+    let original_data_key = [0x22; 32];
+    let authoritative_payload = serde_json::json!({
+        "environments": {
+            "default": {},
+            "production": {"API_KEY": "remote-only"},
+            "staging": {"API_KEY": "stage"}
+        },
+        "aliases": {"prod": "production"},
+        "inheritance": {"staging": ["default"]},
+        "schema": {
+            "version": 2,
+            "envConfig": {"prod": {"canonical": "production"}}
+        }
+    });
+    mock.with_personal_pull_keys(
+        "vault-rotate-123",
+        "session-access-token",
+        authoritative_payload.clone(),
+        &original_wrapping_key,
+        &original_data_key,
+        7,
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "rotate-key"])
+        .output()
+        .expect("run env rotate-key");
+
+    assert!(
+        output.status.success(),
+        "rotate-key failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["version"], 8);
+    assert_eq!(json["environment_count"], 3);
+    assert_eq!(
+        json["environments"],
+        serde_json::json!(["default", "production", "staging"])
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("remote-only"));
+
+    let requests = mock.server().received_requests().await.unwrap();
+    let pushes: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect();
+    assert_eq!(
+        pushes.len(),
+        1,
+        "rotation must perform one CAS push without a preliminary migration write"
+    );
+    let push = pushes[0];
+    let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    assert_eq!(body["expectedVersion"], 7);
+    assert!(body.get("force").is_none());
+
+    let wrapped_key = body["wrappedKey"].as_str().expect("wrapped key");
+    let rotated_data_key = lpm_vault::crypto::unwrap_key(&original_wrapping_key, wrapped_key)
+        .expect("unwrap data key");
+    assert_ne!(
+        rotated_data_key, original_data_key,
+        "rotation must encrypt the complete payload under a fresh data key"
+    );
+    let rotated_plaintext = lpm_vault::crypto::decrypt(
+        &rotated_data_key,
+        body["encryptedBlob"].as_str().expect("encrypted blob"),
+    )
+    .expect("decrypt rotated payload");
+    let rotated_payload: serde_json::Value =
+        serde_json::from_slice(&rotated_plaintext).expect("parse rotated payload");
+    assert_eq!(
+        rotated_payload, authoritative_payload,
+        "rotation must preserve environments, aliases, inheritance, and schema metadata exactly"
+    );
+    let persisted_wrapping_key_bytes = hex::decode(
+        std::fs::read_to_string(&wrapping_key_path)
+            .expect("read wrapping key")
+            .trim(),
+    )
+    .expect("decode wrapping key");
+    let persisted_wrapping_key: [u8; 32] = persisted_wrapping_key_bytes
+        .try_into()
+        .expect("wrapping key must have 32 bytes");
+    assert_eq!(
+        persisted_wrapping_key, original_wrapping_key,
+        "data-key rotation must preserve the shared wrapping key used by browser and CI escrow"
+    );
+}
+
+#[tokio::test]
+async fn env_rotate_key_version_conflict_preserves_local_key_and_version_metadata() {
+    let project = TempProject::empty(r#"{"name":"rotate-key-conflict","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-rotate-conflict-123"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let wrapping_key = [0x33; 32];
+    let wrapping_key_path = project.home().join(".lpm").join(".vault-key");
+    std::fs::write(&wrapping_key_path, hex::encode(wrapping_key)).expect("seed wrapping key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapping_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict wrapping key");
+    }
+    mock.with_personal_pull_failure(
+        "vault-rotate-conflict-123",
+        "session-access-token",
+        serde_json::json!({
+            "environments": {
+                "default": {"API_KEY": "remote"}
+            }
+        }),
+        7,
+        409,
+        "vault version conflict",
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "rotate-key"])
+        .output()
+        .expect("run conflicting env rotate-key");
+
+    assert!(!output.status.success());
+    let error = parse_json_output(&output.stdout);
+    assert_eq!(error["success"], false);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("vault version conflict"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wrapping_key_path)
+            .expect("read wrapping key after conflict")
+            .trim(),
+        hex::encode(wrapping_key)
+    );
+    assert_eq!(
+        lpm_vault::vault_id::read_personal_sync_version(project.path()),
+        None
+    );
+}
+
+#[tokio::test]
+async fn env_rotate_key_encryption_failure_does_not_push_or_update_local_metadata() {
+    let project = TempProject::empty(r#"{"name":"rotate-key-encrypt","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-rotate-encrypt-123"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let wrapping_key = [0x44; 32];
+    let wrapping_key_path = project.home().join(".lpm").join(".vault-key");
+    std::fs::write(&wrapping_key_path, hex::encode(wrapping_key)).expect("seed wrapping key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapping_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict wrapping key");
+    }
+    mock.with_personal_pull(
+        "vault-rotate-encrypt-123",
+        "session-access-token",
+        serde_json::json!({
+            "environments": {
+                "default": {"API_KEY": "remote"}
+            }
+        }),
+        7,
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env(
+            "LPM_TEST_VAULT_WRAPPING_KEY_ERROR",
+            "simulated encryption failure",
+        )
+        .args(["--json", "env", "rotate-key"])
+        .output()
+        .expect("run env rotate-key with encryption failure");
+
+    assert!(!output.status.success());
+    let error = parse_json_output(&output.stdout);
+    assert_eq!(error["success"], false);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("simulated encryption failure"))
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wrapping_key_path)
+            .expect("read wrapping key after encryption failure")
+            .trim(),
+        hex::encode(wrapping_key)
+    );
+    assert_eq!(
+        lpm_vault::vault_id::read_personal_sync_version(project.path()),
+        None
+    );
+}
+
+#[tokio::test]
 async fn env_oidc_allow_emits_json_response() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-allow-json-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -2490,7 +2870,8 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
 }
 
 #[tokio::test]
-async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clears_auth_state() {
+async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revoke_clears_auth_state()
+ {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-refresh-logout-all-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -2536,6 +2917,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clear
     )
     .await;
     mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
         project.home(),
@@ -2600,7 +2982,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clear
 
     let logout_all = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout", "--all"])
+        .args(["logout", "--all", "--revoke"])
         .output()
         .expect("failed to run logout --all after refresh-backed oidc allow/list");
 
@@ -2644,7 +3026,8 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clear
 }
 
 #[tokio::test]
-async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_clears_auth_state() {
+async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_revoke_clears_auth_state()
+ {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-refresh-escrow-logout-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -2694,6 +3077,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_cle
     )
     .await;
     mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
         project.home(),
@@ -2760,7 +3144,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_cle
 
     let logout = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout"])
+        .args(["logout", "--revoke"])
         .output()
         .expect("failed to run logout after refresh-backed escrow warning flow");
 
@@ -2804,8 +3188,8 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_cle
 }
 
 #[tokio::test]
-async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all_clears_auth_state()
-{
+async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all_revoke_clears_auth_state()
+ {
     let project = TempProject::empty(
         r#"{"name":"vault-oidc-refresh-escrow-logout-all-test","version":"1.0.0"}"#,
     );
@@ -2856,6 +3240,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
     )
     .await;
     mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
         project.home(),
@@ -2912,7 +3297,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
 
     let logout_all = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["logout", "--all"])
+        .args(["logout", "--all", "--revoke"])
         .output()
         .expect("failed to run logout --all after refresh-backed escrow warning flow");
 

@@ -272,6 +272,17 @@ impl MockRegistry {
         token: &str,
         expires_at: &str,
     ) -> &Self {
+        self.with_npmrc_token_create_expected(expiry_days, token, expires_at, 1)
+            .await
+    }
+
+    pub async fn with_npmrc_token_create_expected(
+        &self,
+        expiry_days: u32,
+        token: &str,
+        expires_at: &str,
+        expected_calls: u64,
+    ) -> &Self {
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/create"))
             .and(body_string_contains("\"scope\":\"read\""))
@@ -280,8 +291,20 @@ impl MockRegistry {
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": token,
+                "scope": "read",
                 "expiresAt": expires_at,
             })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_create_response(&self, response: serde_json::Value) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/create"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
             .mount(&self.server)
             .await;
@@ -502,6 +525,20 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_revoke_all_pairings_status(&self, status: u16) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/pair/revoke-all"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "error": "pairing revocation unavailable"
+                })),
+            )
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a successful token revocation endpoint.
     pub async fn with_revoke_token(&self, bearer_token: &str) -> &Self {
         self.with_revoke_token_expected(bearer_token, 1).await
@@ -514,11 +551,11 @@ impl MockRegistry {
         expected_calls: u64,
     ) -> &Self {
         Mock::given(method("POST"))
-            .and(path("/api/registry/tokens/revoke"))
+            .and(path("/api/cli/revoke"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .and(body_string_contains(bearer_token.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true
+                "status": "revoked",
+                "alreadyRevoked": false
             })))
             .expect(expected_calls)
             .mount(&self.server)
@@ -825,7 +862,78 @@ impl MockRegistry {
             .expect("failed to encrypt vault payload");
         let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &aes_key)
             .expect("failed to wrap vault payload key");
+        self.mount_personal_pull(
+            vault_id,
+            bearer_token,
+            encrypted_blob,
+            wrapped_key,
+            version,
+            None,
+        )
+        .await
+    }
 
+    pub async fn with_personal_pull_keys(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        payload: serde_json::Value,
+        wrapping_key: &[u8; 32],
+        data_key: &[u8; 32],
+        version: i32,
+    ) -> &Self {
+        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
+        let encrypted_blob = lpm_vault::crypto::encrypt(data_key, plaintext.as_bytes())
+            .expect("failed to encrypt vault payload");
+        let wrapped_key = lpm_vault::crypto::wrap_key(wrapping_key, data_key)
+            .expect("failed to wrap vault payload key");
+        self.mount_personal_pull(
+            vault_id,
+            bearer_token,
+            encrypted_blob,
+            wrapped_key,
+            version,
+            None,
+        )
+        .await
+    }
+
+    pub async fn with_personal_pull_failure(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        payload: serde_json::Value,
+        version: i32,
+        status: u16,
+        error: &str,
+    ) -> &Self {
+        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
+        let data_key = lpm_vault::crypto::generate_aes_key();
+        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
+        let encrypted_blob = lpm_vault::crypto::encrypt(&data_key, plaintext.as_bytes())
+            .expect("failed to encrypt vault payload");
+        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &data_key)
+            .expect("failed to wrap vault payload key");
+        self.mount_personal_pull(
+            vault_id,
+            bearer_token,
+            encrypted_blob,
+            wrapped_key,
+            version,
+            Some((status, error.to_string())),
+        )
+        .await
+    }
+
+    async fn mount_personal_pull(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        encrypted_blob: String,
+        wrapped_key: String,
+        version: i32,
+        push_failure: Option<(u16, String)>,
+    ) -> &Self {
         // Sync endpoints carry an X-LPM-Signature header on success — the
         // CLI hard-fails any 2xx response without it (HMAC verification
         // is mandatory). Sign both GET and POST mock bodies with the
@@ -845,6 +953,15 @@ impl MockRegistry {
         }))
         .expect("test push body should serialize");
         let push_sig = lpm_vault::signature::sign_body(push_body.as_bytes(), bearer_token);
+        let push_response = match push_failure {
+            Some((status, error)) => {
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": error }))
+            }
+            None => ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/json")
+                .insert_header(lpm_vault::signature::SIGNATURE_HEADER, push_sig.as_str())
+                .set_body_string(push_body),
+        };
 
         Mock::given(method("GET"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
@@ -862,12 +979,7 @@ impl MockRegistry {
         Mock::given(method("POST"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "application/json")
-                    .insert_header(lpm_vault::signature::SIGNATURE_HEADER, push_sig.as_str())
-                    .set_body_string(push_body),
-            )
+            .respond_with(push_response)
             .mount(&self.server)
             .await;
 
@@ -983,6 +1095,44 @@ impl MockRegistry {
             "success": true,
             "provider": "github",
             "subject": format!("repo:{repo}"),
+        })))
+        .expect(1)
+        .mount(&self.server)
+        .await;
+        self
+    }
+
+    pub async fn with_gitlab_oidc_policy_create(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        project_id: &str,
+        branches: &[&str],
+        envs: &[&str],
+    ) -> &Self {
+        let mut mock = Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains("\"provider\":\"gitlab\""))
+            .and(body_string_contains(format!(
+                "\"subject\":\"project:{project_id}\""
+            )))
+            .and(body_string_contains("\"allowedWorkflows\":[]"))
+            .and(body_string_contains("\"allowedEvents\":[]"))
+            .and(body_string_contains("\"allowForks\":false"));
+
+        for branch in branches {
+            mock = mock.and(body_string_contains(format!("\"{branch}\"")));
+        }
+        for env_name in envs {
+            mock = mock.and(body_string_contains(format!("\"{env_name}\"")));
+        }
+
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "provider": "gitlab",
+            "subject": format!("project:{project_id}"),
         })))
         .expect(1)
         .mount(&self.server)

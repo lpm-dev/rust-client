@@ -233,7 +233,10 @@ fn ci_setup_gitlab_emits_id_tokens_block_and_authorization_command() {
         "setup snippet must declare the `LPM_OIDC_TOKEN` id_tokens block, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("lpm env oidc allow --provider=gitlab"),
+        stdout.contains("lpm env oidc allow --provider=gitlab")
+            && stdout.contains("--project-id=<numeric-project-id>")
+            && !stdout.contains("--repo=<project-path>")
+            && !stdout.contains("--workflow="),
         "setup output must print the matching authorization command, got:\n{stdout}"
     );
 }

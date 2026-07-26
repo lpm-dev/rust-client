@@ -56,24 +56,25 @@ pub(super) fn parse_remote_pull_payload_for_overwrite(
 
 /// Read `lpm.json` for an `lpm env push` surface (personal or org).
 ///
-/// Returns `Some(config)` on a clean parse and `None` when the file is
-/// absent. When the file is present but malformed, emits a stderr warning
-/// (and a tracing entry) then returns `None` rather than failing the push.
+/// Returns `Ok(Some(config))` on a clean parse and `Ok(None)` when the file is
+/// absent. When JSON syntax is malformed, emits a stderr warning and returns
+/// `Ok(None)` rather than failing the push.
 /// Push is the user's mainline action and a metadata read should never
 /// block it; the stderr warning surfaces the silent-stale-schema failure
 /// mode (push succeeds, server keeps last-known-good schema).
 pub(super) fn read_lpm_json_for_push(
     project_dir: &std::path::Path,
-) -> Option<lpm_runner::lpm_json::LpmJsonConfig> {
+) -> Result<Option<lpm_runner::lpm_json::LpmJsonConfig>, LpmError> {
     match lpm_runner::lpm_json::read_lpm_json(project_dir) {
-        Ok(opt) => opt,
-        Err(e) => {
+        Ok(config) => Ok(config),
+        Err(error) if error.starts_with("failed to parse lpm.json:") => {
             output::warn(&format!(
-                "lpm.json could not be parsed: {e}. Pushing without schema metadata; server keeps the last-known-good schema."
+                "lpm.json could not be parsed: {error}. Pushing without schema metadata; server keeps the last-known-good schema."
             ));
-            tracing::warn!("lpm.json parse error during env push: {e}");
-            None
+            tracing::warn!("lpm.json parse error during env push: {error}");
+            Ok(None)
         }
+        Err(error) => Err(LpmError::Script(error)),
     }
 }
 
@@ -84,7 +85,8 @@ pub(super) fn read_lpm_json_for_push(
 /// required, secret, etc. Wire shape is identical for personal and org
 /// vaults — the calling layer decides whether to send it. Returns `None`
 /// when the project has no `lpm.json` (or it failed to parse — see
-/// [`read_lpm_json_for_push`]).
+/// [`read_lpm_json_for_push`]). Read and semantic-validation failures remain
+/// errors.
 pub(super) fn build_push_schema_value(
     config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Option<serde_json::Value> {
@@ -225,7 +227,7 @@ mod tests {
     fn read_lpm_json_for_push_returns_none_when_file_missing() {
         // Absent lpm.json is not a warning condition — push just doesn't send schema.
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(read_lpm_json_for_push(dir.path()).is_none());
+        assert!(read_lpm_json_for_push(dir.path()).unwrap().is_none());
     }
 
     #[test]
@@ -235,7 +237,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lpm.json"), "{ this is not json")
             .expect("seed broken lpm.json");
-        let parsed = read_lpm_json_for_push(dir.path());
+        let parsed = read_lpm_json_for_push(dir.path()).unwrap();
         assert!(
             parsed.is_none(),
             "malformed lpm.json must yield None so the push proceeds without metadata"
@@ -250,11 +252,45 @@ mod tests {
             r#"{"envSchema":{"vars":{"FOO":{"required":true}}}}"#,
         )
         .expect("seed valid lpm.json");
-        let parsed = read_lpm_json_for_push(dir.path()).expect("valid lpm.json must parse");
+        let parsed = read_lpm_json_for_push(dir.path())
+            .expect("valid lpm.json must parse")
+            .expect("valid lpm.json must exist");
         assert!(
             parsed.env_schema.is_some(),
             "envSchema field must round-trip through the parser helper"
         );
+    }
+
+    #[test]
+    fn read_lpm_json_for_push_rejects_oversized_and_unreadable_files() {
+        let oversized = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            oversized.path().join("lpm.json"),
+            vec![
+                b' ';
+                usize::try_from(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+                    .expect("config cap fits usize")
+            ],
+        )
+        .expect("seed oversized lpm.json");
+        assert!(read_lpm_json_for_push(oversized.path()).is_err());
+
+        let unreadable = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(unreadable.path().join("lpm.json"))
+            .expect("seed unreadable lpm.json path");
+        assert!(read_lpm_json_for_push(unreadable.path()).is_err());
+    }
+
+    #[test]
+    fn read_lpm_json_for_push_rejects_semantically_invalid_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"envSchema":"must-be-an-object"}"#,
+        )
+        .expect("seed semantically invalid lpm.json");
+
+        assert!(read_lpm_json_for_push(dir.path()).is_err());
     }
 
     #[test]

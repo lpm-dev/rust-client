@@ -1,6 +1,6 @@
 mod support;
 
-use support::auth_state::{SessionSeed, seed_sessions};
+use support::auth_state::{SessionSeed, credentials_path, seed_sessions};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
@@ -113,6 +113,7 @@ async fn logout_human_output_uses_slim_done_line_and_clears_state() {
 async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
+    mock.with_revoke_all_pairings().await;
     mock.with_revoke_token("access-primary").await;
 
     seed_sessions(
@@ -120,7 +121,7 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
         &[SessionSeed {
             registry_url: &mock.url(),
             access_token: Some("access-primary"),
-            refresh_token: None,
+            refresh_token: Some("refresh-primary"),
             session_access_expires_at: None,
         }],
     );
@@ -146,7 +147,8 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("› Clearing stored lpm.dev session")
-            && stderr.contains("✓ Revoked server-side token")
+            && stderr.contains("✓ Revoked browser pairings")
+            && stderr.contains("✓ Revoked server-side CLI session")
             && stderr.contains("✓ Done · signed out of lpm.dev"),
         "logout --revoke should show the slim clear/revoke/done lines, got:\n{stderr}"
     );
@@ -158,4 +160,51 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
         !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
         "legacy cliclack glyphs must be gone from logout stderr, got:\n{stderr}"
     );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    let paths: Vec<_> = requests
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["/api/vault/pair/revoke-all", "/api/cli/revoke"],
+        "pairings must be revoked before the session bearer"
+    );
+}
+
+#[tokio::test]
+async fn logout_revoke_json_remote_failure_is_nonzero_but_clears_local_once() {
+    let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_revoke_all_pairings_status(503).await;
+    mock.with_revoke_token("access-primary").await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("access-primary"),
+            refresh_token: Some("refresh-primary"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--revoke"])
+        .output()
+        .expect("run logout --revoke JSON failure");
+
+    assert!(!output.status.success());
+    let documents: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .expect("logout JSON must parse");
+    assert_eq!(documents.len(), 1);
+    let json = &documents[0];
+    assert_eq!(json["success"], false);
+    assert_eq!(json["revoke_requested"], true);
+    assert_eq!(json["pairings_revoked"], false);
+    assert_eq!(json["server_revoked"], true);
+    assert_eq!(json["local_cleared"], true);
+    assert!(!credentials_path(project.home()).exists());
 }

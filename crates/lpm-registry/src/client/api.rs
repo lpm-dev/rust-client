@@ -177,34 +177,32 @@ impl RegistryClient {
             .await
     }
 
-    /// Revoke the current token on the server.
+    /// Revoke the current refresh-backed CLI session on the server.
     ///
     /// Posture: `AuthRequired`. The bearer is re-resolved inside the
     /// recovery closure so that, on a 401 → refresh → retry, the
     /// rotated token is sent on the second attempt.
     ///
-    /// Calls: POST /api/registry/tokens/revoke
-    pub async fn revoke_token(&self) -> Result<(), LpmError> {
-        let url = format!("{}/api/registry/tokens/revoke", self.base_url);
+    /// Calls: POST /api/cli/revoke
+    pub async fn revoke_session(&self) -> Result<(), LpmError> {
+        let url = format!("{}/api/cli/revoke", self.base_url);
 
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let bearer = self
-                .current_bearer(AuthPosture::AuthRequired)
-                .ok_or_else(|| LpmError::Registry("no token to revoke".to_string()))?;
-            let body = serde_json::json!({ "token": bearer });
+                .current_bearer(AuthPosture::SessionRequired)
+                .ok_or(LpmError::SessionExpired)?;
             let req = self
                 .http
                 .for_url(&url)
                 .await?
                 .post(&url)
-                .bearer_auth(&bearer)
-                .json(&body);
+                .bearer_auth(&bearer);
             let response = self.send_with_retry(req).await?;
             if response.status().is_success() {
                 Ok(())
             } else {
                 Err(LpmError::Registry(format!(
-                    "token revocation failed: {}",
+                    "session revocation failed: {}",
                     response.status()
                 )))
             }

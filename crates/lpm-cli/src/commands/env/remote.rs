@@ -84,7 +84,7 @@ pub(super) async fn env_share(
     super::rotation::ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "share")
         .await?;
 
-    let config = super::sync_payload::read_lpm_json_for_push(project_dir);
+    let config = super::sync_payload::read_lpm_json_for_push(project_dir)?;
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());

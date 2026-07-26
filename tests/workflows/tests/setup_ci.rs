@@ -9,7 +9,7 @@
 //! - legacy `proxy = true` config no longer widens `.npmrc`
 //! - `--registry <url>` overrides the registry URL
 //! - JSON envelope shape (path, content, uses_env_var, oidc, proxy)
-//! - missing-token fallback uses the `${LPM_TOKEN}` placeholder
+//! - missing-token failure leaves the project unchanged
 
 mod support;
 
@@ -19,7 +19,7 @@ use support::{TempProject, lpm};
 // ─── default scoped config ────────────────────────────────────────────
 
 #[test]
-fn setup_ci_default_writes_scoped_registry_line_to_dot_npmrc() {
+fn setup_ci_without_bearer_fails_before_writing_dot_npmrc() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -33,57 +33,31 @@ fn setup_ci_default_writes_scoped_registry_line_to_dot_npmrc() {
         .output()
         .expect("failed to run lpm setup ci npmrc");
 
+    assert!(!output.status.success(), "missing bearer must fail");
     assert!(
-        output.status.success(),
-        "lpm setup ci npmrc failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    let npmrc =
-        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
-    assert!(
-        npmrc.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
-        ".npmrc must use the scoped registry line by default, got:\n{npmrc}",
-    );
-    // The default path (no stored token) falls back to `${LPM_TOKEN}`.
-    assert!(
-        npmrc.contains("${LPM_TOKEN}") || npmrc.contains("_authToken="),
-        ".npmrc must include an authToken entry, got:\n{npmrc}",
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.trim().is_empty(),
-        "human setup ci should not write to stdout, got:\n{stdout}"
+        !project.file_exists(".npmrc"),
+        "failure must not write .npmrc"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Generated .npmrc"),
-        "human setup ci should report file generation with the slim done line, got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("! No token found — .npmrc uses ${LPM_TOKEN} placeholder."),
-        "human setup ci should surface the placeholder warning on stderr, got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Set LPM_TOKEN in your CI environment."),
-        "human setup ci should keep the CI env-var hint, got:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
-        "legacy cliclack glyphs must be gone from setup ci stderr, got:\n{stderr}"
+        stderr.contains("LPM_TOKEN") && stderr.contains("lpm login"),
+        "failure must explain how to supply a bearer, got:\n{stderr}"
     );
 }
 
 #[test]
-fn setup_ci_color_output_uses_plain_file_and_cyan_env_var() {
+fn setup_ci_writes_literal_env_bearer_and_preserves_unrelated_config() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "registry=https://registry.example.test/\nfund=false\n",
+    )
+    .expect("seed .npmrc");
 
     let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
         .args([
-            "--color=always",
             "--registry",
             "https://lpm.example.test",
             "setup",
@@ -94,15 +68,160 @@ fn setup_ci_color_output_uses_plain_file_and_cyan_env_var() {
         .expect("failed to run lpm setup ci npmrc --color=always");
 
     assert!(output.status.success(), "lpm setup ci npmrc failed");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let npmrc = project.read_file(".npmrc");
     assert!(
-        stderr.contains("Generated .npmrc") && !stderr.contains("Generated \u{1b}[1m.npmrc"),
-        ".npmrc should remain plain in setup ci output, got:\n{stderr}"
+        npmrc.contains("registry=https://registry.example.test/")
+            && npmrc.contains("fund=false")
+            && npmrc.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/")
+            && npmrc.contains("ci-runtime-token"),
+        "generated block must preserve unrelated config and contain the resolved bearer:\n{npmrc}"
     );
     assert!(
-        stderr.contains("\u{1b}[36mLPM_TOKEN"),
-        "LPM_TOKEN should use the env-var color role, got:\n{stderr}"
+        !npmrc.contains("${LPM_TOKEN}"),
+        "project .npmrc must not contain sensitive environment expansion"
+    );
+
+    let mut parsed = lpm_registry::npmrc::NpmrcConfig::parse_layer_with_options(
+        &npmrc,
+        "project/.npmrc",
+        Some(project.path()),
+        true,
+        &|_| None,
+    );
+    parsed.finalize();
+    assert!(
+        parsed.security_warnings.is_empty() && parsed.errors.is_empty(),
+        "generated project layer must pass the real trust parser: {:?} {:?}",
+        parsed.security_warnings,
+        parsed.errors
+    );
+    assert!(parsed.scope_registries.contains_key("@lpm.dev"));
+    assert!(
+        parsed
+            .auth_for_url("https://lpm.example.test/api/registry/@lpm.dev/pkg")
+            .is_some(),
+        "generated literal bearer must resolve for the scoped registry origin"
+    );
+}
+
+#[test]
+fn setup_ci_replaces_unterminated_generated_block_without_dropping_following_config() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "# LPM Registry (generated by lpm setup ci npmrc)\n\
+         //lpm.example.test/:_authToken=stale-token\n\
+         @lpm.dev:registry=https://lpm.example.test/api/registry/\n\
+         fund=false\n",
+    )
+    .expect("seed unterminated generated block");
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "replacement-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci against unterminated block");
+
+    assert!(
+        output.status.success(),
+        "setup failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let npmrc = project.read_file(".npmrc");
+    assert!(npmrc.contains("fund=false"));
+    assert!(npmrc.contains("replacement-token"));
+    assert!(!npmrc.contains("stale-token"));
+}
+
+#[test]
+fn setup_ci_stray_end_marker_does_not_extend_an_unterminated_generated_block() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "# End LPM Registry\n\
+         # LPM Registry (generated by lpm setup ci npmrc)\n\
+         //lpm.example.test/:_authToken=stale-token\n\
+         @lpm.dev:registry=https://lpm.example.test/api/registry/\n\
+         fund=false\n",
+    )
+    .expect("seed generated block with a stray earlier end marker");
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "lpm_replacement-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci against unterminated block");
+
+    assert!(
+        output.status.success(),
+        "setup failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let npmrc = project.read_file(".npmrc");
+    assert!(
+        npmrc.contains("fund=false"),
+        "an earlier stray end marker must not cause unrelated trailing config to be dropped:\n{npmrc}"
+    );
+    assert!(npmrc.contains("lpm_replacement-token"));
+    assert!(!npmrc.contains("stale-token"));
+}
+
+#[test]
+fn setup_ci_rejects_malformed_bearer_before_writing_dot_npmrc() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-token\u{1b}injected")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci with malformed bearer");
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists(".npmrc"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("malformed"),
+        "failure should identify the malformed bearer"
+    );
+}
+
+#[test]
+fn setup_ci_explicit_oidc_failure_does_not_fall_back_to_stored_token() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let registry_url = "https://lpm.example.test";
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url,
+            access_token: Some("stored-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .args(["--registry", registry_url, "setup", "ci", "npmrc", "--oidc"])
+        .output()
+        .expect("run setup ci with unavailable explicit OIDC");
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists(".npmrc"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no fallback was used"),
+        "explicit OIDC failure should explain that stored credentials were not used"
     );
 }
 
@@ -147,6 +266,7 @@ fn setup_ci_ignores_legacy_proxy_config_when_writing_dot_npmrc() {
         .expect("write legacy proxy config");
 
     let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
         .args([
             "--registry",
             "https://lpm.example.test",
@@ -183,6 +303,7 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
         .args([
             "--registry",
             "https://lpm.example.test",
@@ -220,6 +341,21 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
         content.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
         "envelope content must include the scoped registry line, got:\n{content}",
     );
+}
+
+#[test]
+fn setup_ci_scoped_flag_is_an_unknown_argument_without_writes() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["setup", "ci", "npmrc", "--scoped"])
+        .output()
+        .expect("run setup ci with removed flag");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--scoped"));
+    assert!(!project.file_exists(".npmrc"));
 }
 
 #[test]
