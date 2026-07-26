@@ -306,3 +306,48 @@ async fn logout_revoke_with_specific_target_is_rejected_before_credentials_chang
     );
     assert_eq!(read_credentials(project.home()), before);
 }
+
+#[tokio::test]
+async fn logout_all_json_reports_failure_when_the_local_credential_store_cannot_be_cleared() {
+    let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    std::fs::create_dir_all(credentials_path(project.home()))
+        .expect("create broken credentials-path directory");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "environment-session-token")
+        .args(["--json", "logout", "--all"])
+        .output()
+        .expect("run logout --all with a broken credential store");
+
+    assert!(
+        !output.status.success(),
+        "logout --all must fail when any requested local store cannot be cleared"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["local_cleared"], false);
+}
+
+#[tokio::test]
+async fn targeted_logout_json_reports_failure_when_its_credential_store_cannot_be_cleared() {
+    let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    std::fs::create_dir_all(credentials_path(project.home()))
+        .expect("create broken credentials-path directory");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--npm"])
+        .output()
+        .expect("run targeted npm logout with a broken credential store");
+
+    assert!(
+        !output.status.success(),
+        "targeted logout must fail when its credential cannot be cleared"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["local_cleared"], false);
+}

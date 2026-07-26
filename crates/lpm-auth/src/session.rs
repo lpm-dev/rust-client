@@ -601,7 +601,7 @@ impl SessionManager {
     /// authoritatively rejects the session.
     pub fn clear_session(&self) {
         let _ = clear_token(&self.registry_url);
-        clear_refresh_token(&self.registry_url);
+        let _ = clear_refresh_token(&self.registry_url);
         if let Ok(mut guard) = self.cached.write() {
             *guard = None;
         }

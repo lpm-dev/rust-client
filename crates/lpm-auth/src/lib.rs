@@ -275,34 +275,20 @@ pub fn auth_storage_status(registry_url: &str) -> AuthStorageStatus {
 
 /// Remove the stored token for a given registry URL.
 pub fn clear_token(registry_url: &str) -> Result<(), String> {
-    // Surface real keychain/file errors via tracing so an operator can
-    // see when `lpm logout` claimed success but a credential was left
-    // behind (locked keychain, permission denied, framework error).
-    // The underlying helpers treat "already absent" as Ok(()), so a
-    // warn here means a genuine failure.
-    if let Err(e) = clear_token_from_keychain(registry_url) {
-        tracing::warn!(
-            registry = %registry_url,
-            error = %e,
-            "clear_token: keychain delete failed; token may still be present",
-        );
-    }
-
-    if let Err(e) = clear_token_from_file(registry_url) {
-        tracing::warn!(
-            registry = %registry_url,
-            error = %e,
-            "clear_token: file delete failed; encrypted token may still be present",
-        );
-    }
-
-    Ok(())
+    clear_stored_token(registry_url)
 }
 
 fn clear_stored_token(registry_url: &str) -> Result<(), String> {
     let keychain_result = clear_token_from_keychain(registry_url);
     let file_result = clear_token_from_file(registry_url);
 
+    combine_clear_results(keychain_result, file_result)
+}
+
+fn combine_clear_results(
+    keychain_result: Result<(), String>,
+    file_result: Result<(), String>,
+) -> Result<(), String> {
     match (keychain_result, file_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(keychain), Ok(())) => Err(keychain),
@@ -332,10 +318,10 @@ pub fn clear_login_state(registry_url: &str) -> Result<(), String> {
 
     #[cfg(not(test))]
     let result = {
-        clear_token(registry_url)?;
-        clear_refresh_token(registry_url);
+        let access_result = clear_token(registry_url);
+        let refresh_result = clear_refresh_token(registry_url);
         clear_token_expiry(registry_url);
-        Ok(())
+        combine_clear_results(access_result, refresh_result)
     };
 
     result
@@ -1159,26 +1145,12 @@ pub fn has_refresh_token(registry: &str) -> bool {
 }
 
 /// Clear the stored refresh token for a registry.
-pub fn clear_refresh_token(registry: &str) {
+pub fn clear_refresh_token(registry: &str) -> Result<(), String> {
     let account = scoped_refresh_account(registry);
-
-    // See [`clear_token`] — surface real failures via tracing so a
-    // silent post-logout token never goes unnoticed.
-    if let Err(e) = clear_password_from_keychain_account(&account) {
-        tracing::warn!(
-            registry = %registry,
-            error = %e,
-            "clear_refresh_token: keychain delete failed; refresh token may still be present",
-        );
-    }
-
-    if let Err(e) = clear_token_from_file(&format!("refresh:{registry}")) {
-        tracing::warn!(
-            registry = %registry,
-            error = %e,
-            "clear_refresh_token: file delete failed; encrypted refresh token may still be present",
-        );
-    }
+    combine_clear_results(
+        clear_password_from_keychain_account(&account),
+        clear_token_from_file(&format!("refresh:{registry}")),
+    )
 }
 
 /// Parse the npm auth token from `.npmrc` files.
@@ -2171,6 +2143,23 @@ mod tests {
             assert!(get_token_from_file(&format!("refresh:{registry}")).is_none());
             assert!(!read_token_expiries().contains_key(registry));
             assert!(!legacy_marker.exists());
+        });
+    }
+
+    #[test]
+    fn clear_token_reports_an_unreadable_file_store_instead_of_claiming_success() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let credentials = home.join(".lpm").join(".credentials");
+            std::fs::create_dir_all(&credentials)
+                .expect("create an unreadable credentials-path directory");
+
+            let result = clear_token("https://registry.example.test");
+
+            assert!(
+                result.is_err(),
+                "a credential-store read failure must make logout fail"
+            );
         });
     }
 

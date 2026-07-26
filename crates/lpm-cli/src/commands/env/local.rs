@@ -275,8 +275,6 @@ pub(super) fn parse_env_flag<'a>(
     Ok((env_mode, remaining))
 }
 
-/// Load lpm.json config and resolve an --env flag value to a canonical env name.
-/// Returns (canonical_env_name_or_none, lpm_config_or_none).
 /// Resolve an `--env` flag value to a canonical env name.
 ///
 /// Returns `Err` if the flag was provided but the value is invalid.
@@ -285,9 +283,7 @@ pub(super) fn resolve_env_from_flag(
     env_input: Option<&str>,
     project_dir: &std::path::Path,
 ) -> Result<(Option<String>, Option<lpm_runner::lpm_json::LpmJsonConfig>), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let empty = std::collections::HashMap::new();
     match env_input {
         Some(input) => {
@@ -348,4 +344,26 @@ pub(super) fn vars_list(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_env_from_flag;
+
+    #[test]
+    fn resolve_named_environment_rejects_malformed_lpm_json() {
+        let project = tempfile::tempdir().expect("create temporary project");
+        std::fs::write(
+            project.path().join("lpm.json"),
+            r#"{"env":{"prod":"production"}"#,
+        )
+        .expect("write malformed lpm.json");
+
+        let result = resolve_env_from_flag(Some("prod"), project.path());
+
+        assert!(
+            result.is_err(),
+            "named environment resolution must preserve lpm.json parse failures"
+        );
+    }
 }

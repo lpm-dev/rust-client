@@ -89,6 +89,50 @@ fn workflow_harness_removes_inherited_lpm_vault_id() {
 }
 
 #[test]
+fn env_set_with_a_named_environment_rejects_malformed_lpm_json_before_writing() {
+    let project = TempProject::empty(r#"{"name":"env-config","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"env":{"prod":"production"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "set", "--env=prod", "API_TOKEN=secret"])
+        .output()
+        .expect("run env set with malformed lpm.json");
+
+    assert!(
+        !output.status.success(),
+        "a named env operation must not ignore malformed alias configuration"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to parse lpm.json"),
+        "the failure must identify malformed lpm.json:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn env_oidc_allow_help_is_a_successful_non_mutating_help_surface() {
+    let project = TempProject::empty(r#"{"name":"oidc-help","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["env", "oidc", "allow", "--help"])
+        .output()
+        .expect("run env oidc allow --help");
+
+    assert!(
+        output.status.success(),
+        "OIDC allow help must not be parsed as a policy mutation"
+    );
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains("--provider=github"));
+    assert!(rendered.contains("--provider=gitlab"));
+    assert!(rendered.contains("--project-id"));
+}
+
+#[test]
 fn doctor_json_reports_file_vault_fallback_when_forced_file_backend_is_active() {
     let project = TempProject::empty(r#"{"name":"vault-doctor","version":"1.0.0"}"#);
 

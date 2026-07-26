@@ -16,12 +16,38 @@ pub(super) async fn vars_oidc(
     }
 
     match args[0] {
+        "--help" | "-h" => {
+            print_oidc_help();
+            Ok(())
+        }
+        "allow" if args[1..].iter().any(|arg| matches!(*arg, "--help" | "-h")) => {
+            print_oidc_allow_help();
+            Ok(())
+        }
         "allow" => vars_oidc_allow(&args[1..], project_dir, json_output).await,
         "list" => vars_oidc_list(project_dir, json_output).await,
         unknown => Err(LpmError::Script(format!(
             "unknown oidc action: '{unknown}'. Available: allow, list"
         ))),
     }
+}
+
+fn print_oidc_help() {
+    println!(
+        "Usage:\n  lpm env oidc allow [OPTIONS]\n  lpm env oidc list\n\n\
+         Run `lpm env oidc allow --help` before updating an existing policy."
+    );
+}
+
+fn print_oidc_allow_help() {
+    println!(
+        r#"Usage:
+  lpm env oidc allow --provider=github --repo=<owner/repo> --workflow=.github/workflows/<file>.yml --branch=<list> --env=<list> [--events=<list>] [--allow-forks]
+
+  lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=<list> --env=<list>
+
+This command replaces the policy's complete allowlists. Run `lpm env oidc list` first, then supply every branch, environment, workflow, and event that should remain allowed."#
+    );
 }
 
 /// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production`
@@ -581,13 +607,17 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         ),
         "branch_not_allowed" => Some(
             "The branch claim from your CI's OIDC token isn't in the policy's allowedBranches. \
-             Update it with `lpm env oidc allow`, keeping the same provider identity flags and \
-             supplying `--branch=<list>`.",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
         ),
         "env_not_allowed" => Some(
-            "The requested env isn't in the policy's allowedEnvironments. Update the policy: \
-             rerun `lpm env oidc allow` with the same provider identity flags and \
-             `--env=<list>`.",
+            "The requested env isn't in the policy's allowedEnvironments. Inspect the complete \
+             policy with `lpm env oidc list`, then review `lpm env oidc allow --help` before \
+             deliberately replacing its allowlists.",
+        ),
+        "ref_type_not_allowed" => Some(
+            "The GitLab OIDC token identifies a tag or another non-branch ref. Branch allowlists \
+             authorize branch pipelines only; run this job from an allowed branch.",
         ),
         "workflow_not_allowed" => Some(
             "The workflow file that minted this token isn't in the policy's allowedWorkflows. \
@@ -652,11 +682,24 @@ mod oidc_error_hint_tests {
 
     #[test]
     fn provider_neutral_codes_do_not_invent_github_flags_without_server_hint() {
-        for code in ["policy_not_found", "branch_not_allowed", "env_not_allowed"] {
+        for code in [
+            "policy_not_found",
+            "branch_not_allowed",
+            "env_not_allowed",
+            "ref_type_not_allowed",
+        ] {
             let message = build_oidc_pull_error_message("not allowed", "", code);
             assert!(!message.contains("--repo"), "{code}: {message}");
             assert!(!message.contains("--workflow"), "{code}: {message}");
         }
+    }
+
+    #[test]
+    fn gitlab_non_branch_ref_code_explains_branch_only_policy() {
+        let message =
+            build_oidc_pull_error_message("Ref type not authorized", "", "ref_type_not_allowed");
+        assert!(message.contains("tag"));
+        assert!(message.contains("branch pipelines only"));
     }
 
     #[test]

@@ -1446,73 +1446,26 @@ async fn async_main() -> Result<()> {
                 ));
             }
 
-            let mut lpm_logout_result = Ok(());
-            if all || !has_specific {
-                // Default: LPM only. --all: everything.
-                let registry = cli
-                    .registry
-                    .as_deref()
-                    .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-                lpm_logout_result =
-                    commands::logout::run(&client, &session, registry, revoke, cli.json).await;
-            }
-
-            if all || npm {
-                match auth::clear_npm_token() {
-                    Ok(()) if !cli.json => output::success("Logged out from npmjs.org"),
-                    Err(_) if !cli.json => output::info("Not logged in to npmjs.org"),
-                    _ => {}
-                }
-                auth::clear_token_expiry("npmjs.org");
-            }
-            if all || github {
-                match auth::clear_github_token() {
-                    Ok(()) if !cli.json => output::success(
-                        "Logged out from GitHub Packages fallback token (GitHub CLI auth is managed by gh)",
-                    ),
-                    Err(_) if !cli.json => output::info("Not logged in to GitHub Packages"),
-                    _ => {}
-                }
-                auth::clear_token_expiry("github.com");
-            }
-            if all || gitlab {
-                match auth::clear_gitlab_token() {
-                    Ok(()) if !cli.json => output::success(
-                        "Logged out from GitLab Packages fallback token (GitLab CLI auth is managed by glab)",
-                    ),
-                    Err(_) if !cli.json => output::info("Not logged in to GitLab Packages"),
-                    _ => {}
-                }
-                auth::clear_token_expiry("gitlab.com");
-            }
-
-            // Custom registry logout (explicit URL or --all)
-            if let Some(url) = &logout_registry {
-                match auth::clear_custom_registry_token(url) {
-                    Ok(()) if !cli.json => output::success_line(crate::install_ui::terminal_line!(
-                        "Logged out from {}",
-                        crate::install_ui::url(url),
-                    )),
-                    Err(_) if !cli.json => output::info_line(crate::install_ui::terminal_line!(
-                        "Not logged in to {}",
-                        crate::install_ui::url(url),
-                    )),
-                    _ => {}
-                }
-            }
-            if all {
-                for (url, result) in auth::clear_all_custom_registries() {
-                    match result {
-                        Ok(()) if !cli.json => output::success_line(crate::install_ui::terminal_line!(
-                            "Logged out from {}",
-                            crate::install_ui::url(&url),
-                        )),
-                        _ => {}
-                    }
-                }
-            }
-
-            lpm_logout_result
+            let registry = cli
+                .registry
+                .as_deref()
+                .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+            commands::logout::run(
+                &client,
+                &session,
+                registry,
+                revoke,
+                cli.json,
+                commands::logout::LogoutTargets {
+                    clear_lpm: all || !has_specific,
+                    npm: all || npm,
+                    github: all || github,
+                    gitlab: all || gitlab,
+                    custom_registry: (!all).then_some(logout_registry.as_deref()).flatten(),
+                    all_custom_registries: all,
+                },
+            )
+            .await
         }
         Commands::Setup(args) => match args.action {
             SetupAction::Ci {
@@ -1531,7 +1484,7 @@ async fn async_main() -> Result<()> {
                 match target {
                     "npmrc" => {
                         let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
-                        commands::setup::run(effective_registry, &cwd, cli.json, oidc).await
+                        commands::setup::run(&client, effective_registry, &cwd, cli.json, oidc).await
                     }
                     "github-actions" | "github" | "gha" => {
                         commands::setup::run_ci_platform(target, &cwd, &env)?;

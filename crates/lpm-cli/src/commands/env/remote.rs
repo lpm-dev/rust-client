@@ -283,9 +283,7 @@ pub(super) async fn vars_diff(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let empty_env_map = std::collections::HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());

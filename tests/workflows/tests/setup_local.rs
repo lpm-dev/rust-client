@@ -1,16 +1,16 @@
 mod support;
 
+use sha2::{Digest, Sha256};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
 const FIRST_TOKEN_ID: &str = "11111111-1111-4111-8111-111111111111";
-const SECOND_TOKEN_ID: &str = "22222222-2222-4222-8222-222222222222";
 
 #[tokio::test]
 async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
     let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create(14, "lpm_read_only_token", "2030-01-02T03:04:05Z")
+    mock.with_npmrc_token_replace(14, "2030-01-02T03:04:05Z", 1)
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())
@@ -62,8 +62,14 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
         ".npmrc must use scoped routing by default, got:\n{npmrc}"
     );
     assert!(
-        npmrc.contains("lpm_read_only_token"),
-        ".npmrc must contain the issued read-only token, got:\n{npmrc}"
+        npmrc.lines().any(|line| {
+            line.split_once("/:_authToken=").is_some_and(|(_, token)| {
+                token.len() == 68
+                    && token.starts_with("lpm_")
+                    && token[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        }),
+        ".npmrc must contain a generated read-only token, got:\n{npmrc}"
     );
     assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
 
@@ -87,13 +93,23 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
     assert_eq!(
         requests.len(),
         1,
-        "expected exactly one token-create request"
+        "expected exactly one atomic token-replacement request"
     );
 
     let body: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("token-create body must be JSON");
+        serde_json::from_slice(&requests[0].body).expect("token-replacement body must be JSON");
+    assert_eq!(
+        requests[0].url.path(),
+        "/api/registry/-/token/replace-project"
+    );
     assert_eq!(body["scope"], serde_json::json!("read"));
     assert_eq!(body["expiryDays"], serde_json::json!(14));
+    assert!(
+        body["token"]
+            .as_str()
+            .is_some_and(|token| token.len() == 68)
+    );
+    assert!(body["tokenId"].as_str().is_some_and(|id| id.len() == 36));
     assert!(
         body["name"]
             .as_str()
@@ -113,25 +129,8 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
     );
     project.write_file(".gitignore", "target\n.npmrc\n.npmrc\n");
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create_responses(
-        30,
-        vec![
-            serde_json::json!({
-                "token": "lpm_first_read_only_token",
-                "tokenId": FIRST_TOKEN_ID,
-                "scope": "read",
-                "expiresAt": "2030-01-02T03:04:05Z",
-            }),
-            serde_json::json!({
-                "token": "lpm_second_read_only_token",
-                "tokenId": SECOND_TOKEN_ID,
-                "scope": "read",
-                "expiresAt": "2030-01-02T03:04:05Z",
-            }),
-        ],
-    )
-    .await;
-    mock.with_npmrc_token_revoke(FIRST_TOKEN_ID, 200, 1).await;
+    mock.with_npmrc_token_replace(30, "2030-01-02T03:04:05Z", 2)
+        .await;
 
     for _ in 0..2 {
         let output = lpm_with_registry(&project, &mock.url())
@@ -145,9 +144,6 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
     assert_eq!(npmrc.matches("# LPM Registry (generated").count(), 1);
     assert_eq!(npmrc.matches("@lpm.dev:registry=").count(), 1);
     assert_eq!(npmrc.matches("_authToken=").count(), 1);
-    assert!(npmrc.contains("lpm_second_read_only_token"));
-    assert!(!npmrc.contains("lpm_first_read_only_token"));
-    assert!(npmrc.contains(SECOND_TOKEN_ID));
     assert!(npmrc.contains("registry=https://registry.example.test/"));
     assert!(npmrc.contains("fund=false"));
     assert_eq!(
@@ -160,61 +156,106 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
     );
 
     let requests = mock.server().received_requests().await.unwrap();
-    assert_eq!(
+    assert_eq!(requests.len(), 2);
+    assert!(
         requests
             .iter()
-            .filter(|request| request.url.path() == "/api/registry/-/token/create")
-            .count(),
-        2
+            .all(|request| request.url.path() == "/api/registry/-/token/replace-project")
     );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.url.path() == "/api/registry/-/token/revoke-project")
-            .count(),
-        1,
-        "the superseded setup token must be revoked after the replacement commits"
-    );
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(second["previousTokenId"], first["tokenId"]);
+    assert_ne!(second["tokenId"], first["tokenId"]);
+    assert_ne!(second["token"], first["token"]);
+    assert!(npmrc.contains(second["tokenId"].as_str().unwrap()));
+    assert!(npmrc.contains(second["token"].as_str().unwrap()));
+    assert!(!npmrc.contains(first["token"].as_str().unwrap()));
 }
 
 #[tokio::test]
-async fn setup_local_npmrc_write_failure_restores_gitignore_and_revokes_new_token() {
+async fn setup_local_upgrades_an_unmarked_generated_token_with_one_atomic_replacement() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let previous_token = "lpm_pre_marker_read_only_token";
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create_then_make_directory(
-        serde_json::json!({
-            "token": "lpm_new_read_only_token",
-            "tokenId": FIRST_TOKEN_ID,
-            "scope": "read",
-            "expiresAt": "2030-01-02T03:04:05Z",
-        }),
-        project.path().join(".npmrc"),
+    project.write_file(
+        ".npmrc",
+        &format!(
+            "# LPM Registry (generated by lpm setup local — do not commit)\n\
+             @lpm.dev:registry={}/api/registry\n\
+             {}/api/registry/:_authToken={previous_token}\n\
+             # End LPM Registry\n",
+            mock.url(),
+            mock.url().replace("http:", "")
+        ),
+    );
+    project.write_file(".gitignore", ".npmrc\n");
+    mock.with_npmrc_token_replace(30, "2030-01-02T03:04:05Z", 1)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local against a pre-marker generated block");
+
+    assert!(
+        output.status.success(),
+        "upgrade-safe replacement failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "replacement must be one Registry mutation"
+    );
+    assert_eq!(
+        requests[0].url.path(),
+        "/api/registry/-/token/replace-project"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("replacement body must be JSON");
+    assert_eq!(
+        body["previousTokenHash"],
+        hex::encode(Sha256::digest(previous_token.as_bytes()))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_local_npmrc_write_failure_happens_before_registry_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    project.write_file(".gitignore", ".npmrc\n");
+    let mock = MockRegistry::start().await;
+    let original_mode = std::fs::metadata(project.path())
+        .expect("project metadata")
+        .permissions()
+        .mode();
+    std::fs::set_permissions(
+        project.path(),
+        std::fs::Permissions::from_mode(original_mode & !0o222),
     )
-    .await;
-    mock.with_npmrc_token_revoke(FIRST_TOKEN_ID, 200, 1).await;
+    .expect("make project directory read-only");
 
     let output = lpm_with_registry(&project, &mock.url())
         .args(["setup", "local"])
         .output()
         .expect("run setup local with an npmrc commit failure");
 
+    std::fs::set_permissions(
+        project.path(),
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .expect("restore project directory permissions");
     assert!(!output.status.success());
-    assert!(
-        !project.file_exists(".gitignore"),
-        "the pre-token gitignore update must be rolled back"
-    );
-    assert!(project.path().join(".npmrc").is_dir());
+    assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
+    assert!(!project.file_exists(".npmrc"));
     let requests = mock.server().received_requests().await.unwrap();
-    let paths: Vec<_> = requests
-        .iter()
-        .map(|request| request.url.path().to_string())
-        .collect();
-    assert_eq!(
-        paths,
-        vec![
-            "/api/registry/-/token/create",
-            "/api/registry/-/token/revoke-project"
-        ]
+    assert!(
+        requests.is_empty(),
+        "the recoverable .npmrc must commit before any Registry mutation"
     );
 }
 
@@ -260,54 +301,121 @@ async fn setup_local_gitignore_write_failure_happens_before_token_creation() {
 }
 
 #[tokio::test]
-async fn setup_local_superseded_revoke_failure_restores_old_files_and_revokes_replacement() {
+async fn setup_local_ambiguous_replacement_reuses_pending_credentials_on_retry() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
-    let old_npmrc = format!(
-        "# LPM Registry (generated by lpm setup local — do not commit)\n\
-         # LPM project token id: {FIRST_TOKEN_ID}\n\
-         @lpm.dev:registry=https://lpm.example.test/api/registry\n\
-         //lpm.example.test/api/registry/:_authToken=lpm_old_read_only_token\n\
-         # End LPM Registry\n"
-    );
-    project.write_file(".npmrc", &old_npmrc);
-    project.write_file(".gitignore", "target\n.npmrc\n");
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create_responses(
-        30,
-        vec![serde_json::json!({
-            "token": "lpm_new_read_only_token",
-            "tokenId": SECOND_TOKEN_ID,
-            "scope": "read",
-            "expiresAt": "2030-01-02T03:04:05Z",
-        })],
-    )
-    .await;
-    mock.with_npmrc_token_revoke(FIRST_TOKEN_ID, 400, 1).await;
-    mock.with_npmrc_token_revoke(SECOND_TOKEN_ID, 200, 1).await;
+    mock.with_npmrc_token_replace_ambiguous_then_success(30, "2030-01-02T03:04:05Z")
+        .await;
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with an ambiguous replacement response");
+
+    assert!(!first.status.success());
+    let pending = project.read_file(".npmrc");
+    assert!(pending.contains("# LPM pending project token id: "));
+    assert!(!pending.contains("# LPM project token id: "));
+    assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("retry setup local after an ambiguous replacement response");
+    assert!(
+        second.status.success(),
+        "retry must finish the same idempotent operation:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let final_npmrc = project.read_file(".npmrc");
+    assert!(!final_npmrc.contains("# LPM pending project token id: "));
+    assert!(final_npmrc.contains("# LPM project token id: "));
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(first_body["tokenId"], second_body["tokenId"]);
+    assert_eq!(first_body["token"], second_body["token"]);
+    assert!(requests.iter().all(|request| {
+        serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| {
+            body["tokenId"] == first_body["tokenId"] && body["token"] == first_body["token"]
+        })
+    }));
+    assert!(final_npmrc.contains(first_body["tokenId"].as_str().unwrap()));
+    assert!(final_npmrc.contains(first_body["token"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn setup_local_bounded_registry_rejection_restores_pre_request_files() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let original_npmrc = "registry=https://registry.example.test/\nfund=false\n";
+    project.write_file(".npmrc", original_npmrc);
+    project.write_file(".gitignore", "target\n");
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace_error(400).await;
 
     let output = lpm_with_registry(&project, &mock.url())
         .args(["setup", "local"])
         .output()
-        .expect("run setup local with superseded-token revocation failure");
+        .expect("run setup local with a bounded Registry rejection");
 
     assert!(!output.status.success());
-    assert_eq!(project.read_file(".npmrc"), old_npmrc);
-    assert_eq!(project.read_file(".gitignore"), "target\n.npmrc\n");
+    assert_eq!(project.read_file(".npmrc"), original_npmrc);
+    assert_eq!(project.read_file(".gitignore"), "target\n");
+    assert_eq!(
+        mock.server().received_requests().await.unwrap().len(),
+        1,
+        "bounded client errors must not be retried"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_redacts_a_generated_token_echoed_by_a_registry_error() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace_echoed_token_error().await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with a Registry error that echoes the token");
+
+    assert!(!output.status.success());
+    let requests = mock.server().received_requests().await.unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("replacement body must be JSON");
+    let generated_token = body["token"].as_str().expect("request must contain token");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !rendered.contains(generated_token),
+        "Registry-controlled errors must not disclose the generated bearer"
+    );
+    assert!(rendered.contains("<redacted>"));
 }
 
 #[tokio::test]
 async fn setup_local_stray_end_marker_does_not_extend_an_unterminated_generated_block() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
     project.write_file(
         ".npmrc",
-        "# End LPM Registry\n\
-         # LPM Registry (generated by lpm setup local — do not commit)\n\
-         @lpm.dev:registry=https://lpm.example.test/api/registry/\n\
-         //lpm.example.test/api/registry/:_authToken=lpm_stale-token\n\
-         fund=false\n",
+        &format!(
+            "# End LPM Registry\n\
+             # LPM Registry (generated by lpm setup local — do not commit)\n\
+             @lpm.dev:registry={}/api/registry/\n\
+             {}/api/registry/:_authToken=lpm_stale-token\n\
+             fund=false\n",
+            mock.url(),
+            mock.url().replace("http:", "")
+        ),
     );
-    let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create(30, "lpm_replacement-token", "2030-01-02T03:04:05Z")
+    mock.with_npmrc_token_replace(30, "2030-01-02T03:04:05Z", 1)
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())
@@ -326,7 +434,7 @@ async fn setup_local_stray_end_marker_does_not_extend_an_unterminated_generated_
         npmrc.contains("fund=false"),
         "an earlier stray end marker must not cause unrelated trailing config to be dropped:\n{npmrc}"
     );
-    assert!(npmrc.contains("lpm_replacement-token"));
+    assert!(npmrc.contains("# LPM project token id: "));
     assert!(!npmrc.contains("lpm_stale-token"));
 }
 
@@ -390,50 +498,30 @@ async fn setup_local_rejects_invalid_days_and_removed_scoped_before_network_or_w
 }
 
 #[tokio::test]
-async fn setup_local_rejects_malformed_token_responses_before_writing_files() {
-    for (response, rollback_token_id) in [
-        (
-            serde_json::json!({
-            "token": "lpm_read_only_token",
+async fn setup_local_malformed_success_response_retains_recoverable_pending_state() {
+    for response in [
+        serde_json::json!({
             "tokenId": FIRST_TOKEN_ID,
             "scope": "publish",
             "expiresAt": "2030-01-02T03:04:05Z"
-            }),
-            Some(FIRST_TOKEN_ID),
-        ),
-        (
-            serde_json::json!({
-            "token": "lpm_bad\nregistry=https://attacker.invalid",
-            "tokenId": FIRST_TOKEN_ID,
-            "scope": "read",
-            "expiresAt": "2030-01-02T03:04:05Z"
-            }),
-            Some(FIRST_TOKEN_ID),
-        ),
-        (
-            serde_json::json!({
-            "token": "lpm_read_only_token",
+        }),
+        serde_json::json!({
             "tokenId": FIRST_TOKEN_ID,
             "scope": "read",
             "expiresAt": "not-a-timestamp"
-            }),
-            Some(FIRST_TOKEN_ID),
-        ),
-        (
-            serde_json::json!({
-                "token": "lpm_read_only_token",
-                "scope": "read",
-                "expiresAt": "2030-01-02T03:04:05Z"
-            }),
-            None,
-        ),
+        }),
+        serde_json::json!({
+            "tokenId": FIRST_TOKEN_ID,
+            "expiresAt": "2030-01-02T03:04:05Z"
+        }),
+        serde_json::json!({
+            "scope": "read",
+            "expiresAt": "2030-01-02T03:04:05Z"
+        }),
     ] {
         let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
         let mock = MockRegistry::start().await;
-        mock.with_npmrc_token_create_response(response).await;
-        if let Some(token_id) = rollback_token_id {
-            mock.with_npmrc_token_revoke(token_id, 200, 1).await;
-        }
+        mock.with_npmrc_token_replace_response(response).await;
 
         let output = lpm_with_registry(&project, &mock.url())
             .args(["setup", "local"])
@@ -441,8 +529,10 @@ async fn setup_local_rejects_malformed_token_responses_before_writing_files() {
             .expect("run setup local with malformed response");
 
         assert!(!output.status.success());
-        assert!(!project.file_exists(".npmrc"));
-        assert!(!project.file_exists(".gitignore"));
+        let npmrc = project.read_file(".npmrc");
+        assert!(npmrc.contains("# LPM pending project token id: "));
+        assert!(npmrc.contains("/:_authToken=lpm_"));
+        assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
     }
 }
 
@@ -450,7 +540,7 @@ async fn setup_local_rejects_malformed_token_responses_before_writing_files() {
 async fn setup_local_non_json_output_uses_current_command_name() {
     let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create(30, "lpm_read_only_token", "2030-01-02T03:04:05Z")
+    mock.with_npmrc_token_replace(30, "2030-01-02T03:04:05Z", 1)
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())
@@ -534,7 +624,7 @@ async fn setup_local_non_json_output_uses_current_command_name() {
 async fn setup_local_color_output_dims_expiry_label_and_highlights_lifetime() {
     let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create(30, "lpm_read_only_token", "2030-01-02T03:04:05Z")
+    mock.with_npmrc_token_replace(30, "2030-01-02T03:04:05Z", 1)
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())

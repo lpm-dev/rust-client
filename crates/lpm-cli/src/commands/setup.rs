@@ -1,6 +1,7 @@
 use crate::{auth_storage_notice, install_ui, oidc};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_registry::RegistryClient;
 use std::path::Path;
 
 fn hint_line(message: &str) {
@@ -74,6 +75,7 @@ fn setup_storage_status(token: &ResolvedSetupBearer) -> lpm_auth::AuthStorageSta
 /// - `--oidc`: Exchange an OIDC token from the CI environment instead of using stored auth.
 /// - `--registry` / `-r`: Override the registry URL.
 pub async fn run(
+    client: &RegistryClient,
     registry_url: &str,
     project_dir: &Path,
     json_output: bool,
@@ -114,7 +116,7 @@ pub async fn run(
         registry_url.trim_end_matches('/')
     );
 
-    let generated = format!(
+    let clean_generated = format!(
         "{GENERATED_HEADER}\n//{}/:_authToken={}\n{}\n{GENERATED_END}",
         registry_host, token.token, registry_line
     );
@@ -126,12 +128,62 @@ pub async fn run(
             Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
             Err(error) => return Err(error.into()),
         };
+    if let Some(local_registry) = super::npmrc::local_setup_registry_url(&existing) {
+        let registry_base = registry_url.trim_end_matches('/');
+        let expected_registry = if registry_base.ends_with("/api/registry") {
+            registry_base.to_string()
+        } else {
+            format!("{registry_base}/api/registry")
+        };
+        if local_registry != expected_registry {
+            return Err(LpmError::Script(format!(
+                "the setup-local token belongs to {local_registry}; rerun with its registry before replacing the generated block"
+            )));
+        }
+    }
+    let mut retirement_references = super::npmrc::pending_retirement_references(&existing)?;
+    for reference in super::npmrc::local_project_token_references(&existing)? {
+        if !retirement_references.contains(&reference) {
+            retirement_references.push(reference);
+        }
+    }
+    let generated = if retirement_references.is_empty() {
+        clean_generated.clone()
+    } else {
+        let markers = retirement_references
+            .iter()
+            .map(super::npmrc::ProjectTokenReference::retirement_marker)
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{GENERATED_HEADER}\n{markers}\n//{}/:_authToken={}\n{}\n{GENERATED_END}",
+            registry_host, token.token, registry_line
+        )
+    };
     let npmrc_content = replace_generated_block(&existing, &generated, registry_host);
     lpm_common::write_file_atomic_with_options(
         &npmrc_path,
-        npmrc_content,
+        &npmrc_content,
         lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
     )?;
+    for reference in &retirement_references {
+        if let Err(error) =
+            super::npmrc::retire_project_token(client, registry_url, reference).await
+        {
+            return Err(LpmError::Registry(format!(
+                "{error}. The protected .npmrc retains pending retirement markers; rerun `lpm setup ci npmrc` with the same registry to finish safely"
+            )));
+        }
+    }
+    if !retirement_references.is_empty() {
+        let final_content =
+            replace_generated_block(&npmrc_content, &clean_generated, registry_host);
+        lpm_common::write_file_atomic_with_options(
+            &npmrc_path,
+            final_content,
+            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+        )?;
+    }
 
     if json_output {
         let safe_content = format!(
@@ -180,7 +232,22 @@ fn replace_generated_block(existing: &str, generated: &str, registry_host: &str)
                 .map(|offset| index + 1 + offset);
             index = match next_boundary {
                 Some(end) if lines[end] == GENERATED_END => end + 1,
-                _ => (index + 3).min(lines.len()),
+                _ => {
+                    let mut end = index + 1;
+                    while lines.get(end).is_some_and(|line| {
+                        line.starts_with("# LPM project token id: ")
+                            || line.starts_with("# LPM pending project token id: ")
+                            || line.starts_with("# LPM previous project token id: ")
+                            || line.starts_with("# LPM previous project token hash: ")
+                            || line.starts_with(super::npmrc::RETIRE_TOKEN_ID_PREFIX)
+                            || line.starts_with(super::npmrc::RETIRE_TOKEN_HASH_PREFIX)
+                            || line.starts_with("@lpm.dev:registry=")
+                            || line.contains("/:_authToken=")
+                    }) {
+                        end += 1;
+                    }
+                    end
+                }
             };
             continue;
         }

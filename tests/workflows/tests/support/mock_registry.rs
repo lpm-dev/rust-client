@@ -9,6 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -31,6 +32,21 @@ struct JsonResponseAndCreateDirectory {
     path: PathBuf,
 }
 
+struct ProjectTokenReplacementResponse {
+    expires_at: String,
+}
+
+struct ProjectTokenReplacementEchoError;
+
+struct ProjectTokenReplacementSequence {
+    failures_remaining: AtomicUsize,
+    expires_at: String,
+}
+
+struct ProjectTokenRetirementSequence {
+    failures_remaining: AtomicUsize,
+}
+
 impl Respond for JsonResponseSequence {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let mut bodies = self.bodies.lock().expect("response sequence lock");
@@ -47,6 +63,76 @@ impl Respond for JsonResponseAndCreateDirectory {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         std::fs::create_dir_all(&self.path).expect("create response-side directory");
         ResponseTemplate::new(200).set_body_json(&self.body)
+    }
+}
+
+impl Respond for ProjectTokenReplacementResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("replacement request body must be JSON");
+        let token_id = body["tokenId"]
+            .as_str()
+            .expect("replacement request must contain tokenId");
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tokenId": token_id,
+            "scope": "read",
+            "expiresAt": self.expires_at,
+            "replaced": body.get("previousTokenId").is_some()
+                || body.get("previousTokenHash").is_some(),
+        }))
+    }
+}
+
+impl Respond for ProjectTokenReplacementEchoError {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("replacement request body must be JSON");
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": format!("replacement rejected for {}", body["token"].as_str().unwrap()),
+        }))
+    }
+}
+
+impl Respond for ProjectTokenReplacementSequence {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({ "error": "ambiguous replacement failure" }));
+        }
+        ProjectTokenReplacementResponse {
+            expires_at: self.expires_at.clone(),
+        }
+        .respond(request)
+    }
+}
+
+impl Respond for ProjectTokenRetirementSequence {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({ "error": "ambiguous retirement failure" }));
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("retirement request body must be JSON");
+        let token_id = body["tokenId"]
+            .as_str()
+            .unwrap_or("33333333-3333-4333-8333-333333333333");
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "revoked": true,
+            "tokenId": token_id,
+        }))
     }
 }
 
@@ -363,6 +449,116 @@ impl MockRegistry {
             .and(body_string_contains("\"scope\":\"read\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace(
+        &self,
+        expiry_days: u32,
+        expires_at: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .and(body_string_contains(format!(
+                "\"expiryDays\":{expiry_days}"
+            )))
+            .respond_with(ProjectTokenReplacementResponse {
+                expires_at: expires_at.to_string(),
+            })
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_response(&self, response: serde_json::Value) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_error(&self, status: u16) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "error": "replacement rejected" })),
+            )
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_echoed_token_error(&self) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .respond_with(ProjectTokenReplacementEchoError)
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_ambiguous_then_success(
+        &self,
+        expiry_days: u32,
+        expires_at: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains(format!(
+                "\"expiryDays\":{expiry_days}"
+            )))
+            .respond_with(ProjectTokenReplacementSequence {
+                failures_remaining: AtomicUsize::new(1),
+                expires_at: expires_at.to_string(),
+            })
+            .expect(2)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_revoke_hash(
+        &self,
+        token_hash: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(body_string_contains(format!(
+                "\"tokenHash\":\"{token_hash}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "revoked": true,
+                "tokenId": "33333333-3333-4333-8333-333333333333",
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_revoke_ambiguous_then_success(&self, token_hash: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(body_string_contains(format!(
+                "\"tokenHash\":\"{token_hash}\""
+            )))
+            .respond_with(ProjectTokenRetirementSequence {
+                failures_remaining: AtomicUsize::new(1),
+            })
+            .expect(2)
             .mount(&self.server)
             .await;
         self
