@@ -85,5 +85,9 @@ path = "../../crates/lpm-sandbox/src/bin/socket-probe.rs"
 name = "workflows-policy-extension"
 path = "src/bin/policy_extension_fixture.rs"
 
+[[bin]]
+name = "workflows-swift-fixture"
+path = "src/bin/swift_fixture.rs"
+
 [lints]
 workspace = true

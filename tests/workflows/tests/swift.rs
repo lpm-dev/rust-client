@@ -79,51 +79,25 @@ fn configure_fake_swift(
         .map(|name| serde_json::json!({"name": name, "type": "regular"}))
         .collect();
     let dump_package = serde_json::json!({"targets": target_values}).to_string();
-
-    #[cfg(windows)]
-    let swift_path = bin_dir.join("swift.cmd");
-    #[cfg(not(windows))]
-    let swift_path = bin_dir.join("swift");
-
-    #[cfg(windows)]
-    let script = format!(
-        "@echo off\r\n\
-         if \"%1 %2\"==\"package dump-package\" (\r\n\
-           echo {dump_package}\r\n\
-           exit /b 0\r\n\
-         )\r\n\
-         if \"%1 %2\"==\"package resolve\" (\r\n\
-           if not \"{resolve_exit_code}\"==\"0\" (\r\n\
-             echo inherited Swift stdout\r\n\
-             1>&2 echo inherited Swift stderr\r\n\
-           )\r\n\
-           exit /b {resolve_exit_code}\r\n\
-         )\r\n\
-         exit /b 64\r\n"
-    );
-    #[cfg(not(windows))]
-    let script = format!(
-        "#!/bin/sh\n\
-         if [ \"$1 $2\" = \"package dump-package\" ]; then\n\
-           printf '%s\\n' '{dump_package}'\n\
-           exit 0\n\
-         fi\n\
-         if [ \"$1 $2\" = \"package resolve\" ]; then\n\
-           if [ {resolve_exit_code} -ne 0 ]; then\n\
-             printf '%s\\n' 'inherited Swift stdout'\n\
-             printf '%s\\n' 'inherited Swift stderr' >&2\n\
-           fi\n\
-           exit {resolve_exit_code}\n\
-         fi\n\
-         exit 64\n"
-    );
-    std::fs::write(&swift_path, script).expect("write fake Swift executable");
+    let swift_path = bin_dir.join(fake_swift_executable_name(cfg!(windows)));
+    let fixture = assert_cmd::cargo::cargo_bin("workflows-swift-fixture");
+    std::fs::copy(fixture, &swift_path).expect("copy compiled Swift fixture");
     set_executable(&swift_path);
 
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
     let path = std::env::join_paths(paths).expect("construct PATH with fake Swift");
-    command.env("PATH", path);
+    command
+        .env("PATH", path)
+        .env("LPM_TEST_SWIFT_DUMP_PACKAGE", dump_package)
+        .env(
+            "LPM_TEST_SWIFT_RESOLVE_EXIT_CODE",
+            resolve_exit_code.to_string(),
+        );
+}
+
+fn fake_swift_executable_name(windows: bool) -> &'static str {
+    if windows { "swift.exe" } else { "swift" }
 }
 
 #[cfg(unix)]
@@ -146,6 +120,11 @@ fn combined_output(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[test]
+fn fake_swift_uses_a_native_windows_executable_name() {
+    assert_eq!(fake_swift_executable_name(true), "swift.exe");
 }
 
 fn product_is_attached_to_first_target(manifest: &str) -> bool {
