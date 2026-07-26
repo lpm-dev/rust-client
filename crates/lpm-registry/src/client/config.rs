@@ -666,6 +666,19 @@ impl RegistryClient {
         }
     }
 
+    /// Clone the client's transport configuration while installing one
+    /// explicit bearer and detaching any refresh-backed session.
+    ///
+    /// Use this when the credential being acted on must authenticate the
+    /// request itself. An attached session otherwise takes precedence over
+    /// `with_token`, which would authorize the request as the wrong principal.
+    pub fn clone_with_static_token(&self, token: impl Into<String>) -> Self {
+        let mut client = self.clone_with_config();
+        client.session = None;
+        client.token = Some(SecretString::from(token.into()));
+        client
+    }
+
     /// Force `write_metadata_cache` to run the blocking file write
     /// inline on the calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. See the field doc on

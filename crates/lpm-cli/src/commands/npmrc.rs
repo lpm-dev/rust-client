@@ -12,8 +12,9 @@ const TOKEN_ID_PREFIX: &str = "# LPM project token id: ";
 const PENDING_TOKEN_ID_PREFIX: &str = "# LPM pending project token id: ";
 const PREVIOUS_TOKEN_ID_PREFIX: &str = "# LPM previous project token id: ";
 const PREVIOUS_TOKEN_HASH_PREFIX: &str = "# LPM previous project token hash: ";
-pub(super) const RETIRE_TOKEN_ID_PREFIX: &str = "# LPM pending project token retirement id: ";
-pub(super) const RETIRE_TOKEN_HASH_PREFIX: &str = "# LPM pending project token retirement hash: ";
+const PREVIOUS_TOKEN_BEARER_PREFIX: &str = "# LPM previous project token bearer: ";
+const RETIRE_TOKEN_ID_PREFIX: &str = "# LPM pending project token retirement id: ";
+const RETIRE_TOKEN_HASH_PREFIX: &str = "# LPM pending project token retirement hash: ";
 const GENERATED_END: &str = "# End LPM Registry";
 
 #[derive(Deserialize)]
@@ -24,41 +25,10 @@ struct TokenReplaceResponse {
     expires_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum ProjectTokenReference {
-    Id(String),
-    Hash(String),
-}
-
-impl ProjectTokenReference {
-    fn add_to_body(&self, body: &mut serde_json::Value, previous: bool) {
-        let key = match (self, previous) {
-            (Self::Id(_), true) => "previousTokenId",
-            (Self::Hash(_), true) => "previousTokenHash",
-            (Self::Id(_), false) => "tokenId",
-            (Self::Hash(_), false) => "tokenHash",
-        };
-        body[key] = serde_json::Value::String(self.value().to_string());
-    }
-
-    pub(super) fn retirement_marker(&self) -> String {
-        match self {
-            Self::Id(value) => format!("{RETIRE_TOKEN_ID_PREFIX}{value}"),
-            Self::Hash(value) => format!("{RETIRE_TOKEN_HASH_PREFIX}{value}"),
-        }
-    }
-
-    fn value(&self) -> &str {
-        match self {
-            Self::Id(value) | Self::Hash(value) => value,
-        }
-    }
-}
-
 struct PendingSetupToken {
     token: String,
     token_id: String,
-    previous: Option<ProjectTokenReference>,
+    previous_bearer: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -217,14 +187,13 @@ pub async fn run(
             "the setup-local token belongs to {existing_registry}; rerun with its registry to finish replacement safely"
         )));
     }
+    reject_legacy_ci_retirement_state(&existing_npmrc)?;
     let pending = match pending_setup_token(&existing_npmrc)? {
         Some(pending) => pending,
         None => PendingSetupToken {
             token: generate_project_token()?,
             token_id: generate_uuid_v4()?,
-            previous: local_project_token_references(&existing_npmrc)?
-                .into_iter()
-                .next(),
+            previous_bearer: local_project_token_bearer(&existing_npmrc)?,
         },
     };
 
@@ -257,15 +226,10 @@ pub async fn run(
     }
 
     let previous_marker = pending
-        .previous
+        .previous_bearer
         .as_ref()
-        .map_or_else(String::new, |reference| match reference {
-            ProjectTokenReference::Id(value) => {
-                format!("{PREVIOUS_TOKEN_ID_PREFIX}{value}\n")
-            }
-            ProjectTokenReference::Hash(value) => {
-                format!("{PREVIOUS_TOKEN_HASH_PREFIX}{value}\n")
-            }
+        .map_or_else(String::new, |bearer| {
+            format!("{PREVIOUS_TOKEN_BEARER_PREFIX}{bearer}\n")
         });
     let pending_config = format!(
         "{GENERATED_HEADER}\n{PENDING_TOKEN_ID_PREFIX}{}\n{previous_marker}{registry_line}\n{registry_host}/:_authToken={}\n{GENERATED_END}",
@@ -292,8 +256,9 @@ pub async fn run(
         "name": token_name,
         "expiryDays": days,
     });
-    if let Some(previous) = &pending.previous {
-        previous.add_to_body(&mut body, true);
+    if let Some(previous_bearer) = &pending.previous_bearer {
+        body["previousTokenHash"] =
+            serde_json::Value::String(hex::encode(Sha256::digest(previous_bearer.as_bytes())));
     }
     let url = format!(
         "{}/api/registry/-/token/replace-project",
@@ -444,36 +409,39 @@ fn sanitize_registry_message(message: &str, secret: &str) -> String {
     lpm_common::sanitize_terminal_inline(message).replace(secret, "<redacted>")
 }
 
-pub(super) async fn retire_project_token(
+pub(super) async fn self_revoke_project_token(
     client: &RegistryClient,
     registry_url: &str,
-    reference: &ProjectTokenReference,
+    bearer: &str,
 ) -> Result<(), LpmError> {
     let url = format!(
         "{}/api/registry/-/token/revoke-project",
         registry_url.trim_end_matches('/')
     );
-    let mut request = serde_json::json!({});
-    reference.add_to_body(&mut request, false);
-    let response = client
-        .post_json_raw_status(&url, &request)
+    let isolated_client = client.clone_with_static_token(bearer);
+    let response = isolated_client
+        .post_json_raw_status(&url, &serde_json::json!({ "self": true }))
         .await
         .map_err(|error| {
             LpmError::Registry(format!(
-                "project token retirement response was not received: {error}"
+                "project token self-revocation response was not received: {error}"
             ))
         })?;
     let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::NOT_FOUND
+    ) {
         return Ok(());
     }
     let body: serde_json::Value =
-        lpm_registry::parse_capped_api_json(response, "project token retirement response").await?;
+        lpm_registry::parse_capped_api_json(response, "project token self-revocation response")
+            .await?;
     if !status.is_success() {
         let message = body
             .get("error")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("project token retirement failed");
+            .unwrap_or("project token self-revocation failed");
         return Err(LpmError::Registry(format!(
             "{} ({status})",
             lpm_common::sanitize_terminal_inline(message)
@@ -485,14 +453,9 @@ pub(super) async fn retire_project_token(
         .filter(|token_id| valid_token_id(token_id));
     if body.get("revoked").and_then(serde_json::Value::as_bool) != Some(true)
         || returned_token_id.is_none()
-        || matches!(
-            reference,
-            ProjectTokenReference::Id(expected)
-                if returned_token_id != Some(expected.as_str())
-        )
     {
         return Err(LpmError::Registry(
-            "invalid project token retirement response".into(),
+            "invalid project token self-revocation response".into(),
         ));
     }
     Ok(())
@@ -551,7 +514,7 @@ fn pending_setup_token(existing: &str) -> Result<Option<PendingSetupToken>, LpmE
     else {
         return Ok(None);
     };
-    let token = auth_token_from_lines(&lines).ok_or_else(|| {
+    let token = auth_token_from_lines(&lines)?.ok_or_else(|| {
         LpmError::Script(
             "the pending setup-token block is missing its protected bearer; restore the file or remove the generated block before retrying".into(),
         )
@@ -561,101 +524,88 @@ fn pending_setup_token(existing: &str) -> Result<Option<PendingSetupToken>, LpmE
             "the pending setup-token block contains an invalid bearer".into(),
         ));
     }
-    let previous_id = parse_single_marker(&lines, PREVIOUS_TOKEN_ID_PREFIX, valid_token_id)?;
-    let previous_hash = parse_single_marker(&lines, PREVIOUS_TOKEN_HASH_PREFIX, valid_token_hash)?;
-    if previous_id.is_some() && previous_hash.is_some() {
+    if lines.iter().any(|line| {
+        line.starts_with(PREVIOUS_TOKEN_ID_PREFIX) || line.starts_with(PREVIOUS_TOKEN_HASH_PREFIX)
+    }) {
         return Err(LpmError::Script(
-            "the pending setup-token block contains conflicting predecessor references".into(),
+            "the pending setup-token block uses legacy predecessor ID/hash markers that cannot prove possession. Revoke the pending and predecessor setup tokens in the LPM.dev dashboard, then remove the generated block before retrying".into(),
+        ));
+    }
+    let previous_bearer =
+        parse_single_marker(&lines, PREVIOUS_TOKEN_BEARER_PREFIX, valid_stored_bearer)?;
+    if previous_bearer.as_deref() == Some(token) {
+        return Err(LpmError::Script(
+            "the pending setup-token block reuses the predecessor bearer".into(),
         ));
     }
     Ok(Some(PendingSetupToken {
         token: token.to_string(),
         token_id,
-        previous: previous_id
-            .map(ProjectTokenReference::Id)
-            .or_else(|| previous_hash.map(ProjectTokenReference::Hash)),
+        previous_bearer,
     }))
 }
 
-pub(super) fn local_project_token_references(
-    existing: &str,
-) -> Result<Vec<ProjectTokenReference>, LpmError> {
+fn local_project_token_bearer(existing: &str) -> Result<Option<String>, LpmError> {
     let lines = local_generated_lines(existing);
     if lines.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-
-    let pending_id = parse_single_marker(&lines, PENDING_TOKEN_ID_PREFIX, valid_token_id)?;
-    let previous_id = parse_single_marker(&lines, PREVIOUS_TOKEN_ID_PREFIX, valid_token_id)?;
-    let previous_hash = parse_single_marker(&lines, PREVIOUS_TOKEN_HASH_PREFIX, valid_token_hash)?;
-    if previous_id.is_some() && previous_hash.is_some() {
+    let bearer = auth_token_from_lines(&lines)?;
+    if bearer.is_some_and(|value| !valid_stored_bearer(value)) {
         return Err(LpmError::Script(
-            "the generated setup block contains conflicting predecessor references".into(),
+            "the generated setup-local block contains an invalid bearer".into(),
         ));
     }
-    if let Some(pending_id) = pending_id {
-        let mut references = Vec::with_capacity(2);
-        references.push(ProjectTokenReference::Id(pending_id));
-        if let Some(previous_id) = previous_id {
-            references.push(ProjectTokenReference::Id(previous_id));
-        } else if let Some(previous_hash) = previous_hash {
-            references.push(ProjectTokenReference::Hash(previous_hash));
-        }
-        return Ok(references);
-    }
-
-    if let Some(token_id) = parse_single_marker(&lines, TOKEN_ID_PREFIX, valid_token_id)? {
-        return Ok(vec![ProjectTokenReference::Id(token_id)]);
-    }
-    Ok(auth_token_from_lines(&lines)
-        .map(|token| ProjectTokenReference::Hash(hex::encode(Sha256::digest(token.as_bytes()))))
-        .into_iter()
-        .collect())
+    Ok(bearer.map(str::to_string))
 }
 
 pub(super) fn local_setup_registry_url(existing: &str) -> Option<String> {
     registry_url_from_lines(&local_generated_lines(existing)).map(normalize_registry_url)
 }
 
-pub(super) fn pending_retirement_references(
-    existing: &str,
-) -> Result<Vec<ProjectTokenReference>, LpmError> {
-    let mut references = Vec::new();
-    for line in existing.lines() {
-        if let Some(value) = line.strip_prefix(RETIRE_TOKEN_ID_PREFIX) {
-            if !valid_token_id(value) {
-                return Err(LpmError::Script(
-                    "the generated CI block contains an invalid pending token ID".into(),
-                ));
-            }
-            push_unique(
-                &mut references,
-                ProjectTokenReference::Id(value.to_string()),
-            );
-        } else if let Some(value) = line.strip_prefix(RETIRE_TOKEN_HASH_PREFIX) {
-            if !valid_token_hash(value) {
-                return Err(LpmError::Script(
-                    "the generated CI block contains an invalid pending token hash".into(),
-                ));
-            }
-            push_unique(
-                &mut references,
-                ProjectTokenReference::Hash(value.to_string()),
-            );
-        }
+pub(super) fn setup_ci_predecessor_bearer(existing: &str) -> Result<Option<String>, LpmError> {
+    reject_legacy_ci_retirement_state(existing)?;
+    let local_lines = local_generated_lines(existing);
+    if local_lines
+        .iter()
+        .any(|line| line.starts_with(PENDING_TOKEN_ID_PREFIX))
+    {
+        return Err(LpmError::Script(
+            "setup local has a pending token replacement. Run `lpm setup local` with the same registry to finish it before switching to `lpm setup ci npmrc`".into(),
+        ));
     }
-    Ok(references)
+    local_project_token_bearer(existing)
+}
+
+fn reject_legacy_ci_retirement_state(existing: &str) -> Result<(), LpmError> {
+    let ci_lines = ci_generated_lines(existing);
+    if ci_lines.iter().any(|line| {
+        line.starts_with(RETIRE_TOKEN_ID_PREFIX) || line.starts_with(RETIRE_TOKEN_HASH_PREFIX)
+    }) {
+        return Err(LpmError::Script(
+            "the generated CI block contains legacy pending token-retirement markers that cannot prove possession. Revoke the referenced setup token in the LPM.dev dashboard, then remove the generated block before retrying".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn local_generated_lines(existing: &str) -> Vec<&str> {
+    generated_lines(existing, GENERATED_HEADER)
+}
+
+fn ci_generated_lines(existing: &str) -> Vec<&str> {
+    generated_lines(existing, CI_GENERATED_HEADER)
+}
+
+fn generated_lines<'a>(existing: &'a str, header: &str) -> Vec<&'a str> {
     let mut lines = Vec::new();
-    let mut in_local_block = false;
+    let mut in_generated_block = false;
     for line in existing.lines() {
-        if line == GENERATED_HEADER {
-            in_local_block = true;
+        if line == header {
+            in_generated_block = true;
             continue;
         }
-        if !in_local_block {
+        if !in_generated_block {
             continue;
         }
         if line == GENERATED_END || is_generated_header(line) {
@@ -689,11 +639,24 @@ fn parse_single_marker(
     Ok(found)
 }
 
-fn auth_token_from_lines<'a>(lines: &'a [&str]) -> Option<&'a str> {
-    lines
+fn auth_token_from_lines<'a>(lines: &'a [&str]) -> Result<Option<&'a str>, LpmError> {
+    let mut found = None;
+    for token in lines
         .iter()
-        .find_map(|line| line.split_once("/:_authToken=").map(|(_, token)| token))
-        .filter(|token| !token.is_empty())
+        .filter_map(|line| line.split_once("/:_authToken=").map(|(_, token)| token))
+    {
+        if token.is_empty() {
+            return Err(LpmError::Script(
+                "the generated setup block contains an empty bearer".into(),
+            ));
+        }
+        if found.replace(token).is_some() {
+            return Err(LpmError::Script(
+                "the generated setup block contains duplicate bearer lines".into(),
+            ));
+        }
+    }
+    Ok(found)
 }
 
 fn registry_url_from_lines<'a>(lines: &'a [&str]) -> Option<&'a str> {
@@ -704,12 +667,6 @@ fn registry_url_from_lines<'a>(lines: &'a [&str]) -> Option<&'a str> {
 
 fn normalize_registry_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
-}
-
-fn push_unique(references: &mut Vec<ProjectTokenReference>, reference: ProjectTokenReference) {
-    if !references.contains(&reference) {
-        references.push(reference);
-    }
 }
 
 fn generate_project_token() -> Result<String, LpmError> {
@@ -765,6 +722,15 @@ fn valid_token_hash(token_hash: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_stored_bearer(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 4096
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        })
+}
+
 fn valid_generated_project_token(token: &str) -> bool {
     token.strip_prefix("lpm_").is_some_and(valid_token_hash)
 }
@@ -789,6 +755,7 @@ fn replace_generated_block(existing: &str, generated: &str) -> String {
                             || line.starts_with(PENDING_TOKEN_ID_PREFIX)
                             || line.starts_with(PREVIOUS_TOKEN_ID_PREFIX)
                             || line.starts_with(PREVIOUS_TOKEN_HASH_PREFIX)
+                            || line.starts_with(PREVIOUS_TOKEN_BEARER_PREFIX)
                             || line.starts_with(RETIRE_TOKEN_ID_PREFIX)
                             || line.starts_with(RETIRE_TOKEN_HASH_PREFIX)
                             || line.starts_with("@lpm.dev:registry=")

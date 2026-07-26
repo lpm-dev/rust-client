@@ -141,49 +141,27 @@ pub async fn run(
             )));
         }
     }
-    let mut retirement_references = super::npmrc::pending_retirement_references(&existing)?;
-    for reference in super::npmrc::local_project_token_references(&existing)? {
-        if !retirement_references.contains(&reference) {
-            retirement_references.push(reference);
+    if let Some(predecessor_bearer) = super::npmrc::setup_ci_predecessor_bearer(&existing)? {
+        if predecessor_bearer == token.token {
+            return Err(LpmError::Script(
+                "setup ci cannot replace a setup-local token with the same bearer because retiring it would make the generated credential unusable. Supply a different bearer through LPM_TOKEN, a stored session, or --oidc"
+                    .into(),
+            ));
+        }
+        if let Err(error) =
+            super::npmrc::self_revoke_project_token(client, registry_url, &predecessor_bearer).await
+        {
+            return Err(LpmError::Registry(format!(
+                "{error}. The protected .npmrc still contains the displaced setup token; rerun `lpm setup ci npmrc` with the same registry to retry safely"
+            )));
         }
     }
-    let generated = if retirement_references.is_empty() {
-        clean_generated.clone()
-    } else {
-        let markers = retirement_references
-            .iter()
-            .map(super::npmrc::ProjectTokenReference::retirement_marker)
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "{GENERATED_HEADER}\n{markers}\n//{}/:_authToken={}\n{}\n{GENERATED_END}",
-            registry_host, token.token, registry_line
-        )
-    };
-    let npmrc_content = replace_generated_block(&existing, &generated, registry_host);
+    let npmrc_content = replace_generated_block(&existing, &clean_generated, registry_host);
     lpm_common::write_file_atomic_with_options(
         &npmrc_path,
         &npmrc_content,
         lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
     )?;
-    for reference in &retirement_references {
-        if let Err(error) =
-            super::npmrc::retire_project_token(client, registry_url, reference).await
-        {
-            return Err(LpmError::Registry(format!(
-                "{error}. The protected .npmrc retains pending retirement markers; rerun `lpm setup ci npmrc` with the same registry to finish safely"
-            )));
-        }
-    }
-    if !retirement_references.is_empty() {
-        let final_content =
-            replace_generated_block(&npmrc_content, &clean_generated, registry_host);
-        lpm_common::write_file_atomic_with_options(
-            &npmrc_path,
-            final_content,
-            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-        )?;
-    }
 
     if json_output {
         let safe_content = format!(
@@ -239,8 +217,9 @@ fn replace_generated_block(existing: &str, generated: &str, registry_host: &str)
                             || line.starts_with("# LPM pending project token id: ")
                             || line.starts_with("# LPM previous project token id: ")
                             || line.starts_with("# LPM previous project token hash: ")
-                            || line.starts_with(super::npmrc::RETIRE_TOKEN_ID_PREFIX)
-                            || line.starts_with(super::npmrc::RETIRE_TOKEN_HASH_PREFIX)
+                            || line.starts_with("# LPM previous project token bearer: ")
+                            || line.starts_with("# LPM pending project token retirement id: ")
+                            || line.starts_with("# LPM pending project token retirement hash: ")
                             || line.starts_with("@lpm.dev:registry=")
                             || line.contains("/:_authToken=")
                     }) {

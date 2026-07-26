@@ -5,6 +5,8 @@ pub(super) async fn vars_pull(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+
     // Route to platform pull if --from flag is present
     if args.iter().any(|a| a.starts_with("--from")) {
         return super::platform::vars_platform_pull(&args[1..], project_dir, json_output).await;

@@ -621,17 +621,20 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         ),
         "workflow_not_allowed" => Some(
             "The workflow file that minted this token isn't in the policy's allowedWorkflows. \
-             Add it: lpm env oidc allow --repo=<owner/repo> --workflow=<path>",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
         ),
         "event_not_allowed" => Some(
             "The CI event_name that triggered this run isn't in the policy's allowedEvents. \
-             Add it: lpm env oidc allow --repo=<owner/repo> --events=push,workflow_dispatch",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
         ),
         "fork_not_allowed" => Some(
             "The OIDC token was minted by a fork PR but the policy has allowForks=false. \
-             Add --allow-forks to lpm env oidc allow if this is intentional (note: only \
-             enable for public repos with trusted maintainers — pull_request_target events \
-             from forks run with BASE secrets).",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists. \
+             Fork-triggerable pull_request_target events run with base-repository secrets, \
+             so authorize them only after reviewing that complete policy.",
         ),
         "missing_branch_claim" => Some(
             "The OIDC token from your CI provider has no branch claim. Confirm your provider \
@@ -703,18 +706,38 @@ mod oidc_error_hint_tests {
     }
 
     #[test]
-    fn workflow_not_allowed_names_the_remediation_flag() {
+    fn workflow_not_allowed_requires_complete_policy_review() {
         let msg =
             build_oidc_pull_error_message("Workflow not authorized", "", "workflow_not_allowed");
-        assert!(msg.contains("--workflow"));
+        assert!(msg.contains("lpm env oidc list"));
+        assert!(msg.contains("lpm env oidc allow --help"));
         assert!(msg.contains("allowedWorkflows"));
+    }
+
+    #[test]
+    fn complete_policy_denials_require_review_instead_of_authorizing_the_denied_claim() {
+        for code in [
+            "workflow_not_allowed",
+            "event_not_allowed",
+            "fork_not_allowed",
+        ] {
+            let message = build_oidc_pull_error_message("not allowed", "", code);
+            assert!(message.contains("lpm env oidc list"), "{code}: {message}");
+            assert!(
+                message.contains("lpm env oidc allow --help"),
+                "{code}: {message}"
+            );
+            assert!(!message.contains("Add it:"), "{code}: {message}");
+            assert!(!message.contains("--allow-forks"), "{code}: {message}");
+        }
     }
 
     #[test]
     fn fork_not_allowed_warns_about_pull_request_target() {
         let msg = build_oidc_pull_error_message("Forks not allowed", "", "fork_not_allowed");
-        assert!(msg.contains("--allow-forks"));
+        assert!(!msg.contains("--allow-forks"));
         assert!(msg.contains("pull_request_target"));
+        assert!(msg.contains("lpm env oidc list"));
     }
 
     #[test]

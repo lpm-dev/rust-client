@@ -20,6 +20,8 @@ pub(super) async fn env_rotate_key(
         )));
     }
 
+    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 

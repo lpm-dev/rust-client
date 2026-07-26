@@ -113,6 +113,37 @@ async fn logout_human_output_uses_slim_done_line_and_clears_state() {
 }
 
 #[tokio::test]
+async fn logout_json_fails_when_lpm_token_remains_in_the_process_environment() {
+    let project = TempProject::empty(r#"{"name":"logout-env-token","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "environment-only-token")
+        .args(["--json", "logout"])
+        .output()
+        .expect("run logout with only LPM_TOKEN configured");
+
+    assert!(
+        !output.status.success(),
+        "logout cannot report success while LPM_TOKEN remains active"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["local_cleared"], false);
+    assert!(
+        json["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error
+                    .as_str()
+                    .is_some_and(|message| message.contains("unset LPM_TOKEN"))
+            })),
+        "logout must explain that only the parent environment can remove LPM_TOKEN: {json}"
+    );
+}
+
+#[tokio::test]
 async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

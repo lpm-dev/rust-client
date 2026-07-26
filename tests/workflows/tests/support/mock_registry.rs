@@ -443,6 +443,31 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_npmrc_token_self_revoke(
+        &self,
+        token: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        let response = if status == 200 {
+            serde_json::json!({
+                "revoked": true,
+                "tokenId": "33333333-3333-4333-8333-333333333333",
+            })
+        } else {
+            serde_json::json!({ "error": "project token self-revocation failed" })
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"self\":true"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(response))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_npmrc_token_create_response(&self, response: serde_json::Value) -> &Self {
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/create"))
@@ -555,6 +580,20 @@ impl MockRegistry {
             .and(body_string_contains(format!(
                 "\"tokenHash\":\"{token_hash}\""
             )))
+            .respond_with(ProjectTokenRetirementSequence {
+                failures_remaining: AtomicUsize::new(1),
+            })
+            .expect(2)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_self_revoke_ambiguous_then_success(&self, token: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"self\":true"))
             .respond_with(ProjectTokenRetirementSequence {
                 failures_remaining: AtomicUsize::new(1),
             })

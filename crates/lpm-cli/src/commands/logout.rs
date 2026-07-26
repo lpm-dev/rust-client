@@ -20,6 +20,8 @@ pub async fn run(
     json_output: bool,
     targets: LogoutTargets<'_>,
 ) -> Result<(), LpmError> {
+    let environment_credential_active =
+        targets.clear_lpm && std::env::var("LPM_TOKEN").is_ok_and(|token| !token.is_empty());
     let had_access = targets.clear_lpm && auth::get_token(registry_url).is_some();
     let had_refresh = targets.clear_lpm && auth::has_refresh_token(registry_url);
     let had_lpm_session = had_access || had_refresh;
@@ -80,6 +82,13 @@ pub async fn run(
             &mut local_cleared,
             &mut errors,
         );
+        if environment_credential_active {
+            local_cleared = false;
+            errors.push(
+                "LPM.dev local credential clearing: LPM_TOKEN remains active in the parent process; unset LPM_TOKEN in that shell or CI environment"
+                    .to_string(),
+            );
+        }
     }
     if targets.npm {
         let cleared = record_local_clear(

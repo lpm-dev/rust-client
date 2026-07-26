@@ -559,6 +559,56 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
 }
 
 #[tokio::test]
+async fn env_pull_rejects_semantically_invalid_lpm_json_before_network_or_local_overwrite() {
+    let project = TempProject::empty(r#"{"name":"pull-invalid-config","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file(
+        "lpm.json",
+        r#"{"vault":"vault-invalid-pull","env":{"prod":123}}"#,
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    write_file_backed_vault(
+        project.home(),
+        "vault-invalid-pull",
+        serde_json::json!({
+            "environments": {
+                "default": {"KEEP": "local"}
+            }
+        }),
+    );
+    let vault_path = project.home().join(".lpm/vaults/vault-invalid-pull.enc");
+    let original_vault = std::fs::read(&vault_path).expect("read original local vault");
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "pull", "--yes"])
+        .output()
+        .expect("run env pull with semantically invalid lpm.json");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lpm.json"),
+        "the failure must identify the invalid project configuration"
+    );
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "canonical validation must happen before authentication or pull requests"
+    );
+    assert_eq!(
+        std::fs::read(vault_path).expect("read local vault after rejected pull"),
+        original_vault
+    );
+}
+
+#[tokio::test]
 async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -2343,6 +2393,41 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
 }
 
 #[tokio::test]
+async fn env_rotate_key_rejects_semantically_invalid_lpm_json_before_network_access() {
+    let project = TempProject::empty(r#"{"name":"rotate-invalid-config","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file(
+        "lpm.json",
+        r#"{"vault":"vault-invalid-rotate","env":{"prod":123}}"#,
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "rotate-key"])
+        .output()
+        .expect("run env rotate-key with semantically invalid lpm.json");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lpm.json"),
+        "the failure must identify the invalid project configuration"
+    );
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "canonical validation must happen before rotation fetches remote state"
+    );
+}
+
+#[tokio::test]
 async fn env_rotate_key_version_conflict_preserves_local_key_and_version_metadata() {
     let project = TempProject::empty(r#"{"name":"rotate-key-conflict","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -3492,6 +3577,50 @@ async fn env_share_refuses_force_flag_with_actionable_remediation() {
     assert!(
         combined.contains("lpm env pull --org"),
         "expected the pull-then-retry remediation hint; got: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn env_share_rejects_semantically_invalid_lpm_json_before_registering_a_sharing_key() {
+    let project = TempProject::empty(r#"{"name":"share-invalid-config","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file(
+        "lpm.json",
+        r#"{"vault":"vault-invalid-share","env":{"prod":123}}"#,
+    );
+    write_file_backed_vault(
+        project.home(),
+        "vault-invalid-share",
+        serde_json::json!({
+            "environments": {
+                "default": {"SHARE_ME": "value"}
+            }
+        }),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "share", "--org", "acme"])
+        .output()
+        .expect("run env share with semantically invalid lpm.json");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lpm.json"),
+        "the failure must identify the invalid project configuration"
+    );
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "canonical validation must precede sharing-key classification or registration"
     );
 }
 
