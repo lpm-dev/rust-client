@@ -73,6 +73,22 @@ fn parse_clean_json_stdout(output: &std::process::Output) -> serde_json::Value {
 }
 
 #[test]
+fn workflow_harness_removes_inherited_lpm_vault_id() {
+    let project = TempProject::empty(r#"{"name":"vault-env-isolation-test","version":"1.0.0"}"#);
+    let command = lpm(&project);
+
+    let configured_value = command
+        .get_envs()
+        .find_map(|(name, value)| (name == std::ffi::OsStr::new("LPM_VAULT_ID")).then_some(value));
+
+    assert_eq!(
+        configured_value,
+        Some(None),
+        "workflow commands must not inherit LPM_VAULT_ID from the host",
+    );
+}
+
+#[test]
 fn doctor_json_reports_file_vault_fallback_when_forced_file_backend_is_active() {
     let project = TempProject::empty(r#"{"name":"vault-doctor","version":"1.0.0"}"#);
 

@@ -2323,7 +2323,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 107: lpm env oidc allow ──
     SurfaceV2 {
         id: 107,
-        scenarios: 13,
+        scenarios: 12,
         failure_modes_tested: &[
             "missing repo emits JSON error",
             "missing workflow fails before policy creation",
@@ -2344,7 +2344,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "allow against a vault the user lacks admin rights to",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 13)],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 12)],
         last_audited_at: "2026-07-26",
     },
     // ── id 108: lpm env oidc list ──
