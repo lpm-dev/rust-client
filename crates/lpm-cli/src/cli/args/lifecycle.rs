@@ -385,12 +385,11 @@ pub(crate) struct InstallArgs {
     #[arg(long)]
     pub(crate) fail_if_no_match: bool,
 
-    /// Skip the interactive confirmation prompt when a filtered
-    /// install will mutate more than one workspace member's
-    /// `package.json`. Mirrors `lpm init` and `lpm publish` —
-    /// JSON mode and non-TTY stdin already skip the prompt
-    /// automatically; this flag covers the interactive-terminal-
-    /// but-no-manual-review case (scripts, agents).
+    /// Skip interactive install prompts and use their defaults.
+    ///
+    /// Proceeds when a filtered install mutates multiple workspace
+    /// members. For a Swift package with multiple eligible targets,
+    /// selects the first target.
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,
 
@@ -608,8 +607,12 @@ pub(crate) struct AddArgs {
     #[arg(long)]
     pub(crate) alias: Option<String>,
 
-    /// Swift SPM target name (e.g., MyAppTarget).
-    #[arg(long)]
+    /// Swift source-copy destination-directory suffix.
+    ///
+    /// SPM projects use `Sources/<NAME>`. Xcode projects and workspaces
+    /// use `Packages/LPMComponents/Sources/<NAME>`. This does not add
+    /// manifest dependencies or modify Xcode project wiring.
+    #[arg(long, value_name = "NAME")]
     pub(crate) target: Option<String>,
 
     /// Use warning-only root and dependency engine checks.

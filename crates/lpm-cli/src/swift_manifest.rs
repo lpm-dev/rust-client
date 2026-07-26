@@ -583,7 +583,10 @@ pub fn run_swift_resolve(project_dir: &Path) -> Result<(), LpmError> {
 
     if !status.success() {
         return Err(LpmError::Registry(
-            "swift package resolve failed. Run `lpm swift-registry` to configure SPM first.".into(),
+            "swift package resolve failed after automatic Registry setup. See the Swift output \
+             above for the actual cause. If Registry configuration or the signing certificate is \
+             stale or corrupt, repair it with `lpm swift-registry --force`."
+                .into(),
         ));
     }
 

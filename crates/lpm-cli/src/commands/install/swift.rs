@@ -6,6 +6,7 @@ pub(super) async fn run_swift_install(
     name: &lpm_common::PackageName,
     version: &str,
     ver_meta: &lpm_registry::VersionMetadata,
+    yes: bool,
     json_output: bool,
     registry_url: &str,
 ) -> Result<(), LpmError> {
@@ -30,6 +31,7 @@ pub(super) async fn run_swift_install(
                 ver_meta,
                 &se0292_id,
                 product_name,
+                yes,
                 json_output,
                 registry_url,
             )
@@ -67,6 +69,7 @@ pub(super) async fn run_swift_install_spm(
     ver_meta: &lpm_registry::VersionMetadata,
     se0292_id: &str,
     product_name: &str,
+    yes: bool,
     json_output: bool,
     registry_url: &str,
 ) -> Result<(), LpmError> {
@@ -84,26 +87,29 @@ pub(super) async fn run_swift_install_spm(
 
     // Detect targets
     let targets = swift_manifest::get_spm_targets(manifest_dir).unwrap_or_default();
-    let target_name = if targets.len() == 1 {
-        targets[0].clone()
-    } else if targets.len() > 1 {
-        let mut sel = cliclack::select("Which target should use this dependency?");
-        for (i, target) in targets.iter().enumerate() {
-            sel = sel.item(
-                target.clone(),
-                lpm_common::sanitize_terminal_inline(target).into_owned(),
-                "",
-            );
-            if i == 0 {
-                sel = sel.initial_value(target.clone());
-            }
+    let target_name = match targets.as_slice() {
+        [] => {
+            return Err(LpmError::Registry(
+                "No non-test targets found in Package.swift.".into(),
+            ));
         }
-        sel.interact()
-            .map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?
-    } else {
-        return Err(LpmError::Registry(
-            "No non-test targets found in Package.swift.".into(),
-        ));
+        [target] => target.clone(),
+        [first, ..] if yes => first.clone(),
+        _ => {
+            let mut sel = cliclack::select("Which target should use this dependency?");
+            for (i, target) in targets.iter().enumerate() {
+                sel = sel.item(
+                    target.clone(),
+                    lpm_common::sanitize_terminal_inline(target).into_owned(),
+                    "",
+                );
+                if i == 0 {
+                    sel = sel.initial_value(target.clone());
+                }
+            }
+            sel.interact()
+                .map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?
+        }
     };
 
     // Edit Package.swift
