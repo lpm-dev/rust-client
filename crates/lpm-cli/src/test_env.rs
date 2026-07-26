@@ -61,3 +61,19 @@ impl Drop for ScopedEnv {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_env_restores_previous_value_on_drop() {
+        const KEY: &str = "LPM_TEST_SCOPED_ENV_RESTORE";
+        let previous = std::env::var_os(KEY);
+        {
+            let _env = ScopedEnv::set([(KEY, OsString::from("temporary"))]);
+            assert_eq!(std::env::var_os(KEY), Some(OsString::from("temporary")));
+        }
+        assert_eq!(std::env::var_os(KEY), previous);
+    }
+}

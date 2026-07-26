@@ -1316,54 +1316,65 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     const DOWNLOAD_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE";
     const RELEASE_BY_TAG_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE";
 
-    /// Self-update tests mutate the same two process-global env vars
-    /// (`LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE` and
-    /// `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`). Without serialisation,
-    /// parallel `cargo test` runs would race and steer each other's
-    /// probes at the wrong wiremock instance.
-    fn standalone_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    struct StandaloneEnvGuard {
-        download_prev: Option<String>,
-        release_by_tag_prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for StandaloneEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.download_prev {
-                    Some(v) => std::env::set_var(DOWNLOAD_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(DOWNLOAD_OVERRIDE_KEY),
-                }
-                match &self.release_by_tag_prev {
-                    Some(v) => std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(RELEASE_BY_TAG_OVERRIDE_KEY),
-                }
-            }
-        }
-    }
-
     fn acquire_standalone_env(
         download_template: &str,
         release_by_tag_template: &str,
-    ) -> StandaloneEnvGuard {
-        let lock = standalone_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let guard = StandaloneEnvGuard {
-            download_prev: std::env::var(DOWNLOAD_OVERRIDE_KEY).ok(),
-            release_by_tag_prev: std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).ok(),
-            _lock: lock,
-        };
-        unsafe {
-            std::env::set_var(DOWNLOAD_OVERRIDE_KEY, download_template);
-            std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, release_by_tag_template);
-        }
-        guard
+    ) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([
+            (DOWNLOAD_OVERRIDE_KEY, download_template.into()),
+            (RELEASE_BY_TAG_OVERRIDE_KEY, release_by_tag_template.into()),
+        ])
+    }
+
+    #[test]
+    fn standalone_published_release_overrides_share_process_env_lock() {
+        let (release_ready_tx, release_ready_rx) = std::sync::mpsc::channel();
+        let (release_scope_tx, release_scope_rx) = std::sync::mpsc::channel();
+        let release_scope = std::thread::spawn(move || {
+            let _env = crate::test_env::ScopedEnv::set([(
+                RELEASE_BY_TAG_OVERRIDE_KEY,
+                "http://127.0.0.1:41001/releases/tags/v{tag}".into(),
+            )]);
+            release_ready_tx.send(()).unwrap();
+            release_scope_rx.recv().unwrap();
+        });
+        release_ready_rx.recv().unwrap();
+
+        let (standalone_attempt_tx, standalone_attempt_rx) = std::sync::mpsc::channel();
+        let (standalone_ready_tx, standalone_ready_rx) = std::sync::mpsc::channel();
+        let (standalone_scope_tx, standalone_scope_rx) = std::sync::mpsc::channel();
+        let standalone_scope = std::thread::spawn(move || {
+            standalone_attempt_tx.send(()).unwrap();
+            let _env = acquire_standalone_env(
+                "http://127.0.0.1:41002/download/v{tag}/{file}",
+                "http://127.0.0.1:41002/releases/tags/v{tag}",
+            );
+            standalone_ready_tx.send(()).unwrap();
+            standalone_scope_rx.recv().unwrap();
+        });
+
+        standalone_attempt_rx.recv().unwrap();
+        assert!(
+            standalone_ready_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "standalone override scope acquired while the shared environment lock was held"
+        );
+        release_scope_tx.send(()).unwrap();
+        release_scope.join().unwrap();
+        standalone_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            std::env::var(DOWNLOAD_OVERRIDE_KEY).unwrap(),
+            "http://127.0.0.1:41002/download/v{tag}/{file}"
+        );
+        assert_eq!(
+            std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).unwrap(),
+            "http://127.0.0.1:41002/releases/tags/v{tag}"
+        );
+        standalone_scope_tx.send(()).unwrap();
+        standalone_scope.join().unwrap();
     }
 
     /// Drive `verify_and_fetch_for_standalone` against a wiremock-served

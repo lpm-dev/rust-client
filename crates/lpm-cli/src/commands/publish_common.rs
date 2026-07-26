@@ -545,6 +545,10 @@ fn collect_all_files(
             if IGNORE_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
+            if dir == project_root && name_str == ".lpm" {
+                collect_implicit_lpm_files(&path, project_root, canonical_root, result)?;
+                continue;
+            }
             collect_all_files(&path, project_root, canonical_root, result)?;
         } else if path.is_file() {
             if IGNORE_FILES.contains(&name_str.as_ref()) {
@@ -560,6 +564,47 @@ fn collect_all_files(
                     });
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn collect_implicit_lpm_files(
+    lpm_dir: &Path,
+    project_root: &Path,
+    canonical_root: &Path,
+    result: &mut Vec<TarballFile>,
+) -> Result<(), LpmError> {
+    let skills_dir = lpm_dir.join("skills");
+    let skills_metadata = match std::fs::symlink_metadata(&skills_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if !is_safe_entry(&skills_dir, canonical_root) || !skills_metadata.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_safe_entry(&path, canonical_root) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.is_file()
+            && crate::commands::skills::author::is_authored_skill_path(&path, &skills_dir)
+        {
+            let rel = path.strip_prefix(project_root).map_err(|_| {
+                LpmError::Registry(format!(
+                    "authored package skill escaped project directory: {}",
+                    path.display()
+                ))
+            })?;
+            result.push(TarballFile {
+                path: rel.to_string_lossy().into_owned(),
+                size: metadata.len(),
+            });
         }
     }
     Ok(())
@@ -981,6 +1026,32 @@ fn javascript_string_length(value: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn valid_authored_skill() -> String {
+        format!(
+            "---\nname: package-usage\ndescription: Use the package through its supported public API.\n---\n# Package usage\n\n{}",
+            "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
+        )
+    }
+
+    fn archive_file_paths(tarball_data: &[u8]) -> std::collections::BTreeSet<String> {
+        let decoder = flate2::read::GzDecoder::new(tarball_data);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .path()
+                    .unwrap()
+                    .strip_prefix("package")
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
     #[test]
     fn compute_hashes_correct() {
         let data = b"hello world";
@@ -1013,6 +1084,88 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"package.json"));
         assert!(paths.contains(&"index.js"));
+    }
+
+    #[test]
+    fn implicit_publish_excludes_project_local_lpm_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::create_dir_all(project.join(".lpm/webhooks")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+        std::fs::write(project.join(".lpm/install-hash"), "local install state").unwrap();
+        std::fs::write(
+            project.join(".lpm/certs/cert.pem"),
+            "local development certificate",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/webhook-log.jsonl"),
+            r#"{"authorization":"secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/webhooks/request.json"),
+            r#"{"cookie":"secret"}"#,
+        )
+        .unwrap();
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(
+            files.iter().all(|file| !file.path.starts_with(".lpm/")),
+            "implicit publish set contained project-local state: {:?}",
+            files.iter().map(|file| &file.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn implicit_publish_includes_only_validator_authored_skill_files_under_lpm() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".lpm/skills/assets")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/package-usage.md"),
+            valid_authored_skill(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/author-notes.txt"),
+            "not an authored package skill",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/assets/diagram.svg"),
+            "<svg></svg>",
+        )
+        .unwrap();
+        let validation =
+            crate::commands::skills::author::validate_directory(&project.join(".lpm/skills"))
+                .unwrap();
+        assert_eq!(validation.valid_files, vec!["package-usage.md"]);
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+        let lpm_paths = files
+            .iter()
+            .filter(|file| file.path.starts_with(".lpm/"))
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lpm_paths, vec![".lpm/skills/package-usage.md"]);
     }
 
     #[test]
@@ -1111,6 +1264,69 @@ mod tests {
     }
 
     #[test]
+    fn explicit_publish_can_include_lpm_state_without_including_materialized_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+  "name": "@lpm.dev/test.pkg",
+  "version": "1.0.0",
+  "files": [".lpm/certs/publisher.pem", ".lpm/skills/**/*"]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/certs/publisher.pem"),
+            "deliberately published certificate fixture",
+        )
+        .unwrap();
+        crate::commands::skills::package::materialize(
+            project,
+            "owner.dependency",
+            Some("2.0.0"),
+            &[lpm_registry::Skill {
+                name: "dependency-usage".into(),
+                description: None,
+                version: None,
+                globs: Vec::new(),
+                content: Some("dependency guidance".into()),
+                raw_content: None,
+                size_bytes: None,
+            }],
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/package-usage.md"),
+            valid_authored_skill(),
+        )
+        .unwrap();
+        let pkg_json: serde_json::Value = serde_json::from_str(
+            r#"{
+  "name": "@lpm.dev/test.pkg",
+  "version": "1.0.0",
+  "files": [".lpm/certs/publisher.pem", ".lpm/skills/**/*"]
+}"#,
+        )
+        .unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(paths.contains(".lpm/certs/publisher.pem"));
+        assert!(paths.contains(".lpm/skills/package-usage.md"));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.starts_with(".lpm/skills/owner.dependency/"))
+        );
+    }
+
+    #[test]
     fn create_tarball_does_not_exclude_manifest_shaped_directories_elsewhere() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
@@ -1137,6 +1353,73 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "fixtures/owner.package/payload.txt")
         );
+    }
+
+    #[test]
+    fn implicit_publish_does_not_filter_nested_lpm_named_fixture_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join("fixtures/.lpm/certs")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("fixtures/.lpm/certs/cert.pem"),
+            "published test fixture",
+        )
+        .unwrap();
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == "fixtures/.lpm/certs/cert.pem")
+        );
+    }
+
+    #[test]
+    fn implicit_publish_reported_paths_match_filtered_archive_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".lpm/skills")).unwrap();
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+        std::fs::write(
+            project.join(".lpm/skills/package-usage.md"),
+            valid_authored_skill(),
+        )
+        .unwrap();
+        std::fs::write(project.join(".lpm/install-hash"), "local install state").unwrap();
+        std::fs::write(
+            project.join(".lpm/certs/cert.pem"),
+            "local development certificate",
+        )
+        .unwrap();
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
+
+        let (data, files) = create_tarball(project, &pkg_json).unwrap();
+        let reported_paths = files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_paths = [".lpm/skills/package-usage.md", "index.js", "package.json"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(reported_paths, expected_paths);
+        assert_eq!(archive_file_paths(&data), expected_paths);
     }
 
     #[test]
