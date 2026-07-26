@@ -17,12 +17,60 @@
 
 #![cfg(target_os = "windows")]
 
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+
 use assert_cmd::Command;
+use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
 
 const EXIT_ARGV_PARSE: i32 = 64;
 const EXIT_PROTOCOL_MISMATCH: i32 = 65;
 
 const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
+
+struct TemporaryAppContainerProfile {
+    wide_name: Vec<u16>,
+    cleanup_required: bool,
+}
+
+impl TemporaryAppContainerProfile {
+    fn new(name: &str) -> Self {
+        Self {
+            wide_name: OsStr::new(name).encode_wide().chain(Some(0)).collect(),
+            cleanup_required: true,
+        }
+    }
+
+    fn delete(&mut self) -> i32 {
+        // SAFETY: `wide_name` is null-terminated and remains alive for the call.
+        let hresult = unsafe { DeleteAppContainerProfile(self.wide_name.as_ptr()) };
+        if hresult == 0 {
+            self.cleanup_required = false;
+        }
+        hresult
+    }
+
+    fn assert_deleted(mut self) {
+        let hresult = self.delete();
+        assert_eq!(
+            hresult, 0,
+            "temporary AppContainer profile cleanup failed with HRESULT 0x{hresult:08X}"
+        );
+    }
+}
+
+impl Drop for TemporaryAppContainerProfile {
+    fn drop(&mut self) {
+        if self.cleanup_required {
+            let hresult = self.delete();
+            if hresult != 0 {
+                eprintln!(
+                    "temporary AppContainer profile cleanup failed with HRESULT 0x{hresult:08X}"
+                );
+            }
+        }
+    }
+}
 
 /// Returns the standard minimal argv slice with the bin path,
 /// missing only the program tail. Tests append `--` + program +
@@ -165,17 +213,19 @@ fn helper_runs_trivial_command_under_appcontainer_and_propagates_exit_zero() {
 }
 
 #[test]
-fn helper_supports_concurrent_first_use_of_same_appcontainer_profile() {
+fn helper_supports_concurrent_first_use_and_deletes_temporary_appcontainer_profile() {
     const HELPER_COUNT: usize = 16;
 
     let unique_suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock must be after the Unix epoch")
         .as_nanos();
-    let appcontainer_name = std::sync::Arc::new(format!(
+    let appcontainer_name = format!(
         "LpmConcurrentHelperTest{:x}{unique_suffix:x}",
         std::process::id()
-    ));
+    );
+    let temporary_profile = TemporaryAppContainerProfile::new(&appcontainer_name);
+    let appcontainer_name = std::sync::Arc::new(appcontainer_name);
     let start = std::sync::Arc::new(std::sync::Barrier::new(HELPER_COUNT));
 
     let mut helpers = Vec::with_capacity(HELPER_COUNT);
@@ -183,8 +233,8 @@ fn helper_supports_concurrent_first_use_of_same_appcontainer_profile() {
         let appcontainer_name = std::sync::Arc::clone(&appcontainer_name);
         let start = std::sync::Arc::clone(&start);
         helpers.push(std::thread::spawn(move || {
-            let mut command =
-                Command::cargo_bin("lpm-sandbox-helper").expect("locate built helper");
+            let mut command = Command::cargo_bin("lpm-sandbox-helper")
+                .map_err(|error| format!("locate built helper: {error}"))?;
             command.args([
                 "--protocol-version",
                 "1",
@@ -200,26 +250,30 @@ fn helper_supports_concurrent_first_use_of_same_appcontainer_profile() {
                 r"C:\Windows\System32\whoami.exe",
             ]);
             start.wait();
-            command.output().expect("run concurrent helper")
+            command
+                .output()
+                .map_err(|error| format!("run concurrent helper: {error}"))
         }));
     }
 
     let failures = helpers
         .into_iter()
         .enumerate()
-        .filter_map(|(index, helper)| {
-            let output = helper
-                .join()
-                .expect("concurrent helper thread must not panic");
-            (!output.status.success()).then(|| {
-                format!(
-                    "helper {index}: status {:?}\nstderr: {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr)
-                )
-            })
+        .filter_map(|(index, helper)| match helper.join() {
+            Ok(Ok(output)) if output.status.success() => None,
+            Ok(Ok(output)) => Some(format!(
+                "helper {index}: status {:?}\nstderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Ok(Err(error)) => Some(format!("helper {index}: {error}")),
+            Err(_) => Some(format!(
+                "helper {index}: concurrent helper thread panicked before returning its output"
+            )),
         })
         .collect::<Vec<_>>();
+
+    temporary_profile.assert_deleted();
 
     assert!(
         failures.is_empty(),
