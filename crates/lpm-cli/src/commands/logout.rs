@@ -22,7 +22,7 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let environment_credential_active =
         targets.clear_lpm && std::env::var("LPM_TOKEN").is_ok_and(|token| !token.is_empty());
-    let had_access = targets.clear_lpm && auth::get_token(registry_url).is_some();
+    let had_access = targets.clear_lpm && auth::has_stored_access_token(registry_url);
     let had_refresh = targets.clear_lpm && auth::has_refresh_token(registry_url);
     let had_lpm_session = had_access || had_refresh;
 
@@ -38,10 +38,7 @@ pub async fn run(
     let mut errors = Vec::with_capacity(3);
 
     if targets.clear_lpm && revoke && had_lpm_session {
-        match session
-            .bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-            .await
-        {
+        match session.bearer_string_for_stored_session().await {
             Ok(bearer) => {
                 match lpm_vault::sync::unpair_all(registry_url, &bearer).await {
                     Ok(()) => {
@@ -55,7 +52,11 @@ pub async fn run(
                     }
                 }
 
-                match client.revoke_session().await {
+                match client
+                    .clone_with_static_token(&bearer)
+                    .revoke_session()
+                    .await
+                {
                     Ok(()) => {
                         server_revoked = true;
                         if !json_output {

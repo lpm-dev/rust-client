@@ -144,6 +144,54 @@ async fn logout_json_fails_when_lpm_token_remains_in_the_process_environment() {
 }
 
 #[tokio::test]
+async fn logout_revoke_uses_the_stored_session_when_lpm_token_is_active() {
+    let project = TempProject::empty(r#"{"name":"logout-mixed-auth","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_revoke_all_pairings_for("stored-access").await;
+    mock.with_revoke_token("stored-access").await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("stored-access"),
+            refresh_token: Some("stored-refresh"),
+            session_access_expires_at: None,
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "environment-token")
+        .args(["--json", "logout", "--revoke"])
+        .output()
+        .expect("run logout --revoke with stored and environment credentials");
+
+    assert!(
+        !output.status.success(),
+        "the active parent-process LPM_TOKEN must keep the overall result unsuccessful"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["pairings_revoked"], true);
+    assert_eq!(json["server_revoked"], true);
+    assert_eq!(json["local_cleared"], false);
+    assert!(
+        json["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error
+                    .as_str()
+                    .is_some_and(|message| message.contains("unset LPM_TOKEN"))
+            })),
+        "logout must report only the environment credential as remaining: {json}"
+    );
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "the stored session must be cleared after remote revocation"
+    );
+}
+
+#[tokio::test]
 async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

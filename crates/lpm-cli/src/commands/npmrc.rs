@@ -444,7 +444,7 @@ pub(super) async fn self_revoke_project_token(
             .unwrap_or("project token self-revocation failed");
         return Err(LpmError::Registry(format!(
             "{} ({status})",
-            lpm_common::sanitize_terminal_inline(message)
+            sanitize_registry_message(message, bearer)
         )));
     }
     let returned_token_id = body

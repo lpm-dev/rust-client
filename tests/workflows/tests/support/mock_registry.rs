@@ -468,6 +468,25 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_npmrc_token_self_revoke_error(
+        &self,
+        token: &str,
+        status: u16,
+        error: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"self\":true"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": error })),
+            )
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_npmrc_token_create_response(&self, response: serde_json::Value) -> &Self {
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/create"))
@@ -812,6 +831,19 @@ impl MockRegistry {
                 "success": true
             })))
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_revoke_all_pairings_for(&self, bearer_token: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/pair/revoke-all"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .expect(1)
             .mount(&self.server)
             .await;
         self

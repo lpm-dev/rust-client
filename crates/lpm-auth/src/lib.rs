@@ -243,6 +243,18 @@ pub fn get_token(registry_url: &str) -> Option<String> {
     // check_token_expiry_warnings().
 }
 
+fn get_stored_access_token(registry_url: &str) -> Option<String> {
+    get_stored_access_token_with_backend(registry_url).map(|stored| stored.token)
+}
+
+/// Check whether a non-empty access token is stored for the given registry.
+///
+/// Unlike [`get_token`], this ignores `LPM_TOKEN` and reports only local
+/// secure-storage state.
+pub fn has_stored_access_token(registry_url: &str) -> bool {
+    get_stored_access_token(registry_url).is_some()
+}
+
 /// Store a token for a given registry URL.
 ///
 /// Tries keychain first, falls back to encrypted file.
@@ -2238,6 +2250,19 @@ mod tests {
 
             assert_eq!(get_token(registry), Some("env-token".to_string()));
             assert_eq!(auth_storage_status(registry), AuthStorageStatus::none());
+        });
+    }
+
+    #[test]
+    fn has_stored_access_token_ignores_environment_credentials() {
+        with_temp_home(|_| {
+            let registry = "http://localhost:3000";
+            let _env = LocalEnvGuard::update([
+                ("LPM_TOKEN", Some("env-token".into())),
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ]);
+
+            assert!(!has_stored_access_token(registry));
         });
     }
 

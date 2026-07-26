@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use crate::{
-    clear_refresh_token, clear_token, get_refresh_token, get_token, set_refresh_token,
-    set_session_access_token_expiry, set_token,
+    clear_refresh_token, clear_token, get_refresh_token, get_stored_access_token,
+    set_refresh_token, set_session_access_token_expiry, set_token,
 };
 
 /// Where the current effective token came from.
@@ -416,6 +416,28 @@ impl SessionManager {
         }
     }
 
+    /// Resolve only the refresh-backed session stored for this Registry.
+    ///
+    /// Explicit flags, `LPM_TOKEN`, and CI credentials are deliberately
+    /// ignored. This is for operations that must act on the stored session
+    /// itself even when another credential has higher request priority.
+    pub async fn bearer_string_for_stored_session(&self) -> Result<String, LpmError> {
+        let stored = Self {
+            registry_url: self.registry_url.clone(),
+            cached: RwLock::new(None),
+            classified: AtomicBool::new(false),
+            classify_lock: std::sync::Mutex::new(()),
+            refresh_generation: AtomicU64::new(0),
+            refresh_lock: Mutex::new(()),
+            http: tokio::sync::OnceCell::new(),
+            auth_storage_notice: self.auth_storage_notice.clone(),
+            auth_storage_notice_bits: AtomicU8::new(0),
+        };
+        stored
+            .bearer_string_for(AuthRequirement::SessionRequired)
+            .await
+    }
+
     /// **Step-3 transition bridge — do not introduce new callers.**
     /// Exposes the cached bearer as a plain `String` so `main.rs` can
     /// seed `RegistryClient::with_token` while Step 4 is still in
@@ -731,7 +753,7 @@ fn classify_keychain_sources(
     mut notice: impl FnMut(AuthStorageAccessKind),
 ) -> Option<CachedToken> {
     notice(AuthStorageAccessKind::AccessToken);
-    if let Some(tok) = get_token(registry_url).filter(|t| !t.is_empty()) {
+    if let Some(tok) = get_stored_access_token(registry_url) {
         return Some(CachedToken {
             secret: SecretString::from(tok),
             source: TokenSource::StoredSession,
@@ -1388,6 +1410,24 @@ mod tests {
             "CI-issued LPM_TOKEN must produce eager-classified state"
         );
         assert_eq!(mgr.current_source_peek(), Some(TokenSource::CiToken));
+    }
+
+    #[tokio::test]
+    async fn stored_session_bearer_ignores_the_environment_credential() {
+        let (_home, _env) =
+            token_classify_isolate_with_lpm_token(Some("env-token"), CiTokenTestEnv::Cleared);
+        let registry = "https://stored-session.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+        crate::set_refresh_token(registry, "stored-refresh");
+        let mgr = SessionManager::new(registry, None);
+
+        assert_eq!(mgr.current_source_peek(), Some(TokenSource::EnvVar));
+        assert_eq!(
+            mgr.bearer_string_for_stored_session()
+                .await
+                .expect("stored session should resolve"),
+            "stored-access"
+        );
     }
 
     #[test]
