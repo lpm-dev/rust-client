@@ -1137,6 +1137,170 @@ async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
 }
 
 #[tokio::test]
+async fn env_pull_oidc_uses_lpm_vault_id_without_local_vault() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-env-bootstrap-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    mock.with_oidc_exchange(
+        "ci-oidc-token",
+        "vault-from-environment",
+        Some("preview"),
+        "lpm-ci-token",
+    )
+    .await;
+    mock.with_ci_pull(
+        "vault-from-environment",
+        "lpm-ci-token",
+        Some("preview"),
+        serde_json::json!({"BOOTSTRAPPED": "true"}),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_VAULT_ID", "vault-from-environment")
+        .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .args(["--json", "env", "pull", "--oidc", "--env=preview"])
+        .output()
+        .expect("failed to run env-only OIDC pull");
+
+    assert!(
+        output.status.success(),
+        "env-only OIDC pull failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["vars"]["BOOTSTRAPPED"], "true");
+}
+
+#[tokio::test]
+async fn env_pull_oidc_environment_vault_id_overrides_local_vault() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-env-precedence-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-from-lpm-json"}"#);
+
+    mock.with_oidc_exchange(
+        "ci-oidc-token",
+        "vault-from-environment",
+        None,
+        "lpm-ci-token",
+    )
+    .await;
+    mock.with_ci_pull(
+        "vault-from-environment",
+        "lpm-ci-token",
+        None,
+        serde_json::json!({"SOURCE": "environment"}),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_VAULT_ID", "vault-from-environment")
+        .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .args(["--json", "env", "pull", "--oidc"])
+        .output()
+        .expect("failed to run OIDC pull with vault override");
+
+    assert!(
+        output.status.success(),
+        "OIDC pull did not use the environment vault override:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["vars"]["SOURCE"], "environment");
+}
+
+#[tokio::test]
+async fn env_pull_oidc_whitespace_vault_id_falls_back_to_local_vault() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-env-fallback-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-from-lpm-json"}"#);
+
+    mock.with_oidc_exchange("ci-oidc-token", "vault-from-lpm-json", None, "lpm-ci-token")
+        .await;
+    mock.with_ci_pull(
+        "vault-from-lpm-json",
+        "lpm-ci-token",
+        None,
+        serde_json::json!({"SOURCE": "lpm-json"}),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_VAULT_ID", " \t ")
+        .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .args(["--json", "env", "pull", "--oidc"])
+        .output()
+        .expect("failed to run OIDC pull with whitespace vault override");
+
+    assert!(
+        output.status.success(),
+        "OIDC pull did not fall back to the local vault:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["vars"]["SOURCE"], "lpm-json");
+}
+
+#[test]
+fn env_pull_oidc_without_vault_source_emits_clear_json_error() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-no-vault-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_VAULT_ID", " \t ")
+        .args(["--json", "env", "pull", "--oidc"])
+        .output()
+        .expect("failed to run OIDC pull without a vault source");
+
+    assert!(
+        !output.status.success(),
+        "OIDC pull without a vault source unexpectedly succeeded"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure must emit one JSON document");
+    let error = json["error"].as_str().expect("error should be a string");
+    assert!(
+        error.contains("no vault configured")
+            && error.contains("non-empty LPM_VAULT_ID")
+            && error.contains("lpm.json"),
+        "expected clear vault configuration guidance, got: {error}",
+    );
+}
+
+#[test]
+fn env_pull_oidc_rejects_unsafe_environment_vault_id() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-unsafe-vault-id-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_VAULT_ID", "../other-vault")
+        .args(["--json", "env", "pull", "--oidc"])
+        .output()
+        .expect("failed to run OIDC pull with an unsafe vault ID");
+
+    assert!(
+        !output.status.success(),
+        "OIDC pull unexpectedly accepted an unsafe LPM_VAULT_ID"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure must emit one JSON document");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("LPM_VAULT_ID") && error.contains("unsafe")),
+        "expected unsafe LPM_VAULT_ID error, got: {json}",
+    );
+}
+
+#[tokio::test]
 async fn env_pull_oidc_uses_lpm_oidc_token_canonical_and_ignores_ci_job_jwt_v2() {
     // Locks the contract that LPM_OIDC_TOKEN is the canonical registry-exchange
     // input on every provider, and CI_JOB_JWT_V2 (whose default audience is the
@@ -1335,11 +1499,12 @@ async fn env_oidc_allow_rejects_workflow_in_subdirectory() {
 }
 
 #[tokio::test]
-async fn env_oidc_list_without_vault_emits_json_error() {
+async fn env_oidc_list_ignores_lpm_vault_id_without_local_vault() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-list-json-error-test","version":"1.0.0"}"#);
 
     let output = lpm(&project)
+        .env("LPM_VAULT_ID", "vault-from-environment")
         .args(["--json", "env", "oidc", "list"])
         .output()
         .expect("failed to run oidc list JSON error test");
@@ -2094,15 +2259,16 @@ async fn env_oidc_list_human_output_renders_new_fields() {
 }
 
 #[tokio::test]
-async fn env_oidc_allow_warns_when_escrow_upload_fails() {
-    let project = TempProject::empty(r#"{"name":"vault-oidc-escrow-warn-test","version":"1.0.0"}"#);
+async fn env_oidc_allow_fails_when_escrow_upload_fails() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-escrow-failure-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
     std::fs::write(
         project.path().join("lpm.json"),
         r#"{"vault":"vault-policy-456"}"#,
     )
-    .expect("failed to write lpm.json for oidc escrow warning");
+    .expect("failed to write lpm.json for oidc escrow failure");
 
     seed_sessions(
         project.home(),
@@ -2147,17 +2313,164 @@ async fn env_oidc_allow_warns_when_escrow_upload_fails() {
         .expect("failed to run oidc allow with escrow failure");
 
     assert!(
-        output.status.success(),
-        "oidc allow should succeed even if escrow upload fails"
+        !output.status.success(),
+        "oidc allow unexpectedly succeeded after escrow upload failed"
     );
     let combined_output = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(combined_output.contains("OIDC policy set: github"));
-    assert!(combined_output.contains("Failed to escrow wrapping key"));
-    assert!(combined_output.contains("escrow backend unavailable"));
+    assert!(
+        !combined_output.contains("OIDC policy set: github"),
+        "policy success must not be reported before escrow completes: {combined_output}",
+    );
+    assert!(
+        combined_output.contains("policy may already have been created")
+            && combined_output.contains("CI pulls are not ready")
+            && combined_output.contains("escrow backend unavailable")
+            && combined_output.contains("rerun the same `lpm env oidc allow` command"),
+        "expected partial-completion and safe-rerun guidance, got: {combined_output}",
+    );
+}
+
+#[tokio::test]
+async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-escrow-json-failure-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-json-failure"}"#);
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    mock.with_oidc_policy_create(
+        "session-access-token",
+        "vault-policy-json-failure",
+        "acme/repo",
+        &["main"],
+        &["preview"],
+        &[".github/workflows/deploy.yml"],
+        &["push"],
+    )
+    .await;
+    mock.with_escrow_upload_failure(
+        "session-access-token",
+        "vault-policy-json-failure",
+        "escrow backend unavailable",
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "oidc",
+            "allow",
+            "--provider=github",
+            "--repo=acme/repo",
+            "--branch=main",
+            "--env=preview",
+            "--workflow=.github/workflows/deploy.yml",
+        ])
+        .output()
+        .expect("failed to run JSON oidc allow with escrow failure");
+
+    assert!(
+        !output.status.success(),
+        "JSON oidc allow unexpectedly succeeded after escrow upload failed"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("JSON failure must contain exactly one parseable document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error_code"], "script");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("CI pulls are not ready")),
+        "expected escrow failure in global JSON error envelope, got: {json}",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(r#""success": true"#),
+        "JSON failure must not include a policy success document: {stdout}",
+    );
+}
+
+#[tokio::test]
+async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-wrapping-key-failure-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-key-failure"}"#);
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    mock.with_oidc_policy_create(
+        "session-access-token",
+        "vault-policy-key-failure",
+        "acme/repo",
+        &["main"],
+        &["preview"],
+        &[".github/workflows/deploy.yml"],
+        &["push"],
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env(
+            "LPM_TEST_VAULT_WRAPPING_KEY_ERROR",
+            "wrapping key storage unavailable",
+        )
+        .args([
+            "env",
+            "oidc",
+            "allow",
+            "--provider=github",
+            "--repo=acme/repo",
+            "--branch=main",
+            "--env=preview",
+            "--workflow=.github/workflows/deploy.yml",
+        ])
+        .output()
+        .expect("failed to run oidc allow with wrapping-key retrieval failure");
+
+    assert!(
+        !output.status.success(),
+        "oidc allow unexpectedly succeeded after wrapping-key retrieval failed"
+    );
+    let combined_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !combined_output.contains("OIDC policy set: github"),
+        "policy success must not be reported before escrow completes: {combined_output}",
+    );
+    assert!(
+        combined_output.contains("policy may already have been created")
+            && combined_output.contains("CI pulls are not ready")
+            && combined_output.contains("wrapping key storage unavailable"),
+        "expected wrapping-key failure guidance, got: {combined_output}",
+    );
 }
 
 #[tokio::test]
@@ -2315,7 +2628,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_clear
 }
 
 #[tokio::test]
-async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_auth_state() {
+async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_clears_auth_state() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-refresh-escrow-logout-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -2389,11 +2702,11 @@ async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_auth_
             "--workflow=.github/workflows/deploy.yml",
         ])
         .output()
-        .expect("failed to run refresh-backed oidc allow with escrow warning");
+        .expect("failed to run refresh-backed oidc allow with escrow failure");
 
     assert!(
-        allow.status.success(),
-        "refresh-backed oidc allow with escrow warning failed:\nstdout: {}\nstderr: {}",
+        !allow.status.success(),
+        "refresh-backed oidc allow unexpectedly succeeded after escrow failure:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&allow.stdout),
         String::from_utf8_lossy(&allow.stderr),
     );
@@ -2402,8 +2715,8 @@ async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_auth_
         String::from_utf8_lossy(&allow.stdout),
         String::from_utf8_lossy(&allow.stderr)
     );
-    assert!(allow_output.contains("OIDC policy set: github"));
-    assert!(allow_output.contains("Failed to escrow wrapping key"));
+    assert!(!allow_output.contains("OIDC policy set: github"));
+    assert!(allow_output.contains("CI pulls are not ready"));
     assert!(allow_output.contains("escrow backend unavailable"));
 
     let credentials_after_refresh = read_credentials(project.home());
@@ -2475,7 +2788,8 @@ async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_clears_auth_
 }
 
 #[tokio::test]
-async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_all_clears_auth_state() {
+async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all_clears_auth_state()
+{
     let project = TempProject::empty(
         r#"{"name":"vault-oidc-refresh-escrow-logout-all-test","version":"1.0.0"}"#,
     );
@@ -2550,11 +2864,11 @@ async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_all_clears_a
             "--workflow=.github/workflows/deploy.yml",
         ])
         .output()
-        .expect("failed to run refresh-backed oidc allow with escrow warning before logout --all");
+        .expect("failed to run refresh-backed oidc allow with escrow failure before logout --all");
 
     assert!(
-        allow.status.success(),
-        "refresh-backed oidc allow with escrow warning failed before logout --all:\nstdout: {}\nstderr: {}",
+        !allow.status.success(),
+        "refresh-backed oidc allow unexpectedly succeeded after escrow failure before logout --all:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&allow.stdout),
         String::from_utf8_lossy(&allow.stderr),
     );
@@ -2563,8 +2877,8 @@ async fn env_oidc_allow_warns_on_refresh_backed_session_then_logout_all_clears_a
         String::from_utf8_lossy(&allow.stdout),
         String::from_utf8_lossy(&allow.stderr)
     );
-    assert!(allow_output.contains("OIDC policy set: github"));
-    assert!(allow_output.contains("Failed to escrow wrapping key"));
+    assert!(!allow_output.contains("OIDC policy set: github"));
+    assert!(allow_output.contains("CI pulls are not ready"));
     assert!(allow_output.contains("escrow backend unavailable"));
 
     let list = lpm(&project)

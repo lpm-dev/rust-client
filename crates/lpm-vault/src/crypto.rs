@@ -44,6 +44,11 @@ const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
 ///
 /// If neither exists, generates a random 32-byte key and stores in both locations.
 pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
+    #[cfg(debug_assertions)]
+    if let Ok(error) = std::env::var("LPM_TEST_VAULT_WRAPPING_KEY_ERROR") {
+        return Err(error);
+    }
+
     if force_file_wrapping_key() {
         if let Some(key) = read_wrapping_key_from_file() {
             return Ok(key);

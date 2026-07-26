@@ -2072,7 +2072,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         id: 95,
         scenarios: 2,
         failure_modes_tested: &[
-            "uses project vault id + requested env name",
+            "uses project vault id + requested env name + matching workflow authorization",
             "unknown-platform error envelope on stdout under --json (shared dispatcher with id 95)",
         ],
         failure_modes_known: &[
@@ -2083,7 +2083,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[("tests/workflows/tests/ci.rs", 2)],
-        last_audited_at: "2026-05-14",
+        last_audited_at: "2026-07-26",
     },
     // ── id 96: lpm setup ci gitlab ──
     SurfaceV2 {
@@ -2323,14 +2323,19 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 107: lpm env oidc allow ──
     SurfaceV2 {
         id: 107,
-        scenarios: 7,
+        scenarios: 13,
         failure_modes_tested: &[
             "missing repo emits JSON error",
+            "missing workflow fails before policy creation",
+            "workflow paths in subdirectories are rejected",
             "allow then list shows policy + escrow success",
-            "emits JSON response",
-            "warns when escrow upload fails",
+            "successful allow emits JSON response",
+            "escrow upload failure exits non-zero without policy success output",
+            "escrow upload failure emits one JSON error document",
+            "wrapping-key retrieval failure exits non-zero without policy success output",
             "allow + list on refresh-backed session then logout-all clears auth state",
-            "warns on refresh-backed session then logout clears auth state",
+            "escrow failure on refresh-backed session then logout clears auth state",
+            "escrow failure on refresh-backed session then logout-all clears auth state",
             "canonicalizes env aliases before storing policy",
         ],
         failure_modes_known: &[
@@ -2339,36 +2344,54 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "allow against a vault the user lacks admin rights to",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 7)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 13)],
+        last_audited_at: "2026-07-26",
     },
     // ── id 108: lpm env oidc list ──
     SurfaceV2 {
         id: 108,
-        scenarios: 2,
-        failure_modes_tested: &["without vault emits JSON error", "emits JSON response"],
+        scenarios: 3,
+        failure_modes_tested: &[
+            "ignores LPM_VAULT_ID without a local vault and emits JSON error",
+            "emits JSON response",
+            "human output renders workflows and events",
+        ],
         failure_modes_known: &[
             "vault unavailable mid-list",
             "malformed config response from vault",
             "list across a vault with 100+ allowed identities",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 3)],
+        last_audited_at: "2026-07-26",
     },
     // ── id 109: lpm env oidc pull ──
     SurfaceV2 {
         id: 109,
-        scenarios: 1,
-        failure_modes_tested: &["exchange-error emits JSON error"],
+        scenarios: 14,
+        failure_modes_tested: &[
+            "writes sorted and quoted dotenv output",
+            "LPM_VAULT_ID bootstraps a checkout without local vault config",
+            "LPM_VAULT_ID overrides a different local vault",
+            "whitespace LPM_VAULT_ID falls back to the local vault",
+            "missing environment and local vault sources emit a clear JSON error",
+            "unsafe environment vault IDs are rejected",
+            "canonical LPM_OIDC_TOKEN wins over CI_JOB_JWT_V2",
+            "GitHub Actions runtime token exchange succeeds",
+            "partial GitHub runtime signals fall through to normal token resolution",
+            "GitHub runtime request failures are surfaced",
+            "GitHub runtime responses without a token value are rejected",
+            "exchange error hints are surfaced in human output",
+            "exchange errors emit JSON error output",
+        ],
         failure_modes_known: &[
             "token expiry handling mid-exchange",
             "provider error propagation into JSON envelope",
             "exchange against an unsupported OIDC provider issuer",
         ],
-        json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 1)],
-        last_audited_at: "2026-05-14",
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 14)],
+        last_audited_at: "2026-07-26",
     },
     // ── id 110: lpm dev ──
     //

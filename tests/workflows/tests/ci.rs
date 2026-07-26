@@ -175,9 +175,10 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
     );
     assert!(
         stdout.contains(
-            "lpm env oidc allow --provider=github --repo=<owner/repo> --branch=main --env=preview"
+            "lpm env oidc allow --provider=github --repo=<owner/repo> \
+             --workflow=.github/workflows/deploy.yml --branch=main --env=preview"
         ),
-        "setup output must print the matching authorization command, got:\n{stdout}"
+        "setup output must authorize the same workflow path displayed above it, got:\n{stdout}"
     );
 }
 
