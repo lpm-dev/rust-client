@@ -1328,53 +1328,45 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn standalone_published_release_overrides_share_process_env_lock() {
-        let (release_ready_tx, release_ready_rx) = std::sync::mpsc::channel();
-        let (release_scope_tx, release_scope_rx) = std::sync::mpsc::channel();
-        let release_scope = std::thread::spawn(move || {
-            let _env = crate::test_env::ScopedEnv::set([(
-                RELEASE_BY_TAG_OVERRIDE_KEY,
-                "http://127.0.0.1:41001/releases/tags/v{tag}".into(),
-            )]);
-            release_ready_tx.send(()).unwrap();
-            release_scope_rx.recv().unwrap();
-        });
-        release_ready_rx.recv().unwrap();
-
-        let (standalone_attempt_tx, standalone_attempt_rx) = std::sync::mpsc::channel();
-        let (standalone_ready_tx, standalone_ready_rx) = std::sync::mpsc::channel();
-        let (standalone_scope_tx, standalone_scope_rx) = std::sync::mpsc::channel();
-        let standalone_scope = std::thread::spawn(move || {
-            standalone_attempt_tx.send(()).unwrap();
+        let release_env = crate::test_env::ScopedEnv::set([(
+            RELEASE_BY_TAG_OVERRIDE_KEY,
+            "http://127.0.0.1:41001/releases/tags/v{tag}".into(),
+        )]);
+        let (contention_tx, contention_rx) = std::sync::mpsc::channel();
+        let (standalone_values_tx, standalone_values_rx) = std::sync::mpsc::channel();
+        let standalone_thread = std::thread::spawn(move || {
+            crate::test_env::signal_next_env_lock_contention(contention_tx);
             let _env = acquire_standalone_env(
                 "http://127.0.0.1:41002/download/v{tag}/{file}",
                 "http://127.0.0.1:41002/releases/tags/v{tag}",
             );
-            standalone_ready_tx.send(()).unwrap();
-            standalone_scope_rx.recv().unwrap();
+            standalone_values_tx
+                .send((
+                    std::env::var(DOWNLOAD_OVERRIDE_KEY).unwrap(),
+                    std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).unwrap(),
+                ))
+                .unwrap();
         });
 
-        standalone_attempt_rx.recv().unwrap();
+        contention_rx.recv().unwrap();
         assert!(
-            standalone_ready_rx
-                .recv_timeout(std::time::Duration::from_millis(250))
-                .is_err(),
+            matches!(
+                standalone_values_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
             "standalone override scope acquired while the shared environment lock was held"
         );
-        release_scope_tx.send(()).unwrap();
-        release_scope.join().unwrap();
-        standalone_ready_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        drop(release_env);
+        let (download_override, release_by_tag_override) = standalone_values_rx.recv().unwrap();
+        standalone_thread.join().unwrap();
         assert_eq!(
-            std::env::var(DOWNLOAD_OVERRIDE_KEY).unwrap(),
+            download_override,
             "http://127.0.0.1:41002/download/v{tag}/{file}"
         );
         assert_eq!(
-            std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).unwrap(),
+            release_by_tag_override,
             "http://127.0.0.1:41002/releases/tags/v{tag}"
         );
-        standalone_scope_tx.send(()).unwrap();
-        standalone_scope.join().unwrap();
     }
 
     /// Drive `verify_and_fetch_for_standalone` against a wiremock-served
