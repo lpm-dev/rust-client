@@ -1,7 +1,6 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_security::behavioral::secrets::SecretScanResult;
-use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum SecretScanLine {
@@ -10,8 +9,8 @@ pub(super) enum SecretScanLine {
     Detail(install_ui::TerminalLine),
 }
 
-pub(crate) fn run_publish_secret_scan(
-    project_dir: &Path,
+pub(crate) fn run_publish_secret_scan<'a>(
+    secret_scans: impl IntoIterator<Item = &'a SecretScanResult>,
     json_output: bool,
     allow_secrets: bool,
 ) -> Result<(), LpmError> {
@@ -19,14 +18,22 @@ pub(crate) fn run_publish_secret_scan(
         return Ok(());
     }
 
-    let secret_scan = lpm_security::behavioral::secrets::scan_directory(project_dir);
-    if secret_scan.has_secrets() {
-        if json_output {
-            println!("{}", secret_scan_json(&secret_scan));
-        } else {
-            emit_secret_scan_human(&secret_scan);
+    let mut scanned_artifact = false;
+    for secret_scan in secret_scans {
+        scanned_artifact = true;
+        if secret_scan.has_secrets() {
+            if json_output {
+                println!("{}", secret_scan_json(secret_scan));
+            } else {
+                emit_secret_scan_human(secret_scan);
+            }
+            return Err(LpmError::ExitCode(1));
         }
-        return Err(LpmError::ExitCode(1));
+    }
+    if !scanned_artifact {
+        return Err(LpmError::Registry(
+            "publish artifact was prepared without a secret scan".into(),
+        ));
     }
     if !json_output {
         install_ui::done("Secret scan passed");

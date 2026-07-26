@@ -9,7 +9,7 @@ use super::prepare::{
     validate_publish_tarball_size,
 };
 use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_json};
-use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
+use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets};
 use super::types::{LpmPublicationStatus, PublishResult, PublishTarget};
@@ -89,11 +89,11 @@ fn secret_scan_json_envelope_preserves_machine_fields() {
 fn ensure_lpm_in_files_preserves_tabs() {
     let dir = tempfile::tempdir().unwrap();
     let pkg_json_path = dir.path().join("package.json");
-    let original = "{\n\t\"name\": \"test\",\n\t\"files\": [\n\t\t\"src/\"\n\t]\n}\n";
+    let original = "{\n\t\"name\": \"test\",\n\t\"version\": \"1.0.0\",\n\t\"files\": [\n\t\t\"src/\"\n\t]\n}\n";
     std::fs::write(&pkg_json_path, original).unwrap();
 
-    let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
-    ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap();
+    let mut manifest = read_publish_manifest(dir.path()).unwrap();
+    ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap();
 
     let result = std::fs::read_to_string(&pkg_json_path).unwrap();
     assert!(result.contains("\".lpm/skills\""), "should add .lpm/skills");
@@ -111,11 +111,11 @@ fn ensure_lpm_in_files_preserves_tabs() {
 fn ensure_lpm_in_files_already_present() {
     let dir = tempfile::tempdir().unwrap();
     let pkg_json_path = dir.path().join("package.json");
-    let original = "{\n\t\"files\": [\".lpm/skills\", \"src/\"]\n}\n";
+    let original = "{\n\t\"name\": \"test\",\n\t\"version\": \"1.0.0\",\n\t\"files\": [\".lpm/skills\", \"src/\"]\n}\n";
     std::fs::write(&pkg_json_path, original).unwrap();
 
-    let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
-    ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap();
+    let mut manifest = read_publish_manifest(dir.path()).unwrap();
+    ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap();
 
     let result = std::fs::read_to_string(&pkg_json_path).unwrap();
     assert_eq!(result, original, "file should be untouched");
@@ -125,11 +125,11 @@ fn ensure_lpm_in_files_already_present() {
 fn ensure_lpm_in_files_updates_an_empty_array_with_valid_json() {
     let dir = tempfile::tempdir().unwrap();
     let pkg_json_path = dir.path().join("package.json");
-    let original = "{\n  \"name\": \"test\",\n  \"files\": []\n}\n";
+    let original = "{\n  \"name\": \"test\",\n  \"version\": \"1.0.0\",\n  \"files\": []\n}\n";
     std::fs::write(&pkg_json_path, original).unwrap();
 
-    let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
-    assert!(ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap());
+    let mut manifest = read_publish_manifest(dir.path()).unwrap();
+    assert!(ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap());
 
     let updated: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&pkg_json_path).unwrap()).unwrap();
@@ -141,14 +141,16 @@ fn ensure_lpm_in_files_only_updates_the_top_level_field() {
     let dir = tempfile::tempdir().unwrap();
     let pkg_json_path = dir.path().join("package.json");
     let original = r#"{
+  "name": "test",
+  "version": "1.0.0",
   "metadata": {"files": ["leave-me-alone"]},
   "files": ["src/"]
 }
 "#;
     std::fs::write(&pkg_json_path, original).unwrap();
 
-    let pkg_json: serde_json::Value = serde_json::from_str(original).unwrap();
-    assert!(ensure_lpm_in_files(&pkg_json_path, &pkg_json).unwrap());
+    let mut manifest = read_publish_manifest(dir.path()).unwrap();
+    assert!(ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap());
 
     let updated: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&pkg_json_path).unwrap()).unwrap();
@@ -160,7 +162,7 @@ fn ensure_lpm_in_files_only_updates_the_top_level_field() {
 }
 
 #[test]
-fn publisher_skills_are_included_when_files_array_was_restrictive() {
+fn real_publish_preparation_persists_and_packs_authored_skills() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path();
     std::fs::create_dir_all(project.join(".lpm/skills")).unwrap();
@@ -186,11 +188,10 @@ fn publisher_skills_are_included_when_files_array_was_restrictive() {
 
     let mut manifest = read_publish_manifest(project).unwrap();
     assert!(
-        ensure_lpm_in_files(&manifest.package_json_path, &manifest.pkg_json).unwrap(),
+        ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap(),
         "the restrictive files array should be updated before tarball creation"
     );
-    manifest = read_publish_manifest(project).unwrap();
-    let prepared = prepare_publish_project_from_manifest(project, manifest).unwrap();
+    let prepared = prepare_publish_project_from_manifest(project, manifest, true).unwrap();
 
     assert!(
         prepared
@@ -198,6 +199,72 @@ fn publisher_skills_are_included_when_files_array_was_restrictive() {
             .iter()
             .any(|file| file.path == ".lpm/skills/usage.md"),
         "the current publish tarball must include publisher-authored skills"
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        persisted["files"],
+        serde_json::json!(["index.js", ".lpm/skills"])
+    );
+}
+
+#[test]
+fn read_only_publish_preparation_packs_effective_manifest_without_writing_it() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+    std::fs::create_dir_all(project.join(".lpm/skills")).unwrap();
+    let original = r#"{
+  "name": "@lpm.dev/owner.read-only",
+  "version": "1.0.0",
+  "files": ["index.js"]
+}
+"#;
+    std::fs::write(project.join("package.json"), original).unwrap();
+    std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
+    std::fs::write(
+        project.join(".lpm/skills/usage.md"),
+        "---\nname: usage\ndescription: Complete usage guidance\n---\n# Usage\n",
+    )
+    .unwrap();
+
+    let mut manifest = read_publish_manifest(project).unwrap();
+    assert!(ensure_lpm_in_files(&mut manifest, ManifestWriteMode::ReadOnly).unwrap());
+    let prepared = prepare_publish_project_from_manifest(project, manifest, true).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(project.join("package.json")).unwrap(),
+        original
+    );
+    assert!(
+        prepared
+            .tarball_files
+            .iter()
+            .any(|file| file.path == ".lpm/skills/usage.md")
+    );
+
+    let decoder = flate2::read::GzDecoder::new(prepared.tarball_data.as_slice());
+    let mut archive = tar::Archive::new(decoder);
+    let mut entries = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().into_owned();
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content).unwrap();
+        entries.insert(path, content);
+    }
+
+    assert!(entries.contains_key(std::path::Path::new("package/.lpm/skills/usage.md")));
+    let packed_manifest: serde_json::Value = serde_json::from_slice(
+        entries
+            .get(std::path::Path::new("package/package.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        packed_manifest["files"],
+        serde_json::json!(["index.js", ".lpm/skills"])
     );
 }
 

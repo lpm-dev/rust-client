@@ -6,13 +6,15 @@ use super::output::{
     print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
     publish_result_json, visibility_from_access,
 };
-use super::prepare::{prepare_publish_project_from_manifest, read_publish_manifest};
+use super::prepare::{
+    prepare_publish_project_from_manifest, read_publish_manifest, validate_publish_tarball_size,
+};
 use super::provenance::{
     ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
 };
 use super::quality_gate::run_publish_quality_gate;
 use super::secret_scan::run_publish_secret_scan;
-use super::skills::{compute_published_skills_digest, ensure_lpm_in_files};
+use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
 use super::target::resolve_targets;
 use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublishProject,
@@ -35,7 +37,8 @@ struct NpmFilePreflightInput<'a> {
     package_json_name: &'a str,
     version: &'a str,
     version_data: &'a serde_json::Value,
-    tarball_data: &'a [u8],
+    tarball_data: &'a std::sync::Arc<Vec<u8>>,
+    rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
     json_output: bool,
 }
 
@@ -137,12 +140,12 @@ pub async fn run(
                     validation.valid_files.len()
                 ));
             }
-            if ensure_lpm_in_files(
-                &publish_manifest.package_json_path,
-                &publish_manifest.pkg_json,
-            )? {
-                publish_manifest = read_publish_manifest(project_dir)?;
-            }
+            let write_mode = if dry_run || check_only {
+                ManifestWriteMode::ReadOnly
+            } else {
+                ManifestWriteMode::Persist
+            };
+            ensure_lpm_in_files(&mut publish_manifest, write_mode)?;
         }
         has_authored_skills
     } else {
@@ -157,10 +160,11 @@ pub async fn run(
         readme,
         tarball_data,
         tarball_files,
+        secret_scan,
         tarball_size,
         detected_ecosystem,
         swift_manifest,
-    } = prepare_publish_project_from_manifest(project_dir, publish_manifest)?;
+    } = prepare_publish_project_from_manifest(project_dir, publish_manifest, !allow_secrets)?;
     let publish_config = publish_config.as_ref();
 
     let targets_gitlab = targets.iter().any(|t| matches!(t, PublishTarget::GitLab));
@@ -275,6 +279,13 @@ pub async fn run(
         }
     }
 
+    let rewritten_tarballs = prepare_rewritten_target_tarballs(
+        &targets,
+        &target_names,
+        &name,
+        &tarball_data,
+        !allow_secrets,
+    )?;
     let version_data =
         build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
     let mut precomputed_npm_artifacts =
@@ -286,11 +297,26 @@ pub async fn run(
             version: &version,
             version_data: &version_data,
             tarball_data: &tarball_data,
+            rewritten_tarballs: &rewritten_tarballs,
             json_output,
         })
         .await?;
 
-    run_publish_secret_scan(project_dir, json_output, allow_secrets)?;
+    let mut final_secret_scans = Vec::with_capacity(targets.len());
+    if !allow_secrets {
+        for target in &targets {
+            let target_name = target_names.get(&target.key()).ok_or_else(|| {
+                LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+            })?;
+            final_secret_scans.push(target_secret_scan(
+                target_name,
+                &name,
+                secret_scan.as_ref(),
+                &rewritten_tarballs,
+            )?);
+        }
+    }
+    run_publish_secret_scan(final_secret_scans, json_output, allow_secrets)?;
 
     // Quality checks are required only for the LPM target.
     let quality_result = if targets_lpm {
@@ -472,18 +498,18 @@ pub async fn run(
                 let lpm_result: Result<serde_json::Value, LpmError> = async {
                     let lpm_name = target_names.get("lpm").map_or(name.as_str(), |s| s.as_str());
 
-                    // Rewrite tarball if LPM name differs from package.json name
-                    let lpm_tarball = if lpm_name != name.as_str() {
-                        publish_common::rewrite_tarball_name(&tarball_data, &name, lpm_name)?
-                    } else {
-                        tarball_data.clone()
-                    };
+                    let lpm_tarball = target_tarball_data(
+                        lpm_name,
+                        &name,
+                        &tarball_data,
+                        &rewritten_tarballs,
+                    )?;
 
                     // Recompute dist hashes from the final rewritten tarball so metadata
                     // matches the actual uploaded artifact (not the pre-rewrite original).
                     let mut lpm_version_data = version_data.clone();
                     if lpm_name != name.as_str() {
-                        let lpm_hashes = publish_common::compute_hashes(&lpm_tarball);
+                        let lpm_hashes = publish_common::compute_hashes(lpm_tarball);
                         lpm_version_data["dist"] = serde_json::json!({
                             "shasum": lpm_hashes.shasum,
                             "integrity": lpm_hashes.integrity,
@@ -498,7 +524,7 @@ pub async fn run(
                                     .into(),
                             ));
                         };
-                        let final_hashes = publish_common::compute_hashes(&lpm_tarball);
+                        let final_hashes = publish_common::compute_hashes(lpm_tarball);
                         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
                         let slsa = provenance::build_slsa_statement(
                             &context.ci,
@@ -535,7 +561,7 @@ pub async fn run(
                         lpm_name,
                         &version,
                         &readme,
-                        &lpm_tarball,
+                        lpm_tarball,
                         &tarball_files,
                         &lpm_version_data,
                         &quality_result,
@@ -742,12 +768,17 @@ pub async fn run(
                         if let Some(artifact) = precomputed_npm_artifacts.remove(&target_key) {
                             artifact
                         } else {
+                            let final_tarball = target_tarball_data(
+                                npm_name_str,
+                                &name,
+                                &tarball_data,
+                                &rewritten_tarballs,
+                            )?;
                             prepare_npm_target_artifact(NpmTargetArtifactInput {
-                                package_json_name: &name,
                                 npm_name: npm_name_str,
                                 version: &version,
                                 base_version_data: &version_data,
-                                base_tarball_data: &tarball_data,
+                                final_tarball_data: std::sync::Arc::clone(final_tarball),
                                 provenance_context: provenance_context.as_ref(),
                                 target_label: display,
                                 json_output,
@@ -923,6 +954,78 @@ pub async fn run(
     }
 }
 
+fn prepare_rewritten_target_tarballs(
+    targets: &[PublishTarget],
+    target_names: &HashMap<String, String>,
+    package_json_name: &str,
+    base_tarball_data: &[u8],
+    scan_secrets: bool,
+) -> Result<HashMap<String, publish_common::RewrittenTarball>, LpmError> {
+    let mut rewritten_tarballs = HashMap::with_capacity(targets.len());
+    for target in targets {
+        let target_name = target_names.get(&target.key()).ok_or_else(|| {
+            LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+        })?;
+        if target_name == package_json_name || rewritten_tarballs.contains_key(target_name) {
+            continue;
+        }
+
+        let rewritten = publish_common::rewrite_tarball_name_for_publish(
+            base_tarball_data,
+            package_json_name,
+            target_name,
+            scan_secrets,
+        )?
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "target tarball rewrite was skipped for renamed package {target_name}"
+            ))
+        })?;
+        validate_publish_tarball_size(rewritten.data.len())?;
+        rewritten_tarballs.insert(target_name.clone(), rewritten);
+    }
+    Ok(rewritten_tarballs)
+}
+
+fn target_tarball_data<'a>(
+    target_name: &str,
+    package_json_name: &str,
+    base_tarball_data: &'a std::sync::Arc<Vec<u8>>,
+    rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
+) -> Result<&'a std::sync::Arc<Vec<u8>>, LpmError> {
+    if target_name == package_json_name {
+        return Ok(base_tarball_data);
+    }
+    rewritten_tarballs
+        .get(target_name)
+        .map(|tarball| &tarball.data)
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "missing prepared tarball for renamed package {target_name}"
+            ))
+        })
+}
+
+fn target_secret_scan<'a>(
+    target_name: &str,
+    package_json_name: &str,
+    base_secret_scan: Option<&'a lpm_security::behavioral::secrets::SecretScanResult>,
+    rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
+) -> Result<&'a lpm_security::behavioral::secrets::SecretScanResult, LpmError> {
+    let scan = if target_name == package_json_name {
+        base_secret_scan
+    } else {
+        rewritten_tarballs
+            .get(target_name)
+            .and_then(|tarball| tarball.secret_scan.as_ref())
+    };
+    scan.ok_or_else(|| {
+        LpmError::Registry(format!(
+            "publish artifact for {target_name} was prepared without a secret scan"
+        ))
+    })
+}
+
 async fn precompute_file_provenance_artifacts(
     input: NpmFilePreflightInput<'_>,
 ) -> Result<HashMap<String, NpmTargetArtifact>, LpmError> {
@@ -946,12 +1049,17 @@ async fn precompute_file_provenance_artifacts(
         let npm_name = input.target_names.get(&key).ok_or_else(|| {
             LpmError::Registry(format!("no name resolved for {}", target.display_name()))
         })?;
+        let tarball_data = target_tarball_data(
+            npm_name,
+            input.package_json_name,
+            input.tarball_data,
+            input.rewritten_tarballs,
+        )?;
         let artifact = prepare_npm_target_artifact(NpmTargetArtifactInput {
-            package_json_name: input.package_json_name,
             npm_name,
             version: input.version,
             base_version_data: input.version_data,
-            base_tarball_data: input.tarball_data,
+            final_tarball_data: std::sync::Arc::clone(tarball_data),
             provenance_context: Some(&provenance),
             target_label: target.display_name(),
             json_output: input.json_output,

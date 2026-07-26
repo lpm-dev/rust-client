@@ -8,15 +8,20 @@ pub(super) const MAX_PUBLISH_TARBALL_BYTES: usize = 500 * 1024 * 1024;
 
 pub(super) struct PublishManifest {
     pub(super) package_json_path: std::path::PathBuf,
+    pub(super) package_json_content: String,
+    pub(super) package_json_override: Option<Vec<u8>>,
     pub(super) pkg_json: serde_json::Value,
     pub(super) name: String,
     pub(super) version: String,
     pub(super) publish_config: Option<lpm_json::PublishConfig>,
 }
 
-pub(crate) fn prepare_publish_project(project_dir: &Path) -> Result<PublishProject, LpmError> {
+pub(crate) fn prepare_publish_project(
+    project_dir: &Path,
+    scan_secrets: bool,
+) -> Result<PublishProject, LpmError> {
     let manifest = read_publish_manifest(project_dir)?;
-    prepare_publish_project_from_manifest(project_dir, manifest)
+    prepare_publish_project_from_manifest(project_dir, manifest, scan_secrets)
 }
 
 pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifest, LpmError> {
@@ -53,6 +58,8 @@ pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifes
 
     Ok(PublishManifest {
         package_json_path,
+        package_json_content: content,
+        package_json_override: None,
         pkg_json,
         name,
         version,
@@ -63,24 +70,39 @@ pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifes
 pub(super) fn prepare_publish_project_from_manifest(
     project_dir: &Path,
     manifest: PublishManifest,
+    scan_secrets: bool,
 ) -> Result<PublishProject, LpmError> {
     let PublishManifest {
         package_json_path: _,
+        package_json_content,
+        package_json_override,
         pkg_json,
         name,
         version,
         publish_config,
     } = manifest;
     let readme = publish_common::read_readme(project_dir);
-    let (mut tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
-
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .ok()
         .flatten();
-    if let Some(ref ws) = workspace {
-        tarball_data = publish_common::rewrite_workspace_deps_in_tarball(&tarball_data, ws)?;
+    let mut prepared_package_json =
+        package_json_override.unwrap_or_else(|| package_json_content.into_bytes());
+    if let Some(ref ws) = workspace
+        && let Some(rewritten) =
+            publish_common::rewrite_workspace_deps_in_package_json(&prepared_package_json, ws)?
+    {
+        prepared_package_json = rewritten;
     }
 
+    let prepared_tarball = publish_common::prepare_tarball(
+        project_dir,
+        &pkg_json,
+        publish_common::TarballOptions {
+            package_json_content: Some(&prepared_package_json),
+            scan_secrets,
+        },
+    )?;
+    let tarball_data = std::sync::Arc::new(prepared_tarball.data);
     let tarball_size = tarball_data.len();
     validate_publish_tarball_size(tarball_size)?;
 
@@ -93,14 +115,15 @@ pub(super) fn prepare_publish_project_from_manifest(
         publish_config,
         readme,
         tarball_data,
-        tarball_files,
+        tarball_files: prepared_tarball.files,
+        secret_scan: prepared_tarball.secret_scan,
         tarball_size,
         detected_ecosystem,
         swift_manifest,
     })
 }
 
-pub(super) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
+pub(crate) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
     if tarball_size > MAX_PUBLISH_TARBALL_BYTES {
         return Err(LpmError::Registry(format!(
             "tarball too large: {} (max 500 MiB)",

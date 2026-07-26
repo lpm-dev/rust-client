@@ -7,6 +7,8 @@ mod support;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha512};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use support::assertions::parse_json_output;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
@@ -20,6 +22,61 @@ const SIGSTORE_PEM_CERT_LEAF: &str =
     "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
 const SIGSTORE_PEM_CERT_ROOT: &str =
     "-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+
+fn authored_skills_project(name: &str) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{name}",
+  "version": "1.0.0",
+  "description": "Publish preparation integrity fixture",
+  "main": "index.js",
+  "license": "MIT",
+  "files": ["index.js"]
+}}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        ".lpm/skills/usage.md",
+        concat!(
+            "---\n",
+            "name: usage\n",
+            "description: Complete package usage guidance\n",
+            "---\n",
+            "# Usage\n\n",
+            "Use this package through its documented public API. This guidance includes ",
+            "enough detail for an agent to follow the supported workflow safely.\n",
+        ),
+    );
+    project
+}
+
+fn snapshot_project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut entries = std::fs::read_dir(dir)
+            .expect("read project directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read project entries");
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().expect("read project entry type");
+            if file_type.is_dir() {
+                visit(root, &path, snapshot);
+            } else if file_type.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("project entry must remain below root")
+                    .to_path_buf();
+                snapshot.insert(relative, std::fs::read(path).expect("read project file"));
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
 
 fn unsigned_sigstore_jwt(payload: serde_json::Value) -> String {
     let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
@@ -99,6 +156,59 @@ fn publish_dry_run_validates_package() {
     assert!(
         combined.contains("test-pkg") || combined.contains("dry") || combined.contains("preview"),
         "expected package info or dry-run indicator in output, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn publish_dry_run_with_authored_skills_leaves_project_files_unchanged() {
+    let mock = MockRegistry::start().await;
+    let project = authored_skills_project("@lpm.dev/testuser.read-only-dry-run");
+    let before = snapshot_project_files(project.path());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish dry-run with authored skills");
+
+    assert!(
+        output.status.success(),
+        "publish dry-run must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        snapshot_project_files(project.path()),
+        before,
+        "publish dry-run must not modify project files"
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(
+        json["files"],
+        serde_json::json!(3),
+        "prepared file manifest must contain package.json, index.js, and the authored skill"
+    );
+}
+
+#[test]
+fn publish_check_with_authored_skills_leaves_project_files_unchanged() {
+    let project = authored_skills_project("@lpm.dev/testuser.read-only-check");
+    let before = snapshot_project_files(project.path());
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--lpm"])
+        .output()
+        .expect("run publish check with authored skills");
+
+    assert!(
+        output.status.success(),
+        "publish check must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        snapshot_project_files(project.path()),
+        before,
+        "publish check must not modify project files"
     );
 }
 
@@ -214,6 +324,250 @@ fn publish_secret_scan_json_failure_emits_single_envelope() {
     assert!(
         stderr.trim().is_empty(),
         "JSON secret-scan failure must not add human diagnostics, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_blocks_gitignored_secret_when_files_explicitly_selects_it() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "selected-gitignored-secret",
+  "version": "1.0.0",
+  "files": ["ignored-secret.js"]
+}"#,
+    );
+    std::fs::create_dir(project.path().join(".git")).expect("create git metadata directory");
+    project.write_file(".gitignore", "ignored-secret.js\n");
+    project.write_file(
+        "ignored-secret.js",
+        r#"const password = "not-a-real-selected-secret";"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run publish with selected gitignored secret");
+
+    assert!(
+        !output.status.success(),
+        "selected secret must block publish"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ignored-secret.js") && stderr.contains("generic_password"),
+        "secret result must preserve the selected path and pattern:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_ignores_secret_outside_final_tarball_file_set() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "unselected-secret",
+  "version": "1.0.0",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "not-published.js",
+        r#"const password = "not-a-real-unselected-secret";"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run publish with an unselected secret");
+
+    assert!(
+        output.status.success(),
+        "a secret outside the tarball must not block publish\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn publish_blocks_gitignored_blocked_filename_when_files_selects_it() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "selected-blocked-filename",
+  "version": "1.0.0",
+  "files": ["credentials.json"]
+}"#,
+    );
+    std::fs::create_dir(project.path().join(".git")).expect("create git metadata directory");
+    project.write_file(".gitignore", "credentials.json\n");
+    project.write_file("credentials.json", "{}");
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run publish with selected blocked filename");
+
+    assert!(
+        !output.status.success(),
+        "a selected blocked filename must block publish"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("credentials.json") && stderr.contains("blocked_file"),
+        "blocked-file result must preserve the selected path and pattern:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_allow_secrets_bypasses_selected_file_scan() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "allow-selected-secret",
+  "version": "1.0.0",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file(
+        "index.js",
+        r#"const password = "not-a-real-allowed-secret";"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm", "--allow-secrets"])
+        .output()
+        .expect("run publish with allow-secrets");
+
+    assert!(
+        output.status.success(),
+        "--allow-secrets must retain its bypass behavior\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn publish_scans_manifest_bytes_after_lpm_target_name_rewrite() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "source-package",
+  "version": "1.0.0",
+  "description": "sk_liv\u0065_FAKEFAKEFAKEFAKEFAKE",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.rewritten-secret"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish with target-specific name rewrite");
+
+    assert!(
+        !output.status.success(),
+        "a secret materialized by the final manifest rewrite must block publish\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stripe_live_secret"),
+        "the final rewritten manifest secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_scans_manifest_bytes_after_npm_target_name_rewrite() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "source-package",
+  "version": "1.0.0",
+  "description": "sk_liv\u0065_FAKEFAKEFAKEFAKEFAKE",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"renamed-package"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run npm publish with target-specific name rewrite");
+
+    assert!(
+        !output.status.success(),
+        "a secret materialized by the final npm manifest rewrite must block publish\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stripe_live_secret"),
+        "the final npm manifest secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_scans_selected_javascript_larger_than_two_mib() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "large-selected-secret",
+  "version": "1.0.0",
+  "files": ["bundle.js"]
+}"#,
+    );
+    let mut bundle = "x".repeat(2 * 1024 * 1024);
+    bundle.push_str("\nconst token = \"");
+    bundle.push_str("sk_live_");
+    bundle.push_str("FAKEFAKEFAKEFAKEFAKE\";\n");
+    project.write_file("bundle.js", &bundle);
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .output()
+        .expect("run publish with a large selected JavaScript bundle");
+
+    assert!(
+        !output.status.success(),
+        "a selected scannable file larger than 2 MiB must not bypass the publish scan\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle.js") && stderr.contains("stripe_live_secret"),
+        "the large selected file and secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_check_help_describes_local_preparation_and_validation() {
+    let project = TempProject::empty(r#"{"name":"help-contract","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["publish", "--help"])
+        .output()
+        .expect("run publish help");
+
+    assert!(output.status.success(), "publish help must succeed");
+    let help = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        help.contains(
+            "Prepare and validate locally without publishing: pack files, validate skills and \
+             provenance files, run quality checks, and scan for secrets"
+        ),
+        "publish --check help must describe its local validation contract:\n{help}"
+    );
+    assert!(
+        !help.contains("Only show quality report"),
+        "publish --check help must not claim it only runs quality checks:\n{help}"
     );
 }
 
@@ -402,6 +756,43 @@ async fn publish_to_mock_registry_succeeds() {
             && !combined.contains("Publishing as")
             && !combined.contains("Uploading..."),
         "publish human output should not include old chatter, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn real_publish_with_authored_skills_persists_effective_manifest_and_notice() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = authored_skills_project("@lpm.dev/testuser.real-skills");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run real publish with authored skills");
+
+    assert!(
+        output.status.success(),
+        "real publish must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let package_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("parse package.json");
+    assert_eq!(
+        package_json["files"],
+        serde_json::json!(["index.js", ".lpm/skills"])
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains(
+            "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise"
+        ),
+        "real publish must retain the manifest update notice:\n{combined}"
     );
 }
 

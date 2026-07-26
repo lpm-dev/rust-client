@@ -98,8 +98,9 @@ pub(crate) struct PublishProject {
     pub(crate) version: String,
     pub(crate) publish_config: Option<lpm_json::PublishConfig>,
     pub(crate) readme: Option<String>,
-    pub(crate) tarball_data: Vec<u8>,
+    pub(crate) tarball_data: std::sync::Arc<Vec<u8>>,
     pub(crate) tarball_files: Vec<TarballFile>,
+    pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
     pub(crate) tarball_size: usize,
     pub(crate) detected_ecosystem: String,
     pub(crate) swift_manifest: Option<serde_json::Value>,
@@ -125,7 +126,7 @@ pub(crate) enum ResolvedProvenance {
 
 #[derive(Debug)]
 pub(crate) struct NpmTargetArtifact {
-    pub(crate) tarball_data: Vec<u8>,
+    pub(crate) tarball_data: std::sync::Arc<Vec<u8>>,
     pub(crate) version_data: serde_json::Value,
     pub(crate) provenance_attachment: Option<NpmProvenanceAttachment>,
 }
@@ -142,11 +143,10 @@ pub(crate) struct PublishQualityGateInput<'a> {
 }
 
 pub(crate) struct NpmTargetArtifactInput<'a> {
-    pub(crate) package_json_name: &'a str,
     pub(crate) npm_name: &'a str,
     pub(crate) version: &'a str,
     pub(crate) base_version_data: &'a serde_json::Value,
-    pub(crate) base_tarball_data: &'a [u8],
+    pub(crate) final_tarball_data: std::sync::Arc<Vec<u8>>,
     pub(crate) provenance_context: Option<&'a ResolvedProvenance>,
     pub(crate) target_label: &'a str,
     pub(crate) json_output: bool,

@@ -21,20 +21,10 @@ const SIGSTORE_BUNDLE_V03_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundl
 pub(crate) async fn prepare_npm_target_artifact(
     input: NpmTargetArtifactInput<'_>,
 ) -> Result<NpmTargetArtifact, LpmError> {
-    let tarball_data = if input.npm_name != input.package_json_name {
-        publish_common::rewrite_tarball_name(
-            input.base_tarball_data,
-            input.package_json_name,
-            input.npm_name,
-        )?
-    } else {
-        input.base_tarball_data.to_vec()
-    };
-
     let mut version_data = input.base_version_data.clone();
     let mut provenance_attachment = None;
     if let Some(provenance) = input.provenance_context {
-        let final_hashes = publish_common::compute_hashes(&tarball_data);
+        let final_hashes = publish_common::compute_hashes(&input.final_tarball_data);
         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
         let expected_subject = lpm_common::npm_package_purl(input.npm_name, input.version);
 
@@ -86,7 +76,7 @@ pub(crate) async fn prepare_npm_target_artifact(
     }
 
     Ok(NpmTargetArtifact {
-        tarball_data,
+        tarball_data: input.final_tarball_data,
         version_data,
         provenance_attachment,
     })
@@ -581,8 +571,8 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_npm_target_artifact_rejects_file_provenance_subject_mismatch() {
-        let tarball_data = b"fake-tarball";
-        let final_hashes = publish_common::compute_hashes(tarball_data);
+        let tarball_data = std::sync::Arc::new(b"fake-tarball".to_vec());
+        let final_hashes = publish_common::compute_hashes(&tarball_data);
         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
         let file = LoadedProvenanceFile {
             attachment: NpmProvenanceAttachment {
@@ -594,11 +584,10 @@ mod tests {
         let provenance = ResolvedProvenance::File(file);
 
         let err = prepare_npm_target_artifact(NpmTargetArtifactInput {
-            package_json_name: "pkg",
             npm_name: "pkg",
             version: "1.0.0",
             base_version_data: &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
-            base_tarball_data: tarball_data,
+            final_tarball_data: tarball_data,
             provenance_context: Some(&provenance),
             target_label: "npm",
             json_output: true,
