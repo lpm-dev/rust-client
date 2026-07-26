@@ -571,9 +571,9 @@ async fn get_ci_oidc_token() -> Result<String, LpmError> {
 fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String {
     let code_hint = match code {
         "policy_not_found" => Some(
-            "No OIDC policy exists for this repo+vault. Create one with: \
-             lpm env oidc allow --repo=<owner/repo> --workflow=.github/workflows/<file>.yml \
-             --branch=<name> --env=<name>",
+            "No OIDC policy exists for this CI identity and vault. Create one with \
+             `lpm env oidc allow`, using the provider-specific identity flags shown by \
+             `lpm setup ci` or `lpm env oidc allow --help`.",
         ),
         "policy_misconfigured" => Some(
             "The OIDC policy exists but is missing required fields (likely a pre-migration \
@@ -581,11 +581,13 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         ),
         "branch_not_allowed" => Some(
             "The branch claim from your CI's OIDC token isn't in the policy's allowedBranches. \
-             Update the policy: lpm env oidc allow --repo=<owner/repo> --branch=<list> --workflow=...",
+             Update it with `lpm env oidc allow`, keeping the same provider identity flags and \
+             supplying `--branch=<list>`.",
         ),
         "env_not_allowed" => Some(
             "The requested env isn't in the policy's allowedEnvironments. Update the policy: \
-             lpm env oidc allow --repo=<owner/repo> --env=<list> --workflow=...",
+             rerun `lpm env oidc allow` with the same provider identity flags and \
+             `--env=<list>`.",
         ),
         "workflow_not_allowed" => Some(
             "The workflow file that minted this token isn't in the policy's allowedWorkflows. \
@@ -646,6 +648,15 @@ mod oidc_error_hint_tests {
         assert!(msg.contains("OIDC policy is misconfigured"));
         assert!(msg.contains("dashboard"));
         assert!(msg.contains("Hint:"));
+    }
+
+    #[test]
+    fn provider_neutral_codes_do_not_invent_github_flags_without_server_hint() {
+        for code in ["policy_not_found", "branch_not_allowed", "env_not_allowed"] {
+            let message = build_oidc_pull_error_message("not allowed", "", code);
+            assert!(!message.contains("--repo"), "{code}: {message}");
+            assert!(!message.contains("--workflow"), "{code}: {message}");
+        }
     }
 
     #[test]

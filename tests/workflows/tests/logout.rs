@@ -1,6 +1,9 @@
 mod support;
 
-use support::auth_state::{SessionSeed, credentials_path, seed_sessions};
+use support::auth_state::{
+    SessionSeed, credentials_path, custom_registries_path, read_credentials,
+    seed_custom_registries, seed_sessions,
+};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
@@ -207,4 +210,99 @@ async fn logout_revoke_json_remote_failure_is_nonzero_but_clears_local_once() {
     assert_eq!(json["server_revoked"], true);
     assert_eq!(json["local_cleared"], true);
     assert!(!credentials_path(project.home()).exists());
+}
+
+#[tokio::test]
+async fn logout_all_revoke_remote_failure_still_clears_every_local_registry_credential() {
+    let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let custom_registry = "https://packages.example.internal/npm";
+    mock.with_revoke_all_pairings_status(503).await;
+    mock.with_revoke_token("access-primary").await;
+
+    seed_sessions(
+        project.home(),
+        &[
+            SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("access-primary"),
+                refresh_token: Some("refresh-primary"),
+                session_access_expires_at: None,
+            },
+            SessionSeed {
+                registry_url: "https://registry.npmjs.org",
+                access_token: Some("npm-token"),
+                refresh_token: None,
+                session_access_expires_at: None,
+            },
+            SessionSeed {
+                registry_url: "https://npm.pkg.github.com",
+                access_token: Some("github-token"),
+                refresh_token: None,
+                session_access_expires_at: None,
+            },
+            SessionSeed {
+                registry_url: "https://gitlab.com/api/v4/packages/npm",
+                access_token: Some("gitlab-token"),
+                refresh_token: None,
+                session_access_expires_at: None,
+            },
+            SessionSeed {
+                registry_url: custom_registry,
+                access_token: Some("custom-token"),
+                refresh_token: None,
+                session_access_expires_at: None,
+            },
+        ],
+    );
+    seed_custom_registries(project.home(), &[custom_registry]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--all", "--revoke"])
+        .output()
+        .expect("run logout --all --revoke with remote failure");
+
+    assert!(!output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["local_cleared"], true);
+    assert!(!credentials_path(project.home()).exists());
+    assert!(!custom_registries_path(project.home()).exists());
+}
+
+#[tokio::test]
+async fn logout_revoke_with_specific_target_is_rejected_before_credentials_change() {
+    let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    seed_sessions(
+        project.home(),
+        &[
+            SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("access-primary"),
+                refresh_token: Some("refresh-primary"),
+                session_access_expires_at: None,
+            },
+            SessionSeed {
+                registry_url: "https://registry.npmjs.org",
+                access_token: Some("npm-token"),
+                refresh_token: None,
+                session_access_expires_at: None,
+            },
+        ],
+    );
+    let before = read_credentials(project.home());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["logout", "--revoke", "--npm"])
+        .output()
+        .expect("run logout --revoke --npm");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--revoke can only be used for the LPM.dev session")
+    );
+    assert_eq!(read_credentials(project.home()), before);
 }

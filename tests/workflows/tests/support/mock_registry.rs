@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -25,6 +26,11 @@ struct JsonResponseSequence {
     bodies: Arc<Mutex<VecDeque<serde_json::Value>>>,
 }
 
+struct JsonResponseAndCreateDirectory {
+    body: serde_json::Value,
+    path: PathBuf,
+}
+
 impl Respond for JsonResponseSequence {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let mut bodies = self.bodies.lock().expect("response sequence lock");
@@ -34,6 +40,13 @@ impl Respond for JsonResponseSequence {
             bodies.front().cloned().expect("response sequence body")
         };
         ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+impl Respond for JsonResponseAndCreateDirectory {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        std::fs::create_dir_all(&self.path).expect("create response-side directory");
+        ResponseTemplate::new(200).set_body_json(&self.body)
     }
 }
 
@@ -272,28 +285,72 @@ impl MockRegistry {
         token: &str,
         expires_at: &str,
     ) -> &Self {
-        self.with_npmrc_token_create_expected(expiry_days, token, expires_at, 1)
-            .await
+        self.with_npmrc_token_create_responses(
+            expiry_days,
+            vec![serde_json::json!({
+                "token": token,
+                "tokenId": "11111111-1111-4111-8111-111111111111",
+                "scope": "read",
+                "expiresAt": expires_at,
+            })],
+        )
+        .await
     }
 
-    pub async fn with_npmrc_token_create_expected(
+    pub async fn with_npmrc_token_create_responses(
         &self,
         expiry_days: u32,
-        token: &str,
-        expires_at: &str,
-        expected_calls: u64,
+        responses: Vec<serde_json::Value>,
     ) -> &Self {
+        let expected_calls = responses.len() as u64;
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/create"))
             .and(body_string_contains("\"scope\":\"read\""))
             .and(body_string_contains(format!(
                 "\"expiryDays\":{expiry_days}"
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "token": token,
-                "scope": "read",
-                "expiresAt": expires_at,
-            })))
+            .respond_with(JsonResponseSequence {
+                bodies: Arc::new(Mutex::new(responses.into())),
+            })
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_create_then_make_directory(
+        &self,
+        response: serde_json::Value,
+        path_to_create: PathBuf,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/create"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(JsonResponseAndCreateDirectory {
+                body: response,
+                path: path_to_create,
+            })
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_revoke(
+        &self,
+        token_id: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        let response = if status == 200 {
+            serde_json::json!({ "revoked": true, "tokenId": token_id })
+        } else {
+            serde_json::json!({ "error": "project token revocation failed" })
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(body_string_contains(format!("\"tokenId\":\"{token_id}\"")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(response))
             .expect(expected_calls)
             .mount(&self.server)
             .await;

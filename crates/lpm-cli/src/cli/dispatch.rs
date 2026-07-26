@@ -1439,14 +1439,22 @@ async fn async_main() -> Result<()> {
                 logout_registry,
             } = args;
             let has_specific = npm || github || gitlab || logout_registry.is_some();
+            if revoke && has_specific && !all {
+                return Err(lpm_common::LpmError::Script(
+                    "--revoke can only be used for the LPM.dev session; use `lpm logout --revoke` or `lpm logout --all --revoke`"
+                        .into(),
+                ));
+            }
 
-            if all || (!has_specific) {
+            let mut lpm_logout_result = Ok(());
+            if all || !has_specific {
                 // Default: LPM only. --all: everything.
                 let registry = cli
                     .registry
                     .as_deref()
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-                commands::logout::run(&client, &session, registry, revoke, cli.json).await?;
+                lpm_logout_result =
+                    commands::logout::run(&client, &session, registry, revoke, cli.json).await;
             }
 
             if all || npm {
@@ -1504,7 +1512,7 @@ async fn async_main() -> Result<()> {
                 }
             }
 
-            Ok(())
+            lpm_logout_result
         }
         Commands::Setup(args) => match args.action {
             SetupAction::Ci {

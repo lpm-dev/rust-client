@@ -165,7 +165,7 @@ pub(crate) struct LoginArgs {
 
 #[derive(Args)]
 pub(crate) struct LogoutArgs {
-    /// Also revoke the LPM token on the server.
+    /// Also revoke browser pairings and the current refresh-backed LPM.dev CLI session.
     #[arg(long)]
     pub(crate) revoke: bool,
 

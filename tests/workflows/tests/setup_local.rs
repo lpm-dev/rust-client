@@ -3,6 +3,9 @@ mod support;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
+const FIRST_TOKEN_ID: &str = "11111111-1111-4111-8111-111111111111";
+const SECOND_TOKEN_ID: &str = "22222222-2222-4222-8222-222222222222";
+
 #[tokio::test]
 async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
     let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
@@ -110,8 +113,25 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
     );
     project.write_file(".gitignore", "target\n.npmrc\n.npmrc\n");
     let mock = MockRegistry::start().await;
-    mock.with_npmrc_token_create_expected(30, "lpm_read_only_token", "2030-01-02T03:04:05Z", 2)
-        .await;
+    mock.with_npmrc_token_create_responses(
+        30,
+        vec![
+            serde_json::json!({
+                "token": "lpm_first_read_only_token",
+                "tokenId": FIRST_TOKEN_ID,
+                "scope": "read",
+                "expiresAt": "2030-01-02T03:04:05Z",
+            }),
+            serde_json::json!({
+                "token": "lpm_second_read_only_token",
+                "tokenId": SECOND_TOKEN_ID,
+                "scope": "read",
+                "expiresAt": "2030-01-02T03:04:05Z",
+            }),
+        ],
+    )
+    .await;
+    mock.with_npmrc_token_revoke(FIRST_TOKEN_ID, 200, 1).await;
 
     for _ in 0..2 {
         let output = lpm_with_registry(&project, &mock.url())
@@ -125,6 +145,9 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
     assert_eq!(npmrc.matches("# LPM Registry (generated").count(), 1);
     assert_eq!(npmrc.matches("@lpm.dev:registry=").count(), 1);
     assert_eq!(npmrc.matches("_authToken=").count(), 1);
+    assert!(npmrc.contains("lpm_second_read_only_token"));
+    assert!(!npmrc.contains("lpm_first_read_only_token"));
+    assert!(npmrc.contains(SECOND_TOKEN_ID));
     assert!(npmrc.contains("registry=https://registry.example.test/"));
     assert!(npmrc.contains("fund=false"));
     assert_eq!(
@@ -135,6 +158,141 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
             .count(),
         1
     );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/registry/-/token/create")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/registry/-/token/revoke-project")
+            .count(),
+        1,
+        "the superseded setup token must be revoked after the replacement commits"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_npmrc_write_failure_restores_gitignore_and_revokes_new_token() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_create_then_make_directory(
+        serde_json::json!({
+            "token": "lpm_new_read_only_token",
+            "tokenId": FIRST_TOKEN_ID,
+            "scope": "read",
+            "expiresAt": "2030-01-02T03:04:05Z",
+        }),
+        project.path().join(".npmrc"),
+    )
+    .await;
+    mock.with_npmrc_token_revoke(FIRST_TOKEN_ID, 200, 1).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with an npmrc commit failure");
+
+    assert!(!output.status.success());
+    assert!(
+        !project.file_exists(".gitignore"),
+        "the pre-token gitignore update must be rolled back"
+    );
+    assert!(project.path().join(".npmrc").is_dir());
+    let requests = mock.server().received_requests().await.unwrap();
+    let paths: Vec<_> = requests
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/api/registry/-/token/create",
+            "/api/registry/-/token/revoke-project"
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_local_gitignore_write_failure_happens_before_token_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    project.write_file(".gitignore", "target\n");
+    let mock = MockRegistry::start().await;
+    let original_mode = std::fs::metadata(project.path())
+        .expect("project metadata")
+        .permissions()
+        .mode();
+    std::fs::set_permissions(
+        project.path(),
+        std::fs::Permissions::from_mode(original_mode & !0o222),
+    )
+    .expect("make project directory read-only");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with an unwritable gitignore");
+
+    std::fs::set_permissions(
+        project.path(),
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .expect("restore project directory permissions");
+    assert!(!output.status.success());
+    assert_eq!(project.read_file(".gitignore"), "target\n");
+    assert!(!project.file_exists(".npmrc"));
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("wiremock request log")
+            .is_empty(),
+        "no token may be minted before .gitignore commits"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_superseded_revoke_failure_restores_old_files_and_revokes_replacement() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let old_npmrc = format!(
+        "# LPM Registry (generated by lpm setup local — do not commit)\n\
+         # LPM project token id: {FIRST_TOKEN_ID}\n\
+         @lpm.dev:registry=https://lpm.example.test/api/registry\n\
+         //lpm.example.test/api/registry/:_authToken=lpm_old_read_only_token\n\
+         # End LPM Registry\n"
+    );
+    project.write_file(".npmrc", &old_npmrc);
+    project.write_file(".gitignore", "target\n.npmrc\n");
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_create_responses(
+        30,
+        vec![serde_json::json!({
+            "token": "lpm_new_read_only_token",
+            "tokenId": SECOND_TOKEN_ID,
+            "scope": "read",
+            "expiresAt": "2030-01-02T03:04:05Z",
+        })],
+    )
+    .await;
+    mock.with_npmrc_token_revoke(FIRST_TOKEN_ID, 400, 1).await;
+    mock.with_npmrc_token_revoke(SECOND_TOKEN_ID, 200, 1).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with superseded-token revocation failure");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file(".npmrc"), old_npmrc);
+    assert_eq!(project.read_file(".gitignore"), "target\n.npmrc\n");
 }
 
 #[tokio::test]
@@ -233,26 +391,49 @@ async fn setup_local_rejects_invalid_days_and_removed_scoped_before_network_or_w
 
 #[tokio::test]
 async fn setup_local_rejects_malformed_token_responses_before_writing_files() {
-    for response in [
-        serde_json::json!({
+    for (response, rollback_token_id) in [
+        (
+            serde_json::json!({
             "token": "lpm_read_only_token",
+            "tokenId": FIRST_TOKEN_ID,
             "scope": "publish",
             "expiresAt": "2030-01-02T03:04:05Z"
-        }),
-        serde_json::json!({
+            }),
+            Some(FIRST_TOKEN_ID),
+        ),
+        (
+            serde_json::json!({
             "token": "lpm_bad\nregistry=https://attacker.invalid",
+            "tokenId": FIRST_TOKEN_ID,
             "scope": "read",
             "expiresAt": "2030-01-02T03:04:05Z"
-        }),
-        serde_json::json!({
+            }),
+            Some(FIRST_TOKEN_ID),
+        ),
+        (
+            serde_json::json!({
             "token": "lpm_read_only_token",
+            "tokenId": FIRST_TOKEN_ID,
             "scope": "read",
             "expiresAt": "not-a-timestamp"
-        }),
+            }),
+            Some(FIRST_TOKEN_ID),
+        ),
+        (
+            serde_json::json!({
+                "token": "lpm_read_only_token",
+                "scope": "read",
+                "expiresAt": "2030-01-02T03:04:05Z"
+            }),
+            None,
+        ),
     ] {
         let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
         let mock = MockRegistry::start().await;
         mock.with_npmrc_token_create_response(response).await;
+        if let Some(token_id) = rollback_token_id {
+            mock.with_npmrc_token_revoke(token_id, 200, 1).await;
+        }
 
         let output = lpm_with_registry(&project, &mock.url())
             .args(["setup", "local"])
