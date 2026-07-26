@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: envelope
+---
+{
+  "success": false,
+  "environments": [
+    {
+      "environment": "default",
+      "total": 1,
+      "valid": 0,
+      "errors": [
+        {
+          "key": "REQUIRED",
+          "error": "REQUIRED: missing (required)"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: envelope
+---
+{
+  "success": false,
+  "required": 2,
+  "present": [
+    "REQUIRED_ONE"
+  ],
+  "missing": [
+    "REQUIRED_TWO"
+  ],
+  "extra": [],
+  "valid": false
+}

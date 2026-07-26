@@ -193,9 +193,6 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
     let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> = Vec::new();
     let mut all_valid = true;
 
-    // Temporarily skip validation in load_project_env — we run it manually per-env for reporting
-    lpm_runner::script::set_skip_env_validation(true);
-
     for env_name in &env_names {
         let mode = if env_name == "default" {
             None
@@ -204,7 +201,8 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
         };
 
         // Use unified loader (handles inheritance + vault) — hard errors on cycle/missing
-        let mut env_vars = lpm_runner::dotenv::load_project_env(project_dir, mode)?;
+        let mut env_vars =
+            lpm_runner::dotenv::load_project_env_with_schema_validation(project_dir, mode, false)?;
 
         // Run schema validation manually to collect per-env errors
         let errors = lpm_env::validate(&schema, &mut env_vars);
@@ -213,9 +211,6 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
         }
         results.push((env_name.clone(), schema.len(), errors));
     }
-
-    // Restore validation flag
-    lpm_runner::script::set_skip_env_validation(false);
 
     if json_output {
         let json_results: Vec<serde_json::Value> = results
@@ -241,7 +236,11 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
                 "environments": json_results,
             })
         );
-        return Ok(());
+        return if all_valid {
+            Ok(())
+        } else {
+            Err(LpmError::ExitCode(1))
+        };
     }
 
     println!();
@@ -339,19 +338,25 @@ pub(super) fn vars_validate(
         }
     }
 
+    let valid = missing.is_empty() && (!strict || extra.is_empty());
+
     if json_output {
         println!(
             "{}",
             serde_json::json!({
-                "success": true,
+                "success": valid,
                 "required": required_keys.len(),
                 "present": present,
                 "missing": missing,
                 "extra": extra,
-                "valid": missing.is_empty(),
+                "valid": valid,
             })
         );
-        return Ok(());
+        return if valid {
+            Ok(())
+        } else {
+            Err(LpmError::ExitCode(1))
+        };
     }
 
     println!();
@@ -393,12 +398,12 @@ pub(super) fn vars_validate(
     }
 
     println!();
-    if missing.is_empty() {
+    if valid {
         output::success(&format!(
             "all {} required variables are set",
             required_keys.len()
         ));
-    } else {
+    } else if !missing.is_empty() {
         let missing_list = missing.join(" ");
         println!(
             "{}",
@@ -417,5 +422,27 @@ pub(super) fn vars_validate(
         );
     }
 
-    Ok(())
+    if strict && !extra.is_empty() {
+        let extra_list = extra.join(" ");
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "  {} extra variables are not declared in .env.example",
+                install_ui::red(&extra.len().to_string()),
+            )
+        );
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "  Fix: remove them with {} or add them to .env.example",
+                install_ui::cyan(&format!("lpm env delete {extra_list}")),
+            )
+        );
+    }
+
+    if valid {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(1))
+    }
 }
