@@ -34,6 +34,15 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+fn parse_json_stdout(output: &std::process::Output, command: &str) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{command} must emit exactly one JSON document: {error}\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+        )
+    })
+}
+
 // ─── set / get / list / delete ────────────────────────────────────────
 
 #[test]
@@ -641,10 +650,9 @@ fn env_diff_local_vs_local_reports_added_removed_and_changed_keys() {
 // ─── validate (vs .env.example) ────────────────────────────────────────
 
 #[test]
-fn env_validate_reports_missing_keys_against_dotenv_example() {
+fn env_validate_json_exits_nonzero_and_reports_missing_keys() {
     let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
 
-    // .env.example declares two required keys; vault only has one.
     write_dotenv(&project, ".env.example", "REQUIRED_ONE=\nREQUIRED_TWO=\n");
     lpm(&project)
         .args(["env", "set", "REQUIRED_ONE=value"])
@@ -656,12 +664,14 @@ fn env_validate_reports_missing_keys_against_dotenv_example() {
         .output()
         .expect("failed to run lpm env validate --json");
 
-    assert!(output.status.success(), "env validate --json must succeed");
+    assert!(
+        !output.status.success(),
+        "env validate --json must fail when a required key is missing"
+    );
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("env validate --json must be valid JSON: {e}\n---\n{stdout}"));
-
+    let envelope = parse_json_stdout(&output, "env validate --json");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["valid"], serde_json::json!(false));
     assert_eq!(envelope["required"], serde_json::json!(2));
     let present = envelope["present"]
         .as_array()
@@ -674,6 +684,163 @@ fn env_validate_reports_missing_keys_against_dotenv_example() {
     assert!(
         missing.iter().any(|k| k.as_str() == Some("REQUIRED_TWO")),
         "missing array must list REQUIRED_TWO: {envelope}"
+    );
+    insta::assert_json_snapshot!("env_validate_json_missing_required", envelope);
+}
+
+#[test]
+fn env_validate_human_remediation_assigns_each_missing_key() {
+    let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
+    write_dotenv(
+        &project,
+        ".env.example",
+        "REQUIRED_ONE=\nREQUIRED_TWO=\nREQUIRED_THREE=\n",
+    );
+    lpm(&project)
+        .args(["env", "set", "REQUIRED_ONE=value"])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["env", "validate"])
+        .output()
+        .expect("failed to run lpm env validate");
+
+    assert!(
+        !output.status.success(),
+        "env validate must fail when a required key is missing"
+    );
+    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    assert!(
+        stdout.contains("lpm env set REQUIRED_TWO=... REQUIRED_THREE=..."),
+        "human remediation must provide one KEY=VALUE operand per missing key:\n{stdout}"
+    );
+}
+
+#[test]
+fn env_validate_json_exits_zero_when_all_required_keys_are_present() {
+    let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
+    write_dotenv(
+        &project,
+        ".env.example",
+        "REQUIRED_ONE=ignored\nREQUIRED_TWO=\n",
+    );
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "REQUIRED_ONE=actual-one",
+            "REQUIRED_TWO=actual-two",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["--json", "env", "validate"])
+        .output()
+        .expect("failed to run lpm env validate --json");
+
+    assert!(
+        output.status.success(),
+        "env validate --json must succeed when all required keys are present"
+    );
+    let envelope = parse_json_stdout(&output, "env validate --json");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["valid"], serde_json::json!(true));
+    assert_eq!(
+        envelope["present"],
+        serde_json::json!(["REQUIRED_ONE", "REQUIRED_TWO"])
+    );
+    assert_eq!(envelope["missing"], serde_json::json!([]));
+}
+
+#[test]
+fn env_validate_json_allows_extra_keys_without_strict() {
+    let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
+    write_dotenv(&project, ".env.example", "REQUIRED=\n");
+    lpm(&project)
+        .args(["env", "set", "REQUIRED=value", "EXTRA=extra-value"])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["--json", "env", "validate"])
+        .output()
+        .expect("failed to run lpm env validate --json");
+
+    assert!(
+        output.status.success(),
+        "non-strict env validate must allow extra keys"
+    );
+    let envelope = parse_json_stdout(&output, "env validate --json");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["valid"], serde_json::json!(true));
+}
+
+#[test]
+fn env_validate_json_strict_exits_nonzero_and_reports_extra_keys() {
+    let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
+    write_dotenv(&project, ".env.example", "REQUIRED=\n");
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "REQUIRED=value",
+            "ZETA=z",
+            "ALPHA=a",
+            "MIDDLE=m",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["--json", "env", "validate", "--strict"])
+        .output()
+        .expect("failed to run lpm env validate --strict --json");
+
+    assert!(
+        !output.status.success(),
+        "strict env validate must fail when the default env has extra keys"
+    );
+    let envelope = parse_json_stdout(&output, "env validate --strict --json");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["valid"], serde_json::json!(false));
+    assert_eq!(
+        envelope["extra"],
+        serde_json::json!(["ALPHA", "MIDDLE", "ZETA"])
+    );
+    insta::assert_json_snapshot!("env_validate_json_strict_extra", envelope);
+}
+
+#[test]
+fn env_validate_human_strict_sorts_extra_key_remediation() {
+    let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
+    write_dotenv(&project, ".env.example", "REQUIRED=\n");
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "REQUIRED=value",
+            "ZETA=z",
+            "ALPHA=a",
+            "MIDDLE=m",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["env", "validate", "--strict"])
+        .output()
+        .expect("failed to run lpm env validate --strict");
+
+    assert!(
+        !output.status.success(),
+        "strict env validate must fail when the default env has extra keys"
+    );
+    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    assert!(
+        stdout.contains("lpm env delete ALPHA MIDDLE ZETA"),
+        "human remediation must list extra keys in deterministic order:\n{stdout}"
     );
 }
 
@@ -699,6 +866,65 @@ fn env_validate_without_dotenv_example_fails_with_helpful_message() {
 }
 
 // ─── check (vs lpm.json envSchema) ─────────────────────────────────────
+
+#[test]
+fn env_check_json_exits_nonzero_and_reports_invalid_environment() {
+    let project = TempProject::empty(r#"{"name":"env-check","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "envSchema": {
+    "vars": {
+      "REQUIRED": { "required": true }
+    }
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "env", "check"])
+        .output()
+        .expect("failed to run lpm env check --json");
+
+    assert!(
+        !output.status.success(),
+        "env check --json must fail when an environment is invalid"
+    );
+    let envelope = parse_json_stdout(&output, "env check --json");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["environments"][0]["environment"], "default");
+    assert_eq!(envelope["environments"][0]["errors"][0]["key"], "REQUIRED");
+    insta::assert_json_snapshot!("env_check_json_invalid", envelope);
+}
+
+#[test]
+fn env_check_json_exits_zero_when_environment_is_valid() {
+    let project = TempProject::empty(r#"{"name":"env-check","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "envSchema": {
+    "vars": {
+      "REQUIRED": { "required": true }
+    }
+  }
+}"#,
+    );
+    write_dotenv(&project, ".env", "REQUIRED=present\n");
+
+    let output = lpm(&project)
+        .args(["--json", "env", "check"])
+        .output()
+        .expect("failed to run lpm env check --json");
+
+    assert!(
+        output.status.success(),
+        "env check --json must succeed when every environment is valid"
+    );
+    let envelope = parse_json_stdout(&output, "env check --json");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["environments"][0]["errors"], serde_json::json!([]));
+}
 
 #[test]
 fn env_check_without_lpm_json_env_schema_fails_with_helpful_message() {

@@ -51,7 +51,9 @@ libc = "0.2"
 #                                      ConvertStringSidToSidW
 #   - Win32_Security_Isolation         AppContainer surface —
 #                                      CreateAppContainerProfile +
-#                                      DeriveAppContainerSidFromAppContainerName.
+#                                      DeriveAppContainerSidFromAppContainerName;
+#                                      integration tests also clean temporary
+#                                      profiles with DeleteAppContainerProfile.
 #   - Win32_Storage_FileSystem         FILE_GENERIC_* access masks (used by
 #                                      the AppContainer DACL grants in
 #                                      `windows_appcontainer.rs` /
@@ -64,6 +66,9 @@ libc = "0.2"
 #   - Win32_System_Threading           CREATE_SUSPENDED creation flag +
 #                                      OpenProcessToken (declared in this
 #                                      namespace by windows-sys).
+#                                      CreateMutexW + ReleaseMutex for
+#                                      cross-process AppContainer profile
+#                                      creation serialization.
 #                                      InitializeProcThreadAttributeList +
 #                                      UpdateProcThreadAttribute +
 #                                      CreateProcessW / STARTUPINFOEXW from
