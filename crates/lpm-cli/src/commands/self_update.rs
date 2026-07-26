@@ -1321,19 +1321,15 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     /// `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`). Without serialisation,
     /// parallel `cargo test` runs would race and steer each other's
     /// probes at the wrong wiremock instance.
-    fn standalone_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     struct StandaloneEnvGuard {
-        download_prev: Option<String>,
-        release_by_tag_prev: Option<String>,
+        download_prev: Option<std::ffi::OsString>,
+        release_by_tag_prev: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for StandaloneEnvGuard {
         fn drop(&mut self) {
+            // SAFETY: the shared test environment lock is held through restoration.
             unsafe {
                 match &self.download_prev {
                     Some(v) => std::env::set_var(DOWNLOAD_OVERRIDE_KEY, v),
@@ -1351,14 +1347,13 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         download_template: &str,
         release_by_tag_template: &str,
     ) -> StandaloneEnvGuard {
-        let lock = standalone_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = crate::test_env::lock_env();
         let guard = StandaloneEnvGuard {
-            download_prev: std::env::var(DOWNLOAD_OVERRIDE_KEY).ok(),
-            release_by_tag_prev: std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).ok(),
+            download_prev: std::env::var_os(DOWNLOAD_OVERRIDE_KEY),
+            release_by_tag_prev: std::env::var_os(RELEASE_BY_TAG_OVERRIDE_KEY),
             _lock: lock,
         };
+        // SAFETY: the shared test environment lock is held by `guard`.
         unsafe {
             std::env::set_var(DOWNLOAD_OVERRIDE_KEY, download_template);
             std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, release_by_tag_template);

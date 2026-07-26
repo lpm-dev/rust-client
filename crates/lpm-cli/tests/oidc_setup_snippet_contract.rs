@@ -34,7 +34,7 @@ async fn gitlab_snippet_lpm_oidc_token_drives_setup_oidc() {
 
     Mock::given(method("POST"))
         .and(path("/api/registry/-/token/oidc"))
-        .and(query_param("scope", "install"))
+        .and(query_param("scope", "read"))
         .and(body_partial_json(
             serde_json::json!({ "token": SNIPPET_JWT }),
         ))

@@ -1469,19 +1469,14 @@ mod tests {
     const NPM_OVERRIDE_KEY: &str = "LPM_NPM_REGISTRY_URL_OVERRIDE";
     const GH_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASES_URL_OVERRIDE";
 
-    fn env_override_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     /// RAII guard that restores the override env vars on drop.
     /// Restores fire on normal scope exit AND on panic, so a failing
     /// test doesn't pollute env state for the next test in line.
     /// Captured previous values are stored verbatim — `None` means
     /// "was unset", `Some(v)` means "was `v`".
     struct EnvOverrideGuard {
-        npm_prev: Option<String>,
-        gh_prev: Option<String>,
+        npm_prev: Option<std::ffi::OsString>,
+        gh_prev: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -1506,12 +1501,10 @@ mod tests {
     /// Acquire the global env-override lock and snapshot the current
     /// values. The returned guard restores both vars when dropped.
     fn acquire_env_override_lock() -> EnvOverrideGuard {
-        let lock = env_override_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = crate::test_env::lock_env();
         EnvOverrideGuard {
-            npm_prev: std::env::var(NPM_OVERRIDE_KEY).ok(),
-            gh_prev: std::env::var(GH_OVERRIDE_KEY).ok(),
+            npm_prev: std::env::var_os(NPM_OVERRIDE_KEY),
+            gh_prev: std::env::var_os(GH_OVERRIDE_KEY),
             _lock: lock,
         }
     }
@@ -1630,15 +1623,15 @@ mod tests {
 
     /// Drop guard that restores `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`
     /// to whatever value (or absence) preceded the test. Uses the same
-    /// `env_override_lock` as the older NPM/GH overrides because all
-    /// release-lookup tests need to serialise env mutation.
+    /// shared test environment boundary as the NPM/GH overrides.
     struct ReleaseByTagOverrideGuard {
-        prev: Option<String>,
+        prev: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for ReleaseByTagOverrideGuard {
         fn drop(&mut self) {
+            // SAFETY: the shared test environment lock is held through restoration.
             unsafe {
                 match &self.prev {
                     Some(v) => std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, v),
@@ -1652,13 +1645,12 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        let lock = env_override_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = crate::test_env::lock_env();
         let guard = ReleaseByTagOverrideGuard {
-            prev: std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).ok(),
+            prev: std::env::var_os(RELEASE_BY_TAG_OVERRIDE_KEY),
             _lock: lock,
         };
+        // SAFETY: the shared test environment lock is held by `guard`.
         unsafe { std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, template) };
         fut.await;
         drop(guard);

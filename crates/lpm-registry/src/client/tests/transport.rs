@@ -93,6 +93,22 @@ fn has_bearer_for_posture_detects_attached_session_token() {
     assert!(client.has_bearer_for_posture(AuthPosture::AuthRequired));
 }
 
+#[test]
+fn token_override_replaces_attached_session_bearer() {
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        "https://example.invalid",
+        Some("session-token".to_string()),
+    ));
+    let client = RegistryClient::new()
+        .with_session(session)
+        .with_token_override("oidc-token");
+
+    assert_eq!(
+        client.current_bearer(AuthPosture::AuthRequired),
+        Some("oidc-token".to_string())
+    );
+}
+
 #[tokio::test]
 async fn execute_with_recovery_propagates_success_unchanged() {
     let client = RegistryClient::new();

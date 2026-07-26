@@ -177,6 +177,36 @@ impl RegistryClient {
             .await
     }
 
+    /// Validate publish authorization and version availability without
+    /// reserving a version or creating Registry state.
+    pub async fn publish_preflight(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<PublishPreflightResponse, LpmError> {
+        let url = format!(
+            "{}/api/registry/-/package/publish-preflight?name={}&version={}",
+            self.base_url,
+            urlencoding::encode(name),
+            urlencoding::encode(version)
+        );
+        let response: PublishPreflightResponse = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await?;
+        if !response.success {
+            return Err(LpmError::Registry(format!(
+                "publish preflight was denied for {name}@{version}"
+            )));
+        }
+        if response.name != name || response.version != version {
+            return Err(LpmError::Registry(format!(
+                "publish preflight returned a mismatched package identity (expected {name}@{version}, received {}@{})",
+                response.name, response.version
+            )));
+        }
+        Ok(response)
+    }
+
     /// Revoke the current token on the server.
     ///
     /// Posture: `AuthRequired`. The bearer is re-resolved inside the

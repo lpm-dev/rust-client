@@ -142,20 +142,27 @@ pub(super) async fn run_swift_install_spm(
     }
 
     // Resolve
-    if !edit.already_exists {
+    let registry_setup = if !edit.already_exists {
         // Auto-configure registry scope if needed
-        crate::commands::swift_registry::ensure_configured(registry_url, manifest_dir, json_output)
-            .await?;
+        let setup = crate::commands::swift_registry::ensure_configured(
+            registry_url,
+            manifest_dir,
+            json_output,
+        )
+        .await?;
 
         if !json_output {
             output::info("Resolving Swift packages...");
         }
         swift_manifest::run_swift_resolve(manifest_dir)?;
-    }
+        Some(setup)
+    } else {
+        None
+    };
 
     // Output
     if json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "package": name.scoped(),
             "version": version,
             "mode": "registry",
@@ -164,6 +171,9 @@ pub(super) async fn run_swift_install_spm(
             "target": target_name,
             "already_existed": edit.already_exists,
         });
+        if let Some(setup) = registry_setup {
+            json["registry_setup"] = setup.to_json();
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
         println!();
@@ -261,21 +271,28 @@ pub(super) async fn run_swift_install_xcode(
     }
 
     // Step 4: Resolve Swift packages
-    if !edit.already_exists {
+    let registry_setup = if !edit.already_exists {
         // Auto-configure registry scope if needed
         let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
-        crate::commands::swift_registry::ensure_configured(registry_url, wrapper_dir, json_output)
-            .await?;
+        let setup = crate::commands::swift_registry::ensure_configured(
+            registry_url,
+            wrapper_dir,
+            json_output,
+        )
+        .await?;
 
         if !json_output {
             output::info("Resolving Swift packages...");
         }
         swift_manifest::run_swift_resolve(wrapper_dir)?;
-    }
+        Some(setup)
+    } else {
+        None
+    };
 
     // Step 5: Output
     if json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "package": name.scoped(),
             "version": version,
             "mode": "registry",
@@ -286,6 +303,9 @@ pub(super) async fn run_swift_install_xcode(
             "xcode_target": link_result.target_name,
             "already_existed": edit.already_exists,
         });
+        if let Some(setup) = registry_setup {
+            json["registry_setup"] = setup.to_json();
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
         println!();
