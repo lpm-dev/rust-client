@@ -350,6 +350,8 @@ pub async fn run(
 
     // ── Tunnel setup ───────────────────────────────────────────────────
     let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut tunnel_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
+    let mut capture_consumer_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut inspector_handle: Option<lpm_inspect::InspectorHandle> = None;
     let mut multi_inspector_state = None;
     let (mut multi_tunnel_target_tx, mut multi_tunnel_target_rx) = if tunnel && has_services {
@@ -381,15 +383,13 @@ pub async fn run(
         // It runs alongside the dashboard's webhook tab (which is
         // text-only) so the user can pick whichever fits the moment.
         // Quiet by default — we never auto-open a browser tab here.
-        let inspector_state = match lpm_inspect::db::InspectorDb::open(project_dir) {
-            Ok(db) => lpm_inspect::state::InspectorState::with_db_pending(db),
-            Err(e) => {
-                if !quiet {
-                    dev_ui::warn(&format!("inspector db failed: {e} — using in-memory only"));
-                }
-                lpm_inspect::state::InspectorState::pending()
-            }
-        };
+        let inspector_db = lpm_inspect::db::InspectorDb::open(project_dir).map_err(|error| {
+            LpmError::Tunnel(format!(
+                "failed to open this project's .lpm/inspector.db: {error}. \
+                 Repair or move the corrupt database and retry"
+            ))
+        })?;
+        let inspector_state = lpm_inspect::state::InspectorState::with_db_pending(inspector_db);
         multi_inspector_state = Some(inspector_state.clone());
         if !no_inspect {
             // `Some(n)` → strict bind, fatal on AddrInUse (matches the
@@ -413,34 +413,21 @@ pub async fn run(
             }
         }
 
-        // Create webhook capture channel and logger
+        // Create webhook capture channel.
         let (webhook_tx, mut webhook_rx) =
             tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
-        let webhook_logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
 
-        // M34: `lpm dev --tunnel` persists every captured webhook —
-        // full request/response headers (including Authorization,
-        // Cookie, X-*-Signature) and bodies — under
-        // `.lpm/webhooks/*.json` + `.lpm/webhook-log*.jsonl`. The
-        // Unix mode is 0o600/0o700 so other users can't read the
-        // file, but the bytes survive `git commit` of `.lpm`, IDE
-        // indexing, support bundles, and routine backups. Surface
-        // the persistence contract once at session start so the
-        // operator can choose to redact / gitignore / archive before
-        // running with real upstream secrets.
         tracing::warn!(
             target: "lpm_cli::dev",
             "tunnel webhook capture persists full request/response bodies and headers \
-             (incl. Authorization, Cookie, *-Signature) under .lpm/webhooks/ + \
-             .lpm/webhook-log*.jsonl — files are 0o600 locally but survive commits / \
-             backups / IDE indexing. Add `.lpm/webhooks/` and `.lpm/webhook-log*` to \
-             .gitignore if you haven't already."
+             (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db — the \
+             database is 0o600 locally but survives commits / backups / IDE indexing. \
+             Add `.lpm/inspector.db*` to .gitignore if you haven't already."
         );
         if !quiet {
             dev_ui::warn(
                 "tunnel webhook capture persists full request/response bodies and headers \
-                 under .lpm/webhooks/ + .lpm/webhook-log*.jsonl. \
-                 Add `.lpm/webhooks/` and `.lpm/webhook-log*` to .gitignore.",
+                 in .lpm/inspector.db. Add `.lpm/inspector.db*` to .gitignore.",
             );
         }
 
@@ -473,24 +460,10 @@ pub async fn run(
             ws_tx: None,
         };
 
-        // Spawn webhook consumer: persists to disk, forwards to dashboard,
-        // pushes into the inspector state for SSE, and prints inline summaries
-        // for mutation requests (POST/PUT/PATCH/DELETE).
-        let inspector_state_for_consumer = if inspector_handle.is_some() {
-            Some(inspector_state.clone())
-        } else {
-            None
-        };
-        tokio::spawn(async move {
+        let inspector_state_for_consumer = inspector_state.clone();
+        capture_consumer_handle = Some(tokio::spawn(async move {
             while let Some(webhook) = webhook_rx.recv().await {
-                // Always persist to JSONL log (non-blocking best-effort)
-                let _ = webhook_logger.append(&webhook);
-
-                // Push into the inspector state — this is what the browser
-                // UI's SSE stream consumes for real-time display.
-                if let Some(ref state) = inspector_state_for_consumer {
-                    state.push(webhook.clone()).await;
-                }
+                inspector_state_for_consumer.push(webhook.clone()).await;
 
                 // Forward to dashboard if active
                 if let Some(ref tx) = dashboard_webhook_tx {
@@ -526,7 +499,7 @@ pub async fn run(
                     ));
                 }
             }
-        });
+        }));
 
         // Start tunnel in background task, storing the handle for clean shutdown
         let mut options_clone = options;
@@ -542,11 +515,7 @@ pub async fn run(
         // Mirror commands/tunnel.rs: hand the connect callback a clone of the
         // inspector state so the live tunnel URL + session id are pushed to
         // the inspector UI as soon as the relay returns ServerHello.
-        let inspector_state_for_connect = if inspector_handle.is_some() {
-            Some(inspector_state.clone())
-        } else {
-            None
-        };
+        let inspector_state_for_connect = inspector_state.clone();
         let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
         let usage_for_connect = latest_usage.clone();
         let usage_for_notices = latest_usage;
@@ -563,17 +532,15 @@ pub async fn run(
             let result = lpm_tunnel::client::connect_with_usage(
                 &options_clone,
                 move |session| {
-                    if let Some(ref state) = inspector_state_for_connect {
-                        let url = session.tunnel_url.clone();
-                        let session_id = session.session_id.clone();
-                        let domain = Some(session.domain.clone());
-                        let local = session.local_port;
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            state.set_tunnel_url(url).await;
-                            state.start_session(session_id, domain, local, None).await;
-                        });
-                    }
+                    let url = session.tunnel_url.clone();
+                    let session_id = session.session_id.clone();
+                    let domain = Some(session.domain.clone());
+                    let local = session.local_port;
+                    let state = inspector_state_for_connect.clone();
+                    state.start_session_immediate(session_id, domain, local, None);
+                    tokio::spawn(async move {
+                        state.set_tunnel_url(url).await;
+                    });
 
                     dev_ui::trusted_detail_line(
                         "Tunnel",
@@ -1023,31 +990,28 @@ pub async fn run(
             let result = release_proxy_lease_after(result, &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
 
-            // Clean shutdown: tunnel task, then inspector. Inspector last so
-            // any in-flight push from the webhook consumer can drain.
-            if let Some(handle) = tunnel_handle {
-                handle.abort();
-                let _ = handle.await;
-            }
-            if let Some(handle) = inspector_handle {
-                handle.shutdown();
-            }
-
-            return result;
+            return shutdown_multi_service_tunnel_after(
+                result,
+                tunnel_handle,
+                capture_consumer_handle,
+                multi_inspector_state,
+                inspector_handle,
+            )
+            .await;
         }
 
         let result = lpm_runner::orchestrator::run_services(project_dir, services, options);
         let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
         let result = release_proxy_lease_after(result, &proxy_lease).await;
         let result = release_hosts_file_after(result, hosts_file_lease);
-        if let Some(handle) = tunnel_handle {
-            handle.abort();
-            let _ = handle.await;
-        }
-        if let Some(handle) = inspector_handle {
-            handle.shutdown();
-        }
-        return result;
+        return shutdown_multi_service_tunnel_after(
+            result,
+            tunnel_handle,
+            capture_consumer_handle,
+            multi_inspector_state,
+            inspector_handle,
+        )
+        .await;
     }
 
     // ── Single service: start dev server ────────────────────────────
@@ -1144,6 +1108,8 @@ pub async fn run(
                 let tunnel_domain = tunnel_domain.map(str::to_string);
                 let tunnel_relay_url = tunnel_relay_url.map(str::to_string);
                 let tunnel_target = child_target.clone();
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                tunnel_shutdown_tx = Some(shutdown_tx);
                 startup.tunnel_source = tunnel_source.map(str::to_string);
                 if let Some(domain) = tunnel_domain.as_deref()
                     && !quiet
@@ -1163,6 +1129,7 @@ pub async fn run(
                         false,
                         None,
                         tunnel_relay_url.as_deref(),
+                        Some(shutdown_rx),
                     )
                     .await;
                     if let Err(error) = result {
@@ -1224,10 +1191,7 @@ pub async fn run(
             let _ = script_handle.await;
             let result = release_proxy_lease_after(Err(error), &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
-            if let Some(handle) = tunnel_handle.take() {
-                handle.abort();
-                let _ = handle.await;
-            }
+            shutdown_spawned_tunnel(tunnel_handle.take(), tunnel_shutdown_tx.take()).await;
             if let Some(handle) = inspector_handle.take() {
                 handle.shutdown();
             }
@@ -1245,10 +1209,7 @@ pub async fn run(
 
     // Clean shutdown: tunnel first, then inspector (lets in-flight webhook
     // pushes drain into the inspector state before the server closes).
-    if let Some(handle) = tunnel_handle {
-        handle.abort();
-        let _ = handle.await;
-    }
+    shutdown_spawned_tunnel(tunnel_handle, tunnel_shutdown_tx).await;
     if let Some(handle) = inspector_handle {
         handle.shutdown();
     }
@@ -1589,6 +1550,70 @@ async fn release_proxy_lease_after(
         (Err(primary), Ok(())) => Err(primary),
         (Err(primary), Err(release_err)) => {
             dev_ui::warn(&format!("local proxy route cleanup failed: {release_err}"));
+            Err(primary)
+        }
+    }
+}
+
+async fn shutdown_spawned_tunnel(
+    tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    if let Some(shutdown_tx) = shutdown_tx {
+        let _ = shutdown_tx.send(());
+    }
+    let Some(mut handle) = tunnel_handle else {
+        return;
+    };
+
+    tokio::select! {
+        _ = &mut handle => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+async fn shutdown_multi_service_tunnel_after(
+    result: Result<(), LpmError>,
+    tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    capture_consumer_handle: Option<tokio::task::JoinHandle<()>>,
+    inspector_state: Option<lpm_inspect::state::InspectorState>,
+    inspector_handle: Option<lpm_inspect::InspectorHandle>,
+) -> Result<(), LpmError> {
+    if let Some(handle) = tunnel_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    let capture_result = match capture_consumer_handle {
+        Some(handle) => handle
+            .await
+            .map_err(|error| LpmError::Tunnel(format!("capture task failed: {error}"))),
+        None => Ok(()),
+    };
+    let persistence_result = if let Some(state) = inspector_state {
+        state.end_session().await;
+        state.flush().await.map_err(|error| {
+            LpmError::Tunnel(format!(
+                "failed to commit captures to .lpm/inspector.db: {error}"
+            ))
+        })
+    } else {
+        Ok(())
+    };
+    if let Some(handle) = inspector_handle {
+        handle.shutdown();
+    }
+
+    let cleanup_result = capture_result.and(persistence_result);
+    match (result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup_error)) => {
+            dev_ui::warn(&format!("tunnel capture cleanup failed: {cleanup_error}"));
             Err(primary)
         }
     }

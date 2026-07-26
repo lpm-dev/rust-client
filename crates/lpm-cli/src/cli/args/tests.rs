@@ -2114,6 +2114,24 @@ fn tunnel_inspect_port_explicit_is_some() {
 }
 
 #[test]
+fn tunnel_local_action_flags_parse_without_a_double_dash_separator() {
+    let cli = Cli::try_parse_from([
+        "lpm", "tunnel", "inspect", "--last", "10", "--filter", "stripe", "--status", "4xx",
+    ])
+    .unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Tunnel(network::TunnelArgs { domain, args, .. }) => {
+            assert_eq!(domain.as_deref(), Some("--last"));
+            assert_eq!(
+                args,
+                ["10", "--filter", "stripe", "--status", "4xx"].map(str::to_string)
+            );
+        }
+        _ => panic!("expected Tunnel command"),
+    }
+}
+
+#[test]
 fn dev_inspect_port_default_is_none() {
     let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {

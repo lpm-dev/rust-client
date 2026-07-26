@@ -12,20 +12,30 @@ use serde::{Deserialize, Serialize};
 
 /// `GET /api/requests` — list all captured requests (newest first).
 ///
-/// Returns the in-memory buffer contents. For historical data beyond the
-/// buffer capacity, a future SQLite backend will be queried.
-pub async fn list_requests(State(state): State<InspectorState>) -> Json<ListRequestsResponse> {
+/// Persistent states read the project database; in-memory-only states return
+/// their bounded live buffer.
+pub async fn list_requests(
+    State(state): State<InspectorState>,
+) -> Result<Json<ListRequestsResponse>, StatusCode> {
+    if let Some(db) = state.db() {
+        let requests = db.list_requests(1000, 0).await.map_err(database_error)?;
+        let total = db.count().await.map_err(database_error)?;
+        let items = requests
+            .into_iter()
+            .map(RequestSummary::from_stored)
+            .collect();
+        return Ok(Json(ListRequestsResponse { total, items }));
+    }
+
     let requests = state.get_all().await;
     let total = requests.len();
-
-    // Convert to summary format (no bodies) and reverse for newest-first
-    let items: Vec<RequestSummary> = requests
+    let items = requests
         .into_iter()
         .rev()
         .map(RequestSummary::from)
         .collect();
 
-    Json(ListRequestsResponse { total, items })
+    Ok(Json(ListRequestsResponse { total, items }))
 }
 
 /// `GET /api/requests/:id` — get full detail for a single request.
@@ -35,7 +45,7 @@ pub async fn get_request(
     State(state): State<InspectorState>,
     Path(id): Path<String>,
 ) -> Result<Json<RequestDetail>, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
 
     let mut detail = RequestDetail::from(webhook);
 
@@ -50,20 +60,25 @@ pub async fn get_request(
 }
 
 /// `GET /api/status` — inspector server status.
-pub async fn status(State(state): State<InspectorState>) -> Json<StatusResponse> {
-    let count = state.count().await;
+pub async fn status(
+    State(state): State<InspectorState>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    let count = match state.db() {
+        Some(db) => db.count().await.map_err(database_error)?,
+        None => state.count().await,
+    };
     let tunnel_url = state.get_tunnel_url().await;
     let local_target = state.local_target();
     let local_ready = local_target.port != 0;
 
-    Json(StatusResponse {
+    Ok(Json(StatusResponse {
         inspector: true,
         local_port: local_target.port,
         local_url: local_ready.then(|| local_target.url()),
         local_ready,
         tunnel_url,
         captured_count: count,
-    })
+    }))
 }
 
 /// `GET /api/diff/:id1/:id2` — structural diff between two requests' bodies.
@@ -74,8 +89,8 @@ pub async fn diff_requests(
     State(state): State<InspectorState>,
     Path((id1, id2)): Path<(String, String)>,
 ) -> Result<Json<DiffResponse>, StatusCode> {
-    let wh1 = state.get_by_id(&id1).await.ok_or(StatusCode::NOT_FOUND)?;
-    let wh2 = state.get_by_id(&id2).await.ok_or(StatusCode::NOT_FOUND)?;
+    let wh1 = load_webhook(&state, &id1).await?;
+    let wh2 = load_webhook(&state, &id2).await?;
 
     // Diff request bodies
     let request_diff = diff_bodies(&wh1.request_body, &wh2.request_body);
@@ -151,7 +166,7 @@ pub async fn replay_request(
     Path(id): Path<String>,
     Json(options): Json<crate::replay::ReplayOptions>,
 ) -> Result<Json<crate::replay::ReplayStudioResult>, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
     let target = state.local_target();
 
     let result = crate::replay::replay_with_options(&webhook, &options, &target)
@@ -199,7 +214,7 @@ pub async fn diagnose_request(
     State(state): State<InspectorState>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
 
     match crate::failure::diagnose(&webhook) {
         Some(diagnosis) => Ok(Json(diagnosis).into_response()),
@@ -209,13 +224,13 @@ pub async fn diagnose_request(
 
 /// `GET /api/failures/patterns` — detect failure patterns across recent requests.
 ///
-/// Analyzes the in-memory buffer for related failure clusters.
+/// Analyzes the active project history for related failure clusters.
 pub async fn failure_patterns(
     State(state): State<InspectorState>,
-) -> Json<Vec<crate::failure::FailurePattern>> {
-    let requests = state.get_all().await;
+) -> Result<Json<Vec<crate::failure::FailurePattern>>, StatusCode> {
+    let requests = state.get_all_persisted().await.map_err(database_error)?;
     let patterns = crate::failure::detect_patterns(&requests);
-    Json(patterns)
+    Ok(Json(patterns))
 }
 
 /// `GET /api/requests/:id/curl` — export a request as a runnable cURL command.
@@ -224,7 +239,7 @@ pub async fn export_curl(
     Path(id): Path<String>,
     Query(params): Query<CurlExportParams>,
 ) -> Result<String, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
     Ok(crate::export::to_curl(&webhook, params.url.as_deref()))
 }
 
@@ -237,7 +252,7 @@ pub async fn export_redacted(
     Path(id): Path<String>,
     body: Option<Json<crate::redact::RedactionRules>>,
 ) -> Result<Json<crate::redact::RedactionResult>, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
     let export = crate::export::to_webhook_json(&webhook);
     let rules = body.map_or_else(crate::redact::default_rules, |b| b.0);
     let result = crate::redact::redact(&export, &rules);
@@ -249,7 +264,7 @@ pub async fn export_webhook(
     State(state): State<InspectorState>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::export::WebhookExport>, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
     Ok(Json(crate::export::to_webhook_json(&webhook)))
 }
 
@@ -258,7 +273,7 @@ pub async fn export_fixture(
     State(state): State<InspectorState>,
     Path(id): Path<String>,
 ) -> Result<String, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
     Ok(crate::export::to_test_fixture(&webhook))
 }
 
@@ -267,7 +282,7 @@ pub async fn export_provider_cli(
     State(state): State<InspectorState>,
     Path(id): Path<String>,
 ) -> Result<String, StatusCode> {
-    let webhook = state.get_by_id(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let webhook = load_webhook(&state, &id).await?;
     crate::export::to_provider_cli(&webhook).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -332,7 +347,7 @@ pub async fn create_snapshot(
     // Collect webhooks by ID
     let mut webhooks = Vec::with_capacity(options.ids.len());
     for id in &options.ids {
-        let wh = state.get_by_id(id).await.ok_or(StatusCode::NOT_FOUND)?;
+        let wh = load_webhook(&state, id).await?;
         webhooks.push(wh);
     }
 
@@ -525,7 +540,7 @@ pub async fn get_session(
     let requests = db
         .list_session_requests(&id, 500, 0)
         .await
-        .unwrap_or_default();
+        .map_err(database_error)?;
 
     let mut providers: Vec<String> = requests.iter().filter_map(|r| r.provider.clone()).collect();
     providers.sort();
@@ -615,7 +630,7 @@ pub async fn list_db_requests(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let total = db.count().await.unwrap_or(0);
+    let total = db.count().await.map_err(database_error)?;
     let items: Vec<RequestSummary> = results
         .into_iter()
         .map(RequestSummary::from_stored)
@@ -663,6 +678,7 @@ pub struct ListRequestsResponse {
 #[derive(Serialize)]
 pub struct RequestSummary {
     pub id: String,
+    pub session_id: Option<String>,
     pub timestamp: String,
     pub method: String,
     pub path: String,
@@ -674,6 +690,7 @@ pub struct RequestSummary {
     pub res_size: usize,
     pub is_error: bool,
     pub has_signature_issue: bool,
+    pub auto_acked: bool,
 }
 
 /// Full request detail including headers and bodies.
@@ -776,6 +793,7 @@ impl From<lpm_tunnel::webhook::CapturedWebhook> for RequestSummary {
     fn from(w: lpm_tunnel::webhook::CapturedWebhook) -> Self {
         Self {
             id: w.id,
+            session_id: None,
             timestamp: w.timestamp,
             method: w.method,
             path: w.path,
@@ -787,6 +805,7 @@ impl From<lpm_tunnel::webhook::CapturedWebhook> for RequestSummary {
             res_size: w.response_body.len(),
             is_error: w.response_status >= 400,
             has_signature_issue: w.signature_diagnostic.is_some(),
+            auto_acked: w.auto_acked,
         }
     }
 }
@@ -846,11 +865,34 @@ fn compute_session_duration(started: &str, ended: Option<&str>) -> Option<String
 }
 
 impl RequestSummary {
+    pub(crate) fn from_live(
+        webhook: &lpm_tunnel::webhook::CapturedWebhook,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: webhook.id.clone(),
+            session_id,
+            timestamp: webhook.timestamp.clone(),
+            method: webhook.method.clone(),
+            path: webhook.path.clone(),
+            status: webhook.response_status,
+            duration_ms: webhook.duration_ms,
+            provider: webhook.provider.map(|provider| provider.to_string()),
+            summary: webhook.summary.clone(),
+            req_size: webhook.request_body.len(),
+            res_size: webhook.response_body.len(),
+            is_error: webhook.response_status >= 400,
+            has_signature_issue: webhook.signature_diagnostic.is_some(),
+            auto_acked: webhook.auto_acked,
+        }
+    }
+
     /// Convert from a `StoredRequest` (SQLite row) to an API response.
     pub fn from_stored(r: crate::db::StoredRequest) -> Self {
         Self {
             is_error: r.status >= 400,
             id: r.id,
+            session_id: r.session_id,
             timestamp: r.timestamp,
             method: r.method,
             path: r.path,
@@ -861,8 +903,25 @@ impl RequestSummary {
             req_size: r.req_size,
             res_size: r.res_size,
             has_signature_issue: r.has_signature_issue,
+            auto_acked: r.auto_acked,
         }
     }
+}
+
+async fn load_webhook(
+    state: &InspectorState,
+    id: &str,
+) -> Result<lpm_tunnel::webhook::CapturedWebhook, StatusCode> {
+    state
+        .get_by_id_persisted(id)
+        .await
+        .map_err(database_error)?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+fn database_error(error: rusqlite::Error) -> StatusCode {
+    tracing::warn!("inspector database read failed: {error}");
+    StatusCode::INTERNAL_SERVER_ERROR
 }
 
 impl From<crate::db::StoredSession> for SessionSummary {

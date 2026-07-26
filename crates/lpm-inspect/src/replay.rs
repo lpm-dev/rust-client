@@ -157,8 +157,11 @@ pub async fn replay_sequence(
 
     for (i, id) in options.ids.iter().enumerate() {
         let webhook = state
-            .get_by_id(id)
+            .get_by_id_persisted(id)
             .await
+            .map_err(|error| {
+                LpmError::Tunnel(format!("failed to read inspector database: {error}"))
+            })?
             .ok_or_else(|| LpmError::Tunnel(format!("request '{id}' not found")))?;
 
         let result = replay_with_options(&webhook, &single_opts, &target).await?;

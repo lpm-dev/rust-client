@@ -165,7 +165,7 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         "http://127.0.0.1:{bound_port}/?token={}",
         state.auth_token()
     );
-    tracing::info!("inspector listening on {url}");
+    tracing::info!(port = bound_port, "inspector listening on loopback");
 
     // Spawn the server in a background task
     tokio::spawn(async move {

@@ -230,6 +230,7 @@ pub(crate) struct TunnelArgs {
     pub(crate) action: String,
 
     /// Full tunnel domain (e.g., acme-api.lpm.llc) for claim/unclaim/start.
+    #[arg(allow_hyphen_values = true)]
     pub(crate) domain: Option<String>,
 
     /// Organization slug (for org tunnel domains).

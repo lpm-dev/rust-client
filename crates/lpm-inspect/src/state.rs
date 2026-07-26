@@ -33,21 +33,37 @@ pub struct InspectorState {
     inner: Arc<Inner>,
 }
 
+/// A captured request plus the session assigned at capture time.
+pub struct CapturedRequestEvent {
+    pub webhook: Arc<CapturedWebhook>,
+    pub session_id: Option<String>,
+}
+
+impl std::ops::Deref for CapturedRequestEvent {
+    type Target = CapturedWebhook;
+
+    fn deref(&self) -> &Self::Target {
+        &self.webhook
+    }
+}
+
 struct Inner {
     /// In-memory ring buffer of recent requests. Bounded to prevent OOM.
     buffer: RwLock<WebhookBuffer>,
     /// Broadcast channel for real-time SSE streaming to browser clients.
     /// Uses `broadcast` so multiple browser tabs can subscribe independently.
-    sse_tx: broadcast::Sender<Arc<CapturedWebhook>>,
+    sse_tx: broadcast::Sender<Arc<CapturedRequestEvent>>,
     /// SQLite database for persistent storage and full-text search.
-    /// `None` when running without persistence (e.g., `inspect --ui` with no project dir).
+    /// `None` only for explicitly in-memory state.
     db: Option<InspectorDb>,
+    /// Whether SSE should watch SQLite for captures written by another process.
+    observe_database: bool,
     /// WebSocket events ring buffer (bounded, FIFO eviction).
     ws_events: RwLock<VecDeque<WsEvent>>,
     /// Broadcast channel for real-time WS event streaming to browser.
     ws_sse_tx: broadcast::Sender<Arc<WsEvent>>,
     /// Active session ID for tagging requests.
-    session_id: RwLock<Option<String>>,
+    session_id: SyncRwLock<Option<String>>,
     /// The local endpoint being tunneled and replayed.
     local_target: SyncRwLock<lpm_common::LocalTarget>,
     /// The tunnel URL (set after connection).
@@ -92,9 +108,10 @@ impl InspectorState {
                 buffer: RwLock::new(WebhookBuffer::new(DEFAULT_BUFFER_CAPACITY)),
                 sse_tx,
                 db: None,
+                observe_database: false,
                 ws_events: RwLock::new(VecDeque::with_capacity(WS_EVENT_CAPACITY)),
                 ws_sse_tx,
-                session_id: RwLock::new(None),
+                session_id: SyncRwLock::new(None),
                 local_target: SyncRwLock::new(local_target),
                 tunnel_url: RwLock::new(None),
                 auth_token: generate_auth_token(),
@@ -117,6 +134,23 @@ impl InspectorState {
 
     /// Create persistent inspector state for a complete local endpoint.
     pub fn with_db_for_target(local_target: lpm_common::LocalTarget, db: InspectorDb) -> Self {
+        Self::with_database(local_target, db, false)
+    }
+
+    /// Create read-oriented state that observes captures written by another process.
+    pub fn with_db_observer(local_port: u16, db: InspectorDb) -> Self {
+        Self::with_database(
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, local_port),
+            db,
+            true,
+        )
+    }
+
+    fn with_database(
+        local_target: lpm_common::LocalTarget,
+        db: InspectorDb,
+        observe_database: bool,
+    ) -> Self {
         let (sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         let (ws_sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         Self {
@@ -124,9 +158,10 @@ impl InspectorState {
                 buffer: RwLock::new(WebhookBuffer::new(DEFAULT_BUFFER_CAPACITY)),
                 sse_tx,
                 db: Some(db),
+                observe_database,
                 ws_events: RwLock::new(VecDeque::with_capacity(WS_EVENT_CAPACITY)),
                 ws_sse_tx,
-                session_id: RwLock::new(None),
+                session_id: SyncRwLock::new(None),
                 local_target: SyncRwLock::new(local_target),
                 tunnel_url: RwLock::new(None),
                 auth_token: generate_auth_token(),
@@ -142,16 +177,24 @@ impl InspectorState {
     /// Push a captured request into the buffer, broadcast to SSE, and persist to SQLite.
     pub async fn push(&self, webhook: CapturedWebhook) {
         let webhook = Arc::new(webhook);
+        let session_id = self
+            .inner
+            .session_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        // Persist to SQLite (non-blocking — queued for batch write).
+        if let Some(ref db) = self.inner.db {
+            db.insert_request(CapturedWebhook::clone(&webhook), session_id.clone());
+        }
 
         // Broadcast to SSE subscribers (best-effort — if no subscribers, this is a no-op).
         // If the channel is full, lagged subscribers will get an error on next recv.
-        let _ = self.inner.sse_tx.send(Arc::clone(&webhook));
-
-        // Persist to SQLite (non-blocking — queued for batch write)
-        if let Some(ref db) = self.inner.db {
-            let session_id = self.inner.session_id.read().await.clone();
-            db.insert_request(CapturedWebhook::clone(&webhook), session_id);
-        }
+        let _ = self.inner.sse_tx.send(Arc::new(CapturedRequestEvent {
+            webhook: Arc::clone(&webhook),
+            session_id,
+        }));
 
         // Store in ring buffer (evicts oldest if at capacity).
         let mut buf = self.inner.buffer.write().await;
@@ -170,6 +213,29 @@ impl InspectorState {
         buf.find_by_id(id).cloned()
     }
 
+    /// Get a request from SQLite, falling back only to the pending live buffer.
+    pub async fn get_by_id_persisted(
+        &self,
+        id: &str,
+    ) -> Result<Option<CapturedWebhook>, rusqlite::Error> {
+        if let Some(ref db) = self.inner.db
+            && let Some(webhook) = db.get_webhook(id).await?
+        {
+            return Ok(Some(webhook));
+        }
+        Ok(self.get_by_id(id).await)
+    }
+
+    /// Get persisted requests newest first, or the live buffer when persistence is disabled.
+    pub async fn get_all_persisted(&self) -> Result<Vec<CapturedWebhook>, rusqlite::Error> {
+        if let Some(ref db) = self.inner.db {
+            return db.list_webhooks(DEFAULT_BUFFER_CAPACITY, 0).await;
+        }
+        let mut requests = self.get_all().await;
+        requests.reverse();
+        Ok(requests)
+    }
+
     /// Get the number of requests in the buffer.
     pub async fn count(&self) -> usize {
         let buf = self.inner.buffer.read().await;
@@ -177,7 +243,7 @@ impl InspectorState {
     }
 
     /// Subscribe to the SSE broadcast channel.
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<CapturedWebhook>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<CapturedRequestEvent>> {
         self.inner.sse_tx.subscribe()
     }
 
@@ -261,6 +327,27 @@ impl InspectorState {
         self.inner.db.as_ref()
     }
 
+    /// Whether this state should poll SQLite for writes from another process.
+    pub fn observes_database(&self) -> bool {
+        self.inner.observe_database
+    }
+
+    /// Return the current database revision fingerprint.
+    pub async fn database_revision(&self) -> Result<Option<(i64, usize)>, rusqlite::Error> {
+        match self.inner.db.as_ref() {
+            Some(db) => db.revision().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Wait for all queued persistent writes to commit.
+    pub async fn flush(&self) -> Result<(), String> {
+        match self.inner.db.as_ref() {
+            Some(db) => db.flush_pending_writes().await,
+            None => Ok(()),
+        }
+    }
+
     /// Start a new tunnel session.
     pub async fn start_session(
         &self,
@@ -269,20 +356,35 @@ impl InspectorState {
         local_port: u16,
         name: Option<String>,
     ) {
+        self.start_session_immediate(id, domain, local_port, name);
+    }
+
+    /// Start a session synchronously before the relay can deliver its first request.
+    pub fn start_session_immediate(
+        &self,
+        id: String,
+        domain: Option<String>,
+        local_port: u16,
+        name: Option<String>,
+    ) {
         if let Some(ref db) = self.inner.db {
-            db.start_session(id.clone(), domain, local_port);
-            // Apply the session name if provided
-            if let Some(ref name) = name {
-                let _ = db.rename_session(&id, name).await;
-            }
+            db.start_session_named(id.clone(), domain, local_port, name);
         }
-        let mut session_id = self.inner.session_id.write().await;
+        let mut session_id = self
+            .inner
+            .session_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *session_id = Some(id);
     }
 
     /// End the current tunnel session.
     pub async fn end_session(&self) {
-        let mut session_id = self.inner.session_id.write().await;
+        let mut session_id = self
+            .inner
+            .session_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(id) = session_id.take()
             && let Some(ref db) = self.inner.db
         {

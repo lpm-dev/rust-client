@@ -56,7 +56,7 @@ pub async fn run(
         }
         "replay" => {
             let local_args = local_action_args(domain, extra_args);
-            run_replay(project_dir, &local_args, port).await
+            run_replay(project_dir, &local_args, port, json_output).await
         }
         "log" | "logs" => {
             let local_args = local_action_args(domain, extra_args);
@@ -76,6 +76,7 @@ pub async fn run(
                 auto_ack,
                 session_name,
                 relay_url,
+                None,
             )
             .await
         }
@@ -95,6 +96,7 @@ pub async fn run(
                     auto_ack,
                     session_name,
                     relay_url,
+                    None,
                 )
                 .await;
             }
@@ -198,6 +200,7 @@ pub(crate) async fn run_start(
     auto_ack: bool,
     session_name: Option<&str>,
     relay_url: Option<&str>,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
         LpmError::Tunnel("authentication required. Run `lpm login` first.".into())
@@ -232,18 +235,9 @@ pub(crate) async fn run_start(
         None
     };
 
-    // Start the inspector server (unless --no-inspect)
-    let inspector_state = match lpm_inspect::db::InspectorDb::open(project_dir) {
-        Ok(db) => lpm_inspect::state::InspectorState::with_db_for_target(local_target.clone(), db),
-        Err(e) => {
-            if !json_output {
-                install_ui::warn_untrusted(&format!(
-                    "inspector db failed: {e} — using in-memory only"
-                ));
-            }
-            lpm_inspect::state::InspectorState::new_for_target(local_target.clone())
-        }
-    };
+    let inspector_db = open_inspector_db(project_dir)?;
+    let inspector_state =
+        lpm_inspect::state::InspectorState::with_db_for_target(local_target.clone(), inspector_db);
     let inspector_handle = if no_inspect {
         None
     } else {
@@ -267,7 +261,7 @@ pub(crate) async fn run_start(
         }
     };
 
-    // Create webhook capture channel — feeds both the inspector and the JSONL logger
+    // Create webhook capture channel.
     let (webhook_tx, mut webhook_rx) =
         tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
 
@@ -278,7 +272,7 @@ pub(crate) async fn run_start(
     // Spawn webhook consumer: pushes to inspector state for real-time SSE streaming
     let inspector_state_consumer = inspector_state.clone();
     let print_request_stream = !json_output;
-    tokio::spawn(async move {
+    let webhook_consumer = tokio::spawn(async move {
         while let Some(webhook) = webhook_rx.recv().await {
             if print_request_stream {
                 print_tunnel_request(&webhook);
@@ -289,7 +283,7 @@ pub(crate) async fn run_start(
 
     // Spawn WS event consumer: pushes to inspector state
     let inspector_state_ws = inspector_state.clone();
-    tokio::spawn(async move {
+    let ws_consumer = tokio::spawn(async move {
         while let Some(event) = ws_rx.recv().await {
             inspector_state_ws.push_ws_event(event).await;
         }
@@ -335,9 +329,9 @@ pub(crate) async fn run_start(
             let local = session.local_port;
             let state = inspector_state_for_connect.clone();
             let name = session_name_owned.clone();
+            state.start_session_immediate(session_id, domain, local, name);
             tokio::spawn(async move {
                 state.set_tunnel_url(url).await;
-                state.start_session(session_id, domain, local, name).await;
             });
 
             let usage = usage_for_connect
@@ -416,23 +410,51 @@ pub(crate) async fn run_start(
         },
     );
 
-    if json_output {
-        connect.await?;
+    let connect_result = if json_output {
+        connect.await
     } else {
         tokio::pin!(connect);
-        tokio::select! {
-            result = &mut connect => result?,
-            result = wait_for_tunnel_controls(control_inspector_url) => result?,
+        if let Some(mut shutdown) = shutdown {
+            tokio::select! {
+                result = &mut connect => result,
+                result = wait_for_tunnel_controls(control_inspector_url) => result,
+                _ = &mut shutdown => Ok(())
+            }
+        } else {
+            tokio::select! {
+                result = &mut connect => result,
+                result = wait_for_tunnel_controls(control_inspector_url) => result,
+            }
         }
-    }
+    };
 
-    // End the session and gracefully shut down the inspector
+    drop(options);
+    let webhook_result = webhook_consumer
+        .await
+        .map_err(|error| LpmError::Tunnel(format!("capture task failed: {error}")));
+    let websocket_result = ws_consumer
+        .await
+        .map_err(|error| LpmError::Tunnel(format!("WebSocket capture task failed: {error}")));
     inspector_state.end_session().await;
+    let flush_result = inspector_state.flush().await.map_err(|error| {
+        LpmError::Tunnel(format!(
+            "failed to commit captures to .lpm/inspector.db: {error}"
+        ))
+    });
     if let Some(handle) = inspector_handle {
         handle.shutdown();
     }
 
-    Ok(())
+    let cleanup_result = webhook_result.and(websocket_result).and(flush_result);
+    match (connect_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup_error)) => {
+            tracing::warn!("tunnel capture cleanup failed: {cleanup_error}");
+            Err(primary)
+        }
+    }
 }
 
 /// Claim a tunnel domain (e.g., acme-api.lpm.llc).
@@ -600,9 +622,12 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
 /// `inspect_port = None` auto-picks a free ephemeral port (default, race-free
 /// against any other local service); `Some(n)` binds that exact port and
 /// fails loudly on `AddrInUse`.
-async fn run_inspect_ui(_project_dir: &Path, inspect_port: Option<u16>) -> Result<(), LpmError> {
-    let state = lpm_inspect::state::InspectorState::new(0);
+async fn run_inspect_ui(project_dir: &Path, inspect_port: Option<u16>) -> Result<(), LpmError> {
+    let state = project_inspector_state(project_dir)?;
     let handle = lpm_inspect::start(state, inspect_port.unwrap_or(0)).await?;
+    if let Err(error) = open::that(&handle.url) {
+        install_ui::warn_untrusted(&format!("failed to open inspector in browser: {error}"));
+    }
 
     install_ui::done_line(crate::install_ui::terminal_line!(
         "Inspector: {}",
@@ -622,6 +647,13 @@ async fn run_inspect_ui(_project_dir: &Path, inspect_port: Option<u16>) -> Resul
     Ok(())
 }
 
+fn project_inspector_state(
+    project_dir: &Path,
+) -> Result<lpm_inspect::state::InspectorState, LpmError> {
+    let db = open_inspector_db(project_dir)?;
+    Ok(lpm_inspect::state::InspectorState::with_db_observer(0, db))
+}
+
 // ── Webhook inspect command ─────────────────────────────────────────
 
 /// Show captured webhooks. Supports listing and detail views.
@@ -636,7 +668,7 @@ async fn run_inspect(
     args: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
+    let db = open_inspector_db(project_dir)?;
 
     let last = parse_flag_usize(args, "--last", "-n").unwrap_or(20);
     let filter_provider = parse_flag_str(args, "--filter");
@@ -645,37 +677,55 @@ async fn run_inspect(
 
     if let Some(idx) = detail_index {
         if idx == 0 {
+            if json_output {
+                return Err(LpmError::Tunnel(
+                    "--detail uses 1-based indexing; use --detail 1".to_string(),
+                ));
+            }
             install_ui::warn("--detail uses 1-based indexing. Use --detail 1 for the first entry.");
             return Ok(());
         }
-        // Detail mode: show full webhook by 1-based index
-        let entries = logger.read_recent(idx + 1, None);
+        let entries = read_capture_entries(&db, idx, None).await?;
         if let Some(entry) = entries.get(idx.saturating_sub(1)) {
-            if let Some(full) = logger.load_full(&entry.id) {
+            if let Some(full) = db
+                .get_webhook(&entry.id)
+                .await
+                .map_err(inspector_query_error)?
+            {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&full)
+                            .map_err(|error| LpmError::Tunnel(error.to_string()))?
+                    );
+                    return Ok(());
+                }
                 print_webhook_detail(&full, idx);
             } else {
-                install_ui::warn("Webhook body data not found (may have been rotated)");
+                return Err(LpmError::Tunnel(
+                    "captured request body data was not found in .lpm/inspector.db".to_string(),
+                ));
             }
         } else {
-            install_ui::warn_untrusted(&format!("Webhook #{idx} not found"));
+            return Err(LpmError::Tunnel(format!("Webhook #{idx} not found")));
         }
         return Ok(());
     }
 
-    // List mode
     let filter = build_filter(filter_provider.as_deref(), filter_status.as_deref());
-    let entries = logger.read_recent(last, filter.as_ref());
-
-    if entries.is_empty() {
-        install_ui::phase("No webhooks captured yet. Start a tunnel with: lpm dev --tunnel");
-        return Ok(());
-    }
+    let entries = read_capture_entries(&db, last, filter.as_ref()).await?;
 
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&entries).unwrap_or_default()
+            serde_json::to_string_pretty(&entries)
+                .map_err(|error| LpmError::Tunnel(error.to_string()))?
         );
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        install_ui::phase("No webhooks captured yet. Start a tunnel with: lpm dev --tunnel");
         return Ok(());
     }
 
@@ -711,8 +761,9 @@ async fn run_replay(
     project_dir: &Path,
     args: &[String],
     default_port: Option<u16>,
+    json_output: bool,
 ) -> Result<(), LpmError> {
-    let logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
+    let db = open_inspector_db(project_dir)?;
     let local_target = match parse_flag_u16(args, "--port", "-p")? {
         Some(port) => lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
         None => resolve_local_target(default_port)?,
@@ -730,13 +781,18 @@ async fn run_replay(
     } else {
         number.unwrap_or_default()
     };
-    let entries = logger.read_recent(read_count, None);
+    let entries = read_capture_entries(&db, read_count, None).await?;
 
     let target_entry = if is_last {
         entries.first()
     } else if let Some(n) = number {
         entries.get(n.saturating_sub(1))
     } else {
+        if json_output {
+            return Err(LpmError::Tunnel(
+                "specify a webhook number or use --last".to_string(),
+            ));
+        }
         install_ui::warn("Specify a webhook number or use --last");
         install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
@@ -751,21 +807,25 @@ async fn run_replay(
     };
 
     let entry = target_entry.ok_or_else(|| LpmError::Tunnel("Webhook not found".into()))?;
-    let webhook = logger
-        .load_full(&entry.id)
+    let webhook = db
+        .get_webhook(&entry.id)
+        .await
+        .map_err(inspector_query_error)?
         .ok_or_else(|| LpmError::Tunnel("Webhook body data not found".into()))?;
 
     let idx = number.unwrap_or(1);
-    install_ui::phase_line(crate::install_ui::terminal_line!(
-        "Replaying #{}",
-        install_ui::yellow(&idx.to_string())
-    ));
-    install_ui::detail_line(crate::install_ui::terminal_line!(
-        "  {} {} — {}",
-        style_http_method_fragment(&webhook.method),
-        install_ui::cyan(&webhook.path),
-        lpm_common::sanitize_for_terminal(&entry.summary)
-    ));
+    if !json_output {
+        install_ui::phase_line(crate::install_ui::terminal_line!(
+            "Replaying #{}",
+            install_ui::yellow(&idx.to_string())
+        ));
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} {} — {}",
+            style_http_method_fragment(&webhook.method),
+            install_ui::cyan(&webhook.path),
+            lpm_common::sanitize_for_terminal(&entry.summary)
+        ));
+    }
 
     let replay_client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -774,6 +834,21 @@ async fn run_replay(
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
     let result =
         lpm_tunnel::webhook_replay::replay_webhook(&replay_client, &webhook, &local_target).await?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "id": webhook.id,
+                "status": result.status,
+                "original_status": webhook.response_status,
+                "duration_ms": result.duration_ms,
+            }))
+            .map_err(|error| LpmError::Tunnel(error.to_string()))?
+        );
+        return Ok(());
+    }
 
     let status = style_http_status_fragment(result.status);
     let ok_suffix = if result.status < 300 { " OK" } else { "" };
@@ -808,13 +883,22 @@ async fn run_replay(
 ///   --status <code>    — filter by status class
 ///   --clear            — delete all webhook logs
 async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
-    let logger = lpm_tunnel::webhook_log::WebhookLogger::new(project_dir);
+    let db = open_inspector_db(project_dir)?;
 
     if args.contains(&"--clear".to_string()) {
-        logger
-            .clear()
-            .map_err(|e| LpmError::Tunnel(format!("failed to clear logs: {e}")))?;
-        install_ui::done("Webhook logs cleared");
+        db.clear_history().await.map_err(inspector_query_error)?;
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": true,
+                    "cleared": true,
+                    "store": ".lpm/inspector.db"
+                })
+            );
+        } else {
+            install_ui::done("Tunnel capture history cleared");
+        }
         return Ok(());
     }
 
@@ -823,12 +907,13 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
     let filter_status = parse_flag_str(args, "--status");
     let filter = build_filter(filter_provider.as_deref(), filter_status.as_deref());
 
-    let entries = logger.read_recent(last, filter.as_ref());
+    let entries = read_capture_entries(&db, last, filter.as_ref()).await?;
 
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&entries).unwrap_or_default()
+            serde_json::to_string_pretty(&entries)
+                .map_err(|error| LpmError::Tunnel(error.to_string()))?
         );
         return Ok(());
     }
@@ -847,6 +932,57 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 }
 
 // ── Helper functions ────────────────────────────────────────────────
+
+fn open_inspector_db(project_dir: &Path) -> Result<lpm_inspect::db::InspectorDb, LpmError> {
+    lpm_inspect::db::InspectorDb::open(project_dir).map_err(|error| {
+        LpmError::Tunnel(format!(
+            "failed to open this project's .lpm/inspector.db: {error}. \
+             Repair or move the corrupt database and retry"
+        ))
+    })
+}
+
+fn inspector_query_error(error: impl Display) -> LpmError {
+    LpmError::Tunnel(format!("failed to read .lpm/inspector.db: {error}"))
+}
+
+async fn read_capture_entries(
+    db: &lpm_inspect::db::InspectorDb,
+    count: usize,
+    filter: Option<&lpm_tunnel::webhook_log::WebhookFilter>,
+) -> Result<Vec<lpm_tunnel::webhook_log::WebhookLogEntry>, LpmError> {
+    use lpm_inspect::db::StatusQuery;
+    use lpm_tunnel::webhook_log::StatusFilter;
+
+    let provider = filter.and_then(|value| value.provider.as_deref());
+    let status = filter
+        .and_then(|value| value.status.as_ref())
+        .map(|value| match value {
+            StatusFilter::Exact(code) => StatusQuery::Exact(*code),
+            StatusFilter::Class(class) => StatusQuery::Class(*class),
+            StatusFilter::Range(_, _) => StatusQuery::Error,
+        });
+    let requests = db
+        .search("", provider, status, count)
+        .await
+        .map_err(inspector_query_error)?;
+
+    Ok(requests
+        .into_iter()
+        .map(|request| lpm_tunnel::webhook_log::WebhookLogEntry {
+            id: request.id,
+            ts: request.timestamp,
+            method: request.method,
+            path: request.path,
+            status: request.status,
+            ms: request.duration_ms,
+            provider: request.provider,
+            summary: request.summary,
+            req_size: request.req_size,
+            res_size: request.res_size,
+        })
+        .collect())
+}
 
 fn tunnel_detail(label: &'static str, value: impl Display) {
     install_ui::detail_line(format_tunnel_detail(label, value));
@@ -1654,6 +1790,43 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("between 1 and 65535"));
+    }
+
+    #[tokio::test]
+    async fn inspect_ui_state_opens_the_selected_project_database() {
+        let project = tempfile::tempdir().unwrap();
+        let writer = lpm_inspect::state::InspectorState::with_db(
+            3000,
+            lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        let webhook = lpm_tunnel::webhook::CapturedWebhook {
+            id: "selected-project".to_string(),
+            timestamp: "2026-07-26T12:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/selected".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: Vec::new(),
+            response_status: 200,
+            response_headers: std::collections::HashMap::new(),
+            response_body: Vec::new(),
+            duration_ms: 1,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+        };
+        writer.push(webhook.clone()).await;
+        writer.flush().await.unwrap();
+
+        let observer = project_inspector_state(project.path()).unwrap();
+        let mut observed = observer.get_all_persisted().await.unwrap();
+
+        assert_eq!(
+            observer.db().unwrap().db_path,
+            project.path().join(".lpm/inspector.db")
+        );
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed.pop().unwrap().id, webhook.id);
     }
 
     #[test]

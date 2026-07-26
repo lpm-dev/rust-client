@@ -101,6 +101,7 @@ mod integration_tests {
         assert_eq!(state.local_port(), 0);
         let pending_status = crate::api::status(axum::extract::State(state.clone()))
             .await
+            .unwrap()
             .0;
         assert!(!pending_status.local_ready);
         assert!(pending_status.local_url.is_none());
@@ -303,6 +304,81 @@ mod integration_tests {
         assert_eq!(items[1]["id"], "w1");
 
         handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn api_requests_reopens_persisted_project_history() {
+        let project = tempfile::tempdir().unwrap();
+        let writer_db = crate::db::InspectorDb::open(project.path()).unwrap();
+        let writer = InspectorState::with_db(3000, writer_db);
+        writer.push(make_webhook("persisted-w1", 202)).await;
+        writer.flush().await.unwrap();
+
+        let reader_db = crate::db::InspectorDb::open(project.path()).unwrap();
+        let reader = InspectorState::with_db(0, reader_db);
+        let handle = crate::start(reader.clone(), 0).await.unwrap();
+
+        let resp = reqwest::get(url_with_token(
+            handle.port,
+            "/api/requests",
+            reader.auth_token(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["id"], "persisted-w1");
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persistent_state_records_named_sessions_without_a_browser_subscriber() {
+        let db = crate::db::InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        state
+            .start_session(
+                "session-no-ui".to_string(),
+                Some("hooks.lpm.fyi".to_string()),
+                3000,
+                Some("stripe retries".to_string()),
+            )
+            .await;
+        state.push(make_webhook("session-request", 202)).await;
+        state.end_session().await;
+        state.flush().await.unwrap();
+
+        let sessions = db.list_sessions(10).await.unwrap();
+        let requests = db
+            .list_session_requests("session-no-ui", 10, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name.as_deref(), Some("stripe retries"));
+        assert!(sessions[0].ended_at.is_some());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "session-request");
+    }
+
+    #[tokio::test]
+    async fn project_observer_revision_changes_after_an_external_capture() {
+        let project = tempfile::tempdir().unwrap();
+        let writer =
+            InspectorState::with_db(3000, crate::db::InspectorDb::open(project.path()).unwrap());
+        let observer = InspectorState::with_db_observer(
+            0,
+            crate::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        let before = observer.database_revision().await.unwrap();
+
+        writer.push(make_webhook("external-write", 201)).await;
+        writer.flush().await.unwrap();
+
+        assert!(observer.observes_database());
+        assert_ne!(observer.database_revision().await.unwrap(), before);
     }
 
     #[tokio::test]

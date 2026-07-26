@@ -12,15 +12,12 @@
 //! - `requests` — captured HTTP requests/responses (headers, bodies, timing)
 //! - `requests_fts` — FTS5 index over path, summary, and body content
 
-use lpm_tunnel::webhook::CapturedWebhook;
+use lpm_tunnel::webhook::{CapturedWebhook, WebhookProvider};
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-
-/// Maximum body size stored in SQLite (10 MB). Larger bodies are truncated
-/// with a marker to keep the database manageable.
-const MAX_STORED_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// Batch flush interval — writes are buffered and flushed together.
 const FLUSH_INTERVAL_MS: u64 = 100;
@@ -47,14 +44,14 @@ enum DbWrite {
     InsertRequest(Box<CapturedWebhook>, Option<String>),
     StartSession {
         id: String,
+        name: Option<String>,
         domain: Option<String>,
         local_port: u16,
     },
     EndSession {
         id: String,
     },
-    #[cfg(test)]
-    Flush(tokio::sync::oneshot::Sender<()>),
+    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 impl InspectorDb {
@@ -64,12 +61,14 @@ impl InspectorDb {
     /// write-batching task.
     pub fn open(project_dir: &Path) -> Result<Self, rusqlite::Error> {
         let lpm_dir = project_dir.join(".lpm");
-        std::fs::create_dir_all(&lpm_dir).ok();
+        std::fs::create_dir_all(&lpm_dir)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
 
         let db_path = lpm_dir.join("inspector.db");
 
         // Write connection (owned by the background flush task)
         let write_conn = Connection::open(&db_path)?;
+        restrict_database_permissions(&db_path)?;
         init_schema(&write_conn)?;
 
         // Read connection (shared across API handlers).
@@ -138,8 +137,20 @@ impl InspectorDb {
 
     /// Record a new tunnel session start.
     pub fn start_session(&self, id: String, domain: Option<String>, local_port: u16) {
+        self.start_session_named(id, domain, local_port, None);
+    }
+
+    /// Record a new tunnel session start with an optional display name.
+    pub fn start_session_named(
+        &self,
+        id: String,
+        domain: Option<String>,
+        local_port: u16,
+        name: Option<String>,
+    ) {
         let _ = self.write_tx.send(DbWrite::StartSession {
             id,
+            name,
             domain,
             local_port,
         });
@@ -150,17 +161,18 @@ impl InspectorDb {
         let _ = self.write_tx.send(DbWrite::EndSession { id });
     }
 
-    #[cfg(test)]
-    async fn flush_pending_writes(&self) {
+    /// Wait until all writes queued before this call have committed.
+    pub async fn flush_pending_writes(&self) -> Result<(), String> {
         let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
-        assert!(
-            self.write_tx.send(DbWrite::Flush(flushed_tx)).is_ok(),
-            "inspector database flush task must remain available"
-        );
+        self.write_tx
+            .send(DbWrite::Flush(flushed_tx))
+            .map_err(|_| "inspector database writer stopped unexpectedly".to_string())?;
         tokio::time::timeout(std::time::Duration::from_secs(5), flushed_rx)
             .await
-            .expect("inspector database flush timed out")
-            .expect("inspector database flush task stopped before committing writes");
+            .map_err(|_| "inspector database flush timed out".to_string())?
+            .map_err(|_| {
+                "inspector database writer stopped before committing queued captures".to_string()
+            })?
     }
 
     /// Query recent requests, newest first.
@@ -210,36 +222,47 @@ impl InspectorDb {
             "SELECT id, session_id, timestamp, method, path, status, duration_ms,
                     provider, summary, signature_diagnostic,
                     request_headers, request_body, response_headers, response_body,
-                    tags, auto_acked
+                    tags, auto_acked, req_size, res_size
              FROM requests WHERE id = ?1",
         )?;
 
-        let result = stmt.query_row(params![id], |row| {
-            Ok(StoredRequestDetail {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                timestamp: row.get(2)?,
-                method: row.get(3)?,
-                path: row.get(4)?,
-                status: row.get(5)?,
-                duration_ms: row.get(6)?,
-                provider: row.get(7)?,
-                summary: row.get(8)?,
-                signature_diagnostic: row.get(9)?,
-                request_headers: row.get(10)?,
-                request_body: row.get(11)?,
-                response_headers: row.get(12)?,
-                response_body: row.get(13)?,
-                tags: row.get(14)?,
-                auto_acked: row.get(15)?,
-            })
-        });
+        let result = stmt.query_row(params![id], stored_detail_from_row);
 
         match result {
             Ok(r) => Ok(Some(r)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Get a full captured webhook by ID for detail views and replay.
+    pub async fn get_webhook(&self, id: &str) -> Result<Option<CapturedWebhook>, rusqlite::Error> {
+        self.get_request(id)
+            .await?
+            .map(stored_detail_to_webhook)
+            .transpose()
+    }
+
+    /// Query full captured webhooks, newest first.
+    pub async fn list_webhooks(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<CapturedWebhook>, rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, session_id, timestamp, method, path, status, duration_ms,
+                    provider, summary, signature_diagnostic,
+                    request_headers, request_body, response_headers, response_body,
+                    tags, auto_acked, req_size, res_size
+             FROM requests
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], stored_detail_from_row)?;
+
+        rows.map(|row| row.and_then(stored_detail_to_webhook))
+            .collect()
     }
 
     /// Full-text search across request paths, summaries, and bodies.
@@ -268,7 +291,7 @@ impl InspectorDb {
         }
 
         if provider.is_some() {
-            conditions.push("r.provider = ?2".to_string());
+            conditions.push("LOWER(r.provider) = LOWER(?2)".to_string());
         }
 
         match &status {
@@ -484,9 +507,42 @@ impl InspectorDb {
 
         Ok(deleted)
     }
+
+    /// Remove all active capture history from the inspector database.
+    pub async fn clear_history(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM requests_fts", [])?;
+        tx.execute("DELETE FROM requests", [])?;
+        tx.execute("DELETE FROM sessions", [])?;
+        tx.commit()
+    }
+
+    /// Return a cheap revision fingerprint for external-writer refresh checks.
+    pub async fn revision(&self) -> Result<(i64, usize), rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
 }
 
 // ── Schema initialization ─────────────────────────────────────────────
+
+#[cfg(unix)]
+fn restrict_database_permissions(path: &Path) -> Result<(), rusqlite::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+#[cfg(not(unix))]
+fn restrict_database_permissions(_path: &Path) -> Result<(), rusqlite::Error> {
+    Ok(())
+}
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -585,33 +641,25 @@ async fn flush_pending_batch(conn: &Arc<Mutex<Connection>>, batch: &mut Vec<DbWr
         return;
     }
 
-    let flush_succeeded = {
+    let flush_result = {
         let conn = conn.lock().await;
         match flush_batch(&conn, batch) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(error) => {
                 tracing::warn!("inspector db flush error: {error}");
-                false
+                Err(error.to_string())
             }
         }
     };
-    finish_batch(batch, flush_succeeded);
+    finish_batch(batch, flush_result);
 }
 
-fn finish_batch(batch: &mut Vec<DbWrite>, flush_succeeded: bool) {
-    #[cfg(test)]
-    if flush_succeeded {
-        for write in batch.drain(..) {
-            if let DbWrite::Flush(flushed_tx) = write {
-                let _ = flushed_tx.send(());
-            }
+fn finish_batch(batch: &mut Vec<DbWrite>, flush_result: Result<(), String>) {
+    for write in batch.drain(..) {
+        if let DbWrite::Flush(flushed_tx) = write {
+            let _ = flushed_tx.send(flush_result.clone());
         }
-        return;
     }
-
-    #[cfg(not(test))]
-    let _ = flush_succeeded;
-    batch.clear();
 }
 
 fn flush_batch(conn: &Connection, batch: &[DbWrite]) -> Result<(), rusqlite::Error> {
@@ -624,12 +672,14 @@ fn flush_batch(conn: &Connection, batch: &[DbWrite]) -> Result<(), rusqlite::Err
             }
             DbWrite::StartSession {
                 id,
+                name,
                 domain,
                 local_port,
             } => {
                 tx.execute(
-                    "INSERT OR IGNORE INTO sessions (id, domain, local_port) VALUES (?1, ?2, ?3)",
-                    params![id, domain, local_port],
+                    "INSERT OR IGNORE INTO sessions (id, name, domain, local_port)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, name, domain, local_port],
                 )?;
             }
             DbWrite::EndSession { id } => {
@@ -638,7 +688,6 @@ fn flush_batch(conn: &Connection, batch: &[DbWrite]) -> Result<(), rusqlite::Err
                     params![id],
                 )?;
             }
-            #[cfg(test)]
             DbWrite::Flush(_) => {}
         }
     }
@@ -653,10 +702,6 @@ fn insert_request_row(
 ) -> Result<(), rusqlite::Error> {
     let headers_json = serde_json::to_string(&webhook.request_headers).unwrap_or_default();
     let resp_headers_json = serde_json::to_string(&webhook.response_headers).unwrap_or_default();
-
-    // Truncate oversized bodies to keep the database manageable
-    let req_body = truncate_body(&webhook.request_body);
-    let res_body = truncate_body(&webhook.response_body);
 
     // Extract text for FTS indexing (only index UTF-8 content)
     let req_body_text = std::str::from_utf8(&webhook.request_body)
@@ -686,7 +731,7 @@ fn insert_request_row(
           provider, summary, signature_diagnostic,
           request_headers, request_body, response_headers, response_body,
           req_size, res_size, auto_acked)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             webhook.id,
             session_id,
@@ -699,11 +744,12 @@ fn insert_request_row(
             webhook.summary,
             webhook.signature_diagnostic,
             headers_json,
-            req_body,
+            webhook.request_body,
             resp_headers_json,
-            res_body,
+            webhook.response_body,
             webhook.request_body.len(),
             webhook.response_body.len(),
+            webhook.auto_acked,
         ],
     )?;
 
@@ -726,15 +772,6 @@ fn insert_request_row(
     )?;
 
     Ok(())
-}
-
-/// Truncate a body to [`MAX_STORED_BODY_SIZE`], returning owned bytes.
-fn truncate_body(body: &[u8]) -> Vec<u8> {
-    if body.len() <= MAX_STORED_BODY_SIZE {
-        body.to_vec()
-    } else {
-        body[..MAX_STORED_BODY_SIZE].to_vec()
-    }
 }
 
 /// Sanitize a user query for FTS5 to prevent syntax errors.
@@ -802,6 +839,106 @@ pub struct StoredRequestDetail {
     pub response_body: Vec<u8>,
     pub tags: Option<String>,
     pub auto_acked: bool,
+    pub req_size: usize,
+    pub res_size: usize,
+}
+
+fn stored_detail_from_row(row: &rusqlite::Row<'_>) -> Result<StoredRequestDetail, rusqlite::Error> {
+    Ok(StoredRequestDetail {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        timestamp: row.get(2)?,
+        method: row.get(3)?,
+        path: row.get(4)?,
+        status: row.get(5)?,
+        duration_ms: row.get(6)?,
+        provider: row.get(7)?,
+        summary: row.get(8)?,
+        signature_diagnostic: row.get(9)?,
+        request_headers: row.get(10)?,
+        request_body: row.get(11)?,
+        response_headers: row.get(12)?,
+        response_body: row.get(13)?,
+        tags: row.get(14)?,
+        auto_acked: row.get(15)?,
+        req_size: row.get(16)?,
+        res_size: row.get(17)?,
+    })
+}
+
+fn stored_detail_to_webhook(
+    stored: StoredRequestDetail,
+) -> Result<CapturedWebhook, rusqlite::Error> {
+    if stored.request_body.len() != stored.req_size || stored.response_body.len() != stored.res_size
+    {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "capture body was truncated by an older LPM CLI and cannot be replayed faithfully",
+            )),
+        ));
+    }
+
+    let request_headers: HashMap<String, String> = serde_json::from_str(&stored.request_headers)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let response_headers: HashMap<String, String> = serde_json::from_str(&stored.response_headers)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let provider = stored
+        .provider
+        .as_deref()
+        .map(parse_stored_provider)
+        .transpose()?;
+
+    Ok(CapturedWebhook {
+        id: stored.id,
+        timestamp: stored.timestamp,
+        method: stored.method,
+        path: stored.path,
+        request_headers,
+        request_body: stored.request_body,
+        response_status: stored.status,
+        response_headers,
+        response_body: stored.response_body,
+        duration_ms: stored.duration_ms,
+        provider,
+        summary: stored.summary,
+        signature_diagnostic: stored.signature_diagnostic,
+        auto_acked: stored.auto_acked,
+    })
+}
+
+fn parse_stored_provider(provider: &str) -> Result<WebhookProvider, rusqlite::Error> {
+    match provider.to_ascii_lowercase().as_str() {
+        "stripe" => Ok(WebhookProvider::Stripe),
+        "github" => Ok(WebhookProvider::GitHub),
+        "clerk" => Ok(WebhookProvider::Clerk),
+        "resend" => Ok(WebhookProvider::Resend),
+        "sendgrid" => Ok(WebhookProvider::SendGrid),
+        "twilio" => Ok(WebhookProvider::Twilio),
+        "svix" => Ok(WebhookProvider::Svix),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown stored webhook provider `{provider}`"),
+            )),
+        )),
+    }
 }
 
 /// Session metadata.
@@ -865,7 +1002,7 @@ mod tests {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
         db.insert_request(make_webhook("w2", 500), None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let requests = db.list_requests(10, 0).await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -878,7 +1015,7 @@ mod tests {
     async fn get_request_detail() {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let detail = db.get_request("w1").await.unwrap().unwrap();
         assert_eq!(detail.id, "w1");
@@ -899,7 +1036,7 @@ mod tests {
             br#"{"type":"payment_intent.failed","error":"insufficient_funds"}"#.to_vec();
         w2.summary = "Stripe: payment_intent.failed".to_string();
         db.insert_request(w2, None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         // Search for "insufficient_funds"
         let results = db
@@ -924,9 +1061,9 @@ mod tests {
         w2.provider = None;
         w2.summary = "POST /api/hook".to_string();
         db.insert_request(w2, None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
-        let results = db.search("", Some("Stripe"), None, 10).await.unwrap();
+        let results = db.search("", Some("stripe"), None, 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "w1");
     }
@@ -936,7 +1073,7 @@ mod tests {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
         db.insert_request(make_webhook("w2", 500), None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let results = db
             .search("", None, Some(StatusQuery::Class(5)), 10)
@@ -960,7 +1097,7 @@ mod tests {
         db.insert_request(make_webhook("w1", 200), Some("s1".to_string()));
         db.insert_request(make_webhook("w2", 200), Some("s1".to_string()));
         db.end_session("s1".to_string());
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let sessions = db.list_sessions(10).await.unwrap();
         assert_eq!(sessions.len(), 1);
@@ -976,7 +1113,7 @@ mod tests {
         db.insert_request(make_webhook("w1", 200), None);
         db.insert_request(make_webhook("w2", 200), None);
         db.insert_request(make_webhook("w3", 200), None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         assert_eq!(db.count().await.unwrap(), 3);
     }
@@ -989,7 +1126,7 @@ mod tests {
             w.timestamp = format!("2026-04-06T12:00:{i:02}Z");
             db.insert_request(w, None);
         }
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let page1 = db.list_requests(2, 0).await.unwrap();
         assert_eq!(page1.len(), 2);
@@ -1007,18 +1144,16 @@ mod tests {
         assert_eq!(sanitize_fts_query(""), "");
     }
 
-    #[test]
-    fn truncate_body_within_limit() {
-        let body = vec![1u8; 100];
-        let result = truncate_body(&body);
-        assert_eq!(result.len(), 100);
-    }
+    #[tokio::test]
+    async fn request_body_round_trips_without_legacy_truncation() {
+        let db = InspectorDb::open_temp().unwrap();
+        let mut webhook = make_webhook("large", 200);
+        webhook.request_body = vec![0x5a; 10 * 1024 * 1024 + 1];
+        db.insert_request(webhook.clone(), None);
+        db.flush_pending_writes().await.unwrap();
 
-    #[test]
-    fn truncate_body_over_limit() {
-        let body = vec![1u8; MAX_STORED_BODY_SIZE + 1000];
-        let result = truncate_body(&body);
-        assert_eq!(result.len(), MAX_STORED_BODY_SIZE);
+        let stored = db.get_webhook("large").await.unwrap().unwrap();
+        assert_eq!(stored.request_body, webhook.request_body);
     }
 
     /// Verify that our search query never returns phantom results even if
@@ -1031,7 +1166,7 @@ mod tests {
         w.request_body = br#"{"event":"unique_phantom_canary_xyz"}"#.to_vec();
         w.summary = "unique_phantom_canary_xyz".to_string();
         db.insert_request(w, None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         // Verify the search finds it
         let results = db
@@ -1071,14 +1206,14 @@ mod tests {
         w1.request_body = br#"{"event":"original_value_abc"}"#.to_vec();
         w1.summary = "original_value_abc".to_string();
         db.insert_request(w1, None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         // Replace with different body
         let mut w2 = make_webhook("replace-test", 200);
         w2.request_body = br#"{"event":"replaced_value_def"}"#.to_vec();
         w2.summary = "replaced_value_def".to_string();
         db.insert_request(w2, None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         // Old value must NOT be in FTS index (direct query, no JOIN masking)
         {
@@ -1114,7 +1249,7 @@ mod tests {
     async fn rename_session() {
         let db = InspectorDb::open_temp().unwrap();
         db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let updated = db
             .rename_session("s1", "debugging payment flow")
@@ -1141,7 +1276,7 @@ mod tests {
         db.insert_request(make_webhook("w2", 500), Some("s1".to_string()));
         db.insert_request(make_webhook("w3", 200), Some("s1".to_string()));
         db.end_session("s1".to_string());
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let detail = db.get_session("s1").await.unwrap().unwrap();
         assert_eq!(detail.id, "s1");
@@ -1165,7 +1300,7 @@ mod tests {
         db.insert_request(make_webhook("w2", 200), Some("s1".to_string()));
         // This one belongs to a different session
         db.insert_request(make_webhook("w3", 200), None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let requests = db.list_session_requests("s1", 10, 0).await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -1175,7 +1310,7 @@ mod tests {
     async fn update_tags() {
         let db = InspectorDb::open_temp().unwrap();
         db.insert_request(make_webhook("w1", 200), None);
-        db.flush_pending_writes().await;
+        db.flush_pending_writes().await.unwrap();
 
         let tags = vec!["bug".to_string(), "repro".to_string()];
         let updated = db.update_tags("w1", &tags).await.unwrap();
@@ -1184,5 +1319,104 @@ mod tests {
         let detail = db.get_request("w1").await.unwrap().unwrap();
         let parsed = crate::export::parse_tags(detail.tags.as_deref());
         assert_eq!(parsed, vec!["bug", "repro"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_webhook_reopens_with_replay_fidelity() {
+        let project = tempfile::tempdir().unwrap();
+        let mut webhook = make_webhook("fidelity", 207);
+        webhook
+            .request_headers
+            .insert("x-replay-canary".to_string(), "header-value".to_string());
+        webhook.request_body = vec![0, 1, 2, 0xff];
+        webhook.response_headers.insert(
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        );
+        webhook.response_body = vec![0xfe, 3, 2, 1];
+        webhook.auto_acked = true;
+
+        {
+            let writer = InspectorDb::open(project.path()).unwrap();
+            writer.insert_request(webhook.clone(), None);
+            writer.flush_pending_writes().await.unwrap();
+        }
+
+        let reader = InspectorDb::open(project.path()).unwrap();
+        let reopened = reader.get_webhook("fidelity").await.unwrap().unwrap();
+
+        assert_eq!(reopened.request_headers, webhook.request_headers);
+        assert_eq!(reopened.request_body, webhook.request_body);
+        assert_eq!(reopened.response_headers, webhook.response_headers);
+        assert_eq!(reopened.response_body, webhook.response_body);
+        assert!(reopened.auto_acked);
+    }
+
+    #[tokio::test]
+    async fn project_databases_remain_isolated_for_paths_with_spaces_and_brackets() {
+        let root = tempfile::tempdir().unwrap();
+        let first_project = root.path().join("C [workspace] first");
+        let second_project = root.path().join("D [workspace] second");
+        std::fs::create_dir_all(&first_project).unwrap();
+        std::fs::create_dir_all(&second_project).unwrap();
+
+        let first = InspectorDb::open(&first_project).unwrap();
+        let second = InspectorDb::open(&second_project).unwrap();
+        first.insert_request(make_webhook("first-only", 200), None);
+        second.insert_request(make_webhook("second-only", 200), None);
+        first.flush_pending_writes().await.unwrap();
+        second.flush_pending_writes().await.unwrap();
+
+        assert!(first.get_webhook("second-only").await.unwrap().is_none());
+        assert!(second.get_webhook("first-only").await.unwrap().is_none());
+        assert_eq!(
+            first.list_requests(10, 0).await.unwrap()[0].id,
+            "first-only"
+        );
+        assert_eq!(
+            second.list_requests(10, 0).await.unwrap()[0].id,
+            "second-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reader_observes_every_committed_capture() {
+        let project = tempfile::tempdir().unwrap();
+        let writer = InspectorDb::open(project.path()).unwrap();
+        let reader = InspectorDb::open(project.path()).unwrap();
+        let writer_task = tokio::spawn(async move {
+            for index in 0..100 {
+                let mut webhook = make_webhook(&format!("concurrent-{index:03}"), 200);
+                webhook.timestamp = format!("2026-07-26T12:00:{:02}Z", index % 60);
+                writer.insert_request(webhook, None);
+                if index % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            writer.flush_pending_writes().await.unwrap();
+        });
+
+        while !writer_task.is_finished() {
+            reader.list_requests(25, 0).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        writer_task.await.unwrap();
+
+        assert_eq!(reader.count().await.unwrap(), 100);
+    }
+
+    #[test]
+    fn corrupt_project_database_fails_instead_of_creating_an_empty_store() {
+        let project = tempfile::tempdir().unwrap();
+        let lpm_dir = project.path().join(".lpm");
+        std::fs::create_dir_all(&lpm_dir).unwrap();
+        std::fs::write(lpm_dir.join("inspector.db"), b"not a sqlite database").unwrap();
+
+        let error = match InspectorDb::open(project.path()) {
+            Ok(_) => panic!("corrupt database must not open"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("database"));
     }
 }

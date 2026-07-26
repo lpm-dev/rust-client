@@ -20,6 +20,33 @@ use std::fs;
 use std::time::{Duration, Instant};
 use support::{TempProject, lpm, lpm_spawnable};
 use tokio_tungstenite::tungstenite::Message;
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+
+fn captured_webhook(
+    id: &str,
+    timestamp: &str,
+    status: u16,
+) -> lpm_tunnel::webhook::CapturedWebhook {
+    lpm_tunnel::webhook::CapturedWebhook {
+        id: id.to_string(),
+        timestamp: timestamp.to_string(),
+        method: "POST".to_string(),
+        path: "/webhooks/stripe".to_string(),
+        request_headers: std::collections::HashMap::from([(
+            "stripe-signature".to_string(),
+            "t=123,v1=test".to_string(),
+        )]),
+        request_body: br#"{"type":"payment_intent.payment_failed"}"#.to_vec(),
+        response_status: status,
+        response_headers: std::collections::HashMap::new(),
+        response_body: br#"{"accepted":false}"#.to_vec(),
+        duration_ms: 18,
+        provider: Some(lpm_tunnel::webhook::WebhookProvider::Stripe),
+        summary: "Stripe: payment_intent.payment_failed".to_string(),
+        signature_diagnostic: None,
+        auto_acked: false,
+    }
+}
 
 // ─── dev: --help dispatches and exits cleanly ─────────────────────────
 
@@ -358,16 +385,23 @@ fn tunnel_list_without_auth_under_json_emits_error_envelope_on_stdout() {
 }
 
 #[test]
-fn tunnel_inspect_without_auth_reads_local_log_under_json() {
+fn tunnel_inspect_without_auth_reads_project_inspector_database_under_json() {
     let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
 
-    let lpm_dir = project.path().join(".lpm");
-    fs::create_dir_all(&lpm_dir).expect("failed to create .lpm fixture dir");
-    fs::write(
-        lpm_dir.join("webhook-log.jsonl"),
-        "{\"id\":\"wh-stripe-402\",\"ts\":\"2026-05-22T10:05:00Z\",\"method\":\"POST\",\"path\":\"/webhooks/stripe\",\"status\":402,\"ms\":18,\"provider\":\"Stripe\",\"summary\":\"Stripe: payment_intent.payment_failed\",\"req_size\":56,\"res_size\":27}\n",
-    )
-    .expect("failed to seed webhook log");
+    let runtime = tokio::runtime::Runtime::new().expect("create fixture runtime");
+    runtime.block_on(async {
+        let db =
+            lpm_inspect::db::InspectorDb::open(project.path()).expect("open inspector database");
+        let state = lpm_inspect::state::InspectorState::with_db(3000, db);
+        state
+            .push(captured_webhook(
+                "wh-stripe-402",
+                "2026-05-22T10:05:00Z",
+                402,
+            ))
+            .await;
+        state.flush().await.unwrap();
+    });
 
     let output = lpm(&project)
         .args(["--json", "tunnel", "inspect"])
@@ -389,6 +423,211 @@ fn tunnel_inspect_without_auth_reads_local_log_under_json() {
     assert_eq!(rows.len(), 1, "expected one seeded webhook row");
     assert_eq!(rows[0]["provider"], serde_json::json!("Stripe"));
     assert_eq!(rows[0]["status"], serde_json::json!(402));
+}
+
+#[test]
+fn tunnel_inspect_filters_and_details_share_deterministic_project_history() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let state = lpm_inspect::state::InspectorState::with_db(
+            3000,
+            lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        state
+            .push(captured_webhook(
+                "oldest-stripe",
+                "2026-05-22T10:05:00Z",
+                200,
+            ))
+            .await;
+        state
+            .push(captured_webhook(
+                "middle-stripe",
+                "2026-05-22T10:05:01Z",
+                402,
+            ))
+            .await;
+        let mut newest = captured_webhook("newest-github", "2026-05-22T10:05:02Z", 500);
+        newest.provider = Some(lpm_tunnel::webhook::WebhookProvider::GitHub);
+        state.push(newest).await;
+        state.flush().await.unwrap();
+    });
+
+    let filtered = lpm(&project)
+        .args([
+            "--json", "tunnel", "inspect", "--last", "10", "--filter", "stripe", "--status", "4xx",
+        ])
+        .output()
+        .unwrap();
+    assert!(filtered.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], "middle-stripe");
+
+    let detail = lpm(&project)
+        .args(["--json", "tunnel", "inspect", "--detail", "2"])
+        .output()
+        .unwrap();
+    assert!(
+        detail.status.success(),
+        "detail failed: {}",
+        String::from_utf8_lossy(&detail.stderr)
+    );
+    let webhook: serde_json::Value = serde_json::from_slice(&detail.stdout).unwrap();
+    assert_eq!(webhook["id"], "middle-stripe");
+    assert_eq!(
+        webhook["request_headers"]["stripe-signature"],
+        "t=123,v1=test"
+    );
+}
+
+#[test]
+fn tunnel_inspect_ignores_but_preserves_legacy_capture_files() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let lpm_dir = project.path().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    let legacy_path = lpm_dir.join("webhook-log.jsonl");
+    let legacy = b"{\"id\":\"legacy-only\"}\n";
+    std::fs::write(&legacy_path, legacy).unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "tunnel", "inspect"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(std::fs::read(legacy_path).unwrap(), legacy);
+}
+
+#[test]
+fn tunnel_log_clear_removes_only_active_sqlite_history_under_json() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let lpm_dir = project.path().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    let legacy_path = lpm_dir.join("webhook-log.jsonl");
+    let legacy = b"{\"id\":\"legacy-preserved\"}\n";
+    std::fs::write(&legacy_path, legacy).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let state = lpm_inspect::state::InspectorState::with_db(
+            3000,
+            lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        state
+            .push(captured_webhook(
+                "active-capture",
+                "2026-05-22T10:05:00Z",
+                200,
+            ))
+            .await;
+        state.flush().await.unwrap();
+    });
+
+    let output = lpm(&project)
+        .args(["--json", "tunnel", "log", "--clear"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "success": true,
+            "cleared": true,
+            "store": ".lpm/inspector.db"
+        })
+    );
+    assert_eq!(std::fs::read(legacy_path).unwrap(), legacy);
+
+    let inspect = lpm(&project)
+        .args(["--json", "tunnel", "inspect"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&inspect.stdout).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let lpm_dir = project.path().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(lpm_dir.join("inspector.db"), b"not sqlite").unwrap();
+
+    let output = lpm(&project).args(["tunnel", "inspect"]).output().unwrap();
+
+    assert!(!output.status.success());
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains(".lpm/inspector.db"));
+    assert!(rendered.contains("Repair or move"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_replay_uses_persisted_headers_and_body_and_emits_one_json_document() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let state = lpm_inspect::state::InspectorState::with_db(
+        server.address().port(),
+        lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+    );
+    let mut webhook = captured_webhook("replay-fidelity", "2026-05-22T10:05:00Z", 500);
+    webhook.path = "/webhooks/replay?source=sqlite".to_string();
+    webhook
+        .request_headers
+        .insert("x-replay-canary".to_string(), "header-value".to_string());
+    webhook.request_body = b"exact replay body".to_vec();
+    state.push(webhook).await;
+    state.flush().await.unwrap();
+
+    let port = server.address().port().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        lpm(&project)
+            .args(["--json", "tunnel", "replay", "--last", "--port", &port])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "replay failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["id"], "replay-fidelity");
+    assert_eq!(envelope["status"], 204);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_eq!(requests[0].url.path(), "/webhooks/replay");
+    assert_eq!(requests[0].url.query(), Some("source=sqlite"));
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-replay-canary")
+            .and_then(|value| value.to_str().ok()),
+        Some("header-value")
+    );
+    assert_eq!(requests[0].body, b"exact replay body");
 }
 
 #[test]
