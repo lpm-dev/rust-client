@@ -1026,6 +1026,7 @@ pub async fn run_add_packages(
                     &pkg_name,
                     &resolved_ver,
                     ver_meta,
+                    yes,
                     json_output,
                     client.base_url(),
                 )
