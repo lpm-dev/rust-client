@@ -1201,24 +1201,26 @@ mod tests {
     /// avoid blowing away the default if a script does
     /// `export LPM_NPM_REGISTRY_URL_OVERRIDE=` on accident.
     ///
-    /// Routes through the same `acquire_env_override_lock` as the
-    /// async wiremock tests so plain `cargo test` (parallel by default)
-    /// doesn't race this against them — without the lock, concurrent
-    /// tests can hit the real GitHub rate limit through env-var
-    /// bleed-through.
+    /// Uses the process-wide test environment scope so parallel
+    /// release tests cannot replace each other's endpoints.
     #[test]
     fn npm_registry_url_respects_override_env_var() {
-        let _restore = acquire_env_override_lock();
-        // SAFETY: lock held for the lifetime of `_restore`.
-        unsafe { std::env::set_var(NPM_OVERRIDE_KEY, "http://localhost:9999/foo") };
-        assert_eq!(npm_registry_url(), "http://localhost:9999/foo");
-        unsafe { std::env::set_var(NPM_OVERRIDE_KEY, "") };
-        assert_eq!(
-            npm_registry_url(),
-            NPM_REGISTRY_URL_DEFAULT,
-            "empty override falls back to default"
-        );
-        // `_restore`'s Drop runs at end of scope and rewinds env state.
+        {
+            let _env = crate::test_env::ScopedEnv::set([(
+                NPM_OVERRIDE_KEY,
+                "http://localhost:9999/foo".into(),
+            )]);
+            assert_eq!(npm_registry_url(), "http://localhost:9999/foo");
+        }
+        {
+            let _env =
+                crate::test_env::ScopedEnv::set([(NPM_OVERRIDE_KEY, std::ffi::OsString::new())]);
+            assert_eq!(
+                npm_registry_url(),
+                NPM_REGISTRY_URL_DEFAULT,
+                "empty override falls back to default"
+            );
+        }
     }
 
     /// End-to-end cascade test: when the npm primary returns a fresh
@@ -1446,84 +1448,18 @@ mod tests {
         assert!(s.contains("npm dns failed"), "expected npm error: {s}");
     }
 
-    // ─── Env-override test isolation ─────────────────────────────────
-    //
-    // The `with_env_overrides` async helper AND the sync
-    // `npm_registry_url_respects_override_env_var` test both mutate
-    // the same process-global override env vars
-    // (`LPM_NPM_REGISTRY_URL_OVERRIDE` /
-    // `LPM_GITHUB_RELEASES_URL_OVERRIDE`). Under default `cargo test`
-    // parallelism these races caused flakes — when two wiremock tests
-    // ran concurrently they could swap each other's URLs mid-probe and
-    // hit the real registries. The GitHub release probe can reproduce
-    // rate-limit bleed-through in exactly this shape.
-    //
-    // Lock is a plain `std::sync::Mutex<()>` (held across `.await` in
-    // async tests) because `#[tokio::test]` defaults to the
-    // current-thread runtime — there's no work-stealing scheduler that
-    // could move the future across threads while the guard is held.
-    // The `unwrap_or_else(into_inner)` shape ignores poison: if a test
-    // panics while holding the lock, downstream tests still serialize
-    // correctly; the guarded `()` carries no state to corrupt.
-
     const NPM_OVERRIDE_KEY: &str = "LPM_NPM_REGISTRY_URL_OVERRIDE";
     const GH_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASES_URL_OVERRIDE";
 
-    /// RAII guard that restores the override env vars on drop.
-    /// Restores fire on normal scope exit AND on panic, so a failing
-    /// test doesn't pollute env state for the next test in line.
-    /// Captured previous values are stored verbatim — `None` means
-    /// "was unset", `Some(v)` means "was `v`".
-    struct EnvOverrideGuard {
-        npm_prev: Option<std::ffi::OsString>,
-        gh_prev: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for EnvOverrideGuard {
-        fn drop(&mut self) {
-            // SAFETY: env mutation is unsafe in 2024 edition; serialised
-            // via `_lock` so no other thread can observe a half-restored
-            // pair.
-            unsafe {
-                match &self.npm_prev {
-                    Some(v) => std::env::set_var(NPM_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(NPM_OVERRIDE_KEY),
-                }
-                match &self.gh_prev {
-                    Some(v) => std::env::set_var(GH_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(GH_OVERRIDE_KEY),
-                }
-            }
-        }
-    }
-
-    /// Acquire the global env-override lock and snapshot the current
-    /// values. The returned guard restores both vars when dropped.
-    fn acquire_env_override_lock() -> EnvOverrideGuard {
-        let lock = crate::test_env::lock_env();
-        EnvOverrideGuard {
-            npm_prev: std::env::var_os(NPM_OVERRIDE_KEY),
-            gh_prev: std::env::var_os(GH_OVERRIDE_KEY),
-            _lock: lock,
-        }
-    }
-
-    /// Helper: set npm + GitHub URL overrides for the duration of an
-    /// async block. Lock-isolated and panic-safe via
-    /// [`EnvOverrideGuard`].
     async fn with_env_overrides<F>(npm_url: &str, gh_url: &str, fut: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let _restore = acquire_env_override_lock();
-        // SAFETY: lock held for the lifetime of `_restore`.
-        unsafe {
-            std::env::set_var(NPM_OVERRIDE_KEY, npm_url);
-            std::env::set_var(GH_OVERRIDE_KEY, gh_url);
-        }
+        let _env = crate::test_env::ScopedEnv::set([
+            (NPM_OVERRIDE_KEY, npm_url.into()),
+            (GH_OVERRIDE_KEY, gh_url.into()),
+        ]);
         fut.await;
-        // `_restore`'s Drop runs at end of scope and rewinds env state.
     }
 
     #[test]
@@ -1588,72 +1524,42 @@ mod tests {
     /// proves the fallback path is taken).
     #[test]
     fn resolve_release_url_falls_back_to_default_on_rejected_override() {
-        let _restore = acquire_env_override_lock();
-        // SAFETY: lock held for the lifetime of `_restore`.
-        unsafe {
-            std::env::set_var(NPM_OVERRIDE_KEY, "http://attacker.example/x");
-        }
+        let _env = crate::test_env::ScopedEnv::set([(
+            NPM_OVERRIDE_KEY,
+            "http://attacker.example/x".into(),
+        )]);
         assert_eq!(
             resolve_release_url(NPM_OVERRIDE_KEY, NPM_REGISTRY_URL_DEFAULT),
             NPM_REGISTRY_URL_DEFAULT,
             "non-loopback HTTP override must NOT steer the lookup",
         );
-        unsafe { std::env::remove_var(NPM_OVERRIDE_KEY) };
     }
 
     /// And the positive path: an accepted override IS used.
     #[test]
     fn resolve_release_url_honors_accepted_override() {
-        let _restore = acquire_env_override_lock();
-        // SAFETY: lock held for the lifetime of `_restore`.
-        unsafe {
-            std::env::set_var(NPM_OVERRIDE_KEY, "https://npm.internal.example.com/x");
-        }
+        let _env = crate::test_env::ScopedEnv::set([(
+            NPM_OVERRIDE_KEY,
+            "https://npm.internal.example.com/x".into(),
+        )]);
         assert_eq!(
             resolve_release_url(NPM_OVERRIDE_KEY, NPM_REGISTRY_URL_DEFAULT),
             "https://npm.internal.example.com/x",
             "HTTPS override must steer the lookup",
         );
-        unsafe { std::env::remove_var(NPM_OVERRIDE_KEY) };
     }
 
     // ── fetch_github_release_published_at ─────────────────────────
 
     const RELEASE_BY_TAG_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE";
 
-    /// Drop guard that restores `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`
-    /// to whatever value (or absence) preceded the test. Uses the same
-    /// shared test environment boundary as the NPM/GH overrides.
-    struct ReleaseByTagOverrideGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for ReleaseByTagOverrideGuard {
-        fn drop(&mut self) {
-            // SAFETY: the shared test environment lock is held through restoration.
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(RELEASE_BY_TAG_OVERRIDE_KEY),
-                }
-            }
-        }
-    }
-
     async fn with_release_by_tag_override<F>(template: &str, fut: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let lock = crate::test_env::lock_env();
-        let guard = ReleaseByTagOverrideGuard {
-            prev: std::env::var_os(RELEASE_BY_TAG_OVERRIDE_KEY),
-            _lock: lock,
-        };
-        // SAFETY: the shared test environment lock is held by `guard`.
-        unsafe { std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, template) };
+        let _env =
+            crate::test_env::ScopedEnv::set([(RELEASE_BY_TAG_OVERRIDE_KEY, template.into())]);
         fut.await;
-        drop(guard);
     }
 
     #[tokio::test]
