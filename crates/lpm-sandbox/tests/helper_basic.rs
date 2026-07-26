@@ -165,6 +165,71 @@ fn helper_runs_trivial_command_under_appcontainer_and_propagates_exit_zero() {
 }
 
 #[test]
+fn helper_supports_concurrent_first_use_of_same_appcontainer_profile() {
+    const HELPER_COUNT: usize = 16;
+
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let appcontainer_name = std::sync::Arc::new(format!(
+        "LpmConcurrentHelperTest{:x}{unique_suffix:x}",
+        std::process::id()
+    ));
+    let start = std::sync::Arc::new(std::sync::Barrier::new(HELPER_COUNT));
+
+    let helpers = (0..HELPER_COUNT)
+        .map(|_| {
+            let appcontainer_name = std::sync::Arc::clone(&appcontainer_name);
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                let mut command =
+                    Command::cargo_bin("lpm-sandbox-helper").expect("locate built helper");
+                command.args([
+                    "--protocol-version",
+                    "1",
+                    "--appcontainer-name",
+                    appcontainer_name.as_str(),
+                    "--stdio-stdin",
+                    "null",
+                    "--stdio-stdout",
+                    "null",
+                    "--stdio-stderr",
+                    "null",
+                    "--",
+                    r"C:\Windows\System32\whoami.exe",
+                ]);
+                start.wait();
+                command.output().expect("run concurrent helper")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let failures = helpers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, helper)| {
+            let output = helper
+                .join()
+                .expect("concurrent helper thread must not panic");
+            (!output.status.success()).then(|| {
+                format!(
+                    "helper {index}: status {:?}\nstderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        failures.is_empty(),
+        "all helpers sharing a freshly created AppContainer profile must succeed:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn helper_propagates_nonzero_exit_code_from_lifecycle_child() {
     // cmd /c exit 7 — verifies that GetExitCodeProcess + the
     // u32→i32 cast in run_appcontainer_spawn surface the lifecycle
@@ -180,6 +245,7 @@ fn helper_propagates_nonzero_exit_code_from_lifecycle_child() {
     assert_eq!(
         out.status.code(),
         Some(7),
-        "lifecycle exit code 7 must propagate verbatim through the helper",
+        "lifecycle exit code 7 must propagate verbatim through the helper; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
     );
 }
