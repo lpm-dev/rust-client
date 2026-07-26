@@ -227,7 +227,8 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
     println!(
         "  {}",
         format!(
-            "lpm env oidc allow --provider=github --repo=<owner/repo> --branch=main --env={env_mode}"
+            "lpm env oidc allow --provider=github --repo=<owner/repo> \
+             --workflow=.github/workflows/deploy.yml --branch=main --env={env_mode}"
         )
         .bold()
     );

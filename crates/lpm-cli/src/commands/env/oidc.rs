@@ -174,7 +174,19 @@ pub(super) async fn vars_oidc_allow(
 
     let result: serde_json::Value = super::response::parse_capped_platform_json(response).await?;
 
-    if !json_output {
+    let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key()
+        .map_err(|error| oidc_escrow_setup_error("retrieving the local wrapping key", &error))?;
+    let wrapping_key_hex = hex::encode(wrapping_key);
+    lpm_vault::sync::upload_escrow_key(&registry_url, &auth_token, &vault_id, &wrapping_key_hex)
+        .await
+        .map_err(|error| oidc_escrow_setup_error("uploading the wrapping key", &error))?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
         output::success_line(install_ui::terminal_line!(
             "OIDC policy set: {} {} on branches [{}] for envs [{}] via workflows [{}] events [{}]",
             provider,
@@ -188,56 +200,18 @@ pub(super) async fn vars_oidc_allow(
             workflows.join(", "),
             events.join(", "),
         ));
-    }
-
-    // Escrow the wrapping key so the server can decrypt for CI pulls.
-    // Best-effort: don't fail if escrow upload fails (the policy was already created).
-    match lpm_vault::crypto::get_or_create_wrapping_key() {
-        Ok(wrapping_key) => {
-            let wrapping_key_hex = hex::encode(wrapping_key);
-            match lpm_vault::sync::upload_escrow_key(
-                &registry_url,
-                &auth_token,
-                &vault_id,
-                &wrapping_key_hex,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if !json_output {
-                        output::info(
-                            "CI escrow enabled — secrets will be decrypted server-side for OIDC pulls",
-                        );
-                    }
-                }
-                Err(e) => {
-                    if !json_output {
-                        output::warn_line(install_ui::terminal_line!(
-                            "Failed to escrow wrapping key (CI pull may not work): {}",
-                            install_ui::dim(&e),
-                        ));
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            if !json_output {
-                output::warn_line(install_ui::terminal_line!(
-                    "Could not read wrapping key for CI escrow: {}",
-                    install_ui::dim(&e),
-                ));
-            }
-        }
-    }
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        output::info("CI escrow enabled — secrets will be decrypted server-side for OIDC pulls");
     }
 
     Ok(())
+}
+
+fn oidc_escrow_setup_error(step: &str, error: &str) -> LpmError {
+    LpmError::Script(format!(
+        "OIDC policy may already have been created, but CI pulls are not ready because escrow \
+         setup failed while {step}: {error}. Fix the escrow problem, then rerun the same \
+         `lpm env oidc allow` command; rerunning safely updates the existing policy."
+    ))
 }
 
 /// `lpm env oidc list`
@@ -355,12 +329,7 @@ pub(super) async fn vars_oidc_pull(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
-        LpmError::Script("no vault configured. Set LPM_VAULT_ID or run 'lpm env set' first".into())
-    })?;
-
-    // Also check env var override for vault ID (useful in CI where lpm.json may not exist)
-    let vault_id = std::env::var("LPM_VAULT_ID").unwrap_or(vault_id);
+    let vault_id = resolve_oidc_pull_vault_id(project_dir)?;
 
     let registry_url = lpm_common::resolve_lpm_registry_url();
 
@@ -491,6 +460,28 @@ pub(super) async fn vars_oidc_pull(
     }
 
     Ok(())
+}
+
+fn resolve_oidc_pull_vault_id(project_dir: &std::path::Path) -> Result<String, LpmError> {
+    if let Ok(value) = std::env::var("LPM_VAULT_ID") {
+        let vault_id = value.trim();
+        if !vault_id.is_empty() {
+            if !lpm_vault::vault_id::is_safe_vault_id(vault_id) {
+                return Err(LpmError::Script(
+                    "LPM_VAULT_ID is unsafe; use a vault ID without path separators, control \
+                     characters, or path-traversal components."
+                        .into(),
+                ));
+            }
+            return Ok(vault_id.to_owned());
+        }
+    }
+
+    lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
+        LpmError::Script(
+            "no vault configured. Set a non-empty LPM_VAULT_ID or add `vault` to lpm.json".into(),
+        )
+    })
 }
 
 /// Get the OIDC token from the CI environment for the env-vault flow.
