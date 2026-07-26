@@ -10,7 +10,9 @@ expression: envelope
   ],
   "missing": [],
   "extra": [
-    "EXTRA"
+    "ALPHA",
+    "MIDDLE",
+    "ZETA"
   ],
   "valid": false
 }

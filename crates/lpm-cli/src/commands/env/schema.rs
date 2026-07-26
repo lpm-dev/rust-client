@@ -336,6 +336,7 @@ pub(super) fn vars_validate(
                 extra.push(key.as_str());
             }
         }
+        extra.sort_unstable();
     }
 
     let valid = missing.is_empty() && (!strict || extra.is_empty());
@@ -404,7 +405,16 @@ pub(super) fn vars_validate(
             required_keys.len()
         ));
     } else if !missing.is_empty() {
-        let missing_list = missing.join(" ");
+        let missing_list_capacity = missing.iter().map(|key| key.len() + 4).sum::<usize>()
+            + missing.len().saturating_sub(1);
+        let mut missing_assignments = String::with_capacity(missing_list_capacity);
+        for (index, key) in missing.iter().enumerate() {
+            if index > 0 {
+                missing_assignments.push(' ');
+            }
+            missing_assignments.push_str(key);
+            missing_assignments.push_str("=...");
+        }
         println!(
             "{}",
             install_ui::terminal_line!(
@@ -417,7 +427,7 @@ pub(super) fn vars_validate(
             "{}",
             install_ui::terminal_line!(
                 "  Fix: {}",
-                install_ui::cyan(&format!("lpm env set {missing_list}=...")),
+                install_ui::cyan(&format!("lpm env set {missing_assignments}")),
             )
         );
     }

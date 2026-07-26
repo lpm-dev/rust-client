@@ -689,9 +689,13 @@ fn env_validate_json_exits_nonzero_and_reports_missing_keys() {
 }
 
 #[test]
-fn env_validate_human_exits_nonzero_when_required_key_is_missing() {
+fn env_validate_human_remediation_assigns_each_missing_key() {
     let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
-    write_dotenv(&project, ".env.example", "REQUIRED_ONE=\nREQUIRED_TWO=\n");
+    write_dotenv(
+        &project,
+        ".env.example",
+        "REQUIRED_ONE=\nREQUIRED_TWO=\nREQUIRED_THREE=\n",
+    );
     lpm(&project)
         .args(["env", "set", "REQUIRED_ONE=value"])
         .assert()
@@ -708,8 +712,8 @@ fn env_validate_human_exits_nonzero_when_required_key_is_missing() {
     );
     let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
     assert!(
-        stdout.contains("REQUIRED_TWO") && stdout.contains("lpm env set"),
-        "human output must identify and explain how to set the missing key:\n{stdout}"
+        stdout.contains("lpm env set REQUIRED_TWO=... REQUIRED_THREE=..."),
+        "human remediation must provide one KEY=VALUE operand per missing key:\n{stdout}"
     );
 }
 
@@ -778,7 +782,14 @@ fn env_validate_json_strict_exits_nonzero_and_reports_extra_keys() {
     let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
     write_dotenv(&project, ".env.example", "REQUIRED=\n");
     lpm(&project)
-        .args(["env", "set", "REQUIRED=value", "EXTRA=extra-value"])
+        .args([
+            "env",
+            "set",
+            "REQUIRED=value",
+            "ZETA=z",
+            "ALPHA=a",
+            "MIDDLE=m",
+        ])
         .assert()
         .success();
 
@@ -794,16 +805,26 @@ fn env_validate_json_strict_exits_nonzero_and_reports_extra_keys() {
     let envelope = parse_json_stdout(&output, "env validate --strict --json");
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert_eq!(envelope["valid"], serde_json::json!(false));
-    assert_eq!(envelope["extra"], serde_json::json!(["EXTRA"]));
+    assert_eq!(
+        envelope["extra"],
+        serde_json::json!(["ALPHA", "MIDDLE", "ZETA"])
+    );
     insta::assert_json_snapshot!("env_validate_json_strict_extra", envelope);
 }
 
 #[test]
-fn env_validate_human_strict_exits_nonzero_when_extra_key_is_present() {
+fn env_validate_human_strict_sorts_extra_key_remediation() {
     let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
     write_dotenv(&project, ".env.example", "REQUIRED=\n");
     lpm(&project)
-        .args(["env", "set", "REQUIRED=value", "EXTRA=extra-value"])
+        .args([
+            "env",
+            "set",
+            "REQUIRED=value",
+            "ZETA=z",
+            "ALPHA=a",
+            "MIDDLE=m",
+        ])
         .assert()
         .success();
 
@@ -818,8 +839,8 @@ fn env_validate_human_strict_exits_nonzero_when_extra_key_is_present() {
     );
     let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
     assert!(
-        stdout.contains("EXTRA") && stdout.contains("lpm env delete EXTRA"),
-        "human output must identify and explain how to remove the extra key:\n{stdout}"
+        stdout.contains("lpm env delete ALPHA MIDDLE ZETA"),
+        "human remediation must list extra keys in deterministic order:\n{stdout}"
     );
 }
 
