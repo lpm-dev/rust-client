@@ -139,6 +139,7 @@ pub(crate) async fn run_recursive_workspace_install(
                 options.timing,
                 &[],
                 false,
+                false,
                 lpm_root.clone(),
             );
             crate::workspace_discovery_cache::scope(Arc::clone(&active_workspace), install).await?;

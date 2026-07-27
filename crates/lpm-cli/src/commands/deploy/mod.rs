@@ -272,7 +272,8 @@ pub async fn run(
         false, // audit_after_install: internal pipeline never runs audit
         false, // timing: deploy does not expose install's --timing flag
         &[],
-        true, // emit the install report before the deploy-specific summary
+        true,  // emit the install report before the deploy-specific summary
+        false, // reserve_stdout: deploy owns no stdio protocol channel
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
     )
     .await?;

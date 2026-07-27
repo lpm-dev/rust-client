@@ -259,7 +259,7 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // settled before either step runs.
         Commands::Cache(args) if args.action == "prune" => true,
         // Any `cache clean` invocation, regardless of subcategory.
-        // Bare `cache clean` cleans metadata + tasks + dlx, so the dlx
+        // Bare `cache clean` cleans metadata + tasks + dlx + mcp, so the dlx
         // dir is always in scope; the per-subcategory form trivially is
         // too.
         Commands::Cache(args) => args.action == "clean",
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn predicate_true_for_every_cache_clean_form() {
         // Any `cache clean` invocation can touch the shared dlx dir
-        // because the bare form cleans all three subcategories, so all
+        // because the bare form cleans all four subcategories, so all
         // forms gate on recovery.
         assert!(command_needs_global_state(&parse(&[
             "lpm", "cache", "clean"
@@ -925,6 +925,9 @@ mod tests {
         ])));
         assert!(command_needs_global_state(&parse(&[
             "lpm", "cache", "clean", "tasks"
+        ])));
+        assert!(command_needs_global_state(&parse(&[
+            "lpm", "cache", "clean", "mcp"
         ])));
         // Read-only `cache path` does not.
         assert!(!command_needs_global_state(&parse(&[

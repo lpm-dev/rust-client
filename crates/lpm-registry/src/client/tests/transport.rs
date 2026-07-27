@@ -110,6 +110,27 @@ fn clone_with_static_token_detaches_the_attached_session() {
 }
 
 #[test]
+fn clone_anonymous_drops_session_and_direct_token_credentials() {
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        "https://example.invalid",
+        Some("session-token".to_string()),
+    ));
+    let client = RegistryClient::new()
+        .with_session(session)
+        .with_token("direct-token");
+
+    let anonymous = client.clone_anonymous();
+
+    assert!(anonymous.session().is_none());
+    assert!(anonymous.token.is_none());
+    assert!(
+        anonymous
+            .current_bearer(AuthPosture::AuthRequired)
+            .is_none()
+    );
+}
+
+#[test]
 fn clone_with_session_only_drops_the_direct_token_fallback() {
     let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
         "https://example.invalid",

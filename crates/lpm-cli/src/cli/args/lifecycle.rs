@@ -693,8 +693,8 @@ pub(crate) struct CacheArgs {
     /// Action: clean, path, status, prune.
     pub(crate) action: String,
 
-    /// Optional subcategory: metadata, tasks, or dlx.
-    /// When omitted, `clean` clears all three and `path` prints the
+    /// Optional subcategory: metadata, tasks, dlx, or mcp.
+    /// When omitted, `clean` clears all four and `path` prints the
     /// cache root. Ignored by `prune`.
     pub(crate) subcategory: Option<String>,
 

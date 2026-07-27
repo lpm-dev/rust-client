@@ -14,7 +14,7 @@ use std::path::Path;
 use crate::install_ui;
 
 pub use runtime::{ensure_detected_runtimes, ensure_runtime};
-pub use single::{DlxOptions, dlx, exec, run, run_file, run_file_watch, run_watch};
+pub use single::{DlxOptions, dlx, exec, managed_dlx, run, run_file, run_file_watch, run_watch};
 pub use workspace::run_workspace;
 
 use parallel::run_tasks_parallel;

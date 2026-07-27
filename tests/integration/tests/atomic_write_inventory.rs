@@ -156,6 +156,14 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "NamedTempFile exclusively creates a randomized sibling before persist",
     ),
     (
+        "crates/lpm-cli/src/commands/run/single.rs::recover_managed_runtime",
+        "restores a complete verified MCP runtime directory while holding the MCP cache lock",
+    ),
+    (
+        "crates/lpm-cli/src/commands/run/single.rs::replace_managed_runtime",
+        "swaps complete MCP runtime directories with rollback while holding the MCP cache lock",
+    ),
+    (
         "crates/lpm-cli/src/commands/self_update.rs::swap_current_binary",
         "NamedTempFile exclusively creates the executable sibling; Windows needs a custom running-binary swap",
     ),

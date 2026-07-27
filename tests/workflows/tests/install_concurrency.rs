@@ -2386,7 +2386,7 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
 ///
 /// **Architectural facts:**
 ///
-/// - `lpm cache clean` removes ONLY `~/.lpm/cache/{metadata,tasks,dlx}`
+/// - `lpm cache clean` removes ONLY `~/.lpm/cache/{metadata,tasks,dlx,mcp}`
 ///   (see [crates/lpm-cli/src/commands/cache.rs:64](../../../crates/lpm-cli/src/commands/cache.rs#L64)).
 ///   It NEVER touches `~/.lpm/store/`.
 /// - Tarball staging happens entirely inside `~/.lpm/store/` (temp dir

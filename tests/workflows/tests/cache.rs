@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm cache clean [subcat]` and `lpm cache path [subcat]`.
 //!
-//! These cover the subcategory dispatch (`metadata` / `tasks` / `dlx`) and
+//! These cover the subcategory dispatch (`metadata` / `tasks` / `dlx` / `mcp`) and
 //! the all-subcategory blanket form. No registry, no network.
 
 mod support;
@@ -370,6 +370,21 @@ fn cache_path_metadata_subcategory_prints_metadata_dir() {
 }
 
 #[test]
+fn cache_path_mcp_subcategory_prints_managed_runtime_cache_dir() {
+    let project = TempProject::empty(r#"{"name":"cache-path","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["cache", "path", "mcp"])
+        .output()
+        .expect("failed to run lpm cache path mcp");
+
+    assert!(output.status.success(), "lpm cache path mcp failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = cache_root(&project).join("mcp").display().to_string();
+    assert_eq!(stdout.trim(), expected);
+}
+
+#[test]
 fn cache_path_unknown_subcategory_fails_with_helpful_message() {
     let project = TempProject::empty(r#"{"name":"cache-path","version":"1.0.0"}"#);
 
@@ -422,12 +437,13 @@ fn cache_path_json_envelope_shape_is_stable() {
 // ─── clean subcommand ─────────────────────────────────────────────────
 
 #[test]
-fn cache_clean_blanket_removes_all_three_subcategories() {
+fn cache_clean_blanket_removes_all_four_subcategories() {
     let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
 
     seed_subcat(&project, "metadata", "pkg-meta.json", b"{\"a\":1}");
     seed_subcat(&project, "tasks", "task-cache.bin", &[0xff; 256]);
     seed_subcat(&project, "dlx", "tool.tgz", &[0xee; 1024]);
+    seed_subcat(&project, "mcp", "runtime.json", &[0xdd; 512]);
 
     let output = lpm(&project)
         .args(["cache", "clean"])
@@ -442,7 +458,7 @@ fn cache_clean_blanket_removes_all_three_subcategories() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Cleared 3 cache directories"),
+        stderr.contains("✓ Cleared 4 cache directories"),
         "cache clean must report a slim summary, got:\n{stderr}"
     );
     assert!(
@@ -457,6 +473,7 @@ fn cache_clean_blanket_removes_all_three_subcategories() {
         ("metadata", "pkg-meta.json"),
         ("tasks", "task-cache.bin"),
         ("dlx", "tool.tgz"),
+        ("mcp", "runtime.json"),
     ] {
         let file_path = cache_root(&project).join(subcat).join(file);
         assert!(
@@ -526,6 +543,7 @@ fn cache_clean_json_envelope_reports_per_subcategory_freed_bytes() {
     seed_subcat(&project, "metadata", "a.json", &[0xaa; 100]);
     seed_subcat(&project, "tasks", "b.bin", &[0xbb; 200]);
     seed_subcat(&project, "dlx", "c.tgz", &[0xcc; 300]);
+    seed_subcat(&project, "mcp", "runtime.json", &[0xdd; 400]);
 
     let output = lpm(&project)
         .args(["--json", "cache", "clean"])
@@ -539,13 +557,14 @@ fn cache_clean_json_envelope_reports_per_subcategory_freed_bytes() {
         .unwrap_or_else(|e| panic!("cache clean --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["skipped"], serde_json::json!([]));
     let cleaned = envelope["cleaned"]
         .as_array()
         .expect("cleaned must be an array");
     assert_eq!(
         cleaned.len(),
-        3,
-        "blanket cache clean must report metadata + tasks + dlx, got {} entries: {envelope}",
+        4,
+        "blanket cache clean must report metadata + tasks + dlx + mcp, got {} entries: {envelope}",
         cleaned.len(),
     );
 
@@ -556,13 +575,67 @@ fn cache_clean_json_envelope_reports_per_subcategory_freed_bytes() {
     assert!(categories.contains(&"metadata"));
     assert!(categories.contains(&"tasks"));
     assert!(categories.contains(&"dlx"));
+    assert!(categories.contains(&"mcp"));
 
     let total_bytes = envelope["total_bytes_freed"]
         .as_u64()
         .expect("total_bytes_freed must be a u64");
     assert!(
-        total_bytes >= 600,
-        "total_bytes_freed must include seeded payloads (>=600), got {total_bytes}\nenvelope: {envelope}"
+        total_bytes >= 1_000,
+        "total_bytes_freed must include seeded payloads (>=1000), got {total_bytes}\nenvelope: {envelope}"
+    );
+}
+
+#[test]
+fn cache_clean_json_reports_an_in_use_mcp_runtime_as_skipped() {
+    let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
+    seed_subcat(&project, "metadata", "a.json", &[0xaa; 100]);
+    seed_subcat(&project, "mcp/runtime", "package.json", &[0xdd; 400]);
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    let lock_path = root.cache_mcp_lock();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        lpm_common::with_shared_lock(lock_path, || {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, lpm_common::LpmError>(())
+        })
+    });
+    held_rx.recv().unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "cache", "clean"])
+        .output()
+        .expect("failed to run lpm cache clean --json with a busy MCP runtime");
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+
+    assert!(
+        output.status.success(),
+        "blanket cache clean must continue around a busy MCP runtime: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache clean output must be JSON");
+    assert_eq!(
+        envelope["skipped"],
+        serde_json::json!([{
+            "category": "mcp",
+            "path": cache_root(&project).join("mcp").display().to_string(),
+            "reason": "in use"
+        }])
+    );
+    assert!(
+        cache_root(&project)
+            .join("mcp/runtime/package.json")
+            .is_file(),
+        "the in-use MCP runtime must remain intact"
+    );
+    assert!(
+        !cache_root(&project).join("metadata").exists(),
+        "other cache categories must still be cleaned"
     );
 }
 
