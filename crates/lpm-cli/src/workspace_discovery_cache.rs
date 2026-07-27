@@ -33,16 +33,20 @@ pub(crate) fn refresh_target(
     workspace: &mut Workspace,
     target_dir: &Path,
 ) -> Result<(), WorkspaceError> {
-    let package = lpm_workspace::read_package_json(&target_dir.join("package.json"))?;
-
     if target_dir == workspace.root {
-        workspace.root_package = package;
+        let refreshed_root = lpm_workspace::discover_workspace(target_dir)?
+            .filter(|refreshed| refreshed.root == workspace.root)
+            .map(|refreshed| refreshed.root_package);
+        workspace.root_package = match refreshed_root {
+            Some(package) => package,
+            None => lpm_workspace::read_package_json(&target_dir.join("package.json"))?,
+        };
     } else if let Some(member) = workspace
         .members
         .iter_mut()
         .find(|member| member.path == target_dir)
     {
-        member.package = package;
+        member.package = lpm_workspace::read_package_json(&target_dir.join("package.json"))?;
     }
 
     Ok(())

@@ -22,21 +22,23 @@ then one for the workspace root. The final arm is a single no-flag
 
 | Members | Legacy full pass | Final default | Improvement |
 | ---: | ---: | ---: | ---: |
-| 15 | 101.7 ms | 10.7 ms | 9.5× |
-| 30 | 221.2 ms | 14.7 ms | 15.1× |
-| 60 | 513.7 ms | 22.6 ms | 22.8× |
-| 120 | 1,339.6 ms | 39.2 ms | 34.2× |
-| 240 | 4,049.2 ms | 73.8 ms | 54.9× |
+| 15 | 101.7 ms | 11.2 ms | 9.1× |
+| 30 | 221.2 ms | 15.9 ms | 13.9× |
+| 60 | 513.7 ms | 25.0 ms | 20.5× |
+| 120 | 1,339.6 ms | 44.2 ms | 30.3× |
+| 240 | 4,049.2 ms | 83.8 ms | 48.3× |
 
 With 16× as many members, the legacy pass takes 39.8× as long. The final
-default path takes 6.88× as long. A single process discovers the workspace
-once, shares the immutable discovery metadata across target installs, refreshes
-only the active manifest, and reuses one workspace lock.
+default path takes 7.46× as long. A single process shares immutable discovery
+metadata across member installs, refreshes only each active member manifest,
+performs one fresh root discovery before the root install so merged
+`pnpm-workspace.yaml` configuration stays current, and reuses one workspace
+lock.
 
 The explicit `--recursive` checkpoint before default dispatch was enabled
 measured 12.0, 15.1, 24.6, 45.9, and 100.7 ms for the same fixture sizes.
 Replacing per-target workspace clones with shared metadata reduced the final
-240-member result by a further 26.7%. The final measurement also includes a
+240-member result by a further 16.8%. The final measurement also includes a
 post-`pnpm:devPreinstall` manifest reload for every target, matching the
 single-project lifecycle contract when that script edits `package.json`.
 
@@ -48,11 +50,11 @@ At 240 members:
 | --- | ---: |
 | Legacy full pass | 18,956,288 bytes (18.08 MiB) |
 | Explicit checkpoint | 20,627,456 bytes (19.67 MiB) |
-| Final default | 19,464,192 bytes (18.56 MiB) |
+| Final default | 19,791,872 bytes (18.88 MiB) |
 
-The final path adds 507,904 bytes (2.7%) over the legacy per-process peak. It
-uses 1,163,264 fewer bytes than the first explicit checkpoint. The final value
-is the highest of five measured runs.
+The final path adds 835,584 bytes (4.4%) over the legacy per-process peak. It
+uses 835,584 fewer bytes than the first explicit checkpoint. The final value is
+the highest of five measured runs.
 
 ## Reproduction
 
