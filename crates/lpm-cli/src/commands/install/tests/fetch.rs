@@ -270,6 +270,45 @@ async fn tarball_url_install_v2_extracts_object() {
 }
 
 #[tokio::test]
+async fn buffered_download_keeps_its_slot_until_extraction_can_start() {
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let download_permit = download_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("download semaphore must remain open");
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let held_extract_permit = extract_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("extract semaphore must remain open");
+    let limiter = Some(extract_semaphore);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+    let handoff = tokio::spawn(async move {
+        started_tx
+            .send(())
+            .expect("handoff test receiver must remain alive");
+        handoff_buffered_download_to_extract(download_permit, &limiter).await
+    });
+    started_rx
+        .await
+        .expect("handoff task must reach the extraction wait");
+    tokio::task::yield_now().await;
+
+    assert_eq!(download_semaphore.available_permits(), 0);
+
+    drop(held_extract_permit);
+    let (extract_permit, _) = handoff
+        .await
+        .expect("handoff task must not panic")
+        .expect("handoff must succeed");
+    assert_eq!(download_semaphore.available_permits(), 1);
+    assert!(extract_permit.is_some());
+}
+
+#[tokio::test]
 async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};

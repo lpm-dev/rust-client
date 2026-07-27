@@ -110,6 +110,17 @@ async fn acquire_fetch_extract_permit(
     }
 }
 
+pub(super) async fn handoff_buffered_download_to_extract<P>(
+    download_permit: P,
+    limiter: &FetchExtractLimiter,
+) -> Result<(Option<tokio::sync::OwnedSemaphorePermit>, u128), LpmError> {
+    let wait_start = std::time::Instant::now();
+    let extract_permit = acquire_fetch_extract_permit(limiter).await?;
+    let wait_ms = wait_start.elapsed().as_millis();
+    drop(download_permit);
+    Ok((extract_permit, wait_ms))
+}
+
 pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) start: Instant,
     pub(super) arc_client: Arc<RegistryClient>,
@@ -2587,6 +2598,7 @@ pub(super) fn spawn_speculation_dispatcher(
         // server-side cap if this becomes common.
         let orphan_count: u64 = parked.values().map(|v| v.len() as u64).sum();
         parked_c.fetch_add(orphan_count, Relaxed);
+        drop((metadata, parked, already_dispatched, work_queue));
 
         // Wait for all dispatched speculations to either complete or
         // drop — ensures store visibility for the real fetch loop's
@@ -2695,7 +2707,7 @@ pub(super) async fn speculative_download_and_store(
     // Speculation must never queue ahead of the authoritative fetch loop.
     // If all shared download permits are busy, skip this best-effort
     // prefetch and let the real fetch path own the network slot.
-    let permit = match semaphore.try_acquire() {
+    let permit = match semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::NoPermits) => {
             return Ok(SpeculativeFetchOutcome::SkippedNoPermit);
@@ -2721,8 +2733,8 @@ pub(super) async fn speculative_download_and_store(
         let body = response.bytes().await.map_err(|e| {
             LpmError::Registry(format!("spec body fetch failed for {name}@{version}: {e}"))
         })?;
-        drop(permit);
-        let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+        let (_extract_permit, _) =
+            handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
         let integrity_c = integrity.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
@@ -3282,7 +3294,6 @@ pub(super) async fn fetch_and_store_tarball_url(
         .download_tarball_with_integrity(url, p.integrity.as_deref())
         .await?;
     let download_ms = download_start.elapsed().as_millis();
-    drop(permit);
 
     // download_tarball_with_integrity already verified the SRI when
     // p.integrity was Some; on trust-on-first-use it returned the
@@ -3290,9 +3301,8 @@ pub(super) async fn fetch_and_store_tarball_url(
     // download_ms because the verify is a single string compare.
     let integrity_ms = 0;
 
-    let extract_permit_wait_start = std::time::Instant::now();
-    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
+    let (_extract_permit, extract_permit_wait_ms) =
+        handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
 
     let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
         // — v2 path. The Source::Tarball case
@@ -3477,26 +3487,16 @@ pub(super) async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
 
-    // Collect the entire compressed tarball into memory
-    // BEFORE releasing the download permit, then release the permit
-    // BEFORE the spawn_blocking extract. When the permit covers
-    // download + extract end-to-end, long extract tails serialize
-    // sibling download permit hand-off. Releasing it here lets the next
-    // download start as soon as bytes are on the heap; extract no
-    // longer holds a download slot and can be coordinated separately.
-    //
-    // Bounded memory: `download_tarball_streaming` already enforces
-    // `MAX_COMPRESSED_TARBALL_SIZE` (500 MB) via `Content-Length`, and
-    // `Bytes::clone` is a refcount bump so the move into spawn_blocking
-    // doesn't realloc. Average tarball on fixture-large is ~50-500 KB;
-    // 24-permit peak is ~12 MB resident.
+    // Collect the compressed body, then acquire an extraction slot before
+    // handing the download slot to the next request. This keeps downloaded
+    // bodies waiting for extraction bounded by the download pool instead of
+    // allowing the entire install graph to queue compressed tarballs.
     let download_start = std::time::Instant::now();
     let body = response
         .bytes()
         .await
         .map_err(|e| LpmError::Network(format!("tarball stream failed: {e}")))?;
     let download_ms = download_start.elapsed().as_millis();
-    drop(permit); // release for sibling downloads before extract starts.
 
     let name = p.name.clone();
     let version = p.version.clone();
@@ -3508,9 +3508,8 @@ pub(super) async fn fetch_and_store_streaming(
     // the existing v1 path byte-for-byte.
     let store_v2_owned = store_v2.cloned();
 
-    let extract_permit_wait_start = std::time::Instant::now();
-    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
+    let (_extract_permit, extract_permit_wait_ms) =
+        handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
 
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
