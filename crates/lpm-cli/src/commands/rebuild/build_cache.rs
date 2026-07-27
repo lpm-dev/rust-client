@@ -835,7 +835,7 @@ fn toolchain_snapshot_base_key(
     hasher.update(b"\0");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(b"\0");
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(crate::build_version::version().as_bytes());
     hasher.update(b"\0");
     let probe_environment = toolchain_probe_environment(trusted_environment);
     hasher.update(hash_string_map(&probe_environment).as_bytes());

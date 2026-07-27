@@ -422,7 +422,12 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
 /// This ensures the binary never touches the developer's real HOME, store,
 /// auth tokens, or cache.
 pub fn lpm(project: &TempProject) -> assert_cmd::Command {
-    let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").expect("lpm-rs binary not found");
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    lpm_from_path(project, &binary)
+}
+
+pub fn lpm_from_path(project: &TempProject, binary: &Path) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::new(binary);
     cmd.current_dir(project.path());
     apply_lpm_env(&mut cmd, project);
     cmd

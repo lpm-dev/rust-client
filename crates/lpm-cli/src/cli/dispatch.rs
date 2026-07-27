@@ -3014,7 +3014,9 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Vault(args) => commands::vault::run(&args.action, cli.json).await,
-        Commands::SelfUpdate(args) => commands::self_update::run(cli.json, args.refresh).await,
+        Commands::SelfUpdate(args) => {
+            commands::self_update::run(cli.json, args.refresh, args.channel).await
+        }
         Commands::Completions(args) => {
             let build_args::CompletionsArgs {
                 shell,

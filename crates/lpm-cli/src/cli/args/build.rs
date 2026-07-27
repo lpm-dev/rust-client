@@ -584,6 +584,11 @@ pub(crate) struct DevArgs {
 
 #[derive(Args)]
 pub(crate) struct SelfUpdateArgs {
+    /// Release channel to install. When omitted, stable installations
+    /// follow stable and nightly installations follow nightly.
+    #[arg(long, value_enum)]
+    pub(crate) channel: Option<crate::release_channel::ReleaseChannel>,
+
     /// Bypass the 10-minute version-lookup cache and the
     /// post-failure cooldown. Forces a fresh probe regardless of
     /// recent state. Only affects the version check — not the

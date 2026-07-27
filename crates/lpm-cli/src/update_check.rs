@@ -6,6 +6,7 @@
 //! layer: 24h success TTL, 1h failure backoff (with jitter), and the
 //! coloured notice formatter.
 
+use crate::release_channel::ReleaseChannel;
 use crate::release_lookup::{
     default_cache_path, is_newer_semver, is_stale as base_is_stale, probe_release, read_cache_at,
     write_cache_at,
@@ -25,12 +26,11 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 pub fn read_cached_notice() -> Option<String> {
     let path = default_cache_path()?;
     let cache = read_cache_at(&path)?;
-    let current = env!("CARGO_PKG_VERSION");
-    if !cache.latest.is_empty()
-        && cache.latest != current
-        && is_newer_semver(&cache.latest, current)
-    {
-        Some(format_notice(current, &cache.latest))
+    let current = crate::build_version::version();
+    let channel = ReleaseChannel::from_installed_version(current);
+    let latest = cache.latest_for(channel);
+    if !latest.is_empty() && latest != current && is_newer_semver(latest, current) {
+        Some(format_notice(current, latest))
     } else {
         None
     }
@@ -51,7 +51,8 @@ pub fn is_stale() -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    base_is_stale(cache.as_ref(), now, SUCCESS_TTL, FAILURE_BACKOFF)
+    let channel = ReleaseChannel::from_installed_version(crate::build_version::version());
+    base_is_stale(cache.as_ref(), channel, now, SUCCESS_TTL, FAILURE_BACKOFF)
 }
 
 pub fn should_spawn_background_check() -> bool {
@@ -76,6 +77,7 @@ pub async fn refresh_cache_now() {
     };
 
     let mut cache = read_cache_at(&path).unwrap_or_default();
+    let channel = ReleaseChannel::from_installed_version(crate::build_version::version());
     // `probe_release` mutates `cache` in-place on every outcome:
     // fresh / not-modified bumps `last_check`; failure bumps
     // `last_failure_check`. Either way, persist so the next
@@ -83,7 +85,7 @@ pub async fn refresh_cache_now() {
     //
     // npm registry is the primary source; GitHub Releases is the
     // fallback. See `release_lookup::probe_release` for cascade rules.
-    let _ = probe_release(&mut cache).await;
+    let _ = probe_release(channel, &mut cache).await;
     let _ = write_cache_at(&path, &cache);
 }
 
@@ -167,6 +169,7 @@ mod tests {
         };
         assert!(!release_lookup::is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now,
             SUCCESS_TTL,
             FAILURE_BACKOFF,
@@ -176,7 +179,7 @@ mod tests {
     #[test]
     fn notice_appears_only_when_strictly_newer() {
         // Direct check of the comparator branch the banner uses.
-        assert!(is_newer_semver("99.0.0", env!("CARGO_PKG_VERSION")));
-        assert!(!is_newer_semver(env!("CARGO_PKG_VERSION"), "99.0.0"));
+        assert!(is_newer_semver("99.0.0", crate::build_version::version()));
+        assert!(!is_newer_semver(crate::build_version::version(), "99.0.0"));
     }
 }

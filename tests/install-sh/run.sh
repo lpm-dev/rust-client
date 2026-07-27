@@ -7,6 +7,7 @@
 #   - LPM_INSTALL_INSECURE=1 opt-out succeeds without integrity gate
 #   - LPM_INSTALL_TEST_API_URL / _DOWNLOAD_BASE loopback enforcement
 #   - happy path (manifest + binary match, no cosign on PATH)
+#   - nightly channel lookup and strict stable/nightly separation
 #   - explicit LPM_INSTALL_VERSION path (no latest-release API fetch)
 #   - manifest 404 (release predates signed-install gate)
 #   - bundle 404 (manifest present, bundle missing → fail-closed)
@@ -30,7 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 SERVE_PY="$SCRIPT_DIR/serve.py"
-FIXTURE_VERSION="v0.43.1-test"
+FIXTURE_VERSION="v0.43.1"
+NIGHTLY_VERSION="v0.71.0-nightly.20260728.42.d82ceea"
+LEADING_ZERO_NIGHTLY_VERSION="v0.71.0-nightly.20260728.43.g0123456"
 
 if [ ! -f "$INSTALL_SH" ]; then
   echo "FAIL: install.sh not found at $INSTALL_SH" >&2
@@ -161,6 +164,7 @@ run_install_sh() {
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_VERSION="${LPM_INSTALL_VERSION:-}" \
+    LPM_INSTALL_CHANNEL="${LPM_INSTALL_CHANNEL:-}" \
     sh "$INSTALL_SH" 2>&1
   )"
   RUN_RC=$?
@@ -265,7 +269,63 @@ fixture_sha="$($SHA_TOOL "$FIXTURE_DIR/$PLATFORM" | awk '{print $1}')"
 rm -rf "$FIXTURE_DIR"
 pass "happy path installs the verified binary"
 
-# ── Case 6: explicit version skips the latest-release API ──────
+# ── Case 6: nightly channel installs the verified nightly ──────
+fdir="$(mktemp -d)"
+printf '{"version": "%s"}\n' "${NIGHTLY_VERSION#v}" > "$fdir/api.json"
+printf 'nightly-binary-bytes' > "$fdir/$PLATFORM"
+sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
+printf '%s  %s\n' "$sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_CHANNEL=nightly run_install_sh
+unset LPM_INSTALL_CHANNEL
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "nightly install failed with exit $RUN_RC; out: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Detecting latest nightly version" \
+  || fail "nightly install did not report nightly lookup: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Installing LPM CLI $NIGHTLY_VERSION (nightly channel)" \
+  || fail "nightly install did not report resolved channel/version: $RUN_OUT"
+[ -x "$RUN_INSTALL_DIR/lpm" ] || fail "nightly install did not produce an executable"
+rm -rf "$fdir"
+pass "nightly channel installs the verified nightly"
+
+# ── Case 7: automatic channel lookups reject crossed versions ───
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$NIGHTLY_VERSION" > "$fdir/api.json"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -ne 0 ] || fail "stable channel must reject a nightly API response"
+echo "$RUN_OUT" | grep -q "stable channel returned prerelease" \
+  || fail "stable channel rejection was unclear: $RUN_OUT"
+
+printf '{"version": "0.71.0"}\n' > "$fdir/api.json"
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_CHANNEL=nightly run_install_sh
+unset LPM_INSTALL_CHANNEL
+stop_server
+trap - EXIT
+[ "$RUN_RC" -ne 0 ] || fail "nightly channel must reject a stable registry response"
+echo "$RUN_OUT" | grep -q "nightly channel returned non-nightly" \
+  || fail "nightly channel rejection was unclear: $RUN_OUT"
+rm -rf "$fdir"
+pass "automatic channel lookups reject crossed versions"
+
+# ── Case 8: invalid release channel fails closed ────────────────
+actual_exit=0
+out="$(PATH="$CLEAN_PATH_DIR" HOME="$(mktemp -d)" LPM_INSTALL_CHANNEL=canary sh "$INSTALL_SH" 2>&1)" \
+  || actual_exit=$?
+[ "$actual_exit" -ne 0 ] || fail "invalid install channel should fail"
+echo "$out" | grep -q "must be 'stable' or 'nightly'" \
+  || fail "invalid install channel error was unclear: $out"
+pass "invalid install channel fails closed"
+
+# ── Case 9: explicit version skips the latest-release API ──────
 fdir="$(mktemp -d)"
 printf 'explicit-version-binary-bytes' > "$fdir/$PLATFORM"
 sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
@@ -284,10 +344,31 @@ echo "$RUN_OUT" | grep -q "Using requested version $FIXTURE_VERSION" \
   || fail "explicit-version path did not acknowledge requested version: $RUN_OUT"
 [ -x "$RUN_INSTALL_DIR/lpm" ] \
   || fail "explicit-version path did not produce executable at $RUN_INSTALL_DIR/lpm"
-rm -rf "$fdir"
-pass "explicit version installs without latest-release API"
 
-# ── Case 7: manifest 404 fails closed ─────────────────────────
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_VERSION="$NIGHTLY_VERSION" run_install_sh
+unset LPM_INSTALL_VERSION
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "explicit nightly version failed with exit $RUN_RC; out: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Installing LPM CLI $NIGHTLY_VERSION (nightly channel)" \
+  || fail "explicit nightly version did not infer the nightly channel: $RUN_OUT"
+
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_VERSION="$LEADING_ZERO_NIGHTLY_VERSION" run_install_sh
+unset LPM_INSTALL_VERSION
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] \
+  || fail "semver-safe leading-zero nightly version failed with exit $RUN_RC; out: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Installing LPM CLI $LEADING_ZERO_NIGHTLY_VERSION (nightly channel)" \
+  || fail "semver-safe leading-zero nightly version did not infer the nightly channel: $RUN_OUT"
+rm -rf "$fdir"
+pass "explicit stable and nightly versions install without latest-release API"
+
+# ── Case 10: manifest 404 fails closed ────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'placeholder' > "$fdir/$PLATFORM"

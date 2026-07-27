@@ -9,7 +9,7 @@
 mod support;
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, lpm_from_path};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -35,6 +35,24 @@ fn read_current_version(project: &TempProject) -> String {
         .unwrap_or("0.0.0")
         .trim()
         .to_string()
+}
+
+fn npm_managed_lpm_path(project: &TempProject) -> std::path::PathBuf {
+    let source = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let file_name = if cfg!(windows) {
+        "lpm-rs.exe"
+    } else {
+        "lpm-rs"
+    };
+    let destination = project
+        .path()
+        .join("node_modules")
+        .join("@lpm-registry")
+        .join("cli")
+        .join(file_name);
+    std::fs::create_dir_all(destination.parent().unwrap()).expect("create npm-shaped path");
+    std::fs::copy(source, &destination).expect("copy lpm binary into npm-shaped path");
+    destination
 }
 
 // ─── cache-hit "already on latest" ───────────────────────────────────
@@ -73,6 +91,83 @@ fn self_update_cache_hit_with_matching_latest_reports_up_to_date() {
     assert_eq!(envelope["cache_hit"], serde_json::json!(true));
     assert_eq!(envelope["current"], serde_json::json!(current));
     assert_eq!(envelope["latest"], serde_json::json!(current));
+    assert_eq!(envelope["channel"], serde_json::json!("stable"));
+    assert_eq!(envelope["target_channel"], serde_json::json!("stable"));
+    assert_eq!(envelope["channel_changed"], serde_json::json!(false));
+
+    let mut snapshot = envelope;
+    snapshot["current"] = serde_json::json!("<current-version>");
+    snapshot["latest"] = serde_json::json!("<current-version>");
+    insta::assert_json_snapshot!(snapshot, @r#"
+    {
+      "success": true,
+      "current": "<current-version>",
+      "latest": "<current-version>",
+      "up_to_date": true,
+      "cache_hit": true,
+      "channel": "stable",
+      "target_channel": "stable",
+      "channel_changed": false
+    }
+    "#);
+}
+
+#[test]
+fn self_update_explicit_nightly_switch_returns_exact_npm_install_plan() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    let nightly = "999.0.0-nightly.20260728.42.d82ceea";
+
+    std::fs::create_dir_all(cache_path(&project).parent().unwrap()).expect("mkdir ~/.lpm");
+    let payload = serde_json::json!({
+        "nightly": {
+            "latest": nightly,
+            "lastCheck": now_secs(),
+        }
+    });
+    std::fs::write(cache_path(&project), payload.to_string()).expect("seed nightly cache");
+
+    let binary = npm_managed_lpm_path(&project);
+    let output = lpm_from_path(&project, &binary)
+        .args(["--json", "self-update", "--channel", "nightly"])
+        .output()
+        .expect("run npm-managed lpm self-update");
+
+    assert!(
+        output.status.success(),
+        "stable to nightly plan must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("self-update JSON must parse: {error}\n{stdout}"));
+    assert_eq!(envelope["channel"], "stable");
+    assert_eq!(envelope["target_channel"], "nightly");
+    assert_eq!(envelope["channel_changed"], true);
+    assert_eq!(envelope["latest"], nightly);
+    assert_eq!(envelope["install_method"], "npm");
+    assert_eq!(
+        envelope["update_command"],
+        format!("npm install -g @lpm-registry/cli@{nightly}")
+    );
+
+    let mut snapshot = envelope;
+    snapshot["current"] = serde_json::json!("<current-version>");
+    insta::assert_json_snapshot!(snapshot, @r#"
+    {
+      "success": true,
+      "current": "<current-version>",
+      "latest": "999.0.0-nightly.20260728.42.d82ceea",
+      "up_to_date": false,
+      "install_method": "npm",
+      "update_command": "npm install -g @lpm-registry/cli@999.0.0-nightly.20260728.42.d82ceea",
+      "cache_hit": true,
+      "channel": "stable",
+      "target_channel": "nightly",
+      "channel_changed": true
+    }
+    "#);
 }
 
 #[test]

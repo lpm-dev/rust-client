@@ -669,7 +669,7 @@ async fn stage_mutation_response(
 fn stage_http_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
     lpm_http::client_builder()
         .timeout(timeout)
-        .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
 }

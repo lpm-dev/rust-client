@@ -2,12 +2,12 @@
 //! compatibility warning loop.
 //!
 //! Reads `engines` from the workspace root and installed dependency
-//! metadata, compares constraints against the running CLI version
-//! (`engines.lpm`) and the effective Node version (`engines.node`), and
-//! aborts the install / rebuild / add pipeline when a required constraint
-//! isn't satisfied. While we have the parsed root manifest in hand, this
-//! is also the right place to emit the structured manifest-compat warnings driven by
-//! [`lpm_workspace::PackageJson::manifest_compat_issues`] — a single
+//! metadata, compares constraints against the running stable compatibility
+//! version (`engines.lpm`) and the effective Node version (`engines.node`),
+//! and aborts the install / rebuild / add pipeline when a required constraint
+//! isn't satisfied. While we have the parsed root manifest in hand, this is
+//! also the right place to emit the structured manifest-compat warnings driven
+//! by [`lpm_workspace::PackageJson::manifest_compat_issues`] — a single
 //! emission shared across install / rebuild / add.
 //!
 //! ## Defaults
@@ -338,12 +338,12 @@ impl Mismatch {
     }
 }
 
-/// Compare `engines.lpm` against the running CLI version.
+/// Compare `engines.lpm` against the running CLI's compatibility version.
 fn check_lpm_engine(engines: &HashMap<String, String>) -> Result<(), Mismatch> {
     let Some(required) = engines.get("lpm") else {
         return Ok(());
     };
-    let actual = env!("CARGO_PKG_VERSION");
+    let actual = crate::build_version::engine_compatibility_version();
     match version_satisfies(required, actual) {
         Ok(true) => Ok(()),
         Ok(false) => Err(Mismatch {
@@ -414,9 +414,19 @@ mod tests {
 
     #[test]
     fn lpm_engine_satisfied_passes() {
-        let cur = env!("CARGO_PKG_VERSION");
+        let cur = crate::build_version::engine_compatibility_version();
         let pkg = PackageJson {
             engines: engines(&[("lpm", &format!(">={cur}"))]),
+            ..Default::default()
+        };
+        let dir = tempdir().unwrap();
+        assert!(enforce_with_root(dir.path(), &pkg, true, true).is_ok());
+    }
+
+    #[test]
+    fn nightly_build_satisfies_workspace_stable_lpm_engine_floor() {
+        let pkg = PackageJson {
+            engines: engines(&[("lpm", concat!(">=", env!("CARGO_PKG_VERSION")))]),
             ..Default::default()
         };
         let dir = tempdir().unwrap();

@@ -7,6 +7,7 @@
 # manifest before chmod +x; cosign verify-blob runs opportunistically
 # when a cosign binary is on PATH. Set LPM_INSTALL_INSECURE=1 to skip
 # all integrity checks (NOT recommended; emergency-recovery only).
+# Set LPM_INSTALL_CHANNEL=nightly to install the latest nightly.
 # Set LPM_INSTALL_VERSION=vX.Y.Z to install a specific release tag.
 
 set -e
@@ -147,38 +148,68 @@ if [ -n "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ] && ! is_loopback_http "$LPM_INST
 fi
 
 REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
+INSTALL_CHANNEL="${LPM_INSTALL_CHANNEL:-stable}"
+
+case "$INSTALL_CHANNEL" in
+  stable|nightly) ;;
+  *)
+    echo "ERROR: LPM_INSTALL_CHANNEL must be 'stable' or 'nightly' (got '$INSTALL_CHANNEL')"
+    exit 1
+    ;;
+esac
+
 if [ -n "$REQUESTED_VERSION" ]; then
   VERSION="$REQUESTED_VERSION"
   echo "Using requested version $VERSION..."
 else
-  API_URL="${LPM_INSTALL_TEST_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
-
-  echo "Detecting latest version..."
+  if [ "$INSTALL_CHANNEL" = "nightly" ]; then
+    API_URL="${LPM_INSTALL_TEST_API_URL:-https://registry.npmjs.org/@lpm-registry/cli/nightly}"
+    echo "Detecting latest nightly version..."
+  else
+    API_URL="${LPM_INSTALL_TEST_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
+    echo "Detecting latest stable version..."
+  fi
   API_RESPONSE="$(curl -fsSL --max-time 30 "$API_URL")" || {
-    echo "Failed to detect latest version. Check https://github.com/$REPO/releases"
+    echo "Failed to detect latest $INSTALL_CHANNEL version. Check https://github.com/$REPO/releases"
     exit 1
   }
-  VERSION=$(printf '%s\n' "$API_RESPONSE" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+  if [ "$INSTALL_CHANNEL" = "nightly" ]; then
+    VERSION=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"version"' | sed -E 's/.*"version": *"([^"]+)".*/v\1/')
+  else
+    VERSION=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+  fi
 fi
 
 if [ -z "$VERSION" ]; then
-  echo "Failed to detect latest version. Check https://github.com/$REPO/releases"
+  echo "Failed to detect latest $INSTALL_CHANNEL version. Check https://github.com/$REPO/releases"
   exit 1
 fi
 
-# Shape-validate the resolved version string before treating it as
-# semver — defends against a crafted GitHub API response that returns
-# a tag_name like `"foo"` (which would pass the empty check but fail
-# the downstream version_lt call in confusing ways).
-case "$VERSION" in
-  v[0-9]*.[0-9]*.[0-9]*) ;;
-  *)
-    echo "ERROR: detected version '$VERSION' does not match expected vX.Y.Z[-prerelease] format"
-    echo "       This is a strong tampering signal — the GitHub release API or a"
-    echo "       downstream mirror returned an unexpected tag_name. Refusing to install."
+if ! printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+  echo "ERROR: detected version '$VERSION' does not match expected vX.Y.Z[-prerelease] format"
+  echo "       This is a strong tampering signal — the release registry or a"
+  echo "       downstream mirror returned an unexpected version. Refusing to install."
+  exit 1
+fi
+
+if [ -z "$REQUESTED_VERSION" ]; then
+  if [ "$INSTALL_CHANNEL" = "stable" ] && printf '%s\n' "$VERSION" | grep -q -- '-'; then
+    echo "ERROR: stable channel returned prerelease version '$VERSION'; refusing to install."
     exit 1
-    ;;
-esac
+  fi
+  if [ "$INSTALL_CHANNEL" = "nightly" ] && ! printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.(0|[1-9][0-9]*)\.([0-9a-f]{7,40}|g0[0-9]{6})$'; then
+    echo "ERROR: nightly channel returned non-nightly version '$VERSION'; refusing to install."
+    exit 1
+  fi
+fi
+
+RESOLVED_CHANNEL="$INSTALL_CHANNEL"
+if [ -n "$REQUESTED_VERSION" ]; then
+  case "$VERSION" in
+    *-nightly.*) RESOLVED_CHANNEL="nightly" ;;
+    *) RESOLVED_CHANNEL="stable" ;;
+  esac
+fi
 
 # Downgrade gate. An attacker who controls the API response can point
 # the installer at an old release that still carries valid SHA-256
@@ -204,7 +235,7 @@ if version_lt "$VERSION" "$MIN_VERSION"; then
   fi
 fi
 
-echo "Installing LPM CLI $VERSION for $OS/$ARCH..."
+echo "Installing LPM CLI $VERSION ($RESOLVED_CHANNEL channel) for $OS/$ARCH..."
 
 BASE_URL="${LPM_INSTALL_TEST_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download/$VERSION}"
 

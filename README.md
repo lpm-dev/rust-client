@@ -56,7 +56,16 @@ npm install -g @lpm-registry/cli
 Update LPM with:
 
 ```bash
-lpm self-update
+lpm self-update                    # follow the installed stable/nightly channel
+lpm self-update --channel nightly  # switch to nightly
+lpm self-update --channel stable   # switch back to stable
+```
+
+Nightly snapshots are available through npm and the standalone installer:
+
+```bash
+npm install -g @lpm-registry/cli@nightly
+curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh
 ```
 
 ## Quick Links
