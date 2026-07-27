@@ -279,13 +279,19 @@ function connectSSE() {
 		const { missed } = JSON.parse(e.data)
 		toast(`Missed ${missed} events`); loadAll()
 	})
+	es.addEventListener("refresh", () => { loadAll(); loadSessions() })
+	es.addEventListener("storage_error", () => {
+		toast("Inspector database could not be read. Check .lpm/inspector.db.")
+	})
 	es.onopen = () => { $("#sse-dot").classList.remove("off"); $("#sb-sse").textContent = "SSE: connected"; $("#reconnect-banner").classList.remove("show") }
 	es.onerror = () => { $("#sse-dot").classList.add("off"); $("#sb-sse").textContent = "SSE: reconnecting..."; $("#reconnect-banner").classList.add("show") }
 }
 
 // ── API ────────────────────────────────────────────────
 async function loadAll() {
-	const resp = await fetch("/api/requests"); const data = await resp.json()
+	const resp = await fetch("/api/requests")
+	if (!resp.ok) { toast("Inspector database could not be read. Check .lpm/inspector.db."); return }
+	const data = await resp.json()
 	requests = data.items || []; renderList(); updateCount()
 }
 async function loadStatus() {

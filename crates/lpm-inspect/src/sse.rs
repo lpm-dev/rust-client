@@ -24,29 +24,56 @@ pub async fn stream(
     State(state): State<InspectorState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.subscribe();
+    let observes_database = state.observes_database();
+    let mut revision = state.database_revision().await.ok().flatten();
+    let mut refresh_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh_interval.tick().await;
 
     let stream = async_stream::stream! {
+        // Close the fetch-before-subscribe race in the standalone observer:
+        // once EventSource is established, force one authoritative reload.
+        if observes_database {
+            yield Ok(Event::default().event("refresh").data("{}"));
+        }
+
         loop {
-            match rx.recv().await {
-                Ok(webhook) => {
-                    // Serialize the webhook as a compact JSON event
-                    match serde_json::to_string(&*webhook) {
-                        Ok(json) => {
-                            yield Ok(Event::default().event("request").data(json));
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to serialize SSE event: {e}");
+            tokio::select! {
+                received = rx.recv() => match received {
+                    Ok(capture) => {
+                        let summary = crate::api::RequestSummary::from_live(
+                            &capture.webhook,
+                            capture.session_id.clone(),
+                        );
+                        match serde_json::to_string(&summary) {
+                            Ok(json) => {
+                                yield Ok(Event::default().event("request").data(json));
+                            }
+                            Err(e) => {
+                                tracing::warn!("failed to serialize SSE event: {e}");
+                            }
                         }
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    // Browser fell behind — send a gap marker so it knows to re-fetch
-                    let gap = serde_json::json!({ "missed": count });
-                    yield Ok(Event::default().event("lagged").data(gap.to_string()));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    // Server is shutting down
-                    break;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        let gap = serde_json::json!({ "missed": count });
+                        yield Ok(Event::default().event("lagged").data(gap.to_string()));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                },
+                _ = refresh_interval.tick(), if observes_database => {
+                    match state.database_revision().await {
+                        Ok(next) if next != revision => {
+                            revision = next;
+                            yield Ok(Event::default().event("refresh").data("{}"));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!("inspector database refresh failed: {error}");
+                            yield Ok(Event::default().event("storage_error").data("{}"));
+                        }
+                    }
                 }
             }
         }

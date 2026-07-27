@@ -3,6 +3,10 @@ use lpm_common::LpmError;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
+const MCP_PACKAGE: &str = "@lpm-registry/mcp-server";
+const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
+const MCP_VERSION_POLICY: &str = "latest";
+
 /// MCP server management: setup, remove, status.
 pub async fn run(
     action: &str,
@@ -125,7 +129,7 @@ fn get_editors() -> Vec<EditorConfig> {
 fn default_server_config() -> Value {
     serde_json::json!({
         "command": "npx",
-        "args": ["-y", "@lpm.dev/lpm-mcp-server"],
+        "args": ["-y", MCP_PACKAGE_SPEC],
     })
 }
 
@@ -153,7 +157,7 @@ fn write_config(path: &Path, config: &Value) -> Result<(), LpmError> {
 
     let content =
         serde_json::to_string_pretty(config).map_err(|e| LpmError::Registry(e.to_string()))?;
-    std::fs::write(path, format!("{content}\n"))?;
+    lpm_common::write_file_atomic(path, format!("{content}\n"))?;
     Ok(())
 }
 
@@ -309,22 +313,10 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
         .filter_map(|result| result.configured_name())
         .collect();
 
-    // M43: the written editor config invokes `npx -y @lpm.dev/lpm-mcp-server`
-    // with no version pin. Every editor restart re-resolves the package
-    // against the public npm registry, so a single compromised publish
-    // (or transient registry redirect) becomes editor-session code
-    // execution. We don't pin a version today — the MCP server's
-    // release cadence is independent of lpm-cli, so a hard pin would
-    // freeze the MCP server at whatever was current when this lpm-cli
-    // build shipped. Loudly surface the trust posture so an operator
-    // can pin it themselves (edit the written config to add `@x.y.z`)
-    // or wrap the command in `lpm dlx` which routes through LPM's
-    // script-policy / triage advisor.
     tracing::warn!(
         target: "lpm_cli::mcp",
-        "MCP setup writes an unpinned `npx -y @lpm.dev/lpm-mcp-server` autostart. \
-         Every editor restart re-resolves from npm. To pin: edit the editor config and \
-         change `@lpm.dev/lpm-mcp-server` to `@lpm.dev/lpm-mcp-server@<version>`."
+        "MCP setup writes an `npx -y {MCP_PACKAGE_SPEC}` autostart. Every editor \
+         restart resolves the package's published latest dist-tag from npm."
     );
 
     if json_output {
@@ -334,7 +326,11 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
                 "success": true,
                 "server": name,
                 "configured": configured,
-                "trust_note": "autostart uses `npx -y` with no version pin — see warning on stderr",
+                "package": MCP_PACKAGE,
+                "package_spec": MCP_PACKAGE_SPEC,
+                "version_policy": MCP_VERSION_POLICY,
+                "command": "npx",
+                "args": ["-y", MCP_PACKAGE_SPEC],
             }))
             .unwrap()
         );
@@ -368,11 +364,8 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
         }
 
         install_ui::done_line(install_ui::TerminalLine::new("Server name: ").yellow(name));
-        install_ui::warn(
-            "autostart resolves `@lpm.dev/lpm-mcp-server` from npm on every editor start. \
-             Pin a version by editing the written config (replace the package spec with `@x.y.z`) \
-             if you want a static dependency.",
-        );
+        install_ui::done_line(install_ui::TerminalLine::new("Package: ").yellow(MCP_PACKAGE_SPEC));
+        install_ui::warn("the package's published latest dist-tag is resolved on editor startup");
         install_ui::done("Done · restart your editor to pick up the new MCP server");
     }
 
@@ -690,17 +683,14 @@ mod tests {
                 }
             }
         });
-        let new_config = serde_json::json!({
-            "command": "npx",
-            "args": ["-y", "@lpm.dev/lpm-mcp-server"]
-        });
+        let new_config = default_server_config();
 
         add_server_to_config(&mut config, "mcpServers", "lpm-registry", &new_config).unwrap();
 
         assert_eq!(config["mcpServers"]["lpm-registry"]["command"], "npx");
         assert_eq!(
             config["mcpServers"]["lpm-registry"]["args"],
-            serde_json::json!(["-y", "@lpm.dev/lpm-mcp-server"])
+            serde_json::json!(["-y", MCP_PACKAGE_SPEC])
         );
     }
 
@@ -872,7 +862,7 @@ mod tests {
         assert_eq!(cfg["command"], "npx");
         let args = cfg["args"].as_array().unwrap();
         assert_eq!(args[0], "-y");
-        assert_eq!(args[1], "@lpm.dev/lpm-mcp-server");
+        assert_eq!(args[1], "@lpm-registry/mcp-server@latest");
     }
 
     #[test]
@@ -883,7 +873,7 @@ mod tests {
             "mcpServers": {
                 "lpm-registry": {
                     "command": "npx",
-                    "args": ["-y", "@lpm.dev/lpm-mcp-server"]
+                    "args": ["-y", MCP_PACKAGE_SPEC]
                 }
             }
         });
@@ -892,6 +882,24 @@ mod tests {
         let loaded = load_config(&path).unwrap();
 
         assert_eq!(loaded, config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_config(&path, &serde_json::json!({"mcpServers": {}})).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]

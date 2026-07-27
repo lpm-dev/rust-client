@@ -1979,6 +1979,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scoped_account_matches_mcp_known_answer_vectors() {
+        for (registry_url, expected_account) in [
+            ("https://lpm.dev", "auth-token:bd90fc32d95766d5"),
+            ("https://lpm.dev/", "auth-token:89f54e26677b97ec"),
+            ("http://localhost:3000", "auth-token:f1de9e489ba88cb1"),
+            ("http://127.0.0.1:8787", "auth-token:b1a61bf29a38ff36"),
+            (
+                "https://registry.example.com/custom",
+                "auth-token:1658e811bb24ec08",
+            ),
+        ] {
+            assert_eq!(scoped_account(registry_url), expected_account);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn keychain_password_bytes_trim_surrounding_whitespace() {

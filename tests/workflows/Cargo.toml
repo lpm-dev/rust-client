@@ -45,6 +45,8 @@ lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-vault = { path = "../../crates/lpm-vault" }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }
 lpm-security = { path = "../../crates/lpm-security" }
+lpm-inspect = { path = "../../crates/lpm-inspect" }
+lpm-tunnel = { path = "../../crates/lpm-tunnel" }
 lpm-cli = { path = "../../crates/lpm-cli", features = ["internal-test-sigstore-mock"] }
 # F.3 install-concurrency test plants a framed orphan WAL record via WalWriter +
 # a matching pending-row in manifest.toml so recovery's RolledBack arm fires.

@@ -9,6 +9,7 @@ mod support;
 
 use support::{TempProject, lpm};
 
+const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
 const HOSTILE_SERVER_NAME: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
 
@@ -189,6 +190,10 @@ fn mcp_setup_and_remove_use_slim_human_status() {
         !setup_stderr.contains('●') && !setup_stderr.contains('│') && !setup_stderr.contains('◇'),
         "mcp setup must not use cliclack gutter output, got:\n{setup_stderr}",
     );
+    assert!(
+        setup_stderr.contains(MCP_PACKAGE_SPEC),
+        "mcp setup must report the published package policy, got:\n{setup_stderr}"
+    );
 
     let remove = lpm(&project)
         .args(["mcp", "remove", "test-server"])
@@ -212,6 +217,106 @@ fn mcp_setup_and_remove_use_slim_human_status() {
             && !remove_stderr.contains('│')
             && !remove_stderr.contains('◇'),
         "mcp remove must not use cliclack gutter output, got:\n{remove_stderr}",
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let claude_path = project.home().join(".claude.json");
+    #[cfg(target_os = "macos")]
+    let vscode_path = project
+        .home()
+        .join("Library/Application Support/Code/User/mcp.json");
+    #[cfg(target_os = "linux")]
+    let vscode_path = project.home().join(".config/Code/User/mcp.json");
+
+    std::fs::create_dir_all(vscode_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &claude_path,
+        r#"{"theme":"dark","mcpServers":{"keep":{"command":"node"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &vscode_path,
+        r#"{"inputs":[{"type":"promptString"}],"servers":{"keep":{"command":"node"}}}"#,
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let output = lpm(&project)
+            .args(["mcp", "setup"])
+            .output()
+            .expect("failed to run lpm mcp setup");
+        assert!(
+            output.status.success(),
+            "repeated mcp setup must succeed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let claude: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&claude_path).unwrap()).unwrap();
+    let vscode: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&vscode_path).unwrap()).unwrap();
+    let expected = serde_json::json!({
+        "command": "npx",
+        "args": ["-y", MCP_PACKAGE_SPEC]
+    });
+
+    assert_eq!(claude["mcpServers"]["lpm-registry"], expected);
+    assert_eq!(vscode["servers"]["lpm-registry"], expected);
+    assert_eq!(claude["mcpServers"].as_object().unwrap().len(), 2);
+    assert_eq!(vscode["servers"].as_object().unwrap().len(), 2);
+    assert_eq!(claude["theme"], "dark");
+    assert!(vscode["inputs"].is_array());
+}
+
+#[test]
+fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_config() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let claude_path = project.home().join(".claude.json");
+    std::fs::write(&claude_path, "{}").unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "mcp", "setup"])
+        .output()
+        .expect("failed to run lpm mcp setup --json");
+    assert!(
+        output.status.success(),
+        "mcp setup --json must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("stdout must be one JSON document: {error}\n{stdout}"));
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "server": "lpm-registry",
+      "configured": [
+        "Claude Code"
+      ],
+      "package": "@lpm-registry/mcp-server",
+      "package_spec": "@lpm-registry/mcp-server@latest",
+      "version_policy": "latest",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@lpm-registry/mcp-server@latest"
+      ]
+    }
+    "###);
+
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(claude_path).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["lpm-registry"]["args"],
+        envelope["args"]
     );
 }
 
