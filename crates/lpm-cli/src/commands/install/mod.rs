@@ -311,6 +311,7 @@ pub async fn run_with_options(
         timing,
         compatibility_bin_names,
         true,
+        false,
         lpm_root,
     )
     .await
@@ -354,6 +355,7 @@ pub(crate) async fn run_silent_for_audit_fix(
         false,
         &[],
         false,
+        false,
         lpm_root,
     )
     .await
@@ -393,6 +395,10 @@ pub(crate) async fn run_with_options_with_lpm_root(
     timing: bool,
     compatibility_bin_names: &[String],
     emit_install_report: bool,
+    // Internal stdio launchers reserve stdout for their child protocol.
+    // Install diagnostics remain on stderr, but every stdout-only report
+    // and lifecycle hint is suppressed until the child takes over.
+    reserve_stdout: bool,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let dependency_engine_policy = Arc::new(crate::engine_check::prepare_dependency_policy(
@@ -446,6 +452,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             timing,
             compatibility_bin_names,
             emit_install_report,
+            reserve_stdout,
             &lpm_root,
         ),
     )
@@ -496,6 +503,8 @@ async fn run_with_options_under_store_lock(
     timing: bool,
     compatibility_bin_names: &[String],
     emit_install_report: bool,
+    // See `run_with_options_with_lpm_root` for the stdio contract.
+    reserve_stdout: bool,
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
@@ -1462,7 +1471,7 @@ async fn run_with_options_under_store_lock(
             .map(|p| (p.name.clone(), p.version.clone()))
             .collect();
 
-        if !lpm_packages.is_empty() {
+        if !reserve_stdout && !lpm_packages.is_empty() {
             let quality_threshold = pkg
                 .lpm
                 .as_ref()
@@ -1743,17 +1752,19 @@ async fn run_with_options_under_store_lock(
         });
     }
 
-    maybe_emit_post_install_lifecycle_hint(
-        lpm_root,
-        &packages,
-        &policy,
-        project_dir,
-        script_policy_override,
-        &install_requested_capabilities,
-        &install_user_bound,
-        &blocked_capture,
-        json_output,
-    )?;
+    if !reserve_stdout {
+        maybe_emit_post_install_lifecycle_hint(
+            lpm_root,
+            &packages,
+            &policy,
+            project_dir,
+            script_policy_override,
+            &install_requested_capabilities,
+            &install_user_bound,
+            &blocked_capture,
+            json_output,
+        )?;
+    }
 
     // Write install-hash so `lpm dev` knows deps are up to date.
     // uses the shared compute_install_hash from install_state.

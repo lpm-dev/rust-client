@@ -19,7 +19,9 @@
 //!     metadata/                   ← registry metadata cache (lpm-registry)
 //!     tasks/                      ← task cache (lpm-task)
 //!     dlx/                        ← ephemeral dlx installs (lpm-runner) — was ~/.lpm/dlx-cache/
+//!     mcp/                        ← verified MCP server runtime
 //!     .clean.lock                 ← serializes concurrent `cache clean` ops
+//!     .mcp.lock                   ← coordinates MCP refresh, execution, and cleanup
 //!   engines/                      ← managed engine installs with preserved layouts
 //!   store/
 //!     v2/                         ← default virtual store (objects, links, builds)
@@ -169,6 +171,14 @@ impl LpmRoot {
 
     pub fn cache_dlx(&self) -> PathBuf {
         self.cache_root().join("dlx")
+    }
+
+    pub fn cache_mcp(&self) -> PathBuf {
+        self.cache_root().join("mcp")
+    }
+
+    pub fn cache_mcp_lock(&self) -> PathBuf {
+        self.cache_root().join(".mcp.lock")
     }
 
     pub fn cache_clean_lock(&self) -> PathBuf {
@@ -737,6 +747,44 @@ pub fn acquire_exclusive_lock(
     acquire_exclusive_with_hint(lock_path.as_ref(), default_wait_hint)
 }
 
+/// Try to acquire an exclusive advisory lock without waiting.
+///
+/// Returns `Ok(Some(handle))` when all writer-preference lock components
+/// were acquired, or `Ok(None)` when a reader or writer already owns the
+/// lock domain. Partially acquired components are released before returning
+/// `None`.
+pub fn try_acquire_exclusive_lock(
+    lock_path: impl AsRef<Path>,
+) -> Result<Option<ExclusiveLockHandle>, LpmError> {
+    let data_path = lock_path.as_ref();
+    let intent_path = writer_intent_path_for(data_path);
+    let queue_path = writer_queue_path_for(data_path);
+
+    let queue_file = open_lock_file(&queue_path)?;
+    let mut queue_rw = fd_lock::RwLock::new(queue_file);
+    if !try_acquire(&mut queue_rw, LockMode::Shared)? {
+        return Ok(None);
+    }
+
+    let intent_file = open_lock_file(&intent_path)?;
+    let mut intent_rw = fd_lock::RwLock::new(intent_file);
+    if !try_acquire(&mut intent_rw, LockMode::Exclusive)? {
+        return Ok(None);
+    }
+
+    let data_file = open_lock_file(data_path)?;
+    let mut data_rw = fd_lock::RwLock::new(data_file);
+    if !try_acquire(&mut data_rw, LockMode::Exclusive)? {
+        return Ok(None);
+    }
+
+    Ok(Some(ExclusiveLockHandle {
+        _data: data_rw,
+        _writer_intent: intent_rw,
+        _writer_queue: queue_rw,
+    }))
+}
+
 /// Async variant of [`with_exclusive_lock`]. The lock acquisition runs on
 /// a `tokio::task::spawn_blocking` worker so a contended lock doesn't
 /// block the tokio reactor. The acquired handle is held across `body`'s
@@ -1092,6 +1140,8 @@ mod tests {
             root.cache_metadata(),
             root.cache_tasks(),
             root.cache_dlx(),
+            root.cache_mcp(),
+            root.cache_mcp_lock(),
             root.cache_clean_lock(),
             root.legacy_dlx_cache(),
             root.bin_dir(),
@@ -1275,6 +1325,25 @@ mod tests {
         assert!(err.is_err());
         // Lock must be released even after a body error; a second call succeeds.
         with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
+    }
+
+    #[test]
+    fn try_acquire_exclusive_lock_returns_a_held_raii_handle() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let first = try_acquire_exclusive_lock(&lock_path)
+            .unwrap()
+            .expect("uncontended lock must be acquired");
+        assert!(
+            try_acquire_exclusive_lock(&lock_path).unwrap().is_none(),
+            "the returned handle must retain the exclusive lock"
+        );
+        drop(first);
+        assert!(
+            try_acquire_exclusive_lock(&lock_path).unwrap().is_some(),
+            "dropping the handle must release the exclusive lock"
+        );
     }
 
     #[test]

@@ -275,18 +275,22 @@ async fn async_main() -> Result<()> {
         lpm_auth::SessionManager::new(registry_url.to_string(), explicit_flag_token);
     let session_manager = auth_storage_notice::attach(session_manager, cli.json);
     let session = std::sync::Arc::new(session_manager);
+    let unattended_mcp_serve =
+        matches!(&command, Commands::Mcp(args) if args.action.as_str() == "serve");
 
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(registry_url.to_string())
-        .with_insecure(cli.insecure)
-        .with_session(session.clone());
+        .with_insecure(cli.insecure);
+    if !unattended_mcp_serve {
+        client = client.with_session(session.clone());
+    }
 
     // Step 3 transition bridge: until Step 4 wires posture-aware
     // dispatch through SessionManager, also seed the legacy
     // `with_token` path so existing request methods keep their bearer.
     // SessionManager is the source of truth — this branch goes away
     // once Step 4 lands.
-    if let Some(bearer) = session.current_bearer_for_bridge() {
+    if !unattended_mcp_serve && let Some(bearer) = session.current_bearer_for_bridge() {
         client = client.with_token(bearer);
     }
 
@@ -1907,7 +1911,7 @@ async fn async_main() -> Result<()> {
                 action,
                 name,
             } = args;
-            commands::mcp::run(&action, name.as_deref(), cli.json).await
+            commands::mcp::run(&client, &action, name.as_deref(), cli.json).await
         },
         Commands::Use(args) => {
             let lifecycle_args::UseArgs {
@@ -2074,8 +2078,11 @@ async fn async_main() -> Result<()> {
                     extra_args: &args,
                     refresh,
                     allow_new,
+                    strict_integrity: false,
                     min_release_age_override,
                     min_release_age_exclude: &min_release_age_exclude,
+                    inherit_caller_context: true,
+                    reserve_stdout: false,
                 },
             )
             .await

@@ -1,20 +1,24 @@
 use crate::install_ui;
 use lpm_common::LpmError;
+use lpm_registry::RegistryClient;
 use serde_json::{Map, Value};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 const MCP_PACKAGE: &str = "@lpm-registry/mcp-server";
 const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
-const MCP_VERSION_POLICY: &str = "latest";
+const MCP_VERSION_POLICY: &str = "latest-security-eligible";
 
-/// MCP server management: setup, remove, status.
+/// MCP server management: setup, serve, remove, status.
 pub async fn run(
+    client: &RegistryClient,
     action: &str,
     server_name: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
     match action {
         "setup" => setup(server_name, json_output).await,
+        "serve" => serve(client, server_name, json_output).await,
         "remove" => {
             let name = server_name.ok_or_else(|| {
                 LpmError::Registry("specify server name: lpm mcp remove <name>".into())
@@ -23,7 +27,7 @@ pub async fn run(
         }
         "status" => status(json_output).await,
         _ => Err(LpmError::Registry(format!(
-            "unknown mcp action: {action}. Use: setup, remove, status"
+            "unknown mcp action: {action}. Use: setup, serve, remove, status"
         ))),
     }
 }
@@ -128,9 +132,41 @@ fn get_editors() -> Vec<EditorConfig> {
 
 fn default_server_config() -> Value {
     serde_json::json!({
-        "command": "npx",
-        "args": ["-y", MCP_PACKAGE_SPEC],
+        "command": "lpm",
+        "args": ["mcp", "serve"],
     })
+}
+
+fn require_stdio_transport(stdin_is_terminal: bool, json_output: bool) -> Result<(), LpmError> {
+    if json_output {
+        return Err(LpmError::Registry(
+            "`lpm mcp serve` owns stdout for MCP JSON-RPC and cannot be combined with `--json`"
+                .into(),
+        ));
+    }
+    if stdin_is_terminal {
+        return Err(LpmError::Registry(
+            "`lpm mcp serve` is a stdio transport launched by an MCP client; run `lpm mcp setup` to configure an editor"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn serve(
+    client: &RegistryClient,
+    server_name: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if server_name.is_some() {
+        return Err(LpmError::Registry(
+            "`lpm mcp serve` does not accept a server name".into(),
+        ));
+    }
+    require_stdio_transport(std::io::stdin().is_terminal(), json_output)?;
+    let workspace = std::env::current_dir().map_err(LpmError::Io)?;
+    let anonymous_client = client.clone_anonymous();
+    crate::commands::run::managed_dlx(&anonymous_client, &workspace, MCP_PACKAGE_SPEC).await
 }
 
 fn load_config(path: &Path) -> Result<Value, LpmError> {
@@ -315,8 +351,9 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
 
     tracing::warn!(
         target: "lpm_cli::mcp",
-        "MCP setup writes an `npx -y {MCP_PACKAGE_SPEC}` autostart. Every editor \
-         restart resolves the package's published latest dist-tag from npm."
+        "MCP setup writes an `lpm mcp serve` autostart. The launcher resolves \
+         {MCP_PACKAGE_SPEC} independently of the editor workspace and applies \
+         LPM's security policy."
     );
 
     if json_output {
@@ -329,8 +366,8 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
                 "package": MCP_PACKAGE,
                 "package_spec": MCP_PACKAGE_SPEC,
                 "version_policy": MCP_VERSION_POLICY,
-                "command": "npx",
-                "args": ["-y", MCP_PACKAGE_SPEC],
+                "command": "lpm",
+                "args": ["mcp", "serve"],
             }))
             .unwrap()
         );
@@ -365,7 +402,9 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
 
         install_ui::done_line(install_ui::TerminalLine::new("Server name: ").yellow(name));
         install_ui::done_line(install_ui::TerminalLine::new("Package: ").yellow(MCP_PACKAGE_SPEC));
-        install_ui::warn("the package's published latest dist-tag is resolved on editor startup");
+        install_ui::detail(
+            "  lpm mcp serve runs the newest release allowed by LPM security policy",
+        );
         install_ui::done("Done · restart your editor to pick up the new MCP server");
     }
 
@@ -687,10 +726,10 @@ mod tests {
 
         add_server_to_config(&mut config, "mcpServers", "lpm-registry", &new_config).unwrap();
 
-        assert_eq!(config["mcpServers"]["lpm-registry"]["command"], "npx");
+        assert_eq!(config["mcpServers"]["lpm-registry"]["command"], "lpm");
         assert_eq!(
             config["mcpServers"]["lpm-registry"]["args"],
-            serde_json::json!(["-y", MCP_PACKAGE_SPEC])
+            serde_json::json!(["mcp", "serve"])
         );
     }
 
@@ -855,14 +894,29 @@ mod tests {
     }
 
     #[test]
-    fn default_server_config_uses_npx_invocation() {
-        // Cheap canary: if anyone changes the default server invocation,
-        // they must update this test deliberately.
+    fn default_server_config_uses_the_isolated_lpm_launcher() {
         let cfg = default_server_config();
-        assert_eq!(cfg["command"], "npx");
-        let args = cfg["args"].as_array().unwrap();
-        assert_eq!(args[0], "-y");
-        assert_eq!(args[1], "@lpm-registry/mcp-server@latest");
+        assert_eq!(
+            cfg,
+            serde_json::json!({
+                "command": "lpm",
+                "args": ["mcp", "serve"]
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_serve_refuses_an_interactive_terminal_before_package_resolution() {
+        let error = require_stdio_transport(true, false).unwrap_err();
+
+        assert!(error.to_string().contains("stdio transport"));
+    }
+
+    #[test]
+    fn mcp_serve_reserves_stdout_for_the_protocol() {
+        let error = require_stdio_transport(false, true).unwrap_err();
+
+        assert!(error.to_string().contains("owns stdout"));
     }
 
     #[test]

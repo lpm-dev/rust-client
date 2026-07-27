@@ -477,7 +477,31 @@ pub fn exec_dlx_binary(
     package_spec: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
+    let command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args)?;
+    exec_built_dlx_command(command, package_spec)
+}
+
+/// Execute a verified LPM-owned runtime while preserving the environment
+/// variables that runtime documents as part of its public contract.
+///
+/// This is intentionally narrower than a general allow-list API. Ordinary
+/// `lpm dlx` packages remain fully credential-scrubbed.
+pub fn exec_verified_lpm_runtime(
+    project_dir: &Path,
+    cache_dir: &Path,
+    package_spec: &str,
+    extra_args: &[String],
+) -> Result<(), LpmError> {
     let mut command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args)?;
+    for variable in ["LPM_TOKEN", "LPM_REGISTRY_URL", "LPM_CLI_PATH"] {
+        if let Some(value) = std::env::var_os(variable) {
+            command.env(variable, value);
+        }
+    }
+    exec_built_dlx_command(command, package_spec)
+}
+
+fn exec_built_dlx_command(mut command: Command, package_spec: &str) -> Result<(), LpmError> {
     let bin_name = Path::new(command.get_program())
         .file_name()
         .and_then(|name| name.to_str())

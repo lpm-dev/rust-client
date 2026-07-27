@@ -677,6 +677,18 @@ impl RegistryClient {
         }
     }
 
+    /// Clone transport, TLS, routing, and cache configuration without any
+    /// bearer or refresh-backed session.
+    ///
+    /// Use for unattended public-package flows that must never open a
+    /// credential-store prompt merely to enrich an anonymous request.
+    pub fn clone_anonymous(&self) -> Self {
+        let mut client = self.clone_with_config();
+        client.session = None;
+        client.token = None;
+        client
+    }
+
     /// Clone the client's transport configuration while installing one
     /// explicit bearer and detaching any refresh-backed session.
     ///

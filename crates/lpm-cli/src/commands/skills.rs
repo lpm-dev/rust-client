@@ -186,16 +186,34 @@ pub enum AgentTarget {
     Codex,
     ClaudeCode,
     Cursor,
+    Grok,
+    #[value(name = "opencode")]
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Pi,
+    Kimi,
 }
 
 impl AgentTarget {
-    const ALL: [Self; 3] = [Self::Codex, Self::ClaudeCode, Self::Cursor];
+    const ALL: [Self; 7] = [
+        Self::Codex,
+        Self::ClaudeCode,
+        Self::Cursor,
+        Self::Grok,
+        Self::OpenCode,
+        Self::Pi,
+        Self::Kimi,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude Code",
             Self::Cursor => "Cursor",
+            Self::Grok => "Grok",
+            Self::OpenCode => "OpenCode",
+            Self::Pi => "Pi",
+            Self::Kimi => "Kimi (Moonshot)",
         }
     }
 
@@ -204,6 +222,10 @@ impl AgentTarget {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Cursor => "cursor",
+            Self::Grok => "grok",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+            Self::Kimi => "kimi",
         }
     }
 }

@@ -115,11 +115,7 @@ impl Store {
 
     fn target_root(&self, agent: AgentTarget) -> Result<PathBuf, LpmError> {
         match self.scope {
-            Scope::Project => Ok(match agent {
-                AgentTarget::Codex => self.project_dir.join(".agents").join("skills"),
-                AgentTarget::ClaudeCode => self.project_dir.join(".claude").join("skills"),
-                AgentTarget::Cursor => self.project_dir.join(".cursor").join("skills"),
-            }),
+            Scope::Project => Ok(project_agent_root(&self.project_dir, agent)),
             Scope::Global => global_agent_root(agent),
         }
     }
@@ -1406,11 +1402,7 @@ fn external_agent_root(
     agent: AgentTarget,
 ) -> Result<PathBuf, LpmError> {
     match scope {
-        Scope::Project => Ok(match agent {
-            AgentTarget::Codex => project_dir.join(".agents/skills"),
-            AgentTarget::ClaudeCode => project_dir.join(".claude/skills"),
-            AgentTarget::Cursor => project_dir.join(".cursor/skills"),
-        }),
+        Scope::Project => Ok(project_agent_root(project_dir, agent)),
         Scope::Global => global_agent_root(agent),
     }
 }
@@ -3076,16 +3068,41 @@ fn write_state(store: &Store, state: &ManagedState) -> Result<(), LpmError> {
     Ok(())
 }
 
+fn project_agent_root(project_dir: &Path, agent: AgentTarget) -> PathBuf {
+    let relative = match agent {
+        AgentTarget::Codex => ".agents/skills",
+        AgentTarget::ClaudeCode => ".claude/skills",
+        AgentTarget::Cursor => ".cursor/skills",
+        AgentTarget::Grok => ".grok/skills",
+        AgentTarget::OpenCode => ".opencode/skills",
+        AgentTarget::Pi => ".pi/skills",
+        AgentTarget::Kimi => ".kimi/skills",
+    };
+    project_dir.join(relative)
+}
+
+fn configured_home(variable: &str, fallback: PathBuf) -> PathBuf {
+    std::env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .map_or(fallback, PathBuf::from)
+}
+
 fn global_agent_root(agent: AgentTarget) -> Result<PathBuf, LpmError> {
     let home = dirs::home_dir().ok_or_else(|| {
         LpmError::Registry("could not determine home directory for global agent skills".into())
     })?;
     Ok(match agent {
-        AgentTarget::Codex => std::env::var_os("CODEX_HOME")
-            .map_or_else(|| home.join(".codex"), PathBuf::from)
-            .join("skills"),
+        AgentTarget::Codex => configured_home("CODEX_HOME", home.join(".codex")).join("skills"),
         AgentTarget::ClaudeCode => home.join(".claude/skills"),
         AgentTarget::Cursor => home.join(".cursor/skills"),
+        AgentTarget::Grok => configured_home("GROK_HOME", home.join(".grok")).join("skills"),
+        AgentTarget::OpenCode => {
+            configured_home("XDG_CONFIG_HOME", home.join(".config")).join("opencode/skills")
+        }
+        AgentTarget::Pi => {
+            configured_home("PI_CODING_AGENT_DIR", home.join(".pi/agent")).join("skills")
+        }
+        AgentTarget::Kimi => home.join(".kimi/skills"),
     })
 }
 
@@ -3204,6 +3221,10 @@ fn agent_slug(agent: AgentTarget) -> &'static str {
         AgentTarget::Codex => "codex",
         AgentTarget::ClaudeCode => "claude-code",
         AgentTarget::Cursor => "cursor",
+        AgentTarget::Grok => "grok",
+        AgentTarget::OpenCode => "opencode",
+        AgentTarget::Pi => "pi",
+        AgentTarget::Kimi => "kimi",
     }
 }
 

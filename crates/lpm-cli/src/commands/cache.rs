@@ -2,16 +2,16 @@
 //!
 //! semantic flip: before this change, `lpm cache` operated on the
 //! content-addressable package *store* (`~/.lpm/store/v1/`) despite the
-//! name, while `~/.lpm/cache/metadata/`, `~/.lpm/cache/tasks/`, and
-//! `~/.lpm/dlx-cache/` (now `~/.lpm/cache/dlx/`) were untouched. That is
-//! fixed now: `lpm cache` only ever touches the cache directories, and
-//! `lpm store` is the single entry point for store maintenance.
+//! name, while metadata, task, and runner caches were untouched. That is
+//! fixed now: `lpm cache` only ever touches cache directories, and `lpm
+//! store` is the single entry point for store maintenance.
 //!
 //! Surface:
-//!   lpm cache clean                 cleans metadata + tasks + dlx
+//!   lpm cache clean                 cleans metadata + tasks + dlx + mcp
 //!   lpm cache clean metadata        cleans one subcategory
 //!   lpm cache clean tasks
 //!   lpm cache clean dlx
+//!   lpm cache clean mcp
 //!   lpm cache path                  prints the cache root
 //!   lpm cache path metadata         prints one subcategory path
 //!   lpm cache status                reports local task cache usage + remote status
@@ -21,7 +21,9 @@
 //! mapping one-to-one is the whole point of the rename.
 
 use crate::install_ui;
-use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock};
+use lpm_common::{
+    LpmError, LpmRoot, format_bytes, try_acquire_exclusive_lock, with_exclusive_lock,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -56,7 +58,7 @@ pub async fn run(
         "prune" => super::cache_prune::run(&root, json_output, prune_flags).await,
         "status" => run_status(json_output),
         other => Err(LpmError::Registry(format!(
-            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx], status, prune [--apply] [--max-age <dur>] [--project <path>]"
+            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx|mcp], path [metadata|tasks|dlx|mcp], status, prune [--apply] [--max-age <dur>] [--project <path>]"
         ))),
     }
 }
@@ -68,12 +70,34 @@ fn run_clean(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Re
 
     with_exclusive_lock(root.cache_clean_lock(), || {
         let mut cleaned: Vec<CleanedEntry> = Vec::new();
+        let mut skipped: Vec<SkippedEntry> = Vec::new();
         for (name, dir) in &targets {
             if !dir.exists() {
                 continue;
             }
+            let mcp_lock = if *name == "mcp" {
+                match try_acquire_exclusive_lock(root.cache_mcp_lock())? {
+                    Some(lock) => Some(lock),
+                    None if subcategory == Some("mcp") => {
+                        return Err(LpmError::Registry(
+                            "MCP cache is in use; stop active MCP server sessions and retry".into(),
+                        ));
+                    }
+                    None => {
+                        skipped.push(SkippedEntry {
+                            category: name,
+                            path: dir.clone(),
+                            reason: "in use",
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let bytes_freed = dir_size(dir).unwrap_or(0);
             std::fs::remove_dir_all(dir)?;
+            drop(mcp_lock);
             cleaned.push(CleanedEntry {
                 category: name,
                 path: dir.clone(),
@@ -82,9 +106,9 @@ fn run_clean(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Re
         }
 
         if json_output {
-            emit_clean_json(&cleaned);
+            emit_clean_json(&cleaned, &skipped);
         } else {
-            emit_clean_human(&cleaned);
+            emit_clean_human(&cleaned, &skipped);
         }
 
         // One-time notice: warn users who ran `lpm cache clean` expecting
@@ -108,13 +132,15 @@ fn resolve_targets(
             ("metadata", root.cache_metadata()),
             ("tasks", root.cache_tasks()),
             ("dlx", root.cache_dlx()),
+            ("mcp", root.cache_mcp()),
         ],
         Some("metadata") => vec![("metadata", root.cache_metadata())],
         Some("tasks") => vec![("tasks", root.cache_tasks())],
         Some("dlx") => vec![("dlx", root.cache_dlx())],
+        Some("mcp") => vec![("mcp", root.cache_mcp())],
         Some(other) => {
             return Err(LpmError::Registry(format!(
-                "unknown cache subcategory '{other}'. Use: metadata, tasks, dlx"
+                "unknown cache subcategory '{other}'. Use: metadata, tasks, dlx, mcp"
             )));
         }
     })
@@ -126,7 +152,13 @@ struct CleanedEntry {
     bytes_freed: u64,
 }
 
-fn emit_clean_json(cleaned: &[CleanedEntry]) {
+struct SkippedEntry {
+    category: &'static str,
+    path: PathBuf,
+    reason: &'static str,
+}
+
+fn emit_clean_json(cleaned: &[CleanedEntry], skipped: &[SkippedEntry]) {
     let entries: Vec<_> = cleaned
         .iter()
         .map(|c| {
@@ -138,23 +170,36 @@ fn emit_clean_json(cleaned: &[CleanedEntry]) {
             })
         })
         .collect();
+    let skipped_entries: Vec<_> = skipped
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "category": entry.category,
+                "path": entry.path.display().to_string(),
+                "reason": entry.reason,
+            })
+        })
+        .collect();
     let total: u64 = cleaned.iter().map(|c| c.bytes_freed).sum();
     let json = serde_json::json!({
         "success": true,
         "cleaned": entries,
+        "skipped": skipped_entries,
         "total_bytes_freed": total,
         "total_freed": format_bytes(total),
     });
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
-fn emit_clean_human(cleaned: &[CleanedEntry]) {
+fn emit_clean_human(cleaned: &[CleanedEntry], skipped: &[SkippedEntry]) {
     let total: u64 = cleaned.iter().map(|c| c.bytes_freed).sum();
-    if cleaned.is_empty() || total == 0 {
+    if cleaned.is_empty() {
+        if skipped.is_empty() {
+            install_ui::done("Cache is already empty");
+        }
+    } else if skipped.is_empty() && total == 0 {
         install_ui::done("Cache is already empty");
-        return;
-    }
-    if cleaned.len() == 1 {
+    } else if cleaned.len() == 1 {
         let entry = &cleaned[0];
         install_ui::done_untrusted(&format!(
             "Cleared {} cache · freed {}",
@@ -168,6 +213,12 @@ fn emit_clean_human(cleaned: &[CleanedEntry]) {
             format_bytes(total)
         ));
     }
+    for entry in skipped {
+        install_ui::warn_untrusted(&format!(
+            "{} cache was not cleared because it is {}",
+            entry.category, entry.reason
+        ));
+    }
 }
 
 // ─── path ──────────────────────────────────────────────────────────────
@@ -178,9 +229,10 @@ fn run_path(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Res
         Some("metadata") => root.cache_metadata(),
         Some("tasks") => root.cache_tasks(),
         Some("dlx") => root.cache_dlx(),
+        Some("mcp") => root.cache_mcp(),
         Some(other) => {
             return Err(LpmError::Registry(format!(
-                "unknown cache subcategory '{other}'. Use: metadata, tasks, dlx"
+                "unknown cache subcategory '{other}'. Use: metadata, tasks, dlx, mcp"
             )));
         }
     };
@@ -261,7 +313,7 @@ fn emit_semantic_change_notice() {
 fn semantic_change_notice_details() -> Vec<install_ui::TerminalLine> {
     vec![
         crate::install_ui::terminal_line!(
-            "  {} `lpm cache clean` now cleans metadata, task, and dlx caches only.",
+            "  {} `lpm cache clean` now cleans metadata, task, dlx, and MCP caches only.",
             install_ui::dim("note")
         ),
         crate::install_ui::terminal_line!(
@@ -317,19 +369,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_targets_no_subcategory_returns_all_three() {
+    fn resolve_targets_no_subcategory_returns_all_four() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
         let targets = resolve_targets(&root, None).unwrap();
         let names: Vec<&str> = targets.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, vec!["metadata", "tasks", "dlx"]);
+        assert_eq!(names, vec!["metadata", "tasks", "dlx", "mcp"]);
     }
 
     #[test]
     fn resolve_targets_subcategory_returns_one() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
-        for sub in ["metadata", "tasks", "dlx"] {
+        for sub in ["metadata", "tasks", "dlx", "mcp"] {
             let targets = resolve_targets(&root, Some(sub)).unwrap();
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].0, sub);
@@ -356,8 +408,9 @@ mod tests {
         let joined = console::strip_ansi_codes(&joined).into_owned();
 
         assert!(
-            joined
-                .contains("note `lpm cache clean` now cleans metadata, task, and dlx caches only."),
+            joined.contains(
+                "note `lpm cache clean` now cleans metadata, task, dlx, and MCP caches only."
+            ),
             "notice should explain the new cache-clean scope: {joined}"
         );
         assert!(
@@ -375,6 +428,7 @@ mod tests {
         populate(&root.cache_metadata(), &["a.json"]);
         populate(&root.cache_tasks(), &["b.json"]);
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
+        populate(&root.cache_mcp().join("runtime"), &["package.json"]);
 
         // Plant store state to prove we DON'T touch it.
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
@@ -388,6 +442,7 @@ mod tests {
         assert!(!root.cache_metadata().exists(), "metadata should be gone");
         assert!(!root.cache_tasks().exists(), "tasks should be gone");
         assert!(!root.cache_dlx().exists(), "dlx should be gone");
+        assert!(!root.cache_mcp().exists(), "mcp should be gone");
         assert!(
             root.store_v1().join("react@19.0.0").exists(),
             "store must be untouched"
@@ -402,6 +457,7 @@ mod tests {
         populate(&root.cache_metadata(), &["a.json"]);
         populate(&root.cache_tasks(), &["b.json"]);
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
+        populate(&root.cache_mcp().join("runtime"), &["package.json"]);
 
         let _env = scoped_lpm_home(tmp.path());
         run("clean", Some("metadata"), true, PruneFlags::default())
@@ -411,6 +467,35 @@ mod tests {
         assert!(!root.cache_metadata().exists());
         assert!(root.cache_tasks().join("b.json").exists());
         assert!(root.cache_dlx().join("hash1").join("package.json").exists());
+        assert!(root.cache_mcp().join("runtime/package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn clean_mcp_refuses_to_delete_an_in_use_runtime() {
+        let tmp = TempDir::new().unwrap();
+        let root = setup(&tmp);
+        populate(&root.cache_mcp().join("runtime"), &["package.json"]);
+        let lock_path = root.cache_mcp_lock();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            lpm_common::with_shared_lock(lock_path, || {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        held_rx.recv().unwrap();
+
+        let _env = scoped_lpm_home(tmp.path());
+        let error = run("clean", Some("mcp"), true, PruneFlags::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("in use"));
+        assert!(root.cache_mcp().join("runtime/package.json").exists());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -521,6 +606,9 @@ mod tests {
             .await
             .unwrap();
         run("path", Some("dlx"), true, PruneFlags::default())
+            .await
+            .unwrap();
+        run("path", Some("mcp"), true, PruneFlags::default())
             .await
             .unwrap();
     }

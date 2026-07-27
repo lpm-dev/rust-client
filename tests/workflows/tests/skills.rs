@@ -787,6 +787,111 @@ fn standalone_skills_add_ignores_disabled_lpm_package_skill_config() {
 }
 
 #[test]
+fn standalone_skills_add_materializes_every_supported_project_agent_target() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "grok",
+            "--agent",
+            "opencode",
+            "--agent",
+            "pi",
+            "--agent",
+            "kimi",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("add a standalone skill for the additional project agents");
+
+    assert!(
+        output.status.success(),
+        "additional project targets must be accepted: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for target in [
+        ".grok/skills/release-notes/SKILL.md",
+        ".opencode/skills/release-notes/SKILL.md",
+        ".pi/skills/release-notes/SKILL.md",
+        ".kimi/skills/release-notes/SKILL.md",
+    ] {
+        assert!(
+            project.file_exists(target),
+            "managed skill must be materialized at {target}"
+        );
+    }
+}
+
+#[test]
+fn standalone_skills_add_uses_each_agents_global_home_contract() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let grok_home = project.path().join("grok-home");
+    let opencode_config = project.path().join("xdg-config");
+    let pi_home = project.path().join("pi-agent-home");
+
+    let output = lpm(&project)
+        .env("GROK_HOME", &grok_home)
+        .env("XDG_CONFIG_HOME", &opencode_config)
+        .env("PI_CODING_AGENT_DIR", &pi_home)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "grok",
+            "--agent",
+            "opencode",
+            "--agent",
+            "pi",
+            "--agent",
+            "kimi",
+            "--global",
+            "--yes",
+        ])
+        .output()
+        .expect("add a standalone skill for the additional global agents");
+
+    assert!(
+        output.status.success(),
+        "additional global targets must be accepted: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for target in [
+        grok_home.join("skills/release-notes/SKILL.md"),
+        opencode_config.join("opencode/skills/release-notes/SKILL.md"),
+        pi_home.join("skills/release-notes/SKILL.md"),
+        project.home().join(".kimi/skills/release-notes/SKILL.md"),
+    ] {
+        assert!(
+            target.is_file(),
+            "managed skill must be materialized at {}",
+            target.display()
+        );
+    }
+}
+
+#[test]
 fn skills_install_alias_routes_to_the_add_flow() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     seed_standard_skill(

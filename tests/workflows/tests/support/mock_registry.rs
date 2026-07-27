@@ -2810,6 +2810,20 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_npm_package_error(
+        &self,
+        name: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a batch-metadata endpoint that returns metadata for all registered packages.
     ///
     /// The install pipeline calls `POST /api/registry/batch-metadata` with `{"packages": [...], "deep": true}`

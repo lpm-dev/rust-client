@@ -27,7 +27,11 @@ expression: envelope
       "compatible_agents": [
         "codex",
         "claude-code",
-        "cursor"
+        "cursor",
+        "grok",
+        "opencode",
+        "pi",
+        "kimi"
       ]
     }
   ],

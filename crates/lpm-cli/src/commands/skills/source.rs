@@ -911,12 +911,13 @@ fn discover_skill(tree: &SourceTree, directory: &Path) -> Result<DiscoveredSkill
 }
 
 fn unsupported_agents(requires_claude_code: bool) -> BTreeSet<AgentTarget> {
-    let mut unsupported = BTreeSet::new();
-    if requires_claude_code {
-        unsupported.insert(AgentTarget::Codex);
-        unsupported.insert(AgentTarget::Cursor);
+    if !requires_claude_code {
+        return BTreeSet::new();
     }
-    unsupported
+    AgentTarget::ALL
+        .into_iter()
+        .filter(|agent| *agent != AgentTarget::ClaudeCode)
+        .collect()
 }
 
 fn is_standard_skill_directory(directory: &Path) -> bool {
@@ -933,9 +934,16 @@ fn is_standard_skill_directory(directory: &Path) -> bool {
         }
         [
             Component::Normal(first),
+            Component::Normal(second),
             Component::Normal(_),
-            Component::Normal(_),
-        ] => *first == "skills",
+        ] => {
+            *first == "skills"
+                || (*second == "skills"
+                    && matches!(
+                        first.to_string_lossy().as_ref(),
+                        ".agents" | ".claude" | ".cursor" | ".grok" | ".opencode" | ".pi" | ".kimi"
+                    ))
+        }
         _ => false,
     }
 }
@@ -963,6 +971,10 @@ fn agent_slug(agent: AgentTarget) -> &'static str {
         AgentTarget::Codex => "codex",
         AgentTarget::ClaudeCode => "claude-code",
         AgentTarget::Cursor => "cursor",
+        AgentTarget::Grok => "grok",
+        AgentTarget::OpenCode => "opencode",
+        AgentTarget::Pi => "pi",
+        AgentTarget::Kimi => "kimi",
     }
 }
 
@@ -1150,8 +1162,22 @@ mod tests {
         let skill = discover(&tree, false).unwrap().remove(0);
 
         assert!(skill.supports(AgentTarget::ClaudeCode));
-        assert!(!skill.supports(AgentTarget::Codex));
-        assert!(!skill.supports(AgentTarget::Cursor));
+        assert!(
+            AgentTarget::ALL
+                .into_iter()
+                .filter(|agent| *agent != AgentTarget::ClaudeCode)
+                .all(|agent| !skill.supports(agent))
+        );
+    }
+
+    #[test]
+    fn standard_discovery_accepts_all_supported_agent_layouts() {
+        for vendor in [".grok", ".opencode", ".pi", ".kimi"] {
+            assert!(
+                is_standard_skill_directory(Path::new(&format!("{vendor}/skills/example"))),
+                "{vendor} must be recognized as a standard agent skill layout"
+            );
+        }
     }
 
     #[test]

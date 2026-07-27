@@ -5,7 +5,7 @@ use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::ensure_runtime;
 use super::task::reject_direct_hidden_scripts;
 use crate::install_ui;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot, ResolutionFailureKind};
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
@@ -515,6 +515,17 @@ fn resolve_dlx_target(project_dir: &Path, package_spec: &str) -> Result<DlxTarge
     Ok(target)
 }
 
+fn registry_dlx_target(package_spec: &str) -> DlxTarget {
+    let (package_name, requested_spec) = lpm_runner::dlx::parse_package_spec(package_spec);
+    DlxTarget {
+        package_name,
+        requested_spec,
+        install_spec: package_spec.to_string(),
+        cache_key: package_spec.to_string(),
+        expected_identity: None,
+    }
+}
+
 fn read_project_lpm_config(project_dir: &Path) -> Result<Option<serde_json::Value>, LpmError> {
     let path = project_dir.join("package.json");
     let content =
@@ -535,7 +546,11 @@ fn read_project_lpm_config(project_dir: &Path) -> Result<Option<serde_json::Valu
     Ok(value.get("lpm").cloned())
 }
 
-fn dlx_manifest_text(project_dir: &Path, install_spec: &str) -> Result<String, LpmError> {
+fn dlx_manifest_text(
+    project_dir: &Path,
+    install_spec: &str,
+    inherit_caller_context: bool,
+) -> Result<String, LpmError> {
     let (pkg_name, version_spec) = lpm_runner::dlx::parse_package_spec(install_spec);
     let mut deps = serde_json::Map::new();
     deps.insert(pkg_name, serde_json::Value::String(version_spec));
@@ -543,7 +558,7 @@ fn dlx_manifest_text(project_dir: &Path, install_spec: &str) -> Result<String, L
     let mut manifest = serde_json::Map::new();
     manifest.insert("private".to_string(), serde_json::Value::Bool(true));
     manifest.insert("dependencies".to_string(), serde_json::Value::Object(deps));
-    if let Some(lpm_config) = read_project_lpm_config(project_dir)? {
+    if inherit_caller_context && let Some(lpm_config) = read_project_lpm_config(project_dir)? {
         manifest.insert("lpm".to_string(), lpm_config);
     }
 
@@ -622,8 +637,74 @@ pub struct DlxOptions<'a> {
     pub extra_args: &'a [String],
     pub refresh: bool,
     pub allow_new: bool,
+    pub strict_integrity: bool,
     pub min_release_age_override: Option<u64>,
     pub min_release_age_exclude: &'a [String],
+    pub inherit_caller_context: bool,
+    pub reserve_stdout: bool,
+}
+
+async fn install_dlx_target(
+    client: &lpm_registry::RegistryClient,
+    project_dir: &Path,
+    target: &DlxTarget,
+    install: &lpm_runner::isolate::IsolatedInstall,
+    options: &DlxOptions<'_>,
+) -> Result<(), LpmError> {
+    install.prepare()?;
+
+    std::fs::write(
+        install.root().join("package.json"),
+        dlx_manifest_text(
+            project_dir,
+            &target.install_spec,
+            options.inherit_caller_context,
+        )?,
+    )
+    .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
+
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Installing {}",
+        install_ui::yellow(&target.install_spec)
+    ));
+
+    crate::commands::install::run_with_options_with_lpm_root(
+        client,
+        install.root(),
+        false, // json_output
+        false, // offline
+        crate::commands::install::FrozenLockfileMode::Never,
+        false,                    // force
+        options.allow_new,        // allow_new
+        options.strict_integrity, // strict_integrity
+        false,                    // cli_no_engine_strict
+        None,                     // strict_peer_dependencies_override
+        None,                     // linker_override
+        crate::lpm_skills_config::LpmSkillsPreference::Config,
+        false,                                                   // no_editor_setup
+        true,                                                    // no_security_summary
+        false,                                                   // auto_build
+        None,                                                    // target_set
+        None,                                                    // direct_versions_out
+        None,                                                    // requested_add_count
+        None,                                                    // script_policy_override
+        None,                                                    // advisor_override
+        options.min_release_age_override,                        // min_release_age_override
+        options.min_release_age_exclude,                         // min_release_age_exclude
+        crate::provenance_fetch::DriftIgnorePolicy::default(),   // drift_ignore_policy
+        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify_policy
+        crate::commands::install::InstallOmitPolicy::default(),  // omit_policy
+        false,                                                   // strict_sandbox
+        false,                                                   // no_sandbox
+        false,                                                   // verbose
+        false,                                                   // audit_after_install
+        false,                                                   // timing
+        &[],                                                     // compatibility_bin_names
+        !options.reserve_stdout,                                 // emit_install_report
+        options.reserve_stdout,
+        lpm_common::LpmRoot::from_env()?,
+    )
+    .await
 }
 
 pub async fn dlx(
@@ -632,7 +713,11 @@ pub async fn dlx(
     package_spec: &str,
     options: DlxOptions<'_>,
 ) -> Result<(), LpmError> {
-    let target = resolve_dlx_target(project_dir, package_spec)?;
+    let target = if options.inherit_caller_context {
+        resolve_dlx_target(project_dir, package_spec)?
+    } else {
+        registry_dlx_target(package_spec)
+    };
     let cache_dir = lpm_runner::dlx::dlx_cache_dir(&target.cache_key)?;
     let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
         &target.install_spec,
@@ -681,58 +766,7 @@ pub async fn dlx(
     }
 
     if needs_install {
-        install.prepare()?;
-
-        std::fs::write(
-            install.root().join("package.json"),
-            dlx_manifest_text(project_dir, &target.install_spec)?,
-        )
-        .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
-
-        install_ui::phase_line(crate::install_ui::terminal_line!(
-            "Installing {}",
-            install_ui::yellow(&target.install_spec)
-        ));
-
-        // Use the injected client so authenticated registry scopes keep their
-        // configured credentials during the internal install.
-        crate::commands::install::run_with_options(
-            client,
-            install.root(),
-            false, // json_output
-            false, // offline
-            crate::commands::install::FrozenLockfileMode::Never,
-            false, // force
-            options.allow_new,
-            false, // strict_integrity
-            false, // no_engine_strict
-            None,  // strict_peer_dependencies_override
-            None,  // linker_override
-            crate::lpm_skills_config::LpmSkillsPreference::Config,
-            false, // no_editor_setup
-            true,  // no_security_summary (dlx doesn't need it)
-            false, // auto_build
-            None,  // target_set: dlx is single-project
-            None,  // direct_versions_out: dlx does not finalize placeholders
-            None,  // requested_add_count: dlx is not an add-path install
-            None,  // script_policy_override: `lpm dlx` does not expose policy flags
-            None,  // advisor_override: `lpm dlx` does not expose `--advisor`
-            options.min_release_age_override,
-            options.min_release_age_exclude,
-            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
-            crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: dlx honors env + config posture chain
-            crate::commands::install::InstallOmitPolicy::default(),
-            // dlx does not surface its own
-            // sandbox-mode flags. The env / config / default chain
-            // inside `rebuild::run` still applies.
-            false, // strict_sandbox
-            false, // no_sandbox
-            false, // verbose: internal pipeline, no user-facing Done footer
-            false, // audit_after_install: internal pipeline never runs audit
-            false, // timing: dlx does not expose install's --timing flag
-            &[],
-        )
-        .await?;
+        install_dlx_target(client, project_dir, &target, &install, &options).await?;
     }
 
     let display_identity = if let Some(identity) = cached_identity
@@ -765,4 +799,490 @@ pub async fn dlx(
         &target.install_spec,
         options.extra_args,
     )
+}
+
+#[derive(Debug)]
+enum ManagedRuntimeState {
+    Fresh(DlxResolvedIdentity),
+    Stale(DlxResolvedIdentity),
+    Missing,
+}
+
+fn managed_runtime_markers_present(root: &Path) -> bool {
+    [
+        root.join("package.json"),
+        root.join(lpm_lockfile::LOCKFILE_NAME),
+    ]
+    .iter()
+    .all(|path| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+    }) && std::fs::symlink_metadata(root.join("node_modules/.bin"))
+        .is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn managed_runtime_state(root: &Path, target: &DlxTarget, ttl_secs: u64) -> ManagedRuntimeState {
+    if !managed_runtime_markers_present(root) {
+        return ManagedRuntimeState::Missing;
+    }
+    let Some(identity) = read_dlx_identity(
+        root,
+        &target.package_name,
+        &target.requested_spec,
+        DlxIdentitySource::Cache,
+    ) else {
+        return ManagedRuntimeState::Missing;
+    };
+    if identity
+        .integrity
+        .as_deref()
+        .is_none_or(|integrity| lpm_common::Integrity::parse(integrity).is_err())
+    {
+        return ManagedRuntimeState::Missing;
+    }
+    if !cache_identity_matches_target(&identity, target) {
+        return ManagedRuntimeState::Missing;
+    }
+    if lpm_runner::dlx::is_cache_fresh(root, ttl_secs) {
+        ManagedRuntimeState::Fresh(identity)
+    } else {
+        ManagedRuntimeState::Stale(identity)
+    }
+}
+
+fn remove_cache_entry(path: &Path) -> Result<(), LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path).map_err(LpmError::Io)
+        }
+        Ok(_) => std::fs::remove_file(path).map_err(LpmError::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LpmError::Io(error)),
+    }
+}
+
+fn cache_entry_exists(path: &Path) -> Result<bool, LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(LpmError::Io(error)),
+    }
+}
+
+fn recover_managed_runtime(
+    active: &Path,
+    previous: &Path,
+    target: &DlxTarget,
+    ttl_secs: u64,
+) -> Result<(), LpmError> {
+    if !cache_entry_exists(previous)? {
+        return Ok(());
+    }
+    if !matches!(
+        managed_runtime_state(active, target, ttl_secs),
+        ManagedRuntimeState::Missing
+    ) {
+        remove_cache_entry(previous)?;
+        return Ok(());
+    }
+    if matches!(
+        managed_runtime_state(previous, target, ttl_secs),
+        ManagedRuntimeState::Missing
+    ) {
+        remove_cache_entry(previous)?;
+        return Ok(());
+    }
+    remove_cache_entry(active)?;
+    std::fs::rename(previous, active).map_err(LpmError::Io)
+}
+
+fn replace_managed_runtime(active: &Path, previous: &Path, staged: &Path) -> Result<(), LpmError> {
+    remove_cache_entry(previous)?;
+    let had_active = cache_entry_exists(active)?;
+    if had_active {
+        std::fs::rename(active, previous).map_err(LpmError::Io)?;
+    }
+    if let Err(error) = std::fs::rename(staged, active) {
+        if had_active {
+            let _ = std::fs::rename(previous, active);
+        }
+        return Err(LpmError::Io(error));
+    }
+    if let Err(error) = remove_cache_entry(previous) {
+        tracing::warn!(
+            target: "lpm_cli::mcp",
+            "MCP runtime refresh succeeded but the previous runtime could not be removed: {error}"
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_managed_staging_dirs(cache_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".staging-"))
+        {
+            let _ = remove_cache_entry(&entry.path());
+        }
+    }
+}
+
+fn retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429) || (500..=599).contains(&status)
+}
+
+fn resolution_fetch_failure_is_transient(context: &lpm_common::ResolutionErrorContext) -> bool {
+    if context.kind != ResolutionFailureKind::FetchFailed {
+        return false;
+    }
+    if context.reason.starts_with("network error:") || context.reason.starts_with("rate limited") {
+        return true;
+    }
+    context
+        .reason
+        .strip_prefix("HTTP ")
+        .and_then(|reason| reason.split_once(':').map(|(status, _)| status))
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(retryable_http_status)
+}
+
+fn refresh_can_use_verified_fallback(error: &LpmError) -> bool {
+    match error {
+        LpmError::Network(_) | LpmError::RateLimited { .. } => true,
+        LpmError::Http { status, .. } => retryable_http_status(*status),
+        LpmError::Resolution(context) => resolution_fetch_failure_is_transient(context),
+        _ => false,
+    }
+}
+
+async fn refresh_managed_runtime(
+    client: &lpm_registry::RegistryClient,
+    project_dir: &Path,
+    target: &DlxTarget,
+    cache_root: &Path,
+    active: &Path,
+    previous: &Path,
+    ttl_secs: u64,
+) -> Result<(), LpmError> {
+    lpm_runner::dlx::create_cache_dir(cache_root)?;
+    recover_managed_runtime(active, previous, target, ttl_secs)?;
+    if matches!(
+        managed_runtime_state(active, target, ttl_secs),
+        ManagedRuntimeState::Fresh(_)
+    ) {
+        return Ok(());
+    }
+
+    cleanup_managed_staging_dirs(cache_root);
+    let staging = tempfile::Builder::new()
+        .prefix(".staging-")
+        .tempdir_in(cache_root)
+        .map_err(LpmError::Io)?;
+    let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
+        &target.install_spec,
+        staging.path(),
+        std::time::Duration::from_secs(ttl_secs),
+    );
+    let options = DlxOptions {
+        extra_args: &[],
+        refresh: true,
+        allow_new: false,
+        strict_integrity: true,
+        min_release_age_override: None,
+        min_release_age_exclude: &[],
+        inherit_caller_context: false,
+        reserve_stdout: true,
+    };
+    install_dlx_target(client, project_dir, target, &install, &options).await?;
+    if matches!(
+        managed_runtime_state(staging.path(), target, ttl_secs),
+        ManagedRuntimeState::Missing
+    ) {
+        return Err(LpmError::Script(
+            "MCP runtime installation completed without a verified executable".into(),
+        ));
+    }
+
+    let staged = staging.keep();
+    if let Err(error) = replace_managed_runtime(active, previous, &staged) {
+        let _ = remove_cache_entry(&staged);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn execute_managed_runtime(
+    lock_path: &Path,
+    project_dir: &Path,
+    active: &Path,
+    target: &DlxTarget,
+    ttl_secs: u64,
+    allow_stale: bool,
+    stale_reason: Option<&'static str>,
+) -> Result<Option<()>, LpmError> {
+    lpm_common::with_shared_lock(lock_path, || {
+        let state = managed_runtime_state(active, target, ttl_secs);
+        let identity = match state {
+            ManagedRuntimeState::Fresh(identity) => identity,
+            ManagedRuntimeState::Stale(identity) if allow_stale => {
+                if let Some(reason) = stale_reason {
+                    install_ui::warn(reason);
+                }
+                identity
+            }
+            ManagedRuntimeState::Stale(_) | ManagedRuntimeState::Missing => return Ok(None),
+        };
+        print_dlx_identity(&identity);
+        tracing::warn!(
+            target: "lpm_cli::mcp",
+            package = identity.package_name,
+            version = identity.version,
+            integrity = identity.integrity.as_deref().unwrap_or("unavailable"),
+            "lpm mcp serve launched a verified cached runtime"
+        );
+        lpm_runner::dlx::exec_verified_lpm_runtime(project_dir, active, &target.install_spec, &[])?;
+        Ok(Some(()))
+    })
+}
+
+pub async fn managed_dlx(
+    client: &lpm_registry::RegistryClient,
+    project_dir: &Path,
+    package_spec: &str,
+) -> Result<(), LpmError> {
+    let target = registry_dlx_target(package_spec);
+    let root = LpmRoot::from_env()?;
+    let cache_root = root.cache_mcp();
+    let active = cache_root.join("runtime");
+    let previous = cache_root.join("previous");
+    let lock_path = root.cache_mcp_lock();
+    let ttl_secs = lpm_runner::dlx::CACHE_TTL_SECS;
+
+    loop {
+        if execute_managed_runtime(
+            &lock_path,
+            project_dir,
+            &active,
+            &target,
+            ttl_secs,
+            false,
+            None,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
+
+        if let Some(refresh_lock) = lpm_common::try_acquire_exclusive_lock(&lock_path)? {
+            let refresh = refresh_managed_runtime(
+                client,
+                project_dir,
+                &target,
+                &cache_root,
+                &active,
+                &previous,
+                ttl_secs,
+            )
+            .await;
+            drop(refresh_lock);
+            match refresh {
+                Ok(()) => continue,
+                Err(error) if refresh_can_use_verified_fallback(&error) => {
+                    if execute_managed_runtime(
+                        &lock_path,
+                        project_dir,
+                        &active,
+                        &target,
+                        ttl_secs,
+                        true,
+                        Some(
+                            "MCP runtime refresh could not reach the registry; using the last verified version",
+                        ),
+                    )?
+                    .is_some()
+                    {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if execute_managed_runtime(
+            &lock_path,
+            project_dir,
+            &active,
+            &target,
+            ttl_secs,
+            true,
+            Some("MCP runtime refresh deferred while the verified cache is in use"),
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
+
+        lpm_common::with_exclusive_lock_async(lock_path.clone(), async { Ok(()) }).await?;
+    }
+}
+
+#[cfg(test)]
+mod managed_runtime_tests {
+    use super::*;
+
+    fn resolution_fetch_failure(reason: &str) -> LpmError {
+        LpmError::Resolution(Box::new(lpm_common::ResolutionErrorContext {
+            package: "@lpm-registry/mcp-server".to_string(),
+            requested: "latest".to_string(),
+            dependency: "@lpm-registry/mcp-server".to_string(),
+            required_by: None,
+            kind: ResolutionFailureKind::FetchFailed,
+            reason: reason.to_string(),
+            available_versions: None,
+            newest_version: None,
+            derivation: None,
+        }))
+    }
+
+    fn seed_managed_runtime(root: &Path) {
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"private":true,"dependencies":{"@lpm-registry/mcp-server":"latest"}}"#,
+        )
+        .unwrap();
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "@lpm-registry/mcp-server".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some(
+                "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg=="
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        lockfile
+            .write_to_file(&root.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+    }
+
+    #[test]
+    fn managed_runtime_requires_all_completeness_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_managed_runtime(temp.path());
+        let target = registry_dlx_target("@lpm-registry/mcp-server@latest");
+
+        assert!(matches!(
+            managed_runtime_state(temp.path(), &target, lpm_runner::dlx::CACHE_TTL_SECS),
+            ManagedRuntimeState::Fresh(_)
+        ));
+
+        std::fs::remove_file(temp.path().join("package.json")).unwrap();
+
+        assert!(matches!(
+            managed_runtime_state(temp.path(), &target, lpm_runner::dlx::CACHE_TTL_SECS),
+            ManagedRuntimeState::Missing
+        ));
+    }
+
+    #[test]
+    fn managed_runtime_rejects_a_lockfile_without_valid_integrity() {
+        for integrity in [None, Some("sha512-invalid".to_string())] {
+            let temp = tempfile::tempdir().unwrap();
+            seed_managed_runtime(temp.path());
+            let mut lockfile = lpm_lockfile::Lockfile::new();
+            lockfile.add_package(lpm_lockfile::LockedPackage {
+                name: "@lpm-registry/mcp-server".to_string(),
+                version: "1.0.0".to_string(),
+                integrity,
+                ..Default::default()
+            });
+            lockfile
+                .write_to_file(&temp.path().join(lpm_lockfile::LOCKFILE_NAME))
+                .unwrap();
+            let target = registry_dlx_target("@lpm-registry/mcp-server@latest");
+
+            assert!(matches!(
+                managed_runtime_state(temp.path(), &target, lpm_runner::dlx::CACHE_TTL_SECS),
+                ManagedRuntimeState::Missing
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_runtime_recovery_restores_the_last_complete_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("runtime");
+        let previous = temp.path().join("previous");
+        seed_managed_runtime(&previous);
+        let target = registry_dlx_target("@lpm-registry/mcp-server@latest");
+
+        recover_managed_runtime(&active, &previous, &target, lpm_runner::dlx::CACHE_TTL_SECS)
+            .unwrap();
+
+        assert!(matches!(
+            managed_runtime_state(&active, &target, lpm_runner::dlx::CACHE_TTL_SECS),
+            ManagedRuntimeState::Fresh(_)
+        ));
+        assert!(!previous.exists());
+    }
+
+    #[test]
+    fn managed_runtime_replacement_rolls_back_when_staged_promotion_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("runtime");
+        let previous = temp.path().join("previous");
+        let missing_staged = temp.path().join("missing-staged");
+        seed_managed_runtime(&active);
+        let target = registry_dlx_target("@lpm-registry/mcp-server@latest");
+
+        replace_managed_runtime(&active, &previous, &missing_staged).unwrap_err();
+
+        assert!(matches!(
+            managed_runtime_state(&active, &target, lpm_runner::dlx::CACHE_TTL_SECS),
+            ManagedRuntimeState::Fresh(_)
+        ));
+        assert!(!previous.exists());
+    }
+
+    #[test]
+    fn managed_runtime_fallback_accepts_only_transient_refresh_failures() {
+        assert!(refresh_can_use_verified_fallback(&LpmError::Network(
+            "connection reset".into()
+        )));
+        assert!(refresh_can_use_verified_fallback(&LpmError::Http {
+            status: 503,
+            message: "unavailable".into(),
+        }));
+        assert!(!refresh_can_use_verified_fallback(
+            &LpmError::IntegrityMismatch {
+                expected: "sha512-good".into(),
+                actual: "sha512-bad".into(),
+            }
+        ));
+        assert!(!refresh_can_use_verified_fallback(&LpmError::Http {
+            status: 403,
+            message: "forbidden".into(),
+        }));
+        assert!(!refresh_can_use_verified_fallback(&LpmError::Registry(
+            "security policy blocked the candidate".into(),
+        )));
+        assert!(refresh_can_use_verified_fallback(
+            &resolution_fetch_failure("network error: connection refused",)
+        ));
+        assert!(refresh_can_use_verified_fallback(
+            &resolution_fetch_failure("HTTP 503: unavailable",)
+        ));
+        assert!(!refresh_can_use_verified_fallback(
+            &resolution_fetch_failure("HTTP 403: forbidden"),
+        ));
+        assert!(!refresh_can_use_verified_fallback(
+            &resolution_fetch_failure("authentication required"),
+        ));
+    }
 }

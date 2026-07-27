@@ -7,11 +7,201 @@
 
 mod support;
 
-use support::{TempProject, lpm};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
+use support::{TempProject, lpm, lpm_with_registry};
 
 const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
 const HOSTILE_SERVER_NAME: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
+
+fn mcp_server_tarball(version: &str) -> Vec<u8> {
+    let script = format!(
+        "#!/usr/bin/env node\nconsole.log(`mcp-version:{version};cwd:${{process.cwd()}};auth:${{process.env.LPM_TOKEN ? \"present\" : \"missing\"}}`);\n"
+    );
+    make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "@lpm-registry/mcp-server",
+            "version": version,
+            "bin": {
+                "lpm-mcp-server": "bin/mcp-server.js"
+            }
+        }),
+        &[("bin/mcp-server.js", script.as_bytes())],
+    )
+}
+
+fn mcp_server_tarball_with_blocked_lifecycle(version: &str) -> Vec<u8> {
+    let script = format!(
+        "#!/usr/bin/env node\nconsole.log(`mcp-version:{version};cwd:${{process.cwd()}};auth:${{process.env.LPM_TOKEN ? \"present\" : \"missing\"}}`);\n"
+    );
+    make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "@lpm-registry/mcp-server",
+            "version": version,
+            "bin": {
+                "lpm-mcp-server": "bin/mcp-server.js"
+            },
+            "scripts": {
+                "install": "node -e \"process.exit(0)\""
+            }
+        }),
+        &[("bin/mcp-server.js", script.as_bytes())],
+    )
+}
+
+fn published_at(seconds_ago: i64) -> String {
+    use chrono::SecondsFormat;
+
+    (chrono::Utc::now() - chrono::Duration::seconds(seconds_ago))
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn mcp_runtime_root(project: &TempProject) -> std::path::PathBuf {
+    project.cache_dir().join("mcp/runtime")
+}
+
+fn expire_mcp_runtime(project: &TempProject) {
+    let marker = mcp_runtime_root(project).join("package.json");
+    let marker_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&marker)
+        .expect("open MCP runtime freshness marker");
+    marker_file
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60))
+        .expect("expire MCP runtime freshness marker");
+    let metadata_cache = project.cache_dir().join("metadata");
+    if metadata_cache.exists() {
+        std::fs::remove_dir_all(metadata_cache)
+            .expect("clear registry metadata cache before refreshing MCP runtime");
+    }
+}
+
+async fn mount_mcp_server_versions(
+    registry: &MockRegistry,
+    versions: &[(&str, i64)],
+    latest: &str,
+) {
+    let mut version_metadata = serde_json::Map::new();
+    let mut publication_times = serde_json::Map::new();
+    let mut tarballs = Vec::with_capacity(versions.len());
+
+    for (version, seconds_ago) in versions {
+        let tarball = mcp_server_tarball(version);
+        version_metadata.insert(
+            (*version).to_string(),
+            serde_json::json!({
+                "name": "@lpm-registry/mcp-server",
+                "version": version,
+                "bin": {
+                    "lpm-mcp-server": "bin/mcp-server.js"
+                },
+                "dependencies": {},
+                "dist": {
+                    "tarball": registry.tarball_url("@lpm-registry/mcp-server", version),
+                    "integrity": compute_integrity(&tarball),
+                }
+            }),
+        );
+        publication_times.insert(
+            (*version).to_string(),
+            serde_json::Value::String(published_at(*seconds_ago)),
+        );
+        tarballs.push((*version, tarball));
+    }
+
+    registry
+        .with_package_metadata_and_tarballs(
+            "@lpm-registry/mcp-server",
+            serde_json::json!({
+                "name": "@lpm-registry/mcp-server",
+                "dist-tags": { "latest": latest },
+                "versions": version_metadata,
+                "time": publication_times,
+            }),
+            &tarballs,
+        )
+        .await;
+}
+
+async fn mount_mcp_server_without_integrity(
+    registry: &MockRegistry,
+    version: &str,
+    seconds_ago: i64,
+) {
+    let tarball = mcp_server_tarball(version);
+    let mut versions = serde_json::Map::new();
+    versions.insert(
+        version.to_string(),
+        serde_json::json!({
+            "name": "@lpm-registry/mcp-server",
+            "version": version,
+            "bin": {
+                "lpm-mcp-server": "bin/mcp-server.js"
+            },
+            "dependencies": {},
+            "dist": {
+                "tarball": registry.tarball_url(
+                    "@lpm-registry/mcp-server",
+                    version
+                ),
+            }
+        }),
+    );
+    let mut publication_times = serde_json::Map::new();
+    publication_times.insert(
+        version.to_string(),
+        serde_json::Value::String(published_at(seconds_ago)),
+    );
+    registry
+        .with_package_metadata_and_tarballs(
+            "@lpm-registry/mcp-server",
+            serde_json::json!({
+                "name": "@lpm-registry/mcp-server",
+                "dist-tags": { "latest": version },
+                "versions": versions,
+                "time": publication_times,
+            }),
+            &[(version, tarball)],
+        )
+        .await;
+}
+
+async fn mount_mcp_server_with_blocked_lifecycle(registry: &MockRegistry, version: &str) {
+    let tarball = mcp_server_tarball_with_blocked_lifecycle(version);
+    registry
+        .with_package_metadata_and_tarballs(
+            "@lpm-registry/mcp-server",
+            serde_json::json!({
+                "name": "@lpm-registry/mcp-server",
+                "dist-tags": { "latest": version },
+                "versions": {
+                    version: {
+                        "name": "@lpm-registry/mcp-server",
+                        "version": version,
+                        "bin": {
+                            "lpm-mcp-server": "bin/mcp-server.js"
+                        },
+                        "scripts": {
+                            "install": "node -e \"process.exit(0)\""
+                        },
+                        "dependencies": {},
+                        "dist": {
+                            "tarball": registry.tarball_url(
+                                "@lpm-registry/mcp-server",
+                                version
+                            ),
+                            "integrity": compute_integrity(&tarball),
+                        }
+                    }
+                },
+                "time": {
+                    version: published_at(48 * 60 * 60)
+                },
+            }),
+            &[(version, tarball)],
+        )
+        .await;
+}
 
 fn assert_hostile_server_name_is_inline_safe(context: &str, rendered: &str) {
     assert!(
@@ -262,8 +452,8 @@ fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently(
     let vscode: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vscode_path).unwrap()).unwrap();
     let expected = serde_json::json!({
-        "command": "npx",
-        "args": ["-y", MCP_PACKAGE_SPEC]
+        "command": "lpm",
+        "args": ["mcp", "serve"]
     });
 
     assert_eq!(claude["mcpServers"]["lpm-registry"], expected);
@@ -303,11 +493,11 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
       ],
       "package": "@lpm-registry/mcp-server",
       "package_spec": "@lpm-registry/mcp-server@latest",
-      "version_policy": "latest",
-      "command": "npx",
+      "version_policy": "latest-security-eligible",
+      "command": "lpm",
       "args": [
-        "-y",
-        "@lpm-registry/mcp-server@latest"
+        "mcp",
+        "serve"
       ]
     }
     "###);
@@ -318,6 +508,266 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
         config["mcpServers"]["lpm-registry"]["args"],
         envelope["args"]
     );
+}
+
+#[tokio::test]
+async fn mcp_serve_ignores_workspace_lockfile_and_security_overrides() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"mcp",
+            "version":"1.0.0",
+            "lpm":{"minimumReleaseAge":0}
+        }"#,
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "@lpm-registry/mcp-server".to_string(),
+        version: "0.1.0".to_string(),
+        integrity: Some("sha512-workspace-pin".to_string()),
+        ..Default::default()
+    });
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("seed workspace lockfile");
+
+    let registry = MockRegistry::start().await;
+    mount_mcp_server_versions(&registry, &[("1.0.0", 48 * 60 * 60)], "1.0.0").await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .env("LPM_TOKEN", "workflow-mcp-token")
+        .args(["mcp", "serve"])
+        .output()
+        .expect("run isolated MCP launcher");
+
+    assert!(
+        output.status.success(),
+        "MCP launcher must ignore workspace install policy and lockfile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mcp-version:1.0.0"),
+        "MCP launcher must resolve independently of the workspace pin: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "cwd:{}",
+            project
+                .path()
+                .canonicalize()
+                .expect("canonicalize project path")
+                .display()
+        )),
+        "the launched MCP server must still execute in the editor workspace: {stdout}"
+    );
+    assert!(
+        stdout.contains("auth:present"),
+        "the verified MCP server must receive the documented LPM_TOKEN environment: {stdout}"
+    );
+    assert!(
+        mcp_runtime_root(&project).join("lpm.lock").is_file(),
+        "the MCP launcher must use its dedicated verified runtime cache"
+    );
+    assert!(
+        !project.cache_dir().join("dlx").exists(),
+        "the managed MCP runtime must not be swept with ordinary dlx entries"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_runs_the_newest_release_allowed_by_the_cooldown() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_mcp_server_versions(
+        &registry,
+        &[("1.0.0", 48 * 60 * 60), ("2.0.0", 60)],
+        "2.0.0",
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["mcp", "serve"])
+        .output()
+        .expect("run MCP launcher against a fresh latest release");
+
+    assert!(
+        output.status.success(),
+        "MCP launcher must fall back to a mature release:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("mcp-version:1.0.0"),
+        "MCP launcher must not bypass the release-age cooldown"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_cold_install_reserves_stdout_when_lifecycle_scripts_are_blocked() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_mcp_server_with_blocked_lifecycle(&registry, "1.0.0").await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["mcp", "serve"])
+        .output()
+        .expect("run MCP launcher with a blocked lifecycle script");
+
+    assert!(
+        output.status.success(),
+        "MCP launcher must start after safely blocking lifecycle scripts:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let expected = format!(
+        "mcp-version:1.0.0;cwd:{};auth:missing\n",
+        project
+            .path()
+            .canonicalize()
+            .expect("canonicalize project path")
+            .display()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected,
+        "the cold install must not write lifecycle reporting into MCP JSON-RPC stdout"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_refuses_registry_metadata_without_integrity() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_mcp_server_without_integrity(&registry, "1.0.0", 48 * 60 * 60).await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["mcp", "serve"])
+        .output()
+        .expect("run MCP launcher against metadata without integrity");
+
+    assert!(
+        !output.status.success(),
+        "the managed MCP runtime must not trust an unhashed registry tarball:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Refusing to install an unverified registry tarball"),
+        "the failure must explain the integrity requirement, got:\n{stderr}"
+    );
+    assert!(
+        !mcp_runtime_root(&project).exists(),
+        "a rejected MCP runtime must never become active"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_does_not_fallback_after_an_authentication_failure() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let initial_registry = MockRegistry::start().await;
+    mount_mcp_server_versions(&initial_registry, &[("1.0.0", 48 * 60 * 60)], "1.0.0").await;
+    let initial = lpm_with_registry(&project, &initial_registry.url())
+        .args(["mcp", "serve"])
+        .output()
+        .expect("install the initial verified MCP runtime");
+    assert!(
+        initial.status.success(),
+        "initial MCP launch must succeed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    expire_mcp_runtime(&project);
+
+    let auth_registry = MockRegistry::start().await;
+    auth_registry
+        .with_npm_package_error(
+            "@lpm-registry/mcp-server",
+            403,
+            serde_json::json!({ "error": "forbidden" }),
+        )
+        .await;
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!("@lpm-registry:registry={}/\n", auth_registry.url()),
+    )
+    .expect("write isolated user npmrc");
+    let rejected = lpm_with_registry(&project, &auth_registry.url())
+        .args(["mcp", "serve"])
+        .output()
+        .expect("refresh MCP runtime against an authentication failure");
+
+    assert!(
+        !rejected.status.success(),
+        "an authentication failure must fail closed instead of running stale code:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&rejected.stdout).contains("mcp-version:"),
+        "the cached MCP server must not execute after an authentication failure"
+    );
+    assert!(
+        !String::from_utf8_lossy(&rejected.stderr).contains("last verified version"),
+        "authentication failures must not be described as an outage fallback"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_uses_the_last_verified_runtime_during_a_registry_outage() {
+    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_mcp_server_versions(&registry, &[("1.0.0", 48 * 60 * 60)], "1.0.0").await;
+
+    let initial = lpm_with_registry(&project, &registry.url())
+        .args(["mcp", "serve"])
+        .output()
+        .expect("install the initial verified MCP runtime");
+    assert!(
+        initial.status.success(),
+        "initial MCP launch must succeed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial_stderr = String::from_utf8_lossy(&initial.stderr);
+    assert!(
+        !initial_stderr.contains("Checking stored LPM"),
+        "the unattended MCP launcher must not inspect stored credentials:\n{initial_stderr}"
+    );
+
+    expire_mcp_runtime(&project);
+
+    let fallback = lpm_with_registry(&project, "http://127.0.0.1:9")
+        .args(["mcp", "serve"])
+        .output()
+        .expect("run MCP launcher during registry outage");
+
+    assert!(
+        fallback.status.success(),
+        "a transport outage must not prevent a verified cached launch:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fallback.stdout),
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fallback.stdout).contains("mcp-version:1.0.0"),
+        "the last verified MCP server must execute during the outage"
+    );
+    let fallback_stderr = String::from_utf8_lossy(&fallback.stderr);
+    assert!(
+        fallback_stderr.contains("last verified version"),
+        "the launcher must report its stale-cache fallback on stderr, got:\n{fallback_stderr}"
+    );
+    assert!(
+        !fallback_stderr.contains("Checking stored LPM"),
+        "the unattended MCP launcher must never inspect stored credentials:\n{fallback_stderr}"
+    );
+    let installed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            mcp_runtime_root(&project).join("node_modules/@lpm-registry/mcp-server/package.json"),
+        )
+        .expect("read retained MCP package manifest"),
+    )
+    .expect("parse retained MCP package manifest");
+    assert_eq!(installed["version"], "1.0.0");
 }
 
 // ─── unknown action ───────────────────────────────────────────────────
@@ -338,7 +788,10 @@ fn mcp_unknown_action_lists_valid_subcommands() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("setup") && stderr.contains("remove") && stderr.contains("status"),
+        stderr.contains("setup")
+            && stderr.contains("remove")
+            && stderr.contains("status")
+            && stderr.contains("serve"),
         "stderr must enumerate valid actions, got:\n{stderr}",
     );
 }
