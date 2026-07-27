@@ -28,17 +28,23 @@ pub(super) fn write_post_install_hash(
         &platform,
         &dependency_engine_key,
     );
-    if let Err(e) =
-        crate::install_state::write_install_hash_with_integrity_platform_and_dependency_engine(
-            project_dir,
-            &hash,
-            linker_mode,
-            object_integrity_policy,
-            &platform,
-            &dependency_engine_key,
+    // Lockfile writeback has already created a supported sidecar or removed an
+    // unsupported one, so existence records the exact completed install state.
+    let binary_sidecar_required = project_dir
+        .join(lpm_lockfile::BINARY_LOCKFILE_NAME)
+        .exists();
+    if let Err(e) = crate::install_state::write_install_hash_with_known_runtime_state(
+        project_dir,
+        &hash,
+        linker_mode,
+        object_integrity_policy,
+        &platform,
+        &dependency_engine_key,
+        crate::install_state::KnownInstallHashRuntimeState {
             node_runtime_fingerprint,
-        )
-    {
+            binary_sidecar_required,
+        },
+    ) {
         tracing::warn!(
             "failed to write `.lpm/install-hash` after install ({e}) — \
              the next freshness check will fall through to the slow path"

@@ -292,7 +292,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     } else {
         let metadata = lpm_registry::timing::with_metadata_purpose(
             lpm_registry::timing::MetadataPurpose::BlockedSet,
-            build_blocked_set_metadata(client, route_table, packages),
+            build_blocked_set_metadata(client, route_table, store, packages),
         )
         .await;
         blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
@@ -944,6 +944,7 @@ pub(super) fn blocked_set_metadata_from_previous_state(
 pub(super) async fn build_blocked_set_metadata(
     client: &lpm_registry::RegistryClient,
     route_table: &RouteTable,
+    store: &lpm_store::PackageStore,
     packages: &[InstallPackage],
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
@@ -977,17 +978,18 @@ pub(super) async fn build_blocked_set_metadata(
     // may carry. Future cleanup may remove the field entirely after a
     // transition window.
     //
-    // Run every package's metadata fetch CONCURRENTLY. The metadata is
-    // still required for `published_at` and `behavioral_tags{,_hash}`,
-    // which ship at install time (used by the version-diff card and
-    // the static-tier fingerprint). Fetching in parallel keeps the metadata
-    // path below the rest of the install pipeline on cold runs.
+    // Only packages with lifecycle scripts can enter the blocked set and
+    // consume this enrichment. Fetch those candidates concurrently.
+    let mut metadata_packages = Vec::with_capacity(packages.len());
+    for package in packages {
+        if package_requires_blocked_set_metadata(store, package) {
+            metadata_packages.push(package);
+        }
+    }
+
     let meta_ns = std::sync::atomic::AtomicU64::new(0);
     let meta_ns_ref = &meta_ns;
-    let entry_futures = packages.iter().map(|p| async move {
-        if install_package_is_local_source(p) {
-            return None;
-        }
+    let entry_futures = metadata_packages.iter().map(|&p| async move {
         // Grab the full PackageMetadata for `time[version]` (→
         // `published_at`) and `versions[version]._behavioralTags` (→
         // `behavioral_tags_hash` + `behavioral_tags`). Errors are
@@ -1094,11 +1096,23 @@ pub(super) async fn build_blocked_set_metadata(
     // would always be `0` and adding noise to the line. The
     // `perf.prov_ns_split` line is correspondingly removed.
     tracing::debug!(
-        "perf.blocked_set_metadata_split pkgs={} meta_sum_ms={}",
+        "perf.blocked_set_metadata_split pkgs={} candidates={} meta_sum_ms={}",
         packages.len(),
+        metadata_packages.len(),
         meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
     );
     out
+}
+
+pub(super) fn package_requires_blocked_set_metadata(
+    store: &lpm_store::PackageStore,
+    package: &InstallPackage,
+) -> bool {
+    if install_package_is_local_source(package) {
+        return false;
+    }
+    let package_dir = store.package_dir(&package.name, &package.version);
+    !crate::build_state::read_install_phase_bodies(&package_dir).is_empty()
 }
 
 // is_install_up_to_date() moved to crate::install_state::check_install_state()

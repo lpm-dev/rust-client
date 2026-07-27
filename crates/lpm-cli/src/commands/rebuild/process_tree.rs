@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use wait_timeout::ChildExt;
+
 pub(super) fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -180,31 +182,51 @@ pub(super) fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: &Duration,
 ) -> Result<std::process::ExitStatus, String> {
-    let start = std::time::Instant::now();
-    let poll_interval = Duration::from_millis(100);
     let pid = child.id();
 
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Normal exit: free the Windows Job-tracker entry
-                // so we don't accumulate stale Job handles for the
-                // lifetime of the parent. No-op on Unix.
-                lpm_sandbox::release_sandbox_tracker(pid);
-                return Ok(status);
-            }
-            Ok(None) => {
-                if start.elapsed() > *timeout {
-                    kill_process_tree(&mut child);
-                    let _ = child.wait(); // Reap zombie
-                    return Err(format!(
-                        "timeout after {}s — process group killed",
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => return Err(format!("wait error: {e}")),
+    match child
+        .wait_timeout(*timeout)
+        .map_err(|error| format!("wait error: {error}"))?
+    {
+        Some(status) => {
+            lpm_sandbox::release_sandbox_tracker(pid);
+            Ok(status)
         }
+        None => {
+            kill_process_tree(&mut child);
+            let _ = child.wait();
+            Err(format!(
+                "timeout after {}s — process group killed",
+                timeout.as_secs()
+            ))
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod wait_with_timeout_tests {
+    use super::wait_with_timeout;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn wait_with_timeout_returns_promptly_for_short_lived_children() {
+        let start = Instant::now();
+        for _ in 0..4 {
+            let child = Command::new("sh")
+                .args(["-c", "sleep 0.01"])
+                .spawn()
+                .expect("spawn short-lived child");
+            let status = wait_with_timeout(child, &Duration::from_secs(5))
+                .expect("short-lived child should exit normally");
+            assert!(status.success());
+        }
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "four 10ms children should not inherit a 100ms polling floor: {:?}",
+            elapsed
+        );
     }
 }

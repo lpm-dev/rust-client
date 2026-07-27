@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use lpm_common::LpmError;
@@ -279,7 +279,7 @@ fn hash_object_file(
             path.display()
         ))
     })?;
-    let mut reader = BufReader::new(file);
+    let mut reader = file;
     let mut buf = [0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buf).map_err(|e| {

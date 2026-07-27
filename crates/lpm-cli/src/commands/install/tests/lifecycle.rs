@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn blocked_set_metadata_candidates_include_only_registry_packages_with_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = lpm_store::PackageStore::at(dir.path().join("store"));
+    let scripted = fake_pkg("scripted", "1.0.0", false);
+    let plain = fake_pkg("plain", "1.0.0", false);
+    let mut local = fake_pkg("local", "1.0.0", false);
+    local.source = "directory+../local".to_string();
+
+    for (package, manifest) in [
+        (
+            &scripted,
+            serde_json::json!({"name": "scripted", "scripts": {"postinstall": "node build.js"}}),
+        ),
+        (&plain, serde_json::json!({"name": "plain"})),
+        (
+            &local,
+            serde_json::json!({"name": "local", "scripts": {"postinstall": "node build.js"}}),
+        ),
+    ] {
+        let package_dir = store.package_dir(&package.name, &package.version);
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    assert!(package_requires_blocked_set_metadata(&store, &scripted));
+    assert!(!package_requires_blocked_set_metadata(&store, &plain));
+    assert!(!package_requires_blocked_set_metadata(&store, &local));
+}
+
+#[test]
 fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
     let dir = tempfile::tempdir().unwrap();
     crate::build_state::write_build_state(
