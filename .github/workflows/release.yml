@@ -4,13 +4,22 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to publish, without the leading v"
+      channel:
+        description: "Release channel"
         required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - nightly
+      version:
+        description: "Stable/recovery version without v; leave empty for generated nightly versions"
+        required: false
       mode:
-        description: "Recovery mode to run"
+        description: "Release or recovery mode"
         required: true
         default: "full"
         type: choice
@@ -23,7 +32,12 @@ on:
         description: "Release run ID supplying exact npm artifacts for a targeted recovery"
         required: false
 
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.channel || 'stable' }}
+  cancel-in-progress: false
+
 permissions:
+  actions: read
   contents: write
   id-token: write # Required for npm OIDC trusted publishing (no token needed) + Sigstore Fulcio
   attestations: write # Required for actions/attest-build-provenance to mint the artifact attestation
@@ -38,8 +52,119 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  release-metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      channel: ${{ steps.metadata.outputs.channel }}
+      npm_tag: ${{ steps.metadata.outputs.npm_tag }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
+      - name: Resolve and validate channel metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            CHANNEL=stable
+            MODE=full
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            CHANNEL="${INPUT_CHANNEL:-stable}"
+            MODE="${INPUT_MODE:-full}"
+            if [ "$CHANNEL" = "nightly" ]; then
+              if [ "$MODE" = "full" ]; then
+                if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+                  echo "::error::Nightly releases must run from the main branch."
+                  exit 1
+                fi
+                if [ -n "${INPUT_VERSION:-}" ]; then
+                  echo "::error::Leave version empty for full nightly releases; it is generated automatically."
+                  exit 1
+                fi
+                CREATED_AT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.created_at')
+                RUN_DATE=$(printf '%s' "$CREATED_AT" | cut -c1-10 | tr -d '-')
+                VERSION=$(node npm/release/nightly-version.mjs \
+                  --repo "$PWD" \
+                  --date "$RUN_DATE" \
+                  --run-number "$GITHUB_RUN_NUMBER" \
+                  --sha "$GITHUB_SHA")
+              else
+                VERSION="${INPUT_VERSION:-}"
+                if [ -z "$VERSION" ]; then
+                  echo "::error::version is required for nightly recovery runs."
+                  exit 1
+                fi
+              fi
+            else
+              VERSION="${INPUT_VERSION:-}"
+              if [ -z "$VERSION" ]; then
+                echo "::error::version is required for stable release and recovery runs."
+                exit 1
+              fi
+            fi
+          fi
+
+          case "$CHANNEL" in
+            stable)
+              if ! printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+                echo "::error::Stable release version must be X.Y.Z, got '$VERSION'."
+                exit 1
+              fi
+              NPM_TAG=latest
+              PRERELEASE=false
+              ;;
+            nightly)
+              if ! printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'; then
+                echo "::error::Generated nightly version has an invalid shape: '$VERSION'."
+                exit 1
+              fi
+              NPM_TAG=nightly
+              PRERELEASE=true
+              ;;
+            *)
+              echo "::error::Unknown release channel '$CHANNEL'."
+              exit 1
+              ;;
+          esac
+
+          if [ "$MODE" = "full" ]; then
+            WORKSPACE_VERSION=$(node --input-type=module -e \
+              'import { workspaceStableVersion } from "./npm/release/nightly-version.mjs"; console.log(workspaceStableVersion("."));')
+            if [ "$CHANNEL" = "stable" ] && [ "$VERSION" != "$WORKSPACE_VERSION" ]; then
+              echo "::error::Stable release $VERSION does not match workspace version $WORKSPACE_VERSION."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "channel=$CHANNEL"
+            echo "npm_tag=$NPM_TAG"
+            echo "prerelease=$PRERELEASE"
+            echo "tag=v$VERSION"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved $CHANNEL release v$VERSION (npm dist-tag: $NPM_TAG)."
+
   verify:
     name: Release verification
+    needs: release-metadata
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -103,18 +228,22 @@ jobs:
         run: cargo nextest run --locked -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
   verify-windows-filesystem:
+    needs: release-metadata
     if: github.event_name == 'push' || inputs.mode == 'full'
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
   build:
     name: Build ${{ matrix.target }}
     needs:
+      - release-metadata
       - verify
       - verify-windows-filesystem
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     environment: windows-signing
     timeout-minutes: ${{ matrix.timeout_minutes }}
+    env:
+      LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
     strategy:
       matrix:
         include:
@@ -197,8 +326,6 @@ jobs:
 
       - name: Verify musl binary on Alpine
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           file "${{ matrix.binary }}"
@@ -212,7 +339,7 @@ jobs:
             readelf -d "${{ matrix.binary }}"
             exit 1
           fi
-          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          VERSION="${{ needs.release-metadata.outputs.version }}"
           actual=$(docker run --rm \
             -v "$PWD:/work:ro" \
             alpine@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 \
@@ -388,11 +515,9 @@ jobs:
 
       - name: Execute release binary (macOS)
         if: runner.os == 'macOS'
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          VERSION="${{ needs.release-metadata.outputs.version }}"
           case "${{ matrix.target }}" in
             aarch64-apple-darwin)
               actual=$(arch -arm64 "./${{ matrix.binary }}" --version)
@@ -411,25 +536,17 @@ jobs:
 
       - name: Execute release binary (Linux glibc)
         if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          VERSION="${{ needs.release-metadata.outputs.version }}"
           actual=$("./${{ matrix.binary }}" --version)
           test "$actual" = "lpm $VERSION"
 
       - name: Execute release binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          $version = if ([string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
-            $env:GITHUB_REF_NAME.TrimStart("v")
-          } else {
-            $env:INPUT_VERSION
-          }
+          $version = "${{ needs.release-metadata.outputs.version }}"
           $actual = (& ".\${{ matrix.binary }}" --version | Out-String).Trim()
           if ($actual -ne "lpm $version") {
             Write-Error "Release binary reported '$actual', expected 'lpm $version'."
@@ -458,12 +575,14 @@ jobs:
 
   pack-npm-packages:
     name: Pack exact npm release artifacts
-    needs: build
+    needs:
+      - build
+      - release-metadata
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ needs.release-metadata.outputs.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -479,22 +598,13 @@ jobs:
           merge-multiple: true
           path: binaries
 
-      - name: Resolve release version
-        id: version
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Pack and hash release packages
         run: |
           node npm/release/prepare-packages.mjs \
             --repo "$PWD" \
             --binaries "$PWD/binaries" \
             --output "$PWD/npm-release-packages" \
-            --version "${{ steps.version.outputs.version }}"
+            --version "${{ needs.release-metadata.outputs.version }}"
 
       - name: Upload exact npm tarballs
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -574,6 +684,7 @@ jobs:
 
   smoke-windows-recovery:
     name: Smoke npm artifacts (win32-x64 recovery)
+    needs: release-metadata
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-smoke-only'
     runs-on: windows-latest
     timeout-minutes: 20
@@ -617,12 +728,13 @@ jobs:
           node npm/release/smoke-install.mjs
           --tarballs npm-release-packages
           --platform win32-x64
-          --version ${{ inputs.version }}
+          --version ${{ needs.release-metadata.outputs.version }}
 
   release:
     name: Create Release
     needs:
       - build
+      - release-metadata
       - smoke-npm-packages
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ubuntu-latest
@@ -633,7 +745,7 @@ jobs:
       id-token: write
       attestations: write
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
+      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
     steps:
       - name: Download signed release binaries
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -691,6 +803,7 @@ jobs:
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
             -f tag_name="$RELEASE_TAG" \
+            -f target_commitish="$GITHUB_SHA" \
             --jq '.body' > "$RUNNER_TEMP/release-notes.md"
           test -s "$RUNNER_TEMP/release-notes.md"
 
@@ -701,10 +814,15 @@ jobs:
           files: binaries/*
           body_path: ${{ runner.temp }}/release-notes.md
           append_body: false
+          prerelease: ${{ needs.release-metadata.outputs.prerelease }}
+          make_latest: ${{ needs.release-metadata.outputs.channel == 'stable' }}
+          target_commitish: ${{ github.sha }}
 
   publish-npm-platform:
     name: Publish npm Platform Packages
-    needs: release
+    needs:
+      - release
+      - release-metadata
     if: >-
       always() &&
       ((needs.release.result == 'success' &&
@@ -716,6 +834,8 @@ jobs:
       contents: read
       id-token: write
       actions: read
+    env:
+      NPM_TAG: ${{ needs.release-metadata.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -797,7 +917,7 @@ jobs:
             echo "Publishing ${package}@${VERSION} from verified tarball ${tarball}..."
             set +e
             npx npm@11.12.1 publish "./npm-release-packages/$tarball" \
-              --provenance --access public 2>&1 | tee /tmp/npm-publish.log
+              --provenance --access public --tag "$NPM_TAG" 2>&1 | tee /tmp/npm-publish.log
             local exit_code=${PIPESTATUS[0]}
             set -e
             if [ "$exit_code" -ne 0 ]; then
@@ -824,6 +944,7 @@ jobs:
     needs:
       - pack-npm-packages
       - publish-npm-platform
+      - release-metadata
     if: >-
       always() &&
       ((needs.pack-npm-packages.result == 'success' && needs.publish-npm-platform.result == 'success') ||
@@ -836,6 +957,8 @@ jobs:
       contents: read
       id-token: write
       actions: read
+    env:
+      NPM_TAG: ${{ needs.release-metadata.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -927,7 +1050,7 @@ jobs:
           echo "Publishing @lpm-registry/cli@${VERSION} from verified tarball ${TARBALL}..."
           set +e
           npx npm@11.12.1 publish "./npm-release-packages/$TARBALL" \
-            --provenance --access public 2>&1 | tee /tmp/npm-publish.log
+            --provenance --access public --tag "$NPM_TAG" 2>&1 | tee /tmp/npm-publish.log
           exit_code=${PIPESTATUS[0]}
           set -e
           if [ "$exit_code" -ne 0 ]; then
@@ -971,7 +1094,11 @@ jobs:
                  "@lpm-registry/cli@${VERSION}" &&
                INSTALLED_VERSION=$("$PREFIX/bin/lpm" --version 2>/tmp/lpm-wrapper-smoke.log) &&
                test "$INSTALLED_VERSION" = "lpm $VERSION" &&
-               "$PREFIX/bin/lpx" --help >/dev/null 2>>/tmp/lpm-wrapper-smoke.log; then
+               "$PREFIX/bin/lpx" --help >/dev/null 2>>/tmp/lpm-wrapper-smoke.log &&
+               TAGGED_VERSION=$(npx npm@11.12.1 view \
+                 "@lpm-registry/cli" "dist-tags.${NPM_TAG}" \
+                 --cache "$NPM_CACHE" --prefer-online) &&
+               test "$TAGGED_VERSION" = "$VERSION"; then
               install_verified=1
               cleanup_attempt
               break
@@ -999,8 +1126,12 @@ jobs:
 
   update-homebrew:
     name: Update Homebrew Formula
-    needs: release
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    needs:
+      - release
+      - release-metadata
+    if: >-
+      needs.release-metadata.outputs.channel == 'stable' &&
+      (github.event_name == 'push' || inputs.mode == 'full')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1010,15 +1141,10 @@ jobs:
           cosign-release: "v3.0.6"
 
       - name: Verify release manifest and export Homebrew checksums
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          VERSION="${GITHUB_REF_NAME}"
-          if [ -n "${INPUT_VERSION}" ]; then
-            VERSION="v${INPUT_VERSION}"
-          fi
+          VERSION="${{ needs.release-metadata.outputs.tag }}"
           BASE="https://github.com/lpm-dev/rust-client/releases/download/${VERSION}"
 
           curl -fsSL --retry 3 --max-time 60 "${BASE}/SHA256SUMS.txt" -o SHA256SUMS.txt

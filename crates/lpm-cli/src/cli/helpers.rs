@@ -35,7 +35,7 @@ pub(super) fn maybe_emit_network_fs_warning(root: &lpm_common::LpmRoot) {
 /// stale-but-empty, or shows the user is already on the latest, only
 /// the version line is printed (zero noise).
 pub(super) fn print_version_with_notice() {
-    println!("lpm {}", env!("CARGO_PKG_VERSION"));
+    println!("lpm {}", crate::build_version::version());
     if let Some(notice) = update_check::read_cached_notice() {
         // `read_cached_notice` already wraps the message with leading +
         // trailing newlines and colour, so we can print it as-is.

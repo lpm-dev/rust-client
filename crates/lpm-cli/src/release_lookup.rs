@@ -7,13 +7,13 @@
 //! Both read and write the same file (`~/.lpm/update-check.json`) so an
 //! explicit `lpm self-update` doubles as a banner refresh.
 //!
-//! Two probe sources are tried in order:
+//! Two channel-specific probe sources are tried in order:
 //!
-//! 1. **npm registry** (`registry.npmjs.org/@lpm-registry/cli/latest`) —
+//! 1. **npm registry** (`@lpm-registry/cli`'s `latest` or `nightly`
+//!    dist-tag) —
 //!    anonymous, no rate limit in practice, used by every install
-//!    channel. The npm `latest` dist-tag stays in lockstep with our
-//!    GitHub Releases, so version reporting is identical regardless of
-//!    how the user installed `lpm`.
+//!    method. Each npm dist-tag stays in lockstep with its corresponding
+//!    GitHub release channel.
 //! 2. **GitHub Releases** — fallback only, when npm is unreachable. The
 //!    primary problem this fixes: every channel used to share a single
 //!    60 req/hr unauthenticated GitHub IP bucket and rate-limit each
@@ -31,9 +31,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const NPM_REGISTRY_URL_DEFAULT: &str = "https://registry.npmjs.org/@lpm-registry/cli/latest";
-const GITHUB_RELEASES_URL_DEFAULT: &str =
+use crate::release_channel::ReleaseChannel;
+
+const NPM_STABLE_REGISTRY_URL_DEFAULT: &str = "https://registry.npmjs.org/@lpm-registry/cli/latest";
+const NPM_NIGHTLY_REGISTRY_URL_DEFAULT: &str =
+    "https://registry.npmjs.org/@lpm-registry/cli/nightly";
+const GITHUB_STABLE_RELEASES_URL_DEFAULT: &str =
     "https://api.github.com/repos/lpm-dev/rust-client/releases/latest";
+const GITHUB_NIGHTLY_RELEASES_URL_DEFAULT: &str =
+    "https://api.github.com/repos/lpm-dev/rust-client/releases?per_page=100";
 
 /// Template for the "release by tag" endpoint. `{tag}` is substituted
 /// at call time (raw, no encoding — version strings are restricted to
@@ -61,18 +67,35 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// servers, local mirrors). The override is logged at `warn` level
 /// whenever it fires so an operator scanning logs can spot an
 /// attacker-controlled redirect of the self-update version probe.
-fn npm_registry_url() -> String {
-    resolve_release_url("LPM_NPM_REGISTRY_URL_OVERRIDE", NPM_REGISTRY_URL_DEFAULT)
+fn npm_registry_url(channel: ReleaseChannel) -> String {
+    let (env_var, default_url) = match channel {
+        ReleaseChannel::Stable => (
+            "LPM_NPM_REGISTRY_URL_OVERRIDE",
+            NPM_STABLE_REGISTRY_URL_DEFAULT,
+        ),
+        ReleaseChannel::Nightly => (
+            "LPM_NPM_NIGHTLY_REGISTRY_URL_OVERRIDE",
+            NPM_NIGHTLY_REGISTRY_URL_DEFAULT,
+        ),
+    };
+    resolve_release_url(env_var, default_url)
 }
 
 /// Resolve the GitHub Releases endpoint. Honours
 /// `LPM_GITHUB_RELEASES_URL_OVERRIDE` for tests. Same gating + logging
 /// contract as [`npm_registry_url`].
-fn github_releases_url() -> String {
-    resolve_release_url(
-        "LPM_GITHUB_RELEASES_URL_OVERRIDE",
-        GITHUB_RELEASES_URL_DEFAULT,
-    )
+fn github_releases_url(channel: ReleaseChannel) -> String {
+    let (env_var, default_url) = match channel {
+        ReleaseChannel::Stable => (
+            "LPM_GITHUB_RELEASES_URL_OVERRIDE",
+            GITHUB_STABLE_RELEASES_URL_DEFAULT,
+        ),
+        ReleaseChannel::Nightly => (
+            "LPM_GITHUB_NIGHTLY_RELEASES_URL_OVERRIDE",
+            GITHUB_NIGHTLY_RELEASES_URL_DEFAULT,
+        ),
+    };
+    resolve_release_url(env_var, default_url)
 }
 
 /// Shared override-resolution path. Reads `env_var`, validates the
@@ -152,34 +175,125 @@ fn is_loopback_host(host: &str) -> bool {
 /// optional so the original `{latest, lastCheck}` JSON written by the
 /// pre-refactor banner deserialises cleanly into the new struct.
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct UpdateCache {
+pub(crate) struct ChannelUpdateCache {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    latest: String,
+
+    #[serde(rename = "lastCheck", default)]
+    last_check: u64,
+
+    #[serde(rename = "lastFailureCheck", default, skip_serializing_if = "is_zero")]
+    last_failure_check: u64,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    etag: String,
+
+    #[serde(rename = "npmEtag", default, skip_serializing_if = "String::is_empty")]
+    npm_etag: String,
+}
+
+impl ChannelUpdateCache {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UpdateCache {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub latest: String,
 
-    /// Unix seconds of the last successful network probe.
+    /// Unix seconds of the last successful stable-channel network probe.
     #[serde(rename = "lastCheck", default)]
     pub last_check: u64,
 
-    /// Unix seconds of the last network probe that did NOT update
-    /// `last_check` (network error, 403, etc.). Drives the failure
-    /// backoff so stale `last_check` doesn't make every invocation
-    /// spawn a fresh refresh child.
+    /// Unix seconds of the last stable-channel probe that failed.
     #[serde(rename = "lastFailureCheck", default, skip_serializing_if = "is_zero")]
     pub last_failure_check: u64,
 
-    /// Cached `ETag` from the most recent successful GitHub Releases
-    /// response. Sent as `If-None-Match` on the next GitHub probe so a
-    /// 304 reuses the stored `latest` without re-downloading the JSON.
+    /// Cached stable-channel GitHub Releases `ETag`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etag: String,
 
-    /// Cached `ETag` from the most recent successful npm registry
-    /// response. Tracked separately from `etag` because npm and GitHub
-    /// generate etags from independent storage backends — sending an
-    /// npm-shaped etag to GitHub (or vice versa) would either be
-    /// ignored or yield a spurious 304 against the wrong body.
+    /// Cached stable-channel npm registry `ETag`.
     #[serde(rename = "npmEtag", default, skip_serializing_if = "String::is_empty")]
     pub npm_etag: String,
+
+    #[serde(default, skip_serializing_if = "ChannelUpdateCache::is_empty")]
+    pub(crate) nightly: ChannelUpdateCache,
+}
+
+impl UpdateCache {
+    pub fn latest_for(&self, channel: ReleaseChannel) -> &str {
+        match channel {
+            ReleaseChannel::Stable => &self.latest,
+            ReleaseChannel::Nightly => &self.nightly.latest,
+        }
+    }
+
+    pub fn last_check_for(&self, channel: ReleaseChannel) -> u64 {
+        match channel {
+            ReleaseChannel::Stable => self.last_check,
+            ReleaseChannel::Nightly => self.nightly.last_check,
+        }
+    }
+
+    pub fn last_failure_check_for(&self, channel: ReleaseChannel) -> u64 {
+        match channel {
+            ReleaseChannel::Stable => self.last_failure_check,
+            ReleaseChannel::Nightly => self.nightly.last_failure_check,
+        }
+    }
+
+    pub fn record_success_for(
+        &mut self,
+        channel: ReleaseChannel,
+        version: String,
+        checked_at: u64,
+    ) {
+        self.set_latest_for(channel, version);
+        self.set_last_check_for(channel, checked_at);
+        self.set_last_failure_check_for(channel, 0);
+    }
+
+    fn etag_for(&self, channel: ReleaseChannel, source: Source) -> &str {
+        match (channel, source) {
+            (ReleaseChannel::Stable, Source::Npm) => &self.npm_etag,
+            (ReleaseChannel::Stable, Source::GitHub) => &self.etag,
+            (ReleaseChannel::Nightly, Source::Npm) => &self.nightly.npm_etag,
+            (ReleaseChannel::Nightly, Source::GitHub) => &self.nightly.etag,
+        }
+    }
+
+    fn set_etag_for(&mut self, channel: ReleaseChannel, source: Source, etag: String) {
+        match (channel, source) {
+            (ReleaseChannel::Stable, Source::Npm) => self.npm_etag = etag,
+            (ReleaseChannel::Stable, Source::GitHub) => self.etag = etag,
+            (ReleaseChannel::Nightly, Source::Npm) => self.nightly.npm_etag = etag,
+            (ReleaseChannel::Nightly, Source::GitHub) => self.nightly.etag = etag,
+        }
+    }
+
+    fn set_latest_for(&mut self, channel: ReleaseChannel, version: String) {
+        match channel {
+            ReleaseChannel::Stable => self.latest = version,
+            ReleaseChannel::Nightly => self.nightly.latest = version,
+        }
+    }
+
+    fn set_last_check_for(&mut self, channel: ReleaseChannel, checked_at: u64) {
+        match channel {
+            ReleaseChannel::Stable => self.last_check = checked_at,
+            ReleaseChannel::Nightly => self.nightly.last_check = checked_at,
+        }
+    }
+
+    fn set_last_failure_check_for(&mut self, channel: ReleaseChannel, checked_at: u64) {
+        match channel {
+            ReleaseChannel::Stable => self.last_failure_check = checked_at,
+            ReleaseChannel::Nightly => self.nightly.last_failure_check = checked_at,
+        }
+    }
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -333,6 +447,7 @@ pub fn clear_cache_at(path: &Path) {
 /// fanout property, not cryptographic randomness.
 pub fn is_stale(
     cache: Option<&UpdateCache>,
+    channel: ReleaseChannel,
     now_secs: u64,
     success_ttl: Duration,
     failure_ttl: Duration,
@@ -341,20 +456,23 @@ pub fn is_stale(
         return true;
     };
 
-    if cache.last_check == 0 && cache.last_failure_check == 0 {
+    let last_check = cache.last_check_for(channel);
+    let last_failure_check = cache.last_failure_check_for(channel);
+
+    if last_check == 0 && last_failure_check == 0 {
         return true;
     }
 
     let success_fresh =
-        cache.last_check > 0 && now_secs.saturating_sub(cache.last_check) < success_ttl.as_secs();
+        last_check > 0 && now_secs.saturating_sub(last_check) < success_ttl.as_secs();
     if success_fresh {
         return false;
     }
 
-    if cache.last_failure_check > 0 {
-        let jitter = jitter_seconds(cache.last_failure_check, failure_ttl);
+    if last_failure_check > 0 {
+        let jitter = jitter_seconds(last_failure_check, failure_ttl);
         let effective_ttl = failure_ttl.as_secs().saturating_add(jitter);
-        let failure_fresh = now_secs.saturating_sub(cache.last_failure_check) < effective_ttl;
+        let failure_fresh = now_secs.saturating_sub(last_failure_check) < effective_ttl;
         if failure_fresh {
             return false;
         }
@@ -404,26 +522,74 @@ enum Source {
     GitHub,
 }
 
+impl Source {
+    const fn alternate(self) -> Self {
+        match self {
+            Self::Npm => Self::GitHub,
+            Self::GitHub => Self::Npm,
+        }
+    }
+}
+
 /// Pull the version string out of the parsed JSON for a given source.
 ///
 /// Split out as a pure function so the parsing contract is unit-testable
 /// without spinning up wiremock — the failure modes here (missing field,
 /// empty value, non-string type) historically cause silent regressions
 /// when a registry tweaks its response shape.
-fn extract_version(source: Source, body: &serde_json::Value) -> Result<String, LookupError> {
-    match source {
-        Source::Npm => match body.get("version").and_then(|v| v.as_str()) {
-            Some(v) if !v.is_empty() => Ok(v.to_string()),
-            _ => Err(LookupError::MalformedResponse(
-                "missing version on npm registry response".into(),
-            )),
-        },
-        Source::GitHub => match body.get("tag_name").and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() => Ok(t.strip_prefix('v').unwrap_or(t).to_string()),
-            _ => Err(LookupError::MalformedResponse(
-                "missing tag_name on github releases response".into(),
-            )),
-        },
+fn extract_version(
+    source: Source,
+    channel: ReleaseChannel,
+    body: &serde_json::Value,
+) -> Result<String, LookupError> {
+    let version = match (source, channel) {
+        (Source::Npm, _) => body
+            .get("version")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                LookupError::MalformedResponse("missing version on npm registry response".into())
+            })?,
+        (Source::GitHub, ReleaseChannel::Stable) => body
+            .get("tag_name")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(|tag| tag.strip_prefix('v').unwrap_or(tag).to_owned())
+            .ok_or_else(|| {
+                LookupError::MalformedResponse(
+                    "missing tag_name on github releases response".into(),
+                )
+            })?,
+        (Source::GitHub, ReleaseChannel::Nightly) => body
+            .as_array()
+            .and_then(|releases| {
+                releases.iter().find_map(|release| {
+                    let is_nightly_release = release.get("draft").and_then(|value| value.as_bool())
+                        == Some(false)
+                        && release.get("prerelease").and_then(|value| value.as_bool())
+                            == Some(true);
+                    if !is_nightly_release {
+                        return None;
+                    }
+                    let tag = release.get("tag_name").and_then(|value| value.as_str())?;
+                    let version = tag.strip_prefix('v').unwrap_or(tag);
+                    channel.accepts_version(version).then(|| version.to_owned())
+                })
+            })
+            .ok_or_else(|| {
+                LookupError::MalformedResponse(
+                    "github releases response did not contain a published nightly release".into(),
+                )
+            })?,
+    };
+
+    if channel.accepts_version(&version) {
+        Ok(version)
+    } else {
+        Err(LookupError::MalformedResponse(format!(
+            "{source:?} returned version {version:?} for the {channel} channel"
+        )))
     }
 }
 
@@ -445,13 +611,16 @@ fn extract_version(source: Source, body: &serde_json::Value) -> Result<String, L
 ///   defaults to the npm error since npm is the primary path.
 /// - npm `MalformedResponse` → also fall back to GitHub. A malformed
 ///   primary shouldn't block updates if the fallback works.
-pub async fn probe_release(cache: &mut UpdateCache) -> Result<FetchOutcome, LookupError> {
-    let npm_err = match probe_one(Source::Npm, cache).await {
+pub async fn probe_release(
+    channel: ReleaseChannel,
+    cache: &mut UpdateCache,
+) -> Result<FetchOutcome, LookupError> {
+    let npm_err = match probe_one(Source::Npm, channel, cache).await {
         Ok(outcome) => return Ok(outcome),
         Err(e) => e,
     };
 
-    match probe_one(Source::GitHub, cache).await {
+    match probe_one(Source::GitHub, channel, cache).await {
         Ok(outcome) => Ok(outcome),
         Err(gh_err) => Err(prefer_more_actionable(npm_err, gh_err)),
     }
@@ -477,7 +646,11 @@ fn prefer_more_actionable(npm_err: LookupError, gh_err: LookupError) -> LookupEr
 /// bumps `last_failure_check` and returns the typed error.
 ///
 /// Caller is responsible for persisting the cache via `write_cache_at`.
-async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutcome, LookupError> {
+async fn probe_one(
+    source: Source,
+    channel: ReleaseChannel,
+    cache: &mut UpdateCache,
+) -> Result<FetchOutcome, LookupError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -487,21 +660,18 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| {
-            cache.last_failure_check = now;
+            cache.set_last_failure_check_for(channel, now);
             LookupError::Transport(format!("failed to build HTTP client: {e}"))
         })?;
 
     let url = match source {
-        Source::Npm => npm_registry_url(),
-        Source::GitHub => github_releases_url(),
+        Source::Npm => npm_registry_url(channel),
+        Source::GitHub => github_releases_url(channel),
     };
 
     let mut req = client.get(&url).header("User-Agent", "lpm-cli");
 
-    let cached_etag = match source {
-        Source::Npm => cache.npm_etag.clone(),
-        Source::GitHub => cache.etag.clone(),
-    };
+    let cached_etag = cache.etag_for(channel, source).to_owned();
 
     match source {
         Source::Npm => {
@@ -515,14 +685,14 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
         }
     }
 
-    if !cached_etag.is_empty() {
+    if !cached_etag.is_empty() && channel.accepts_version(cache.latest_for(channel)) {
         req = req.header("If-None-Match", &cached_etag);
     }
 
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            cache.last_failure_check = now;
+            cache.set_last_failure_check_for(channel, now);
             return Err(LookupError::Transport(
                 lpm_http::display_error(&e).to_string(),
             ));
@@ -532,11 +702,17 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
     let status = resp.status();
 
     // 304 Not Modified: cache stays valid, just bump the timestamp.
-    if status.as_u16() == 304 && !cache.latest.is_empty() {
-        cache.last_check = now;
-        return Ok(FetchOutcome::NotModified {
-            version: cache.latest.clone(),
-        });
+    if status.as_u16() == 304 {
+        let version = cache.latest_for(channel);
+        if channel.accepts_version(version) {
+            let version = version.to_owned();
+            cache.set_last_check_for(channel, now);
+            return Ok(FetchOutcome::NotModified { version });
+        }
+        cache.set_last_failure_check_for(channel, now);
+        return Err(LookupError::MalformedResponse(format!(
+            "{source:?} returned not-modified without a valid cached {channel} version"
+        )));
     }
 
     // 403 with primary rate limit (GitHub-specific) — npm doesn't gate
@@ -555,7 +731,7 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
             .get("x-ratelimit-reset")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
-        cache.last_failure_check = now;
+        cache.set_last_failure_check_for(channel, now);
         return Err(LookupError::RateLimited { reset_at });
     }
 
@@ -563,7 +739,7 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
         // Best-effort body excerpt for diagnostics; ignore body errors.
         let body = resp.text().await.unwrap_or_default();
         let excerpt: String = body.chars().take(200).collect();
-        cache.last_failure_check = now;
+        cache.set_last_failure_check_for(channel, now);
         return Err(LookupError::HttpStatus {
             status: status.as_u16(),
             body_excerpt: excerpt,
@@ -581,28 +757,28 @@ async fn probe_one(source: Source, cache: &mut UpdateCache) -> Result<FetchOutco
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            cache.last_failure_check = now;
+            cache.set_last_failure_check_for(channel, now);
             return Err(LookupError::MalformedResponse(format!(
                 "body not JSON: {e}"
             )));
         }
     };
 
-    let version = match extract_version(source, &body) {
+    let version = match extract_version(source, channel, &body) {
         Ok(v) => v,
         Err(e) => {
-            cache.last_failure_check = now;
+            cache.set_last_failure_check_for(channel, now);
             return Err(e);
         }
     };
 
-    cache.latest = version.clone();
-    cache.last_check = now;
-    cache.last_failure_check = 0;
-    match source {
-        Source::Npm => cache.npm_etag = etag,
-        Source::GitHub => cache.etag = etag,
-    }
+    cache.set_latest_for(channel, version.clone());
+    cache.set_last_check_for(channel, now);
+    cache.set_last_failure_check_for(channel, 0);
+    cache.set_etag_for(channel, source, etag);
+    // The shared channel version now came from this source; an ETag from
+    // the alternate source no longer describes the cached response body.
+    cache.set_etag_for(channel, source.alternate(), String::new());
 
     Ok(FetchOutcome::Fresh { version })
 }
@@ -798,6 +974,7 @@ mod tests {
             last_failure_check: 0,
             etag: "W/\"abc123\"".into(),
             npm_etag: "\"npm-xyz789\"".into(),
+            ..Default::default()
         };
         write_cache_at(&path, &cache).unwrap();
         let loaded = read_cache_at(&path).unwrap();
@@ -831,6 +1008,55 @@ mod tests {
     }
 
     #[test]
+    fn stable_and_nightly_cache_state_round_trip_independently() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        let mut cache = UpdateCache::default();
+        cache.record_success_for(ReleaseChannel::Stable, "0.71.0".into(), 1_700_000_000);
+        cache.record_success_for(
+            ReleaseChannel::Nightly,
+            "0.72.0-nightly.20260728.42.d82ceea".into(),
+            1_700_000_100,
+        );
+        cache.set_etag_for(ReleaseChannel::Stable, Source::Npm, "stable-npm".into());
+        cache.set_etag_for(
+            ReleaseChannel::Nightly,
+            Source::GitHub,
+            "nightly-github".into(),
+        );
+
+        write_cache_at(&path, &cache).unwrap();
+        let loaded = read_cache_at(&path).unwrap();
+
+        assert_eq!(loaded.latest_for(ReleaseChannel::Stable), "0.71.0");
+        assert_eq!(
+            loaded.latest_for(ReleaseChannel::Nightly),
+            "0.72.0-nightly.20260728.42.d82ceea"
+        );
+        assert_eq!(loaded.last_check_for(ReleaseChannel::Stable), 1_700_000_000);
+        assert_eq!(
+            loaded.last_check_for(ReleaseChannel::Nightly),
+            1_700_000_100
+        );
+        assert_eq!(
+            loaded.etag_for(ReleaseChannel::Stable, Source::Npm),
+            "stable-npm"
+        );
+        assert_eq!(
+            loaded.etag_for(ReleaseChannel::Nightly, Source::GitHub),
+            "nightly-github"
+        );
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["latest"], "0.71.0");
+        assert_eq!(
+            raw["nightly"]["latest"],
+            "0.72.0-nightly.20260728.42.d82ceea"
+        );
+    }
+
+    #[test]
     fn write_omits_zero_failure_field() {
         // last_failure_check=0 should not be serialised, keeping the
         // happy-path on-disk shape clean and forward-compatible with
@@ -845,6 +1071,7 @@ mod tests {
                 last_failure_check: 0,
                 etag: String::new(),
                 npm_etag: String::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -870,6 +1097,7 @@ mod tests {
     fn is_stale_with_no_cache() {
         assert!(is_stale(
             None,
+            ReleaseChannel::Stable,
             now_secs(),
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -881,6 +1109,7 @@ mod tests {
         let cache = UpdateCache::default();
         assert!(is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now_secs(),
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -897,6 +1126,7 @@ mod tests {
         };
         assert!(!is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now,
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -913,6 +1143,7 @@ mod tests {
         };
         assert!(is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now,
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -931,6 +1162,7 @@ mod tests {
         };
         assert!(!is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now,
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -947,6 +1179,7 @@ mod tests {
         };
         assert!(is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now,
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -966,6 +1199,7 @@ mod tests {
         };
         assert!(!is_stale(
             Some(&cache),
+            ReleaseChannel::Stable,
             now,
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -1139,8 +1373,39 @@ mod tests {
             "name": "@lpm-registry/cli",
             "version": "0.37.0",
         });
-        let v = extract_version(Source::Npm, &body).unwrap();
+        let v = extract_version(Source::Npm, ReleaseChannel::Stable, &body).unwrap();
         assert_eq!(v, "0.37.0");
+    }
+
+    #[test]
+    fn extract_version_npm_accepts_nightly_for_nightly_channel() {
+        let body = serde_json::json!({
+            "version": "0.71.0-nightly.20260728.42.d82ceea",
+        });
+        let version = extract_version(Source::Npm, ReleaseChannel::Nightly, &body).unwrap();
+        assert_eq!(version, "0.71.0-nightly.20260728.42.d82ceea");
+    }
+
+    #[test]
+    fn extract_version_npm_rejects_nightly_for_stable_channel() {
+        let body = serde_json::json!({
+            "version": "0.71.0-nightly.20260728.42.d82ceea",
+        });
+        assert!(matches!(
+            extract_version(Source::Npm, ReleaseChannel::Stable, &body),
+            Err(LookupError::MalformedResponse(_))
+        ));
+    }
+
+    #[test]
+    fn extract_version_npm_rejects_stable_and_rc_for_nightly_channel() {
+        for version in ["0.71.0", "0.71.0-rc.1"] {
+            let body = serde_json::json!({ "version": version });
+            assert!(matches!(
+                extract_version(Source::Npm, ReleaseChannel::Nightly, &body),
+                Err(LookupError::MalformedResponse(_))
+            ));
+        }
     }
 
     /// npm responses have a bare numeric version (no `v` prefix). The
@@ -1149,7 +1414,7 @@ mod tests {
     #[test]
     fn extract_version_npm_does_not_strip_v_prefix() {
         let body = serde_json::json!({ "version": "v0.37.0" });
-        let v = extract_version(Source::Npm, &body).unwrap();
+        let v = extract_version(Source::Npm, ReleaseChannel::Stable, &body).unwrap();
         assert_eq!(v, "v0.37.0", "npm version field is verbatim");
     }
 
@@ -1157,7 +1422,7 @@ mod tests {
     fn extract_version_npm_missing_field_errors() {
         let body = serde_json::json!({ "name": "@lpm-registry/cli" });
         assert!(matches!(
-            extract_version(Source::Npm, &body),
+            extract_version(Source::Npm, ReleaseChannel::Stable, &body),
             Err(LookupError::MalformedResponse(_))
         ));
     }
@@ -1166,7 +1431,7 @@ mod tests {
     fn extract_version_npm_empty_field_errors() {
         let body = serde_json::json!({ "version": "" });
         assert!(matches!(
-            extract_version(Source::Npm, &body),
+            extract_version(Source::Npm, ReleaseChannel::Stable, &body),
             Err(LookupError::MalformedResponse(_))
         ));
     }
@@ -1176,14 +1441,14 @@ mod tests {
     #[test]
     fn extract_version_github_strips_v_prefix() {
         let body = serde_json::json!({ "tag_name": "v0.37.0" });
-        let v = extract_version(Source::GitHub, &body).unwrap();
+        let v = extract_version(Source::GitHub, ReleaseChannel::Stable, &body).unwrap();
         assert_eq!(v, "0.37.0");
     }
 
     #[test]
     fn extract_version_github_without_v_prefix() {
         let body = serde_json::json!({ "tag_name": "0.37.0" });
-        let v = extract_version(Source::GitHub, &body).unwrap();
+        let v = extract_version(Source::GitHub, ReleaseChannel::Stable, &body).unwrap();
         assert_eq!(v, "0.37.0");
     }
 
@@ -1191,9 +1456,38 @@ mod tests {
     fn extract_version_github_missing_field_errors() {
         let body = serde_json::json!({});
         assert!(matches!(
-            extract_version(Source::GitHub, &body),
+            extract_version(Source::GitHub, ReleaseChannel::Stable, &body),
             Err(LookupError::MalformedResponse(_))
         ));
+    }
+
+    #[test]
+    fn extract_version_github_nightly_selects_published_nightly_prerelease() {
+        let body = serde_json::json!([
+            {
+                "tag_name": "v0.72.0-nightly.20260728.45.aaaaaaa",
+                "draft": true,
+                "prerelease": true
+            },
+            {
+                "tag_name": "v0.72.0",
+                "draft": false,
+                "prerelease": false
+            },
+            {
+                "tag_name": "v0.72.0-rc.1",
+                "draft": false,
+                "prerelease": true
+            },
+            {
+                "tag_name": "v0.72.0-nightly.20260728.42.d82ceea",
+                "draft": false,
+                "prerelease": true
+            }
+        ]);
+
+        let version = extract_version(Source::GitHub, ReleaseChannel::Nightly, &body).unwrap();
+        assert_eq!(version, "0.72.0-nightly.20260728.42.d82ceea");
     }
 
     /// `LPM_NPM_REGISTRY_URL_OVERRIDE` lets tests and private-mirror
@@ -1210,14 +1504,17 @@ mod tests {
                 NPM_OVERRIDE_KEY,
                 "http://localhost:9999/foo".into(),
             )]);
-            assert_eq!(npm_registry_url(), "http://localhost:9999/foo");
+            assert_eq!(
+                npm_registry_url(ReleaseChannel::Stable),
+                "http://localhost:9999/foo"
+            );
         }
         {
             let _env =
                 crate::test_env::ScopedEnv::set([(NPM_OVERRIDE_KEY, std::ffi::OsString::new())]);
             assert_eq!(
-                npm_registry_url(),
-                NPM_REGISTRY_URL_DEFAULT,
+                npm_registry_url(ReleaseChannel::Stable),
+                NPM_STABLE_REGISTRY_URL_DEFAULT,
                 "empty override falls back to default"
             );
         }
@@ -1255,7 +1552,9 @@ mod tests {
         let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
         with_env_overrides(&npm_url, &gh_url, async {
             let mut cache = UpdateCache::default();
-            let outcome = probe_release(&mut cache).await.expect("npm probe ok");
+            let outcome = probe_release(ReleaseChannel::Stable, &mut cache)
+                .await
+                .expect("npm probe ok");
             assert_eq!(
                 outcome,
                 FetchOutcome::Fresh {
@@ -1300,7 +1599,9 @@ mod tests {
         let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
         with_env_overrides(&npm_url, &gh_url, async {
             let mut cache = UpdateCache::default();
-            let outcome = probe_release(&mut cache).await.expect("github fallback ok");
+            let outcome = probe_release(ReleaseChannel::Stable, &mut cache)
+                .await
+                .expect("github fallback ok");
             assert_eq!(
                 outcome,
                 FetchOutcome::Fresh {
@@ -1312,6 +1613,122 @@ mod tests {
             // overall, even though the npm leg of it bumped the
             // failure timestamp before the GitHub leg cleared it.
             assert_eq!(cache.last_failure_check, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_release_uses_nightly_npm_endpoint_and_cache_slot() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+        let version = "0.72.0-nightly.20260728.42.d82ceea";
+
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/nightly"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"nightly-npm\"")
+                    .set_body_json(serde_json::json!({ "version": version })),
+            )
+            .expect(1)
+            .mount(&npm)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/nightly", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases", gh.uri());
+        with_nightly_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache {
+                latest: "0.71.0".into(),
+                last_check: 1_700_000_000,
+                ..Default::default()
+            };
+            cache.set_etag_for(
+                ReleaseChannel::Nightly,
+                Source::GitHub,
+                "\"older-nightly-github\"".into(),
+            );
+            let outcome = probe_release(ReleaseChannel::Nightly, &mut cache)
+                .await
+                .expect("nightly npm probe");
+
+            assert_eq!(
+                outcome,
+                FetchOutcome::Fresh {
+                    version: version.into()
+                }
+            );
+            assert_eq!(cache.latest_for(ReleaseChannel::Stable), "0.71.0");
+            assert_eq!(cache.latest_for(ReleaseChannel::Nightly), version);
+            assert_eq!(
+                cache.etag_for(ReleaseChannel::Nightly, Source::Npm),
+                "\"nightly-npm\""
+            );
+            assert_eq!(cache.etag_for(ReleaseChannel::Nightly, Source::GitHub), "");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_release_nightly_falls_back_to_github_prerelease_list() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let npm = MockServer::start().await;
+        let gh = MockServer::start().await;
+        let version = "0.72.0-nightly.20260728.42.d82ceea";
+
+        Mock::given(method("GET"))
+            .and(path("/@lpm-registry/cli/nightly"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&npm)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/rust-client/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "tag_name": "v0.72.0",
+                    "draft": false,
+                    "prerelease": false
+                },
+                {
+                    "tag_name": format!("v{version}"),
+                    "draft": false,
+                    "prerelease": true
+                }
+            ])))
+            .expect(1)
+            .mount(&gh)
+            .await;
+
+        let npm_url = format!("{}/@lpm-registry/cli/nightly", npm.uri());
+        let gh_url = format!("{}/repos/lpm-dev/rust-client/releases", gh.uri());
+        with_nightly_env_overrides(&npm_url, &gh_url, async {
+            let mut cache = UpdateCache::default();
+            cache.set_etag_for(
+                ReleaseChannel::Nightly,
+                Source::Npm,
+                "\"older-nightly-npm\"".into(),
+            );
+            let outcome = probe_release(ReleaseChannel::Nightly, &mut cache)
+                .await
+                .expect("nightly GitHub fallback");
+            assert_eq!(
+                outcome,
+                FetchOutcome::Fresh {
+                    version: version.into()
+                }
+            );
+            assert_eq!(cache.latest_for(ReleaseChannel::Nightly), version);
+            assert_eq!(cache.etag_for(ReleaseChannel::Nightly, Source::Npm), "");
         })
         .await;
     }
@@ -1342,7 +1759,9 @@ mod tests {
         let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
         with_env_overrides(&npm_url, &gh_url, async {
             let mut cache = UpdateCache::default();
-            let err = probe_release(&mut cache).await.expect_err("both legs fail");
+            let err = probe_release(ReleaseChannel::Stable, &mut cache)
+                .await
+                .expect_err("both legs fail");
             // Primary error wins. The npm 503 body excerpt should
             // appear, not the GitHub 500 body.
             let s = err.to_string();
@@ -1400,7 +1819,9 @@ mod tests {
         let gh_url = format!("{}/repos/lpm-dev/rust-client/releases/latest", gh.uri());
         with_env_overrides(&npm_url, &gh_url, async {
             let mut cache = UpdateCache::default();
-            let err = probe_release(&mut cache).await.expect_err("both legs fail");
+            let err = probe_release(ReleaseChannel::Stable, &mut cache)
+                .await
+                .expect_err("both legs fail");
             assert!(
                 matches!(err, LookupError::RateLimited { .. }),
                 "expected RateLimited to win the cascade, got {err:?}"
@@ -1450,6 +1871,8 @@ mod tests {
 
     const NPM_OVERRIDE_KEY: &str = "LPM_NPM_REGISTRY_URL_OVERRIDE";
     const GH_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASES_URL_OVERRIDE";
+    const NPM_NIGHTLY_OVERRIDE_KEY: &str = "LPM_NPM_NIGHTLY_REGISTRY_URL_OVERRIDE";
+    const GH_NIGHTLY_OVERRIDE_KEY: &str = "LPM_GITHUB_NIGHTLY_RELEASES_URL_OVERRIDE";
 
     async fn with_env_overrides<F>(npm_url: &str, gh_url: &str, fut: F)
     where
@@ -1458,6 +1881,17 @@ mod tests {
         let _env = crate::test_env::ScopedEnv::set([
             (NPM_OVERRIDE_KEY, npm_url.into()),
             (GH_OVERRIDE_KEY, gh_url.into()),
+        ]);
+        fut.await;
+    }
+
+    async fn with_nightly_env_overrides<F>(npm_url: &str, gh_url: &str, fut: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let _env = crate::test_env::ScopedEnv::set([
+            (NPM_NIGHTLY_OVERRIDE_KEY, npm_url.into()),
+            (GH_NIGHTLY_OVERRIDE_KEY, gh_url.into()),
         ]);
         fut.await;
     }
@@ -1529,8 +1963,8 @@ mod tests {
             "http://attacker.example/x".into(),
         )]);
         assert_eq!(
-            resolve_release_url(NPM_OVERRIDE_KEY, NPM_REGISTRY_URL_DEFAULT),
-            NPM_REGISTRY_URL_DEFAULT,
+            resolve_release_url(NPM_OVERRIDE_KEY, NPM_STABLE_REGISTRY_URL_DEFAULT),
+            NPM_STABLE_REGISTRY_URL_DEFAULT,
             "non-loopback HTTP override must NOT steer the lookup",
         );
     }
@@ -1543,7 +1977,7 @@ mod tests {
             "https://npm.internal.example.com/x".into(),
         )]);
         assert_eq!(
-            resolve_release_url(NPM_OVERRIDE_KEY, NPM_REGISTRY_URL_DEFAULT),
+            resolve_release_url(NPM_OVERRIDE_KEY, NPM_STABLE_REGISTRY_URL_DEFAULT),
             "https://npm.internal.example.com/x",
             "HTTPS override must steer the lookup",
         );

@@ -1,4 +1,5 @@
 use crate::install_ui;
+use crate::release_channel::ReleaseChannel;
 use crate::release_lookup::{
     FetchOutcome, LookupError, clear_cache_at, default_cache_path,
     fetch_github_release_published_at, github_release_download_url, is_newer_semver, probe_release,
@@ -35,14 +36,17 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 /// the appropriate upgrade command. Supports npm, Homebrew, cargo,
 /// and standalone (curl) installations.
 ///
-/// Version discovery probes the npm registry first
-/// (`registry.npmjs.org/@lpm-registry/cli/latest`) and falls back to
-/// GitHub Releases. The npm primary is anonymous and unmetered for our
-/// purposes, so most users never touch the rate-limited GitHub path.
-/// The two sources stay in lockstep because every release publishes
-/// from the same tag.
-pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
-    let current = env!("CARGO_PKG_VERSION");
+/// Version discovery probes the installed or requested channel's npm
+/// dist-tag first and falls back to the matching GitHub release.
+pub async fn run(
+    json_output: bool,
+    refresh: bool,
+    requested_channel: Option<ReleaseChannel>,
+) -> Result<(), LpmError> {
+    let current = crate::build_version::version();
+    let channel = ReleaseChannel::from_installed_version(current);
+    let target_channel = requested_channel.unwrap_or(channel);
+    let channel_changed = channel != target_channel;
 
     let cache_path = default_cache_path();
     let mut cache = cache_path
@@ -68,17 +72,19 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     //   (c) otherwise → probe.
     // `--refresh` bypasses both (a) and (b).
     let cache_hit = !refresh
-        && !cache.latest.is_empty()
-        && cache.last_check > 0
-        && now.saturating_sub(cache.last_check) < LOOKUP_TTL.as_secs();
+        && !cache.latest_for(target_channel).is_empty()
+        && target_channel.accepts_version(cache.latest_for(target_channel))
+        && cache.last_check_for(target_channel) > 0
+        && now.saturating_sub(cache.last_check_for(target_channel)) < LOOKUP_TTL.as_secs();
 
     let in_failure_backoff = !refresh
         && !cache_hit
-        && cache.last_failure_check > 0
-        && now.saturating_sub(cache.last_failure_check) < FAILURE_BACKOFF.as_secs();
+        && cache.last_failure_check_for(target_channel) > 0
+        && now.saturating_sub(cache.last_failure_check_for(target_channel))
+            < FAILURE_BACKOFF.as_secs();
 
     if in_failure_backoff {
-        let elapsed = now.saturating_sub(cache.last_failure_check);
+        let elapsed = now.saturating_sub(cache.last_failure_check_for(target_channel));
         let remaining = FAILURE_BACKOFF.as_secs().saturating_sub(elapsed);
         // SelfUpdatePaused — not Network. The failure isn't a live
         // transport problem; it's a local cache decision to back off.
@@ -92,9 +98,9 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     }
 
     let latest = if cache_hit {
-        cache.latest.clone()
+        cache.latest_for(target_channel).to_owned()
     } else {
-        match probe_release(&mut cache).await {
+        match probe_release(target_channel, &mut cache).await {
             Ok(FetchOutcome::Fresh { version }) | Ok(FetchOutcome::NotModified { version }) => {
                 if let Some(p) = cache_path.as_deref() {
                     let _ = write_cache_at(p, &cache);
@@ -119,9 +125,14 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             install_ui::dim("latest"),
             install_ui::status_ok(&latest)
         );
+        eprintln!(
+            "    {}   {}",
+            install_ui::dim("release channel"),
+            target_channel.as_str().cyan()
+        );
     }
 
-    if latest == current || !is_newer_semver(&latest, current) {
+    if !should_install_update(current, &latest, channel, target_channel) {
         if json_output {
             let json = serde_json::json!({
                 "success": true,
@@ -129,6 +140,9 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
                 "latest": latest,
                 "up_to_date": true,
                 "cache_hit": cache_hit,
+                "channel": channel.as_str(),
+                "target_channel": target_channel.as_str(),
+                "channel_changed": channel_changed,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if latest == current {
@@ -149,6 +163,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     }
 
     let method = detect_install_method();
+    method.ensure_channel_supported(target_channel)?;
 
     // For non-Standalone channels the JSON contract is plan-only: emit
     // the update command, return without invoking the channel's
@@ -165,6 +180,9 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             "install_method": method.name(),
             "update_command": method.command(&latest),
             "cache_hit": cache_hit,
+            "channel": channel.as_str(),
+            "target_channel": target_channel.as_str(),
+            "channel_changed": channel_changed,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
         return Ok(());
@@ -173,7 +191,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     if !json_output {
         eprintln!(
             "    {}   {}",
-            install_ui::dim("channel"),
+            install_ui::dim("install method"),
             method.name().cyan()
         );
         install_ui::phase("Update command");
@@ -230,9 +248,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     if let Some(p) = cache_path.as_deref() {
         match method {
             InstallMethod::Standalone | InstallMethod::Cargo | InstallMethod::Npm => {
-                cache.latest = latest.clone();
-                cache.last_check = now;
-                cache.last_failure_check = 0;
+                cache.record_success_for(target_channel, latest.clone(), now);
                 let _ = write_cache_at(p, &cache);
             }
             InstallMethod::Homebrew => {
@@ -252,6 +268,9 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             "up_to_date": false,
             "install_method": method.name(),
             "cache_hit": cache_hit,
+            "channel": channel.as_str(),
+            "target_channel": target_channel.as_str(),
+            "channel_changed": channel_changed,
             "verified": true,
             "attestation": audit_json(audit),
         });
@@ -264,6 +283,15 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     }
 
     Ok(())
+}
+
+fn should_install_update(
+    current: &str,
+    latest: &str,
+    channel: ReleaseChannel,
+    target_channel: ReleaseChannel,
+) -> bool {
+    latest != current && (channel != target_channel || is_newer_semver(latest, current))
 }
 
 /// Map a `LookupError` into `LpmError` so the existing CLI error
@@ -322,14 +350,25 @@ impl InstallMethod {
             InstallMethod::Standalone => standalone_command(version),
         }
     }
+
+    fn ensure_channel_supported(&self, channel: ReleaseChannel) -> Result<(), LpmError> {
+        if channel != ReleaseChannel::Nightly
+            || matches!(self, InstallMethod::Npm | InstallMethod::Standalone)
+        {
+            return Ok(());
+        }
+
+        Err(LpmError::SelfUpdate(format!(
+            "the nightly channel is not available through {} installs; use the npm or standalone installer",
+            self.name()
+        )))
+    }
 }
 
 /// Equivalent shell command for the Standalone upgrade path. The
 /// wrapper does an in-place download of the version-pinned release
 /// asset for the current binary's path — `install.sh` is the install
-/// helper for new users, not what `lpm self-update` actually runs
-/// (it does its own `releases/latest` lookup and writes to
-/// `~/.lpm/bin/`).
+/// helper for new users, not what `lpm self-update` actually runs.
 ///
 /// On unsupported platforms or when the current exe path is unknown,
 /// fall back to the GitHub Releases page so the user has somewhere to
@@ -939,7 +978,7 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
             "updated_at_unix_secs": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
-            "previous_binary_version": env!("CARGO_PKG_VERSION"),
+            "previous_binary_version": crate::build_version::version(),
         });
         let journal_bytes = serde_json::to_vec_pretty(&journal).unwrap_or_default();
         if let Err(e) = lpm_common::write_file_atomic(&journal_path, journal_bytes) {
@@ -1898,6 +1937,92 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let cmd = InstallMethod::Npm.command("0.25.0");
         assert!(cmd.contains("@lpm-registry/cli@0.25.0"), "cmd: {cmd}");
         assert!(!cmd.contains("@latest"), "must not use @latest: {cmd}");
+    }
+
+    #[test]
+    fn explicit_stable_to_nightly_switch_installs_target() {
+        assert!(should_install_update(
+            "0.71.0",
+            "0.72.0-nightly.20260728.42.d82ceea",
+            ReleaseChannel::Stable,
+            ReleaseChannel::Nightly,
+        ));
+    }
+
+    #[test]
+    fn installed_nightly_advances_to_next_nightly() {
+        assert!(should_install_update(
+            "0.72.0-nightly.20260728.41.aaaaaaa",
+            "0.72.0-nightly.20260728.42.d82ceea",
+            ReleaseChannel::Nightly,
+            ReleaseChannel::Nightly,
+        ));
+    }
+
+    #[test]
+    fn explicit_nightly_to_older_stable_switch_allows_semver_downgrade() {
+        assert!(should_install_update(
+            "0.72.0-nightly.20260728.42.d82ceea",
+            "0.71.0",
+            ReleaseChannel::Nightly,
+            ReleaseChannel::Stable,
+        ));
+    }
+
+    #[test]
+    fn same_channel_does_not_install_equal_or_older_version() {
+        assert!(!should_install_update(
+            "0.71.0",
+            "0.71.0",
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
+        ));
+        assert!(!should_install_update(
+            "0.71.0",
+            "0.70.0",
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
+        ));
+    }
+
+    #[test]
+    fn nightly_channel_is_limited_to_npm_and_standalone_installs() {
+        assert!(
+            InstallMethod::Npm
+                .ensure_channel_supported(ReleaseChannel::Nightly)
+                .is_ok()
+        );
+        assert!(
+            InstallMethod::Standalone
+                .ensure_channel_supported(ReleaseChannel::Nightly)
+                .is_ok()
+        );
+        for method in [InstallMethod::Homebrew, InstallMethod::Cargo] {
+            let error = method
+                .ensure_channel_supported(ReleaseChannel::Nightly)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("nightly channel"),
+                "method {method:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_update_channel_argument_parses() {
+        use clap::Parser;
+
+        for (argument, expected) in [
+            ("stable", ReleaseChannel::Stable),
+            ("nightly", ReleaseChannel::Nightly),
+        ] {
+            let cli =
+                crate::Cli::try_parse_from(["lpm", "self-update", "--channel", argument]).unwrap();
+            let Some(crate::Commands::SelfUpdate(args)) = cli.command else {
+                panic!("expected self-update command")
+            };
+            assert_eq!(args.channel, Some(expected));
+        }
     }
 
     #[test]

@@ -103,7 +103,7 @@ pub(crate) async fn run(
             None
         };
     let answers = collect_init_answers(&options, target, resolved_owner.as_deref())?;
-    let package_manager = format!("lpm@{}", env!("CARGO_PKG_VERSION"));
+    let package_manager = format!("lpm@{}", crate::build_version::version());
 
     let mut pkg = serde_json::json!({
         "name": answers.name,

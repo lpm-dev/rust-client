@@ -343,7 +343,7 @@ fn check_lpm_engine(engines: &HashMap<String, String>) -> Result<(), Mismatch> {
     let Some(required) = engines.get("lpm") else {
         return Ok(());
     };
-    let actual = env!("CARGO_PKG_VERSION");
+    let actual = crate::build_version::version();
     match version_satisfies(required, actual) {
         Ok(true) => Ok(()),
         Ok(false) => Err(Mismatch {
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn lpm_engine_satisfied_passes() {
-        let cur = env!("CARGO_PKG_VERSION");
+        let cur = crate::build_version::version();
         let pkg = PackageJson {
             engines: engines(&[("lpm", &format!(">={cur}"))]),
             ..Default::default()

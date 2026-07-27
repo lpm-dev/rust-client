@@ -165,7 +165,7 @@ async fn exchange_trusted_publish_token(
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
-        .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
         .map_err(|e| LpmError::Registry(format!("npm OIDC client build failed: {e}")))?;
     let url = npm_oidc_exchange_url(registry_url, npm_name);

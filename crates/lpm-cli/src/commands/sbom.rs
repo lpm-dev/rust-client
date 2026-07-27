@@ -538,7 +538,7 @@ fn render_cyclonedx(document: &SbomDocument) -> Value {
                 "components": [{
                     "type": "application",
                     "name": "lpm-rs",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": crate::build_version::version(),
                 }]
             },
             "component": cyclonedx_root_component(document, root_ref),
@@ -748,7 +748,7 @@ fn render_spdx(document: &SbomDocument) -> Value {
         "documentNamespace": document_namespace(document),
         "creationInfo": {
             "created": document.generated_at,
-            "creators": [format!("Tool: lpm-rs-{}", env!("CARGO_PKG_VERSION"))],
+            "creators": [format!("Tool: lpm-rs-{}", crate::build_version::version())],
         },
         "packages": packages,
         "relationships": relationships,
