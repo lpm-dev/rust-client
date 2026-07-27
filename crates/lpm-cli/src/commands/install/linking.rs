@@ -541,8 +541,16 @@ pub(super) async fn run_link_and_finish(
         all_trusted_for_auto_build,
         effective_policy,
     );
+    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
+        Some(lpm_store::V2BaselineIndex::for_project(
+            project_dir,
+            lpm_root,
+        )?)
+    } else {
+        None
+    };
 
-    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
+    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
         project_dir,
         &store,
         &installed_with_integrity,
@@ -550,8 +558,11 @@ pub(super) async fn run_link_and_finish(
         &crate::build_state::BlockedSetMetadata::default(),
         &offline_requested_capabilities,
         &offline_user_bound,
-        None,
-        store_version,
+        crate::build_state::BlockedSetCaptureOptions {
+            advisor_approvals: None,
+            execution_exclusions: None,
+            baseline_index: baseline_index.as_ref(),
+        },
     )?;
 
     let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
@@ -594,19 +605,20 @@ pub(super) async fn run_link_and_finish(
             .iter()
             .cloned()
             .collect::<HashSet<_>>();
-        blocked_capture =
-            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
-                project_dir,
-                &store,
-                &installed_with_integrity,
-                &policy,
-                &crate::build_state::BlockedSetMetadata::default(),
-                &offline_requested_capabilities,
-                &offline_user_bound,
-                None,
-                Some(&execution_exclusions),
-                store_version,
-            )?;
+        blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
+            project_dir,
+            &store,
+            &installed_with_integrity,
+            &policy,
+            &crate::build_state::BlockedSetMetadata::default(),
+            &offline_requested_capabilities,
+            &offline_user_bound,
+            crate::build_state::BlockedSetCaptureOptions {
+                advisor_approvals: None,
+                execution_exclusions: Some(&execution_exclusions),
+                baseline_index: baseline_index.as_ref(),
+            },
+        )?;
 
         let relinked_bins = relink_bins_after_lifecycle_build(
             project_dir,

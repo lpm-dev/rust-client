@@ -3,8 +3,9 @@
 //! Run with:
 //! `cargo run --release -p lpm-store --example hash_backend`
 
-use sha2::Digest;
 use std::time::Instant;
+
+use sha2::Digest;
 
 const SAMPLE_BYTES: usize = 64 * 1024 * 1024;
 const TREE_HASH_CHUNK: usize = 64 * 1024;

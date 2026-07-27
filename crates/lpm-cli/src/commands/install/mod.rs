@@ -1333,6 +1333,7 @@ async fn run_with_options_under_store_lock(
         advisor_session,
         auto_build_attempted,
         blocked_capture,
+        baseline_index,
         blocked_metadata_ms: wf_tail_blocked_metadata_ms,
         trust_snapshot_ms: wf_tail_trust_snapshot_ms,
     } = run_online_lifecycle_prepare_phase(OnlineLifecyclePrepareInput {
@@ -1571,6 +1572,7 @@ async fn run_with_options_under_store_lock(
         blocked_set_metadata: &blocked_set_metadata,
         requested_capabilities: &install_requested_capabilities,
         user_bound: &install_user_bound,
+        baseline_index: baseline_index.as_ref(),
     })
     .await?;
     if let Some(bin_linked) = bin_linked {

@@ -503,7 +503,7 @@ pub fn compute_blocked_packages_with_metadata(
         metadata,
         requested_capabilities,
         user_bound,
-        BlockedPackageComputationExtras {
+        BlockedSetCaptureOptions {
             advisor_approvals,
             execution_exclusions: None,
             baseline_index: None,
@@ -511,11 +511,12 @@ pub fn compute_blocked_packages_with_metadata(
     )
 }
 
-struct BlockedPackageComputationExtras<'a> {
-    advisor_approvals:
+pub(crate) struct BlockedSetCaptureOptions<'a> {
+    pub(crate) advisor_approvals:
         Option<&'a std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>>,
-    execution_exclusions: Option<&'a HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
-    baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
+    pub(crate) execution_exclusions:
+        Option<&'a HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
+    pub(crate) baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
 }
 
 fn compute_blocked_packages_with_metadata_and_baseline(
@@ -525,7 +526,7 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     metadata: &BlockedSetMetadata,
     requested_capabilities: &crate::capability::CapabilitySet,
     user_bound: &crate::capability::UserBound,
-    extras: BlockedPackageComputationExtras<'_>,
+    extras: BlockedSetCaptureOptions<'_>,
 ) -> Vec<BlockedPackage> {
     use rayon::prelude::*;
 
@@ -721,7 +722,7 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     blocked
 }
 
-fn resolve_blocked_package_dir(
+pub(crate) fn resolve_blocked_package_dir(
     store: &PackageStore,
     name: &str,
     version: &str,
@@ -845,6 +846,33 @@ pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
         None
     };
 
+    capture_blocked_set_after_install_with_options(
+        project_dir,
+        store,
+        installed,
+        policy,
+        metadata,
+        requested_capabilities,
+        user_bound,
+        BlockedSetCaptureOptions {
+            advisor_approvals,
+            execution_exclusions,
+            baseline_index: baseline_index.as_ref(),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_blocked_set_after_install_with_options(
+    project_dir: &Path,
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    options: BlockedSetCaptureOptions<'_>,
+) -> Result<BlockedSetCapture, LpmError> {
     let blocked = compute_blocked_packages_with_metadata_and_baseline(
         store,
         installed,
@@ -852,11 +880,7 @@ pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
         metadata,
         requested_capabilities,
         user_bound,
-        BlockedPackageComputationExtras {
-            advisor_approvals,
-            execution_exclusions,
-            baseline_index: baseline_index.as_ref(),
-        },
+        options,
     );
     let fingerprint = compute_blocked_set_fingerprint(&blocked);
 

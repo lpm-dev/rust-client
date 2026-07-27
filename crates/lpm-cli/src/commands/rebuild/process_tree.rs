@@ -206,27 +206,58 @@ pub(super) fn wait_with_timeout(
 #[cfg(all(test, unix))]
 mod wait_with_timeout_tests {
     use super::wait_with_timeout;
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
     #[test]
-    fn wait_with_timeout_returns_promptly_for_short_lived_children() {
+    fn wait_with_timeout_returns_success_for_short_lived_child() {
+        let child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let status = wait_with_timeout(child, &Duration::from_secs(5))
+            .expect("short-lived child should exit normally");
+
+        assert!(status.success());
+    }
+
+    #[test]
+    fn wait_with_timeout_kills_and_reaps_long_lived_child() {
+        let mut command = Command::new("sleep");
+        command.arg("30").process_group(0);
+        let child = command.spawn().expect("spawn long-lived child");
+        let pid = child.id();
+
+        let error = wait_with_timeout(child, &Duration::from_millis(10))
+            .expect_err("long-lived child should time out");
+        assert!(error.starts_with("timeout after "));
+
+        // SAFETY: `pid` came from the child this test spawned. A second
+        // non-blocking wait can only report whether that child was reaped.
+        let wait_result =
+            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
+        let wait_error = std::io::Error::last_os_error();
+        assert_eq!(wait_result, -1);
+        assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[test]
+    #[ignore = "manual wall-clock benchmark; scheduler-sensitive by design"]
+    fn wait_with_timeout_manual_benchmark_for_four_short_lived_children() {
         let start = Instant::now();
         for _ in 0..4 {
-            let child = Command::new("sh")
-                .args(["-c", "sleep 0.01"])
-                .spawn()
-                .expect("spawn short-lived child");
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 0.01"]).process_group(0);
+            let child = command.spawn().expect("spawn short-lived child");
             let status = wait_with_timeout(child, &Duration::from_secs(5))
                 .expect("short-lived child should exit normally");
             assert!(status.success());
         }
 
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "four 10ms children should not inherit a 100ms polling floor: {:?}",
-            elapsed
+        eprintln!(
+            "four serial 10 ms lifecycle children: {:?}",
+            start.elapsed()
         );
     }
 }

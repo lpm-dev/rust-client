@@ -29,10 +29,19 @@ The SHA assembly backend is enabled on non-Windows product builds. Windows
 retains the portable software backend because `sha2-asm` does not support
 MSVC's assembler.
 
+After converting the lifecycle timing check into an ignored manual benchmark
+so CI scheduling cannot fail correctness tests, a verification rerun measured
+70.088750 ms for the same four children (5.96× faster than the 417.999875 ms
+polling baseline). The product implementation is unchanged from the 63.953208
+ms result in the table.
+
 For the profiled 811-package add case, registry metadata candidates fall from
 811 packages to the 9 packages that contain lifecycle scripts: 802 fewer
 metadata lookups (98.9%). A unit test pins the candidate rules for scripted,
-script-free, and local-source packages.
+script-free, and local-source packages. V2 installs resolve those candidates
+through the same project-scoped baseline index used by blocked-set capture, and
+reuse that index for any post-build recapture. The workflow regression covers
+cold metadata enrichment plus a warm reinstall after the registry disappears.
 
 ## Allocation reductions
 
@@ -53,8 +62,8 @@ hash and behavioral end-to-end harnesses above include their relevant paths.
 cargo run --release -p lpm-security --example behavioral_hotpath
 cargo run --release -p lpm-store --example hash_backend
 cargo test -p lpm-cli --bin lpm-rs \
-  wait_with_timeout_returns_promptly_for_short_lived_children \
-  -- --test-threads=1
+  wait_with_timeout_manual_benchmark_for_four_short_lived_children \
+  -- --ignored --nocapture --test-threads=1
 ```
 
 The warm-state comparison was a temporary release-mode unit harness so it could

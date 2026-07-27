@@ -29,9 +29,11 @@ fn blocked_set_metadata_candidates_include_only_registry_packages_with_scripts()
         .unwrap();
     }
 
-    assert!(package_requires_blocked_set_metadata(&store, &scripted));
-    assert!(!package_requires_blocked_set_metadata(&store, &plain));
-    assert!(!package_requires_blocked_set_metadata(&store, &local));
+    assert!(package_requires_blocked_set_metadata(
+        &store, None, &scripted
+    ));
+    assert!(!package_requires_blocked_set_metadata(&store, None, &plain));
+    assert!(!package_requires_blocked_set_metadata(&store, None, &local));
 }
 
 #[test]
