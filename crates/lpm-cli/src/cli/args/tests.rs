@@ -42,6 +42,26 @@ fn self_update_help_text_does_not_promise_github_probe() {
 }
 
 #[test]
+fn logout_help_describes_every_remote_resource_revoked() {
+    use clap::CommandFactory;
+
+    let mut cmd = Cli::command();
+    let mut buf = Vec::new();
+    cmd.find_subcommand_mut("logout")
+        .expect("logout subcommand registered")
+        .write_long_help(&mut buf)
+        .expect("write logout help");
+    let help = String::from_utf8(buf).expect("logout help must be UTF-8");
+
+    assert!(
+        help.contains(
+            "Also revoke browser pairings and the current refresh-backed LPM.dev CLI session"
+        ),
+        "logout help must describe the complete remote effect: {help}"
+    );
+}
+
+#[test]
 fn capital_v_sets_version_flag_with_no_subcommand() {
     let cli = Cli::try_parse_from(["lpm", "-V"]).unwrap();
     assert!(cli.version_flag, "-V must set version flag");

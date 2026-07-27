@@ -1,12 +1,14 @@
 ---
 source: tests/workflows/tests/setup_local.rs
-assertion_line: 43
+assertion_line: 48
 expression: envelope
 ---
 {
   "success": true,
   "npmrc_path": "[NPMRC_PATH]",
+  "gitignore_path": "[GITIGNORE_PATH]",
   "proxy": false,
+  "scope": "read",
   "expires_at": "2030-01-02T03:04:05Z",
   "expiry_days": 14,
   "gitignore_updated": true

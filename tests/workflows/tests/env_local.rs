@@ -12,6 +12,43 @@ mod support;
 
 use support::{TempProject, lpm};
 
+#[test]
+fn env_list_and_validate_fail_closed_on_malformed_lpm_json() {
+    let project = TempProject::empty(r#"{"name":"env-config-matrix","version":"1.0.0"}"#);
+    project.write_file("lpm.json", "{ not valid json");
+
+    let list = lpm(&project)
+        .args(["--json", "env", "list"])
+        .output()
+        .expect("run env list with malformed config");
+    assert!(
+        !list.status.success(),
+        "env list must fail closed because aliases and inheritance can change its result:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert_eq!(
+        serde_json::Deserializer::from_slice(&list.stdout)
+            .into_iter::<serde_json::Value>()
+            .count(),
+        1,
+        "JSON mode must emit exactly one document"
+    );
+
+    let validate = lpm(&project)
+        .args(["--json", "env", "validate"])
+        .output()
+        .expect("run config-dependent env validate");
+    assert!(!validate.status.success());
+    assert_eq!(
+        serde_json::Deserializer::from_slice(&validate.stdout)
+            .into_iter::<serde_json::Value>()
+            .count(),
+        1,
+        "JSON mode must emit exactly one document"
+    );
+}
+
 fn write_dotenv(project: &TempProject, file: &str, content: &str) {
     project.write_file(file, content);
 }

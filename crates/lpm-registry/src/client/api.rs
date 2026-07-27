@@ -207,34 +207,69 @@ impl RegistryClient {
         Ok(response)
     }
 
-    /// Revoke the current token on the server.
+    /// Revoke every browser pairing authorized by the current stored session.
     ///
-    /// Posture: `AuthRequired`. The bearer is re-resolved inside the
+    /// Posture: `SessionRequired`. The bearer is re-resolved inside the
+    /// recovery closure so a stale access token gets one refresh and retry.
+    ///
+    /// Calls: POST /api/vault/pair/revoke-all
+    pub async fn revoke_all_pairings(&self) -> Result<(), LpmError> {
+        let url = format!("{}/api/vault/pair/revoke-all", self.base_url);
+
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
+            let response = self
+                .post_json_raw_status(&url, &serde_json::json!({}))
+                .await?;
+            let status = response.status();
+
+            match status {
+                status if status.is_success() => Ok(()),
+                reqwest::StatusCode::UNAUTHORIZED => Err(LpmError::AuthRequired),
+                reqwest::StatusCode::FORBIDDEN => {
+                    let body = read_capped_error_text(response).await;
+                    Err(forbidden_error_from_body(body))
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    let body = read_capped_error_text(response).await;
+                    Err(LpmError::NotFound(body))
+                }
+                _ => {
+                    let body = read_capped_error_text(response).await;
+                    Err(LpmError::Registry(format!(
+                        "pairing revocation failed: HTTP {status}: {body}"
+                    )))
+                }
+            }
+        })
+        .await
+    }
+
+    /// Revoke the current refresh-backed CLI session on the server.
+    ///
+    /// Posture: `SessionRequired`. The bearer is re-resolved inside the
     /// recovery closure so that, on a 401 → refresh → retry, the
     /// rotated token is sent on the second attempt.
     ///
-    /// Calls: POST /api/registry/tokens/revoke
-    pub async fn revoke_token(&self) -> Result<(), LpmError> {
-        let url = format!("{}/api/registry/tokens/revoke", self.base_url);
+    /// Calls: POST /api/cli/revoke
+    pub async fn revoke_session(&self) -> Result<(), LpmError> {
+        let url = format!("{}/api/cli/revoke", self.base_url);
 
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let bearer = self
-                .current_bearer(AuthPosture::AuthRequired)
-                .ok_or_else(|| LpmError::Registry("no token to revoke".to_string()))?;
-            let body = serde_json::json!({ "token": bearer });
+                .current_bearer(AuthPosture::SessionRequired)
+                .ok_or(LpmError::SessionExpired)?;
             let req = self
                 .http
                 .for_url(&url)
                 .await?
                 .post(&url)
-                .bearer_auth(&bearer)
-                .json(&body);
+                .bearer_auth(&bearer);
             let response = self.send_with_retry(req).await?;
             if response.status().is_success() {
                 Ok(())
             } else {
                 Err(LpmError::Registry(format!(
-                    "token revocation failed: {}",
+                    "session revocation failed: {}",
                     response.status()
                 )))
             }

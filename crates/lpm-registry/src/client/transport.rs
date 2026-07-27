@@ -25,6 +25,33 @@ impl RegistryClient {
         self.send_with_retry(req).await
     }
 
+    /// POST JSON once and preserve every HTTP status for the caller.
+    ///
+    /// Use this for idempotent, recoverable mutations whose caller must
+    /// distinguish a bounded 4xx rejection from an ambiguous transport or
+    /// server failure. Network failures are returned without an automatic
+    /// retry so the caller's durable recovery record remains authoritative.
+    pub async fn post_json_raw_status(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.validate_base_url()?;
+        let mut request = self.http.for_url(url).await?.post(url).json(body);
+        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+            request = request.bearer_auth(bearer);
+        }
+        let request = request
+            .build()
+            .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
+        self.http
+            .for_url(request.url().as_str())
+            .await?
+            .execute(request)
+            .await
+            .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+    }
+
     /// Build a GET request with auth headers (defaults to `AuthRequired`
     /// posture). Use `build_get_with_posture` for explicit control.
     ///

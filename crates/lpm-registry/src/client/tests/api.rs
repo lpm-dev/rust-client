@@ -366,8 +366,8 @@ async fn whoami_retries_500_then_succeeds_after_backoff() {
 }
 
 #[tokio::test]
-async fn revoke_token_sends_bearer_auth_header_and_token_body() {
-    use wiremock::matchers::{body_string_contains, header, method, path};
+async fn revoke_session_sends_bearer_auth_header_without_token_body() {
+    use wiremock::matchers::{body_bytes, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
@@ -375,18 +375,18 @@ async fn revoke_token_sends_bearer_auth_header_and_token_body() {
     let client = client.with_token("revoke-me-token");
 
     Mock::given(method("POST"))
-        .and(path("/api/registry/tokens/revoke"))
+        .and(path("/api/cli/revoke"))
         .and(header("authorization", "Bearer revoke-me-token"))
-        .and(body_string_contains("\"token\":\"revoke-me-token\""))
+        .and(body_bytes(Vec::<u8>::new()))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)
         .await;
 
     client
-        .revoke_token()
+        .revoke_session()
         .await
-        .expect("revoke_token should succeed with auth header and token body");
+        .expect("revoke_session should succeed with bearer-only authentication");
 }
 
 #[tokio::test]

@@ -453,7 +453,17 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
     };
 
     let mut config: LpmJsonConfig =
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse lpm.json: {e}"))?;
+        serde_json::from_str(&content).map_err(|error| match error.classify() {
+            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                format!("failed to parse lpm.json: {error}")
+            }
+            serde_json::error::Category::Data => {
+                format!("invalid lpm.json data: {error}")
+            }
+            serde_json::error::Category::Io => {
+                format!("failed to read lpm.json: {error}")
+            }
+        })?;
 
     validated_cert_extra_permitted_dns(&config)?;
 

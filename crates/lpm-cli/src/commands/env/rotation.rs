@@ -1,47 +1,123 @@
 use super::prelude::*;
 
 pub(super) async fn env_rotate_key(
+    args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    if args
+        .iter()
+        .any(|arg| *arg == "--org" || arg.starts_with("--org="))
+    {
+        return Err(LpmError::Script(
+            "`lpm env rotate-key` supports personal vaults only; organization key rotation is not available"
+                .into(),
+        ));
+    }
+    if let Some(argument) = args.first() {
+        return Err(LpmError::Script(format!(
+            "unknown rotate-key argument: {argument}"
+        )));
+    }
+
+    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
     let registry_url = lpm_common::resolve_lpm_registry_url();
     let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
 
-    let secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
-    if secrets.is_empty() {
-        return Err(LpmError::Script("vault is empty, nothing to rotate".into()));
-    }
+    let (raw_json, current_version) =
+        lpm_vault::sync::pull_raw_for_rotation(&registry_url, &auth_token, &vault_id)
+            .await
+            .map_err(LpmError::Script)?;
+    let environment_names = validate_rotation_payload(&raw_json).map_err(LpmError::Script)?;
 
     if !json_output {
         output::info("rotating vault encryption key...");
     }
 
-    // Re-encrypt with new key and push
-    let result = lpm_vault::sync::push(&registry_url, &auth_token, &vault_id, &secrets, None, true)
-        .await
-        .map_err(LpmError::Script)?;
+    let result = lpm_vault::sync::push_raw(
+        &registry_url,
+        &auth_token,
+        &vault_id,
+        &raw_json,
+        Some(current_version),
+        false,
+        None,
+    )
+    .await
+    .map_err(LpmError::Script)?;
 
-    if let Some(version) = result.version {
-        lpm_vault::vault_id::write_personal_sync_version(project_dir, version)
-            .map_err(LpmError::Script)?;
-    }
+    let version = result
+        .version
+        .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
+    lpm_vault::vault_id::write_personal_sync_version(project_dir, version)
+        .map_err(LpmError::Script)?;
 
     if json_output {
         super::response::print_json_value(&serde_json::json!({
             "success": true,
             "status": "rotated",
-            "version": result.version,
+            "version": version,
+            "environment_count": environment_names.len(),
+            "environments": environment_names,
         }));
     } else {
         output::success_line(crate::install_ui::terminal_line!(
-            "encryption key rotated (version {})",
-            install_ui::bold(&result.version.unwrap_or(0).to_string())
+            "encryption key rotated (version {}, preserved {} environment{})",
+            install_ui::bold(&version.to_string()),
+            environment_names.len(),
+            if environment_names.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
+        if !environment_names.is_empty() {
+            output::info(&format!("preserved: {}", environment_names.join(", ")));
+        }
     }
     Ok(())
+}
+
+fn validate_rotation_payload(raw_json: &str) -> Result<Vec<String>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw_json)
+        .map_err(|error| format!("remote vault payload is not valid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "remote vault payload must be a JSON object".to_string())?;
+
+    if let Some(environments) = object.get("environments") {
+        let environments = environments
+            .as_object()
+            .ok_or_else(|| "remote environments payload must be an object".to_string())?;
+        let mut names = Vec::with_capacity(environments.len());
+        for (name, values) in environments {
+            if name.trim().is_empty() {
+                return Err("remote environment names cannot be empty".to_string());
+            }
+            let values = values
+                .as_object()
+                .ok_or_else(|| format!("environment {name:?} must contain a key/value object"))?;
+            if values.values().any(|value| value.as_str().is_none()) {
+                return Err(format!(
+                    "environment {name:?} contains a non-string secret value"
+                ));
+            }
+            names.push(name.clone());
+        }
+        names.sort_unstable();
+        return Ok(names);
+    }
+
+    if object.values().any(|value| value.as_str().is_none()) {
+        return Err(
+            "legacy flat remote vault payload contains a non-string secret value".to_string(),
+        );
+    }
+    Ok(vec!["default".to_string()])
 }
 
 /// Shared classify-then-act helper for every org-vault flow that needs
