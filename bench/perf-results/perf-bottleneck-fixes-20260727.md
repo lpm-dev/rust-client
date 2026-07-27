@@ -25,6 +25,10 @@ both arms. The legacy arm removes only the new binary-sidecar expectation line,
 forcing the prior full TOML validation path. The marker arm records that the
 completed install intentionally has no binary sidecar.
 
+The SHA assembly backend is enabled on non-Windows product builds. Windows
+retains the portable software backend because `sha2-asm` does not support
+MSVC's assembler.
+
 For the profiled 811-package add case, registry metadata candidates fall from
 811 packages to the 9 packages that contain lifecycle scripts: 802 fewer
 metadata lookups (98.9%). A unit test pins the candidate rules for scripted,

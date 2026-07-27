@@ -93,7 +93,7 @@ proptest = "1"
 thiserror = "2"
 
 # Hashing & crypto
-sha2 = { version = "0.10", features = ["asm"] }
+sha2 = "0.10"
 # BLAKE3 is used for v2 store graph-key derivation. It is much faster than
 # SHA-256 on common hardware and runs once per resolved package per install.
 # Content integrity remains SHA-512 SRI per the registry contract.
