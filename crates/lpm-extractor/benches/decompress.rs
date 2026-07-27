@@ -112,6 +112,38 @@ fn flate2_decompress(compressed: &[u8]) -> Vec<u8> {
     out
 }
 
+fn reader_copy_then_libdeflate(compressed: &[u8]) -> Vec<u8> {
+    const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+    let mut reader = std::io::Cursor::new(compressed);
+    let mut buffered = Vec::with_capacity(READ_CHUNK_SIZE);
+    let mut chunk = [0u8; READ_CHUNK_SIZE];
+    loop {
+        let read = reader.read(&mut chunk).unwrap();
+        if read == 0 {
+            break;
+        }
+        buffered.extend_from_slice(&chunk[..read]);
+    }
+    libdeflate_decompress(&buffered)
+}
+
+fn make_high_entropy_gzip(size: usize) -> Vec<u8> {
+    let mut state = 0x4d59_5df4_d0f3_3173u64;
+    let mut payload = Vec::with_capacity(size);
+    while payload.len() < size {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        payload.extend_from_slice(&state.to_le_bytes());
+    }
+    payload.truncate(size);
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&payload).unwrap();
+    encoder.finish().unwrap()
+}
+
 fn bench_decompress(c: &mut Criterion) {
     let sizes = [
         ("small_100KB", 100 * 1024),
@@ -142,5 +174,28 @@ fn bench_decompress(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_decompress);
+fn bench_buffered_input(c: &mut Criterion) {
+    let compressed = make_high_entropy_gzip(16 * 1024 * 1024);
+    let mut group = c.benchmark_group("buffered_input/high_entropy_16MB");
+    group.sample_size(20);
+    group.throughput(criterion::Throughput::Bytes(compressed.len() as u64));
+
+    group.bench_function("direct_slice", |b| {
+        b.iter(|| {
+            let out = libdeflate_decompress(std::hint::black_box(&compressed));
+            std::hint::black_box(out);
+        })
+    });
+
+    group.bench_function("reader_copy", |b| {
+        b.iter(|| {
+            let out = reader_copy_then_libdeflate(std::hint::black_box(&compressed));
+            std::hint::black_box(out);
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_decompress, bench_buffered_input);
 criterion_main!(benches);

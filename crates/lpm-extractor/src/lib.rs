@@ -356,6 +356,30 @@ where
     )
 }
 
+/// Extract an in-memory tarball while inspecting regular file entries.
+///
+/// Unlike [`extract_tarball_from_reader_with_inspector`], this path uses the
+/// supplied compressed slice directly instead of first copying it into a
+/// second buffer.
+pub fn extract_tarball_with_inspector<P, I>(
+    data: &[u8],
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    extract_tarball_from_slice_with_inspector_with_limits(
+        data,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        buffer_predicate,
+        inspector,
+    )
+}
+
 fn extract_tarball_from_reader_with_inspector_with_limits<R, P, I>(
     reader: R,
     target_dir: &Path,
@@ -384,28 +408,71 @@ where
     // into the prefix buffer are hashed once, and any remaining bytes are read
     // from the original reader by the fallback decoder.
     match read_compressed_input(reader, limits.max_buffered_compressed_size)? {
-        CompressedInput::Buffered(compressed) => {
-            match decompress_gzip_libdeflate_with_limits(&compressed, limits)? {
-                BufferedGzipDecode::Decoded(decompressed) => extract_tar_archive_with_inspector(
-                    std::io::Cursor::new(decompressed),
-                    target_dir,
-                    limits,
-                    buffer_predicate,
-                    inspector,
-                    |_| Ok(()),
-                ),
-                BufferedGzipDecode::NeedsStreaming => extract_streaming_gzip_tarball(
-                    std::io::Cursor::new(compressed),
-                    target_dir,
-                    limits,
-                    buffer_predicate,
-                    inspector,
-                ),
-            }
-        }
+        CompressedInput::Buffered(compressed) => extract_buffered_gzip_tarball(
+            &compressed,
+            target_dir,
+            limits,
+            buffer_predicate,
+            inspector,
+        ),
         CompressedInput::Stream(reader) => {
             extract_streaming_gzip_tarball(reader, target_dir, limits, buffer_predicate, inspector)
         }
+    }
+}
+
+fn extract_tarball_from_slice_with_inspector_with_limits<P, I>(
+    data: &[u8],
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    let _span = tracing::info_span!("extractor.extract").entered();
+    if data.len() as u64 > limits.max_buffered_compressed_size {
+        return extract_streaming_gzip_tarball(
+            std::io::Cursor::new(data),
+            target_dir,
+            limits,
+            buffer_predicate,
+            inspector,
+        );
+    }
+
+    extract_buffered_gzip_tarball(data, target_dir, limits, buffer_predicate, inspector)
+}
+
+fn extract_buffered_gzip_tarball<P, I>(
+    compressed: &[u8],
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    match decompress_gzip_libdeflate_with_limits(compressed, limits)? {
+        BufferedGzipDecode::Decoded(decompressed) => extract_tar_archive_with_inspector(
+            std::io::Cursor::new(decompressed),
+            target_dir,
+            limits,
+            buffer_predicate,
+            inspector,
+            |_| Ok(()),
+        ),
+        BufferedGzipDecode::NeedsStreaming => extract_streaming_gzip_tarball(
+            std::io::Cursor::new(compressed),
+            target_dir,
+            limits,
+            buffer_predicate,
+            inspector,
+        ),
     }
 }
 
@@ -1034,9 +1101,9 @@ fn rollback_extraction(
     Err(error)
 }
 
-/// Extract a .tgz from an in-memory byte slice. Delegates to `extract_tarball_from_reader`.
+/// Extract a .tgz directly from an in-memory byte slice.
 pub fn extract_tarball(data: &[u8], target_dir: &Path) -> Result<Vec<PathBuf>, LpmError> {
-    extract_tarball_from_reader(data, target_dir)
+    extract_tarball_with_inspector(data, target_dir, |_, _| false, |_| {})
 }
 
 /// Extract a .tgz from a file on disk. Uses `BufReader` for efficient I/O.
@@ -1343,6 +1410,30 @@ mod tests {
 
         let files = extract_tarball_from_reader_with_inspector_with_limits(
             std::io::Cursor::new(&tgz),
+            dir.path(),
+            limits,
+            |_, _| false,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(files, [PathBuf::from("index.js")]);
+        assert_eq!(std::fs::read(dir.path().join("index.js")).unwrap(), payload);
+    }
+
+    #[test]
+    fn slice_extractor_streams_when_compressed_input_exceeds_buffered_cap() {
+        let payload = b"small package content";
+        let tgz = create_test_tarball("index.js", payload);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_buffered_compressed_size: 8,
+            max_buffered_decompressed_size: 64 * 1024,
+            ..streaming_test_limits()
+        };
+
+        let files = extract_tarball_from_slice_with_inspector_with_limits(
+            &tgz,
             dir.path(),
             limits,
             |_, _| false,

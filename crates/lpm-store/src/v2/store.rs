@@ -716,7 +716,7 @@ impl Store {
         let extract_start = std::time::Instant::now();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
         let extracted_stats = std::cell::RefCell::new(ExtractedObjectStats::default());
-        let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
+        let extract_result = lpm_extractor::extract_tarball_with_inspector(
             tarball_data,
             &tmp_dir,
             lpm_security::behavioral::PackageAnalyzer::should_buffer_source,
