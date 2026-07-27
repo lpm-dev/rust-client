@@ -177,9 +177,46 @@ impl RegistryClient {
             .await
     }
 
+    /// Revoke every browser pairing authorized by the current stored session.
+    ///
+    /// Posture: `SessionRequired`. The bearer is re-resolved inside the
+    /// recovery closure so a stale access token gets one refresh and retry.
+    ///
+    /// Calls: POST /api/vault/pair/revoke-all
+    pub async fn revoke_all_pairings(&self) -> Result<(), LpmError> {
+        let url = format!("{}/api/vault/pair/revoke-all", self.base_url);
+
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
+            let response = self
+                .post_json_raw_status(&url, &serde_json::json!({}))
+                .await?;
+            let status = response.status();
+
+            match status {
+                status if status.is_success() => Ok(()),
+                reqwest::StatusCode::UNAUTHORIZED => Err(LpmError::AuthRequired),
+                reqwest::StatusCode::FORBIDDEN => {
+                    let body = read_capped_error_text(response).await;
+                    Err(forbidden_error_from_body(body))
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    let body = read_capped_error_text(response).await;
+                    Err(LpmError::NotFound(body))
+                }
+                _ => {
+                    let body = read_capped_error_text(response).await;
+                    Err(LpmError::Registry(format!(
+                        "pairing revocation failed: HTTP {status}: {body}"
+                    )))
+                }
+            }
+        })
+        .await
+    }
+
     /// Revoke the current refresh-backed CLI session on the server.
     ///
-    /// Posture: `AuthRequired`. The bearer is re-resolved inside the
+    /// Posture: `SessionRequired`. The bearer is re-resolved inside the
     /// recovery closure so that, on a 401 → refresh → retry, the
     /// rotated token is sent on the second attempt.
     ///

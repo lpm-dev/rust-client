@@ -192,6 +192,73 @@ async fn logout_revoke_uses_the_stored_session_when_lpm_token_is_active() {
 }
 
 #[tokio::test]
+async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
+    let project = TempProject::empty(r#"{"name":"logout-stale-access","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_revoke_all_pairings_for_status("stale-access", 401, 1)
+        .await;
+    mock.with_refresh_expected(
+        "stored-refresh",
+        "rotated-access",
+        "rotated-refresh",
+        "2030-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_revoke_all_pairings_for_status("rotated-access", 200, 1)
+        .await;
+    mock.with_revoke_token("rotated-access").await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("stale-access"),
+            refresh_token: Some("stored-refresh"),
+            session_access_expires_at: None,
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--revoke"])
+        .output()
+        .expect("run logout --revoke with stale stored access");
+
+    assert!(
+        output.status.success(),
+        "logout should refresh and retry before local cleanup:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["pairings_revoked"], true);
+    assert_eq!(json["server_revoked"], true);
+    assert_eq!(json["local_cleared"], true);
+    assert_eq!(json["errors"], serde_json::json!([]));
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "the refreshed stored session must be removed after remote revocation"
+    );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    let paths: Vec<_> = requests
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/api/vault/pair/revoke-all",
+            "/api/cli/refresh",
+            "/api/vault/pair/revoke-all",
+            "/api/cli/revoke",
+        ],
+        "a stale bearer must trigger one refresh before ordered revocation retries"
+    );
+}
+
+#[tokio::test]
 async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

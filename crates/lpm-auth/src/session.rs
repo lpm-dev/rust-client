@@ -416,13 +416,14 @@ impl SessionManager {
         }
     }
 
-    /// Resolve only the refresh-backed session stored for this Registry.
+    /// Create a manager that resolves only the refresh-backed session stored
+    /// for this Registry.
     ///
     /// Explicit flags, `LPM_TOKEN`, and CI credentials are deliberately
-    /// ignored. This is for operations that must act on the stored session
-    /// itself even when another credential has higher request priority.
-    pub async fn bearer_string_for_stored_session(&self) -> Result<String, LpmError> {
-        let stored = Self {
+    /// ignored. Keeping the manager alive lets request clients refresh and
+    /// retry the stored session without falling back to another credential.
+    pub fn stored_session_only(&self) -> Self {
+        Self {
             registry_url: self.registry_url.clone(),
             cached: RwLock::new(None),
             classified: AtomicBool::new(false),
@@ -432,10 +433,7 @@ impl SessionManager {
             http: tokio::sync::OnceCell::new(),
             auth_storage_notice: self.auth_storage_notice.clone(),
             auth_storage_notice_bits: AtomicU8::new(0),
-        };
-        stored
-            .bearer_string_for(AuthRequirement::SessionRequired)
-            .await
+        }
     }
 
     /// **Step-3 transition bridge — do not introduce new callers.**
@@ -1413,7 +1411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_session_bearer_ignores_the_environment_credential() {
+    async fn stored_session_only_ignores_the_environment_credential() {
         let (_home, _env) =
             token_classify_isolate_with_lpm_token(Some("env-token"), CiTokenTestEnv::Cleared);
         let registry = "https://stored-session.invalid";
@@ -1423,7 +1421,8 @@ mod tests {
 
         assert_eq!(mgr.current_source_peek(), Some(TokenSource::EnvVar));
         assert_eq!(
-            mgr.bearer_string_for_stored_session()
+            mgr.stored_session_only()
+                .bearer_string_for(AuthRequirement::SessionRequired)
                 .await
                 .expect("stored session should resolve"),
             "stored-access"

@@ -679,6 +679,19 @@ impl RegistryClient {
         client
     }
 
+    /// Clone the client's transport configuration with one session as the
+    /// exclusive credential source.
+    ///
+    /// The direct-token bridge is cleared so an explicit or environment
+    /// credential from the original client cannot authorize a request if
+    /// the supplied session expires.
+    pub fn clone_with_session_only(&self, session: Arc<SessionManager>) -> Self {
+        let mut client = self.clone_with_config();
+        client.session = Some(session);
+        client.token = None;
+        client
+    }
+
     /// Force `write_metadata_cache` to run the blocking file write
     /// inline on the calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. See the field doc on

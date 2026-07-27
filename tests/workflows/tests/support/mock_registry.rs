@@ -837,13 +837,26 @@ impl MockRegistry {
     }
 
     pub async fn with_revoke_all_pairings_for(&self, bearer_token: &str) -> &Self {
+        self.with_revoke_all_pairings_for_status(bearer_token, 200, 1)
+            .await
+    }
+
+    pub async fn with_revoke_all_pairings_for_status(
+        &self,
+        bearer_token: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        let response = if status == 200 {
+            serde_json::json!({ "success": true })
+        } else {
+            serde_json::json!({ "error": "pairing revocation unauthorized" })
+        };
         Mock::given(method("POST"))
             .and(path("/api/vault/pair/revoke-all"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true
-            })))
-            .expect(1)
+            .respond_with(ResponseTemplate::new(status).set_body_json(response))
+            .expect(expected_calls)
             .mount(&self.server)
             .await;
         self
