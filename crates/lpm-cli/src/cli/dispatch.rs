@@ -61,13 +61,12 @@ pub(crate) fn run() -> Result<()> {
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         )
         .ok();
-        let workspace_json_output = fast_lane.json
-            && (pkg_content_opt
-                .as_deref()
-                .is_some_and(install_state::is_workspace_root_content)
-                || install_state::has_pnpm_workspace_yaml(&cwd));
+        let workspace_root_install = pkg_content_opt
+            .as_deref()
+            .is_some_and(install_state::is_workspace_root_content)
+            || install_state::has_pnpm_workspace_yaml(&cwd);
 
-        if !workspace_json_output && let Some(pkg_content) = pkg_content_opt.as_deref() {
+        if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
             if state.up_to_date {
                 match check_fast_lane_admission(&cwd, pkg_content, fast_lane.json) {
@@ -482,6 +481,8 @@ async fn async_main() -> Result<()> {
         Commands::Install(args) => {
             let lifecycle_args::InstallArgs {
                 packages,
+                recursive,
+                no_recursive,
                 save_dev,
                 omit,
                 prod,
@@ -538,6 +539,11 @@ async fn async_main() -> Result<()> {
                     _ => None,
                 };
             let omit_policy = install_omit_policy_from_cli(&omit, prod);
+            if recursive && global {
+                return Err(lpm_common::LpmError::Script(
+                    "`--recursive` cannot be combined with `--global`.".into(),
+                ));
+            }
             if save_dev && omit_policy.dev {
                 return Err(lpm_common::LpmError::Script(
                     "`-D` / `--save-dev` cannot be combined with `--prod`, \
@@ -854,11 +860,28 @@ async fn async_main() -> Result<()> {
                 save_prefix: parsed_save_prefix,
             };
 
+            if recursive && !packages.is_empty() {
+                return Err(lpm_common::LpmError::Script(
+                    "`--recursive` refreshes workspace package manifests and cannot be combined \
+                     with package specs. Use `lpm install <pkg> --filter <member>` to add packages."
+                        .into(),
+                ));
+            }
+
             if packages.is_empty() {
-                // --filter / -w / --fail-if-no-match only
-                // apply when adding packages. Bare `lpm install` is the
-                // refresh-from-package.json operation and ignores them
-                // (or hard-errors if the user mistakenly passed them).
+                let workspace_root_default = lpm_workspace::read_package_json(
+                    &cwd.join("package.json"),
+                )
+                .map_err(|error| {
+                    lpm_common::LpmError::Script(format!(
+                        "failed to read package.json while detecting workspace install mode: {error}"
+                    ))
+                })?
+                .workspaces
+                .is_some()
+                    || install_state::has_pnpm_workspace_yaml(&cwd);
+                let recursive_install = recursive || (workspace_root_default && !no_recursive);
+
                 if catalog.is_some() {
                     return Err(lpm_common::LpmError::Script(
                         "`--catalog` only applies when adding packages. Pass package specs \
@@ -867,21 +890,21 @@ async fn async_main() -> Result<()> {
                             .into(),
                     ));
                 }
-                if !filter.is_empty()
-                    || !filter_prod.is_empty()
-                    || !changed_files_ignore_pattern.is_empty()
-                    || !test_pattern.is_empty()
-                    || workspace_root
-                    || fail_if_no_match
+                if workspace_root
+                    || (!recursive_install
+                        && (!filter.is_empty()
+                            || !filter_prod.is_empty()
+                            || !changed_files_ignore_pattern.is_empty()
+                            || !test_pattern.is_empty()
+                            || fail_if_no_match))
                 {
                     Err(lpm_common::LpmError::Script(
-                        "`--filter`, `--filter-prod`, `--changed-files-ignore-pattern`, `--test-pattern`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
-                         Pass package specs (e.g., `lpm install react --filter web`) or run `lpm install` \
-                         alone to refresh from package.json."
+                        "`--filter`, `--filter-prod`, `--changed-files-ignore-pattern`, \
+                         `--test-pattern`, and `--fail-if-no-match` require `--recursive` when \
+                         refreshing from package.json. `-w` only applies when adding packages."
                             .into(),
                     ))
                 } else {
-                    // Bare install path.
                     let eff_no_editor =
                         no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
                     let eff_no_sec =
@@ -897,51 +920,88 @@ async fn async_main() -> Result<()> {
                     // without each call site re-implementing it.
                     let cli_linker = linker.map(LinkerCli::into_linker_mode);
 
-                    let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
-                    root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
+                    if recursive_install {
+                        commands::install::run_recursive_workspace_install(
+                            &client,
+                            &cwd,
+                            &filter,
+                            &filter_prod,
+                            &changed_files_ignore_pattern,
+                            &test_pattern,
+                            fail_if_no_match,
+                            commands::install::RecursiveInstallOptions {
+                                json_output: cli.json,
+                                offline,
+                                frozen_lockfile: frozen_lockfile_mode,
+                                force,
+                                allow_new: eff_allow_new,
+                                strict_integrity,
+                                no_engine_strict,
+                                strict_peer_dependencies_override:
+                                    cli_strict_peer_dependencies,
+                                linker_override: cli_linker,
+                                lpm_skills_preference,
+                                no_editor_setup: eff_no_editor,
+                                no_security_summary: eff_no_sec,
+                                auto_build: eff_auto_build,
+                                script_policy_override: cli_script_policy_override,
+                                advisor_override: advisor.clone(),
+                                min_release_age_override,
+                                min_release_age_exclude,
+                                drift_ignore_policy,
+                                verify_policy,
+                                omit_policy,
+                                strict_sandbox: strict_sandbox || paranoid,
+                                no_sandbox,
+                                verbose: cli.verbose,
+                                audit_after_install: eff_audit_after_install,
+                                timing: eff_timing,
+                            },
+                        )
+                        .await
+                    } else {
+                        let root_lifecycle =
+                            commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
+                        root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
 
-                    commands::install::run_with_options(
-                        &client,
-                        &cwd,
-                        cli.json,
-                        offline,
-                        frozen_lockfile_mode,
-                        force,
-                        eff_allow_new,
-                        strict_integrity,
-                        no_engine_strict,
-                        cli_strict_peer_dependencies,
-                        cli_linker,
-                        lpm_skills_preference,
-                        eff_no_editor,
-                        eff_no_sec,
-                        eff_auto_build,
-                        None, // target_set: bare-install path is single-target
-                        None, // direct_versions_out: bare install does not finalize a manifest
-                        None, // requested_add_count: bare install reports the full graph
-                        cli_script_policy_override,
-                        advisor.clone(),
-                        min_release_age_override,
-                        &min_release_age_exclude,
-                        drift_ignore_policy,
-                        verify_policy,
-                        omit_policy,
-                        // collapse `--strict-sandbox`
-                        // and its `--paranoid` alias into a single bool
-                        // before the resolver (the chain inside
-                        // `rebuild::run` already accepts a single
-                        // `strict_sandbox` boolean).
-                        strict_sandbox || paranoid,
-                        no_sandbox,
-                        cli.verbose,
-                        eff_audit_after_install,
-                        eff_timing,
-                        &[],
-                    )
-                    .await?;
+                        commands::install::run_with_options(
+                            &client,
+                            &cwd,
+                            cli.json,
+                            offline,
+                            frozen_lockfile_mode,
+                            force,
+                            eff_allow_new,
+                            strict_integrity,
+                            no_engine_strict,
+                            cli_strict_peer_dependencies,
+                            cli_linker,
+                            lpm_skills_preference,
+                            eff_no_editor,
+                            eff_no_sec,
+                            eff_auto_build,
+                            None,
+                            None,
+                            None,
+                            cli_script_policy_override,
+                            advisor.clone(),
+                            min_release_age_override,
+                            &min_release_age_exclude,
+                            drift_ignore_policy,
+                            verify_policy,
+                            omit_policy,
+                            strict_sandbox || paranoid,
+                            no_sandbox,
+                            cli.verbose,
+                            eff_audit_after_install,
+                            eff_timing,
+                            &[],
+                        )
+                        .await?;
 
-                    commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
-                        .run_after_successful_install(&cwd, cli.json)
+                        commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
+                            .run_after_successful_install(&cwd, cli.json)
+                    }
                 }
             } else if !filter.is_empty() || !filter_prod.is_empty() || workspace_root {
                 // explicit filter or -w flag → workspace-aware path.

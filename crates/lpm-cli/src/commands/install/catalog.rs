@@ -79,7 +79,7 @@ pub(super) fn catalog_save_policy_for_project(
     project_dir: &Path,
     forced_catalog: Option<&str>,
 ) -> Result<CatalogSavePolicy, LpmError> {
-    if let Some(workspace) = lpm_workspace::discover_workspace(project_dir)
+    if let Some(workspace) = crate::workspace_discovery_cache::discover_workspace(project_dir)
         .map_err(|e| LpmError::Registry(format!("failed to discover workspace catalogs: {e}")))?
     {
         return Ok(CatalogSavePolicy::from_package(
@@ -95,17 +95,17 @@ pub(super) fn catalog_save_policy_for_project(
 }
 
 pub(super) fn cleanup_unused_catalogs_after_install(project_dir: &Path) -> Result<bool, LpmError> {
-    let workspace = lpm_workspace::discover_workspace(project_dir)
+    let workspace = crate::workspace_discovery_cache::discover_workspace(project_dir)
         .map_err(|e| LpmError::Registry(format!("failed to discover workspace catalogs: {e}")))?;
 
     let (root_dir, cleanup_enabled, member_dirs) = if let Some(workspace) = workspace {
         let cleanup_enabled = cleanup_unused_catalogs_enabled(&workspace.root_package);
         let member_dirs = workspace
             .members
-            .into_iter()
-            .map(|member| member.path)
+            .iter()
+            .map(|member| member.path.clone())
             .collect();
-        (workspace.root, cleanup_enabled, member_dirs)
+        (workspace.root.clone(), cleanup_enabled, member_dirs)
     } else {
         let pkg_json_path = project_dir.join("package.json");
         let pkg = lpm_workspace::read_package_json(&pkg_json_path)

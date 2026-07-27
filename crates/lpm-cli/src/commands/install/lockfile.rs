@@ -417,6 +417,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) setup_route_table_ms: u128,
     pub(super) emit_timing: bool,
     pub(super) target_set: Option<&'a [String]>,
+    pub(super) emit_install_report: bool,
     pub(super) force_security_floor: bool,
     pub(super) override_set: &'a OverrideSet,
     pub(super) linker_mode: lpm_linker::LinkerMode,
@@ -438,6 +439,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         setup_route_table_ms,
         emit_timing,
         target_set,
+        emit_install_report,
         force_security_floor,
         override_set,
         linker_mode,
@@ -452,7 +454,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         run_policy_extensions(policy_extension_configs, project_dir, &[], json_output).await?;
     let elapsed = start.elapsed();
     let total_ms = elapsed.as_millis();
-    if json_output {
+    if emit_install_report && json_output {
         let mut json = serde_json::json!({
             "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
             "success": true,
@@ -500,7 +502,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         }
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else {
+    } else if emit_install_report {
         output::success("No dependencies to install");
     }
 
@@ -637,6 +639,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) strict_integrity: bool,
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
+    pub(super) emit_install_report: bool,
 }
 
 pub(super) async fn run_offline_install_phase(
@@ -687,6 +690,7 @@ pub(super) async fn run_offline_install_phase(
         strict_integrity,
         compatibility_bin_names,
         dependency_engine_policy,
+        emit_install_report,
     } = input;
 
     if overrides_changed {
@@ -870,6 +874,7 @@ pub(super) async fn run_offline_install_phase(
         emit_timing,
         compatibility_bin_names,
         store_version,
+        emit_install_report,
     )
     .await
 }

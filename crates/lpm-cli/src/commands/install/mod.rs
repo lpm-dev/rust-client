@@ -36,6 +36,7 @@ mod package;
 mod patches;
 mod peer;
 pub(crate) mod policy_extensions;
+mod recursive;
 mod reporting;
 mod resolve;
 mod setup;
@@ -89,6 +90,7 @@ use policy_extensions::{
     policy_extensions_disable_tarball_prefetch,
     reject_remote_tarball_url_deps_with_policy_extensions, run_policy_extensions,
 };
+pub(crate) use recursive::{RecursiveInstallOptions, run_recursive_workspace_install};
 use reporting::*;
 use resolve::experimental as experimental_resolver;
 use resolve::*;
@@ -574,6 +576,7 @@ async fn run_with_options_under_store_lock(
         timing_detail_mode,
         force_security_floor,
         target_set,
+        emit_install_report,
         start,
     })
     .await?;
@@ -689,7 +692,7 @@ async fn run_with_options_under_store_lock(
         override_set,
     } = prepare_override_resolution_state(OverrideResolutionInput {
         package: &pkg,
-        workspace: workspace.as_ref(),
+        workspace: workspace.as_deref(),
         catalog_resolutions: &mut catalog_resolutions,
     })?;
 
@@ -752,6 +755,7 @@ async fn run_with_options_under_store_lock(
             setup_route_table_ms: wf_setup_route_table_ms,
             emit_timing,
             target_set,
+            emit_install_report,
             force_security_floor,
             override_set: &override_set,
             linker_mode,
@@ -844,6 +848,7 @@ async fn run_with_options_under_store_lock(
             strict_integrity,
             compatibility_bin_names,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
+            emit_install_report,
         })
         .await;
     }
@@ -1055,6 +1060,7 @@ async fn run_with_options_under_store_lock(
             &prior_patch_state,
             &current_patch_fingerprint,
             dependency_engine_policy.as_ref(),
+            emit_install_report,
         )
         .await;
     }

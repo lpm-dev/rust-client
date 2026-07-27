@@ -81,8 +81,8 @@ and malformed/legacy marker behavior.
 - Tree snapshots retain `ctime`. Dropping it would weaken tamper detection;
   hardware SHA acceleration instead reduces the unavoidable content-hash
   fallback after archive restore.
-- Recursive workspace install was not added because it is a new command
-  behavior, not a transparent optimization.
+- Recursive workspace install was split into a separately measured follow-up;
+  see `recursive-workspace-install-20260727.md`.
 - Resolver metadata was not made lazy in this pass; that requires a larger
   ownership and cache-format redesign. The avoidable speculative body copy and
   tree-hash allocation were removed now.

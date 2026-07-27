@@ -227,6 +227,7 @@ pub(in crate::commands::install) async fn run(
     prior_patch_state: &Option<patch_state::PatchState>,
     current_patch_fingerprint: &str,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
+    emit_install_report: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::info("using experimental resolver path");
@@ -656,7 +657,7 @@ pub(in crate::commands::install) async fn run(
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
 
-    if json_output {
+    if emit_install_report && json_output {
         let package_json: Vec<serde_json::Value> = install_packages
             .iter()
             .map(|package| {
@@ -743,7 +744,7 @@ pub(in crate::commands::install) async fn run(
             fingerprint_json_value(current_patches.len(), current_patch_fingerprint);
         crate::security_floor::attach_security_posture(&mut json, false);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else {
+    } else if emit_install_report {
         output::success_line(crate::install_ui::terminal_line!(
             "{} packages installed in {}s",
             install_ui::bold(&install_packages.len().to_string()),

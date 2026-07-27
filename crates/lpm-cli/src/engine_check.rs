@@ -39,7 +39,7 @@ use lpm_runtime::effective::{
     Effective, EffectiveNodeResolution, probe_detected_node_fingerprint,
     resolve_detected_node_with_fingerprint,
 };
-use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
+use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -295,10 +295,10 @@ fn enforce_root_with_policy(
 /// `lpm add`'s plain source copy into a manifest-less directory; the
 /// gate skips silently rather than blocking the flow.
 fn resolve_root_package(start_dir: &Path) -> Result<Option<(PathBuf, PackageJson)>, LpmError> {
-    if let Some(ws) = discover_workspace(start_dir)
+    if let Some(ws) = crate::workspace_discovery_cache::discover_workspace(start_dir)
         .map_err(|e| LpmError::Workspace(format!("could not discover workspace: {e}")))?
     {
-        return Ok(Some((ws.root, ws.root_package)));
+        return Ok(Some((ws.root.clone(), ws.root_package.clone())));
     }
     let pkg_json = start_dir.join("package.json");
     if !pkg_json.exists() {

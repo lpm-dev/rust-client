@@ -33,6 +33,7 @@ fn install_workspace_once(project: &TempProject) {
     let output = lpm(project)
         .args([
             "install",
+            "--no-recursive",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
