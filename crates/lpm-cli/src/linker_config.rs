@@ -149,7 +149,10 @@ pub(crate) fn resolve_effective_linker_with_source(
     // chain) we fall through silently to the default rather than fail
     // the install — the install pipeline still works under Hoisted, so
     // the cost of a recoverable I/O blip should not be a hard error.
-    if matches!(lpm_workspace::discover_workspace(project_dir), Ok(Some(_))) {
+    if matches!(
+        crate::workspace_discovery_cache::discover_workspace(project_dir),
+        Ok(Some(_))
+    ) {
         return Ok((
             LinkerMode::Isolated,
             LinkerModeSource::WorkspaceAutoDetected,

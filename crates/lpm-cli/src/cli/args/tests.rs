@@ -87,6 +87,24 @@ fn verbose_long_form_survives() {
 }
 
 #[test]
+fn recursive_install_flag_parses_short_or_long_forms() {
+    for raw in [["lpm", "install", "-r"], ["lpm", "install", "--recursive"]] {
+        let cli = Cli::try_parse_from(raw).expect("recursive install flag should parse");
+        let Some(Commands::Install(args)) = cli.command else {
+            panic!("recursive flag should select install for {raw:?}");
+        };
+        assert!(args.recursive, "recursive flag should be set for {raw:?}");
+    }
+}
+
+#[test]
+fn setup_ci_keeps_its_registry_short_flag() {
+    let cli = Cli::try_parse_from(["lpm", "setup", "ci", "-r", "https://registry.example"])
+        .expect("setup ci registry short flag should remain available");
+    assert!(matches!(cli.command, Some(Commands::Setup(_))));
+}
+
+#[test]
 fn audit_level_rejects_unknown_severity() {
     let error = match Cli::try_parse_from(["lpm", "audit", "--level", "severe"]) {
         Ok(_) => panic!("unknown audit severity must fail during argument parsing"),

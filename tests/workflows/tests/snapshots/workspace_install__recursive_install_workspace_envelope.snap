@@ -1,0 +1,47 @@
+---
+source: tests/workflows/tests/workspace_install.rs
+assertion_line: 243
+expression: envelope
+---
+{
+  "schema_version": 2,
+  "success": true,
+  "recursive": true,
+  "workspace_root": "<workspace>",
+  "duration_ms": "<duration>",
+  "targets": [
+    {
+      "name": "@fixture/core",
+      "path": "<workspace>/packages/core",
+      "kind": "member",
+      "status": "success",
+      "duration_ms": "<duration>"
+    },
+    {
+      "name": "@fixture/unrelated",
+      "path": "<workspace>/packages/unrelated",
+      "kind": "member",
+      "status": "success",
+      "duration_ms": "<duration>"
+    },
+    {
+      "name": "@fixture/web",
+      "path": "<workspace>/packages/web",
+      "kind": "member",
+      "status": "success",
+      "duration_ms": "<duration>"
+    },
+    {
+      "name": "workspace-root",
+      "path": "<workspace>",
+      "kind": "root",
+      "status": "success",
+      "duration_ms": "<duration>"
+    }
+  ],
+  "summary": {
+    "total": 4,
+    "succeeded": 4,
+    "failed": 0
+  }
+}

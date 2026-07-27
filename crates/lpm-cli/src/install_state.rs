@@ -407,7 +407,7 @@ pub fn collect_file_link_manifest_bytes(
     // Errors silently degrade (no workspaces field / unparseable
     // package.json / canonicalize failure) — same posture as the
     // outer walker.
-    if let Ok(Some(ws)) = lpm_workspace::discover_workspace(project_dir) {
+    if let Ok(Some(ws)) = crate::workspace_discovery_cache::discover_workspace(project_dir) {
         push_freshness_file(
             ws.root.join("pnpm-workspace.yaml"),
             &mut freshness_files,

@@ -380,6 +380,7 @@ pub(super) async fn run_link_and_finish(
     emit_timing: bool,
     compatibility_bin_names: &[String],
     store_version: lpm_store::StoreVersion,
+    emit_install_report: bool,
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
     let force_security_floor = crate::security_floor::force_security_floor_enabled(global_config);
@@ -687,7 +688,7 @@ pub(super) async fn run_link_and_finish(
         .filter(|a| a.touched_anything())
         .collect();
 
-    if json_output {
+    if emit_install_report && json_output {
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
             .map(|p| {
@@ -779,7 +780,7 @@ pub(super) async fn run_link_and_finish(
         );
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else {
+    } else if emit_install_report {
         // patch summary in human mode.
         // invariant : use the filtered summary so a no-op
         // idempotent rerun does NOT print "Applied 1 patch" with zero

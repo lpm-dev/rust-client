@@ -28,7 +28,7 @@ pub(super) struct WorkspaceMemberLink {
 }
 
 pub(super) struct WorkspaceInstallContext {
-    pub(super) workspace: Option<lpm_workspace::Workspace>,
+    pub(super) workspace: Option<Arc<lpm_workspace::Workspace>>,
     pub(super) workspace_member_deps: Vec<WorkspaceMemberLink>,
     pub(super) direct_workspace_member_deps: Vec<WorkspaceMemberLink>,
     pub(super) all_workspace_members: Vec<WorkspaceMemberLink>,
@@ -42,7 +42,7 @@ pub(super) fn prepare_workspace_install_context(
     requested_v2_mode: bool,
     json_output: bool,
 ) -> Result<WorkspaceInstallContext, LpmError> {
-    let workspace = lpm_workspace::discover_workspace(project_dir)
+    let workspace = crate::workspace_discovery_cache::discover_workspace(project_dir)
         .ok()
         .flatten();
 
@@ -67,7 +67,7 @@ pub(super) fn prepare_workspace_install_context(
         (Vec::new(), catalog_resolutions)
     };
 
-    let all_workspace_members = all_workspace_members(workspace.as_ref());
+    let all_workspace_members = all_workspace_members(workspace.as_deref());
 
     pre_extract_file_link_workspace_members(
         deps,
@@ -864,7 +864,7 @@ pub(super) fn link_workspace_members(
     }
 
     let mut node_modules_roots = vec![project_dir.join("node_modules")];
-    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir)
+    if let Ok(Some(workspace)) = crate::workspace_discovery_cache::discover_workspace(project_dir)
         && workspace.root != project_dir
     {
         node_modules_roots.push(workspace.root.join("node_modules"));

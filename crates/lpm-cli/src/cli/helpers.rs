@@ -76,8 +76,40 @@ where
         args.insert(1, std::ffi::OsString::from("dlx"));
         return args;
     }
+    move_leading_recursive_flag_after_install(&mut args);
     insert_run_file_command_for_naked_source(&mut args);
     args
+}
+
+fn move_leading_recursive_flag_after_install(args: &mut Vec<std::ffi::OsString>) {
+    let mut index = 1;
+    let mut recursive_indices = Vec::new();
+
+    while index < args.len() {
+        let arg = args[index].as_os_str();
+        if arg == std::ffi::OsStr::new("--") {
+            return;
+        }
+        if matches!(arg.to_str(), Some("-r" | "--recursive")) {
+            recursive_indices.push(index);
+            index += 1;
+            continue;
+        }
+        if let Some(skip) = top_level_global_flag_width(arg) {
+            index += skip;
+            continue;
+        }
+        if !matches!(arg.to_str(), Some("install" | "i")) {
+            return;
+        }
+
+        for recursive_index in recursive_indices.into_iter().rev() {
+            let flag = args.remove(recursive_index);
+            index -= 1;
+            args.insert(index + 1, flag);
+        }
+        return;
+    }
 }
 
 fn insert_run_file_command_for_naked_source(args: &mut Vec<std::ffi::OsString>) {
@@ -182,7 +214,9 @@ pub(super) fn clap_help_hint_from_argv(args: &[std::ffi::OsString]) -> Option<St
         }
 
         match value {
-            "--json" | "--verbose" | "--insecure" | "-V" | "-v" => continue,
+            "--json" | "--recursive" | "-r" | "--verbose" | "--insecure" | "-V" | "-v" => {
+                continue;
+            }
             "--registry" | "--token" | "--color" => {
                 skip_next = true;
                 continue;
@@ -683,6 +717,22 @@ mod tests {
 
         assert_eq!(args.package, "cowsay");
         assert_eq!(args.args, vec!["--version"]);
+    }
+
+    #[test]
+    fn args_for_cli_parse_moves_leading_recursive_flag_to_install() {
+        for raw in [
+            &["lpm", "-r", "install"][..],
+            &["lpm", "--recursive", "i"][..],
+            &["lpm", "--json", "-r", "install"][..],
+        ] {
+            let args = args_for_cli_parse(raw.iter().map(std::ffi::OsString::from));
+            let cli = Cli::try_parse_from(args).expect("leading recursive flag should parse");
+            let Some(Commands::Install(args)) = cli.command else {
+                panic!("leading recursive flag should select install for {raw:?}");
+            };
+            assert!(args.recursive, "recursive flag should be set for {raw:?}");
+        }
     }
 
     #[test]

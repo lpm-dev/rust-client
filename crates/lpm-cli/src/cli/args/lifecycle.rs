@@ -29,6 +29,17 @@ pub(crate) struct InstallArgs {
     /// If omitted, installs all dependencies from package.json.
     pub(crate) packages: Vec<String>,
 
+    /// Install every package in the owning workspace.
+    ///
+    /// Discovers the workspace once, installs members in dependency order,
+    /// and installs the workspace root last.
+    #[arg(short = 'r', long)]
+    pub(crate) recursive: bool,
+
+    /// Install only the current project, even at a workspace root.
+    #[arg(long, conflicts_with = "recursive")]
+    pub(crate) no_recursive: bool,
+
     /// Save as devDependencies instead of dependencies.
     #[arg(long, short = 'D')]
     pub(crate) save_dev: bool,
@@ -346,12 +357,12 @@ pub(crate) struct InstallArgs {
     pub(crate) advisor: Option<String>,
 
     /// Filter workspace members. Same grammar as `lpm run --filter`.
-    /// Only meaningful when adding packages — bare `lpm install`
-    /// (no packages) ignores this flag.
+    /// During a workspace refresh, the selected members' required
+    /// workspace dependency closure is installed as well.
     ///
-    /// Example: `lpm install react --filter web` adds react to
-    /// `packages/web/package.json` and runs the install pipeline at
-    /// `packages/web/`.
+    /// Examples:
+    /// - `lpm install --filter web` refreshes web and its workspace dependencies.
+    /// - `lpm install react --filter web` adds react to web.
     ///
     /// Mutually exclusive with `-w`.
     #[arg(long)]

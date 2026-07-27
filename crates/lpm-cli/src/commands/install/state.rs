@@ -76,6 +76,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) timing_detail_mode: TimingDetailMode,
     pub(super) force_security_floor: bool,
     pub(super) target_set: Option<&'a [String]>,
+    pub(super) emit_install_report: bool,
     pub(super) start: Instant,
 }
 
@@ -191,59 +192,64 @@ pub(super) async fn run_install_freshness_phase(
         }
         let elapsed = input.start.elapsed();
         let total_ms = elapsed.as_millis();
-        if input.json_output {
-            let mut json = serde_json::json!({
-                "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
-                "success": true,
-                "up_to_date": true,
-                "duration_ms": total_ms as u64,
-                "timing": {
-                    "resolve_ms": 0u128,
-                    "fetch_ms": 0u128,
-                    "link_ms": 0u128,
-                    "total_ms": total_ms,
-                    "waterfall": {
-                        "setup_ms": total_ms,
+        if input.emit_install_report {
+            if input.json_output {
+                let mut json = serde_json::json!({
+                    "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
+                    "success": true,
+                    "up_to_date": true,
+                    "duration_ms": total_ms as u64,
+                    "timing": {
                         "resolve_ms": 0u128,
-                        "pre_fetch_ms": 0u128,
                         "fetch_ms": 0u128,
-                        "pre_link_ms": 0u128,
                         "link_ms": 0u128,
-                        "link_await_ms": 0u128,
-                        "link_finalize_ms": 0u128,
-                        "tail_ms": 0u128,
                         "total_ms": total_ms,
+                        "waterfall": {
+                            "setup_ms": total_ms,
+                            "resolve_ms": 0u128,
+                            "pre_fetch_ms": 0u128,
+                            "fetch_ms": 0u128,
+                            "pre_link_ms": 0u128,
+                            "link_ms": 0u128,
+                            "link_await_ms": 0u128,
+                            "link_finalize_ms": 0u128,
+                            "tail_ms": 0u128,
+                            "total_ms": total_ms,
+                        },
                     },
-                },
-                "peer_conflicts": [],
-                "peer_issues": peer_issues_json_value(&[], &[]),
-                "security": {
-                    "policy_extensions": policy_extension_stats.to_json(),
-                },
-            });
-            json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
-            if input.timing_detail_mode.enabled() {
-                json["timing"]["detail"] = setup_only_timing_detail_json(
-                    input.timing_detail_mode,
-                    total_ms,
-                    setup_install_state_ms,
-                    0,
+                    "peer_conflicts": [],
+                    "peer_issues": peer_issues_json_value(&[], &[]),
+                    "security": {
+                        "policy_extensions": policy_extension_stats.to_json(),
+                    },
+                });
+                json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
+                if input.timing_detail_mode.enabled() {
+                    json["timing"]["detail"] = setup_only_timing_detail_json(
+                        input.timing_detail_mode,
+                        total_ms,
+                        setup_install_state_ms,
+                        0,
+                    );
+                }
+                if !input.emit_timing
+                    && let Some(obj) = json.as_object_mut()
+                {
+                    obj.remove("timing");
+                }
+                if let Some(targets) = input.target_set {
+                    json["target_set"] = serde_json::Value::Array(
+                        targets.iter().map(|s| serde_json::json!(s)).collect(),
+                    );
+                }
+                crate::security_floor::attach_security_posture(
+                    &mut json,
+                    input.force_security_floor,
                 );
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            } else {
+                install_ui::done_untrusted(&format!("Up to date · {total_ms}ms"));
             }
-            if !input.emit_timing
-                && let Some(obj) = json.as_object_mut()
-            {
-                obj.remove("timing");
-            }
-            if let Some(targets) = input.target_set {
-                json["target_set"] = serde_json::Value::Array(
-                    targets.iter().map(|s| serde_json::json!(s)).collect(),
-                );
-            }
-            crate::security_floor::attach_security_posture(&mut json, input.force_security_floor);
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            install_ui::done_untrusted(&format!("Up to date · {total_ms}ms"));
         }
         return Ok(InstallFreshnessResult {
             setup_install_state_ms,

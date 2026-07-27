@@ -68,6 +68,7 @@ mod update_check;
 pub mod upgrade_engine;
 pub mod version_diff;
 mod workspace_concurrency_config;
+mod workspace_discovery_cache;
 mod workspace_filter_config;
 pub mod workspace_select;
 mod xcode_project;

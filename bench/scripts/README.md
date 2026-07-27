@@ -1,5 +1,37 @@
 # Install benchmark scripts
 
+## Recursive workspace install
+
+`recursive-workspace-install-benchmark.mjs` compares one up-to-date root
+workspace install across lpm, Bun, pnpm, and npm. Each manager receives an
+isolated fixture, HOME, cache, and store. The default fixture has 240
+independent, dependency-free members, so the benchmark isolates process
+startup, workspace discovery, lockfile validation, and install dispatch
+without registry or download variance. Samples run round-robin with a rotating
+first manager. LPM, Bun, and npm use the package.json workspace declaration;
+the pnpm fixture additionally includes its required `pnpm-workspace.yaml`.
+
+Build lpm and validate the harness before measuring:
+
+```bash
+cargo build --release --locked -p lpm-cli --bin lpm-rs
+node bench/scripts/recursive-workspace-install-benchmark.mjs --self-test
+```
+
+Run the four-manager comparison:
+
+```bash
+node bench/scripts/recursive-workspace-install-benchmark.mjs \
+  --members 240 \
+  --samples 20 \
+  --managers lpm,bun,pnpm,npm
+```
+
+The harness writes `plan.json`, raw `rows.json`, `summary.json`, and
+`summary.md` to a unique directory under `/tmp` by default. Use `--output` to
+select another artifact directory, `--warmups` to override the three warmup
+rounds, or the manager-specific `--*-bin` options to pin exact binaries.
+
 ## Native lifecycle-build cache
 
 Build the release CLI, then compare strict cache misses, local artifact hits,

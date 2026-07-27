@@ -3094,6 +3094,7 @@ async fn install_experimental_spike_live_graph_links_workspace_member_source() {
         .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
         .args([
             "install",
+            "--no-recursive",
             "--json",
             "--timing",
             "--no-security-summary",
@@ -9486,7 +9487,7 @@ fn assert_root_symlink_missing(project: &TempProject, root_name: &str) {
     );
 }
 
-fn workspace_repeat_fast_lane_project() -> TempProject {
+fn workspace_repeat_project() -> TempProject {
     let project = TempProject::empty(
         r#"{
   "name": "ws-repeat-fast-lane",
@@ -9568,8 +9569,8 @@ fn install_hash_invalidates_on_workspace_member_manifest_change() {
 }
 
 #[test]
-fn workspace_repeat_install_uses_sync_fast_lane_when_unchanged() {
-    let project = workspace_repeat_fast_lane_project();
+fn workspace_repeat_install_reports_the_recursive_target_count() {
+    let project = workspace_repeat_project();
 
     let first = lpm(&project)
         .args(WORKSPACE_INSTALL_FLAGS)
@@ -9598,14 +9599,14 @@ fn workspace_repeat_install_uses_sync_fast_lane_when_unchanged() {
         String::from_utf8_lossy(&second.stderr),
     );
     assert!(
-        combined.contains("up to date ("),
-        "unchanged workspace repeat install should use the sync fast-lane output; got:\n{combined}"
+        combined.contains("Installed 2 workspace packages"),
+        "unchanged workspace repeat install should retain recursive orchestration; got:\n{combined}"
     );
 }
 
 #[test]
-fn workspace_repeat_install_json_keeps_full_pipeline_envelope_when_unchanged() {
-    let project = workspace_repeat_fast_lane_project();
+fn workspace_repeat_install_json_keeps_the_recursive_workspace_envelope() {
+    let project = workspace_repeat_project();
 
     let first = lpm(&project)
         .args(WORKSPACE_INSTALL_FLAGS)
@@ -9630,10 +9631,13 @@ fn workspace_repeat_install_json_keeps_full_pipeline_envelope_when_unchanged() {
     );
     let envelope: serde_json::Value =
         serde_json::from_slice(&second.stdout).expect("install --json must emit JSON");
-    assert_eq!(envelope["up_to_date"], true);
-    assert!(
-        envelope.get("peer_issues").is_some_and(|v| v.is_object()),
-        "workspace --json repeat install must keep the full install envelope; got:\n{envelope}"
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["recursive"], true);
+    assert_eq!(envelope["summary"]["total"], 2);
+    assert_eq!(
+        envelope["targets"].as_array().map(std::vec::Vec::len),
+        Some(2),
+        "workspace --json repeat install must report each recursive target; got:\n{envelope}"
     );
 }
 
