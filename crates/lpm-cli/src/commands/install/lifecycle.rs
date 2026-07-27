@@ -246,6 +246,7 @@ pub(super) struct OnlineLifecyclePrepareResult {
     pub(super) advisor_session: Option<crate::triage_advisor_session::AdvisorSession>,
     pub(super) auto_build_attempted: bool,
     pub(super) blocked_capture: crate::build_state::BlockedSetCapture,
+    pub(super) baseline_index: Option<lpm_store::V2BaselineIndex>,
     pub(super) blocked_metadata_ms: u128,
     pub(super) trust_snapshot_ms: u128,
 }
@@ -277,6 +278,14 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
+        Some(lpm_store::V2BaselineIndex::for_project(
+            project_dir,
+            lpm_root,
+        )?)
+    } else {
+        None
+    };
 
     let blocked_metadata_start = std::time::Instant::now();
     let mut blocked_metadata_ms = 0u128;
@@ -292,7 +301,13 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     } else {
         let metadata = lpm_registry::timing::with_metadata_purpose(
             lpm_registry::timing::MetadataPurpose::BlockedSet,
-            build_blocked_set_metadata(client, route_table, packages),
+            build_blocked_set_metadata(
+                client,
+                route_table,
+                store,
+                baseline_index.as_ref(),
+                packages,
+            ),
         )
         .await;
         blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
@@ -366,7 +381,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     let auto_build_will_execute = auto_build_attempted && !script_policy_cfg.deny_all;
 
     let capture_start = std::time::Instant::now();
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
+    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
         project_dir,
         store,
         &installed_with_integrity,
@@ -374,11 +389,14 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         &blocked_set_metadata,
         &requested_capabilities,
         &user_bound,
-        select_approvals_for_capture(
-            auto_build_will_execute,
-            advisor_session.as_ref().map(|s| s.approvals()),
-        ),
-        store_version,
+        crate::build_state::BlockedSetCaptureOptions {
+            advisor_approvals: select_approvals_for_capture(
+                auto_build_will_execute,
+                advisor_session.as_ref().map(|s| s.approvals()),
+            ),
+            execution_exclusions: None,
+            baseline_index: baseline_index.as_ref(),
+        },
     )?;
     tracing::debug!(
         "perf.capture_blocked_set pkgs={} ms={}",
@@ -407,6 +425,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         advisor_session,
         auto_build_attempted,
         blocked_capture,
+        baseline_index,
         blocked_metadata_ms,
         trust_snapshot_ms,
     })
@@ -435,6 +454,7 @@ pub(super) struct OnlineAutoBuildPhaseInput<'a> {
     pub(super) blocked_set_metadata: &'a crate::build_state::BlockedSetMetadata,
     pub(super) requested_capabilities: &'a crate::capability::CapabilitySet,
     pub(super) user_bound: &'a crate::capability::UserBound,
+    pub(super) baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
 }
 
 pub(super) struct OnlineAutoBuildPhaseResult {
@@ -468,6 +488,7 @@ pub(super) async fn run_online_auto_build_phase(
         blocked_set_metadata,
         requested_capabilities,
         user_bound,
+        baseline_index,
     } = input;
 
     if auto_build_attempted {
@@ -521,19 +542,23 @@ pub(super) async fn run_online_auto_build_phase(
             .iter()
             .cloned()
             .collect::<HashSet<_>>();
-        blocked_capture =
-            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
-                project_dir,
-                store,
-                installed_with_integrity,
-                policy,
-                blocked_set_metadata,
-                requested_capabilities,
-                user_bound,
-                select_approvals_for_capture(true, advisor_session.map(|s| s.approvals())),
-                Some(&execution_exclusions),
-                store_version,
-            )?;
+        blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
+            project_dir,
+            store,
+            installed_with_integrity,
+            policy,
+            blocked_set_metadata,
+            requested_capabilities,
+            user_bound,
+            crate::build_state::BlockedSetCaptureOptions {
+                advisor_approvals: select_approvals_for_capture(
+                    true,
+                    advisor_session.map(|s| s.approvals()),
+                ),
+                execution_exclusions: Some(&execution_exclusions),
+                baseline_index,
+            },
+        )?;
     }
 
     let bin_linked =
@@ -944,6 +969,8 @@ pub(super) fn blocked_set_metadata_from_previous_state(
 pub(super) async fn build_blocked_set_metadata(
     client: &lpm_registry::RegistryClient,
     route_table: &RouteTable,
+    store: &lpm_store::PackageStore,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
     packages: &[InstallPackage],
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
@@ -977,17 +1004,18 @@ pub(super) async fn build_blocked_set_metadata(
     // may carry. Future cleanup may remove the field entirely after a
     // transition window.
     //
-    // Run every package's metadata fetch CONCURRENTLY. The metadata is
-    // still required for `published_at` and `behavioral_tags{,_hash}`,
-    // which ship at install time (used by the version-diff card and
-    // the static-tier fingerprint). Fetching in parallel keeps the metadata
-    // path below the rest of the install pipeline on cold runs.
+    // Only packages with lifecycle scripts can enter the blocked set and
+    // consume this enrichment. Fetch those candidates concurrently.
+    let mut metadata_packages = Vec::with_capacity(packages.len());
+    for package in packages {
+        if package_requires_blocked_set_metadata(store, baseline_index, package) {
+            metadata_packages.push(package);
+        }
+    }
+
     let meta_ns = std::sync::atomic::AtomicU64::new(0);
     let meta_ns_ref = &meta_ns;
-    let entry_futures = packages.iter().map(|p| async move {
-        if install_package_is_local_source(p) {
-            return None;
-        }
+    let entry_futures = metadata_packages.iter().map(|&p| async move {
         // Grab the full PackageMetadata for `time[version]` (→
         // `published_at`) and `versions[version]._behavioralTags` (→
         // `behavioral_tags_hash` + `behavioral_tags`). Errors are
@@ -1094,11 +1122,29 @@ pub(super) async fn build_blocked_set_metadata(
     // would always be `0` and adding noise to the line. The
     // `perf.prov_ns_split` line is correspondingly removed.
     tracing::debug!(
-        "perf.blocked_set_metadata_split pkgs={} meta_sum_ms={}",
+        "perf.blocked_set_metadata_split pkgs={} candidates={} meta_sum_ms={}",
         packages.len(),
+        metadata_packages.len(),
         meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
     );
     out
+}
+
+pub(super) fn package_requires_blocked_set_metadata(
+    store: &lpm_store::PackageStore,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    package: &InstallPackage,
+) -> bool {
+    if install_package_is_local_source(package) {
+        return false;
+    }
+    let package_dir = crate::build_state::resolve_blocked_package_dir(
+        store,
+        &package.name,
+        &package.version,
+        baseline_index,
+    );
+    !crate::build_state::read_install_phase_bodies(&package_dir).is_empty()
 }
 
 // is_install_up_to_date() moved to crate::install_state::check_install_state()

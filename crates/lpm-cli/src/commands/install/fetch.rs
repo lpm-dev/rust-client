@@ -2724,11 +2724,10 @@ pub(super) async fn speculative_download_and_store(
         drop(permit);
         let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
-        let bytes = body.to_vec();
         let integrity_c = integrity.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             v2_clone
-                .extract_object_from_bytes(&bytes, integrity_c.as_deref())
+                .extract_object_from_bytes(&body, integrity_c.as_deref())
                 .map(|_| ())
         })
         .await

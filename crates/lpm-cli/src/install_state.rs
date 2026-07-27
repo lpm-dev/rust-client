@@ -809,13 +809,6 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
         };
     }
 
-    if binary_lockfile_sidecar_needs_refresh(project_dir) {
-        return InstallState {
-            up_to_date: false,
-            hash: Some(current_hash),
-        };
-    }
-
     // D8c — layout-aware freshness gate. If the project is
     // on the legacy `node_modules/.lpm/` wrapper layout but the new
     // `<project>/.lpm/wrappers/` root is empty, the install is NOT
@@ -871,6 +864,16 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
     };
     let cached_hash = cached_hash_file.lines().next().unwrap_or("").trim();
     if cached_hash != current_hash {
+        return InstallState {
+            up_to_date: false,
+            hash: Some(current_hash),
+        };
+    }
+
+    if binary_lockfile_sidecar_needs_refresh(
+        project_dir,
+        binary_sidecar_expectation(&cached_hash_file),
+    ) {
         return InstallState {
             up_to_date: false,
             hash: Some(current_hash),
@@ -1023,7 +1026,7 @@ fn try_mtime_fast_path(
         return None;
     }
 
-    if binary_lockfile_sidecar_needs_refresh(project_dir) {
+    if binary_lockfile_sidecar_needs_refresh(project_dir, binary_sidecar_expectation(&content)) {
         return None;
     }
 
@@ -1059,7 +1062,34 @@ fn mtime_ns(path: &Path) -> Option<u64> {
     Some(dur.as_nanos() as u64)
 }
 
-fn binary_lockfile_sidecar_needs_refresh(project_dir: &Path) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BinarySidecarExpectation {
+    Required,
+    NotRequired,
+}
+
+fn binary_sidecar_expectation(content: &str) -> Option<BinarySidecarExpectation> {
+    let mut expectation = None;
+    for line in content.lines() {
+        let Some(value) = line.strip_prefix("b:") else {
+            continue;
+        };
+        if expectation.is_some() {
+            return None;
+        }
+        expectation = match value {
+            "required" => Some(BinarySidecarExpectation::Required),
+            "not-required" => Some(BinarySidecarExpectation::NotRequired),
+            _ => return None,
+        };
+    }
+    expectation
+}
+
+fn binary_lockfile_sidecar_needs_refresh(
+    project_dir: &Path,
+    expectation: Option<BinarySidecarExpectation>,
+) -> bool {
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if !lockfile_path.exists() {
         return false;
@@ -1068,7 +1098,11 @@ fn binary_lockfile_sidecar_needs_refresh(project_dir: &Path) -> bool {
     let binary_path = lockfile_path.with_extension("lockb");
     match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
         Ok(Some(_)) => binary_lockfile_is_older_than_toml(&lockfile_path, &binary_path),
-        Ok(None) => binary_lockfile_absence_requires_refresh(&lockfile_path),
+        Ok(None) => match expectation {
+            Some(BinarySidecarExpectation::Required) => true,
+            Some(BinarySidecarExpectation::NotRequired) => false,
+            None => binary_lockfile_absence_requires_refresh(&lockfile_path),
+        },
         Err(_) => true,
     }
 }
@@ -1107,11 +1141,11 @@ pub fn write_install_hash(
 }
 
 /// Write `.lpm/install-hash` with the freshness hash plus mtime, linker,
-/// integrity-policy, platform, and dependency-engine metadata. Callers
-/// provide the pre-computed hash, the linker mode, and the v2 object
-/// integrity policy that were effective for the install. The metadata lets
-/// the mtime fast path detect config, host-platform, and dependency-engine
-/// context changes without recomputing the full SHA-256.
+/// integrity-policy, platform, dependency-engine, and binary-sidecar metadata.
+/// Callers provide the pre-computed hash, the linker mode, and the v2 object
+/// integrity policy that were effective for the install. The metadata lets the
+/// mtime fast path detect config, host-platform, and dependency-engine context
+/// changes without recomputing the full SHA-256 or parsing the lockfile.
 ///
 /// On any failure reading an mtime (typically missing lpm.lock on a
 /// dependency-less project), falls back to a `0` sentinel. A mismatch
@@ -1164,7 +1198,81 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     dependency_engine_key: &str,
     node_runtime_fingerprint: Option<&str>,
 ) -> std::io::Result<()> {
-    if node_runtime_fingerprint.is_some_and(|value| !is_node_runtime_fingerprint(value)) {
+    let binary_sidecar_expectation =
+        lpm_lockfile::Lockfile::read_from_file(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
+            .ok()
+            .map(|lockfile| {
+                if lpm_lockfile::binary::binary_format_supports(&lockfile) {
+                    BinarySidecarExpectation::Required
+                } else {
+                    BinarySidecarExpectation::NotRequired
+                }
+            });
+    write_install_hash_with_metadata(
+        project_dir,
+        hash,
+        linker_mode,
+        object_integrity_policy,
+        platform,
+        dependency_engine_key,
+        InstallHashWriteMetadata {
+            node_runtime_fingerprint,
+            binary_sidecar_expectation,
+        },
+    )
+}
+
+pub(crate) struct KnownInstallHashRuntimeState<'a> {
+    pub(crate) node_runtime_fingerprint: Option<&'a str>,
+    pub(crate) binary_sidecar_required: bool,
+}
+
+pub(crate) fn write_install_hash_with_known_runtime_state(
+    project_dir: &Path,
+    hash: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    platform: &PlatformTuple,
+    dependency_engine_key: &str,
+    runtime_state: KnownInstallHashRuntimeState<'_>,
+) -> std::io::Result<()> {
+    let expectation = if runtime_state.binary_sidecar_required {
+        BinarySidecarExpectation::Required
+    } else {
+        BinarySidecarExpectation::NotRequired
+    };
+    write_install_hash_with_metadata(
+        project_dir,
+        hash,
+        linker_mode,
+        object_integrity_policy,
+        platform,
+        dependency_engine_key,
+        InstallHashWriteMetadata {
+            node_runtime_fingerprint: runtime_state.node_runtime_fingerprint,
+            binary_sidecar_expectation: Some(expectation),
+        },
+    )
+}
+
+struct InstallHashWriteMetadata<'a> {
+    node_runtime_fingerprint: Option<&'a str>,
+    binary_sidecar_expectation: Option<BinarySidecarExpectation>,
+}
+
+fn write_install_hash_with_metadata(
+    project_dir: &Path,
+    hash: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    platform: &PlatformTuple,
+    dependency_engine_key: &str,
+    metadata: InstallHashWriteMetadata<'_>,
+) -> std::io::Result<()> {
+    if metadata
+        .node_runtime_fingerprint
+        .is_some_and(|value| !is_node_runtime_fingerprint(value))
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid Node runtime fingerprint",
@@ -1178,10 +1286,15 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     let linker_str = linker_mode.as_str();
     let integrity_policy_str = object_integrity_policy.as_str();
     let platform_str = platform_tuple_key(platform);
-    let node_runtime_fingerprint = node_runtime_fingerprint.unwrap_or("none");
-    let content = format!(
+    let node_runtime_fingerprint = metadata.node_runtime_fingerprint.unwrap_or("none");
+    let mut content = format!(
         "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\n"
     );
+    match metadata.binary_sidecar_expectation {
+        Some(BinarySidecarExpectation::Required) => content.push_str("b:required\n"),
+        Some(BinarySidecarExpectation::NotRequired) => content.push_str("b:not-required\n"),
+        None => {}
+    }
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
     // Manage the "needs-slow-path" sentinel.
@@ -1799,7 +1912,8 @@ mod tests {
     #[test]
     fn write_install_hash_records_all_fast_path_metadata() {
         // Contract: file content is hash + mtime line + linker line + integrity line +
-        // platform line + dependency-engine line.
+        // platform line + dependency-engine line + runtime fingerprint line +
+        // binary-sidecar expectation line.
         // Pins the on-disk format so a v1 reader still gets the hash on
         // line 1 (legacy compat), AND the mtime fast-path can detect
         // post-install config and platform flips without recomputing the full hash.
@@ -1807,7 +1921,9 @@ mod tests {
         let p = dir.path();
         let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "").unwrap();
+        lpm_lockfile::Lockfile::default()
+            .write_to_file(&p.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
         write_install_hash(p, "abc123", lpm_linker::LinkerMode::Hoisted).unwrap();
         let content = fs::read_to_string(p.join(".lpm").join("install-hash")).unwrap();
         let mut lines = content.lines();
@@ -1839,6 +1955,7 @@ mod tests {
         );
         assert_eq!(lines.next(), Some("e:none"));
         assert_eq!(lines.next(), Some("n:none"));
+        assert_eq!(lines.next(), Some("b:required"));
         assert_eq!(lines.next(), None);
     }
 
@@ -1856,6 +1973,58 @@ mod tests {
             content.lines().any(|line| line == "n:none"),
             "install-hash must reserve a stable node runtime fingerprint line: {content:?}"
         );
+    }
+
+    #[test]
+    fn install_hash_records_when_binary_sidecar_is_not_required() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        let mut lockfile = lpm_lockfile::Lockfile::default();
+        lockfile
+            .importers
+            .insert(".".into(), lpm_lockfile::ImporterSnapshot::default());
+        lockfile
+            .write_to_file(&p.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let lock = fs::read_to_string(p.join(lpm_lockfile::LOCKFILE_NAME)).unwrap();
+        let hash = compute_install_hash_v6(
+            r#"{"dependencies":{}}"#,
+            &lock,
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+        );
+
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::Hoisted).unwrap();
+
+        let content = fs::read_to_string(p.join(".lpm").join("install-hash")).unwrap();
+        assert!(content.lines().any(|line| line == "b:not-required"));
+        assert!(check_install_state(p).up_to_date);
+    }
+
+    #[test]
+    fn malformed_binary_sidecar_expectation_falls_back_to_lockfile_validation() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let _home = scoped_home_for(p);
+        let package_json = r#"{"dependencies":{}}"#;
+        fs::write(p.join("package.json"), package_json).unwrap();
+        lpm_lockfile::Lockfile::default()
+            .write_to_file(&p.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let lock = fs::read_to_string(p.join(lpm_lockfile::LOCKFILE_NAME)).unwrap();
+        let hash =
+            compute_install_hash_v6(package_json, &lock, &[], lpm_linker::LinkerMode::Isolated);
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
+        let state_path = p.join(".lpm").join("install-hash");
+        let content = fs::read_to_string(&state_path)
+            .unwrap()
+            .replace("b:required", "b:unknown");
+        fs::write(state_path, content).unwrap();
+
+        assert!(!check_install_state(p).up_to_date);
     }
 
     #[test]

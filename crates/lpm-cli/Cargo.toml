@@ -60,6 +60,7 @@ owo-colors = { workspace = true, features = ["supports-colors"] }
 indicatif = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+wait-timeout = "0.2"
 
 # Auth / secure storage
 aes-gcm = { workspace = true }
