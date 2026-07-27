@@ -2120,15 +2120,41 @@ fn tunnel_local_action_flags_parse_without_a_double_dash_separator() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs { domain, args, .. }) => {
-            assert_eq!(domain.as_deref(), Some("--last"));
-            assert_eq!(
-                args,
-                ["10", "--filter", "stripe", "--status", "4xx"].map(str::to_string)
-            );
+        Commands::Tunnel(network::TunnelArgs {
+            domain,
+            args,
+            last,
+            filter,
+            status,
+            ..
+        }) => {
+            assert!(domain.is_none());
+            assert!(args.is_empty());
+            assert_eq!(last.as_deref(), Some("10"));
+            assert_eq!(filter.as_deref(), Some("stripe"));
+            assert_eq!(status.as_deref(), Some("4xx"));
         }
         _ => panic!("expected Tunnel command"),
     }
+}
+
+#[test]
+fn tunnel_replay_last_parses_without_a_value() {
+    let cli = Cli::try_parse_from(["lpm", "tunnel", "replay", "--last", "--port", "4000"]).unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Tunnel(network::TunnelArgs {
+            last, replay_port, ..
+        }) => {
+            assert_eq!(last.as_deref(), Some("latest"));
+            assert_eq!(replay_port, Some(4000));
+        }
+        _ => panic!("expected Tunnel command"),
+    }
+}
+
+#[test]
+fn tunnel_unknown_direct_flag_is_rejected_by_clap() {
+    assert!(Cli::try_parse_from(["lpm", "tunnel", "inspect", "--not-a-real-flag"]).is_err());
 }
 
 #[test]

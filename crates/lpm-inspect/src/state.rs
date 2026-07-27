@@ -139,11 +139,18 @@ impl InspectorState {
 
     /// Create read-oriented state that observes captures written by another process.
     pub fn with_db_observer(local_port: u16, db: InspectorDb) -> Self {
-        Self::with_database(
+        Self::with_db_observer_for_target(
             lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, local_port),
             db,
-            true,
         )
+    }
+
+    /// Create read-oriented state for a complete replay endpoint.
+    pub fn with_db_observer_for_target(
+        local_target: lpm_common::LocalTarget,
+        db: InspectorDb,
+    ) -> Self {
+        Self::with_database(local_target, db, true)
     }
 
     fn with_database(
@@ -333,7 +340,7 @@ impl InspectorState {
     }
 
     /// Return the current database revision fingerprint.
-    pub async fn database_revision(&self) -> Result<Option<(i64, usize)>, rusqlite::Error> {
+    pub async fn database_revision(&self) -> Result<Option<i64>, rusqlite::Error> {
         match self.inner.db.as_ref() {
             Some(db) => db.revision().await.map(Some),
             None => Ok(None),

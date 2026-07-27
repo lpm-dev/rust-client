@@ -76,7 +76,10 @@ impl InspectorDb {
         // wait gracefully if the write connection holds a lock during batch flushes.
         let read_conn = Connection::open(&db_path)?;
         read_conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;",
         )?;
 
         let (write_tx, write_rx) = mpsc::unbounded_channel();
@@ -114,7 +117,10 @@ impl InspectorDb {
 
         let read_conn = Connection::open(&tmp)?;
         read_conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;",
         )?;
 
         let (write_tx, write_rx) = mpsc::unbounded_channel();
@@ -508,24 +514,27 @@ impl InspectorDb {
         Ok(deleted)
     }
 
-    /// Remove all active capture history from the inspector database.
+    /// Remove captured requests and completed sessions from the inspector database.
+    ///
+    /// Open sessions are retained so another process can continue attaching
+    /// captures without violating the request-to-session foreign key.
     pub async fn clear_history(&self) -> Result<(), rusqlite::Error> {
         let conn = self.read_conn.lock().await;
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM requests_fts", [])?;
         tx.execute("DELETE FROM requests", [])?;
-        tx.execute("DELETE FROM sessions", [])?;
+        tx.execute("DELETE FROM sessions WHERE ended_at IS NOT NULL", [])?;
         tx.commit()
     }
 
-    /// Return a cheap revision fingerprint for external-writer refresh checks.
-    pub async fn revision(&self) -> Result<(i64, usize), rusqlite::Error> {
+    /// Return SQLite's connection-local external-write revision.
+    ///
+    /// `data_version` changes when another connection commits, including
+    /// request, session, and tag mutations. That makes it a better observer
+    /// signal than a request-only row-count fingerprint.
+    pub async fn revision(&self) -> Result<i64, rusqlite::Error> {
         let conn = self.read_conn.lock().await;
-        conn.query_row(
-            "SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM requests",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
     }
 }
 
@@ -599,6 +608,7 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 async fn flush_task(conn: Arc<Mutex<Connection>>, mut rx: mpsc::UnboundedReceiver<DbWrite>) {
     let mut batch: Vec<DbWrite> = Vec::with_capacity(FLUSH_BATCH_SIZE);
+    let mut pending_error: Option<String> = None;
 
     loop {
         // Wait for the first write or channel close
@@ -626,22 +636,26 @@ async fn flush_task(conn: Arc<Mutex<Connection>>, mut rx: mpsc::UnboundedReceive
             }
         }
 
-        flush_pending_batch(&conn, &mut batch).await;
+        flush_pending_batch(&conn, &mut batch, &mut pending_error).await;
     }
 
     // Drain remaining writes on shutdown
     while let Ok(write) = rx.try_recv() {
         batch.push(write);
     }
-    flush_pending_batch(&conn, &mut batch).await;
+    flush_pending_batch(&conn, &mut batch, &mut pending_error).await;
 }
 
-async fn flush_pending_batch(conn: &Arc<Mutex<Connection>>, batch: &mut Vec<DbWrite>) {
+async fn flush_pending_batch(
+    conn: &Arc<Mutex<Connection>>,
+    batch: &mut Vec<DbWrite>,
+    pending_error: &mut Option<String>,
+) {
     if batch.is_empty() {
         return;
     }
 
-    let flush_result = {
+    let current_result = {
         let conn = conn.lock().await;
         match flush_batch(&conn, batch) {
             Ok(()) => Ok(()),
@@ -651,7 +665,18 @@ async fn flush_pending_batch(conn: &Arc<Mutex<Connection>>, batch: &mut Vec<DbWr
             }
         }
     };
-    finish_batch(batch, flush_result);
+    if let Err(error) = current_result
+        && pending_error.is_none()
+    {
+        *pending_error = Some(error);
+    }
+
+    let has_flush_marker = batch.iter().any(|write| matches!(write, DbWrite::Flush(_)));
+    let reported_result = pending_error.clone().map_or(Ok(()), Err);
+    finish_batch(batch, reported_result);
+    if has_flush_marker {
+        *pending_error = None;
+    }
 }
 
 fn finish_batch(batch: &mut Vec<DbWrite>, flush_result: Result<(), String>) {
@@ -1105,6 +1130,68 @@ mod tests {
         assert_eq!(sessions[0].domain, Some("acme.lpm.fyi".to_string()));
         assert_eq!(sessions[0].request_count, 2);
         assert!(sessions[0].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_history_preserves_an_open_session_for_future_captures() {
+        let project = tempfile::tempdir().unwrap();
+        let writer = InspectorDb::open(project.path()).unwrap();
+        let clearer = InspectorDb::open(project.path()).unwrap();
+
+        writer.start_session(
+            "active-session".to_string(),
+            Some("active.lpm.fyi".to_string()),
+            3000,
+        );
+        writer.insert_request(
+            make_webhook("before-clear", 200),
+            Some("active-session".to_string()),
+        );
+        writer.flush_pending_writes().await.unwrap();
+
+        clearer.clear_history().await.unwrap();
+
+        writer.insert_request(
+            make_webhook("after-clear", 201),
+            Some("active-session".to_string()),
+        );
+        writer.flush_pending_writes().await.unwrap();
+
+        assert!(writer.get_webhook("before-clear").await.unwrap().is_none());
+        assert!(writer.get_webhook("after-clear").await.unwrap().is_some());
+        let sessions = writer.list_sessions(10).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "active-session");
+        assert_eq!(sessions[0].request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_flush_reports_a_failure_from_an_earlier_batch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let mut pending_error = None;
+        let mut failed_batch = vec![DbWrite::InsertRequest(
+            Box::new(make_webhook("orphaned-request", 200)),
+            Some("missing-session".to_string()),
+        )];
+
+        flush_pending_batch(&conn, &mut failed_batch, &mut pending_error).await;
+
+        assert!(
+            pending_error
+                .as_deref()
+                .is_some_and(|error| error.contains("FOREIGN KEY")),
+            "the first failed batch must remain pending until an explicit flush"
+        );
+
+        let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
+        let mut marker_batch = vec![DbWrite::Flush(flushed_tx)];
+        flush_pending_batch(&conn, &mut marker_batch, &mut pending_error).await;
+
+        let error = flushed_rx.await.unwrap().unwrap_err();
+        assert!(error.contains("FOREIGN KEY"));
+        assert!(pending_error.is_none());
     }
 
     #[tokio::test]

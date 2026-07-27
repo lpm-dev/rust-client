@@ -382,6 +382,36 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn project_observer_revision_changes_when_an_external_session_starts_and_ends() {
+        let project = tempfile::tempdir().unwrap();
+        let writer =
+            InspectorState::with_db(3000, crate::db::InspectorDb::open(project.path()).unwrap());
+        let observer = InspectorState::with_db_observer(
+            0,
+            crate::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        let before_start = observer.database_revision().await.unwrap();
+
+        writer
+            .start_session(
+                "external-session".to_string(),
+                Some("external.lpm.fyi".to_string()),
+                3000,
+                None,
+            )
+            .await;
+        writer.flush().await.unwrap();
+        let after_start = observer.database_revision().await.unwrap();
+
+        writer.end_session().await;
+        writer.flush().await.unwrap();
+        let after_end = observer.database_revision().await.unwrap();
+
+        assert_ne!(after_start, before_start);
+        assert_ne!(after_end, after_start);
+    }
+
+    #[tokio::test]
     async fn api_request_detail_endpoint() {
         let state = InspectorState::new(3000);
         let port = 14_403;

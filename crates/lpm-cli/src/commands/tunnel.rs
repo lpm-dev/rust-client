@@ -42,12 +42,25 @@ pub async fn run(
     // that port and propagate `AddrInUse` as fatal — that's the documented
     // contract of `--inspect-port N`.
     match action {
-        "claim" => run_claim(client, domain, org, json_output).await,
-        "unclaim" | "release" => run_unclaim(client, domain, org, json_output).await,
-        "list" | "ls" => run_list(client, org, json_output).await,
-        "domains" => run_domains(client, json_output).await,
+        "claim" => {
+            reject_local_options(action, extra_args)?;
+            run_claim(client, domain, org, json_output).await
+        }
+        "unclaim" | "release" => {
+            reject_local_options(action, extra_args)?;
+            run_unclaim(client, domain, org, json_output).await
+        }
+        "list" | "ls" => {
+            reject_local_options(action, extra_args)?;
+            run_list(client, org, json_output).await
+        }
+        "domains" => {
+            reject_local_options(action, extra_args)?;
+            run_domains(client, json_output).await
+        }
         "inspect" => {
             let local_args = local_action_args(domain, extra_args);
+            validate_local_action_args(action, &local_args)?;
             // `lpm tunnel inspect --ui` opens the browser inspector on historical data
             if local_args.contains(&"--ui".to_string()) {
                 return run_inspect_ui(project_dir, inspect_port).await;
@@ -56,13 +69,16 @@ pub async fn run(
         }
         "replay" => {
             let local_args = local_action_args(domain, extra_args);
+            validate_local_action_args(action, &local_args)?;
             run_replay(project_dir, &local_args, port, json_output).await
         }
         "log" | "logs" => {
             let local_args = local_action_args(domain, extra_args);
+            validate_local_action_args(action, &local_args)?;
             run_log(project_dir, &local_args, json_output).await
         }
         "start" | "" => {
+            reject_local_options("start", extra_args)?;
             let local_target = resolve_local_target(port)?;
             run_start(
                 token,
@@ -83,6 +99,7 @@ pub async fn run(
         _ => {
             // If action looks like a port number, treat as start
             if let Ok(p) = action.parse::<u16>() {
+                reject_local_options("start", extra_args)?;
                 let local_target = resolve_local_target(Some(p))?;
                 return run_start(
                     token,
@@ -151,6 +168,133 @@ fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> 
     }
     normalized_args.extend(extra_args.iter().cloned());
     normalized_args
+}
+
+fn reject_local_options(action: &str, args: &[String]) -> Result<(), LpmError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(LpmError::Tunnel(format!(
+        "capture-history options are not valid with `lpm tunnel {action}`"
+    )))
+}
+
+fn validate_local_action_args(action: &str, args: &[String]) -> Result<(), LpmError> {
+    let mut index = 0;
+    let mut replay_index_seen = false;
+
+    while index < args.len() {
+        let raw = &args[index];
+        if !raw.starts_with('-') {
+            if action == "replay"
+                && !replay_index_seen
+                && raw.parse::<usize>().is_ok_and(|value| value > 0)
+            {
+                replay_index_seen = true;
+                index += 1;
+                continue;
+            }
+            return Err(LpmError::Tunnel(format!(
+                "unexpected positional argument for `lpm tunnel {action}`"
+            )));
+        }
+
+        let (spelling, inline_value) = raw
+            .split_once('=')
+            .map_or((raw.as_str(), None), |(flag, value)| (flag, Some(value)));
+        let safe_spelling = lpm_common::sanitize_terminal_inline(spelling);
+        let flag = match spelling {
+            "-n" => "--last",
+            "-d" => "--detail",
+            "-p" => "--port",
+            other => other,
+        };
+        let allowed = match action {
+            "inspect" => matches!(
+                flag,
+                "--ui" | "--last" | "--detail" | "--filter" | "--status"
+            ),
+            "replay" => matches!(flag, "--last" | "--port"),
+            "log" | "logs" => matches!(flag, "--last" | "--filter" | "--status" | "--clear"),
+            _ => false,
+        };
+        if !allowed {
+            return Err(LpmError::Tunnel(format!(
+                "option `{safe_spelling}` is not valid with `lpm tunnel {action}`"
+            )));
+        }
+
+        if matches!(flag, "--ui" | "--clear") {
+            if inline_value.is_some() {
+                return Err(LpmError::Tunnel(format!(
+                    "option `{safe_spelling}` does not take a value"
+                )));
+            }
+            index += 1;
+            continue;
+        }
+
+        if flag == "--last" && action == "replay" {
+            if inline_value.is_some() {
+                return Err(LpmError::Tunnel(
+                    "`lpm tunnel replay --last` does not take a value".to_string(),
+                ));
+            }
+            index += 1;
+            continue;
+        }
+
+        let value = match inline_value {
+            Some(value) if !value.is_empty() => value,
+            Some(_) => {
+                return Err(LpmError::Tunnel(format!(
+                    "option `{safe_spelling}` requires a value"
+                )));
+            }
+            None => args
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    LpmError::Tunnel(format!("option `{safe_spelling}` requires a value"))
+                })?,
+        };
+
+        match flag {
+            "--last" | "--detail" => {
+                if !value.parse::<usize>().is_ok_and(|value| value > 0) {
+                    return Err(LpmError::Tunnel(format!(
+                        "option `{safe_spelling}` requires a positive integer"
+                    )));
+                }
+            }
+            "--port" => {
+                if !value.parse::<u16>().is_ok_and(|value| value > 0) {
+                    return Err(LpmError::Tunnel(
+                        "replay port must be between 1 and 65535".to_string(),
+                    ));
+                }
+            }
+            "--status" => {
+                let named = matches!(value, "2xx" | "3xx" | "4xx" | "5xx" | "error" | "err");
+                let exact = value
+                    .parse::<u16>()
+                    .is_ok_and(|status| (100..=599).contains(&status));
+                if !named && !exact {
+                    let safe_value = lpm_common::sanitize_terminal_inline(value);
+                    return Err(LpmError::Tunnel(format!(
+                        "invalid status filter `{safe_value}`; use 2xx, 3xx, 4xx, 5xx, error, or an HTTP status code"
+                    )));
+                }
+            }
+            "--filter" => {}
+            _ => unreachable!("allowed local action flags are handled above"),
+        }
+
+        index += if inline_value.is_some() { 1 } else { 2 };
+    }
+
+    Ok(())
 }
 
 fn tunnel_ready_json(
@@ -651,7 +795,18 @@ fn project_inspector_state(
     project_dir: &Path,
 ) -> Result<lpm_inspect::state::InspectorState, LpmError> {
     let db = open_inspector_db(project_dir)?;
-    Ok(lpm_inspect::state::InspectorState::with_db_observer(0, db))
+    let sessions = lpm_runner::dev_session::discover_active_sessions()?;
+    let local_target = observer_replay_target(&sessions);
+    Ok(lpm_inspect::state::InspectorState::with_db_observer_for_target(local_target, db))
+}
+
+fn observer_replay_target(
+    sessions: &[lpm_runner::dev_session::ActiveDevSession],
+) -> lpm_common::LocalTarget {
+    match sessions {
+        [session] => session.target.clone(),
+        _ => lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 0),
+    }
 }
 
 // ── Webhook inspect command ─────────────────────────────────────────
@@ -1692,6 +1847,29 @@ mod tests {
     }
 
     #[test]
+    fn local_action_validation_rejects_missing_and_unknown_flags() {
+        let missing = validate_local_action_args("inspect", &["--last".to_string()]).unwrap_err();
+        assert!(missing.to_string().contains("requires a value"));
+
+        let unknown =
+            validate_local_action_args("inspect", &["--not-a-real-flag".to_string()]).unwrap_err();
+        assert!(unknown.to_string().contains("not valid"));
+    }
+
+    #[test]
+    fn local_action_validation_preserves_replay_last_without_a_value() {
+        validate_local_action_args(
+            "replay",
+            &[
+                "--last".to_string(),
+                "--port".to_string(),
+                "4000".to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn active_dev_target_selection_requires_exactly_one_session() {
         let session = |port| lpm_runner::dev_session::ActiveDevSession {
             lpm_pid: 1,
@@ -1710,6 +1888,24 @@ mod tests {
         let multiple = select_active_target(&[session(5173), session(5174)]).unwrap_err();
         assert!(multiple.to_string().contains("multiple active"));
         assert!(multiple.to_string().contains("5173, 5174"));
+    }
+
+    #[test]
+    fn inspector_observer_uses_the_only_active_dev_target() {
+        let session = |port| lpm_runner::dev_session::ActiveDevSession {
+            lpm_pid: 1,
+            owner_pid: Some(2),
+            project_dir: std::path::PathBuf::from(format!("/project-{port}")),
+            service: None,
+            target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+        };
+
+        assert_eq!(observer_replay_target(&[]).port, 0);
+        assert_eq!(observer_replay_target(&[session(5173)]).port, 5173);
+        assert_eq!(
+            observer_replay_target(&[session(5173), session(5174)]).port,
+            0
+        );
     }
 
     #[test]

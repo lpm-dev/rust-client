@@ -2881,8 +2881,40 @@ async fn async_main() -> Result<()> {
                 session,
                 no_inspect,
                 inspect_port,
-                args,
+                ui,
+                last,
+                detail,
+                filter,
+                status,
+                clear,
+                replay_port,
+                mut args,
             } = args;
+            if ui {
+                args.push("--ui".to_string());
+            }
+            if let Some(last) = last {
+                if last == "latest" {
+                    args.push("--last".to_string());
+                } else {
+                    args.push(format!("--last={last}"));
+                }
+            }
+            if let Some(detail) = detail {
+                args.push(format!("--detail={detail}"));
+            }
+            if let Some(filter) = filter {
+                args.push(format!("--filter={filter}"));
+            }
+            if let Some(status) = status {
+                args.push(format!("--status={status}"));
+            }
+            if clear {
+                args.push("--clear".to_string());
+            }
+            if let Some(replay_port) = replay_port {
+                args.push(format!("--port={replay_port}"));
+            }
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {

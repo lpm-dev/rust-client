@@ -31,6 +31,12 @@ pub async fn stream(
     refresh_interval.tick().await;
 
     let stream = async_stream::stream! {
+        // Close the fetch-before-subscribe race in the standalone observer:
+        // once EventSource is established, force one authoritative reload.
+        if observes_database {
+            yield Ok(Event::default().event("refresh").data("{}"));
+        }
+
         loop {
             tokio::select! {
                 received = rx.recv() => match received {

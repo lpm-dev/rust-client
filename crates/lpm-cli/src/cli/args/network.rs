@@ -230,7 +230,6 @@ pub(crate) struct TunnelArgs {
     pub(crate) action: String,
 
     /// Full tunnel domain (e.g., acme-api.lpm.llc) for claim/unclaim/start.
-    #[arg(allow_hyphen_values = true)]
     pub(crate) domain: Option<String>,
 
     /// Organization slug (for org tunnel domains).
@@ -263,7 +262,40 @@ pub(crate) struct TunnelArgs {
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub(crate) inspect_port: Option<u16>,
 
-    /// Extra arguments for webhook subcommands (--last, --filter, --status, etc.).
+    /// Open the standalone browser inspector. Valid with `inspect`.
+    #[arg(long)]
+    pub(crate) ui: bool,
+
+    /// Number of recent captures to show, or select the latest capture for replay.
+    #[arg(
+        long,
+        short = 'n',
+        num_args = 0..=1,
+        default_missing_value = "latest"
+    )]
+    pub(crate) last: Option<String>,
+
+    /// Show one capture by its 1-based list index. Valid with `inspect`.
+    #[arg(long, short = 'd')]
+    pub(crate) detail: Option<usize>,
+
+    /// Filter captures by provider. Valid with `inspect` and `log`.
+    #[arg(long)]
+    pub(crate) filter: Option<String>,
+
+    /// Filter captures by HTTP status or class. Valid with `inspect` and `log`.
+    #[arg(long)]
+    pub(crate) status: Option<String>,
+
+    /// Clear capture history. Valid with `log`.
+    #[arg(long)]
+    pub(crate) clear: bool,
+
+    /// Replay to this local port. Valid with `replay`.
+    #[arg(long = "port", short = 'p', value_parser = clap::value_parser!(u16).range(1..))]
+    pub(crate) replay_port: Option<u16>,
+
+    /// Legacy local-action arguments accepted only after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(crate) args: Vec<String>,
 }
