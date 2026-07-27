@@ -1081,9 +1081,7 @@ fn resolve_env_name(
     let Some(input) = input else {
         return Ok(None);
     };
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let empty = HashMap::new();
     let env_map = config.as_ref().map_or(&empty, |value| &value.env);
     let environments = config

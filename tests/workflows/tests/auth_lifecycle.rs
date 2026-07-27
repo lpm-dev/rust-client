@@ -308,7 +308,7 @@ async fn refresh_only_session_logout_then_startup_does_not_rehydrate_again() {
     .await;
     mock.with_authenticated_whoami("access-from-refresh", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),
@@ -413,7 +413,7 @@ async fn refresh_only_session_logout_all_clears_everything_and_does_not_rehydrat
     .await;
     mock.with_authenticated_whoami("access-from-refresh", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),
@@ -920,7 +920,7 @@ async fn logout_prevents_startup_session_rehydration() {
         .await;
     mock.with_authenticated_whoami("access-after-refresh", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),
@@ -982,7 +982,7 @@ async fn logout_all_clears_lpm_and_external_registry_state() {
 
     mock.with_authenticated_whoami("access-before-logout-all", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),
@@ -1243,7 +1243,7 @@ async fn logout_all_normalizes_malformed_custom_registry_tracking_and_clears_fil
 
     mock.with_authenticated_whoami("access-before-logout-all", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),
@@ -1348,7 +1348,7 @@ async fn logout_clears_recent_token_validation_marker() {
         TempProject::empty(r#"{"name":"auth-logout-token-check-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),

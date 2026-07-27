@@ -627,6 +627,17 @@ impl RegistryClient {
         self
     }
 
+    /// Replace session-backed authentication with an explicit bearer token.
+    ///
+    /// Use this for short-lived credentials minted by an OIDC exchange. An
+    /// attached session otherwise takes precedence over `self.token`, which
+    /// would cause subsequent requests to keep using the pre-exchange bearer.
+    pub fn with_token_override(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(SecretString::from(token.into()));
+        self.session = None;
+        self
+    }
+
     /// Attach the shared `SessionManager` so request methods can fetch a
     /// token / trigger silent refresh on demand. Idempotent — subsequent
     /// calls replace the prior session reference.
@@ -664,6 +675,32 @@ impl RegistryClient {
             worker_metadata_http3_enabled: self.worker_metadata_http3_enabled,
             worker_metadata_http3_client: Arc::clone(&self.worker_metadata_http3_client),
         }
+    }
+
+    /// Clone the client's transport configuration while installing one
+    /// explicit bearer and detaching any refresh-backed session.
+    ///
+    /// Use this when the credential being acted on must authenticate the
+    /// request itself. An attached session otherwise takes precedence over
+    /// `with_token`, which would authorize the request as the wrong principal.
+    pub fn clone_with_static_token(&self, token: impl Into<String>) -> Self {
+        let mut client = self.clone_with_config();
+        client.session = None;
+        client.token = Some(SecretString::from(token.into()));
+        client
+    }
+
+    /// Clone the client's transport configuration with one session as the
+    /// exclusive credential source.
+    ///
+    /// The direct-token bridge is cleared so an explicit or environment
+    /// credential from the original client cannot authorize a request if
+    /// the supplied session expires.
+    pub fn clone_with_session_only(&self, session: Arc<SessionManager>) -> Self {
+        let mut client = self.clone_with_config();
+        client.session = Some(session);
+        client.token = None;
+        client
     }
 
     /// Force `write_metadata_cache` to run the blocking file write

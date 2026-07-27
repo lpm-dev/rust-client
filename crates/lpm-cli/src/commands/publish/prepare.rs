@@ -143,9 +143,7 @@ pub(super) fn read_optional_lpm_config(
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|error| LpmError::Registry(format!("failed to parse {}: {error}", path.display())))
+    crate::lpm_config::parse_and_validate(&path, &content).map(Some)
 }
 
 pub(super) fn detect_publish_ecosystem(
@@ -176,4 +174,45 @@ pub(super) fn detect_publish_ecosystem(
     };
 
     Ok((detected_ecosystem, swift_manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_padded_empty_config(path: &Path, size: usize) {
+        let mut content = vec![b' '; size];
+        content[0] = b'{';
+        content[1] = b'}';
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn lpm_config_at_the_16_mib_local_limit_is_accepted() {
+        let project = tempfile::tempdir().unwrap();
+        write_padded_empty_config(
+            &project.path().join("lpm.config.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize,
+        );
+
+        assert_eq!(
+            read_optional_lpm_config(project.path()).unwrap(),
+            Some(serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn lpm_config_one_byte_over_the_16_mib_local_limit_is_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        write_padded_empty_config(
+            &project.path().join("lpm.config.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize + 1,
+        );
+
+        let error = read_optional_lpm_config(project.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("16777216-byte limit"), "{error}");
+    }
 }

@@ -90,9 +90,11 @@ impl NpmFirewallPreflightClient {
             .ci_oidc
             .get_or_try_init(|| async {
                 let oidc_token =
-                    crate::oidc::exchange_oidc_token(self.base.base_url(), None, "install").await?;
+                    crate::oidc::exchange_oidc_token(self.base.base_url(), None, "read").await?;
                 Ok::<Arc<RegistryClient>, LpmError>(Arc::new(
-                    self.base.clone_with_config().with_token(oidc_token.token),
+                    self.base
+                        .clone_with_config()
+                        .with_token_override(oidc_token.token),
                 ))
             })
             .await?;

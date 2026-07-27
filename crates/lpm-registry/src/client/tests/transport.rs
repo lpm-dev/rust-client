@@ -93,6 +93,55 @@ fn has_bearer_for_posture_detects_attached_session_token() {
     assert!(client.has_bearer_for_posture(AuthPosture::AuthRequired));
 }
 
+#[test]
+fn clone_with_static_token_detaches_the_attached_session() {
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        "https://example.invalid",
+        Some("session-token".to_string()),
+    ));
+    let client = RegistryClient::new().with_session(session);
+
+    let isolated = client.clone_with_static_token("displaced-token");
+
+    assert_eq!(
+        isolated.current_bearer(AuthPosture::AuthRequired),
+        Some("displaced-token".to_string())
+    );
+}
+
+#[test]
+fn clone_with_session_only_drops_the_direct_token_fallback() {
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        "https://example.invalid",
+        Some("stored-session-token".to_string()),
+    ));
+    let client = RegistryClient::new().with_token("environment-bridge-token");
+
+    let isolated = client.clone_with_session_only(session);
+
+    assert!(isolated.token.is_none());
+    assert_eq!(
+        isolated.current_bearer(AuthPosture::SessionRequired),
+        Some("stored-session-token".to_string())
+    );
+}
+
+#[test]
+fn token_override_replaces_attached_session_bearer() {
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
+        "https://example.invalid",
+        Some("session-token".to_string()),
+    ));
+    let client = RegistryClient::new()
+        .with_session(session)
+        .with_token_override("oidc-token");
+
+    assert_eq!(
+        client.current_bearer(AuthPosture::AuthRequired),
+        Some("oidc-token".to_string())
+    );
+}
+
 #[tokio::test]
 async fn execute_with_recovery_propagates_success_unchanged() {
     let client = RegistryClient::new();

@@ -26,7 +26,7 @@
 
 use std::fs;
 use std::process::{Command, Output};
-use wiremock::matchers::{body_partial_json, method, path, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const PACKAGE_NAME: &str = "@lpm.dev/owner.publish-oidc-contract";
@@ -38,6 +38,19 @@ fn write_minimal_project(cwd: &std::path::Path) {
     fs::write(
         cwd.join("package.json"),
         format!(r#"{{"name":"{PACKAGE_NAME}","version":"0.1.0","description":"contract test"}}"#),
+    )
+    .unwrap();
+}
+
+fn write_authored_skill(cwd: &std::path::Path) {
+    let skills_dir = cwd.join(".lpm/skills");
+    fs::create_dir_all(&skills_dir).unwrap();
+    fs::write(
+        skills_dir.join("publish.md"),
+        format!(
+            "---\nname: publish\ndescription: Publishing guidance\n---\n\n{}",
+            "Use this package safely with concrete steps and examples. ".repeat(4)
+        ),
     )
     .unwrap();
 }
@@ -97,6 +110,20 @@ async fn publish_dry_run_lpm_target_exchange_includes_package_field() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("name", PACKAGE_NAME))
+        .and(query_param("version", "0.1.0"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": PACKAGE_NAME,
+            "version": "0.1.0",
+            "packageExists": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_minimal_project(tmp.path());
@@ -139,6 +166,340 @@ async fn publish_dry_run_lpm_target_exchange_includes_package_field() {
         body["package"], PACKAGE_NAME,
         "publish auto-exchange must include `package` — origin requires it for scope=publish"
     );
+}
+
+#[tokio::test]
+async fn multi_target_dry_run_changes_only_the_resolved_lpm_name() {
+    const RESOLVED_NAME: &str = "@lpm.dev/owner.resolved-publish-name";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .and(query_param("scope", "publish"))
+        .and(body_partial_json(serde_json::json!({
+            "token": SUPPLIED_JWT,
+            "package": RESOLVED_NAME,
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": EXCHANGED_TOKEN })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("name", RESOLVED_NAME))
+        .and(query_param("version", "0.1.0"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": RESOLVED_NAME,
+            "version": "0.1.0",
+            "packageExists": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"source-package","version":"0.1.0","description":"contract test"}"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("lpm.json"),
+        format!(r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}}}}}}"#),
+    )
+    .unwrap();
+    let output = spawn_publish(
+        tmp.path(),
+        &server.uri(),
+        &["--dry-run", "--lpm", "--npm", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "resolved-name dry run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let targets = json["targets"].as_array().unwrap();
+    let lpm_target = targets
+        .iter()
+        .find(|target| target["registry"] == "lpm")
+        .unwrap();
+    let npm_target = targets
+        .iter()
+        .find(|target| target["registry"] == "npm")
+        .unwrap();
+    assert_eq!(lpm_target["name"], RESOLVED_NAME);
+    assert_eq!(npm_target["name"], "source-package");
+}
+
+#[tokio::test]
+async fn publish_dry_run_surfaces_oidc_failure_for_resolved_lpm_name() {
+    const RESOLVED_NAME: &str = "@lpm.dev/owner.denied-name";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(serde_json::json!({"error":"publisher policy denied"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    fs::write(
+        tmp.path().join("lpm.json"),
+        format!(r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}}}}}}"#),
+    )
+    .unwrap();
+    let output = spawn_publish(tmp.path(), &server.uri(), &["--dry-run", "--json"]);
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(RESOLVED_NAME))
+    );
+}
+
+#[tokio::test]
+async fn publish_dry_run_human_failure_surfaces_remote_preflight_denial() {
+    const RESOLVED_NAME: &str = "@lpm.dev/owner.human-preflight-denied";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": EXCHANGED_TOKEN })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("name", RESOLVED_NAME))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(serde_json::json!({"error":"version already exists"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    fs::write(
+        tmp.path().join("lpm.json"),
+        format!(r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}}}}}}"#),
+    )
+    .unwrap();
+
+    let output = spawn_publish(tmp.path(), &server.uri(), &["--dry-run"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(RESOLVED_NAME), "{stderr}");
+    assert!(stderr.contains("0.1.0"), "{stderr}");
+    assert!(stderr.contains("version already exists"), "{stderr}");
+}
+
+#[tokio::test]
+async fn publish_dry_run_json_preflight_denial_emits_one_failure_document() {
+    const RESOLVED_NAME: &str = "@lpm.dev/owner.preflight-denied";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": EXCHANGED_TOKEN })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(serde_json::json!({"error":"publisher permission denied"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    fs::write(
+        tmp.path().join("lpm.json"),
+        format!(r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}}}}}}"#),
+    )
+    .unwrap();
+
+    let output = spawn_publish(tmp.path(), &server.uri(), &["--dry-run", "--json"]);
+
+    assert!(!output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be exactly one JSON document");
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(RESOLVED_NAME))
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).trim().is_empty());
+}
+
+#[tokio::test]
+async fn publish_dry_run_surfaces_required_skills_lookup_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": EXCHANGED_TOKEN })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/skills"))
+        .and(query_param("name", "owner.publish-oidc-contract"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("skills unavailable"))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    write_authored_skill(tmp.path());
+
+    let output = spawn_publish(tmp.path(), &server.uri(), &["--dry-run", "--json"]);
+
+    assert!(!output.status.success());
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be one JSON document");
+    assert_eq!(json["success"], false);
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("previously published skills"))
+    );
+}
+
+#[tokio::test]
+async fn first_publish_dry_run_treats_missing_published_skills_as_an_empty_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": EXCHANGED_TOKEN })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/skills"))
+        .and(query_param("name", "owner.publish-oidc-contract"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({ "error": "Package not found" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("name", PACKAGE_NAME))
+        .and(query_param("version", "0.1.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": PACKAGE_NAME,
+            "version": "0.1.0",
+            "packageExists": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    write_authored_skill(tmp.path());
+
+    let output = spawn_publish(tmp.path(), &server.uri(), &["--dry-run", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "first-publish dry run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["success"], true);
+    assert_eq!(json["dry_run"], true);
+}
+
+#[tokio::test]
+async fn first_publish_with_authored_skills_continues_after_missing_published_skills() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": EXCHANGED_TOKEN })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/skills"))
+        .and(query_param("name", "owner.publish-oidc-contract"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({ "error": "Package not found" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "owner",
+            "mfa_enabled": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "message": "Package published"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+    write_authored_skill(tmp.path());
+
+    let output = spawn_publish(tmp.path(), &server.uri(), &["--yes", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "first publish failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["success"], true);
+    assert_eq!(json["results"][0]["success"], true);
 }
 
 #[tokio::test]

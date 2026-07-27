@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -25,6 +27,43 @@ struct JsonResponseSequence {
     bodies: Arc<Mutex<VecDeque<serde_json::Value>>>,
 }
 
+struct JsonResponseAndCreateDirectory {
+    body: serde_json::Value,
+    path: PathBuf,
+}
+
+struct ProjectTokenReplacementResponse {
+    expires_at: String,
+}
+
+struct ProjectTokenReplacementEchoError;
+
+struct ProjectTokenReplacementSequence {
+    failures_remaining: AtomicUsize,
+    expires_at: String,
+}
+
+struct ProjectTokenRetirementSequence {
+    failures_remaining: AtomicUsize,
+}
+
+struct PublishPreflightResponder;
+
+impl Respond for PublishPreflightResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": query.get("name").map_or("", |value| value.as_ref()),
+            "version": query.get("version").map_or("", |value| value.as_ref()),
+            "packageExists": true,
+        }))
+    }
+}
+
 impl Respond for JsonResponseSequence {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let mut bodies = self.bodies.lock().expect("response sequence lock");
@@ -34,6 +73,83 @@ impl Respond for JsonResponseSequence {
             bodies.front().cloned().expect("response sequence body")
         };
         ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+impl Respond for JsonResponseAndCreateDirectory {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        std::fs::create_dir_all(&self.path).expect("create response-side directory");
+        ResponseTemplate::new(200).set_body_json(&self.body)
+    }
+}
+
+impl Respond for ProjectTokenReplacementResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("replacement request body must be JSON");
+        let token_id = body["tokenId"]
+            .as_str()
+            .expect("replacement request must contain tokenId");
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tokenId": token_id,
+            "scope": "read",
+            "expiresAt": self.expires_at,
+            "replaced": body.get("previousTokenId").is_some()
+                || body.get("previousTokenHash").is_some(),
+        }))
+    }
+}
+
+impl Respond for ProjectTokenReplacementEchoError {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("replacement request body must be JSON");
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": format!("replacement rejected for {}", body["token"].as_str().unwrap()),
+        }))
+    }
+}
+
+impl Respond for ProjectTokenReplacementSequence {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({ "error": "ambiguous replacement failure" }));
+        }
+        ProjectTokenReplacementResponse {
+            expires_at: self.expires_at.clone(),
+        }
+        .respond(request)
+    }
+}
+
+impl Respond for ProjectTokenRetirementSequence {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({ "error": "ambiguous retirement failure" }));
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("retirement request body must be JSON");
+        let token_id = body["tokenId"]
+            .as_str()
+            .unwrap_or("33333333-3333-4333-8333-333333333333");
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "revoked": true,
+            "tokenId": token_id,
+        }))
     }
 }
 
@@ -133,6 +249,12 @@ impl MockRegistry {
                 "available": false,
                 "skills": [],
             })))
+            .with_priority(u8::MAX)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(PublishPreflightResponder)
             .with_priority(u8::MAX)
             .mount(&server)
             .await;
@@ -272,17 +394,252 @@ impl MockRegistry {
         token: &str,
         expires_at: &str,
     ) -> &Self {
+        self.with_npmrc_token_create_responses(
+            expiry_days,
+            vec![serde_json::json!({
+                "token": token,
+                "tokenId": "11111111-1111-4111-8111-111111111111",
+                "scope": "read",
+                "expiresAt": expires_at,
+            })],
+        )
+        .await
+    }
+
+    pub async fn with_npmrc_token_create_responses(
+        &self,
+        expiry_days: u32,
+        responses: Vec<serde_json::Value>,
+    ) -> &Self {
+        let expected_calls = responses.len() as u64;
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/create"))
             .and(body_string_contains("\"scope\":\"read\""))
             .and(body_string_contains(format!(
                 "\"expiryDays\":{expiry_days}"
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "token": token,
-                "expiresAt": expires_at,
-            })))
+            .respond_with(JsonResponseSequence {
+                bodies: Arc::new(Mutex::new(responses.into())),
+            })
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_create_then_make_directory(
+        &self,
+        response: serde_json::Value,
+        path_to_create: PathBuf,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/create"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(JsonResponseAndCreateDirectory {
+                body: response,
+                path: path_to_create,
+            })
             .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_revoke(
+        &self,
+        token_id: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        let response = if status == 200 {
+            serde_json::json!({ "revoked": true, "tokenId": token_id })
+        } else {
+            serde_json::json!({ "error": "project token revocation failed" })
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(body_string_contains(format!("\"tokenId\":\"{token_id}\"")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(response))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_self_revoke(
+        &self,
+        token: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        let response = if status == 200 {
+            serde_json::json!({
+                "revoked": true,
+                "tokenId": "33333333-3333-4333-8333-333333333333",
+            })
+        } else {
+            serde_json::json!({ "error": "project token self-revocation failed" })
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"self\":true"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(response))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_self_revoke_error(
+        &self,
+        token: &str,
+        status: u16,
+        error: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"self\":true"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": error })),
+            )
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_create_response(&self, response: serde_json::Value) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/create"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace(
+        &self,
+        expiry_days: u32,
+        expires_at: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .and(body_string_contains(format!(
+                "\"expiryDays\":{expiry_days}"
+            )))
+            .respond_with(ProjectTokenReplacementResponse {
+                expires_at: expires_at.to_string(),
+            })
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_response(&self, response: serde_json::Value) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_error(&self, status: u16) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "error": "replacement rejected" })),
+            )
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_echoed_token_error(&self) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .respond_with(ProjectTokenReplacementEchoError)
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_replace_ambiguous_then_success(
+        &self,
+        expiry_days: u32,
+        expires_at: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains(format!(
+                "\"expiryDays\":{expiry_days}"
+            )))
+            .respond_with(ProjectTokenReplacementSequence {
+                failures_remaining: AtomicUsize::new(1),
+                expires_at: expires_at.to_string(),
+            })
+            .expect(2)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_revoke_hash(
+        &self,
+        token_hash: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(body_string_contains(format!(
+                "\"tokenHash\":\"{token_hash}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "revoked": true,
+                "tokenId": "33333333-3333-4333-8333-333333333333",
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_revoke_ambiguous_then_success(&self, token_hash: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(body_string_contains(format!(
+                "\"tokenHash\":\"{token_hash}\""
+            )))
+            .respond_with(ProjectTokenRetirementSequence {
+                failures_remaining: AtomicUsize::new(1),
+            })
+            .expect(2)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_npmrc_token_self_revoke_ambiguous_then_success(&self, token: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/revoke-project"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains("\"self\":true"))
+            .respond_with(ProjectTokenRetirementSequence {
+                failures_remaining: AtomicUsize::new(1),
+            })
+            .expect(2)
             .mount(&self.server)
             .await;
         self
@@ -502,6 +859,46 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_revoke_all_pairings_for(&self, bearer_token: &str) -> &Self {
+        self.with_revoke_all_pairings_for_status(bearer_token, 200, 1)
+            .await
+    }
+
+    pub async fn with_revoke_all_pairings_for_status(
+        &self,
+        bearer_token: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        let response = if status == 200 {
+            serde_json::json!({ "success": true })
+        } else {
+            serde_json::json!({ "error": "pairing revocation unauthorized" })
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/vault/pair/revoke-all"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(response))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_revoke_all_pairings_status(&self, status: u16) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/pair/revoke-all"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "error": "pairing revocation unavailable"
+                })),
+            )
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a successful token revocation endpoint.
     pub async fn with_revoke_token(&self, bearer_token: &str) -> &Self {
         self.with_revoke_token_expected(bearer_token, 1).await
@@ -514,11 +911,11 @@ impl MockRegistry {
         expected_calls: u64,
     ) -> &Self {
         Mock::given(method("POST"))
-            .and(path("/api/registry/tokens/revoke"))
+            .and(path("/api/cli/revoke"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .and(body_string_contains(bearer_token.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true
+                "status": "revoked",
+                "alreadyRevoked": false
             })))
             .expect(expected_calls)
             .mount(&self.server)
@@ -825,7 +1222,78 @@ impl MockRegistry {
             .expect("failed to encrypt vault payload");
         let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &aes_key)
             .expect("failed to wrap vault payload key");
+        self.mount_personal_pull(
+            vault_id,
+            bearer_token,
+            encrypted_blob,
+            wrapped_key,
+            version,
+            None,
+        )
+        .await
+    }
 
+    pub async fn with_personal_pull_keys(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        payload: serde_json::Value,
+        wrapping_key: &[u8; 32],
+        data_key: &[u8; 32],
+        version: i32,
+    ) -> &Self {
+        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
+        let encrypted_blob = lpm_vault::crypto::encrypt(data_key, plaintext.as_bytes())
+            .expect("failed to encrypt vault payload");
+        let wrapped_key = lpm_vault::crypto::wrap_key(wrapping_key, data_key)
+            .expect("failed to wrap vault payload key");
+        self.mount_personal_pull(
+            vault_id,
+            bearer_token,
+            encrypted_blob,
+            wrapped_key,
+            version,
+            None,
+        )
+        .await
+    }
+
+    pub async fn with_personal_pull_failure(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        payload: serde_json::Value,
+        version: i32,
+        status: u16,
+        error: &str,
+    ) -> &Self {
+        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
+        let data_key = lpm_vault::crypto::generate_aes_key();
+        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
+        let encrypted_blob = lpm_vault::crypto::encrypt(&data_key, plaintext.as_bytes())
+            .expect("failed to encrypt vault payload");
+        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &data_key)
+            .expect("failed to wrap vault payload key");
+        self.mount_personal_pull(
+            vault_id,
+            bearer_token,
+            encrypted_blob,
+            wrapped_key,
+            version,
+            Some((status, error.to_string())),
+        )
+        .await
+    }
+
+    async fn mount_personal_pull(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        encrypted_blob: String,
+        wrapped_key: String,
+        version: i32,
+        push_failure: Option<(u16, String)>,
+    ) -> &Self {
         // Sync endpoints carry an X-LPM-Signature header on success — the
         // CLI hard-fails any 2xx response without it (HMAC verification
         // is mandatory). Sign both GET and POST mock bodies with the
@@ -845,6 +1313,15 @@ impl MockRegistry {
         }))
         .expect("test push body should serialize");
         let push_sig = lpm_vault::signature::sign_body(push_body.as_bytes(), bearer_token);
+        let push_response = match push_failure {
+            Some((status, error)) => {
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": error }))
+            }
+            None => ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/json")
+                .insert_header(lpm_vault::signature::SIGNATURE_HEADER, push_sig.as_str())
+                .set_body_string(push_body),
+        };
 
         Mock::given(method("GET"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
@@ -862,12 +1339,7 @@ impl MockRegistry {
         Mock::given(method("POST"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "application/json")
-                    .insert_header(lpm_vault::signature::SIGNATURE_HEADER, push_sig.as_str())
-                    .set_body_string(push_body),
-            )
+            .respond_with(push_response)
             .mount(&self.server)
             .await;
 
@@ -983,6 +1455,44 @@ impl MockRegistry {
             "success": true,
             "provider": "github",
             "subject": format!("repo:{repo}"),
+        })))
+        .expect(1)
+        .mount(&self.server)
+        .await;
+        self
+    }
+
+    pub async fn with_gitlab_oidc_policy_create(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        project_id: &str,
+        branches: &[&str],
+        envs: &[&str],
+    ) -> &Self {
+        let mut mock = Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains("\"provider\":\"gitlab\""))
+            .and(body_string_contains(format!(
+                "\"subject\":\"project:{project_id}\""
+            )))
+            .and(body_string_contains("\"allowedWorkflows\":[]"))
+            .and(body_string_contains("\"allowedEvents\":[]"))
+            .and(body_string_contains("\"allowForks\":false"));
+
+        for branch in branches {
+            mock = mock.and(body_string_contains(format!("\"{branch}\"")));
+        }
+        for env_name in envs {
+            mock = mock.and(body_string_contains(format!("\"{env_name}\"")));
+        }
+
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "provider": "gitlab",
+            "subject": format!("project:{project_id}"),
         })))
         .expect(1)
         .mount(&self.server)

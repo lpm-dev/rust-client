@@ -18,5 +18,5 @@ fn main() {
 
     lpm_auth::set_token(&registry_url, &access_token)
         .unwrap_or_else(|error| panic!("failed to store access token: {error}"));
-    lpm_auth::clear_refresh_token(&registry_url);
+    let _ = lpm_auth::clear_refresh_token(&registry_url);
 }

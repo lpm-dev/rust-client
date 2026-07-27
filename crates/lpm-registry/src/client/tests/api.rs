@@ -28,6 +28,92 @@ async fn whoami_maps_401_to_auth_required() {
 }
 
 #[tokio::test]
+async fn publish_preflight_sends_resolved_identity_and_bearer_without_mutation() {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("name", "@lpm.dev/owner.resolved"))
+        .and(query_param("version", "1.2.3"))
+        .and(header("authorization", "Bearer publish-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3",
+            "packageExists": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token");
+    let response = client
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .unwrap();
+    assert!(response.success);
+    assert!(response.package_exists);
+}
+
+#[tokio::test]
+async fn publish_preflight_rejects_an_unsuccessful_success_envelope() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("denied"), "{error}");
+}
+
+#[tokio::test]
+async fn publish_preflight_rejects_a_mismatched_response_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/owner.other",
+            "version": "9.9.9"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("mismatched package identity"), "{error}");
+}
+
+#[tokio::test]
 async fn whoami_maps_403_to_forbidden_with_body() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -280,8 +366,8 @@ async fn whoami_retries_500_then_succeeds_after_backoff() {
 }
 
 #[tokio::test]
-async fn revoke_token_sends_bearer_auth_header_and_token_body() {
-    use wiremock::matchers::{body_string_contains, header, method, path};
+async fn revoke_session_sends_bearer_auth_header_without_token_body() {
+    use wiremock::matchers::{body_bytes, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
@@ -289,18 +375,18 @@ async fn revoke_token_sends_bearer_auth_header_and_token_body() {
     let client = client.with_token("revoke-me-token");
 
     Mock::given(method("POST"))
-        .and(path("/api/registry/tokens/revoke"))
+        .and(path("/api/cli/revoke"))
         .and(header("authorization", "Bearer revoke-me-token"))
-        .and(body_string_contains("\"token\":\"revoke-me-token\""))
+        .and(body_bytes(Vec::<u8>::new()))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)
         .await;
 
     client
-        .revoke_token()
+        .revoke_session()
         .await
-        .expect("revoke_token should succeed with auth header and token body");
+        .expect("revoke_session should succeed with bearer-only authentication");
 }
 
 #[tokio::test]

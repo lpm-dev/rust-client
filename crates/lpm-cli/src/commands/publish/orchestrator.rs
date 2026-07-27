@@ -346,9 +346,8 @@ pub async fn run(
     //   asked for and contradicts the documented contract. `--dry-run` IS
     //   honored — it forms part of the LPM-side preflight (alongside the
     //   skills-staleness lookup below) so OIDC trust misconfiguration
-    //   surfaces before a real publish. Note: dry-run does NOT cover the
-    //   later per-target auth checks (whoami/permissions) — those run only
-    //   on a real publish.
+    //   surfaces before a real publish. The dry-run authorization and version
+    //   check runs below; upload-only checks still run only on a real publish.
     //
     // This runs before the skill-staleness check so the first LPM network
     // call uses the exchanged client too.
@@ -357,25 +356,27 @@ pub async fn run(
     // only becomes known after `package.json` is parsed — that's why this
     // can't live in main.rs.
     //
-    // Failure is non-fatal: the original `client` is reused so a missing
-    // OIDC policy or a misconfigured token can still publish via the stored
-    // session token. The failure is debug-logged for diagnostics.
     let oidc_swapped_client;
     let client: &RegistryClient =
         if targets_lpm && !check_only && oidc::registry_exchange_jwt_available() {
-            match oidc::exchange_oidc_token(client.base_url(), Some(&name), "publish").await {
-                Ok(oidc_token) => {
-                    oidc_swapped_client = client.clone_with_config().with_token(oidc_token.token);
-                    if !json_output {
-                        install_ui::phase("Using OIDC-exchanged session token for LPM publish");
-                    }
-                    &oidc_swapped_client
-                }
-                Err(e) => {
-                    tracing::debug!("OIDC publish auto-exchange failed, using stored token: {e}");
-                    client
-                }
+            let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
+                LpmError::Registry("no resolved LPM.dev package name for OIDC exchange".into())
+            })?;
+            let oidc_token =
+                oidc::exchange_oidc_token(client.base_url(), Some(resolved_lpm_name), "publish")
+                    .await
+                    .map_err(|error| {
+                        LpmError::Registry(format!(
+                            "Trusted Publisher exchange failed for {resolved_lpm_name}: {error}"
+                        ))
+                    })?;
+            oidc_swapped_client = client
+                .clone_with_config()
+                .with_token_override(oidc_token.token);
+            if !json_output {
+                install_ui::phase("Using OIDC-exchanged session token for LPM publish");
             }
+            &oidc_swapped_client
         } else {
             client
         };
@@ -388,18 +389,31 @@ pub async fn run(
     // identical to the previously published version") is part of the
     // LPM-side preflight a dry-run is meant to surface.
     if has_skills && targets_lpm && !check_only {
-        let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(&name);
-        match client.get_skills(name_short, None).await {
-            Ok(prev) if !prev.skills.is_empty() => {
-                let local_digest = author::compute_digest(&skills_dir)?;
-                let published_digest = compute_published_skills_digest(&prev.skills);
-                if local_digest == published_digest && !json_output {
-                    install_ui::warn(
-                        "Skills are identical to the previously published version — consider updating them",
-                    );
-                }
+        let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
+            LpmError::Registry("no resolved LPM.dev package name for skills preflight".into())
+        })?;
+        let name_short = resolved_lpm_name
+            .strip_prefix("@lpm.dev/")
+            .unwrap_or(resolved_lpm_name);
+        let prev = match client.get_skills(name_short, None).await {
+            Ok(prev) => Some(prev),
+            Err(LpmError::NotFound(_)) => None,
+            Err(error) => {
+                return Err(LpmError::Registry(format!(
+                    "could not check previously published skills for {resolved_lpm_name}: {error}"
+                )));
             }
-            _ => {}
+        };
+        if let Some(prev) = prev
+            && !prev.skills.is_empty()
+        {
+            let local_digest = author::compute_digest(&skills_dir)?;
+            let published_digest = compute_published_skills_digest(&prev.skills);
+            if local_digest == published_digest && !json_output {
+                install_ui::warn(
+                    "Skills are identical to the previously published version — consider updating them",
+                );
+            }
         }
     }
 
@@ -413,6 +427,19 @@ pub async fn run(
     }
 
     if dry_run {
+        if targets_lpm {
+            let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
+                LpmError::Registry("no resolved LPM.dev package name for publish preflight".into())
+            })?;
+            client
+                .publish_preflight(resolved_lpm_name, &version)
+                .await
+                .map_err(|error| {
+                    LpmError::Registry(format!(
+                        "LPM.dev publish preflight failed for {resolved_lpm_name}@{version}: {error}"
+                    ))
+                })?;
+        }
         if json_output {
             let json = serde_json::json!({
                 "success": true,

@@ -121,9 +121,7 @@ pub(super) fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result
     })?;
 
     // Read config first so we can resolve env aliases
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     // Resolve the env mode through the canonical resolver (e.g., "dev" → "development")
     let empty_env_map = std::collections::HashMap::new();
@@ -174,9 +172,7 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
         })?;
 
     // Get all environment names from lpm.json env mapping
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     // Discover all environments via the canonical resolver.
     // This produces a consistent, deduplicated list from config + vault,

@@ -287,7 +287,11 @@ pub(super) fn print_publish_quality_result(result: &quality::QualityResult) {
         "Quality score: {}/{}",
         result.score, result.max_score
     ));
-    for check in result.checks.iter().filter(|check| !check.passed) {
+    for check in result
+        .checks
+        .iter()
+        .filter(|check| !check.server_only && !check.passed)
+    {
         install_ui::warn_line(format_publish_quality_issue(check));
     }
 }

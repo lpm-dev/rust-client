@@ -18,17 +18,21 @@
 //! - Testing: 11pts
 //! - Health: 36pts
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityResult {
+    /// Locally normalized preflight score. The Registry computes its own final score.
     pub score: u32,
     pub max_score: u32,
+    pub earned_points: u32,
+    pub applicable_points: u32,
     pub checks: Vec<QualityCheck>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QualityCheck {
     pub id: String,
     pub category: String,
@@ -40,6 +44,46 @@ pub struct QualityCheck {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub server_only: bool,
+}
+
+impl Serialize for QualityCheck {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("QualityCheck", 9)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("category", &self.category)?;
+        state.serialize_field("label", &self.label)?;
+        state.serialize_field("passed", &self.passed)?;
+        state.serialize_field("points", &self.points)?;
+        state.serialize_field("max_points", &self.max_points)?;
+        if let Some(detail) = &self.detail {
+            state.serialize_field("detail", detail)?;
+        }
+        if self.server_only {
+            state.serialize_field("server_only", &true)?;
+        }
+        let evaluation = if self.server_only {
+            "not_evaluated"
+        } else if self.passed {
+            "passed"
+        } else {
+            "failed"
+        };
+        state.serialize_field("evaluation", evaluation)?;
+        state.end()
+    }
+}
+
+fn normalize_score(earned_points: u32, applicable_points: u32) -> u32 {
+    if applicable_points == 0 {
+        return 0;
+    }
+    earned_points
+        .saturating_mul(100)
+        .saturating_add(applicable_points / 2)
+        / applicable_points
 }
 
 /// Run all client-side quality checks, dispatching by ecosystem.
@@ -71,13 +115,23 @@ pub fn run_quality_checks(
     // ── Health (36pts) — shared across all ecosystems ──────────────
     push_health_checks(&mut checks, pkg_json, ecosystem);
 
-    // Calculate total
-    let score: u32 = checks.iter().map(|c| c.points).sum();
-    let max_score: u32 = checks.iter().map(|c| c.max_points).sum();
+    let earned_points = checks
+        .iter()
+        .filter(|check| !check.server_only)
+        .map(|check| check.points)
+        .sum();
+    let applicable_points = checks
+        .iter()
+        .filter(|check| !check.server_only)
+        .map(|check| check.max_points)
+        .sum();
+    let score = normalize_score(earned_points, applicable_points);
 
     QualityResult {
         score,
-        max_score,
+        max_score: 100,
+        earned_points,
+        applicable_points,
         checks,
     }
 }
@@ -470,7 +524,7 @@ fn push_swift_code_quality_checks(
         } else {
             Some("No Swift source files found".into())
         },
-        server_only: true,
+        server_only: false,
     });
 
     // has-doc-comments (7pts) — server-side DocC check
@@ -783,6 +837,7 @@ mod tests {
         });
         let result = run_quality_checks(&pkg, None, Path::new("/tmp"), &[], "js", None);
         assert_eq!(result.max_score, 100, "JS total should be 100");
+        assert!(result.applicable_points < 100);
     }
 
     #[test]
@@ -800,6 +855,70 @@ mod tests {
         let result =
             run_quality_checks(&pkg, None, Path::new("/tmp"), &[], "swift", Some(&manifest));
         assert_eq!(result.max_score, 100, "Swift total should be 100");
+        assert!(result.applicable_points < 100);
+    }
+
+    #[test]
+    fn fully_passing_local_js_checks_normalize_to_100() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("tests")).unwrap();
+        let pkg = serde_json::json!({
+            "name": "excellent",
+            "version": "1.0.0",
+            "description": "A well documented package for quality testing",
+            "keywords": ["quality"],
+            "repository": "https://example.invalid/repo",
+            "homepage": "https://example.invalid",
+            "license": "MIT",
+            "type": "module",
+            "types": "index.d.ts",
+            "exports": {".": "./index.js"},
+            "sideEffects": false,
+            "engines": {"node": ">=20"},
+            "dependencies": {},
+            "scripts": {"test": "node --test"}
+        });
+        let readme = format!(
+            "# Excellent\n\n## Install\nlpm install excellent\n\n## Usage\n```js\nuse();\n```\n\n## API Reference\n```js\napi();\n```\n{}",
+            "Complete documentation. ".repeat(10)
+        );
+        let files = vec![
+            "index.js".into(),
+            "index.d.ts".into(),
+            "index.js.map".into(),
+            "CHANGELOG.md".into(),
+            "LICENSE".into(),
+        ];
+        let result = run_quality_checks(&pkg, Some(&readme), project.path(), &files, "js", None);
+        let failures = result
+            .checks
+            .iter()
+            .filter(|check| !check.server_only && !check.passed)
+            .map(|check| check.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "unexpected local failures: {failures:?}"
+        );
+        assert_eq!(result.score, 100);
+        assert_eq!(result.earned_points, result.applicable_points);
+    }
+
+    #[test]
+    fn server_only_checks_serialize_as_not_evaluated() {
+        let check = QualityCheck {
+            id: "remote".into(),
+            category: "health".into(),
+            label: "Remote".into(),
+            passed: false,
+            points: 0,
+            max_points: 5,
+            detail: None,
+            server_only: true,
+        };
+        let json = serde_json::to_value(check).unwrap();
+        assert_eq!(json["evaluation"], "not_evaluated");
+        assert_eq!(json["passed"], false);
     }
 
     #[test]

@@ -16,6 +16,14 @@ pub(super) async fn vars_oidc(
     }
 
     match args[0] {
+        "--help" | "-h" => {
+            print_oidc_help();
+            Ok(())
+        }
+        "allow" if args[1..].iter().any(|arg| matches!(*arg, "--help" | "-h")) => {
+            print_oidc_allow_help();
+            Ok(())
+        }
         "allow" => vars_oidc_allow(&args[1..], project_dir, json_output).await,
         "list" => vars_oidc_list(project_dir, json_output).await,
         unknown => Err(LpmError::Script(format!(
@@ -24,30 +32,38 @@ pub(super) async fn vars_oidc(
     }
 }
 
+fn print_oidc_help() {
+    println!(
+        "Usage:\n  lpm env oidc allow [OPTIONS]\n  lpm env oidc list\n\n\
+         Run `lpm env oidc allow --help` before updating an existing policy."
+    );
+}
+
+fn print_oidc_allow_help() {
+    println!(
+        r#"Usage:
+  lpm env oidc allow --provider=github --repo=<owner/repo> --workflow=.github/workflows/<file>.yml --branch=<list> --env=<list> [--events=<list>] [--allow-forks]
+
+  lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=<list> --env=<list>
+
+This command replaces the policy's complete allowlists. Run `lpm env oidc list` first, then supply every branch, environment, workflow, and event that should remain allowed."#
+    );
+}
+
 /// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production`
 pub(super) async fn vars_oidc_allow(
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let vault_id =
-        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
-
     let mut provider = "github";
     let mut repo: Option<&str> = None;
+    let mut project_id: Option<&str> = None;
     let mut branches: Vec<String> = vec!["main".to_string()];
     let mut envs: Vec<String> = Vec::new();
-    // No default: the server schema is `.min(1)`, and the safe default
-    // ".github/workflows/deploy.yml" guesses the user's workflow name
-    // (which is almost always wrong). Forcing the user to supply it
-    // surfaces the security model.
     let mut workflows: Vec<String> = Vec::new();
-    // `allowedEvents`. Defaults to push-only — the safest
-    // event for fork-PR exposure. Adding `pull_request_target` to
-    // this list also requires `--allow-forks` (cross-field check
-    // enforced server-side, gated on JWT fixtures).
-    let mut events: Vec<String> = vec!["push".to_string()];
+    let mut events: Vec<String> = Vec::new();
+    let mut events_supplied = false;
     let mut allow_forks = false;
 
     for arg in args {
@@ -55,6 +71,8 @@ pub(super) async fn vars_oidc_allow(
             provider = v;
         } else if let Some(v) = arg.strip_prefix("--repo=") {
             repo = Some(v);
+        } else if let Some(v) = arg.strip_prefix("--project-id=") {
+            project_id = Some(v);
         } else if let Some(v) = arg.strip_prefix("--branch=") {
             branches = v.split(',').map(|s| s.trim().to_string()).collect();
         } else if let Some(v) = arg.strip_prefix("--env=") {
@@ -63,48 +81,109 @@ pub(super) async fn vars_oidc_allow(
             workflows = v.split(',').map(|s| s.trim().to_string()).collect();
         } else if let Some(v) = arg.strip_prefix("--events=") {
             events = v.split(',').map(|s| s.trim().to_string()).collect();
+            events_supplied = true;
         } else if *arg == "--allow-forks" {
             allow_forks = true;
-        }
-    }
-
-    let repo = repo.ok_or_else(|| {
-        LpmError::Script(
-            "missing --repo flag. Usage: lpm env oidc allow --repo=owner/repo \
-             --workflow=.github/workflows/deploy.yml --branch=main --env=production"
-                .into(),
-        )
-    })?;
-
-    if workflows.is_empty() {
-        return Err(LpmError::Script(
-            "missing --workflow flag. Usage: lpm env oidc allow --repo=owner/repo \
-             --workflow=.github/workflows/deploy.yml [--workflow=path2,path3]"
-                .into(),
-        ));
-    }
-
-    // Validate workflow paths client-side so the user gets a fast
-    // failure instead of waiting for the server round-trip. The shape
-    // matches the server's Zod regex
-    // (`lib/validations/vault.js::GITHUB_WORKFLOW_PATH_RE`).
-    for wf in &workflows {
-        let valid = wf.starts_with(".github/workflows/")
-            && !wf[".github/workflows/".len()..].contains('/')
-            && (wf.ends_with(".yml") || wf.ends_with(".yaml"));
-        if !valid {
+        } else {
             return Err(LpmError::Script(format!(
-                "workflow path '{wf}' must be of the form `.github/workflows/<file>.yml` \
-                 (subdirectories under .github/workflows/ are not supported by GitHub Actions)"
+                "unknown OIDC policy argument: {arg}"
             )));
         }
     }
 
-    // Canonicalize env names through resolver — OIDC policies store canonical names
+    if envs.is_empty() {
+        return Err(LpmError::Script(
+            "missing --env flag; name at least one environment this policy may access".into(),
+        ));
+    }
+
+    let (subject, identity_label) = match provider {
+        "github" => {
+            if project_id.is_some() {
+                return Err(LpmError::Script(
+                    "--project-id applies only to GitLab OIDC policies".into(),
+                ));
+            }
+            let repo = repo.ok_or_else(|| {
+                LpmError::Script(
+                    "missing --repo flag. Usage: lpm env oidc allow --provider=github \
+                     --repo=owner/repo --workflow=.github/workflows/deploy.yml \
+                     --branch=main --env=production"
+                        .into(),
+                )
+            })?;
+            let valid_repo = repo.split_once('/').is_some_and(|(owner, repository)| {
+                !owner.is_empty()
+                    && !repository.is_empty()
+                    && !repository.contains('/')
+                    && !repo
+                        .chars()
+                        .any(|character| character.is_whitespace() || character == ':')
+            });
+            if !valid_repo {
+                return Err(LpmError::Script(
+                    "--repo must be exactly <owner>/<repository>".into(),
+                ));
+            }
+            if workflows.is_empty() {
+                return Err(LpmError::Script(
+                    "missing --workflow flag. GitHub policies require \
+                     --workflow=.github/workflows/<file>.yml"
+                        .into(),
+                ));
+            }
+            for workflow in &workflows {
+                let valid = workflow.starts_with(".github/workflows/")
+                    && !workflow[".github/workflows/".len()..].contains('/')
+                    && (workflow.ends_with(".yml") || workflow.ends_with(".yaml"));
+                if !valid {
+                    return Err(LpmError::Script(format!(
+                        "workflow path '{workflow}' must be of the form \
+                         `.github/workflows/<file>.yml`"
+                    )));
+                }
+            }
+            if !events_supplied {
+                events.push("push".to_string());
+            }
+            (format!("repo:{repo}"), format!("repository {repo}"))
+        }
+        "gitlab" => {
+            if repo.is_some() || !workflows.is_empty() || events_supplied || allow_forks {
+                return Err(LpmError::Script(
+                    "GitLab OIDC policies do not accept GitHub-only --repo, --workflow, \
+                     --events, or --allow-forks flags"
+                        .into(),
+                ));
+            }
+            let project_id = project_id.ok_or_else(|| {
+                LpmError::Script(
+                    "missing --project-id flag. GitLab policies require the numeric project ID"
+                        .into(),
+                )
+            })?;
+            if project_id.starts_with('0')
+                || project_id.is_empty()
+                || !project_id.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(LpmError::Script(
+                    "--project-id must be a positive numeric GitLab project ID".into(),
+                ));
+            }
+            (
+                format!("project:{project_id}"),
+                format!("project ID {project_id}"),
+            )
+        }
+        unknown => {
+            return Err(LpmError::Script(format!(
+                "unsupported OIDC provider '{unknown}'; available providers: github, gitlab"
+            )));
+        }
+    };
+
     if !envs.is_empty() {
-        let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-            .ok()
-            .flatten();
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
         let empty = std::collections::HashMap::new();
         let env_map = config.as_ref().map_or(&empty, |c| &c.env);
         let environments = config.as_ref().and_then(|c| c.environments.as_ref());
@@ -136,7 +215,9 @@ pub(super) async fn vars_oidc_allow(
         envs = canonical_envs;
     }
 
-    let subject = format!("repo:{repo}");
+    let vault_id =
+        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
+    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
 
     let client = lpm_http::client_builder()
         .build()
@@ -187,19 +268,24 @@ pub(super) async fn vars_oidc_allow(
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
     } else {
-        output::success_line(install_ui::terminal_line!(
-            "OIDC policy set: {} {} on branches [{}] for envs [{}] via workflows [{}] events [{}]",
-            provider,
-            install_ui::bold(repo),
-            branches.join(", "),
-            if envs.is_empty() {
-                "all".to_string()
-            } else {
-                envs.join(", ")
-            },
-            workflows.join(", "),
-            events.join(", "),
-        ));
+        let environment_label = envs.join(", ");
+        if provider == "gitlab" {
+            output::success_line(install_ui::terminal_line!(
+                "OIDC policy set: gitlab {} on branches [{}] for envs [{}]",
+                install_ui::bold(&identity_label),
+                branches.join(", "),
+                environment_label,
+            ));
+        } else {
+            output::success_line(install_ui::terminal_line!(
+                "OIDC policy set: github {} on branches [{}] for envs [{}] via workflows [{}] events [{}]",
+                install_ui::bold(&identity_label),
+                branches.join(", "),
+                environment_label,
+                workflows.join(", "),
+                events.join(", "),
+            ));
+        }
         output::info("CI escrow enabled — secrets will be decrypted server-side for OIDC pulls");
     }
 
@@ -511,9 +597,9 @@ async fn get_ci_oidc_token() -> Result<String, LpmError> {
 fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String {
     let code_hint = match code {
         "policy_not_found" => Some(
-            "No OIDC policy exists for this repo+vault. Create one with: \
-             lpm env oidc allow --repo=<owner/repo> --workflow=.github/workflows/<file>.yml \
-             --branch=<name> --env=<name>",
+            "No OIDC policy exists for this CI identity and vault. Create one with \
+             `lpm env oidc allow`, using the provider-specific identity flags shown by \
+             `lpm setup ci` or `lpm env oidc allow --help`.",
         ),
         "policy_misconfigured" => Some(
             "The OIDC policy exists but is missing required fields (likely a pre-migration \
@@ -521,25 +607,34 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         ),
         "branch_not_allowed" => Some(
             "The branch claim from your CI's OIDC token isn't in the policy's allowedBranches. \
-             Update the policy: lpm env oidc allow --repo=<owner/repo> --branch=<list> --workflow=...",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
         ),
         "env_not_allowed" => Some(
-            "The requested env isn't in the policy's allowedEnvironments. Update the policy: \
-             lpm env oidc allow --repo=<owner/repo> --env=<list> --workflow=...",
+            "The requested env isn't in the policy's allowedEnvironments. Inspect the complete \
+             policy with `lpm env oidc list`, then review `lpm env oidc allow --help` before \
+             deliberately replacing its allowlists.",
+        ),
+        "ref_type_not_allowed" => Some(
+            "The GitLab OIDC token identifies a tag or another non-branch ref. Branch allowlists \
+             authorize branch pipelines only; run this job from an allowed branch.",
         ),
         "workflow_not_allowed" => Some(
             "The workflow file that minted this token isn't in the policy's allowedWorkflows. \
-             Add it: lpm env oidc allow --repo=<owner/repo> --workflow=<path>",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
         ),
         "event_not_allowed" => Some(
             "The CI event_name that triggered this run isn't in the policy's allowedEvents. \
-             Add it: lpm env oidc allow --repo=<owner/repo> --events=push,workflow_dispatch",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
         ),
         "fork_not_allowed" => Some(
             "The OIDC token was minted by a fork PR but the policy has allowForks=false. \
-             Add --allow-forks to lpm env oidc allow if this is intentional (note: only \
-             enable for public repos with trusted maintainers — pull_request_target events \
-             from forks run with BASE secrets).",
+             Inspect the complete policy with `lpm env oidc list`, then review \
+             `lpm env oidc allow --help` before deliberately replacing its allowlists. \
+             Fork-triggerable pull_request_target events run with base-repository secrets, \
+             so authorize them only after reviewing that complete policy.",
         ),
         "missing_branch_claim" => Some(
             "The OIDC token from your CI provider has no branch claim. Confirm your provider \
@@ -589,18 +684,60 @@ mod oidc_error_hint_tests {
     }
 
     #[test]
-    fn workflow_not_allowed_names_the_remediation_flag() {
+    fn provider_neutral_codes_do_not_invent_github_flags_without_server_hint() {
+        for code in [
+            "policy_not_found",
+            "branch_not_allowed",
+            "env_not_allowed",
+            "ref_type_not_allowed",
+        ] {
+            let message = build_oidc_pull_error_message("not allowed", "", code);
+            assert!(!message.contains("--repo"), "{code}: {message}");
+            assert!(!message.contains("--workflow"), "{code}: {message}");
+        }
+    }
+
+    #[test]
+    fn gitlab_non_branch_ref_code_explains_branch_only_policy() {
+        let message =
+            build_oidc_pull_error_message("Ref type not authorized", "", "ref_type_not_allowed");
+        assert!(message.contains("tag"));
+        assert!(message.contains("branch pipelines only"));
+    }
+
+    #[test]
+    fn workflow_not_allowed_requires_complete_policy_review() {
         let msg =
             build_oidc_pull_error_message("Workflow not authorized", "", "workflow_not_allowed");
-        assert!(msg.contains("--workflow"));
+        assert!(msg.contains("lpm env oidc list"));
+        assert!(msg.contains("lpm env oidc allow --help"));
         assert!(msg.contains("allowedWorkflows"));
+    }
+
+    #[test]
+    fn complete_policy_denials_require_review_instead_of_authorizing_the_denied_claim() {
+        for code in [
+            "workflow_not_allowed",
+            "event_not_allowed",
+            "fork_not_allowed",
+        ] {
+            let message = build_oidc_pull_error_message("not allowed", "", code);
+            assert!(message.contains("lpm env oidc list"), "{code}: {message}");
+            assert!(
+                message.contains("lpm env oidc allow --help"),
+                "{code}: {message}"
+            );
+            assert!(!message.contains("Add it:"), "{code}: {message}");
+            assert!(!message.contains("--allow-forks"), "{code}: {message}");
+        }
     }
 
     #[test]
     fn fork_not_allowed_warns_about_pull_request_target() {
         let msg = build_oidc_pull_error_message("Forks not allowed", "", "fork_not_allowed");
-        assert!(msg.contains("--allow-forks"));
+        assert!(!msg.contains("--allow-forks"));
         assert!(msg.contains("pull_request_target"));
+        assert!(msg.contains("lpm env oidc list"));
     }
 
     #[test]

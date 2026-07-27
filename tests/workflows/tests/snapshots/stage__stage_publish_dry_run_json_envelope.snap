@@ -14,8 +14,10 @@ expression: envelope
   "files": 3,
   "tarball_size": 0,
   "quality": {
-    "score": 15,
+    "score": 22,
     "max_score": 100,
+    "earned_points": 15,
+    "applicable_points": 68,
     "checks": [
       {
         "id": "has-readme",
@@ -24,7 +26,8 @@ expression: envelope
         "passed": false,
         "points": 0,
         "max_points": 8,
-        "detail": "No README found"
+        "detail": "No README found",
+        "evaluation": "failed"
       },
       {
         "id": "readme-install",
@@ -33,7 +36,8 @@ expression: envelope
         "passed": false,
         "points": 0,
         "max_points": 3,
-        "detail": "Add install/setup instructions to README"
+        "detail": "Add install/setup instructions to README",
+        "evaluation": "failed"
       },
       {
         "id": "readme-usage",
@@ -42,7 +46,8 @@ expression: envelope
         "passed": false,
         "points": 0,
         "max_points": 3,
-        "detail": "Add usage examples or 2+ code blocks"
+        "detail": "Add usage examples or 2+ code blocks",
+        "evaluation": "failed"
       },
       {
         "id": "readme-api",
@@ -50,7 +55,8 @@ expression: envelope
         "label": "README has API reference",
         "passed": false,
         "points": 0,
-        "max_points": 2
+        "max_points": 2,
+        "evaluation": "failed"
       },
       {
         "id": "has-changelog",
@@ -58,7 +64,8 @@ expression: envelope
         "label": "Has CHANGELOG",
         "passed": false,
         "points": 0,
-        "max_points": 3
+        "max_points": 3,
+        "evaluation": "failed"
       },
       {
         "id": "has-license",
@@ -66,7 +73,8 @@ expression: envelope
         "label": "Has license",
         "passed": true,
         "points": 3,
-        "max_points": 3
+        "max_points": 3,
+        "evaluation": "passed"
       },
       {
         "id": "has-types",
@@ -74,7 +82,8 @@ expression: envelope
         "label": "Has TypeScript types",
         "passed": false,
         "points": 0,
-        "max_points": 8
+        "max_points": 8,
+        "evaluation": "failed"
       },
       {
         "id": "esm-exports",
@@ -82,7 +91,8 @@ expression: envelope
         "label": "ESM exports",
         "passed": false,
         "points": 0,
-        "max_points": 3
+        "max_points": 3,
+        "evaluation": "failed"
       },
       {
         "id": "tree-shakable",
@@ -90,7 +100,8 @@ expression: envelope
         "label": "Tree-shakeable",
         "passed": false,
         "points": 0,
-        "max_points": 3
+        "max_points": 3,
+        "evaluation": "failed"
       },
       {
         "id": "has-exports-map",
@@ -98,7 +109,8 @@ expression: envelope
         "label": "Has exports map",
         "passed": false,
         "points": 0,
-        "max_points": 3
+        "max_points": 3,
+        "evaluation": "failed"
       },
       {
         "id": "has-engines",
@@ -106,7 +118,8 @@ expression: envelope
         "label": "Has engines field",
         "passed": false,
         "points": 0,
-        "max_points": 1
+        "max_points": 1,
+        "evaluation": "failed"
       },
       {
         "id": "small-deps",
@@ -115,7 +128,8 @@ expression: envelope
         "passed": true,
         "points": 3,
         "max_points": 3,
-        "detail": "0 dependencies"
+        "detail": "0 dependencies",
+        "evaluation": "passed"
       },
       {
         "id": "source-maps",
@@ -123,7 +137,8 @@ expression: envelope
         "label": "Has source maps",
         "passed": false,
         "points": 0,
-        "max_points": 1
+        "max_points": 1,
+        "evaluation": "failed"
       },
       {
         "id": "intellisense-coverage",
@@ -133,7 +148,8 @@ expression: envelope
         "points": 0,
         "max_points": 4,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "no-eval",
@@ -143,7 +159,8 @@ expression: envelope
         "points": 0,
         "max_points": 3,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "has-test-files",
@@ -151,7 +168,8 @@ expression: envelope
         "label": "Has test files",
         "passed": false,
         "points": 0,
-        "max_points": 7
+        "max_points": 7,
+        "evaluation": "failed"
       },
       {
         "id": "has-test-script",
@@ -159,7 +177,8 @@ expression: envelope
         "label": "Has test script",
         "passed": false,
         "points": 0,
-        "max_points": 4
+        "max_points": 4,
+        "evaluation": "failed"
       },
       {
         "id": "has-description",
@@ -167,7 +186,8 @@ expression: envelope
         "label": "Has description",
         "passed": true,
         "points": 3,
-        "max_points": 3
+        "max_points": 3,
+        "evaluation": "passed"
       },
       {
         "id": "has-keywords",
@@ -175,7 +195,8 @@ expression: envelope
         "label": "Has keywords",
         "passed": false,
         "points": 0,
-        "max_points": 1
+        "max_points": 1,
+        "evaluation": "failed"
       },
       {
         "id": "has-repository",
@@ -183,7 +204,8 @@ expression: envelope
         "label": "Has repository",
         "passed": false,
         "points": 0,
-        "max_points": 2
+        "max_points": 2,
+        "evaluation": "failed"
       },
       {
         "id": "has-homepage",
@@ -191,7 +213,8 @@ expression: envelope
         "label": "Has homepage",
         "passed": false,
         "points": 0,
-        "max_points": 1
+        "max_points": 1,
+        "evaluation": "failed"
       },
       {
         "id": "no-lifecycle-scripts",
@@ -199,7 +222,8 @@ expression: envelope
         "label": "No lifecycle scripts",
         "passed": true,
         "points": 2,
-        "max_points": 2
+        "max_points": 2,
+        "evaluation": "passed"
       },
       {
         "id": "semver-consistency",
@@ -207,7 +231,8 @@ expression: envelope
         "label": "SemVer consistency",
         "passed": true,
         "points": 4,
-        "max_points": 4
+        "max_points": 4,
+        "evaluation": "passed"
       },
       {
         "id": "no-vulnerabilities",
@@ -217,7 +242,8 @@ expression: envelope
         "points": 0,
         "max_points": 5,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "maintenance-health",
@@ -227,7 +253,8 @@ expression: envelope
         "points": 0,
         "max_points": 4,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "author-verified",
@@ -237,7 +264,8 @@ expression: envelope
         "points": 0,
         "max_points": 3,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "has-skills",
@@ -247,7 +275,8 @@ expression: envelope
         "points": 0,
         "max_points": 7,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "skills-comprehensive",
@@ -257,7 +286,8 @@ expression: envelope
         "points": 0,
         "max_points": 3,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       },
       {
         "id": "reasonable-size",
@@ -267,7 +297,8 @@ expression: envelope
         "points": 0,
         "max_points": 3,
         "detail": "Server verifies after upload",
-        "server_only": true
+        "server_only": true,
+        "evaluation": "not_evaluated"
       }
     ]
   }
