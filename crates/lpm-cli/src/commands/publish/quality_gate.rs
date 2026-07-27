@@ -20,14 +20,49 @@ pub(crate) fn run_publish_quality_gate(
         print_publish_quality_result(&result);
     }
 
-    if let Some(min) = input.min_score
-        && result.score < min
-    {
-        return Err(LpmError::Registry(format!(
-            "quality score {} is below minimum {} (use --min-score to adjust)",
-            result.score, min
-        )));
+    if let Some(min) = input.min_score {
+        enforce_minimum_score(&result, min)?;
     }
 
     Ok(result)
+}
+
+fn enforce_minimum_score(result: &quality::QualityResult, minimum: u32) -> Result<(), LpmError> {
+    if result.score < minimum {
+        return Err(LpmError::Registry(format!(
+            "local preflight quality score {} is below minimum {} ({} of {} locally applicable points; use --min-score to adjust)",
+            result.score, minimum, result.earned_points, result.applicable_points
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(score: u32) -> quality::QualityResult {
+        quality::QualityResult {
+            score,
+            max_score: 100,
+            earned_points: score,
+            applicable_points: 100,
+            checks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn score_immediately_below_80_fails_the_default_threshold() {
+        assert!(enforce_minimum_score(&result(79), 80).is_err());
+    }
+
+    #[test]
+    fn score_at_80_passes_the_default_threshold() {
+        enforce_minimum_score(&result(80), 80).unwrap();
+    }
+
+    #[test]
+    fn score_immediately_above_80_passes_the_default_threshold() {
+        enforce_minimum_score(&result(81), 80).unwrap();
+    }
 }

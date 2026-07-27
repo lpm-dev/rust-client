@@ -28,6 +28,92 @@ async fn whoami_maps_401_to_auth_required() {
 }
 
 #[tokio::test]
+async fn publish_preflight_sends_resolved_identity_and_bearer_without_mutation() {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("name", "@lpm.dev/owner.resolved"))
+        .and(query_param("version", "1.2.3"))
+        .and(header("authorization", "Bearer publish-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3",
+            "packageExists": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token");
+    let response = client
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .unwrap();
+    assert!(response.success);
+    assert!(response.package_exists);
+}
+
+#[tokio::test]
+async fn publish_preflight_rejects_an_unsuccessful_success_envelope() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("denied"), "{error}");
+}
+
+#[tokio::test]
+async fn publish_preflight_rejects_a_mismatched_response_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/owner.other",
+            "version": "9.9.9"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("mismatched package identity"), "{error}");
+}
+
+#[tokio::test]
 async fn whoami_maps_403_to_forbidden_with_body() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

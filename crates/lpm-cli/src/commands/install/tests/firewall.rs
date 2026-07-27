@@ -191,7 +191,7 @@ async fn enforce_firewall_preflight_exchanges_ci_oidc_token_when_no_bearer_exist
 
     Mock::given(method("POST"))
         .and(path("/api/registry/-/token/oidc"))
-        .and(query_param("scope", "install"))
+        .and(query_param("scope", "read"))
         .and(body_string_contains("\"token\":\"ci-oidc-jwt\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "token": "exchanged-firewall-token"
@@ -321,7 +321,7 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
 
     Mock::given(method("POST"))
         .and(path("/api/registry/-/token/oidc"))
-        .and(query_param("scope", "install"))
+        .and(query_param("scope", "read"))
         .and(body_string_contains("\"token\":\"ci-oidc-jwt\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "token": "exchanged-firewall-token"

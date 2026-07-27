@@ -28,9 +28,7 @@ pub(super) fn read_lpm_config(extract_dir: &Path) -> Result<Option<serde_json::V
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|error| LpmError::Registry(format!("failed to parse {}: {error}", path.display())))
+    crate::lpm_config::parse_and_validate(&path, &content).map(Some)
 }
 
 /// Coerce a JSON value from `lpm.config.json` to its canonical string

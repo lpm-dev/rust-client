@@ -942,9 +942,8 @@ pub(super) async fn resolve_lpm_install_preflight(
 ///
 /// this is the legacy path used when no `--filter`
 /// or `-w` flag is set AND we're not inside a workspace member directory.
-/// New filtered paths go through `run_install_filtered_add` instead, which
-/// handles workspace-aware target resolution but rejects Swift packages
-/// (SE-0292 workspace support is deferred toa future release).
+/// New filtered paths go through `run_install_filtered_add`, which preserves
+/// the same ecosystem routing after resolving workspace targets.
 ///
 /// `save_flags` carries the per-command save-spec overrides
 /// (`--exact`, `--tilde`, `--save-prefix`). They flow through stage and
@@ -1177,12 +1176,8 @@ pub async fn run_add_packages(
 /// each one with the requested package specs, then runs the install
 /// pipeline ONCE at the resolved `install_root`.
 ///
-/// **Swift packages**: this path treats every package as JS — Swift
-/// `ecosystem=swift` packages added through this path will be written into
-/// the target `package.json` files but the SE-0292 routing in
-/// `run_swift_install` will not fire. Workspace-aware Swift install is
-/// tracked undera future release. For pure Swift workflows, use the legacy
-/// path: `cd <project> && lpm install @scope/swift-pkg` (no `-w` / `--filter`).
+/// Swift packages are applied only to selected members that own a direct
+/// `Package.swift`; JavaScript packages retain the existing package.json path.
 ///
 /// `save_flags` carries the per-command save-spec overrides
 /// applied to every targeted member's manifest finalize step.
@@ -1292,7 +1287,29 @@ pub async fn run_install_filtered_add(
         yes,
         json_output,
     )?;
-    let packages = reviewed.specs;
+    let requested_packages = reviewed.specs;
+    let mut js_packages = Vec::with_capacity(requested_packages.len());
+    let mut swift_packages = Vec::new();
+    for spec in &requested_packages {
+        let (name, intent) = crate::save_spec::parse_user_save_intent(spec)?;
+        if name.starts_with("@lpm.dev/") {
+            let package_name = lpm_common::PackageName::parse(&name)?;
+            let range = intent_to_range_string(&intent);
+            let (metadata, resolved_version) =
+                resolve_lpm_install_preflight(client, &package_name, &range).await?;
+            let version_metadata = metadata.version(&resolved_version).ok_or_else(|| {
+                LpmError::NotFound(format!(
+                    "version {resolved_version} not found for {}",
+                    package_name.scoped()
+                ))
+            })?;
+            if version_metadata.effective_ecosystem() == "swift" {
+                swift_packages.push((package_name, resolved_version, version_metadata.clone()));
+                continue;
+            }
+        }
+        js_packages.push(spec.clone());
+    }
 
     // 3. Multi-member confirmation prompt.
     //
@@ -1314,12 +1331,86 @@ pub async fn run_install_filtered_add(
     if targets.multi_member {
         confirm_multi_member_mutation(
             "Adding",
-            packages.len(),
+            requested_packages.len(),
             &targets.member_manifests,
             yes,
             json_output,
         )?;
     }
+
+    let workspace_lock = lpm_common::project_install_lock(&workspace_root_for_config);
+    lpm_common::with_exclusive_lock_async(workspace_lock, async {
+    let swift_manifests = targets
+        .member_manifests
+        .iter()
+        .map(|manifest| {
+            crate::commands::install_targets::install_root_for(manifest).join("Package.swift")
+        })
+        .filter(|manifest| manifest.is_file())
+        .collect::<Vec<_>>();
+    if !swift_packages.is_empty() && swift_manifests.is_empty() {
+        return Err(LpmError::Registry(
+            "the selected workspace targets do not contain a Package.swift for the requested Swift package"
+                .into(),
+        ));
+    }
+
+    let mut swift_transaction = if swift_packages.is_empty() {
+        None
+    } else {
+        let required = swift_manifests
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        let swift_lockfiles = swift_manifests
+            .iter()
+            .map(|manifest| manifest.with_file_name("Package.resolved"))
+            .collect::<Vec<_>>();
+        let optional = swift_lockfiles
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        Some(crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+            &required,
+            &optional,
+            &[],
+        )?)
+    };
+    for manifest_path in &swift_manifests {
+        let manifest_dir = manifest_path.parent().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "selected Swift manifest has no parent directory: {}",
+                manifest_path.display()
+            ))
+        })?;
+        for (package_name, version, version_metadata) in &swift_packages {
+            let identifier = crate::swift_manifest::lpm_to_se0292_id(package_name);
+            let product_name = version_metadata
+                .swift_product_name()
+                .unwrap_or(&package_name.name);
+            run_swift_install_spm(
+                manifest_dir,
+                manifest_path,
+                package_name,
+                version,
+                version_metadata,
+                &identifier,
+                product_name,
+                yes,
+                json_output,
+                client.base_url(),
+            )
+            .await?;
+        }
+    }
+
+    if js_packages.is_empty() {
+        if let Some(transaction) = swift_transaction.take() {
+            transaction.commit();
+        }
+        return Ok(());
+    }
+    let packages = js_packages;
 
     // 4. Iterate per target. For EACH targeted manifest:
     // a. Mutate the manifest with the new package entries.
@@ -1427,8 +1518,7 @@ pub async fn run_install_filtered_add(
     // lock is the simpler correct primitive for v1. Sibling lock to the
     // single-project path's per-project lock; same `.install.lock`
     // filename so a future refactor can unify them.
-    let workspace_lock = lpm_common::project_install_lock(&workspace_root_for_config);
-    lpm_common::with_exclusive_lock_async(workspace_lock, async {
+    let js_result = async {
         let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
             &required_refs,
             &optional_refs,
@@ -1568,6 +1658,14 @@ pub async fn run_install_filtered_add(
         // All members succeeded — persist every staged + finalized manifest.
         tx.commit();
         Ok(())
+    }
+    .await;
+    if js_result.is_ok()
+        && let Some(transaction) = swift_transaction.take()
+    {
+        transaction.commit();
+    }
+    js_result
     })
     .await
 }

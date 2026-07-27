@@ -11,7 +11,8 @@
 //! 1. **Snapshotted (restore-on-rollback)** files have their bytes captured
 //!    at construction time. On rollback, the bytes are written back; if the
 //!    file did not exist at snapshot time, it is removed instead. Used for
-//!    `package.json`, `lpm.lock`, `lpm.lockb`.
+//!    `package.json`, `Package.swift`, `lpm.lock`, `lpm.lockb`, and
+//!    `Package.resolved`.
 //! 2. **Invalidated (delete-on-rollback)** files are deleted unconditionally
 //!    on rollback, regardless of their pre-snapshot state. Used for
 //!    `.lpm/install-hash` — a cache file whose stale presence would let the
@@ -35,8 +36,8 @@
 //! The install pipeline mutates `node_modules/` heavily (delete + re-link),
 //! and snapshotting it would mean copying potentially gigabytes of files
 //! per transaction. the contract is that after a failed install,
-//! the on-disk state files (`package.json`, `lpm.lock`, `.lpm/install-hash`)
-//! are coherent with each other and with what the user typed. The
+//! the on-disk manifest and lockfiles are coherent with each other and with
+//! what the user typed. The
 //! `node_modules/` tree may temporarily diverge from the lockfile, but the
 //! deleted `install-hash` cache forces the next `lpm install` to re-link
 //! and converge. This is documented as a known limitation of the rollback
@@ -86,15 +87,16 @@ impl ManifestTransaction {
     }
 
     /// Snapshot the full install state surface for the rollback
-    /// boundary. `required` paths must exist (typically the manifest);
+    /// boundary. `required` paths must exist (typically `package.json` or
+    /// `Package.swift`);
     /// `optional` paths are recorded as `Some(bytes)` if present and
     /// `None` if missing (rollback will remove them); `invalidate` paths
     /// are deleted on rollback regardless of their pre-snapshot state
     /// (cache files like `.lpm/install-hash`).
     ///
     /// Used by `run_add_packages` and `run_install_filtered_add` to
-    /// guard `package.json` (required), `lpm.lock` + `lpm.lockb`
-    /// (optional, may be absent on a fresh project), and
+    /// guard manifests (required), `lpm.lock` + `lpm.lockb` +
+    /// `Package.resolved` (optional, may be absent on a fresh project), and
     /// `.lpm/install-hash` (invalidate).
     pub fn snapshot_install_state(
         required: &[&Path],

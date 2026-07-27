@@ -9,8 +9,10 @@
 
 mod support;
 
-use support::mock_registry::MockRegistry;
+use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 const SWIFT_PACKAGE: &str = "@lpm.dev/acme.swift-logger";
 const SWIFT_VERSION: &str = "1.0.0";
@@ -36,7 +38,7 @@ let package = Package(
     project
 }
 
-async fn mount_swift_package(mock: &MockRegistry) {
+async fn mount_swift_package(mock: &MockRegistry) -> Vec<u8> {
     let tarball = b"unused swift package tarball";
     let mut metadata = mock.package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball);
     let version = &mut metadata["versions"][SWIFT_VERSION];
@@ -50,9 +52,20 @@ async fn mount_swift_package(mock: &MockRegistry) {
     });
     mock.with_package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball, metadata)
         .await;
+    let cert = rcgen::generate_simple_self_signed(vec!["lpm.dev".to_string()])
+        .unwrap()
+        .cert
+        .der()
+        .to_vec();
+    Mock::given(method("GET"))
+        .and(path("/api/swift-registry/certificate"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(cert.clone()))
+        .mount(mock.server())
+        .await;
+    cert
 }
 
-fn configure_existing_registry(project: &TempProject, registry_url: &str) {
+fn configure_existing_registry(project: &TempProject, registry_url: &str, cert: &[u8]) {
     project.write_file(
         ".swiftpm/configuration/registries.json",
         &serde_json::json!({
@@ -64,6 +77,38 @@ fn configure_existing_registry(project: &TempProject, registry_url: &str) {
         })
         .to_string(),
     );
+    let global_config = project
+        .home()
+        .join(".swiftpm/configuration/registries.json");
+    std::fs::create_dir_all(global_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        global_config,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "security": {
+                "default": {
+                    "signing": {
+                        "onUnsigned": "warn",
+                        "onUntrustedCertificate": "warn"
+                    }
+                },
+                "scopeOverrides": {
+                    "lpmdev": {
+                        "signing": {
+                            "onUntrustedCertificate": "silentAllow"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cert_path = project
+        .home()
+        .join(".swiftpm/security/trusted-root-certs/lpm.der");
+    std::fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
+    std::fs::write(cert_path, cert).unwrap();
 }
 
 fn configure_fake_swift(
@@ -94,6 +139,10 @@ fn configure_fake_swift(
             "LPM_TEST_SWIFT_RESOLVE_EXIT_CODE",
             resolve_exit_code.to_string(),
         );
+}
+
+fn configure_fake_swift_lockfile_write(command: &mut assert_cmd::Command, content: &str) {
+    command.env("LPM_TEST_SWIFT_PACKAGE_RESOLVED", content);
 }
 
 fn fake_swift_executable_name(windows: bool) -> &'static str {
@@ -252,9 +301,9 @@ async fn swift_registry_json_output() {
 #[tokio::test]
 async fn swift_install_yes_selects_first_eligible_target_without_prompting() {
     let mock = MockRegistry::start().await;
-    mount_swift_package(&mock).await;
+    let cert = mount_swift_package(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url());
+    configure_existing_registry(&project, &mock.url(), &cert);
 
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget", "SecondTarget"], 0);
@@ -282,9 +331,9 @@ async fn swift_install_yes_selects_first_eligible_target_without_prompting() {
 #[tokio::test]
 async fn swift_install_yes_json_reports_the_first_modified_target() {
     let mock = MockRegistry::start().await;
-    mount_swift_package(&mock).await;
+    let cert = mount_swift_package(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url());
+    configure_existing_registry(&project, &mock.url(), &cert);
 
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget", "SecondTarget"], 0);
@@ -313,9 +362,9 @@ async fn swift_install_yes_json_reports_the_first_modified_target() {
 #[tokio::test]
 async fn swift_install_with_multiple_targets_without_yes_requires_interactive_selection() {
     let mock = MockRegistry::start().await;
-    mount_swift_package(&mock).await;
+    let cert = mount_swift_package(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url());
+    configure_existing_registry(&project, &mock.url(), &cert);
 
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget", "SecondTarget"], 0);
@@ -344,9 +393,9 @@ async fn swift_install_with_multiple_targets_without_yes_requires_interactive_se
 #[tokio::test]
 async fn swift_install_with_no_eligible_targets_preserves_the_existing_error() {
     let mock = MockRegistry::start().await;
-    mount_swift_package(&mock).await;
+    let cert = mount_swift_package(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url());
+    configure_existing_registry(&project, &mock.url(), &cert);
 
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &[], 0);
@@ -369,9 +418,9 @@ async fn swift_install_with_no_eligible_targets_preserves_the_existing_error() {
 #[tokio::test]
 async fn swift_install_with_one_eligible_target_selects_it_automatically() {
     let mock = MockRegistry::start().await;
-    mount_swift_package(&mock).await;
+    let cert = mount_swift_package(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url());
+    configure_existing_registry(&project, &mock.url(), &cert);
 
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
@@ -388,6 +437,330 @@ async fn swift_install_with_one_eligible_target_selects_it_automatically() {
     assert!(
         product_is_attached_to_first_target(&project.read_file("Package.swift")),
         "the only eligible target must receive the Swift product"
+    );
+}
+
+fn swift_workspace() -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"workspace-root","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/swift-member/package.json",
+        r#"{"name":"swift-member","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "packages/swift-member/Package.swift",
+        r#"// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "SwiftMember",
+    dependencies: [],
+    targets: [
+        .target(name: "FirstTarget", dependencies: [])
+    ]
+)
+"#,
+    );
+    project.write_file(
+        "packages/js-member/package.json",
+        r#"{"name":"js-member","version":"1.0.0"}"#,
+    );
+    project
+}
+
+#[tokio::test]
+async fn workspace_root_swift_install_mutates_only_the_root_package_swift() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_workspace();
+    project.write_file(
+        "Package.swift",
+        r#"// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "WorkspaceRoot",
+    dependencies: [],
+    targets: [
+        .target(name: "RootTarget", dependencies: [])
+    ]
+)
+"#,
+    );
+    let member_before = project.read_file("packages/swift-member/Package.swift");
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["RootTarget"], 0);
+    let output = command
+        .args(["--json", "install", "--yes", "-w", SWIFT_PACKAGE])
+        .output()
+        .expect("run workspace-root Swift install");
+
+    assert!(
+        output.status.success(),
+        "workspace-root Swift install failed:\n{}",
+        combined_output(&output)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["target"], "RootTarget");
+    assert!(
+        project
+            .read_file("Package.swift")
+            .contains("lpmdev.acme_swift-logger")
+    );
+    assert_eq!(
+        project.read_file("packages/swift-member/Package.swift"),
+        member_before
+    );
+}
+
+#[tokio::test]
+async fn filtered_workspace_swift_install_mutates_only_the_selected_package_swift() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_workspace();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .args([
+            "--json",
+            "install",
+            "--yes",
+            "--filter",
+            "swift-member",
+            SWIFT_PACKAGE,
+        ])
+        .output()
+        .expect("run filtered Swift workspace install");
+
+    assert!(
+        output.status.success(),
+        "filtered Swift install should succeed:\n{}",
+        combined_output(&output)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["target"], "FirstTarget");
+    assert_eq!(
+        json["registry_setup"],
+        serde_json::json!({
+            "scope": "repaired",
+            "signing_certificate": "retained",
+            "signing_trust": "retained"
+        })
+    );
+    assert!(
+        project
+            .read_file("packages/swift-member/Package.swift")
+            .contains("lpmdev.acme_swift-logger")
+    );
+    assert!(
+        !project
+            .read_file("packages/swift-member/package.json")
+            .contains(SWIFT_PACKAGE),
+        "Swift Registry packages must never be staged into package.json"
+    );
+    assert!(
+        !project
+            .read_file("packages/js-member/package.json")
+            .contains(SWIFT_PACKAGE),
+        "an unrelated JavaScript member must remain untouched"
+    );
+}
+
+#[tokio::test]
+async fn member_cwd_swift_install_mutates_only_that_workspace_member() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_workspace();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .current_dir(project.path().join("packages/swift-member"))
+        .args(["--json", "install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run Swift install from a workspace member");
+
+    assert!(
+        output.status.success(),
+        "member-cwd Swift install should succeed:\n{}",
+        combined_output(&output)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["target"], "FirstTarget");
+    assert!(
+        project
+            .read_file("packages/swift-member/Package.swift")
+            .contains("lpmdev.acme_swift-logger")
+    );
+    assert!(
+        !project
+            .read_file("packages/js-member/package.json")
+            .contains(SWIFT_PACKAGE)
+    );
+}
+
+#[tokio::test]
+async fn mixed_swift_and_javascript_request_routes_each_ecosystem_to_its_manifest() {
+    const JS_PACKAGE: &str = "@lpm.dev/acme.js-helper";
+
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let js_tarball = make_tarball(JS_PACKAGE, "1.0.0");
+    mock.with_package(JS_PACKAGE, "1.0.0", &js_tarball).await;
+    let project = swift_workspace();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .current_dir(project.path().join("packages/swift-member"))
+        .args([
+            "install",
+            "--yes",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+            SWIFT_PACKAGE,
+            JS_PACKAGE,
+        ])
+        .output()
+        .expect("run a mixed Swift and JavaScript workspace install");
+
+    assert!(
+        output.status.success(),
+        "mixed workspace install should succeed:\n{}",
+        combined_output(&output)
+    );
+    assert!(
+        project
+            .read_file("packages/swift-member/Package.swift")
+            .contains("lpmdev.acme_swift-logger")
+    );
+    let member_manifest = project.read_file("packages/swift-member/package.json");
+    assert!(member_manifest.contains(JS_PACKAGE));
+    assert!(!member_manifest.contains(SWIFT_PACKAGE));
+    assert!(
+        !project
+            .read_file("packages/js-member/package.json")
+            .contains(JS_PACKAGE)
+    );
+}
+
+#[tokio::test]
+async fn filtered_workspace_swift_resolve_failure_rolls_back_the_selected_manifest() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_workspace();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let before = project.read_file("packages/swift-member/Package.swift");
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 17);
+    let output = command
+        .args([
+            "install",
+            "--yes",
+            "--filter",
+            "swift-member",
+            SWIFT_PACKAGE,
+        ])
+        .output()
+        .expect("run failing filtered Swift workspace install");
+
+    assert!(!output.status.success());
+    assert_eq!(
+        project.read_file("packages/swift-member/Package.swift"),
+        before,
+        "workspace Swift manifest must roll back when resolve fails"
+    );
+    assert!(
+        !project
+            .read_file("packages/js-member/package.json")
+            .contains(SWIFT_PACKAGE)
+    );
+}
+
+#[tokio::test]
+async fn swift_resolve_failure_restores_an_existing_package_resolved() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_workspace();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let lockfile_path = "packages/swift-member/Package.resolved";
+    let original_lockfile = r#"{"version":2,"pins":[{"identity":"original"}]}"#;
+    project.write_file(lockfile_path, original_lockfile);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 17);
+    configure_fake_swift_lockfile_write(
+        &mut command,
+        r#"{"version":2,"pins":[{"identity":"rewritten"}]}"#,
+    );
+    let output = command
+        .args([
+            "install",
+            "--yes",
+            "--filter",
+            "swift-member",
+            SWIFT_PACKAGE,
+        ])
+        .output()
+        .expect("run failing Swift workspace install");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file(lockfile_path), original_lockfile);
+}
+
+#[tokio::test]
+async fn later_javascript_failure_removes_package_resolved_created_by_swift() {
+    const JS_PACKAGE: &str = "@lpm.dev/acme.unfetchable";
+
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    mock.with_full_package_metadata(
+        JS_PACKAGE,
+        "1.0.0",
+        &[("1.0.0", serde_json::json!({}), None)],
+    )
+    .await;
+    let project = swift_workspace();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let lockfile_path = "packages/swift-member/Package.resolved";
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    configure_fake_swift_lockfile_write(
+        &mut command,
+        r#"{"version":2,"pins":[{"identity":"new"}]}"#,
+    );
+    let output = command
+        .current_dir(project.path().join("packages/swift-member"))
+        .args([
+            "install",
+            "--yes",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+            SWIFT_PACKAGE,
+            JS_PACKAGE,
+        ])
+        .output()
+        .expect("run mixed install with a failing JavaScript package");
+
+    assert!(
+        !output.status.success(),
+        "the missing JavaScript tarball must fail:\n{}",
+        combined_output(&output)
+    );
+    assert!(
+        !project.file_exists(lockfile_path),
+        "Package.resolved created by Swift must be removed when the later JavaScript leg fails"
     );
 }
 
@@ -421,9 +794,9 @@ fn add_help_describes_target_as_a_swift_destination_suffix() {
 #[tokio::test]
 async fn swift_resolve_failure_points_to_inherited_output_and_optional_repair() {
     let mock = MockRegistry::start().await;
-    mount_swift_package(&mock).await;
+    let cert = mount_swift_package(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url());
+    configure_existing_registry(&project, &mock.url(), &cert);
 
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget"], 17);

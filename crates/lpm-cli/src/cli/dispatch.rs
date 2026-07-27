@@ -984,9 +984,9 @@ async fn async_main() -> Result<()> {
                 // "inside a workspace member directory" case via target
                 // resolution — so we ALWAYS prefer it for workspace mode.
                 // For pure standalone projects with NO workspace, the
-                // legacy `run_add_packages` is still preferred because it
-                // handles per-package Swift (SE-0292) routing, which
-                // intentionally defers from the workspace path.
+                // legacy `run_add_packages` is still preferred for standalone
+                // projects; the workspace path now preserves the same
+                // per-package ecosystem routing after target selection.
                 let workspace = lpm_workspace::discover_workspace(&cwd).ok().flatten();
                 if workspace.is_some() {
                     commands::install::run_install_filtered_add(

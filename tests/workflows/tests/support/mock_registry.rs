@@ -47,6 +47,23 @@ struct ProjectTokenRetirementSequence {
     failures_remaining: AtomicUsize,
 }
 
+struct PublishPreflightResponder;
+
+impl Respond for PublishPreflightResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": query.get("name").map_or("", |value| value.as_ref()),
+            "version": query.get("version").map_or("", |value| value.as_ref()),
+            "packageExists": true,
+        }))
+    }
+}
+
 impl Respond for JsonResponseSequence {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let mut bodies = self.bodies.lock().expect("response sequence lock");
@@ -232,6 +249,12 @@ impl MockRegistry {
                 "available": false,
                 "skills": [],
             })))
+            .with_priority(u8::MAX)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(PublishPreflightResponder)
             .with_priority(u8::MAX)
             .mount(&server)
             .await;

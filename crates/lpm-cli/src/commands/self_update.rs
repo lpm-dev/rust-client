@@ -1316,54 +1316,57 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     const DOWNLOAD_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE";
     const RELEASE_BY_TAG_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE";
 
-    /// Self-update tests mutate the same two process-global env vars
-    /// (`LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE` and
-    /// `LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE`). Without serialisation,
-    /// parallel `cargo test` runs would race and steer each other's
-    /// probes at the wrong wiremock instance.
-    fn standalone_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    struct StandaloneEnvGuard {
-        download_prev: Option<String>,
-        release_by_tag_prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for StandaloneEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.download_prev {
-                    Some(v) => std::env::set_var(DOWNLOAD_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(DOWNLOAD_OVERRIDE_KEY),
-                }
-                match &self.release_by_tag_prev {
-                    Some(v) => std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, v),
-                    None => std::env::remove_var(RELEASE_BY_TAG_OVERRIDE_KEY),
-                }
-            }
-        }
-    }
-
     fn acquire_standalone_env(
         download_template: &str,
         release_by_tag_template: &str,
-    ) -> StandaloneEnvGuard {
-        let lock = standalone_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let guard = StandaloneEnvGuard {
-            download_prev: std::env::var(DOWNLOAD_OVERRIDE_KEY).ok(),
-            release_by_tag_prev: std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).ok(),
-            _lock: lock,
-        };
-        unsafe {
-            std::env::set_var(DOWNLOAD_OVERRIDE_KEY, download_template);
-            std::env::set_var(RELEASE_BY_TAG_OVERRIDE_KEY, release_by_tag_template);
-        }
-        guard
+    ) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([
+            (DOWNLOAD_OVERRIDE_KEY, download_template.into()),
+            (RELEASE_BY_TAG_OVERRIDE_KEY, release_by_tag_template.into()),
+        ])
+    }
+
+    #[test]
+    fn standalone_published_release_overrides_share_process_env_lock() {
+        let release_env = crate::test_env::ScopedEnv::set([(
+            RELEASE_BY_TAG_OVERRIDE_KEY,
+            "http://127.0.0.1:41001/releases/tags/v{tag}".into(),
+        )]);
+        let (contention_tx, contention_rx) = std::sync::mpsc::channel();
+        let (standalone_values_tx, standalone_values_rx) = std::sync::mpsc::channel();
+        let standalone_thread = std::thread::spawn(move || {
+            crate::test_env::signal_next_env_lock_contention(contention_tx);
+            let _env = acquire_standalone_env(
+                "http://127.0.0.1:41002/download/v{tag}/{file}",
+                "http://127.0.0.1:41002/releases/tags/v{tag}",
+            );
+            standalone_values_tx
+                .send((
+                    std::env::var(DOWNLOAD_OVERRIDE_KEY).unwrap(),
+                    std::env::var(RELEASE_BY_TAG_OVERRIDE_KEY).unwrap(),
+                ))
+                .unwrap();
+        });
+
+        contention_rx.recv().unwrap();
+        assert!(
+            matches!(
+                standalone_values_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "standalone override scope acquired while the shared environment lock was held"
+        );
+        drop(release_env);
+        let (download_override, release_by_tag_override) = standalone_values_rx.recv().unwrap();
+        standalone_thread.join().unwrap();
+        assert_eq!(
+            download_override,
+            "http://127.0.0.1:41002/download/v{tag}/{file}"
+        );
+        assert_eq!(
+            release_by_tag_override,
+            "http://127.0.0.1:41002/releases/tags/v{tag}"
+        );
     }
 
     /// Drive `verify_and_fetch_for_standalone` against a wiremock-served

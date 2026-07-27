@@ -937,6 +937,16 @@ pub struct WhoamiResponse {
     pub limits: Option<WhoamiLimits>,
 }
 
+/// GET /api/registry/-/package/publish-preflight
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishPreflightResponse {
+    pub success: bool,
+    pub name: String,
+    pub version: String,
+    #[serde(default, rename = "packageExists")]
+    pub package_exists: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoamiUsage {
     #[serde(default, rename = "storage_bytes")]

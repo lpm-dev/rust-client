@@ -82,7 +82,7 @@ pub async fn run(
     use_oidc: bool,
 ) -> Result<(), LpmError> {
     let token = if use_oidc {
-        oidc::exchange_oidc_token(registry_url, None, "install")
+        oidc::exchange_oidc_token(registry_url, None, "read")
             .await
             .map(|oidc_token| ResolvedSetupBearer::oidc(oidc_token.token))
             .map_err(|error| {

@@ -68,7 +68,7 @@ pub(crate) fn validate_directory(skills_dir: &Path) -> Result<ValidationReport, 
                 relative_display(skills_dir, &path)
             ));
         } else if metadata.is_file() {
-            if path.extension().is_some_and(|extension| extension == "md") {
+            if is_authored_skill_path(&path, skills_dir) {
                 validate_file(skills_dir, &path, metadata.len(), &mut names, &mut report)?;
             }
         } else if metadata.is_dir() {
@@ -94,6 +94,20 @@ pub(crate) fn validate_directory(skills_dir: &Path) -> Result<ValidationReport, 
     }
 
     Ok(report)
+}
+
+pub(crate) fn is_authored_skill_path(path: &Path, skills_dir: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(skills_dir) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(file_name)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && Path::new(file_name)
+            .extension()
+            .is_some_and(|extension| extension == "md")
 }
 
 fn validate_file(
