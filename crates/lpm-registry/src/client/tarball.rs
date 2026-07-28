@@ -174,9 +174,26 @@ impl RegistryClient {
         url: &str,
         max_compressed_size: u64,
     ) -> Result<DownloadedTarball, LpmError> {
+        self.download_tarball_to_file_with_limit_and_accounting(url, max_compressed_size, None)
+            .await
+    }
+
+    async fn download_tarball_to_file_with_limit_and_accounting(
+        &self,
+        url: &str,
+        max_compressed_size: u64,
+        accounting: Option<ManagedInstallAccounting>,
+    ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let mut response = self.send_with_retry(self.build_get(url).await?).await?;
+        let mut request = self.build_get(url).await?;
+        if accounting.is_some() {
+            request = request.header(
+                MANAGED_INSTALL_ACCOUNTING_HEADER,
+                MANAGED_INSTALL_ACCOUNTING_VERSION,
+            );
+        }
+        let mut response = self.send_with_retry(request).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > max_compressed_size
@@ -270,9 +287,25 @@ impl RegistryClient {
         &self,
         url: &str,
     ) -> Result<reqwest::Response, LpmError> {
+        self.download_tarball_streaming_with_accounting(url, None)
+            .await
+    }
+
+    async fn download_tarball_streaming_with_accounting(
+        &self,
+        url: &str,
+        accounting: Option<ManagedInstallAccounting>,
+    ) -> Result<reqwest::Response, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let response = self.send_with_retry(self.build_get(url).await?).await?;
+        let mut request = self.build_get(url).await?;
+        if accounting.is_some() {
+            request = request.header(
+                MANAGED_INSTALL_ACCOUNTING_HEADER,
+                MANAGED_INSTALL_ACCOUNTING_VERSION,
+            );
+        }
+        let response = self.send_with_retry(request).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > MAX_COMPRESSED_TARBALL_SIZE
@@ -315,6 +348,32 @@ impl RegistryClient {
             crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
                 self.download_tarball_to_file_with_auth(url, None).await
             }
+        }
+    }
+
+    /// Download a routed install tarball and mark only LPM-origin requests as managed.
+    pub async fn download_tarball_routed_managed(
+        &self,
+        route_table: &crate::route::RouteTable,
+        name: &str,
+        url: &str,
+        accounting: ManagedInstallAccounting,
+    ) -> Result<DownloadedTarball, LpmError> {
+        match route_table.route_for_package(name) {
+            crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
+                if !self.is_base_url_origin(url) {
+                    return Err(LpmError::Registry(format!(
+                        "managed LPM tarball URL refused because its origin does not match the configured LPM registry: {url}"
+                    )));
+                }
+                self.download_tarball_to_file_with_limit_and_accounting(
+                    url,
+                    MAX_COMPRESSED_TARBALL_SIZE,
+                    Some(accounting),
+                )
+                .await
+            }
+            _ => self.download_tarball_routed(route_table, name, url).await,
         }
     }
 
@@ -363,6 +422,31 @@ impl RegistryClient {
             crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
                 self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_streaming_with_auth(url, None).await
+            }
+        }
+    }
+
+    /// Stream a routed install tarball and mark only LPM-origin requests as managed.
+    pub async fn download_tarball_streaming_routed_managed(
+        &self,
+        route_table: &crate::route::RouteTable,
+        name: &str,
+        url: &str,
+        accounting: ManagedInstallAccounting,
+    ) -> Result<reqwest::Response, LpmError> {
+        match route_table.route_for_package(name) {
+            crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
+                if !self.is_base_url_origin(url) {
+                    return Err(LpmError::Registry(format!(
+                        "managed LPM tarball URL refused because its origin does not match the configured LPM registry: {url}"
+                    )));
+                }
+                self.download_tarball_streaming_with_accounting(url, Some(accounting))
+                    .await
+            }
+            _ => {
+                self.download_tarball_streaming_routed(route_table, name, url)
+                    .await
             }
         }
     }

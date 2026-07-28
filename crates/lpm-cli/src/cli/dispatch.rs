@@ -152,11 +152,31 @@ fn check_fast_lane_admission(
     let package_skills_ready = !lpm_skills_config::LpmSkillsPreference::Config
         .resolve(&global_config)?
         || crate::commands::skills::package::materialization_complete(project_dir, package_json);
-    if policy_extension_configs.is_empty() && package_skills_ready {
+    if policy_extension_configs.is_empty()
+        && package_skills_ready
+        && !lockfile_contains_lpm_package(project_dir)
+    {
         Ok(FastLaneAdmission::ExitAllowed)
     } else {
         Ok(FastLaneAdmission::NeedsInstallPipeline)
     }
+}
+
+fn lockfile_contains_lpm_package(project_dir: &std::path::Path) -> bool {
+    let binary_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    if let Ok(Some(reader)) = lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+        return reader
+            .iter()
+            .any(|package| package.name().starts_with("@lpm.dev/"));
+    }
+
+    let toml_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    lpm_lockfile::Lockfile::read_from_file(&toml_path).map_or(true, |lockfile| {
+        lockfile
+            .packages
+            .iter()
+            .any(|package| package.name.starts_with("@lpm.dev/"))
+    })
 }
 
 async fn async_main() -> Result<()> {
@@ -3091,5 +3111,65 @@ fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSe
         changed_files_ignore_pattern: args.changed_files_ignore_pattern,
         test_pattern: args.test_pattern,
         fail_if_no_match: args.fail_if_no_match,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lockfile_contains_lpm_package;
+
+    fn lockfile_with_packages(names: &[&str]) -> lpm_lockfile::Lockfile {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        for name in names {
+            lockfile.add_package(lpm_lockfile::LockedPackage {
+                name: (*name).to_string(),
+                version: "1.0.0".to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+        }
+        lockfile
+    }
+
+    #[test]
+    fn npm_only_toml_lockfile_allows_synchronous_fast_lane() {
+        let directory = tempfile::tempdir().unwrap();
+        lockfile_with_packages(&["react", "@types/node"])
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+
+        assert!(!lockfile_contains_lpm_package(directory.path()));
+    }
+
+    #[test]
+    fn lpm_package_in_toml_lockfile_requires_install_pipeline() {
+        let directory = tempfile::tempdir().unwrap();
+        lockfile_with_packages(&["react", "@lpm.dev/alice.alpha"])
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+
+        assert!(lockfile_contains_lpm_package(directory.path()));
+    }
+
+    #[test]
+    fn lpm_package_in_binary_lockfile_requires_install_pipeline() {
+        let directory = tempfile::tempdir().unwrap();
+        let lockfile = lockfile_with_packages(&["react", "@lpm.dev/bob.beta"]);
+        lockfile
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        lpm_lockfile::binary::write_binary(
+            &lockfile,
+            &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
+        )
+        .unwrap();
+
+        assert!(lockfile_contains_lpm_package(directory.path()));
+    }
+
+    #[test]
+    fn unreadable_lockfile_requires_install_pipeline() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert!(lockfile_contains_lpm_package(directory.path()));
     }
 }

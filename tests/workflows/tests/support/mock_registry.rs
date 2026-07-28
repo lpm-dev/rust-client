@@ -258,6 +258,12 @@ impl MockRegistry {
             .with_priority(u8::MAX)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/pool/install-report"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(u8::MAX)
+            .mount(&server)
+            .await;
         MockRegistry {
             server,
             tarball_integrities: Arc::default(),

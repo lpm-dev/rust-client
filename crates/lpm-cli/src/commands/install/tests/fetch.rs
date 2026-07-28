@@ -130,6 +130,94 @@ fn speculative_dependency_enqueue_rewrites_aliases_and_skips_optional_deps() {
 }
 
 #[tokio::test]
+async fn managed_lpm_stale_url_retry_preserves_the_accounting_marker() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let server = MockServer::start().await;
+    let stale_url = format!("{}/stale.tgz", server.uri());
+    let fresh_url = format!("{}/fresh.tgz", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/stale.tgz"))
+        .and(header(
+            lpm_registry::MANAGED_INSTALL_ACCOUNTING_HEADER,
+            lpm_registry::MANAGED_INSTALL_ACCOUNTING_VERSION,
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/acme.pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "@lpm.dev/acme.pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "@lpm.dev/acme.pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": fresh_url,
+                        "integrity": integrity,
+                    },
+                },
+            },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/fresh.tgz"))
+        .and(header(
+            lpm_registry::MANAGED_INSTALL_ACCOUNTING_HEADER,
+            lpm_registry::MANAGED_INSTALL_ACCOUNTING_VERSION,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("test-token")
+            .with_cache_dir(None),
+    );
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let store_root = tempfile::tempdir().expect("store root");
+    let store = PackageStore::at(store_root.path());
+    let mut package = fake_pkg("@lpm.dev/acme.pkg", "1.0.0", true);
+    package.source = format!("registry+{}", server.uri());
+    package.is_lpm = true;
+    package.integrity = Some(integrity);
+    package.tarball_url = Some(stale_url);
+    package.metadata_checked_for_tarball = true;
+    let gate_stats = Arc::new(GateStats::default());
+
+    let (_, _, final_url, _) = fetch_and_store_legacy(
+        &client,
+        &route_table,
+        &store,
+        None,
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &gate_stats,
+        install_pkg_acquire_permit(),
+        &None,
+        ManagedInstallAccounting,
+    )
+    .await
+    .expect("managed stale URL recovery should succeed");
+
+    assert_eq!(final_url, fresh_url);
+}
+
+#[tokio::test]
 async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
@@ -528,6 +616,7 @@ async fn speculative_v2_download_extracts_object() {
         &url,
         Some(&expected_sri),
         &None,
+        ManagedInstallAccounting,
     )
     .await
     .expect("speculative v2 download must succeed");

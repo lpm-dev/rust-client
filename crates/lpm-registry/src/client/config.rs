@@ -353,6 +353,13 @@ impl RegistryClient {
         parsed_origin == self.base_url_origin || parsed_origin == self.npm_registry_url_origin
     }
 
+    pub(super) fn is_base_url_origin(&self, url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        parsed.origin().ascii_serialization() == self.base_url_origin
+    }
+
     /// Set the registry base URL.
     ///
     /// Stores the URL for later validation. Non-localhost HTTP URLs are rejected

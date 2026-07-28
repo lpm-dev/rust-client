@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::{Mutex, OnceLock};
 
+mod accounting;
 mod fetch;
 mod firewall;
 mod gitignore;

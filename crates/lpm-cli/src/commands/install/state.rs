@@ -77,6 +77,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) force_security_floor: bool,
     pub(super) target_set: Option<&'a [String]>,
     pub(super) emit_install_report: bool,
+    pub(super) install_accounting: ManagedInstallAccounting,
     pub(super) start: Instant,
 }
 
@@ -128,42 +129,47 @@ pub(super) async fn run_install_freshness_phase(
         && !input.strict_peer_dependencies
         && install_state.up_to_date
         && compatibility_bins_ready;
-    let fast_path_policy_extension_stats =
-        if !fast_path_base_eligible || input.policy_extension_configs.is_empty() {
-            None
-        } else {
-            let gate_stats = GateStats::default();
-            if let Some(fast) = try_lockfile_fast_path(
-                input.lockfile_path,
-                input.manifest_deps,
-                &[],
-                input.client,
-                &gate_stats,
-                false,
-            ) {
-                let mut policy_packages = fast.packages;
-                if input.omit_policy.dev {
-                    filter_dev_packages(&mut policy_packages, input.production_dependency_names);
-                }
-                filter_dependency_engine_packages(
-                    &mut policy_packages,
-                    input.dependency_engine_policy,
-                )?;
-                filter_platform_packages(&mut policy_packages)?;
-                Some(
-                    run_policy_extensions(
-                        input.policy_extension_configs,
-                        input.project_dir,
-                        &policy_packages,
-                        input.json_output,
-                    )
-                    .await?,
-                )
-            } else {
-                None
+    let fast_path_packages = if fast_path_base_eligible {
+        let gate_stats = GateStats::default();
+        if let Some(fast) = try_lockfile_fast_path(
+            input.lockfile_path,
+            input.manifest_deps,
+            &[],
+            input.client,
+            &gate_stats,
+            false,
+        ) {
+            let mut packages = fast.packages;
+            if input.omit_policy.dev {
+                filter_dev_packages(&mut packages, input.production_dependency_names);
             }
-        };
+            filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
+            filter_platform_packages(&mut packages)?;
+            Some(packages)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let fast_path_policy_extension_stats = match (
+        fast_path_packages.as_deref(),
+        input.policy_extension_configs.is_empty(),
+    ) {
+        (Some(_), true) => None,
+        (Some(packages), false) => Some(
+            run_policy_extensions(
+                input.policy_extension_configs,
+                input.project_dir,
+                packages,
+                input.json_output,
+            )
+            .await?,
+        ),
+        (None, _) => None,
+    };
     if fast_path_base_eligible
+        && let Some(fast_path_packages) = fast_path_packages.as_deref()
         && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
         let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
@@ -190,6 +196,8 @@ pub(super) async fn run_install_freshness_phase(
                 input.dependency_engine_policy,
             );
         }
+        report_pool_install_attribution(input.client, fast_path_packages, input.install_accounting)
+            .await?;
         let elapsed = input.start.elapsed();
         let total_ms = elapsed.as_millis();
         if input.emit_install_report {

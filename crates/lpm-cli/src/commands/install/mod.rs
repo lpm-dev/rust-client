@@ -6,7 +6,10 @@ use crate::patch_state;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_linker::LinkTarget;
-use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
+use lpm_registry::{
+    GateDecision, ManagedInstallAccounting, RegistryClient, RouteTable, UpstreamRoute,
+    evaluate_cached_url,
+};
 use lpm_resolver::{
     CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,
     PeerConflictReport, PeerWarning, ResolvedPackage, SpeculativePackageMetadata,
@@ -21,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
+mod accounting;
 mod catalog;
 mod concurrency;
 mod diff_util;
@@ -51,6 +55,7 @@ mod timing;
 mod validation;
 mod workspace;
 
+use accounting::*;
 use catalog::*;
 use concurrency::*;
 use fetch::*;
@@ -508,6 +513,7 @@ async fn run_with_options_under_store_lock(
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
+    let install_accounting = ManagedInstallAccounting;
     let InstallSetupContext {
         timing_detail_mode,
         emit_timing,
@@ -586,6 +592,7 @@ async fn run_with_options_under_store_lock(
         force_security_floor,
         target_set,
         emit_install_report,
+        install_accounting,
         start,
     })
     .await?;
@@ -1069,6 +1076,7 @@ async fn run_with_options_under_store_lock(
             &prior_patch_state,
             &current_patch_fingerprint,
             dependency_engine_policy.as_ref(),
+            install_accounting,
             emit_install_report,
         )
         .await;
@@ -1106,6 +1114,7 @@ async fn run_with_options_under_store_lock(
         start,
         lockfile_result,
         arc_client: arc_client.clone(),
+        install_accounting,
         route_table: route_table.clone(),
         project_dir,
         deps: &mut deps,
@@ -1182,6 +1191,7 @@ async fn run_with_options_under_store_lock(
             project_dir.to_path_buf(),
             gate_stats.clone(),
             fetch_extract_limiter.clone(),
+            install_accounting,
             streaming_fetch,
             ArtifactSelection::from_used_lockfile(used_lockfile),
         ));
@@ -1245,6 +1255,7 @@ async fn run_with_options_under_store_lock(
         fetch_semaphore,
         fetch_extract_limiter,
         fetch_coord,
+        install_accounting,
         speculation_join,
         fetch_overlap_join,
         spec_tracker,
@@ -1682,6 +1693,8 @@ async fn run_with_options_under_store_lock(
         } else {
             None
         };
+
+    report_pool_install_attribution(arc_client.as_ref(), &packages, install_accounting).await?;
 
     if emit_install_report {
         emit_online_install_report(OnlineInstallReportInput {

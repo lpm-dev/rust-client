@@ -227,6 +227,7 @@ pub(in crate::commands::install) async fn run(
     prior_patch_state: &Option<patch_state::PatchState>,
     current_patch_fingerprint: &str,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
+    install_accounting: ManagedInstallAccounting,
     emit_install_report: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
@@ -339,6 +340,7 @@ pub(in crate::commands::install) async fn run(
                                     Arc::clone(&gate_stats),
                                     force,
                                     fetch_extract_limiter.clone(),
+                                    install_accounting,
                                     ArtifactSelection::FreshResolution,
                                     &mut fetch_handles,
                                     &mut stats,
@@ -388,6 +390,7 @@ pub(in crate::commands::install) async fn run(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                install_accounting,
             )
             .await?;
             stage_timings.peer_drain_ms = peer_drain_start.elapsed().as_millis();
@@ -407,6 +410,7 @@ pub(in crate::commands::install) async fn run(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                install_accounting,
                 &mut fetch_handles,
                 &mut stats,
             )?;
@@ -433,6 +437,7 @@ pub(in crate::commands::install) async fn run(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                install_accounting,
                 ArtifactSelection::FreshResolution,
                 &mut fetch_handles,
                 &mut stats,
@@ -485,6 +490,7 @@ pub(in crate::commands::install) async fn run(
             Arc::clone(&gate_stats),
             force,
             fetch_extract_limiter.clone(),
+            install_accounting,
             ArtifactSelection::LockfileReplay,
             &mut fetch_handles,
             &mut stats,
@@ -659,6 +665,8 @@ pub(in crate::commands::install) async fn run(
     );
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
+
+    report_pool_install_attribution(&client, &install_packages, install_accounting).await?;
 
     if emit_install_report && json_output {
         let package_json: Vec<serde_json::Value> = install_packages

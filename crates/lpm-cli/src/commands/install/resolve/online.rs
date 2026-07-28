@@ -4,6 +4,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) start: Instant,
     pub(in crate::commands::install) lockfile_result: Option<LockfileFastPath>,
     pub(in crate::commands::install) arc_client: Arc<RegistryClient>,
+    pub(in crate::commands::install) install_accounting: ManagedInstallAccounting,
     pub(in crate::commands::install) route_table: RouteTable,
     pub(in crate::commands::install) project_dir: &'a Path,
     pub(in crate::commands::install) deps: &'a mut HashMap<String, String>,
@@ -84,6 +85,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         start,
         lockfile_result,
         arc_client,
+        install_accounting,
         route_table,
         project_dir,
         deps,
@@ -265,6 +267,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
+                        install_accounting,
                     );
                     let selected_package_fetch_overlap_allowed = fetch_overlap_allowed_local
                         && !policy_extensions_disable_tarball_prefetch(policy_extension_configs);
@@ -283,6 +286,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 project_dir.to_path_buf(),
                                 gate_stats.clone(),
                                 fetch_extract_limiter.clone(),
+                                install_accounting,
                                 dependency_engine_policy.clone(),
                                 streaming_fetch,
                                 1,
@@ -315,6 +319,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 project_dir.to_path_buf(),
                                 gate_stats.clone(),
                                 fetch_extract_limiter.clone(),
+                                install_accounting,
                                 dependency_engine_policy.clone(),
                                 streaming_fetch,
                                 fetch_overlap_min_selected(),
@@ -406,6 +411,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
+                        install_accounting,
                     );
 
                     let resolve_client = arc_client.clone();
