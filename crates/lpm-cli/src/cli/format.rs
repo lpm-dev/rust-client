@@ -532,6 +532,14 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
                         "update in a mutable development environment and commit the lockfiles",
                     ),
                 )));
+            } else if context.kind == lpm_common::ArtifactUnavailableKind::Pinned {
+                push_detail(
+                    &mut lines,
+                    "recovery",
+                    install_ui::dim(
+                        "restore the artifact, or update its owning direct dependency or override",
+                    ),
+                );
             }
             lines
         }
@@ -1159,6 +1167,34 @@ mod tests {
                 "  package axois",
                 "  resembles axios (edit_distance)",
                 "  try lpm install axios",
+            ]
+        );
+    }
+
+    #[test]
+    fn slim_error_lines_render_pinned_artifact_without_command_as_recovery_guidance() {
+        let error = lpm_common::LpmError::ArtifactUnavailable(Box::new(
+            lpm_common::ArtifactUnavailableErrorContext {
+                package: "transitive-package".into(),
+                version: "1.0.0".into(),
+                source: "registry+https://registry.npmjs.org".into(),
+                kind: lpm_common::ArtifactUnavailableKind::Pinned,
+                lockfiles_preserved: true,
+                suggested_command: None,
+            },
+        ));
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(
+            plain,
+            vec![
+                "Pinned artifact unavailable",
+                "  package transitive-package@1.0.0",
+                "  source registry+https://registry.npmjs.org",
+                "  lockfiles preserved",
+                "  recovery restore the artifact, or update its owning direct dependency or override",
             ]
         );
     }

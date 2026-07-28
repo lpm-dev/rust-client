@@ -134,16 +134,33 @@ impl ArtifactUnavailableErrorContext {
 impl fmt::Display for ArtifactUnavailableErrorContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ArtifactUnavailableKind::Pinned => write!(
-                f,
-                "pinned artifact {} is unavailable from {}; lpm.lock and lpm.lockb pins were \
-                 preserved. Changing the pin requires `{}` in a mutable development environment, \
-                 followed by committing the updated lockfiles. Frozen and `lpm ci` installs will \
-                 continue to fail until that explicit update is committed",
-                self.package_request(),
-                self.source,
-                self.suggested_command.as_deref().unwrap_or("lpm upgrade"),
-            ),
+            ArtifactUnavailableKind::Pinned => {
+                write!(
+                    f,
+                    "pinned artifact {} is unavailable from {}; lpm.lock and lpm.lockb pins were \
+                     preserved. ",
+                    self.package_request(),
+                    self.source,
+                )?;
+                if let Some(command) = self.suggested_command.as_deref() {
+                    write!(
+                        f,
+                        "Changing the pin requires `{command}` in a mutable development \
+                         environment, followed by committing the updated lockfiles. Frozen and \
+                         `lpm ci` installs will continue to fail until that explicit update is \
+                         committed"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "No direct package.json dependency key is available for this artifact, so \
+                         restore it or update its owning direct dependency or an override in a \
+                         mutable development environment, then commit the updated lockfiles. \
+                         Frozen and `lpm ci` installs will continue to fail until the artifact is \
+                         restored or that explicit update is committed"
+                    )
+                }
+            }
             ArtifactUnavailableKind::Selected => write!(
                 f,
                 "selected artifact {} is unavailable from {}; existing lpm.lock and lpm.lockb \

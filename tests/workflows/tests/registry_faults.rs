@@ -41,9 +41,10 @@ fn install_with(
     json: bool,
 ) -> std::process::Output {
     let mut command = lpm_with_registry(project, &registry.url());
-    command
-        .env("LPM_GREEDY_FUSION", "0")
-        .env("LPM_STREAM_FETCH", "1");
+    if !env.iter().any(|(name, _)| *name == "LPM_GREEDY_FUSION") {
+        command.env("LPM_GREEDY_FUSION", "0");
+    }
+    command.env("LPM_STREAM_FETCH", "1");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -135,6 +136,17 @@ async fn establish_lockfile_then_yank(
     project_name: &str,
     package_name: &str,
 ) -> (FaultRegistry, TempProject, (Vec<u8>, Vec<u8>)) {
+    establish_project_lockfile_then_yank(
+        project_with_dep(project_name, package_name, "1.0.0"),
+        package_name,
+    )
+    .await
+}
+
+async fn establish_project_lockfile_then_yank(
+    project: TempProject,
+    package_name: &str,
+) -> (FaultRegistry, TempProject, (Vec<u8>, Vec<u8>)) {
     let registry = FaultRegistry::start().await;
     let version = "1.0.0";
     let tarball = make_tarball(package_name, version);
@@ -152,7 +164,6 @@ async fn establish_lockfile_then_yank(
         )
         .await;
 
-    let project = project_with_dep(project_name, package_name, version);
     let first = install(&project, &registry);
     assert!(
         first.status.success(),
@@ -222,7 +233,7 @@ fn locked_package(project: &TempProject, package_name: &str) -> lpm_lockfile::Lo
 }
 
 #[tokio::test]
-async fn install_fails_without_lockfile_when_metadata_advertises_yanked_tarball() {
+async fn fresh_resolution_artifact_failure_exercises_fetch_overlap() {
     let registry = FaultRegistry::start().await;
     let package_name = "fault-yanked-mid-resolution";
     let version = "1.0.0";
@@ -239,12 +250,22 @@ async fn install_fails_without_lockfile_when_metadata_advertises_yanked_tarball(
         .await;
 
     let project = project_with_dep("fault-yanked-mid-resolution-app", package_name, version);
-    let output = install(&project, &registry);
+    let output = install_with(
+        &project,
+        &registry,
+        &[],
+        &[
+            ("LPM_GREEDY_FUSION", "1"),
+            ("LPM_FETCH_OVERLAP", "1"),
+            ("LPM_FETCH_OVERLAP_MIN_SELECTED", "1"),
+        ],
+        false,
+    );
 
     assert_failed_cleanly(&output, &project, package_name);
     assert!(
-        tarball_hits.get() >= 1,
-        "install must attempt the tarball URL that resolution selected"
+        tarball_hits.get() >= 2,
+        "selected-event overlap and authoritative fetch must both attempt the unavailable tarball"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -253,6 +274,57 @@ async fn install_fails_without_lockfile_when_metadata_advertises_yanked_tarball(
             && stderr.contains("preserved"),
         "fresh resolution error should identify the selected artifact and preservation contract, got:\n{stderr}"
     );
+}
+
+#[tokio::test]
+async fn selected_artifact_json_error_exposes_stable_preservation_contract() {
+    let registry = FaultRegistry::start().await;
+    let package_name = "fault-json-selected-artifact";
+    let version = "1.0.0";
+    let tarball = make_tarball(package_name, version);
+    let metadata = registry.package_metadata(package_name, version, &tarball);
+    let tarball_path = FaultRegistry::tarball_path(package_name, version);
+
+    registry.with_batch_metadata(vec![metadata.clone()]).await;
+    registry
+        .with_package_metadata_reply(package_name, MetadataReply::Ok(metadata))
+        .await;
+    registry
+        .with_tarball_reply(&tarball_path, missing_tarball_reply())
+        .await;
+
+    let project = project_with_dep("fault-json-selected-artifact-app", package_name, version);
+    let output = install_with(&project, &registry, &[], &[], true);
+
+    assert!(
+        !output.status.success(),
+        "JSON install must fail when the selected artifact is unavailable"
+    );
+    assert!(
+        !project.file_exists("lpm.lock") && !project.file_exists("lpm.lockb"),
+        "selected artifact failure must not create lockfiles"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "selected artifact error must emit one JSON envelope: {error}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(envelope["error_code"], "selected_artifact_unavailable");
+    assert_eq!(envelope["error"]["package"], package_name);
+    assert_eq!(envelope["error"]["version"], version);
+    assert_eq!(envelope["error"]["kind"], "selected");
+    assert_eq!(envelope["error"]["lockfiles_preserved"], true);
+    assert!(envelope["error"]["suggested_command"].is_null());
+    assert!(
+        envelope.get("next_steps").is_none(),
+        "fresh-resolution failures must not expose a pin-update action"
+    );
+    insta::assert_json_snapshot!("selected_artifact_unavailable_error", envelope, {
+        ".error.message" => "[SELECTED ARTIFACT MESSAGE]",
+        ".error.source" => "[REGISTRY]",
+    });
 }
 
 #[tokio::test]
@@ -327,6 +399,18 @@ async fn ci_replay_preserves_pins_when_tarball_is_yanked() {
         stderr.contains("mutable development environment") && stderr.contains("commit"),
         "CI error must explain how to update and commit the lockfile explicitly:\n{stderr}"
     );
+}
+
+#[tokio::test]
+async fn install_automatically_frozen_by_ci_preserves_pins_when_tarball_is_yanked() {
+    let package_name = "fault-auto-frozen-lockfile-yanked";
+    let (registry, project, lockfiles) =
+        establish_lockfile_then_yank("fault-auto-frozen-lockfile-yanked-app", package_name).await;
+
+    let output = install_with(&project, &registry, &[], &[("CI", "true")], false);
+
+    assert_pinned_artifact_failure(&output, package_name);
+    assert_lockfiles_unchanged(&project, &lockfiles);
 }
 
 #[tokio::test]
@@ -446,7 +530,7 @@ async fn metadata_refresh_server_error_keeps_http_classification_and_lockfiles()
 }
 
 #[tokio::test]
-async fn lockfile_artifact_failures_preserve_files_across_all_install_fetch_routes() {
+async fn lockfile_artifact_failures_preserve_files_across_authoritative_and_experimental_routes() {
     let cases = [
         (
             "legacy-v1",
@@ -533,7 +617,7 @@ async fn lockfile_artifact_failures_preserve_files_across_all_install_fetch_rout
 }
 
 #[tokio::test]
-async fn pinned_artifact_json_error_exposes_stable_preservation_contract() {
+async fn direct_dependency_pinned_artifact_json_error_uses_manifest_key() {
     let package_name = "fault-json-pinned-artifact";
     let (registry, project, lockfiles) =
         establish_lockfile_then_yank("fault-json-pinned-artifact-app", package_name).await;
@@ -561,8 +645,139 @@ async fn pinned_artifact_json_error_exposes_stable_preservation_contract() {
         envelope["error"]["suggested_command"],
         format!("lpm upgrade {package_name}")
     );
+    assert_eq!(
+        envelope["next_steps"][0]["command"],
+        format!("lpm upgrade {package_name}")
+    );
     insta::assert_json_snapshot!("pinned_artifact_unavailable_error", envelope, {
         ".error.message" => "[PINNED ARTIFACT MESSAGE]",
+        ".error.source" => "[REGISTRY]",
+    });
+}
+
+#[tokio::test]
+async fn aliased_dependency_pinned_artifact_json_error_uses_alias_manifest_key() {
+    let canonical_name = "fault-json-aliased-artifact";
+    let alias_name = "local-artifact";
+    let project = project_with_dep(
+        "fault-json-aliased-artifact-app",
+        alias_name,
+        &format!("npm:{canonical_name}@1.0.0"),
+    );
+    let (registry, project, lockfiles) =
+        establish_project_lockfile_then_yank(project, canonical_name).await;
+
+    let output = install_with(&project, &registry, &[], &[], true);
+
+    assert!(
+        !output.status.success(),
+        "JSON install must fail when an aliased dependency artifact is unavailable"
+    );
+    assert_lockfiles_unchanged(&project, &lockfiles);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "aliased artifact error must emit one JSON envelope: {error}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(
+        envelope["error"]["suggested_command"],
+        format!("lpm upgrade {alias_name}")
+    );
+    assert_eq!(
+        envelope["next_steps"][0]["command"],
+        format!("lpm upgrade {alias_name}")
+    );
+    insta::assert_json_snapshot!("aliased_pinned_artifact_unavailable_error", envelope, {
+        ".error.message" => "[ALIASED PINNED ARTIFACT MESSAGE]",
+        ".error.source" => "[REGISTRY]",
+    });
+}
+
+#[tokio::test]
+async fn transitive_dependency_pinned_artifact_json_error_has_no_command_action() {
+    let registry = FaultRegistry::start().await;
+    let direct_name = "fault-json-direct-owner";
+    let transitive_name = "fault-json-transitive-artifact";
+    let version = "1.0.0";
+    let direct_tarball = make_tarball(direct_name, version);
+    let transitive_tarball = make_tarball(transitive_name, version);
+    let mut direct_metadata = registry.package_metadata(direct_name, version, &direct_tarball);
+    direct_metadata["versions"][version]["dependencies"] =
+        serde_json::json!({ transitive_name: version });
+    let transitive_metadata =
+        registry.package_metadata(transitive_name, version, &transitive_tarball);
+
+    registry
+        .with_batch_metadata(vec![direct_metadata.clone(), transitive_metadata.clone()])
+        .await;
+    registry
+        .with_package_metadata_reply(direct_name, MetadataReply::Ok(direct_metadata))
+        .await;
+    registry
+        .with_package_metadata_reply(transitive_name, MetadataReply::Ok(transitive_metadata))
+        .await;
+    registry
+        .with_tarball_reply(
+            &FaultRegistry::tarball_path(direct_name, version),
+            TarballReply::Bytes(direct_tarball),
+        )
+        .await;
+    registry
+        .with_tarball_sequence(
+            &FaultRegistry::tarball_path(transitive_name, version),
+            vec![
+                TarballReply::Bytes(transitive_tarball),
+                missing_tarball_reply(),
+            ],
+        )
+        .await;
+
+    let project = project_with_dep("fault-json-transitive-artifact-app", direct_name, version);
+    let first = install(&project, &registry);
+    assert!(
+        first.status.success(),
+        "initial install must establish a transitive lockfile graph:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let lockfiles = capture_lockfiles(&project);
+    clear_materialized_state(&project);
+
+    let output = install_with(&project, &registry, &[], &[], true);
+
+    assert!(
+        !output.status.success(),
+        "JSON replay must fail when a transitive artifact is unavailable"
+    );
+    assert_lockfiles_unchanged(&project, &lockfiles);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "transitive artifact error must emit one JSON envelope: {error}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(envelope["error"]["package"], transitive_name);
+    assert!(
+        envelope["error"]["suggested_command"].is_null(),
+        "transitive packages must not expose an unusable upgrade command"
+    );
+    assert!(
+        envelope.get("next_steps").is_none(),
+        "transitive packages must not expose a machine-actionable command"
+    );
+    let message = envelope["error"]["message"]
+        .as_str()
+        .expect("artifact error message must be a string");
+    assert!(
+        message.contains("owning direct dependency")
+            && message.contains("override")
+            && message.contains("restore"),
+        "transitive recovery guidance must explain the actionable choices: {message}"
+    );
+    insta::assert_json_snapshot!("transitive_pinned_artifact_unavailable_error", envelope, {
+        ".error.message" => "[TRANSITIVE PINNED ARTIFACT MESSAGE]",
         ".error.source" => "[REGISTRY]",
     });
 }

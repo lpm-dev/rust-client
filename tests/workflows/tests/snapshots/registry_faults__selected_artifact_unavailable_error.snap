@@ -1,0 +1,19 @@
+---
+source: tests/workflows/tests/registry_faults.rs
+expression: envelope
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error_code": "selected_artifact_unavailable",
+  "error": {
+    "code": "SELECTED_ARTIFACT_UNAVAILABLE",
+    "message": "[SELECTED ARTIFACT MESSAGE]",
+    "package": "fault-json-selected-artifact",
+    "version": "1.0.0",
+    "source": "[REGISTRY]",
+    "kind": "selected",
+    "lockfiles_preserved": true,
+    "suggested_command": null
+  }
+}

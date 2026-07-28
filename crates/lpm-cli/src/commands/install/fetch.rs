@@ -2116,6 +2116,23 @@ mod tests {
     fn fetch_extract_permits_stay_unbounded_for_non_macos_v2_installs() {
         assert_eq!(platform_default_fetch_extract_permits(true, false), None);
     }
+
+    #[test]
+    fn upgrade_command_uses_every_direct_root_manifest_key() {
+        let names = vec!["canonical".to_string(), "local-alias".to_string()];
+
+        assert_eq!(
+            upgrade_command_for_root_links(true, Some(&names)),
+            Some("lpm upgrade canonical local-alias".to_string())
+        );
+    }
+
+    #[test]
+    fn upgrade_command_is_omitted_for_non_direct_root_links() {
+        let names = vec!["auto-installed-peer".to_string()];
+
+        assert_eq!(upgrade_command_for_root_links(false, Some(&names)), None);
+    }
 }
 
 /// Pick the highest version in a slim speculation packument that
@@ -2994,6 +3011,29 @@ fn sanitized_source_identity(package: &InstallPackage) -> String {
     }
 }
 
+fn upgrade_command_for_root_links(
+    is_direct: bool,
+    root_link_names: Option<&[String]>,
+) -> Option<String> {
+    if !is_direct {
+        return None;
+    }
+    let root_link_names = root_link_names?;
+    let first = root_link_names.first()?;
+    let mut command = String::with_capacity(
+        "lpm upgrade ".len()
+            + root_link_names.iter().map(String::len).sum::<usize>()
+            + root_link_names.len().saturating_sub(1),
+    );
+    command.push_str("lpm upgrade ");
+    command.push_str(first);
+    for name in &root_link_names[1..] {
+        command.push(' ');
+        command.push_str(name);
+    }
+    Some(command)
+}
+
 pub(super) fn artifact_unavailable_error(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -3001,12 +3041,13 @@ pub(super) fn artifact_unavailable_error(
     selection: ArtifactSelection,
 ) -> LpmError {
     invalidate_metadata_routed(client, route_table, &package.name, &package.version);
-    let kind = match selection {
-        ArtifactSelection::LockfileReplay => lpm_common::ArtifactUnavailableKind::Pinned,
-        ArtifactSelection::FreshResolution => lpm_common::ArtifactUnavailableKind::Selected,
+    let (kind, suggested_command) = match selection {
+        ArtifactSelection::LockfileReplay => (
+            lpm_common::ArtifactUnavailableKind::Pinned,
+            upgrade_command_for_root_links(package.is_direct, package.root_link_names.as_deref()),
+        ),
+        ArtifactSelection::FreshResolution => (lpm_common::ArtifactUnavailableKind::Selected, None),
     };
-    let suggested_command = matches!(selection, ArtifactSelection::LockfileReplay)
-        .then(|| format!("lpm upgrade {}", package.name));
     LpmError::ArtifactUnavailable(Box::new(lpm_common::ArtifactUnavailableErrorContext {
         package: package.name.clone(),
         version: package.version.clone(),
