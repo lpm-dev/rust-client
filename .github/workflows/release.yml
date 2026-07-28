@@ -5,6 +5,8 @@ on:
     tags:
       - "v*"
       - "!v*-*"
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       channel:
@@ -33,7 +35,7 @@ on:
         required: false
 
 concurrency:
-  group: release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.channel || 'stable' }}
+  group: release-${{ (github.event_name == 'schedule' || inputs.channel == 'nightly') && 'nightly' || format('{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: false
 
 permissions:
@@ -55,11 +57,13 @@ jobs:
   release-metadata:
     name: Resolve release metadata
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       channel: ${{ steps.metadata.outputs.channel }}
+      mode: ${{ steps.metadata.outputs.mode }}
       npm_tag: ${{ steps.metadata.outputs.npm_tag }}
       prerelease: ${{ steps.metadata.outputs.prerelease }}
+      should_release: ${{ steps.metadata.outputs.should_release }}
       tag: ${{ steps.metadata.outputs.tag }}
       version: ${{ steps.metadata.outputs.version }}
     steps:
@@ -80,23 +84,103 @@ jobs:
         run: |
           set -euo pipefail
 
+          SHOULD_RELEASE=true
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             CHANNEL=stable
             MODE=full
             VERSION="${GITHUB_REF_NAME#v}"
+          elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            CHANNEL=nightly
+            MODE=full
+            VERSION=
           else
             CHANNEL="${INPUT_CHANNEL:-stable}"
             MODE="${INPUT_MODE:-full}"
-            if [ "$CHANNEL" = "nightly" ]; then
-              if [ "$MODE" = "full" ]; then
-                if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-                  echo "::error::Nightly releases must run from the main branch."
+            VERSION="${INPUT_VERSION:-}"
+          fi
+
+          if [ "$CHANNEL" = "nightly" ]; then
+            if [ "$MODE" = "full" ]; then
+              if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+                echo "::error::Nightly releases must run from the main branch."
+                exit 1
+              fi
+              if [ -n "${INPUT_VERSION:-}" ]; then
+                echo "::error::Leave version empty for full nightly releases; it is generated automatically."
+                exit 1
+              fi
+
+              if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+                PACKAGES=(
+                  "@lpm-registry/cli"
+                  "@lpm-registry/cli-darwin-arm64"
+                  "@lpm-registry/cli-darwin-x64"
+                  "@lpm-registry/cli-linux-arm64"
+                  "@lpm-registry/cli-linux-x64"
+                  "@lpm-registry/cli-linux-x64-musl"
+                  "@lpm-registry/cli-win32-x64"
+                )
+                STATE_ARGS=()
+                NPM_NIGHTLY=
+                for package in "${PACKAGES[@]}"; do
+                  package_version=$(npm view "$package" "dist-tags.nightly" --json --prefer-online |
+                    jq -er 'if type == "string" and length > 0 then . else error("missing nightly dist-tag") end')
+                  STATE_ARGS+=(--npm-version "${package}=${package_version}")
+                  if [ "$package" = "@lpm-registry/cli" ]; then
+                    NPM_NIGHTLY="$package_version"
+                  fi
+                done
+
+                if ! printf '%s\n' "$NPM_NIGHTLY" |
+                  grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'; then
+                  echo "::error::npm nightly dist-tag has an invalid version: '$NPM_NIGHTLY'."
                   exit 1
                 fi
-                if [ -n "${INPUT_VERSION:-}" ]; then
-                  echo "::error::Leave version empty for full nightly releases; it is generated automatically."
-                  exit 1
-                fi
+
+                PREVIOUS_TAG="v${NPM_NIGHTLY}"
+                RELEASE_JSON="$RUNNER_TEMP/previous-nightly-release.json"
+                gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${PREVIOUS_TAG}" > "$RELEASE_JSON"
+                GITHUB_TAG=$(jq -er '.tag_name | strings | select(length > 0)' "$RELEASE_JSON")
+                GITHUB_PRERELEASE=$(jq -er \
+                  'if (.prerelease | type) == "boolean" then (.prerelease | tostring) else error("invalid prerelease flag") end' \
+                  "$RELEASE_JSON")
+                GITHUB_DRAFT=$(jq -er \
+                  'if (.draft | type) == "boolean" then (.draft | tostring) else error("invalid draft flag") end' \
+                  "$RELEASE_JSON")
+                GITHUB_PUBLISHED_AT=$(jq -er \
+                  '.published_at | strings | select(length > 0)' "$RELEASE_JSON")
+
+                COMPARE_JSON="$RUNNER_TEMP/previous-nightly-comparison.json"
+                gh api \
+                  "repos/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${GITHUB_SHA}" \
+                  > "$COMPARE_JSON"
+                TAG_SHA=$(jq -er '.base_commit.sha | strings | select(length > 0)' "$COMPARE_JSON")
+                COMPARE_STATUS=$(jq -er '.status | strings | select(length > 0)' "$COMPARE_JSON")
+                case "$COMPARE_STATUS" in
+                  identical) RELATIONSHIP=same ;;
+                  ahead) RELATIONSHIP=ancestor ;;
+                  behind | diverged) RELATIONSHIP=diverged ;;
+                  *)
+                    echo "::error::GitHub returned unknown comparison status '$COMPARE_STATUS'."
+                    exit 1
+                    ;;
+                esac
+
+                STATE_JSON=$(node npm/release/nightly-release-state.mjs \
+                  --current-sha "$GITHUB_SHA" \
+                  --tag-sha "$TAG_SHA" \
+                  --github-tag "$GITHUB_TAG" \
+                  --github-prerelease "$GITHUB_PRERELEASE" \
+                  --github-draft "$GITHUB_DRAFT" \
+                  --github-published-at "$GITHUB_PUBLISHED_AT" \
+                  --relationship "$RELATIONSHIP" \
+                  "${STATE_ARGS[@]}")
+                SHOULD_RELEASE=$(printf '%s' "$STATE_JSON" | jq -r '.shouldRelease')
+                STATE_REASON=$(printf '%s' "$STATE_JSON" | jq -r '.reason')
+                echo "::notice::$STATE_REASON"
+              fi
+
+              if [ "$SHOULD_RELEASE" = "true" ]; then
                 CREATED_AT=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.created_at')
                 RUN_DATE=$(printf '%s' "$CREATED_AT" | cut -c1-10 | tr -d '-')
                 VERSION=$(node npm/release/nightly-version.mjs \
@@ -105,19 +189,17 @@ jobs:
                   --run-number "$GITHUB_RUN_NUMBER" \
                   --sha "$GITHUB_SHA")
               else
-                VERSION="${INPUT_VERSION:-}"
-                if [ -z "$VERSION" ]; then
-                  echo "::error::version is required for nightly recovery runs."
-                  exit 1
-                fi
+                VERSION="$NPM_NIGHTLY"
               fi
             else
-              VERSION="${INPUT_VERSION:-}"
               if [ -z "$VERSION" ]; then
-                echo "::error::version is required for stable release and recovery runs."
+                echo "::error::version is required for nightly recovery runs."
                 exit 1
               fi
             fi
+          elif [ -z "$VERSION" ]; then
+            echo "::error::version is required for stable release and recovery runs."
+            exit 1
           fi
 
           case "$CHANNEL" in
@@ -154,18 +236,24 @@ jobs:
 
           {
             echo "channel=$CHANNEL"
+            echo "mode=$MODE"
             echo "npm_tag=$NPM_TAG"
             echo "prerelease=$PRERELEASE"
+            echo "should_release=$SHOULD_RELEASE"
             echo "tag=v$VERSION"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Resolved $CHANNEL release v$VERSION (npm dist-tag: $NPM_TAG)."
+          if [ "$SHOULD_RELEASE" = "true" ]; then
+            echo "Resolved $CHANNEL release v$VERSION (npm dist-tag: $NPM_TAG)."
+          else
+            echo "No nightly release needed for $GITHUB_SHA."
+          fi
 
   verify:
     name: Release verification
     needs: release-metadata
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -229,7 +317,7 @@ jobs:
 
   verify-windows-filesystem:
     needs: release-metadata
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
   build:
@@ -238,7 +326,7 @@ jobs:
       - release-metadata
       - verify
       - verify-windows-filesystem
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     environment: windows-signing
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -578,7 +666,7 @@ jobs:
     needs:
       - build
       - release-metadata
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -616,8 +704,10 @@ jobs:
 
   smoke-npm-packages:
     name: Smoke npm artifacts (${{ matrix.platform }})
-    needs: pack-npm-packages
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    needs:
+      - pack-npm-packages
+      - release-metadata
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -685,7 +775,10 @@ jobs:
   smoke-windows-recovery:
     name: Smoke npm artifacts (win32-x64 recovery)
     needs: release-metadata
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-smoke-only'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      github.event_name == 'workflow_dispatch' &&
+      needs.release-metadata.outputs.mode == 'windows-smoke-only'
     runs-on: windows-latest
     timeout-minutes: 20
     permissions:
@@ -736,7 +829,7 @@ jobs:
       - build
       - release-metadata
       - smoke-npm-packages
-    if: github.event_name == 'push' || inputs.mode == 'full'
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -825,9 +918,11 @@ jobs:
       - release-metadata
     if: >-
       always() &&
+      needs.release-metadata.outputs.should_release == 'true' &&
       ((needs.release.result == 'success' &&
-      (github.event_name == 'push' || inputs.mode == 'full')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'))
+      needs.release-metadata.outputs.mode == 'full') ||
+      (github.event_name == 'workflow_dispatch' &&
+      needs.release-metadata.outputs.mode == 'npm-publish-only'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -947,9 +1042,12 @@ jobs:
       - release-metadata
     if: >-
       always() &&
+      needs.release-metadata.outputs.should_release == 'true' &&
       ((needs.pack-npm-packages.result == 'success' && needs.publish-npm-platform.result == 'success') ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only') ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only' &&
+      (github.event_name == 'workflow_dispatch' &&
+      needs.release-metadata.outputs.mode == 'wrapper-only') ||
+      (github.event_name == 'workflow_dispatch' &&
+      needs.release-metadata.outputs.mode == 'npm-publish-only' &&
       needs.publish-npm-platform.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1130,8 +1228,9 @@ jobs:
       - release
       - release-metadata
     if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
       needs.release-metadata.outputs.channel == 'stable' &&
-      (github.event_name == 'push' || inputs.mode == 'full')
+      needs.release-metadata.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

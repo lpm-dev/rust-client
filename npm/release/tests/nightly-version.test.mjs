@@ -66,19 +66,26 @@ test("workspace stable version comes from Cargo workspace metadata", () => {
   assert.match(workspaceStableVersion(repoRoot), /^\d+\.\d+\.\d+$/);
 });
 
-test("step-one nightly publishing is manual and preserves stable release routing", () => {
+test("scheduled nightly publishing is changed-only and preserves stable release routing", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
 
-  assert.doesNotMatch(workflow, /^\s+schedule:\s*$/m);
+  assert.match(workflow, /^\s+schedule:\s*$/m);
+  assert.match(workflow, /^\s+- cron: "\d+ \d+ \* \* \*"\s*$/m);
   assert.match(workflow, /^\s+- "!v\*-\*"\s*$/m);
   assert.match(workflow, /^\s+channel:\s*$/m);
+  assert.match(workflow, /should_release: \$\{\{ steps\.metadata\.outputs\.should_release \}\}/);
+  assert.match(workflow, /node npm\/release\/nightly-release-state\.mjs/);
+  assert.match(
+    workflow,
+    /github\.event_name == 'schedule' \|\| inputs\.channel == 'nightly'/,
+  );
   assert.match(workflow, /LPM_BUILD_VERSION: \$\{\{ needs\.release-metadata\.outputs\.version \}\}/);
   assert.equal(workflow.match(/--tag "\$NPM_TAG"/g)?.length, 2);
   assert.match(workflow, /prerelease: \$\{\{ needs\.release-metadata\.outputs\.prerelease \}\}/);
   assert.match(workflow, /make_latest: \$\{\{ needs\.release-metadata\.outputs\.channel == 'stable' \}\}/);
   assert.match(
     workflow,
-    /needs\.release-metadata\.outputs\.channel == 'stable' &&\s+\(github\.event_name == 'push' \|\| inputs\.mode == 'full'\)/,
+    /needs\.release-metadata\.outputs\.should_release == 'true' &&\s+needs\.release-metadata\.outputs\.channel == 'stable' &&\s+needs\.release-metadata\.outputs\.mode == 'full'/,
   );
 });
