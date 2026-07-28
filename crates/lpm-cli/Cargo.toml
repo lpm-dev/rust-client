@@ -177,6 +177,8 @@ windows-sys = { version = "0.60", features = [
 keyring = { workspace = true }
 
 [features]
+# Build GNU Linux release artifacts without host DBus/OpenSSL dependencies.
+portable-linux = ["keyring/vendored"]
 # Build with `--features dhat-heap` to instrument heap allocations.
 # Outputs dhat-heap.json on exit — view at https://nnethercote.github.io/dh_view/dh_view.html
 # Usage: cargo build -p lpm-cli --features dhat-heap
