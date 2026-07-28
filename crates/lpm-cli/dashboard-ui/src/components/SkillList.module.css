@@ -250,6 +250,10 @@
   background: var(--faint);
 }
 
+.dotWarning {
+  background: var(--warn);
+}
+
 .listEmpty {
   padding: 22px 18px;
   font-size: 12.5px;

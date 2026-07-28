@@ -1,7 +1,7 @@
 import type { KeyboardEvent } from 'react';
 import styles from './SkillList.module.css';
 import type { Skill } from '../api/types';
-import { fileCountLabel } from '../lib/skillView';
+import { fileCountLabel, isBrokenLink } from '../lib/skillView';
 
 interface SkillListItemProps {
   skill: Skill;
@@ -19,6 +19,7 @@ function badgeClass(skill: Skill): string {
 
 function dotClass(skill: Skill): string {
   if (skill.state === 'enabled') return `${styles.dot} ${styles.dotEnabled}`;
+  if (isBrokenLink(skill)) return `${styles.dot} ${styles.dotWarning}`;
   if (skill.category === 'external') return `${styles.dot} ${styles.dotUnmanaged}`;
   return styles.dot;
 }
@@ -53,7 +54,7 @@ export function SkillListItem({ skill, selected, tabbable, onSelect }: SkillList
             {skill.scope} · {skill.agent}
           </span>
         </span>
-        <span>{fileCountLabel(skill.stats.files)}</span>
+        <span>{isBrokenLink(skill) ? 'broken link' : fileCountLabel(skill.stats.files)}</span>
       </div>
     </li>
   );

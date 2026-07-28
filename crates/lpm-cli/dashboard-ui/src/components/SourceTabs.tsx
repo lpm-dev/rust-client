@@ -19,7 +19,7 @@ export function SourceTabs({ active, counts, onChange, controls }: SourceTabsPro
       ref={barRef}
       className={styles.tabBar}
       role="tablist"
-      aria-label="filter skills by source"
+      aria-label="filter skills by source or status"
       onKeyDown={(event) => moveRovingFocus(event, barRef.current, '[role="tab"]')}
     >
       {SOURCE_TABS.map((tab) => {

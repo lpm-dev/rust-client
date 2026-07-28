@@ -1222,16 +1222,80 @@ fn dashboard_external_inventory(
     project_dir: &Path,
     include_global: bool,
 ) -> Result<Vec<SkillInventoryItem>, LpmError> {
-    Ok(external_inventory(project_dir, include_global)?
-        .into_iter()
-        .map(dashboard_external_item)
-        .collect())
+    Ok(dashboard_external_items(external_inventory(
+        project_dir,
+        include_global,
+    )?))
 }
 
-fn dashboard_external_item(skill: ExternalInventory) -> SkillInventoryItem {
-    let directory = PathBuf::from(&skill.path);
-    let assessment = if skill.healthy {
-        read_and_scan_directory(&directory)
+#[derive(Debug)]
+struct ExternalDashboardGroup {
+    name: String,
+    scope: String,
+    directory: PathBuf,
+    targets: BTreeMap<AgentTarget, PathBuf>,
+    healthy: bool,
+}
+
+fn dashboard_external_items(skills: Vec<ExternalInventory>) -> Vec<SkillInventoryItem> {
+    let mut healthy_groups = BTreeMap::new();
+    let mut unavailable_groups = BTreeMap::new();
+    for skill in skills {
+        let directory = PathBuf::from(&skill.path);
+        // External agent roots use whole-directory aliases; only their resolved root is trusted.
+        // The bounded scanner still rejects every symlink found inside the skill tree.
+        if skill.healthy
+            && let Ok(canonical) = directory.canonicalize()
+        {
+            let key = (skill.scope.clone(), canonical.clone());
+            let group = healthy_groups
+                .entry(key)
+                .or_insert_with(|| ExternalDashboardGroup {
+                    name: skill.name.clone(),
+                    scope: skill.scope.clone(),
+                    directory: canonical,
+                    targets: BTreeMap::new(),
+                    healthy: true,
+                });
+            group.targets.entry(skill.agent).or_insert(directory);
+            continue;
+        }
+
+        let key = (skill.scope.clone(), skill.agent, directory.clone());
+        unavailable_groups
+            .entry(key)
+            .or_insert_with(|| ExternalDashboardGroup {
+                name: skill.name,
+                scope: skill.scope,
+                directory: directory.clone(),
+                targets: BTreeMap::from([(skill.agent, directory)]),
+                healthy: false,
+            });
+    }
+
+    let mut result = Vec::with_capacity(healthy_groups.len() + unavailable_groups.len());
+    result.extend(
+        healthy_groups
+            .into_values()
+            .map(dashboard_external_group_item),
+    );
+    result.extend(
+        unavailable_groups
+            .into_values()
+            .map(dashboard_external_group_item),
+    );
+    result.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    result
+}
+
+fn dashboard_external_group_item(group: ExternalDashboardGroup) -> SkillInventoryItem {
+    let assessment = if group.healthy {
+        read_and_scan_directory(&group.directory)
     } else {
         DirectoryAssessment {
             skill_content: None,
@@ -1243,53 +1307,69 @@ fn dashboard_external_item(skill: ExternalInventory) -> SkillInventoryItem {
             modified_at_ms: None,
         }
     };
-    let description = assessment.skill_content.as_deref().and_then(|content| {
-        lpm_security::skill_security::parse_agent_skill_frontmatter(content)
-            .0
-            .description
-    });
-    let agent = agent_slug(skill.agent);
-    let global_flag = if skill.scope == "global" {
-        " --global"
+    let description = if group.healthy {
+        assessment.skill_content.as_deref().and_then(|content| {
+            lpm_security::skill_security::parse_agent_skill_frontmatter(content)
+                .0
+                .description
+        })
     } else {
-        ""
+        Some("Broken agent skill link. Its target no longer exists.".into())
     };
-    SkillInventoryItem {
-        id: stable_id(
-            "external",
-            &format!("{}:{agent}:{}", skill.scope, directory.display()),
-        ),
-        kind: SkillInventoryKind::External,
-        name: skill.name,
-        description,
-        source: "external agent directory".into(),
-        scope: skill.scope,
-        package: None,
-        version: None,
-        path: Some(directory.display().to_string()),
-        size_bytes: None,
-        context_tokens: assessment.context_tokens,
-        file_count: assessment.file_count,
-        modified_at_ms: assessment.modified_at_ms,
-        targets: vec![SkillTarget {
-            agent: agent.into(),
-            label: skill.agent.label().into(),
-            path: directory.display().to_string(),
-            enabled: skill.healthy,
-            healthy: skill.healthy,
-            status: if skill.healthy {
+    let only_agent = (group.targets.len() == 1)
+        .then(|| group.targets.keys().next().copied())
+        .flatten();
+    let directory_path = group.directory.display().to_string();
+    let identity = match only_agent.filter(|_| !group.healthy) {
+        Some(agent) => format!("{}:{}:{directory_path}", group.scope, agent_slug(agent)),
+        None => format!("{}:{directory_path}", group.scope),
+    };
+    let targets = group
+        .targets
+        .into_iter()
+        .map(|(agent, path)| SkillTarget {
+            agent: agent_slug(agent).into(),
+            label: agent.label().into(),
+            path: path.display().to_string(),
+            enabled: group.healthy,
+            healthy: group.healthy,
+            status: if group.healthy {
                 "healthy"
             } else {
                 "broken-link"
             }
             .into(),
             materialization: "external".into(),
-        }],
-        healthy: skill.healthy,
-        integrity: None,
+        })
+        .collect();
+    let mut command = String::from("lpm skills list --kind external");
+    if let Some(agent) = only_agent {
+        command.push_str(" --agent ");
+        command.push_str(agent_slug(agent));
+    }
+    if group.scope == "global" {
+        command.push_str(" --global");
+    }
+    SkillInventoryItem {
+        id: stable_id("external", &identity),
+        kind: SkillInventoryKind::External,
+        name: group.name,
+        description,
+        source: "external agent directory".into(),
+        scope: group.scope,
+        package: None,
+        version: None,
+        path: Some(directory_path),
+        size_bytes: None,
+        context_tokens: assessment.context_tokens,
+        file_count: assessment.file_count,
+        modified_at_ms: assessment.modified_at_ms,
+        targets,
+        healthy: group.healthy,
+        integrity: (!group.healthy).then(|| "broken-link".into()),
         security: assessment.security,
         actions: Vec::new(),
-        command: format!("lpm skills list --kind external --agent {agent}{global_flag}"),
+        command,
     }
 }
 
@@ -1316,10 +1396,7 @@ fn dashboard_external_inventory_report(
             &mut report,
         );
     }
-    external.sort_by(|left, right| left.name.cmp(&right.name));
-    report
-        .skills
-        .extend(external.into_iter().map(dashboard_external_item));
+    report.skills.extend(dashboard_external_items(external));
     report
 }
 
@@ -3653,6 +3730,114 @@ mod tests {
         assert_eq!(
             inventory[0].context_tokens,
             Some(skill_content.chars().count().div_ceil(4))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_external_inventory_reads_a_skill_through_its_root_alias() {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("shared/manual");
+        let alias = project.path().join(".claude/skills/manual");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: manual\ndescription: Manual guide\n---\nUse the guide.",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+
+        let inventory = dashboard_external_inventory(project.path(), false).unwrap();
+        let skill = &inventory[0];
+
+        assert_eq!(
+            (
+                skill.file_count,
+                skill.description.as_deref(),
+                skill.security.status.as_str()
+            ),
+            (1, Some("Manual guide"), "scanned")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_external_inventory_groups_canonical_aliases_and_preserves_agent_targets() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical = project.path().join(".agents/skills/manual");
+        let alias = project.path().join(".claude/skills/manual");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(
+            canonical.join("SKILL.md"),
+            "---\nname: manual\ndescription: Manual guide\n---\nUse the guide.",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+
+        let inventory = dashboard_external_inventory(project.path(), false).unwrap();
+        let targets: Vec<_> = inventory[0]
+            .targets
+            .iter()
+            .map(|target| target.agent.as_str())
+            .collect();
+
+        assert_eq!(
+            (inventory.len(), targets),
+            (1, vec!["codex", "claude-code"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_external_inventory_root_alias_still_rejects_nested_symlinks() {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("shared/manual");
+        let alias = project.path().join(".claude/skills/manual");
+        let outside = project.path().join("outside.md");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: manual\ndescription: Manual guide\n---\nUse the guide.",
+        )
+        .unwrap();
+        std::fs::write(&outside, "Do not scan this file.").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("linked.md")).unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+
+        let inventory = dashboard_external_inventory(project.path(), false).unwrap();
+        let message = inventory[0].security.message.as_deref().unwrap();
+
+        assert!(
+            message.contains("refusing symlink in skill directory"),
+            "unexpected scan failure: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_external_inventory_identifies_a_broken_agent_alias() {
+        let project = tempfile::tempdir().unwrap();
+        let alias = project.path().join(".claude/skills/missing");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../../missing-skills/missing", &alias).unwrap();
+
+        let inventory = dashboard_external_inventory(project.path(), false).unwrap();
+        let skill = &inventory[0];
+
+        assert_eq!(
+            (
+                skill.description.as_deref(),
+                skill.integrity.as_deref(),
+                skill.targets[0].status.as_str()
+            ),
+            (
+                Some("Broken agent skill link. Its target no longer exists."),
+                Some("broken-link"),
+                "broken-link"
+            )
         );
     }
 
