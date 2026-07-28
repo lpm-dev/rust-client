@@ -41,7 +41,7 @@ pub use self::firewall::{
 };
 pub use self::install_accounting::{
     MANAGED_INSTALL_ACCOUNTING_HEADER, MANAGED_INSTALL_ACCOUNTING_VERSION,
-    ManagedInstallAccounting, PoolInstallRoot,
+    MAX_MANAGED_POOL_INSTALL_ROOTS, ManagedInstallAccounting, PoolInstallRoot,
 };
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{

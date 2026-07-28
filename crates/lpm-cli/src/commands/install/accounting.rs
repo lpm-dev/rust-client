@@ -17,22 +17,16 @@ pub(super) fn select_pool_install_roots(packages: &[InstallPackage]) -> Vec<Pool
     }
 
     let mut pending = VecDeque::new();
-    let mut direct_pool_roots = BTreeSet::new();
     for index in indices
         .iter()
         .copied()
         .filter(|index| packages[*index].is_direct)
     {
-        let package = &packages[index];
-        if package.is_lpm {
-            direct_pool_roots.insert((package.name.as_str(), package.version.as_str()));
-        }
         pending.push_back((index, false));
     }
 
     let mut visited = HashSet::with_capacity(packages.len());
     let mut roots = BTreeSet::new();
-    let mut covered_pool_packages = BTreeSet::new();
     while let Some((index, covered_by_lpm)) = pending.pop_front() {
         if !visited.insert((index, covered_by_lpm)) {
             continue;
@@ -40,9 +34,6 @@ pub(super) fn select_pool_install_roots(packages: &[InstallPackage]) -> Vec<Pool
 
         let package = &packages[index];
         let identity = (package.name.as_str(), package.version.as_str());
-        if package.is_lpm && covered_by_lpm {
-            covered_pool_packages.insert(identity);
-        }
         if package.is_lpm && (!covered_by_lpm || package.is_direct) {
             roots.insert(identity);
         }
@@ -65,9 +56,6 @@ pub(super) fn select_pool_install_roots(packages: &[InstallPackage]) -> Vec<Pool
         }
     }
 
-    roots.retain(|identity| {
-        direct_pool_roots.contains(identity) || !covered_pool_packages.contains(identity)
-    });
     roots
         .into_iter()
         .map(|(name, version)| PoolInstallRoot::new(name, version))

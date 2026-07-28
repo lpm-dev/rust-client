@@ -98,7 +98,7 @@ fn direct_lpm_root_remains_separate_when_also_covered_by_an_lpm_ancestor() {
 }
 
 #[test]
-fn lpm_descendant_reached_through_npm_is_not_promoted_when_an_lpm_root_also_covers_it() {
+fn lpm_descendant_reached_by_covered_and_uncovered_paths_remains_a_root() {
     let alpha = accounting_package(
         "@lpm.dev/alice.alpha",
         "1.0.0",
@@ -117,7 +117,7 @@ fn lpm_descendant_reached_through_npm_is_not_promoted_when_an_lpm_root_also_cove
 
     assert_eq!(
         root_names(&[npm_x, beta, alpha]),
-        vec!["@lpm.dev/alice.alpha@1.0.0"]
+        vec!["@lpm.dev/alice.alpha@1.0.0", "@lpm.dev/bob.beta@2.0.0",]
     );
 }
 

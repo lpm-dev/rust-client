@@ -4,6 +4,8 @@ use super::*;
 pub const MANAGED_INSTALL_ACCOUNTING_HEADER: &str = "x-lpm-install-accounting";
 /// Protocol version sent in [`MANAGED_INSTALL_ACCOUNTING_HEADER`].
 pub const MANAGED_INSTALL_ACCOUNTING_VERSION: &str = "explicit-v1";
+/// Maximum roots accepted by one managed Pool install report.
+pub const MAX_MANAGED_POOL_INSTALL_ROOTS: usize = 200;
 
 /// Typed proof that an install will submit explicit Pool attribution after linking.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -43,11 +45,16 @@ impl RegistryClient {
         }
 
         let url = format!("{}/api/registry/pool/install-report", self.base_url);
-        let body = serde_json::json!({ "roots": roots });
-        self.execute_with_recovery(AuthPosture::AuthRequired, || {
-            self.post_json_raw(&url, &body)
-        })
-        .await?;
+        let mut deterministic_roots = roots.to_vec();
+        deterministic_roots.sort_unstable();
+        deterministic_roots.dedup();
+        for chunk in deterministic_roots.chunks(MAX_MANAGED_POOL_INSTALL_ROOTS) {
+            let body = serde_json::json!({ "roots": chunk });
+            self.execute_with_recovery(AuthPosture::AuthRequired, || {
+                self.post_json_raw(&url, &body)
+            })
+            .await?;
+        }
         Ok(())
     }
 }

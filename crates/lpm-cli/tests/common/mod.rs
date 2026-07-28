@@ -380,4 +380,10 @@ pub async fn mount_mock_registry(server: &MockServer, packages: &[MockPackage]) 
         })))
         .mount(server)
         .await;
+    Mock::given(method("POST"))
+        .and(match_path("/api/registry/pool/install-report"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(u8::MAX)
+        .mount(server)
+        .await;
 }

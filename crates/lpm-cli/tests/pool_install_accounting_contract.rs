@@ -241,6 +241,7 @@ async fn failed_install_never_sends_a_pool_accounting_report() {
     let server = MockServer::start().await;
     let package_name = "@lpm.dev/alice.alpha";
     let tarball_url = format!("{}/broken.tgz", server.uri());
+    let integrity = common::sri_for(b"tarball response is never accepted");
     let metadata = lpm_registry::PackageMetadata {
         name: package_name.to_string(),
         description: None,
@@ -252,7 +253,7 @@ async fn failed_install_never_sends_a_pool_accounting_report() {
                 version: "1.0.0".to_string(),
                 dist: Some(lpm_registry::DistInfo {
                     tarball: Some(tarball_url),
-                    integrity: Some("sha512-dGVzdA==".to_string()),
+                    integrity: Some(integrity),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -283,7 +284,7 @@ async fn failed_install_never_sends_a_pool_accounting_report() {
     Mock::given(method("GET"))
         .and(match_path("/broken.tgz"))
         .respond_with(ResponseTemplate::new(422).set_body_string("broken tarball"))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -305,6 +306,10 @@ async fn failed_install_never_sends_a_pool_accounting_report() {
     assert!(
         !status.success(),
         "broken tarball install unexpectedly succeeded. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        common::strip_ansi(&format!("{stdout}\n{stderr}")).contains("broken tarball"),
+        "fixture must fail because the tarball request was rejected. stdout={stdout} stderr={stderr}"
     );
     assert!(
         server

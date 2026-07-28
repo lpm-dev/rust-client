@@ -170,3 +170,51 @@ async fn repeated_identical_pool_install_reports_remain_retry_safe() {
     let requests = server.received_requests().await.expect("received requests");
     assert_eq!(requests[0].body, requests[1].body);
 }
+
+#[tokio::test]
+async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/pool/install-report"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("test-token");
+    let roots = (0..401)
+        .rev()
+        .map(|index| PoolInstallRoot::new(format!("@lpm.dev/alice.package-{index:03}"), "1.0.0"))
+        .collect::<Vec<_>>();
+
+    client
+        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .await
+        .expect("bounded accounting chunks should succeed");
+
+    let requests = server.received_requests().await.expect("received requests");
+    let chunks = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON accounting body");
+            body["roots"]
+                .as_array()
+                .expect("roots array")
+                .iter()
+                .map(|root| root["name"].as_str().expect("root name").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![200, 200, 1]
+    );
+    assert!(chunks.iter().flatten().map(String::as_str).is_sorted());
+}
