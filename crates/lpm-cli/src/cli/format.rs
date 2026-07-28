@@ -168,6 +168,21 @@ fn print_json_error(error: &lpm_common::LpmError) {
                 "error": serde_json::Value::Object(detail),
             })
         }
+        lpm_common::LpmError::ArtifactUnavailable(context) => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": error.error_code().to_ascii_uppercase(),
+                "message": context.to_string(),
+                "package": context.package,
+                "version": context.version,
+                "source": context.source,
+                "kind": context.kind,
+                "lockfiles_preserved": context.lockfiles_preserved,
+                "suggested_command": context.suggested_command,
+            }
+        }),
         lpm_common::LpmError::TyposquatSuspected(context) => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -221,6 +236,14 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
             "Re-authenticate with LPM",
             "lpm login",
         )),
+        lpm_common::LpmError::ArtifactUnavailable(context) => {
+            context.suggested_command.as_deref().map(|command| {
+                crate::json_contract::command_next_steps(
+                    "Update the pin in a mutable development environment",
+                    command,
+                )
+            })
+        }
         lpm_common::LpmError::TyposquatSuspected(context) => {
             context.suggested_command.as_deref().map(|command| {
                 crate::json_contract::command_next_steps("Install the suggested package", command)
@@ -484,6 +507,33 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         ),
         lpm_common::LpmError::NotFound(reason) => {
             diagnostic_lines("Not found", Some(reason), error)
+        }
+        lpm_common::LpmError::ArtifactUnavailable(context) => {
+            let headline = match context.kind {
+                lpm_common::ArtifactUnavailableKind::Pinned => "Pinned artifact unavailable",
+                lpm_common::ArtifactUnavailableKind::Selected => "Selected artifact unavailable",
+            };
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                headline,
+            ))];
+            push_detail(
+                &mut lines,
+                "package",
+                install_ui::yellow(&context.package_request()),
+            );
+            push_detail(&mut lines, "source", install_ui::cyan(&context.source));
+            push_detail(&mut lines, "lockfiles", install_ui::status_ok("preserved"));
+            if let Some(command) = &context.suggested_command {
+                push_detail(&mut lines, "command", install_ui::yellow(command));
+                lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+                    "  {} {}",
+                    install_ui::dim("CI"),
+                    install_ui::dim(
+                        "update in a mutable development environment and commit the lockfiles",
+                    ),
+                )));
+            }
+            lines
         }
         lpm_common::LpmError::RateLimited { retry_after_secs } => {
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(

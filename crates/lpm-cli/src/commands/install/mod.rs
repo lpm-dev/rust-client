@@ -1183,6 +1183,7 @@ async fn run_with_options_under_store_lock(
             gate_stats.clone(),
             fetch_extract_limiter.clone(),
             streaming_fetch,
+            ArtifactSelection::from_used_lockfile(used_lockfile),
         ));
     }
 

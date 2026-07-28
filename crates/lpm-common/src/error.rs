@@ -104,6 +104,57 @@ impl fmt::Display for ResolutionErrorContext {
     }
 }
 
+/// Whether an unavailable artifact came from a committed lockfile pin or from
+/// the current mutable resolution.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactUnavailableKind {
+    Pinned,
+    Selected,
+}
+
+/// Structured context for an install-time artifact that cannot be retrieved
+/// without changing the selected package contract.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ArtifactUnavailableErrorContext {
+    pub package: String,
+    pub version: String,
+    pub source: String,
+    pub kind: ArtifactUnavailableKind,
+    pub lockfiles_preserved: bool,
+    pub suggested_command: Option<String>,
+}
+
+impl ArtifactUnavailableErrorContext {
+    pub fn package_request(&self) -> String {
+        format!("{}@{}", self.package, self.version)
+    }
+}
+
+impl fmt::Display for ArtifactUnavailableErrorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ArtifactUnavailableKind::Pinned => write!(
+                f,
+                "pinned artifact {} is unavailable from {}; lpm.lock and lpm.lockb pins were \
+                 preserved. Changing the pin requires `{}` in a mutable development environment, \
+                 followed by committing the updated lockfiles. Frozen and `lpm ci` installs will \
+                 continue to fail until that explicit update is committed",
+                self.package_request(),
+                self.source,
+                self.suggested_command.as_deref().unwrap_or("lpm upgrade"),
+            ),
+            ArtifactUnavailableKind::Selected => write!(
+                f,
+                "selected artifact {} is unavailable from {}; existing lpm.lock and lpm.lockb \
+                 files were preserved and no new lockfile was written",
+                self.package_request(),
+                self.source,
+            ),
+        }
+    }
+}
+
 /// One suspicious package name detected before it enters a project.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct TyposquatErrorFinding {
@@ -302,6 +353,15 @@ pub enum LpmError {
         help("Check the package name and try `lpm search` to find packages.")
     )]
     NotFound(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(lpm::artifact_unavailable),
+        help(
+            "Restore the pinned artifact in the registry, or update the dependency explicitly in a mutable development environment."
+        )
+    )]
+    ArtifactUnavailable(Box<ArtifactUnavailableErrorContext>),
 
     #[error("rate limited — retry after {retry_after_secs}s")]
     #[diagnostic(
@@ -545,6 +605,10 @@ impl LpmError {
                 "upstream_proxy_entitlement_required"
             }
             LpmError::NotFound(_) => "not_found",
+            LpmError::ArtifactUnavailable(context) => match context.kind {
+                ArtifactUnavailableKind::Pinned => "pinned_artifact_unavailable",
+                ArtifactUnavailableKind::Selected => "selected_artifact_unavailable",
+            },
             LpmError::RateLimited { .. } => "rate_limited",
             LpmError::Script(_) => "script",
             LpmError::ScriptWithOutput { .. } => "script",
@@ -709,6 +773,14 @@ mod tests {
                 entitlement_source: None,
             },
             LpmError::NotFound("x".into()),
+            LpmError::ArtifactUnavailable(Box::new(ArtifactUnavailableErrorContext {
+                package: "left-pad".into(),
+                version: "1.3.0".into(),
+                source: "registry+https://registry.npmjs.org".into(),
+                kind: ArtifactUnavailableKind::Pinned,
+                lockfiles_preserved: true,
+                suggested_command: Some("lpm upgrade left-pad".into()),
+            })),
             LpmError::RateLimited {
                 retry_after_secs: 5,
             },
@@ -808,6 +880,18 @@ mod tests {
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
         assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
+        assert_eq!(
+            LpmError::ArtifactUnavailable(Box::new(ArtifactUnavailableErrorContext {
+                package: "left-pad".into(),
+                version: "1.3.0".into(),
+                source: "registry+https://registry.npmjs.org".into(),
+                kind: ArtifactUnavailableKind::Pinned,
+                lockfiles_preserved: true,
+                suggested_command: Some("lpm upgrade left-pad".into()),
+            }))
+            .error_code(),
+            "pinned_artifact_unavailable"
+        );
         assert_eq!(LpmError::Forbidden("x".into()).error_code(), "forbidden");
         assert_eq!(
             LpmError::NpmFirewallBlocked {
