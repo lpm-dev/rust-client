@@ -18,12 +18,14 @@ const INVENTORY_SKILL = {
       label: 'Codex',
       enabled: true,
       healthy: true,
+      status: 'healthy',
     },
     {
       agent: 'cursor',
       label: 'Cursor',
       enabled: false,
       healthy: true,
+      status: 'disabled',
     },
   ],
   healthy: true,
@@ -122,6 +124,57 @@ describe('HTTP dashboard API', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       `/api/v1/skills/${encodeURIComponent(INVENTORY_SKILL.id)}`,
     );
+  });
+
+  it('maps a broken external alias to an explicit unavailable skill', async () => {
+    const brokenSkill = {
+      ...INVENTORY_SKILL,
+      id: `external:${'b'.repeat(64)}`,
+      kind: 'external',
+      name: 'missing-guide',
+      description: undefined,
+      source: 'external agent directory',
+      context_tokens: undefined,
+      file_count: 0,
+      modified_at_ms: undefined,
+      targets: [
+        {
+          agent: 'claude-code',
+          label: 'Claude Code',
+          enabled: false,
+          healthy: false,
+          status: 'broken-link',
+        },
+      ],
+      healthy: false,
+      integrity: 'broken-link',
+      security: {
+        status: 'unavailable',
+        warning_count: 0,
+        block_count: 0,
+        findings: [],
+        message: 'external skill target is a broken link',
+      },
+      actions: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        read_only: false,
+        skipped_entries: 0,
+        warnings: [],
+        skills: [brokenSkill],
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const snapshot = await createHttpDashboardApi().listSkills();
+
+    expect(snapshot.skills[0]).toMatchObject({
+      state: 'unavailable',
+      description: 'Broken agent skill link. Its target no longer exists.',
+      integrity: 'broken-link',
+      targets: [{ status: 'broken-link' }],
+    });
   });
 
   it('keeps mutation preview separate from applying the reviewed plan', async () => {

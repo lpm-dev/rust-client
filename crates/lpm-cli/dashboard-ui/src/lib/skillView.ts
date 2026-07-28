@@ -20,7 +20,17 @@ export function skillRawText(skill: Skill): string {
   return skill.raw ?? skillBody(skill);
 }
 
+export function isBrokenLink(skill: Skill): boolean {
+  return (
+    skill.integrity === 'broken-link' ||
+    skill.targets.some((target) => target.status === 'broken-link')
+  );
+}
+
 export function skillBanner(skill: Skill): string {
+  if (isBrokenLink(skill)) {
+    return 'needs attention · broken agent-directory link — target no longer exists';
+  }
   if (skill.category === 'external') {
     return 'inspection only · unmanaged agent-directory skill — run lpm skills add to manage it';
   }
@@ -39,6 +49,10 @@ export function isManaged(skill: Skill): boolean {
 
 export function hasSecurityWarning(skill: Skill): boolean {
   return skill.security !== 'no findings' && skill.security !== '—';
+}
+
+export function needsAttention(skill: Skill): boolean {
+  return skill.state === 'unavailable' || hasSecurityWarning(skill);
 }
 
 export interface MetadataRow {

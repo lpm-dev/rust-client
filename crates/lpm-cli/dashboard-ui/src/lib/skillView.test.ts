@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import type { Skill } from '../api/types';
-import { skillRawText } from './skillView';
+import { skillBanner, skillRawText } from './skillView';
 
 it('raw view preserves the exact authored markdown', () => {
   const raw = '---\nname: exact\ndescription: Exact source\ncustom: keep-me\n---\n\nBody.\n';
@@ -31,4 +31,34 @@ it('raw view preserves the exact authored markdown', () => {
   };
 
   expect(skillRawText(skill)).toBe(raw);
+});
+
+it('broken external link banner explains the missing target', () => {
+  const skill: Skill = {
+    id: 'external:broken',
+    name: 'broken',
+    namespace: 'external agent directory',
+    category: 'external',
+    scope: 'global',
+    state: 'unavailable',
+    agent: 'Claude Code',
+    version: '—',
+    updated: '—',
+    updatedTs: 0,
+    description: 'Broken agent skill link. Its target no longer exists.',
+    path: '/tmp/broken',
+    files: [],
+    stats: { files: 0, words: 0, lines: 0, keys: 0 },
+    context: '—',
+    integrity: 'broken-link',
+    security: 'external skill target is a broken link',
+    globs: '—',
+    warnings: [],
+    targets: [],
+    actions: [],
+  };
+
+  expect(skillBanner(skill)).toBe(
+    'needs attention · broken agent-directory link — target no longer exists',
+  );
 });

@@ -20,6 +20,7 @@ interface InventoryTarget {
   label: string;
   enabled: boolean;
   healthy: boolean;
+  status: string;
 }
 
 interface SecurityAssessment {
@@ -152,7 +153,19 @@ function targetsFor(targets: InventoryTarget[]): SkillTarget[] {
     label: target.label,
     enabled: target.enabled,
     healthy: target.healthy,
+    status: target.status,
   }));
+}
+
+function descriptionFor(skill: InventorySkill): string {
+  if (skill.description) return skill.description;
+  if (
+    skill.integrity === 'broken-link' ||
+    skill.targets.some((target) => target.status === 'broken-link')
+  ) {
+    return 'Broken agent skill link. Its target no longer exists.';
+  }
+  return 'Skill metadata is unavailable.';
 }
 
 function summarySkill(skill: InventorySkill): Skill {
@@ -169,7 +182,7 @@ function summarySkill(skill: InventorySkill): Skill {
     version: skill.version ?? '—',
     updated: formatTimestamp(modifiedAt),
     updatedTs: modifiedAt,
-    description: skill.description ?? 'Skill metadata is unavailable.',
+    description: descriptionFor(skill),
     path: skill.path ?? '—',
     files: [],
     stats: { files: skill.file_count, words: 0, lines: 0, keys: 0 },

@@ -61,9 +61,9 @@
 }
 
 .sortWrap {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
   flex-shrink: 0;
 }
 
@@ -75,6 +75,8 @@
 }
 
 .sortSelect {
+  appearance: none;
+  -webkit-appearance: none;
   font-family: inherit;
   font-size: 12px;
   color: var(--ink);
@@ -82,8 +84,16 @@
   border: 1px solid var(--border);
   border-radius: 6px;
   height: 36px;
-  padding: 0 8px;
+  min-width: 106px;
+  padding: 0 38px 0 12px;
   cursor: pointer;
+}
+
+.sortChevron {
+  position: absolute;
+  right: 13px;
+  color: var(--ink);
+  pointer-events: none;
 }
 
 .searchWrap {
@@ -104,8 +114,11 @@
 }
 
 .searchIcon {
-  color: var(--faint);
-  font-size: 14px;
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+  flex: none;
 }
 
 .searchInput {
@@ -232,6 +245,14 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+
+.rowAgentMeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
 }
 
 .dot {
@@ -248,6 +269,10 @@
 
 .dotUnmanaged {
   background: var(--faint);
+}
+
+.dotWarning {
+  background: var(--warn);
 }
 
 .listEmpty {

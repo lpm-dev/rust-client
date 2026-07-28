@@ -1,0 +1,50 @@
+.group {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: -3px;
+  color: #171717;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--panel);
+  flex: none;
+}
+
+.icon:first-child {
+  margin-left: 0;
+}
+
+.icon:hover {
+  z-index: 1;
+}
+
+.glyph {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.pi {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1;
+  transform: translateY(-1px);
+}
+
+.fallback {
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+}

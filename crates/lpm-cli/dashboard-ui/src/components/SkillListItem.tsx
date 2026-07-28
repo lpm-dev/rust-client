@@ -1,7 +1,8 @@
 import type { KeyboardEvent } from 'react';
 import styles from './SkillList.module.css';
 import type { Skill } from '../api/types';
-import { fileCountLabel } from '../lib/skillView';
+import { fileCountLabel, isBrokenLink } from '../lib/skillView';
+import { AgentIcons } from './AgentIcons';
 
 interface SkillListItemProps {
   skill: Skill;
@@ -19,6 +20,7 @@ function badgeClass(skill: Skill): string {
 
 function dotClass(skill: Skill): string {
   if (skill.state === 'enabled') return `${styles.dot} ${styles.dotEnabled}`;
+  if (isBrokenLink(skill)) return `${styles.dot} ${styles.dotWarning}`;
   if (skill.category === 'external') return `${styles.dot} ${styles.dotUnmanaged}`;
   return styles.dot;
 }
@@ -49,11 +51,17 @@ export function SkillListItem({ skill, selected, tabbable, onSelect }: SkillList
       <div className={styles.rowFoot}>
         <span className={styles.rowFootLeft}>
           <span className={dotClass(skill)} aria-hidden="true" />
-          <span>
-            {skill.scope} · {skill.agent}
+          <span className={styles.rowAgentMeta}>
+            <span>{skill.scope}</span>
+            <span aria-hidden="true">·</span>
+            {skill.targets.length > 0 ? (
+              <AgentIcons targets={skill.targets} />
+            ) : (
+              <span>{skill.agent}</span>
+            )}
           </span>
         </span>
-        <span>{fileCountLabel(skill.stats.files)}</span>
+        <span>{isBrokenLink(skill) ? 'broken link' : fileCountLabel(skill.stats.files)}</span>
       </div>
     </li>
   );

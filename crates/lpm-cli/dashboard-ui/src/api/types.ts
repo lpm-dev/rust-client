@@ -10,6 +10,7 @@ export interface SkillTarget {
   label: string;
   enabled: boolean;
   healthy: boolean;
+  status: string;
 }
 
 export interface SkillStats {

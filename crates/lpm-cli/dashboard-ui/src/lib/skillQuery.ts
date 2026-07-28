@@ -1,10 +1,12 @@
 import type { Skill } from '../api/types';
+import { needsAttention } from './skillView';
 
-export type SourceTabId = 'all' | 'global' | 'project' | 'package';
+export type SourceTabId = 'all' | 'attention' | 'global' | 'project' | 'package';
 export type SortId = 'name' | 'updated' | 'size' | 'state';
 
 export const SOURCE_TABS: ReadonlyArray<{ id: SourceTabId; label: string }> = [
   { id: 'all', label: 'all sources' },
+  { id: 'attention', label: 'needs attention' },
   { id: 'global', label: 'global' },
   { id: 'project', label: 'project' },
   { id: 'package', label: 'package' },
@@ -22,6 +24,7 @@ export type SourceCounts = Record<SourceTabId, number>;
 export function countBySource(skills: readonly Skill[]): SourceCounts {
   return {
     all: skills.length,
+    attention: skills.filter(needsAttention).length,
     global: skills.filter((s) => s.scope === 'global').length,
     project: skills.filter((s) => s.scope === 'project').length,
     package: skills.filter((s) => s.category === 'package').length,
@@ -30,6 +33,8 @@ export function countBySource(skills: readonly Skill[]): SourceCounts {
 
 function matchesSource(skill: Skill, tab: SourceTabId): boolean {
   switch (tab) {
+    case 'attention':
+      return needsAttention(skill);
     case 'global':
       return skill.scope === 'global';
     case 'project':
