@@ -98,7 +98,19 @@ export function SkillList({
       <div className={styles.filterRow}>
         <div className={styles.searchWrap}>
           <span className={styles.searchIcon} aria-hidden="true">
-            &#8981;
+            <svg
+              data-ui-icon="search"
+              width="20"
+              height="20"
+              viewBox="0 0 20 20"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+            >
+              <circle cx="8.5" cy="8.5" r="5.75" />
+              <path d="m12.75 12.75 4.5 4.5" />
+            </svg>
           </span>
           {/* Short placeholder because sort now shares the row; the full hint
               stays in the accessible name. */}
@@ -128,6 +140,21 @@ export function SkillList({
               </option>
             ))}
           </select>
+          <svg
+            className={styles.sortChevron}
+            data-ui-icon="sort-chevron"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="m7 9.5 5 5 5-5" />
+          </svg>
         </div>
       </div>
 

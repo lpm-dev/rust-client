@@ -2,6 +2,7 @@ import type { KeyboardEvent } from 'react';
 import styles from './SkillList.module.css';
 import type { Skill } from '../api/types';
 import { fileCountLabel, isBrokenLink } from '../lib/skillView';
+import { AgentIcons } from './AgentIcons';
 
 interface SkillListItemProps {
   skill: Skill;
@@ -50,8 +51,14 @@ export function SkillListItem({ skill, selected, tabbable, onSelect }: SkillList
       <div className={styles.rowFoot}>
         <span className={styles.rowFootLeft}>
           <span className={dotClass(skill)} aria-hidden="true" />
-          <span>
-            {skill.scope} · {skill.agent}
+          <span className={styles.rowAgentMeta}>
+            <span>{skill.scope}</span>
+            <span aria-hidden="true">·</span>
+            {skill.targets.length > 0 ? (
+              <AgentIcons targets={skill.targets} />
+            ) : (
+              <span>{skill.agent}</span>
+            )}
           </span>
         </span>
         <span>{isBrokenLink(skill) ? 'broken link' : fileCountLabel(skill.stats.files)}</span>
