@@ -266,6 +266,15 @@ pub enum LpmError {
     #[diagnostic(code(lpm::registry))]
     Registry(String),
 
+    #[error("packages were installed, but Pool attribution could not be confirmed: {reason}")]
+    #[diagnostic(
+        code(lpm::pool_attribution_unconfirmed),
+        help(
+            "Run the same `lpm install` command again. The cached packages will be reused and the attribution report will be retried safely."
+        )
+    )]
+    PoolAttributionUnconfirmed { reason: String },
+
     #[error("{0}")]
     #[diagnostic(
         code(lpm::resolution_failed),
@@ -608,6 +617,7 @@ impl LpmError {
             LpmError::InvalidVersion(_) => "invalid_version",
             LpmError::InvalidVersionRange(_) => "invalid_version_range",
             LpmError::Registry(_) => "registry",
+            LpmError::PoolAttributionUnconfirmed { .. } => "pool_attribution_unconfirmed",
             LpmError::Resolution(_) => "resolution_failed",
             LpmError::TyposquatSuspected(_) => "typosquat_suspected",
             LpmError::PeerDependency(_) => "peer_dependency",
@@ -762,6 +772,7 @@ mod tests {
             LpmError::InvalidVersion("x".into()),
             LpmError::InvalidVersionRange("x".into()),
             LpmError::Registry("x".into()),
+            LpmError::PoolAttributionUnconfirmed { reason: "x".into() },
             LpmError::Resolution(Box::new(resolution_error_context())),
             LpmError::PeerDependency("x".into()),
             LpmError::Network("x".into()),
@@ -940,6 +951,10 @@ mod tests {
             "upstream_proxy_entitlement_required"
         );
         assert_eq!(LpmError::Network("x".into()).error_code(), "network");
+        assert_eq!(
+            LpmError::PoolAttributionUnconfirmed { reason: "x".into() }.error_code(),
+            "pool_attribution_unconfirmed"
+        );
         assert_eq!(
             LpmError::RateLimited {
                 retry_after_secs: 5

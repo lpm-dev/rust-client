@@ -5,6 +5,7 @@ mod body;
 mod cache;
 mod firewall;
 mod http_tls;
+mod install_accounting;
 mod metadata;
 mod tarball;
 mod transport;

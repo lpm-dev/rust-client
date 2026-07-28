@@ -143,6 +143,7 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) fetch_semaphore: Arc<Semaphore>,
     pub(super) fetch_extract_limiter: FetchExtractLimiter,
     pub(super) fetch_coord: Arc<FetchCoordinator>,
+    pub(super) install_accounting: ManagedInstallAccounting,
     pub(super) speculation_join: Option<SpeculationJoin>,
     pub(super) fetch_overlap_join: Option<FetchOverlapJoin>,
     pub(super) spec_tracker: SpeculativeKeyTracker,
@@ -251,6 +252,7 @@ pub(super) async fn run_online_fetch_phase(
         fetch_semaphore,
         fetch_extract_limiter,
         fetch_coord,
+        install_accounting,
         mut speculation_join,
         mut fetch_overlap_join,
         spec_tracker,
@@ -1865,6 +1867,7 @@ pub(super) async fn run_online_fetch_phase(
                         &gate_stats_c,
                         permit,
                         &fetch_extract_limiter_c,
+                        install_accounting,
                     )
                     .await?
                 } else {
@@ -1879,6 +1882,7 @@ pub(super) async fn run_online_fetch_phase(
                         &gate_stats_c,
                         permit,
                         &fetch_extract_limiter_c,
+                        install_accounting,
                     )
                     .await?
                 };
@@ -2355,6 +2359,7 @@ pub(super) fn spawn_speculation_dispatcher(
     // window code paths that still write v1 alongside).
     store_v2: Option<Arc<lpm_store::v2::Store>>,
     fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
 ) -> (tokio::task::JoinHandle<()>, DispatcherCounters) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -2368,6 +2373,7 @@ pub(super) fn spawn_speculation_dispatcher(
     let spec_tracker_spec = spec_tracker;
     let store_v2_spec = store_v2;
     let fetch_extract_limiter_spec = fetch_extract_limiter;
+    let install_accounting_spec = install_accounting;
 
     let dispatched = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -2526,6 +2532,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 let spec_tracker_task = spec_tracker_spec.clone();
                 let store_v2_task = store_v2_spec.clone();
                 let fetch_extract_limiter_task = fetch_extract_limiter_spec.clone();
+                let install_accounting_task = install_accounting_spec;
                 spec_tasks.push(tokio::spawn(async move {
                     let task_start = std::time::Instant::now();
                     match speculative_download_and_store(
@@ -2541,6 +2548,7 @@ pub(super) fn spawn_speculation_dispatcher(
                         &url,
                         integrity.as_deref(),
                         &fetch_extract_limiter_task,
+                        install_accounting_task,
                     )
                     .await
                     {
@@ -2677,6 +2685,7 @@ pub(super) async fn speculative_download_and_store(
     url: &str,
     integrity: Option<&str>,
     fetch_extract_limiter: &FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
 ) -> Result<SpeculativeFetchOutcome, LpmError> {
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -2745,7 +2754,7 @@ pub(super) async fn speculative_download_and_store(
     // Keep speculative downloads on the auth-aware route so custom registries
     // use the same credentials and origin checks as authoritative fetches.
     let response = client
-        .download_tarball_streaming_routed(route_table, name, url)
+        .download_tarball_streaming_routed_managed(route_table, name, url, install_accounting)
         .await?;
 
     if let Some(v2) = store_v2 {
@@ -3083,6 +3092,7 @@ pub(super) async fn fetch_and_store_legacy(
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
 ) -> Result<
     (
         String,
@@ -3131,7 +3141,7 @@ pub(super) async fn fetch_and_store_legacy(
 
     let download_start = std::time::Instant::now();
     let downloaded = match client
-        .download_tarball_routed(route_table, &p.name, &initial_url)
+        .download_tarball_routed_managed(route_table, &p.name, &initial_url, install_accounting)
         .await
     {
         Ok(r) => r,
@@ -3178,7 +3188,12 @@ pub(super) async fn fetch_and_store_legacy(
                 ));
             }
             match client
-                .download_tarball_routed(route_table, &p.name, &fresh_url)
+                .download_tarball_routed_managed(
+                    route_table,
+                    &p.name,
+                    &fresh_url,
+                    install_accounting,
+                )
                 .await
             {
                 Ok(r) => {
@@ -3417,6 +3432,7 @@ pub(super) async fn fetch_and_store_streaming(
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
 ) -> Result<
     (
         String,
@@ -3459,7 +3475,12 @@ pub(super) async fn fetch_and_store_streaming(
     let mut final_url = initial_url.clone();
 
     let response = match client
-        .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
+        .download_tarball_streaming_routed_managed(
+            route_table,
+            &p.name,
+            &initial_url,
+            install_accounting,
+        )
         .await
     {
         Ok(r) => r,
@@ -3505,7 +3526,12 @@ pub(super) async fn fetch_and_store_streaming(
                 ));
             }
             match client
-                .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
+                .download_tarball_streaming_routed_managed(
+                    route_table,
+                    &p.name,
+                    &fresh_url,
+                    install_accounting,
+                )
                 .await
             {
                 Ok(r) => {

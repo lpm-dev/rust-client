@@ -98,6 +98,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
     project_dir: PathBuf,
     gate_stats: Arc<GateStats>,
     fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     streaming_fetch: bool,
     min_selected: usize,
@@ -140,6 +141,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                                     &project_dir,
                                     &gate_stats,
                                     &fetch_extract_limiter,
+                                    install_accounting,
                                     dependency_engine_policy.as_ref(),
                                     streaming_fetch,
                                     &mut seen,
@@ -161,6 +163,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                         &project_dir,
                         &gate_stats,
                         &fetch_extract_limiter,
+                        install_accounting,
                         dependency_engine_policy.as_ref(),
                         streaming_fetch,
                         &mut seen,
@@ -198,6 +201,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
     project_dir: PathBuf,
     gate_stats: Arc<GateStats>,
     fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
     streaming_fetch: bool,
     artifact_selection: ArtifactSelection,
 ) -> FetchOverlapJoin {
@@ -220,6 +224,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
                 &project_dir,
                 &gate_stats,
                 &fetch_extract_limiter,
+                install_accounting,
                 streaming_fetch,
                 artifact_selection,
                 &mut seen,
@@ -252,6 +257,7 @@ fn dispatch_selected_event(
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
     fetch_extract_limiter: &FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
     streaming_fetch: bool,
     seen: &mut HashSet<String>,
@@ -278,6 +284,7 @@ fn dispatch_selected_event(
         project_dir,
         gate_stats,
         fetch_extract_limiter,
+        install_accounting,
         streaming_fetch,
         ArtifactSelection::FreshResolution,
         seen,
@@ -298,6 +305,7 @@ fn dispatch_install_package(
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
     fetch_extract_limiter: &FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
     streaming_fetch: bool,
     artifact_selection: ArtifactSelection,
     seen: &mut HashSet<String>,
@@ -324,6 +332,7 @@ fn dispatch_install_package(
         project_dir.to_path_buf(),
         gate_stats.clone(),
         fetch_extract_limiter.clone(),
+        install_accounting,
         streaming_fetch,
         artifact_selection,
     ));
@@ -401,6 +410,7 @@ async fn fetch_selected_package(
     project_dir: PathBuf,
     gate_stats: Arc<GateStats>,
     fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
     streaming_fetch: bool,
     artifact_selection: ArtifactSelection,
 ) -> FetchOverlapTaskStatus {
@@ -437,6 +447,7 @@ async fn fetch_selected_package(
                 &gate_stats,
                 permit,
                 &fetch_extract_limiter,
+                install_accounting,
             )
             .await?
         } else {
@@ -451,6 +462,7 @@ async fn fetch_selected_package(
                 &gate_stats,
                 permit,
                 &fetch_extract_limiter,
+                install_accounting,
             )
             .await?
         };

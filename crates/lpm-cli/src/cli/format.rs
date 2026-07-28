@@ -121,6 +121,13 @@ fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
 }
 
 fn print_json_error(error: &lpm_common::LpmError) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_error_value(error)).unwrap()
+    );
+}
+
+fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
     let mut json = match error {
         lpm_common::LpmError::Resolution(context) => {
             let mut detail = serde_json::Map::with_capacity(12);
@@ -213,6 +220,20 @@ fn print_json_error(error: &lpm_common::LpmError) {
                 "suggested_command": suggested_command,
             }
         }),
+        lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "installed": true,
+            "pool_attribution_confirmed": false,
+            "error_code": "pool_attribution_unconfirmed",
+            "error": {
+                "code": "POOL_ATTRIBUTION_UNCONFIRMED",
+                "message": error.to_string(),
+                "reason": reason,
+                "retry_safe": true,
+                "suggested_action": "Run the same lpm install command again.",
+            }
+        }),
         _ => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -223,7 +244,7 @@ fn print_json_error(error: &lpm_common::LpmError) {
     if let Some(next_steps) = next_steps_for_error(error) {
         json["next_steps"] = next_steps;
     }
-    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    json
 }
 
 fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Value> {
@@ -384,6 +405,18 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         }
         lpm_common::LpmError::Registry(reason) => {
             diagnostic_lines("Registry error", Some(reason), error)
+        }
+        lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Installed, but Pool attribution is unconfirmed",
+            ))];
+            push_untrusted_detail(&mut lines, "reason", reason);
+            push_detail(
+                &mut lines,
+                "retry",
+                install_ui::yellow("run the same lpm install command again"),
+            );
+            lines
         }
         lpm_common::LpmError::Resolution(context) => resolution_error_lines(context, error),
         lpm_common::LpmError::TyposquatSuspected(context) => {
@@ -1113,6 +1146,62 @@ mod tests {
         assert!(
             plain.iter().all(|line| !line.contains("Error:")),
             "slim error rows must not include miette framing: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn pool_attribution_failure_json_is_truthful_about_installed_state() {
+        let error = lpm_common::LpmError::PoolAttributionUnconfirmed {
+            reason: "HTTP 503: temporary outage".into(),
+        };
+
+        let envelope = json_error_value(&error);
+
+        assert_eq!(envelope["success"], serde_json::json!(false));
+        assert_eq!(envelope["installed"], serde_json::json!(true));
+        assert_eq!(
+            envelope["pool_attribution_confirmed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            envelope["error_code"],
+            serde_json::json!("pool_attribution_unconfirmed")
+        );
+        assert_eq!(envelope["error"]["retry_safe"], serde_json::json!(true));
+        insta::assert_json_snapshot!(envelope, @r###"
+        {
+          "schema_version": 1,
+          "success": false,
+          "installed": true,
+          "pool_attribution_confirmed": false,
+          "error_code": "pool_attribution_unconfirmed",
+          "error": {
+            "code": "POOL_ATTRIBUTION_UNCONFIRMED",
+            "message": "packages were installed, but Pool attribution could not be confirmed: HTTP 503: temporary outage",
+            "reason": "HTTP 503: temporary outage",
+            "retry_safe": true,
+            "suggested_action": "Run the same lpm install command again."
+          }
+        }
+        "###);
+    }
+
+    #[test]
+    fn pool_attribution_failure_human_output_reports_partial_success() {
+        let error = lpm_common::LpmError::PoolAttributionUnconfirmed {
+            reason: "HTTP 503: temporary outage".into(),
+        };
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(
+            plain,
+            vec![
+                "Installed, but Pool attribution is unconfirmed",
+                "  reason HTTP 503: temporary outage",
+                "  retry run the same lpm install command again",
+            ]
         );
     }
 

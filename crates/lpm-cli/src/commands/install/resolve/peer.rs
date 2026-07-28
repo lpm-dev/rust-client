@@ -46,6 +46,7 @@ pub(super) async fn drain_ambient_peer_installs(
     gate_stats: Arc<GateStats>,
     force: bool,
     fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
 ) -> Result<(), LpmError> {
     if !auto_install_peers {
         return Ok(());
@@ -158,6 +159,7 @@ pub(super) async fn drain_ambient_peer_installs(
                         Arc::clone(&gate_stats),
                         force,
                         fetch_extract_limiter.clone(),
+                        install_accounting,
                         ArtifactSelection::FreshResolution,
                         fetch_handles,
                         stats,

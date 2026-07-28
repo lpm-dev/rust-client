@@ -21,6 +21,7 @@ mod cache;
 mod config;
 mod firewall;
 mod http;
+mod install_accounting;
 mod metadata;
 mod state;
 mod tarball;
@@ -37,6 +38,10 @@ pub use self::firewall::{
     NpmFirewallDecisionPolicy, NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics,
     NpmFirewallLookupDuration, NpmFirewallMatchSources, NpmFirewallPolicyAction,
     NpmFirewallPolicyProfile, NpmFirewallSummary,
+};
+pub use self::install_accounting::{
+    MANAGED_INSTALL_ACCOUNTING_HEADER, MANAGED_INSTALL_ACCOUNTING_VERSION,
+    ManagedInstallAccounting, PoolInstallRoot,
 };
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{

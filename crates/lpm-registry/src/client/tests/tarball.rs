@@ -1113,6 +1113,175 @@ async fn routed_lpm_tarball_download_keeps_lpm_bearer() {
 }
 
 #[tokio::test]
+async fn managed_lpm_file_spool_download_sends_accounting_marker() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/lpm-tarball.tgz"))
+        .and(header(
+            MANAGED_INSTALL_ACCOUNTING_HEADER,
+            MANAGED_INSTALL_ACCOUNTING_VERSION,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"managed-file-spool"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("LPM-SESSION-BEARER");
+    let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+    let url = format!("{}/lpm-tarball.tgz", server.uri());
+
+    let downloaded = client
+        .download_tarball_routed_managed(
+            &route_table,
+            "@lpm.dev/acme.pkg",
+            &url,
+            ManagedInstallAccounting,
+        )
+        .await
+        .expect("managed file-spool download should succeed");
+
+    assert_eq!(downloaded.compressed_size, 18);
+}
+
+#[tokio::test]
+async fn managed_lpm_streaming_download_sends_accounting_marker() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/lpm-tarball.tgz"))
+        .and(header(
+            MANAGED_INSTALL_ACCOUNTING_HEADER,
+            MANAGED_INSTALL_ACCOUNTING_VERSION,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"managed-stream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("LPM-SESSION-BEARER");
+    let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+    let url = format!("{}/lpm-tarball.tgz", server.uri());
+
+    let response = client
+        .download_tarball_streaming_routed_managed(
+            &route_table,
+            "@lpm.dev/acme.pkg",
+            &url,
+            ManagedInstallAccounting,
+        )
+        .await
+        .expect("managed streaming download should succeed");
+
+    assert_eq!(
+        response.bytes().await.expect("read managed stream"),
+        b"managed-stream".as_slice()
+    );
+}
+
+#[tokio::test]
+async fn managed_npm_download_sends_neither_accounting_marker_nor_lpm_bearer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo/-/foo-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"managed-npm"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_npm_registry_url(server.uri())
+        .with_token("LPM-SESSION-BEARER");
+    let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+    let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+
+    client
+        .download_tarball_routed_managed(&route_table, "foo", &url, ManagedInstallAccounting)
+        .await
+        .expect("managed install context must not alter npm request isolation");
+
+    let requests = server.received_requests().await.expect("received requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert!(
+        requests[0]
+            .headers
+            .get(MANAGED_INSTALL_ACCOUNTING_HEADER)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn managed_custom_registry_download_sends_custom_auth_but_no_lpm_marker_or_bearer() {
+    use crate::npmrc::NpmrcConfig;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo/-/foo-1.0.0.tgz"))
+        .and(header("authorization", "Bearer CUSTOM-TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"managed-custom"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let registry_url = server.uri();
+    let registry_authority = registry_url
+        .strip_prefix("http://")
+        .expect("wiremock server uses http");
+    let npmrc = NpmrcConfig::parse(
+        &format!(
+            "registry={}/\n//{registry_authority}/:_authToken=CUSTOM-TOKEN\n",
+            registry_url
+        ),
+        "test",
+        &|_| None,
+    );
+    let route_table = crate::route::RouteTable::new(crate::route::RouteMode::Direct, npmrc)
+        .expect("mock npmrc should be valid");
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_token("LPM-SESSION-BEARER");
+    let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+
+    client
+        .download_tarball_routed_managed(&route_table, "foo", &url, ManagedInstallAccounting)
+        .await
+        .expect("managed install context should preserve custom Registry auth");
+
+    let requests = server.received_requests().await.expect("received requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer CUSTOM-TOKEN")
+    );
+    assert!(
+        requests[0]
+            .headers
+            .get(MANAGED_INSTALL_ACCOUNTING_HEADER)
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn download_tarball_with_auth_origin_mismatch_returns_error() {
     // S2 defense parity with `get_npm_metadata_from`: auth scoped
     // to origin A, request to origin B → hard-fail before the
