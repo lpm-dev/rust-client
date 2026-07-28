@@ -59,6 +59,7 @@ pub(super) fn spawn_missing_fetches_for_drafts(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                ArtifactSelection::FreshResolution,
                 fetch_handles,
                 stats,
             );
@@ -79,6 +80,7 @@ pub(super) fn spawn_fetches_for_packages(
     gate_stats: Arc<GateStats>,
     force: bool,
     fetch_extract_limiter: FetchExtractLimiter,
+    artifact_selection: ArtifactSelection,
     fetch_handles: &mut HashMap<String, FetchHandle>,
     stats: &mut ExperimentalResolverStats,
 ) -> Result<(), LpmError> {
@@ -95,6 +97,7 @@ pub(super) fn spawn_fetches_for_packages(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                artifact_selection,
                 fetch_handles,
                 stats,
             );
@@ -117,6 +120,7 @@ pub(super) fn maybe_spawn_fetch(
     gate_stats: Arc<GateStats>,
     force: bool,
     fetch_extract_limiter: FetchExtractLimiter,
+    artifact_selection: ArtifactSelection,
     fetch_handles: &mut HashMap<String, FetchHandle>,
     stats: &mut ExperimentalResolverStats,
 ) {
@@ -177,8 +181,7 @@ pub(super) fn maybe_spawn_fetch(
             store_v2_handle.as_deref(),
             &package,
             queue_wait_ms,
-            &project_dir,
-            TarballNotFoundRecovery::DeleteProjectLockfiles,
+            artifact_selection,
             &gate_stats,
             permit,
             &fetch_extract_limiter,

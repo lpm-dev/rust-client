@@ -339,6 +339,7 @@ pub(in crate::commands::install) async fn run(
                                     Arc::clone(&gate_stats),
                                     force,
                                     fetch_extract_limiter.clone(),
+                                    ArtifactSelection::FreshResolution,
                                     &mut fetch_handles,
                                     &mut stats,
                                 );
@@ -432,6 +433,7 @@ pub(in crate::commands::install) async fn run(
                 Arc::clone(&gate_stats),
                 force,
                 fetch_extract_limiter.clone(),
+                ArtifactSelection::FreshResolution,
                 &mut fetch_handles,
                 &mut stats,
             )?;
@@ -483,6 +485,7 @@ pub(in crate::commands::install) async fn run(
             Arc::clone(&gate_stats),
             force,
             fetch_extract_limiter.clone(),
+            ArtifactSelection::LockfileReplay,
             &mut fetch_handles,
             &mut stats,
         )?;

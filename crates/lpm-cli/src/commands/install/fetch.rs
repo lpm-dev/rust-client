@@ -10,10 +10,20 @@ const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
 const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 10;
 
-#[derive(Clone, Copy)]
-pub(super) enum TarballNotFoundRecovery {
-    DeleteProjectLockfiles,
-    PreserveProjectLockfiles,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ArtifactSelection {
+    LockfileReplay,
+    FreshResolution,
+}
+
+impl ArtifactSelection {
+    pub(super) fn from_used_lockfile(used_lockfile: bool) -> Self {
+        if used_lockfile {
+            Self::LockfileReplay
+        } else {
+            Self::FreshResolution
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1851,8 +1861,7 @@ pub(super) async fn run_online_fetch_phase(
                         store_v2_arg,
                         &p,
                         queue_wait_ms,
-                        &project_dir_buf,
-                        TarballNotFoundRecovery::DeleteProjectLockfiles,
+                        ArtifactSelection::from_used_lockfile(used_lockfile),
                         &gate_stats_c,
                         permit,
                         &fetch_extract_limiter_c,
@@ -1866,8 +1875,7 @@ pub(super) async fn run_online_fetch_phase(
                         store_v2_arg,
                         &p,
                         queue_wait_ms,
-                        &project_dir_buf,
-                        TarballNotFoundRecovery::DeleteProjectLockfiles,
+                        ArtifactSelection::from_used_lockfile(used_lockfile),
                         &gate_stats_c,
                         permit,
                         &fetch_extract_limiter_c,
@@ -2107,6 +2115,23 @@ mod tests {
     #[test]
     fn fetch_extract_permits_stay_unbounded_for_non_macos_v2_installs() {
         assert_eq!(platform_default_fetch_extract_permits(true, false), None);
+    }
+
+    #[test]
+    fn upgrade_command_uses_every_direct_root_manifest_key() {
+        let names = vec!["canonical".to_string(), "local-alias".to_string()];
+
+        assert_eq!(
+            upgrade_command_for_root_links(true, Some(&names)),
+            Some("lpm upgrade canonical local-alias".to_string())
+        );
+    }
+
+    #[test]
+    fn upgrade_command_is_omitted_for_non_direct_root_links() {
+        let names = vec!["auto-installed-peer".to_string()];
+
+        assert_eq!(upgrade_command_for_root_links(false, Some(&names)), None);
     }
 }
 
@@ -2940,12 +2965,8 @@ pub(super) async fn resolve_tarball_url(
     Ok(ResolvedRegistryTarballUrl { url })
 }
 
-/// Invalidate metadata cache for a package, routing through the
-/// custom-registry-aware path when the package is served from a
-/// `.npmrc`-declared registry. added
-/// [`RegistryClient::invalidate_custom_metadata_cache`]; this helper
-/// is the install-path consumer that the route-table invariant requires
-/// was missing.
+/// Invalidate metadata through the package's configured route so custom
+/// registries use their own cache namespace and authentication context.
 pub(super) fn invalidate_metadata_routed(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -2963,35 +2984,78 @@ pub(super) fn invalidate_metadata_routed(
     }
 }
 
-/// Shared 404-handling: invalidate stale metadata and return the user-facing
-/// error message the caller should surface. Authoritative fetches also remove
-/// lockfiles so the next `lpm install` re-resolves; best-effort overlap fetches
-/// preserve project state.
-///
-/// `project_dir` is the project root, not necessarily the current process CWD.
-pub(super) fn handle_tarball_not_found_with_recovery(
-    client: &Arc<RegistryClient>,
-    name: &str,
-    version: &str,
-    project_dir: &Path,
-    recovery: TarballNotFoundRecovery,
-) -> LpmError {
-    client.invalidate_metadata_cache(name);
-    client.invalidate_npm_version_metadata_cache(name, version);
-    if matches!(recovery, TarballNotFoundRecovery::DeleteProjectLockfiles) {
-        let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-        if lock_path.exists() {
-            let _ = std::fs::remove_file(&lock_path);
-        }
-        let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-        if lockb_path.exists() {
-            let _ = std::fs::remove_file(&lockb_path);
-        }
+fn sanitized_registry_identity(url: &str, source_id: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return format!("registry:{source_id}");
+    };
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        format!("registry:{source_id}")
+    } else {
+        format!("registry+{origin}")
     }
-    LpmError::NotFound(format!(
-        "{name}@{version} tarball not found (possibly unpublished). \
-         Cache cleared — run `lpm install` again to re-resolve."
-    ))
+}
+
+fn sanitized_source_identity(package: &InstallPackage) -> String {
+    let Ok(source) = package.source_kind() else {
+        return "unknown-source".to_string();
+    };
+    match &source {
+        lpm_lockfile::Source::Registry { url } => {
+            sanitized_registry_identity(url, &source.source_id())
+        }
+        lpm_lockfile::Source::Tarball { .. } => format!("tarball:{}", source.source_id()),
+        lpm_lockfile::Source::Directory { .. } => format!("directory:{}", source.source_id()),
+        lpm_lockfile::Source::Link { .. } => format!("link:{}", source.source_id()),
+        lpm_lockfile::Source::Git { .. } => format!("git:{}", source.source_id()),
+    }
+}
+
+fn upgrade_command_for_root_links(
+    is_direct: bool,
+    root_link_names: Option<&[String]>,
+) -> Option<String> {
+    if !is_direct {
+        return None;
+    }
+    let root_link_names = root_link_names?;
+    let first = root_link_names.first()?;
+    let mut command = String::with_capacity(
+        "lpm upgrade ".len()
+            + root_link_names.iter().map(String::len).sum::<usize>()
+            + root_link_names.len().saturating_sub(1),
+    );
+    command.push_str("lpm upgrade ");
+    command.push_str(first);
+    for name in &root_link_names[1..] {
+        command.push(' ');
+        command.push_str(name);
+    }
+    Some(command)
+}
+
+pub(super) fn artifact_unavailable_error(
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    package: &InstallPackage,
+    selection: ArtifactSelection,
+) -> LpmError {
+    invalidate_metadata_routed(client, route_table, &package.name, &package.version);
+    let (kind, suggested_command) = match selection {
+        ArtifactSelection::LockfileReplay => (
+            lpm_common::ArtifactUnavailableKind::Pinned,
+            upgrade_command_for_root_links(package.is_direct, package.root_link_names.as_deref()),
+        ),
+        ArtifactSelection::FreshResolution => (lpm_common::ArtifactUnavailableKind::Selected, None),
+    };
+    LpmError::ArtifactUnavailable(Box::new(lpm_common::ArtifactUnavailableErrorContext {
+        package: package.name.clone(),
+        version: package.version.clone(),
+        source: sanitized_source_identity(package),
+        kind,
+        lockfiles_preserved: true,
+        suggested_command,
+    }))
 }
 
 /// Legacy fetch path — download to temp file, reopen, extract. Returns
@@ -2999,11 +3063,9 @@ pub(super) fn handle_tarball_not_found_with_recovery(
 /// a held download semaphore permit. Kept as the default while the
 /// streaming path is validated.
 ///
-/// `project_dir` + `gate_stats` are threaded in
-/// for the CWD-safe `handle_tarball_not_found` (which deletes
-/// lockfiles relative to the project root, not CWD) and the
-/// stale-URL same-run retry telemetry. See the design doc §
-/// Change 2 for the full retry semantics.
+/// `artifact_selection` keeps unavailable-artifact errors distinct between
+/// lockfile replay and fresh resolution. `gate_stats` records the one-time
+/// stale-URL retry outcome.
 // See the docs on `fetch_and_store_streaming` for why the permit drop
 // happens between download and extract. Same shape applies on the legacy
 // spool path.
@@ -3017,8 +3079,7 @@ pub(super) async fn fetch_and_store_legacy(
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
-    project_dir: &Path,
-    not_found_recovery: TarballNotFoundRecovery,
+    artifact_selection: ArtifactSelection,
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
@@ -3055,14 +3116,11 @@ pub(super) async fn fetch_and_store_legacy(
     {
         Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            // Metadata 404 — package/version genuinely gone.
-            // Nothing to retry.
-            return Err(handle_tarball_not_found_with_recovery(
+            return Err(artifact_unavailable_error(
                 client,
-                &p.name,
-                &p.version,
-                project_dir,
-                not_found_recovery,
+                route_table,
+                p,
+                artifact_selection,
             ));
         }
         Err(e) => return Err(e),
@@ -3077,7 +3135,7 @@ pub(super) async fn fetch_and_store_legacy(
         .await
     {
         Ok(r) => r,
-        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() && p.integrity.is_some() => {
             // Stored URL went stale — package was republished, or
             // upstream migrated paths. Invalidate metadata + retry
             // ONCE with a freshly-resolved URL.
@@ -3095,16 +3153,16 @@ pub(super) async fn fetch_and_store_legacy(
             .await
             {
                 Ok(u) => u,
-                Err(_) => {
+                Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found_with_recovery(
+                    return Err(artifact_unavailable_error(
                         client,
-                        &p.name,
-                        &p.version,
-                        project_dir,
-                        not_found_recovery,
+                        route_table,
+                        p,
+                        artifact_selection,
                     ));
                 }
+                Err(e) => return Err(e),
             };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             let fresh_url = fresh_resolution.url.clone();
@@ -3112,12 +3170,11 @@ pub(super) async fn fetch_and_store_legacy(
                 // Loop guard — metadata still points at the same
                 // stale URL. Tarball is really gone, not just moved.
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                return Err(handle_tarball_not_found_with_recovery(
+                return Err(artifact_unavailable_error(
                     client,
-                    &p.name,
-                    &p.version,
-                    project_dir,
-                    not_found_recovery,
+                    route_table,
+                    p,
+                    artifact_selection,
                 ));
             }
             match client
@@ -3131,25 +3188,22 @@ pub(super) async fn fetch_and_store_legacy(
                 }
                 Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found_with_recovery(
+                    return Err(artifact_unavailable_error(
                         client,
-                        &p.name,
-                        &p.version,
-                        project_dir,
-                        not_found_recovery,
+                        route_table,
+                        p,
+                        artifact_selection,
                     ));
                 }
                 Err(e) => return Err(e),
             }
         }
         Err(LpmError::NotFound(_)) => {
-            // On-demand path (no stored URL) 404 — really gone.
-            return Err(handle_tarball_not_found_with_recovery(
+            return Err(artifact_unavailable_error(
                 client,
-                &p.name,
-                &p.version,
-                project_dir,
-                not_found_recovery,
+                route_table,
+                p,
+                artifact_selection,
             ));
         }
         Err(e) => return Err(e),
@@ -3359,8 +3413,7 @@ pub(super) async fn fetch_and_store_streaming(
     store_v2: Option<&lpm_store::v2::Store>,
     p: &InstallPackage,
     queue_wait_ms: u128,
-    project_dir: &Path,
-    not_found_recovery: TarballNotFoundRecovery,
+    artifact_selection: ArtifactSelection,
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
@@ -3392,12 +3445,11 @@ pub(super) async fn fetch_and_store_streaming(
     {
         Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found_with_recovery(
+            return Err(artifact_unavailable_error(
                 client,
-                &p.name,
-                &p.version,
-                project_dir,
-                not_found_recovery,
+                route_table,
+                p,
+                artifact_selection,
             ));
         }
         Err(e) => return Err(e),
@@ -3411,7 +3463,7 @@ pub(super) async fn fetch_and_store_streaming(
         .await
     {
         Ok(r) => r,
-        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() => {
+        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() && p.integrity.is_some() => {
             // Stored URL stale — retry ONCE with fresh metadata.
             // See `fetch_and_store_legacy` for the full semantics;
             // this branch mirrors that retry logic byte-for-byte
@@ -3430,27 +3482,26 @@ pub(super) async fn fetch_and_store_streaming(
             .await
             {
                 Ok(u) => u,
-                Err(_) => {
+                Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found_with_recovery(
+                    return Err(artifact_unavailable_error(
                         client,
-                        &p.name,
-                        &p.version,
-                        project_dir,
-                        not_found_recovery,
+                        route_table,
+                        p,
+                        artifact_selection,
                     ));
                 }
+                Err(e) => return Err(e),
             };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             let fresh_url = fresh_resolution.url.clone();
             if fresh_url == initial_url {
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                return Err(handle_tarball_not_found_with_recovery(
+                return Err(artifact_unavailable_error(
                     client,
-                    &p.name,
-                    &p.version,
-                    project_dir,
-                    not_found_recovery,
+                    route_table,
+                    p,
+                    artifact_selection,
                 ));
             }
             match client
@@ -3464,24 +3515,22 @@ pub(super) async fn fetch_and_store_streaming(
                 }
                 Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found_with_recovery(
+                    return Err(artifact_unavailable_error(
                         client,
-                        &p.name,
-                        &p.version,
-                        project_dir,
-                        not_found_recovery,
+                        route_table,
+                        p,
+                        artifact_selection,
                     ));
                 }
                 Err(e) => return Err(e),
             }
         }
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found_with_recovery(
+            return Err(artifact_unavailable_error(
                 client,
-                &p.name,
-                &p.version,
-                project_dir,
-                not_found_recovery,
+                route_table,
+                p,
+                artifact_selection,
             ));
         }
         Err(e) => return Err(e),

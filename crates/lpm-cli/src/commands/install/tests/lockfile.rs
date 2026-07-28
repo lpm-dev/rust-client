@@ -566,63 +566,149 @@ fn resolved_to_install_packages_uses_npmrc_override_when_present() {
 
 // ── lockfile repair and URL gate tests ───────────────────────
 
-/// `handle_tarball_not_found` must delete the project's own `lpm.lock` /
-/// `lpm.lockb`, not CWD-relative files.
 #[test]
-fn tarball_not_found_error_honors_project_dir() {
+fn tarball_not_found_error_preserves_project_lockfiles_byte_for_byte() {
     let proj = tempfile::tempdir().unwrap();
     let project_dir = proj.path();
 
     let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-    std::fs::write(&lock_path, "# stale lockfile").unwrap();
-    std::fs::write(&lockb_path, b"LPMBfake").unwrap();
-    assert!(lock_path.exists());
-    assert!(lockb_path.exists());
+    let lock_bytes = b"# existing lockfile\n";
+    let lockb_bytes = b"LPMBfake\0bytes";
+    std::fs::write(&lock_path, lock_bytes).unwrap();
+    std::fs::write(&lockb_path, lockb_bytes).unwrap();
 
-    // Construct a real client — we only care that
-    // `invalidate_metadata_cache` + file-delete run. No network.
+    let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let deps = HashMap::from([("some-pkg".to_string(), "1.0.0".to_string())]);
+    let packages = resolved_to_install_packages(
+        &[fake_resolved("some-pkg", "1.0.0", None)],
+        &deps,
+        &HashMap::new(),
+        &[],
+        &HashMap::new(),
+        &route_table,
+        &RegistryClient::new(),
+    );
     let client = Arc::new(RegistryClient::new());
-    let err = handle_tarball_not_found_with_recovery(
+    let err = artifact_unavailable_error(
         &client,
-        "some-pkg",
-        "1.0.0",
-        project_dir,
-        TarballNotFoundRecovery::DeleteProjectLockfiles,
+        &route_table,
+        &packages[0],
+        ArtifactSelection::LockfileReplay,
     );
 
-    // Lockfiles in the PROJECT directory are gone.
-    assert!(!lock_path.exists(), "project_dir/lpm.lock must be deleted");
-    assert!(
-        !lockb_path.exists(),
-        "project_dir/lpm.lockb must be deleted"
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_bytes,
+        "tarball failures must preserve lpm.lock byte-for-byte"
     );
-    // Error message references the package for user diagnostics.
-    assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("some-pkg@1.0.0")));
+    assert_eq!(
+        std::fs::read(&lockb_path).unwrap(),
+        lockb_bytes,
+        "tarball failures must preserve lpm.lockb byte-for-byte"
+    );
+    assert!(
+        matches!(
+            err,
+            LpmError::ArtifactUnavailable(ref context)
+                if context.package == "some-pkg"
+                    && context.version == "1.0.0"
+                    && context.lockfiles_preserved
+                    && context.suggested_command.as_deref() == Some("lpm upgrade some-pkg")
+        ) && err.to_string().contains("pins were preserved"),
+        "error must identify the pinned artifact and preserved lockfiles: {err}"
+    );
 }
 
 #[test]
-fn tarball_not_found_overlap_recovery_preserves_project_lockfiles() {
+fn fresh_resolution_artifact_failure_preserves_existing_project_lockfiles() {
     let proj = tempfile::tempdir().unwrap();
     let project_dir = proj.path();
 
     let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-    std::fs::write(&lock_path, "# existing lockfile").unwrap();
-    std::fs::write(&lockb_path, b"LPMBfake").unwrap();
+    let lock_bytes = b"# stale existing lockfile\n";
+    let lockb_bytes = b"LPMBstale-existing";
+    std::fs::write(&lock_path, lock_bytes).unwrap();
+    std::fs::write(&lockb_path, lockb_bytes).unwrap();
 
+    let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let deps = HashMap::from([("overlap-pkg".to_string(), "1.0.0".to_string())]);
+    let packages = resolved_to_install_packages(
+        &[fake_resolved("overlap-pkg", "1.0.0", None)],
+        &deps,
+        &HashMap::new(),
+        &[],
+        &HashMap::new(),
+        &route_table,
+        &RegistryClient::new(),
+    );
     let client = Arc::new(RegistryClient::new());
-    let err = handle_tarball_not_found_with_recovery(
+    let err = artifact_unavailable_error(
         &client,
-        "overlap-pkg",
-        "1.0.0",
-        project_dir,
-        TarballNotFoundRecovery::PreserveProjectLockfiles,
+        &route_table,
+        &packages[0],
+        ArtifactSelection::FreshResolution,
     );
 
-    assert!(lock_path.exists(), "overlap fetch must preserve lpm.lock");
-    assert!(lockb_path.exists(), "overlap fetch must preserve lpm.lockb");
-    assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("overlap-pkg@1.0.0")));
+    assert_eq!(
+        std::fs::read(lock_path).unwrap(),
+        lock_bytes,
+        "fresh resolution failure must preserve stale lpm.lock byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read(lockb_path).unwrap(),
+        lockb_bytes,
+        "fresh resolution failure must preserve stale lpm.lockb byte-for-byte"
+    );
+    assert!(
+        matches!(
+            err,
+            LpmError::ArtifactUnavailable(ref context)
+                if context.kind == lpm_common::ArtifactUnavailableKind::Selected
+                    && context.lockfiles_preserved
+        ),
+        "fresh resolution must retain its own artifact classification: {err}"
+    );
+}
+
+#[test]
+fn artifact_unavailable_error_redacts_registry_credentials_and_url_components() {
+    let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let deps = HashMap::from([("secret-source".to_string(), "1.0.0".to_string())]);
+    let mut packages = resolved_to_install_packages(
+        &[fake_resolved("secret-source", "1.0.0", None)],
+        &deps,
+        &HashMap::new(),
+        &[],
+        &HashMap::new(),
+        &route_table,
+        &RegistryClient::new(),
+    );
+    packages[0].source = "registry+https://user:password@example.test/private/token-value?auth=query-secret#fragment-secret".to_string();
+
+    let err = artifact_unavailable_error(
+        &Arc::new(RegistryClient::new()),
+        &route_table,
+        &packages[0],
+        ArtifactSelection::LockfileReplay,
+    );
+    let rendered = err.to_string();
+
+    assert!(rendered.contains("registry+https://example.test"));
+    for secret in [
+        "user",
+        "password",
+        "private",
+        "token-value",
+        "query-secret",
+        "fragment-secret",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "artifact error exposed secret-bearing URL component {secret:?}: {rendered}"
+        );
+    }
 }
 
 /// The fast-path writeback trigger fires on v1 → v2 binary migration

@@ -199,6 +199,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
     gate_stats: Arc<GateStats>,
     fetch_extract_limiter: FetchExtractLimiter,
     streaming_fetch: bool,
+    artifact_selection: ArtifactSelection,
 ) -> FetchOverlapJoin {
     let handle = tokio::spawn(async move {
         let mut seen = HashSet::with_capacity(packages.len());
@@ -220,6 +221,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
                 &gate_stats,
                 &fetch_extract_limiter,
                 streaming_fetch,
+                artifact_selection,
                 &mut seen,
                 &mut tasks,
                 &mut stats,
@@ -277,6 +279,7 @@ fn dispatch_selected_event(
         gate_stats,
         fetch_extract_limiter,
         streaming_fetch,
+        ArtifactSelection::FreshResolution,
         seen,
         tasks,
         stats,
@@ -296,6 +299,7 @@ fn dispatch_install_package(
     gate_stats: &Arc<GateStats>,
     fetch_extract_limiter: &FetchExtractLimiter,
     streaming_fetch: bool,
+    artifact_selection: ArtifactSelection,
     seen: &mut HashSet<String>,
     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
     stats: &mut FetchOverlapStats,
@@ -321,6 +325,7 @@ fn dispatch_install_package(
         gate_stats.clone(),
         fetch_extract_limiter.clone(),
         streaming_fetch,
+        artifact_selection,
     ));
 }
 
@@ -397,6 +402,7 @@ async fn fetch_selected_package(
     gate_stats: Arc<GateStats>,
     fetch_extract_limiter: FetchExtractLimiter,
     streaming_fetch: bool,
+    artifact_selection: ArtifactSelection,
 ) -> FetchOverlapTaskStatus {
     if !package_platform_compatible(&package) {
         return FetchOverlapTaskStatus::SkippedPlatform;
@@ -427,8 +433,7 @@ async fn fetch_selected_package(
                 store_v2_handle.as_deref(),
                 &package,
                 queue_wait_ms,
-                &project_dir,
-                TarballNotFoundRecovery::PreserveProjectLockfiles,
+                artifact_selection,
                 &gate_stats,
                 permit,
                 &fetch_extract_limiter,
@@ -442,8 +447,7 @@ async fn fetch_selected_package(
                 store_v2_handle.as_deref(),
                 &package,
                 queue_wait_ms,
-                &project_dir,
-                TarballNotFoundRecovery::PreserveProjectLockfiles,
+                artifact_selection,
                 &gate_stats,
                 permit,
                 &fetch_extract_limiter,

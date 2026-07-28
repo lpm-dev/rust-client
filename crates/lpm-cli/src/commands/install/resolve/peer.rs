@@ -158,6 +158,7 @@ pub(super) async fn drain_ambient_peer_installs(
                         Arc::clone(&gate_stats),
                         force,
                         fetch_extract_limiter.clone(),
+                        ArtifactSelection::FreshResolution,
                         fetch_handles,
                         stats,
                     );

@@ -11,6 +11,7 @@ use super::mock_registry::{MockRegistry, compute_integrity};
 pub enum MetadataReply {
     Ok(serde_json::Value),
     NotFound(String),
+    Status { code: u16, body: String },
 }
 
 #[derive(Clone)]
@@ -215,6 +216,9 @@ impl Respond for MetadataSequenceResponder {
         match self.state.next() {
             MetadataReply::Ok(metadata) => ResponseTemplate::new(200).set_body_json(metadata),
             MetadataReply::NotFound(body) => ResponseTemplate::new(404)
+                .insert_header("content-type", "application/json")
+                .set_body_string(body),
+            MetadataReply::Status { code, body } => ResponseTemplate::new(code)
                 .insert_header("content-type", "application/json")
                 .set_body_string(body),
         }

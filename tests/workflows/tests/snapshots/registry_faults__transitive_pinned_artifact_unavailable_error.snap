@@ -1,0 +1,19 @@
+---
+source: tests/workflows/tests/registry_faults.rs
+expression: envelope
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error_code": "pinned_artifact_unavailable",
+  "error": {
+    "code": "PINNED_ARTIFACT_UNAVAILABLE",
+    "message": "[TRANSITIVE PINNED ARTIFACT MESSAGE]",
+    "package": "fault-json-transitive-artifact",
+    "version": "1.0.0",
+    "source": "[REGISTRY]",
+    "kind": "pinned",
+    "lockfiles_preserved": true,
+    "suggested_command": null
+  }
+}

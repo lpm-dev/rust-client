@@ -29,8 +29,8 @@ pub use bounded_read::{
     TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped, read_text_file_capped,
 };
 pub use error::{
-    LpmError, ResolutionErrorContext, ResolutionFailureKind, TyposquatErrorContext,
-    TyposquatErrorFinding,
+    ArtifactUnavailableErrorContext, ArtifactUnavailableKind, LpmError, ResolutionErrorContext,
+    ResolutionFailureKind, TyposquatErrorContext, TyposquatErrorFinding,
 };
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
