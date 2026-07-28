@@ -31,8 +31,8 @@ async fn report_managed_pool_install_posts_authenticated_exact_roots_without_dep
         .with_base_url(server.uri())
         .with_token("test-token");
     let roots = vec![
-        PoolInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0"),
-        PoolInstallRoot::new("@lpm.dev/carol.charlie", "3.0.0"),
+        ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0"),
+        ManagedInstallRoot::new("@lpm.dev/carol.charlie", "3.0.0"),
     ];
 
     client
@@ -103,7 +103,7 @@ async fn report_managed_pool_install_retries_transient_failures_with_identical_p
     let client = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("test-token");
-    let roots = vec![PoolInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
+    let roots = vec![ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
 
     client
         .report_managed_pool_install(&roots, ManagedInstallAccounting)
@@ -131,7 +131,7 @@ async fn report_managed_pool_install_stops_after_the_bounded_retry_budget() {
     let client = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("test-token");
-    let roots = vec![PoolInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
+    let roots = vec![ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
 
     let result = client
         .report_managed_pool_install(&roots, ManagedInstallAccounting)
@@ -156,7 +156,7 @@ async fn repeated_identical_pool_install_reports_remain_retry_safe() {
     let client = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("test-token");
-    let roots = vec![PoolInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
+    let roots = vec![ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
 
     client
         .report_managed_pool_install(&roots, ManagedInstallAccounting)
@@ -189,7 +189,7 @@ async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
         .with_token("test-token");
     let roots = (0..401)
         .rev()
-        .map(|index| PoolInstallRoot::new(format!("@lpm.dev/alice.package-{index:03}"), "1.0.0"))
+        .map(|index| ManagedInstallRoot::new(format!("@lpm.dev/alice.package-{index:03}"), "1.0.0"))
         .collect::<Vec<_>>();
 
     client

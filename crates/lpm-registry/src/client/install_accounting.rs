@@ -11,17 +11,21 @@ pub const MAX_MANAGED_POOL_INSTALL_ROOTS: usize = 200;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ManagedInstallAccounting;
 
-/// A resolved top-level Pool accounting root reported after a successful install.
+/// A resolved top-level LPM accounting root reported after a successful install.
+///
+/// Pool eligibility is intentionally absent: the Registry derives distribution
+/// and publisher access authoritatively before crediting the root or traversing
+/// its saved Pool dependency tree.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
-pub struct PoolInstallRoot {
+pub struct ManagedInstallRoot {
     /// Canonical LPM package name.
     pub name: String,
     /// Exact resolved package version.
     pub version: String,
 }
 
-impl PoolInstallRoot {
-    /// Construct a resolved Pool accounting root.
+impl ManagedInstallRoot {
+    /// Construct a resolved LPM accounting root.
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -37,7 +41,7 @@ impl RegistryClient {
     /// from its saved package-version dependency trees.
     pub async fn report_managed_pool_install(
         &self,
-        roots: &[PoolInstallRoot],
+        roots: &[ManagedInstallRoot],
         _accounting: ManagedInstallAccounting,
     ) -> Result<(), LpmError> {
         if roots.is_empty() {

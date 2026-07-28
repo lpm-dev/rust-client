@@ -1,7 +1,7 @@
 use super::*;
-use lpm_registry::{PoolInstallRoot, RegistryClient};
+use lpm_registry::{ManagedInstallRoot, RegistryClient};
 
-pub(super) fn select_pool_install_roots(packages: &[InstallPackage]) -> Vec<PoolInstallRoot> {
+pub(super) fn select_lpm_install_roots(packages: &[InstallPackage]) -> Vec<ManagedInstallRoot> {
     let mut indices: Vec<usize> = (0..packages.len()).collect();
     indices.sort_unstable_by(|left, right| {
         install_pkg_key(&packages[*left]).cmp(&install_pkg_key(&packages[*right]))
@@ -58,7 +58,7 @@ pub(super) fn select_pool_install_roots(packages: &[InstallPackage]) -> Vec<Pool
 
     roots
         .into_iter()
-        .map(|(name, version)| PoolInstallRoot::new(name, version))
+        .map(|(name, version)| ManagedInstallRoot::new(name, version))
         .collect()
 }
 
@@ -67,7 +67,7 @@ pub(super) async fn report_pool_install_attribution(
     packages: &[InstallPackage],
     accounting: ManagedInstallAccounting,
 ) -> Result<(), LpmError> {
-    let roots = select_pool_install_roots(packages);
+    let roots = select_lpm_install_roots(packages);
     client
         .report_managed_pool_install(&roots, accounting)
         .await

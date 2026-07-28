@@ -17,7 +17,7 @@ fn accounting_package(
 }
 
 fn root_names(packages: &[InstallPackage]) -> Vec<String> {
-    select_pool_install_roots(packages)
+    select_lpm_install_roots(packages)
         .into_iter()
         .map(|root| format!("{}@{}", root.name, root.version))
         .collect()
@@ -51,6 +51,24 @@ fn lpm_descendant_below_direct_lpm_root_is_not_an_additional_root() {
     assert_eq!(
         root_names(&[beta, npm_x, alpha]),
         vec!["@lpm.dev/alice.alpha@1.0.0"]
+    );
+}
+
+#[test]
+fn non_pool_lpm_root_remains_the_server_authoritative_traversal_root() {
+    let private_root = accounting_package(
+        "@lpm.dev/alice.private-root",
+        "1.0.0",
+        true,
+        true,
+        &[("@lpm.dev/bob.pool-dependency", "2.0.0")],
+    );
+    let pool_dependency =
+        accounting_package("@lpm.dev/bob.pool-dependency", "2.0.0", false, true, &[]);
+
+    assert_eq!(
+        root_names(&[pool_dependency, private_root]),
+        vec!["@lpm.dev/alice.private-root@1.0.0"]
     );
 }
 

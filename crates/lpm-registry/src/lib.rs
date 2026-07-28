@@ -14,7 +14,7 @@ pub use client::{
     BatchMetadataEntryStream, DownloadedTarball, FanOutStats, GateDecision,
     MANAGED_INSTALL_ACCOUNTING_HEADER, MANAGED_INSTALL_ACCOUNTING_VERSION,
     MAX_COMPRESSED_TARBALL_SIZE, MAX_MANAGED_POOL_INSTALL_ROOTS, ManagedInstallAccounting,
-    PackageMetadataFetchTimings, PoolInstallRoot, RegistryClient, TimedPackageMetadata,
+    ManagedInstallRoot, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,
     TimedReleaseTimeMetadata, evaluate_cached_url, is_https_url, is_localhost_url,
     parse_capped_api_json,
 };
