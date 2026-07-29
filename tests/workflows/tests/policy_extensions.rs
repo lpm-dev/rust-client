@@ -3,7 +3,7 @@
 mod support;
 
 use support::assertions;
-use support::mock_registry::{MockRegistry, make_tarball};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 
 const POLICY_PACKAGE: &str = "policy-pkg";
@@ -253,6 +253,79 @@ async fn install_policy_extension_blocks_bare_up_to_date_fast_lane() {
     assert!(
         combined.contains("blocked by LPM policy extensions"),
         "bare warm policy block error must explain the policy extension block; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_policy_extension_runs_once_when_stale_v2_analysis_cache_falls_back() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball(POLICY_PACKAGE, POLICY_VERSION);
+    mock.with_package(POLICY_PACKAGE, POLICY_VERSION, &tarball)
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "policy-extension-stale-analysis",
+  "version": "1.0.0",
+  "dependencies": {{ "{POLICY_PACKAGE}": "{POLICY_VERSION}" }}
+}}"#
+    ));
+    let invocation_count = project.path().join("policy-extension-count");
+    write_policy_extension_config(
+        &project,
+        &policy_extension_command(&[
+            "--action",
+            "allow",
+            "--count",
+            invocation_count.to_str().expect("utf-8 temp path"),
+        ]),
+        "enforce",
+        None,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let object_dir = store
+        .paths()
+        .object_dir(&compute_integrity(&tarball))
+        .unwrap();
+    let cache_path = object_dir.join(".lpm-security.json");
+    let mut cache: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+    cache["version"] = serde_json::json!(lpm_security::behavioral::SCHEMA_VERSION - 1);
+    std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache).unwrap()).unwrap();
+    std::fs::write(&invocation_count, b"0").unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run warm install with stale analysis cache");
+
+    assert!(
+        output.status.success(),
+        "stale-cache fallback install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&invocation_count).unwrap(),
+        "1",
+        "one install must invoke each policy extension exactly once"
     );
 }
 

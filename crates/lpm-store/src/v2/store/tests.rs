@@ -2626,6 +2626,51 @@ fn enabled_v2_reuse_backfills_missing_analysis_without_reextracting() {
 }
 
 #[test]
+fn enabled_extract_collision_backfills_missing_winner_analysis_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let arrived = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let enabled = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        crate::SecurityAnalysisPolicy::Enabled,
+    )
+    .with_object_publish_barriers(Arc::clone(&arrived), Arc::clone(&resume));
+    let disabled = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        crate::SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"collision-backfill\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"eval('collision-backfill')"),
+    ]);
+    let enabled_tarball = tarball.clone();
+    let enabled_extract =
+        std::thread::spawn(move || enabled.extract_object_from_bytes(&enabled_tarball, None));
+
+    arrived.wait();
+    let (winner_path, _, _) = disabled.extract_object_from_bytes(&tarball, None).unwrap();
+    assert!(
+        !winner_path.join(".lpm-security.json").exists(),
+        "disabled writer must publish the cache-free winning object"
+    );
+    resume.wait();
+    let (reused_path, _, _) = enabled_extract.join().unwrap().unwrap();
+
+    assert_eq!(reused_path, winner_path);
+    assert!(
+        lpm_security::behavioral::read_cached_analysis(&reused_path)
+            .unwrap()
+            .source
+            .eval
+    );
+}
+
+#[test]
 fn v2_fused_extraction_reports_precise_source_scan_time() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());

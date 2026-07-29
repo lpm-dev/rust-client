@@ -7,6 +7,7 @@ fn main() {
     let mut code = "fixture".to_string();
     let mut reason = "fixture decision".to_string();
     let mut log_path = None;
+    let mut count_path = None;
     let mut forced_exit = None;
 
     let mut args = std::env::args().skip(1);
@@ -18,6 +19,7 @@ fn main() {
             "--code" => code = next_arg(&mut args, "--code"),
             "--reason" => reason = next_arg(&mut args, "--reason"),
             "--log" => log_path = Some(next_arg(&mut args, "--log")),
+            "--count" => count_path = Some(next_arg(&mut args, "--count")),
             "--exit" => forced_exit = Some(next_arg(&mut args, "--exit")),
             other => panic!("unknown fixture arg {other}"),
         }
@@ -30,6 +32,14 @@ fn main() {
 
     if let Some(path) = log_path {
         std::fs::write(path, &request).expect("write policy extension request log");
+    }
+    if let Some(path) = count_path {
+        let count = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        std::fs::write(path, count.saturating_add(1).to_string())
+            .expect("write policy extension invocation count");
     }
 
     if let Some(exit) = forced_exit {

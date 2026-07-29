@@ -478,6 +478,8 @@ pub struct Store {
     paths: StoreV2Paths,
     object_integrity_policy: ObjectIntegrityPolicy,
     security_analysis_policy: SecurityAnalysisPolicy,
+    #[cfg(test)]
+    object_publish_barriers: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 impl Store {
@@ -510,6 +512,8 @@ impl Store {
             paths: StoreV2Paths::from_lpm_root(lpm_root),
             object_integrity_policy,
             security_analysis_policy,
+            #[cfg(test)]
+            object_publish_barriers: None,
         }
     }
 
@@ -539,7 +543,19 @@ impl Store {
             paths: StoreV2Paths::at(root),
             object_integrity_policy,
             security_analysis_policy,
+            #[cfg(test)]
+            object_publish_barriers: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_object_publish_barriers(
+        mut self,
+        arrived: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.object_publish_barriers = Some((arrived, resume));
+        self
     }
 
     /// The path helper this Store wraps.
@@ -843,6 +859,11 @@ impl Store {
             )));
         }
 
+        #[cfg(test)]
+        if let Some((arrived, resume)) = &self.object_publish_barriers {
+            arrived.wait();
+            resume.wait();
+        }
         let rename_start = std::time::Instant::now();
         let rename_result = std::fs::rename(&tmp_dir, &object_dir);
         timings.finalize_rename_ms = rename_start.elapsed().as_millis();
@@ -876,6 +897,7 @@ impl Store {
                         object_dir.display()
                     ))
                 })?;
+                self.backfill_security_cache_if_enabled(&object_dir, sri);
                 Ok(ExtractedObject {
                     path: object_dir,
                     source_sri: sri.to_string(),

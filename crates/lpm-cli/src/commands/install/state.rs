@@ -270,22 +270,6 @@ pub(super) async fn run_install_freshness_phase(
     } else {
         None
     };
-    let fast_path_policy_extension_stats = match (
-        fast_path_packages.as_deref(),
-        input.policy_extension_configs.is_empty(),
-    ) {
-        (Some(_), true) => None,
-        (Some(packages), false) => Some(
-            run_policy_extensions(
-                input.policy_extension_configs,
-                input.project_dir,
-                packages,
-                input.json_output,
-            )
-            .await?,
-        ),
-        (None, _) => None,
-    };
     let source_analysis_caches_ready = fast_path_packages.as_deref().is_none_or(|packages| {
         source_analysis_caches_are_current(
             input.lpm_root,
@@ -295,6 +279,23 @@ pub(super) async fn run_install_freshness_phase(
             input.security_analysis_policy,
         )
     });
+    let fast_path_policy_extension_stats = match (
+        fast_path_packages.as_deref(),
+        input.policy_extension_configs.is_empty(),
+        source_analysis_caches_ready,
+    ) {
+        (Some(_), true, true) => None,
+        (Some(packages), false, true) => Some(
+            run_policy_extensions(
+                input.policy_extension_configs,
+                input.project_dir,
+                packages,
+                input.json_output,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     if fast_path_base_eligible
         && let Some(fast_path_packages) = fast_path_packages.as_deref()
         && source_analysis_caches_ready
