@@ -113,20 +113,48 @@ fn resolve_install_catalogs(
 fn all_workspace_members(workspace: Option<&lpm_workspace::Workspace>) -> Vec<WorkspaceMemberLink> {
     workspace
         .map(|ws| {
-            ws.members
-                .iter()
-                .filter_map(|m| {
-                    let name = m.package.name.as_deref()?.to_string();
-                    let version = m.package.version.as_deref().unwrap_or("0.0.0").to_string();
+            linkable_workspace_packages(ws)
+                .filter_map(|(package, source_dir)| {
+                    let name = package.name.as_deref()?.to_string();
+                    let version = package.version.as_deref().unwrap_or("0.0.0").to_string();
                     Some(WorkspaceMemberLink {
                         name,
                         version,
-                        source_dir: m.path.clone(),
+                        source_dir: source_dir.to_path_buf(),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn linkable_workspace_packages(
+    workspace: &lpm_workspace::Workspace,
+) -> impl Iterator<Item = (&lpm_workspace::PackageJson, &Path)> {
+    std::iter::once((&workspace.root_package, workspace.root.as_path())).chain(
+        workspace
+            .members
+            .iter()
+            .map(|member| (&member.package, member.path.as_path())),
+    )
+}
+
+pub(super) fn is_declared_workspace_package_source(
+    project_dir: &Path,
+    source_dir: &Path,
+    package_name: &str,
+    package_version: &str,
+) -> bool {
+    let Ok(Some(workspace)) = crate::workspace_discovery_cache::discover_workspace(project_dir)
+    else {
+        return false;
+    };
+
+    linkable_workspace_packages(&workspace).any(|(package, path)| {
+        package.name.as_deref() == Some(package_name)
+            && package.version.as_deref().unwrap_or("0.0.0") == package_version
+            && path.canonicalize().is_ok_and(|path| path == source_dir)
+    })
 }
 
 /// Interactive confirmation for multi-member workspace mutations.
@@ -228,10 +256,10 @@ pub(crate) fn confirm_multi_member_mutation(
 /// internally develop libraries before any release).
 ///
 /// Returns `Err(LpmError::Workspace)` if a `workspace:` reference points at a
-/// package name that is not in the workspace's discovered member list. This
-/// preserves the validation behavior of `resolve_workspace_protocol` so that
-/// typos in cross-member deps still hard-error instead of silently shipping
-/// no dependency.
+/// package name that is not the named workspace root or a discovered member.
+/// This preserves the validation behavior of `resolve_workspace_protocol` so
+/// that typos in local deps still hard-error instead of silently shipping no
+/// dependency.
 ///
 /// Members are matched by their declared `package.json` `name` field, not by
 /// directory name. The version field is read from the member's own
@@ -260,15 +288,11 @@ pub(super) fn extract_workspace_protocol_deps(
 
     let mut extracted = Vec::with_capacity(workspace_names.len());
     for (name, range) in &workspace_names {
-        let member = workspace
-            .members
-            .iter()
-            .find(|m| m.package.name.as_deref() == Some(name.as_str()))
+        let (package, source_dir) = linkable_workspace_packages(workspace)
+            .find(|(package, _)| package.name.as_deref() == Some(name.as_str()))
             .ok_or_else(|| {
-                let mut available: Vec<&str> = workspace
-                    .members
-                    .iter()
-                    .filter_map(|m| m.package.name.as_deref())
+                let mut available: Vec<&str> = linkable_workspace_packages(workspace)
+                    .filter_map(|(package, _)| package.name.as_deref())
                     .collect();
                 available.sort();
                 let available_str = if available.is_empty() {
@@ -282,17 +306,12 @@ pub(super) fn extract_workspace_protocol_deps(
                 ))
             })?;
 
-        let version = member
-            .package
-            .version
-            .as_deref()
-            .unwrap_or("0.0.0")
-            .to_string();
+        let version = package.version.as_deref().unwrap_or("0.0.0").to_string();
 
         extracted.push(WorkspaceMemberLink {
             name: name.clone(),
             version,
-            source_dir: member.path.clone(),
+            source_dir: source_dir.to_path_buf(),
         });
     }
 
@@ -680,11 +699,13 @@ pub(super) fn pre_extract_file_link_workspace_members(
 ///
 /// BFS over `workspace_member_deps` (the seed set: extracted top-
 /// level + any / the invariant additions merged in by the caller),
-/// reading each member's `package.json` and following every
-/// `workspace:` dep to its target in `all_workspace_members`. New
-/// targets are appended to `workspace_member_deps` and enqueued so
-/// chains like `root → foo (workspace:*) → bar (workspace:*) → baz
-/// (workspace:*)` all end up root-linked.
+/// reading each member's `package.json` and following its runtime
+/// `workspace:` dependencies to targets in `all_workspace_members`.
+/// New targets are appended to `workspace_member_deps` and enqueued
+/// so chains like `root → foo (workspace:*) → bar (workspace:*) →
+/// baz (workspace:*)` all end up root-linked. A consumed member's
+/// `devDependencies` are not transitives; direct target development
+/// dependencies have already been extracted into the seed set.
 ///
 /// **Round 5 (online path)** added this BFS after pre_resolve +
 /// merge of `additional_workspace_links`. **Round 6** factored it
@@ -751,12 +772,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
             continue;
         };
-        for field in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
+        for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
             let Some(deps_obj) = value.get(field).and_then(|v| v.as_object()) else {
                 continue;
             };

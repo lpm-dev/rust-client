@@ -318,6 +318,12 @@ impl InstallPackage {
                 // does; failures fall through silently).
                 if let Ok(project_canonical) = project_dir.canonicalize()
                     && !canonical.starts_with(&project_canonical)
+                    && !is_declared_workspace_package_source(
+                        project_dir,
+                        &canonical,
+                        &self.name,
+                        &self.version,
+                    )
                 {
                     tracing::warn!(
                         name = %self.name,

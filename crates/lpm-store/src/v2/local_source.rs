@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::SecurityAnalysisPolicy;
@@ -119,6 +120,19 @@ fn finish_local_source_object_rename(
 
 const MAX_LOCAL_SOURCE_OBJECT_DEPTH: usize = 256;
 
+#[inline]
+fn is_excluded_local_source_entry(name: &OsStr) -> bool {
+    name == "node_modules"
+        || name == ".git"
+        // LPM updates these VCS sidecars during installs; including them makes
+        // recursive workspace package snapshots invalidate themselves.
+        || name == ".gitignore"
+        || name == ".gitattributes"
+        || name == ".lpm"
+        || name == "lpm.lock"
+        || name == "lpm.lockb"
+}
+
 pub(crate) fn populate_local_source_object_into(
     source_root: &Path,
     tmp_dir: &Path,
@@ -171,7 +185,7 @@ fn walk_local_source_object(
         let entry = entry
             .map_err(|e| LpmError::Store(format!("failed to enumerate local source entry: {e}")))?;
         let name = entry.file_name();
-        if name == "node_modules" || name == ".git" {
+        if is_excluded_local_source_entry(&name) {
             continue;
         }
 

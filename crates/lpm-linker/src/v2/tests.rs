@@ -349,6 +349,119 @@ fn link_packages_v2_resolves_dep_via_key_map() {
 }
 
 #[test]
+fn link_packages_v2_deduplicates_identical_dependency_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let dependency_sri = synthetic_sri(b"duplicate-dependency-slots/dependency");
+    write_object(
+        &store,
+        &dependency_sri,
+        &[(
+            "package.json",
+            br#"{"name":"shared-peer","version":"1.0.0"}"#,
+        )],
+    );
+    let consumer_sri = synthetic_sri(b"duplicate-dependency-slots/consumer");
+    write_object(
+        &store,
+        &consumer_sri,
+        &[("package.json", br#"{"name":"consumer","version":"1.0.0"}"#)],
+    );
+
+    let dependency = LinkDependency::registry("shared-peer", "1.0.0");
+    let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+    consumer.target.dependencies = vec![dependency.clone(), dependency];
+
+    let result = link_packages_v2(
+        &project,
+        vec![
+            consumer,
+            target("shared-peer", "1.0.0", &dependency_sri, false),
+        ],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .expect("identical dependency slots should materialize one sibling link");
+
+    let consumer_package = result
+        .materialized
+        .iter()
+        .find(|package| package.name == "consumer")
+        .expect("consumer should be materialized");
+    let sibling = consumer_package
+        .destination
+        .parent()
+        .and_then(Path::parent)
+        .expect("consumer package should live under a link entry")
+        .join("node_modules")
+        .join("shared-peer");
+    assert!(
+        sibling.join("package.json").is_file(),
+        "deduplicated sibling must resolve to the dependency package"
+    );
+}
+
+#[test]
+fn link_packages_v2_rejects_conflicting_dependency_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let first_sri = synthetic_sri(b"conflicting-dependency-slots/first");
+    write_object(
+        &store,
+        &first_sri,
+        &[("package.json", br#"{"name":"first","version":"1.0.0"}"#)],
+    );
+    let second_sri = synthetic_sri(b"conflicting-dependency-slots/second");
+    write_object(
+        &store,
+        &second_sri,
+        &[("package.json", br#"{"name":"second","version":"1.0.0"}"#)],
+    );
+    let consumer_sri = synthetic_sri(b"conflicting-dependency-slots/consumer");
+    write_object(
+        &store,
+        &consumer_sri,
+        &[("package.json", br#"{"name":"consumer","version":"1.0.0"}"#)],
+    );
+
+    let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+    consumer.target.dependencies = vec![
+        LinkDependency::new("shared-slot", "first", "1.0.0", None),
+        LinkDependency::new("shared-slot", "second", "1.0.0", None),
+    ];
+
+    let error = link_packages_v2(
+        &project,
+        vec![
+            consumer,
+            target("first", "1.0.0", &first_sri, false),
+            target("second", "1.0.0", &second_sri, false),
+        ],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .expect_err("one dependency slot cannot resolve to two graph keys");
+
+    assert!(
+        matches!(
+            error,
+            LpmError::Store(message)
+                if message.contains("dependency slot shared-slot")
+                    && message.contains("conflicting graph keys")
+        ),
+        "conflicting dependency slots must return a typed store error"
+    );
+}
+
+#[test]
 fn link_packages_v2_nests_same_name_dependency_inside_package_node_modules() {
     let tmp = tempfile::tempdir().unwrap();
     let store = V2Store::at(tmp.path().join("store"));

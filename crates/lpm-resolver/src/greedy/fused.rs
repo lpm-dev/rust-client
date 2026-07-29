@@ -11,6 +11,7 @@ use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version
 use super::types::{Edge, PeerRequirement};
 use crate::resolve::SelectedPackageEvent;
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct FusedTreeProvider<'a> {
     client: &'a Arc<RegistryClient>,
@@ -28,10 +29,52 @@ struct FusedTreeProvider<'a> {
 
 struct MetadataFetchDispatch<'a> {
     metadata_sem: &'a Arc<tokio::sync::Semaphore>,
+    telemetry: &'a Arc<MetadataFetchTelemetry>,
     client: &'a Arc<RegistryClient>,
     route_table: &'a RouteTable,
     policy: &'a ResolverPolicy,
     trace_metadata_fetches: bool,
+}
+
+#[derive(Default)]
+struct MetadataFetchTelemetry {
+    active: AtomicU64,
+    active_high_water: AtomicU64,
+    semaphore_wait_count: AtomicU64,
+    semaphore_wait_ns: AtomicU64,
+}
+
+impl MetadataFetchTelemetry {
+    fn enter(self: &Arc<Self>) -> ActiveMetadataFetch {
+        let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+        self.active_high_water.fetch_max(active, Ordering::Relaxed);
+        ActiveMetadataFetch {
+            telemetry: Arc::clone(self),
+        }
+    }
+
+    fn record_wait_duration(&self, elapsed: std::time::Duration) {
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let _ =
+            self.semaphore_wait_ns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(elapsed_ns))
+                });
+    }
+}
+
+struct ActiveMetadataFetch {
+    telemetry: Arc<MetadataFetchTelemetry>,
+}
+
+impl Drop for ActiveMetadataFetch {
+    fn drop(&mut self) {
+        self.telemetry.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn record_pending_high_water(high_water: &mut u64, pending: usize) {
+    *high_water = (*high_water).max(u64::try_from(pending).unwrap_or(u64::MAX));
 }
 
 impl TreeManifestProvider for FusedTreeProvider<'_> {
@@ -196,11 +239,27 @@ fn spawn_metadata_fetch_job(
     let route_table_c = dispatch.route_table.clone();
     let policy_c = dispatch.policy.clone();
     let trace_metadata_fetches = dispatch.trace_metadata_fetches;
+    let telemetry = Arc::clone(dispatch.telemetry);
     metadata_jobs.spawn(async move {
-        let _p = permit
-            .acquire_owned()
-            .await
-            .expect("metadata semaphore must outlive the resolver");
+        let _permit = match Arc::clone(&permit).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                telemetry
+                    .semaphore_wait_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let wait_started = Instant::now();
+                let permit = permit
+                    .acquire_owned()
+                    .await
+                    .expect("metadata semaphore must outlive the resolver");
+                telemetry.record_wait_duration(wait_started.elapsed());
+                permit
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                panic!("metadata semaphore must outlive the resolver")
+            }
+        };
+        let _active_fetch = telemetry.enter();
         let result = fetch_metadata_for_resolver_with_trace_detail(
             &client_c,
             &route_table_c,
@@ -710,18 +769,22 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // boundaries — only the spawn closures own clones of the
     // canonicals they're fetching.
     let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
+    let metadata_fetch_telemetry = Arc::new(MetadataFetchTelemetry::default());
     let metadata_dispatch = MetadataFetchDispatch {
         metadata_sem: &metadata_sem,
+        telemetry: &metadata_fetch_telemetry,
         client: &client,
         route_table: &route_table,
         policy: &policy,
         trace_metadata_fetches,
     };
 
-    // Counters. Declared here so the lpm.dev pre-batch below can
-    // increment them before the main loop starts.
+    // Counters. Declared here so the Worker root pre-batch below can
+    // update them before the main loop starts.
     let mut dispatcher_rpc_count: u64 = 0;
+    let mut pending_high_water: u64 = 0;
     let mut tarball_dispatched_count: u64 = 0;
+    let mut parked_max_depth: u32 = 0;
     // Speculative peer-manifest fetches dispatched concurrent with
     // regular dep dispatch. Bumped by the peer-prefetch step; surfaces on
     // `StageTiming.peer_prefetch_count`.
@@ -797,6 +860,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         && worker_streaming_batch_enabled()
         && !worker_root_package_specs.is_empty();
     if !worker_root_names.is_empty() {
+        record_pending_high_water(&mut pending_high_water, worker_root_names.len());
         if streaming_worker_batch {
             match client
                 .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
@@ -897,13 +961,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             }
         }
     }
-    // High-water marks update after each queue-drain pass
-    // so the post-loop value reflects the peak across the run, not just the
-    // final tick. `dispatcher_rpc_count` and `tarball_dispatched_count` are
-    // declared above the lpm.dev pre-batch so it can pre-increment them.
-    let mut inflight_high_water: u64 = 0;
-    let mut parked_max_depth: u32 = 0;
-
     loop {
         let mut worker_batch_candidates: Vec<(CanonicalKey, String)> = Vec::new();
 
@@ -1032,6 +1089,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             } else {
                 Vec::new()
             };
+            record_pending_high_water(&mut pending_high_water, inflight.len());
             if streaming_worker_batch && !worker_package_specs.is_empty() {
                 match client
                     .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
@@ -1222,10 +1280,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         // High-water samples. O(unique-canonicals-parked) per tick;
         // ~tens of entries × ~134 ticks on bench/fixture-large is
         // negligible vs the network wall.
-        let inflight_now = inflight.len() as u64;
-        if inflight_now > inflight_high_water {
-            inflight_high_water = inflight_now;
-        }
+        record_pending_high_water(&mut pending_high_water, inflight.len());
         if let Some(max_park) = parked.values().map(|v| v.len() as u32).max()
             && max_park > parked_max_depth
         {
@@ -1313,6 +1368,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         let worker_package_specs =
                             worker_package_specs_from_parked_edges(&waiting_candidates, &parked);
                         if !worker_package_specs.is_empty() {
+                            record_pending_high_water(&mut pending_high_water, inflight.len());
                             match client
                                 .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
                                     &worker_names,
@@ -1532,7 +1588,17 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             walker_rpc_count: 0,
             escape_hatch_rpc_count: 0,
             dispatcher_rpc_count: dispatcher_rpc_count + tree_provider.dispatcher_rpc_count.get(),
-            dispatcher_inflight_high_water: inflight_high_water,
+            dispatcher_configured_fanout: u64::try_from(npm_fanout).unwrap_or(u64::MAX),
+            dispatcher_inflight_high_water: metadata_fetch_telemetry
+                .active_high_water
+                .load(Ordering::Relaxed),
+            dispatcher_pending_high_water: pending_high_water,
+            dispatcher_semaphore_wait_count: metadata_fetch_telemetry
+                .semaphore_wait_count
+                .load(Ordering::Relaxed),
+            dispatcher_semaphore_wait_ns: metadata_fetch_telemetry
+                .semaphore_wait_ns
+                .load(Ordering::Relaxed),
             parked_max_depth,
             tarball_dispatched_count: tarball_dispatched_count
                 + tree_provider.tarball_dispatched_count.get(),

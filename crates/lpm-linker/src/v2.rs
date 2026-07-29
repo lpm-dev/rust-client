@@ -790,6 +790,8 @@ fn populate_one(
     // — `peerDependencies` keys ARE the canonical name by spec).
     let mut deps: Vec<DepLink> =
         Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
+    let mut dependency_targets_by_local: HashMap<&str, &GraphKey> =
+        HashMap::with_capacity(v2t.target.dependencies.len());
     for dep in &v2t.target.dependencies {
         if !is_safe_root_link_name(&dep.local) {
             tracing::warn!(
@@ -800,22 +802,33 @@ fn populate_one(
             );
             continue;
         }
-        let dep_key = key_map
-            .get_for_dependency(dep)
-            .ok_or_else(|| {
-                LpmError::Store(format!(
-                    "v2 linker: dep {}=>{}@{} of {}@{} has no resolved graph key",
-                    dep.local,
-                    dep.target_name,
-                    dep.graph_key_value(),
-                    v2t.target.name,
-                    v2t.target.version
-                ))
-            })?
-            .clone();
+        let dep_key = key_map.get_for_dependency(dep).ok_or_else(|| {
+            LpmError::Store(format!(
+                "v2 linker: dep {}=>{}@{} of {}@{} has no resolved graph key",
+                dep.local,
+                dep.target_name,
+                dep.graph_key_value(),
+                v2t.target.name,
+                v2t.target.version
+            ))
+        })?;
+        if let Some(existing) = dependency_targets_by_local.get(dep.local.as_str()) {
+            if *existing == dep_key.as_ref() {
+                continue;
+            }
+            return Err(LpmError::Store(format!(
+                "v2 linker: dependency slot {} of {}@{} resolves to conflicting graph keys {} and {}",
+                dep.local,
+                v2t.target.name,
+                v2t.target.version,
+                existing.dir_name(),
+                dep_key.dir_name(),
+            )));
+        }
+        dependency_targets_by_local.insert(dep.local.as_str(), dep_key.as_ref());
         deps.push(DepLink {
             local: dep.local.clone(),
-            target: dep_key,
+            target: Arc::clone(dep_key),
         });
     }
     // Peer-edge siblings. Each resolved peer becomes a sibling
@@ -823,13 +836,8 @@ fn populate_one(
     // walk-up from the consumer's package dir never reaches the
     // peer (v2 link entries are absolute paths into the global
     // store, not the project tree).
-    // Skip the HashSet construction entirely when there are no peers —
-    // the common case for most packages. For the peer case, build
-    // already_local as &str (no clone) then drop before mutating deps.
     if !v2t.target.peers.is_empty() {
         let peer_extras: Vec<DepLink> = {
-            let already_local: std::collections::HashSet<&str> =
-                deps.iter().map(|d| d.local.as_str()).collect();
             v2t.target
                 .peers
                 .iter()
@@ -846,7 +854,9 @@ fn populate_one(
                         false
                     }
                 })
-                .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
+                .filter(|(peer_name, _)| {
+                    !dependency_targets_by_local.contains_key(peer_name.as_str())
+                })
                 .filter_map(|(peer_name, peer_ver)| {
                     let peer_key = key_map.get_peer(peer_name, peer_ver)?.clone();
                     Some(DepLink {
@@ -855,8 +865,6 @@ fn populate_one(
                     })
                 })
                 .collect()
-            // already_local (borrows from deps) is dropped here, before
-            // deps is mutated by extend below.
         };
         deps.extend(peer_extras);
     }

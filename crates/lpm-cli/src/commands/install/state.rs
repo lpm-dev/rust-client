@@ -204,6 +204,25 @@ pub(super) struct InstallFreshnessResult {
     pub(super) completed: bool,
 }
 
+fn validated_lockfile_deps_for_freshness<'a>(
+    project_dir: &Path,
+    manifest_deps: &'a HashMap<String, String>,
+) -> Option<(Cow<'a, HashMap<String, String>>, bool)> {
+    if !manifest_deps
+        .values()
+        .any(|specifier| specifier.starts_with("workspace:"))
+    {
+        return Some((Cow::Borrowed(manifest_deps), false));
+    }
+
+    let workspace = crate::workspace_discovery_cache::discover_workspace(project_dir)
+        .ok()
+        .flatten()?;
+    let mut lockfile_deps = manifest_deps.clone();
+    extract_workspace_protocol_deps(&mut lockfile_deps, &workspace).ok()?;
+    Some((Cow::Owned(lockfile_deps), true))
+}
+
 pub(super) async fn run_install_freshness_phase(
     input: InstallFreshnessInput<'_>,
 ) -> Result<InstallFreshnessResult, LpmError> {
@@ -249,15 +268,25 @@ pub(super) async fn run_install_freshness_phase(
         && compatibility_bins_ready;
     let fast_path_packages = if fast_path_base_eligible {
         let gate_stats = GateStats::default();
-        if let Some(fast) = try_lockfile_fast_path(
-            input.lockfile_path,
-            input.manifest_deps,
-            &[],
-            input.client,
-            &gate_stats,
-            false,
-        ) {
-            let mut packages = fast.packages;
+        let fast = validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
+            .and_then(|(lockfile_deps, workspace_deps_filtered)| {
+                if workspace_deps_filtered
+                    && lockfile_deps.is_empty()
+                    && lpm_lockfile::Lockfile::exists(input.lockfile_path)
+                {
+                    return Some(Vec::new());
+                }
+                try_lockfile_fast_path(
+                    input.lockfile_path,
+                    &lockfile_deps,
+                    &[],
+                    input.client,
+                    &gate_stats,
+                    false,
+                )
+                .map(|fast| fast.packages)
+            });
+        if let Some(mut packages) = fast {
             if input.omit_policy.dev {
                 filter_dev_packages(&mut packages, input.production_dependency_names);
             }
@@ -749,5 +778,49 @@ mod dependency_engine_freshness_tests {
         );
 
         assert_eq!(revalidation_count.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod workspace_freshness_tests {
+    use super::*;
+
+    #[test]
+    fn validated_lockfile_deps_excludes_workspace_protocol_and_retains_registry_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+        )
+        .unwrap();
+        let member_dir = dir.path().join("packages/member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            r#"{
+  "name": "workspace-member",
+  "version": "1.0.0",
+  "private": true
+}"#,
+        )
+        .unwrap();
+        let manifest_deps = HashMap::from([
+            ("workspace-root".to_string(), "workspace:*".to_string()),
+            ("registry-package".to_string(), "^1.0.0".to_string()),
+        ]);
+
+        let (lockfile_deps, workspace_deps_filtered) =
+            validated_lockfile_deps_for_freshness(&member_dir, &manifest_deps).unwrap();
+
+        assert!(workspace_deps_filtered);
+        assert_eq!(
+            lockfile_deps.as_ref(),
+            &HashMap::from([("registry-package".to_string(), "^1.0.0".to_string())])
+        );
     }
 }

@@ -2159,6 +2159,56 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         detail["resolve"]["scheduler"].is_object(),
         "detail.resolve.scheduler must expose resolver wait/fanout counters; got {detail:#?}"
     );
+    let dispatcher_contract = serde_json::json!({
+        "summary": envelope["timing"]["resolve"]["dispatcher"],
+        "detail": detail["resolve"]["scheduler"]["dispatcher"],
+    });
+    for surface in ["summary", "detail"] {
+        let dispatcher = &dispatcher_contract[surface];
+        for field in [
+            "rpc_count",
+            "configured_fanout",
+            "inflight_high_water",
+            "active_fetch_high_water",
+            "pending_high_water",
+            "semaphore_wait_count",
+            "semaphore_wait_ms",
+            "parked_max_depth",
+            "tarball_dispatched",
+            "peer_prefetch_count",
+        ] {
+            assert!(
+                dispatcher[field].is_number(),
+                "{surface} dispatcher field {field} must be numeric; got {dispatcher:#?}"
+            );
+        }
+        assert_eq!(
+            dispatcher["inflight_high_water"], dispatcher["active_fetch_high_water"],
+            "{surface} compatibility alias must match active fetch high-water",
+        );
+    }
+    insta::assert_json_snapshot!("install_json_timing_dispatcher_concurrency", dispatcher_contract, {
+        ".summary.rpc_count" => "[COUNT]",
+        ".summary.configured_fanout" => "[COUNT]",
+        ".summary.inflight_high_water" => "[COUNT]",
+        ".summary.active_fetch_high_water" => "[COUNT]",
+        ".summary.pending_high_water" => "[COUNT]",
+        ".summary.semaphore_wait_count" => "[COUNT]",
+        ".summary.semaphore_wait_ms" => "[DURATION]",
+        ".summary.parked_max_depth" => "[COUNT]",
+        ".summary.tarball_dispatched" => "[COUNT]",
+        ".summary.peer_prefetch_count" => "[COUNT]",
+        ".detail.rpc_count" => "[COUNT]",
+        ".detail.configured_fanout" => "[COUNT]",
+        ".detail.inflight_high_water" => "[COUNT]",
+        ".detail.active_fetch_high_water" => "[COUNT]",
+        ".detail.pending_high_water" => "[COUNT]",
+        ".detail.semaphore_wait_count" => "[COUNT]",
+        ".detail.semaphore_wait_ms" => "[DURATION]",
+        ".detail.parked_max_depth" => "[COUNT]",
+        ".detail.tarball_dispatched" => "[COUNT]",
+        ".detail.peer_prefetch_count" => "[COUNT]",
+    });
     assert!(
         detail["resolve"]["cpu"].is_object(),
         "detail.resolve.cpu must expose parser/resolver CPU counters; got {detail:#?}"

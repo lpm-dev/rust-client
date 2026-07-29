@@ -1394,8 +1394,9 @@ fn package_json_node_engine(pkg_json: &serde_json::Value) -> Option<String> {
 /// `package.json` and return its transitive deps with their kind
 /// classification.
 ///
-/// Walks `dependencies` + `devDependencies` + `peerDependencies` +
-/// `optionalDependencies`. Each entry is classified as:
+/// Walks `dependencies` + `peerDependencies` + `optionalDependencies`.
+/// `devDependencies` belong to the source project itself and are not
+/// transitive dependencies of a consumer. Each entry is classified as:
 /// The resolver only special-cases `npm:` aliases at the root level;
 /// everything else gets fed into [`lpm_resolver::ranges::NpmRange::parse`],
 /// which rejects URL and git specs as invalid semver ranges. Unsupported
@@ -1446,12 +1447,7 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
         .map(|deps| deps.keys().map(String::as_str).collect::<HashSet<_>>())
         .unwrap_or_default();
     let mut out = Vec::new();
-    for field in [
-        "dependencies",
-        "devDependencies",
-        "peerDependencies",
-        "optionalDependencies",
-    ] {
+    for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
         let Some(deps) = pkg_json.get(field).and_then(|v| v.as_object()) else {
             continue;
         };

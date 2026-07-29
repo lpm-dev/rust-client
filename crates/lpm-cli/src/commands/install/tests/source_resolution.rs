@@ -1027,6 +1027,28 @@ fn read_source_dep_specs_optional_dependency_overrides_required_duplicate() {
     );
 }
 
+#[test]
+fn read_source_dep_specs_excludes_dev_dependencies_from_consumed_local_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("local-source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("package.json"),
+        br#"{
+          "name": "local-source",
+          "version": "0.1.0",
+          "dependencies": { "runtime-package": "^1.0.0" },
+          "devDependencies": { "build-only-package": "^2.0.0" }
+        }"#,
+    )
+    .unwrap();
+
+    let specs = read_source_dep_specs(&source_dir).unwrap();
+    let names: Vec<&str> = specs.iter().map(|spec| spec.local_name.as_str()).collect();
+
+    assert_eq!(names, vec!["runtime-package"]);
+}
+
 #[tokio::test]
 async fn pre_resolve_marks_duplicate_local_dependency_optional_after_override() {
     let store_root = tempfile::tempdir().unwrap();
