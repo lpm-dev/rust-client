@@ -514,6 +514,109 @@ fn finalize_strict_catalog_policy_errors_when_resolved_version_mismatches_catalo
     assert!(message.contains("catalog:^1.0.0"));
 }
 
+#[test]
+fn reconcile_finalized_add_rebuilds_complete_importer_after_catalog_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg_path = dir.path().join("package.json");
+    write_manifest(
+        &pkg_path,
+        &serde_json::json!({
+            "name": "demo",
+            "dependencies": {
+                "used": "catalog:"
+            },
+            "devDependencies": {
+                "dev-only": "^2.0.0"
+            },
+            "overrides": {
+                "used": "catalog:"
+            },
+            "resolutions": {
+                "dev-only": "^2.1.0"
+            },
+            "catalogs": {
+                "default": {
+                    "used": "^1.0.0",
+                    "unused": "^9.0.0"
+                }
+            },
+            "lpm": {
+                "cleanupUnusedCatalogs": true,
+                "autoInstallPeers": false,
+                "overrides": {
+                    "used": "catalog:"
+                }
+            }
+        }),
+    );
+
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                "used".to_string(),
+                "catalog:".to_string(),
+            )]),
+            dev_dependencies: std::collections::BTreeMap::from([(
+                "dev-only".to_string(),
+                "^2.0.0".to_string(),
+            )]),
+            lpm_overrides: std::collections::BTreeMap::from([(
+                "used".to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            overrides: std::collections::BTreeMap::from([(
+                "used".to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            resolutions: std::collections::BTreeMap::from([(
+                "dev-only".to_string(),
+                "^2.1.0".to_string(),
+            )]),
+            catalogs: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                std::collections::BTreeMap::from([
+                    ("used".to_string(), "^1.0.0".to_string()),
+                    ("unused".to_string(), "^9.0.0".to_string()),
+                ]),
+            )]),
+            auto_install_peers: Some(false),
+            ..Default::default()
+        },
+    );
+    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+    lockfile.write_all(&lockfile_path).unwrap();
+    std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+    std::fs::write(
+        dir.path().join(".lpm").join("install-hash"),
+        "stale-hash\n0:0\nl:hoisted\ni:source\np:test\ne:none\nn:none\n",
+    )
+    .unwrap();
+
+    assert!(cleanup_unused_catalogs_after_install(dir.path()).unwrap());
+    reconcile_finalized_add_install_state(dir.path()).unwrap();
+
+    let reconciled = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    let importer = reconciled.importers.get(".").unwrap();
+    assert_eq!(
+        importer.catalogs,
+        std::collections::BTreeMap::from([(
+            "default".to_string(),
+            std::collections::BTreeMap::from([("used".to_string(), "^1.0.0".to_string(),)]),
+        )])
+    );
+    assert_eq!(
+        importer.lpm_overrides,
+        std::collections::BTreeMap::from([("used".to_string(), "^1.0.0".to_string())])
+    );
+    assert_eq!(
+        importer.overrides,
+        std::collections::BTreeMap::from([("used".to_string(), "^1.0.0".to_string())])
+    );
+    assert_eq!(importer.auto_install_peers, Some(false));
+}
+
 /// Finalize is a no-op when no entries are placeholders.
 #[test]
 fn finalize_is_noop_when_no_placeholders() {

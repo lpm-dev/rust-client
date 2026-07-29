@@ -8,7 +8,7 @@ mod support;
 use support::assertions;
 use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
-    make_tarball_from_pkg_json,
+    make_tarball_from_pkg_json, make_tarball_with_files,
 };
 use support::{
     TempProject, configure_fake_node, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry,
@@ -4820,6 +4820,140 @@ async fn mount_ms_2_1_3(mock: &MockRegistry) {
         "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
     });
     mock.with_batch_metadata(vec![batch_meta]).await;
+}
+
+#[tokio::test]
+async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "bare-add-lockfile-reconciliation",
+  "version": "1.0.0",
+  "dependencies": {}
+}"#,
+    );
+
+    let add = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "ms",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run bare package add");
+    assert!(
+        add.status.success(),
+        "bare package add should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr),
+    );
+
+    let manifest_dependencies = read_dependencies(&project);
+    assert_eq!(
+        manifest_dependencies
+            .get("ms")
+            .and_then(|value| value.as_str()),
+        Some("^2.1.3"),
+        "bare add should finalize the saved dependency range",
+    );
+
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("read lockfile after bare add");
+    let importer = lockfile
+        .importers
+        .get(".")
+        .expect("bare add should persist the root importer");
+    assert_eq!(
+        importer.dependencies.get("ms").map(String::as_str),
+        Some("^2.1.3"),
+        "lockfile importer must match the finalized package.json before add commits",
+    );
+    let lockfile_before = project.read_file(lpm_lockfile::LOCKFILE_NAME);
+
+    let reinstall = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run immediate install after bare add");
+    assert!(
+        reinstall.status.success(),
+        "immediate install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    assert!(
+        combined.to_lowercase().contains("up to date"),
+        "the finalized add state should hit the freshness fast path:\n{combined}",
+    );
+    assert!(
+        !combined.contains("Upgraded lpm.lockb"),
+        "an importer reconciliation must never be reported as a binary format upgrade:\n{combined}",
+    );
+    assert_eq!(
+        project.read_file(lpm_lockfile::LOCKFILE_NAME),
+        lockfile_before,
+        "an immediate install must not rewrite an already-current lockfile",
+    );
+}
+
+#[tokio::test]
+async fn npm_only_install_reports_cached_behavioral_security_findings() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "local-security-finding",
+        "1.0.0",
+        &[(
+            "danger.js",
+            b"module.exports = eval(process.env.LPM_INPUT);\n",
+        )],
+    );
+    mock.with_package("local-security-finding", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "npm-only-security-summary",
+  "version": "1.0.0",
+  "lpm": {
+    "strictDeps": "loose"
+  },
+  "dependencies": {
+    "local-security-finding": "1.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("run npm-only install with a behavioral finding");
+    assert!(
+        output.status.success(),
+        "npm-only install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("Security summary") && combined.to_lowercase().contains("eval"),
+        "local cached analysis must be summarized without an @lpm.dev dependency:\n{combined}",
+    );
 }
 
 async fn mount_registry_version(

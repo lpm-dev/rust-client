@@ -15,7 +15,7 @@
 use crate::install_ui;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
-use lpm_store::PackageStore;
+use lpm_store::V2BaselineIndex;
 use std::collections::{HashMap, HashSet};
 
 /// Severity tier for the post-install summary.
@@ -34,6 +34,32 @@ struct TagIssue {
     packages: Vec<String>, // "name@version"
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SecuritySummaryPackage {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) source: String,
+    pub(crate) integrity: Option<String>,
+    pub(crate) is_lpm: bool,
+}
+
+impl SecuritySummaryPackage {
+    fn finding_key(&self) -> String {
+        let integrity = self.integrity.as_deref().unwrap_or("");
+        let mut key = String::with_capacity(
+            self.name.len() + self.version.len() + self.source.len() + integrity.len() + 3,
+        );
+        key.push_str(&self.name);
+        key.push('@');
+        key.push_str(&self.version);
+        key.push('\u{1f}');
+        key.push_str(&self.source);
+        key.push('\u{1f}');
+        key.push_str(integrity);
+        key
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SecuritySummaryLine {
     Warn(install_ui::TerminalLine),
@@ -45,10 +71,11 @@ enum SecuritySummaryLine {
 /// Reads `.lpm-security.json` from the store for ALL packages, then
 /// fetches registry metadata for @lpm.dev packages to merge behavioral
 /// tags, vulnerabilities, AI findings, and lifecycle scripts.
-pub async fn post_install_security_summary(
+pub(crate) async fn post_install_security_summary(
     client: &RegistryClient,
-    store: &PackageStore,
-    packages: &[(String, String, bool)], // (name, version, is_lpm)
+    lpm_root: &lpm_common::LpmRoot,
+    baseline_index: Option<&V2BaselineIndex>,
+    packages: &[SecuritySummaryPackage],
     json_output: bool,
     quiet: bool,
 ) {
@@ -58,48 +85,70 @@ pub async fn post_install_security_summary(
 
     // ── Client-side analysis (all packages) ──────────
 
+    let empty_baseline_index = V2BaselineIndex::default();
+    let baseline_index = baseline_index.unwrap_or(&empty_baseline_index);
     let show_progress = !json_output && packages.len() > 50;
     if show_progress {
-        install_ui::phase_untrusted(&format!("Analyzing {} packages", packages.len()));
+        install_ui::phase_untrusted(&format!(
+            "Checking cached security results for {} packages",
+            packages.len()
+        ));
     }
 
     let mut tag_counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
 
-    for (i, (name, version, _is_lpm)) in packages.iter().enumerate() {
+    for (i, package) in packages.iter().enumerate() {
         if show_progress && i % 50 == 0 && i > 0 {
-            install_ui::phase_untrusted(&format!("Analyzed {i}/{} packages", packages.len()));
+            install_ui::phase_untrusted(&format!(
+                "Checked cached security results for {i}/{} packages",
+                packages.len()
+            ));
         }
 
-        let pkg_dir = store.package_dir(name, version);
-        let analysis = match behavioral::read_cached_analysis(&pkg_dir) {
+        let analysis = match lpm_store::find_installed_package_baseline_by_identity_indexed(
+            baseline_index,
+            lpm_root,
+            &package.name,
+            &package.version,
+            package.integrity.as_deref(),
+        )
+        .and_then(|baseline| behavioral::read_cached_analysis(&baseline.pristine_dir))
+        {
             Some(a) => a,
             None => continue,
         };
 
-        let pkg_id = format!("{name}@{version}");
+        let pkg_id = package.finding_key();
         collect_tags_from_analysis(&analysis, &pkg_id, &mut tag_counts);
     }
 
     if show_progress {
-        install_ui::done_untrusted(&format!("Analyzed {} packages", packages.len()));
+        install_ui::done_untrusted(&format!(
+            "Checked cached security results for {} packages",
+            packages.len()
+        ));
     }
 
     // ── Registry-side enrichment (@lpm.dev only) ─────
 
-    let lpm_packages: HashMap<String, String> = packages
-        .iter()
-        .filter(|(_, _, is_lpm)| *is_lpm)
-        .map(|(n, v, _)| (n.clone(), v.clone()))
-        .collect();
+    let lpm_packages: Vec<&SecuritySummaryPackage> =
+        packages.iter().filter(|package| package.is_lpm).collect();
 
     if !lpm_packages.is_empty() {
-        let names: Vec<String> = lpm_packages.keys().cloned().collect();
+        let names: Vec<String> = lpm_packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         if let Ok(metadata_map) = client.batch_metadata(&names).await {
-            for (name, version) in &lpm_packages {
-                if let Some(metadata) = metadata_map.get(name) {
-                    let ver_meta = metadata.version(version).or_else(|| metadata.latest());
+            for package in &lpm_packages {
+                if let Some(metadata) = metadata_map.get(&package.name) {
+                    let ver_meta = metadata
+                        .version(&package.version)
+                        .or_else(|| metadata.latest());
                     if let Some(vm) = ver_meta {
-                        let pkg_id = format!("{name}@{version}");
+                        let pkg_id = package.finding_key();
                         collect_registry_warnings(vm, &pkg_id, &mut tag_counts);
                     }
                 }
@@ -642,7 +691,31 @@ fn build_severity_groups(counts: &HashMap<&'static str, HashSet<String>>) -> Vec
         if let Some(pkgs) = counts.get(key)
             && !pkgs.is_empty()
         {
-            let mut sorted_pkgs: Vec<String> = pkgs.iter().cloned().collect();
+            let mut coordinate_counts: HashMap<&str, usize> = HashMap::new();
+            for package in pkgs {
+                *coordinate_counts
+                    .entry(package.split('\u{1f}').next().unwrap_or(package))
+                    .or_default() += 1;
+            }
+            let mut sorted_pkgs: Vec<String> = pkgs
+                .iter()
+                .map(|package| {
+                    let mut fields = package.split('\u{1f}');
+                    let coordinate = fields.next().unwrap_or(package);
+                    if coordinate_counts.get(coordinate).copied().unwrap_or(0) < 2 {
+                        return coordinate.to_string();
+                    }
+                    let source = fields.next().unwrap_or("");
+                    let integrity = fields.next().unwrap_or("");
+                    let source = install_ui::safe_package_source_identity(source);
+                    let integrity_preview: String = integrity.chars().take(20).collect();
+                    if integrity_preview.is_empty() {
+                        format!("{coordinate} ({source})")
+                    } else {
+                        format!("{coordinate} ({source}, {integrity_preview}…)")
+                    }
+                })
+                .collect();
             sorted_pkgs.sort();
             issues.push(TagIssue {
                 tag_label: label,
@@ -658,10 +731,13 @@ fn build_severity_groups(counts: &HashMap<&'static str, HashSet<String>>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use lpm_security::behavioral::manifest::ManifestTags;
     use lpm_security::behavioral::source::SourceTags;
     use lpm_security::behavioral::supply_chain::SupplyChainTags;
     use lpm_security::behavioral::{AnalysisMeta, PackageAnalysis};
+    use lpm_store::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+    use std::sync::Arc;
 
     fn make_analysis(
         source: SourceTags,
@@ -682,6 +758,114 @@ mod tests {
                 oversized_source_files: vec![],
             },
         }
+    }
+
+    fn write_cached_analysis_link(
+        lpm_root: &lpm_common::LpmRoot,
+        suffix: &str,
+        source_sri: &str,
+        analysis: &PackageAnalysis,
+    ) {
+        let link_dir = lpm_root
+            .store_root()
+            .join("v2")
+            .join("links")
+            .join(format!("duplicate@1.0.0+{suffix}"));
+        let package_dir = link_dir.join("node_modules").join("duplicate");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        behavioral::write_cached_analysis(&package_dir, analysis).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"duplicate","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        LinkMeta {
+            schema: 1,
+            graph_key: format!("duplicate@1.0.0+{suffix}"),
+            graph_key_digest_hex: suffix.repeat(4),
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source_sri: source_sri.to_string(),
+            object_path: format!("objects/{source_sri}"),
+            deps: Vec::new(),
+            platform: Arc::new(LinkMetaPlatform {
+                os: "darwin".to_string(),
+                cpu: "arm64".to_string(),
+                libc: None,
+            }),
+            created_at: Utc::now(),
+            last_referenced_at: Utc::now(),
+        }
+        .write_to(&link_dir)
+        .unwrap();
+    }
+
+    #[test]
+    fn cached_security_lookup_distinguishes_same_coordinates_from_different_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        write_cached_analysis_link(
+            &lpm_root,
+            "aaaaaaaaaaaaaaaa",
+            "sha512-source-a",
+            &make_analysis(
+                SourceTags {
+                    eval: true,
+                    ..Default::default()
+                },
+                SupplyChainTags::default(),
+                ManifestTags::default(),
+            ),
+        );
+        write_cached_analysis_link(
+            &lpm_root,
+            "bbbbbbbbbbbbbbbb",
+            "sha512-source-b",
+            &make_analysis(
+                SourceTags {
+                    shell: true,
+                    ..Default::default()
+                },
+                SupplyChainTags::default(),
+                ManifestTags::default(),
+            ),
+        );
+        let index = V2BaselineIndex::build(&lpm_root).unwrap();
+        let packages = [
+            (
+                "duplicate",
+                "1.0.0",
+                "registry+https://registry.npmjs.org",
+                "sha512-source-a",
+            ),
+            (
+                "duplicate",
+                "1.0.0",
+                "registry+https://registry.example.com",
+                "sha512-source-b",
+            ),
+        ];
+        let mut observed_tags = HashSet::new();
+
+        for (name, version, _source, integrity) in packages {
+            let analysis = lpm_store::find_installed_package_baseline_by_identity_indexed(
+                &index,
+                &lpm_root,
+                name,
+                version,
+                Some(integrity),
+            )
+            .and_then(|baseline| behavioral::read_cached_analysis(&baseline.pristine_dir))
+            .unwrap();
+            if analysis.source.eval {
+                observed_tags.insert("eval");
+            }
+            if analysis.source.shell {
+                observed_tags.insert("shell");
+            }
+        }
+
+        assert_eq!(observed_tags, HashSet::from(["eval", "shell"]));
     }
 
     // ── collect_tags_from_analysis tests ──────────────────────────────
@@ -844,6 +1028,77 @@ mod tests {
 
         // HashSet deduplicates automatically
         assert_eq!(counts.get("eval").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn severity_groups_keep_same_coordinates_from_distinct_sources() {
+        let npm = SecuritySummaryPackage {
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://registry.npmjs.org".to_string(),
+            integrity: Some("sha512-source-a".to_string()),
+            is_lpm: false,
+        };
+        let custom = SecuritySummaryPackage {
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://registry.example.com".to_string(),
+            integrity: Some("sha512-source-b".to_string()),
+            is_lpm: false,
+        };
+        let counts = HashMap::from([(
+            "eval",
+            HashSet::from([npm.finding_key(), custom.finding_key()]),
+        )]);
+
+        let issues = build_severity_groups(&counts);
+
+        assert_eq!(issues[0].packages.len(), 2);
+        assert!(
+            issues[0]
+                .packages
+                .iter()
+                .any(|package| package.contains("registry.npmjs.org"))
+        );
+        assert!(
+            issues[0]
+                .packages
+                .iter()
+                .any(|package| package.contains("registry.example.com"))
+        );
+    }
+
+    #[test]
+    fn severity_groups_redact_registry_credentials_and_url_components() {
+        let package = SecuritySummaryPackage {
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://user:password@example.test/private?token=query-secret"
+                .to_string(),
+            integrity: Some("sha512-source-a".to_string()),
+            is_lpm: false,
+        };
+        let sibling = SecuritySummaryPackage {
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://registry.npmjs.org".to_string(),
+            integrity: Some("sha512-source-b".to_string()),
+            is_lpm: false,
+        };
+        let counts = HashMap::from([(
+            "eval",
+            HashSet::from([package.finding_key(), sibling.finding_key()]),
+        )]);
+
+        let issues = build_severity_groups(&counts);
+
+        assert_eq!(
+            issues[0].packages,
+            [
+                "duplicate@1.0.0 (registry+https://example.test, sha512-source-a…)",
+                "duplicate@1.0.0 (registry+https://registry.npmjs.org, sha512-source-b…)",
+            ]
+        );
     }
 
     #[test]

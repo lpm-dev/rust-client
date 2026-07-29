@@ -1160,6 +1160,7 @@ pub async fn run_add_packages(
         maybe_test_panic("after-finalize");
 
         cleanup_unused_catalogs_after_install(project_dir)?;
+        reconcile_finalized_add_install_state(project_dir)?;
 
         // 6. All steps succeeded — commit the transaction so the manifest
         // edits persist.
@@ -1654,6 +1655,9 @@ pub async fn run_install_filtered_add(
         }
 
         cleanup_unused_catalogs_after_install(&workspace_root_for_config)?;
+        for install_root in &member_install_roots {
+            reconcile_finalized_add_install_state(install_root)?;
+        }
 
         // All members succeeded — persist every staged + finalized manifest.
         tx.commit();
@@ -1668,4 +1672,95 @@ pub async fn run_install_filtered_add(
     js_result
     })
     .await
+}
+
+pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmError> {
+    let package_json_path = project_dir.join("package.json");
+    let package_json = lpm_common::read_text_file_capped(
+        &package_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read finalized {}: {e}",
+            package_json_path.display(),
+        ))
+    })?;
+    let package: lpm_workspace::PackageJson = serde_json::from_str(&package_json).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to parse finalized {}: {e}",
+            package_json_path.display(),
+        ))
+    })?;
+
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read {} after finalizing package.json: {e}",
+            lockfile_path.display(),
+        ))
+    })?;
+    let auto_install_peers = lockfile
+        .importers
+        .get(".")
+        .and_then(|importer| importer.auto_install_peers)
+        .unwrap_or(true);
+    let importer = finalized_importer_snapshot(project_dir, &package, auto_install_peers)?;
+
+    if lockfile.importers.get(".") == Some(&importer) {
+        return Ok(());
+    }
+
+    lockfile.importers.insert(".".to_string(), importer);
+    lockfile.write_all(&lockfile_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to reconcile {} with finalized package.json: {e}",
+            lockfile_path.display(),
+        ))
+    })?;
+    super::state::refresh_post_install_hash_after_manifest_finalize(project_dir)
+}
+
+fn finalized_importer_snapshot(
+    project_dir: &Path,
+    package: &lpm_workspace::PackageJson,
+    auto_install_peers: bool,
+) -> Result<lpm_lockfile::ImporterSnapshot, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(project_dir).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to rediscover workspace after finalizing package.json: {e}"
+        ))
+    })?;
+    let catalogs = workspace.as_ref().map_or(&package.catalogs, |workspace| {
+        &workspace.root_package.catalogs
+    });
+    let raw_lpm_overrides = package
+        .lpm
+        .as_ref()
+        .map(|lpm| &lpm.overrides)
+        .cloned()
+        .unwrap_or_default();
+    let (lpm_overrides, _) =
+        resolve_catalog_protocol_in_override_map(&raw_lpm_overrides, catalogs)?;
+    let (overrides, _) = resolve_catalog_protocol_in_override_map(&package.overrides, catalogs)?;
+    let (resolutions, _) =
+        resolve_catalog_protocol_in_override_map(&package.resolutions, catalogs)?;
+    let current_patches = package
+        .lpm
+        .as_ref()
+        .map(|lpm| &lpm.patched_dependencies)
+        .cloned()
+        .unwrap_or_default();
+    let patch_fingerprint =
+        (!current_patches.is_empty()).then(|| patch_state::compute_fingerprint(&current_patches));
+
+    Ok(validation::importer_snapshot_for_current_manifest(
+        package,
+        lpm_overrides.as_ref(),
+        overrides.as_ref(),
+        resolutions.as_ref(),
+        catalogs,
+        patch_fingerprint.as_deref(),
+        auto_install_peers,
+    ))
 }

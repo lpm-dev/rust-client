@@ -145,6 +145,8 @@ fn create_file_signing_secret(path: &Path) -> Result<Vec<u8>, LpmError> {
 }
 
 fn read_keyring_signing_secret(account: &str) -> Result<Vec<u8>, SigningSecretReadError> {
+    #[cfg(target_os = "macos")]
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| {
         SigningSecretReadError::Unavailable(format!("security approval keyring error: {e}"))
     })?;
@@ -214,6 +216,8 @@ fn create_signing_secret() -> Result<Vec<u8>, LpmError> {
     }
 
     let account = keyring_account(KEYRING_ACCOUNT)?;
+    #[cfg(target_os = "macos")]
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
         .map_err(|e| security_store_error(format!("security approval keyring error: {e}")))?;
 

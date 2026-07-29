@@ -12,8 +12,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use crate::{
-    clear_refresh_token, clear_token, get_refresh_token, get_stored_access_token,
-    set_refresh_token, set_session_access_token_expiry, set_token,
+    clear_refresh_token, clear_token, set_refresh_token, set_session_access_token_expiry, set_token,
 };
 
 /// Where the current effective token came from.
@@ -97,7 +96,7 @@ pub enum AuthRequirement {
     SessionRequired,
 }
 
-/// Stored credential item that `SessionManager` is about to inspect.
+/// Stored credential whose macOS Keychain read requires user interaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStorageAccessKind {
     /// Stored short-lived access token.
@@ -111,10 +110,10 @@ impl AuthStorageAccessKind {
     pub fn macos_notice_message(self) -> &'static str {
         match self {
             AuthStorageAccessKind::AccessToken => {
-                "Checking stored LPM token; macOS may show an LPM Keychain permission sheet. Choose Allow or Always Allow to continue."
+                "macOS needs permission to read the stored LPM CLI token. Choose Allow or Always Allow in the Keychain sheet."
             }
             AuthStorageAccessKind::RefreshToken => {
-                "Checking stored LPM refresh token; macOS may show an LPM Keychain permission sheet. Choose Allow or Always Allow to continue."
+                "macOS needs permission to read the stored LPM CLI refresh token. Choose Allow or Always Allow in the Keychain sheet."
             }
         }
     }
@@ -231,12 +230,14 @@ impl SessionManager {
         }
     }
 
-    /// Register a callback that runs before stored auth material is read.
+    /// Register a callback that runs before a stored credential lookup retries
+    /// with macOS Keychain interaction enabled.
     ///
-    /// The callback is de-duplicated per access/refresh credential kind for
-    /// this manager. It is intended for CLI surfaces that need to explain a
-    /// possible OS secure-storage prompt without making the auth crate depend
-    /// on terminal rendering.
+    /// A silent preflight hit, missing credential, unrelated storage failure,
+    /// or encrypted-file fallback does not invoke it. The callback is
+    /// de-duplicated per access/refresh credential kind for this manager so
+    /// CLI surfaces can explain the imminent OS prompt without making the auth
+    /// crate depend on terminal rendering.
     pub fn with_auth_storage_access_notice(
         mut self,
         notice: impl Fn(AuthStorageAccessKind) + Send + Sync + 'static,
@@ -307,8 +308,9 @@ impl SessionManager {
     }
 
     fn load_refresh_token(&self) -> Result<String, LpmError> {
-        self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
-        match get_refresh_token(&self.registry_url) {
+        match crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
+            self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
+        }) {
             Some(refresh_token) => {
                 self.mark_refresh_available();
                 Ok(refresh_token)
@@ -750,8 +752,9 @@ fn classify_keychain_sources(
     registry_url: &str,
     mut notice: impl FnMut(AuthStorageAccessKind),
 ) -> Option<CachedToken> {
-    notice(AuthStorageAccessKind::AccessToken);
-    if let Some(tok) = get_stored_access_token(registry_url) {
+    if let Some(tok) = crate::get_stored_access_token_with_interaction_notice(registry_url, || {
+        notice(AuthStorageAccessKind::AccessToken);
+    }) {
         return Some(CachedToken {
             secret: SecretString::from(tok),
             source: TokenSource::StoredSession,
@@ -771,8 +774,11 @@ fn classify_keychain_sources(
     // an `IfRefreshable` source and calls `refresh_now`, which reads
     // the refresh token from disk and exchanges it. The retry then
     // attaches the rotated access token.
-    notice(AuthStorageAccessKind::RefreshToken);
-    if get_refresh_token(registry_url).is_some() {
+    if crate::get_refresh_token_with_interaction_notice(registry_url, || {
+        notice(AuthStorageAccessKind::RefreshToken);
+    })
+    .is_some()
+    {
         return Some(CachedToken {
             secret: SecretString::from(String::new()),
             source: TokenSource::StoredSession,
@@ -1252,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_storage_notice_emits_access_once_for_stored_access_bearer() {
+    fn encrypted_file_access_token_read_emits_no_keychain_notice() {
         let _env = token_classify_isolate();
         let registry = "https://notice-access.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
@@ -1268,13 +1274,13 @@ mod tests {
         assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
         assert_eq!(
             notices.lock().unwrap().as_slice(),
-            &[AuthStorageAccessKind::AccessToken],
-            "stored access reads should not warn for refresh unless refresh is needed"
+            &[],
+            "encrypted-file reads cannot display a macOS Keychain permission sheet",
         );
     }
 
     #[test]
-    fn auth_storage_notice_emits_access_then_refresh_for_refresh_only_state() {
+    fn encrypted_file_refresh_only_recovery_emits_no_keychain_notice() {
         let _env = token_classify_isolate();
         let registry = "https://notice-refresh-only.invalid";
         crate::set_refresh_token(registry, "stored-refresh");
@@ -1289,16 +1295,13 @@ mod tests {
         assert_eq!(mgr.current_bearer_lazy(), None);
         assert_eq!(
             notices.lock().unwrap().as_slice(),
-            &[
-                AuthStorageAccessKind::AccessToken,
-                AuthStorageAccessKind::RefreshToken,
-            ],
-            "refresh-only recovery inspects access first, then refresh"
+            &[],
+            "encrypted-file refresh recovery cannot display a macOS Keychain permission sheet",
         );
     }
 
     #[tokio::test]
-    async fn auth_storage_notice_emits_refresh_once_for_session_required_check() {
+    async fn encrypted_file_session_required_check_emits_no_keychain_notice() {
         let _env = token_classify_isolate();
         let registry = "https://notice-session-required.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
@@ -1325,11 +1328,8 @@ mod tests {
 
         assert_eq!(
             notices.lock().unwrap().as_slice(),
-            &[
-                AuthStorageAccessKind::AccessToken,
-                AuthStorageAccessKind::RefreshToken,
-            ],
-            "refresh-token notice should not repeat after the first read"
+            &[],
+            "encrypted-file session checks cannot display a macOS Keychain permission sheet",
         );
     }
 

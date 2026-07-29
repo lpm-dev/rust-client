@@ -310,13 +310,18 @@ fn rewrite_fast_path_lockfile_if_needed(
     needs_binary_upgrade: bool,
     json_output: bool,
 ) -> Result<Option<u128>, LpmError> {
-    let url_churn = !fresh_urls.is_empty();
-    let importer_snapshot_changed = lockfile.importers.get(".") != Some(current_importer_snapshot);
-    let patch_records_changed = lockfile.patches != *current_lockfile_patches;
-    let schema_version_changed =
-        lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION;
+    let reasons = FastPathLockfileRewriteReasons {
+        fresh_url_count: fresh_urls.len(),
+        binary_writeback: needs_binary_upgrade,
+        importer_snapshot_changed: lockfile.importers.get(".") != Some(current_importer_snapshot),
+        patch_records_changed: lockfile.patches != *current_lockfile_patches,
+        schema_version_changed: lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION,
+    };
 
-    if importer_snapshot_changed || patch_records_changed || schema_version_changed {
+    if reasons.importer_snapshot_changed
+        || reasons.patch_records_changed
+        || reasons.schema_version_changed
+    {
         lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
         lockfile.patches = current_lockfile_patches.clone();
         lockfile
@@ -324,24 +329,33 @@ fn rewrite_fast_path_lockfile_if_needed(
             .insert(".".to_string(), current_importer_snapshot.clone());
     }
 
-    if !url_churn
-        && !needs_binary_upgrade
-        && !importer_snapshot_changed
-        && !patch_records_changed
-        && !schema_version_changed
-    {
+    if !reasons.requires_write() {
         return Ok(None);
     }
 
     patch_fresh_tarball_urls(&mut lockfile, fresh_urls);
     let write_ms = write_lockfile_and_measure(&lockfile, lockfile_path, "rewrite")?;
-    emit_fast_path_lockfile_rewrite_notice(
-        json_output,
-        url_churn,
-        needs_binary_upgrade,
-        fresh_urls.len(),
-    );
+    emit_fast_path_lockfile_rewrite_notice(json_output, reasons);
     Ok(Some(write_ms))
+}
+
+#[derive(Clone, Copy)]
+struct FastPathLockfileRewriteReasons {
+    fresh_url_count: usize,
+    binary_writeback: bool,
+    importer_snapshot_changed: bool,
+    patch_records_changed: bool,
+    schema_version_changed: bool,
+}
+
+impl FastPathLockfileRewriteReasons {
+    fn requires_write(self) -> bool {
+        self.fresh_url_count > 0
+            || self.binary_writeback
+            || self.importer_snapshot_changed
+            || self.patch_records_changed
+            || self.schema_version_changed
+    }
 }
 
 fn patch_fresh_tarball_urls(
@@ -381,28 +395,36 @@ fn write_lockfile_and_measure(
 
 fn emit_fast_path_lockfile_rewrite_notice(
     json_output: bool,
-    url_churn: bool,
-    needs_binary_upgrade: bool,
-    fresh_url_count: usize,
+    reasons: FastPathLockfileRewriteReasons,
 ) {
     if json_output {
         return;
     }
 
-    if url_churn && needs_binary_upgrade {
-        output::info(&format!(
-            "Refreshed {fresh_url_count} stale tarball URL(s) + upgraded lpm.lockb to v{}",
+    if let Some(message) = fast_path_lockfile_rewrite_notice(reasons) {
+        output::info(&message);
+    }
+}
+
+fn fast_path_lockfile_rewrite_notice(reasons: FastPathLockfileRewriteReasons) -> Option<String> {
+    if reasons.fresh_url_count > 0 && reasons.binary_writeback {
+        Some(format!(
+            "Refreshed {} stale tarball URL(s) and wrote lpm.lockb v{} format",
+            reasons.fresh_url_count,
             lpm_lockfile::binary::BINARY_VERSION,
-        ));
-    } else if url_churn {
-        output::info(&format!(
-            "Refreshed {fresh_url_count} stale tarball URL(s) in lockfile",
-        ));
+        ))
+    } else if reasons.fresh_url_count > 0 {
+        Some(format!(
+            "Refreshed {} stale tarball URL(s) in lockfile",
+            reasons.fresh_url_count,
+        ))
+    } else if reasons.binary_writeback {
+        Some(format!(
+            "Wrote lpm.lockb v{} format",
+            lpm_lockfile::binary::BINARY_VERSION,
+        ))
     } else {
-        output::info(&format!(
-            "Upgraded lpm.lockb to v{} format",
-            lpm_lockfile::binary::BINARY_VERSION,
-        ));
+        None
     }
 }
 
@@ -2206,4 +2228,43 @@ pub(super) fn resolved_to_install_packages_with_workspace_members(
     );
     rewrite_workspace_resolved_sources(&mut packages, all_workspace_members, project_dir);
     packages
+}
+
+#[cfg(test)]
+mod rewrite_notice_tests {
+    use super::*;
+
+    #[test]
+    fn fast_path_lockfile_notice_is_absent_for_importer_only_rewrite() {
+        let notice = fast_path_lockfile_rewrite_notice(FastPathLockfileRewriteReasons {
+            fresh_url_count: 0,
+            binary_writeback: false,
+            importer_snapshot_changed: true,
+            patch_records_changed: false,
+            schema_version_changed: false,
+        });
+
+        assert_eq!(
+            notice, None,
+            "repairing TOML-only importer metadata must stay silent",
+        );
+    }
+
+    #[test]
+    fn fast_path_lockfile_notice_describes_binary_write_without_claiming_upgrade() {
+        let notice = fast_path_lockfile_rewrite_notice(FastPathLockfileRewriteReasons {
+            fresh_url_count: 0,
+            binary_writeback: true,
+            importer_snapshot_changed: false,
+            patch_records_changed: false,
+            schema_version_changed: false,
+        })
+        .expect("binary writeback should have a notice");
+
+        assert!(notice.contains("Wrote lpm.lockb"));
+        assert!(
+            !notice.contains("Upgraded"),
+            "a missing or stale sidecar is not necessarily an old format: {notice}",
+        );
+    }
 }

@@ -17,6 +17,16 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
+/// Serialize Keychain calls while legacy Security.framework probes may
+/// temporarily change the process-wide interaction setting.
+#[cfg(target_os = "macos")]
+pub fn macos_keychain_operation_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Detect the running host's libc flavor.
 ///
 /// Returns `Some("musl")` / `Some("glibc")` on Linux when the loader
