@@ -141,6 +141,11 @@ fn recursive_install_resolves_workspace_protocol_to_named_root_package() {
         &output,
         "workspace protocol should resolve a named workspace root",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("link/directory dep resolves to a path outside the project tree"),
+        "a declared workspace-root source is an expected cross-project link: {stderr}",
+    );
     let linked_manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("docs/node_modules/vitepress/package.json"))
             .expect("linked workspace root should expose its package manifest");
@@ -150,6 +155,179 @@ fn recursive_install_resolves_workspace_protocol_to_named_root_package() {
             linked_manifest["version"].as_str(),
         ),
         (Some("vitepress"), Some("1.5.0")),
+    );
+}
+
+#[test]
+fn member_install_does_not_install_workspace_root_dev_dependencies_transitively() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "devDependencies": {
+    "build-only-package": "https://example.invalid/build-only-package.tgz"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "workspace-member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "workspace-root": "workspace:*"
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/member"))
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install a member that consumes the workspace root");
+
+    assert_install_succeeded(
+        &output,
+        "workspace-root devDependencies must not become member transitives",
+    );
+    let linked_manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file("packages/member/node_modules/workspace-root/package.json"),
+    )
+    .expect("linked workspace root should expose its package manifest");
+    assert_eq!(linked_manifest["name"], "workspace-root");
+}
+
+#[test]
+fn member_install_does_not_link_transitive_workspace_dev_dependencies() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/runtime/package.json",
+        r#"{
+  "name": "@fixture/runtime",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@fixture/build-tool": "workspace:*"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/build-tool/package.json",
+        r#"{
+  "name": "@fixture/build-tool",
+  "version": "1.0.0",
+  "private": true
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/runtime": "workspace:*"
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install a member with a consumed workspace package");
+
+    assert_install_succeeded(
+        &output,
+        "consumed workspace package devDependencies must not become transitives",
+    );
+    assert!(
+        project
+            .path()
+            .join("packages/app/node_modules/@fixture/runtime")
+            .exists(),
+        "the direct workspace runtime dependency should be linked",
+    );
+    assert!(
+        !project
+            .path()
+            .join("packages/app/node_modules/@fixture/build-tool")
+            .exists(),
+        "the consumed workspace package devDependency must not be linked",
+    );
+}
+
+#[test]
+fn repeated_recursive_install_fast_exits_members_with_a_shared_workspace_root() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "shared-workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    for member in ["first", "second"] {
+        project.write_file(
+            &format!("packages/{member}/package.json"),
+            &format!(
+                r#"{{
+  "name": "@fixture/{member}",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {{
+    "shared-workspace-root": "workspace:*"
+  }}
+}}"#,
+            ),
+        );
+    }
+
+    let first = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run initial recursive install with a shared workspace root");
+    assert_install_succeeded(&first, "initial recursive install should succeed");
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        !first_stderr.contains("incomplete or stale link entry"),
+        "initial recursive install should keep the shared workspace-root snapshot stable: \
+         {first_stderr}",
+    );
+
+    let second = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("rerun recursive install with a shared workspace root");
+    assert_install_succeeded(&second, "repeated recursive install should succeed");
+
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !stderr.contains("incomplete or stale link entry"),
+        "repeated recursive install should reuse the shared workspace-root link entry: {stderr}",
+    );
+    assert!(
+        !stderr.contains("Using lockfile")
+            && !stderr.contains("link/directory dep resolves to a path outside the project tree"),
+        "repeated recursive install should finish before member resolution and linking: {stderr}",
     );
 }
 

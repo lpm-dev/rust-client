@@ -1,5 +1,53 @@
 use super::*;
 
+#[test]
+fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("packages/runtime");
+    let build_tool_dir = dir.path().join("packages/build-tool");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&build_tool_dir).unwrap();
+    std::fs::write(
+        runtime_dir.join("package.json"),
+        r#"{
+  "name": "@test/runtime",
+  "version": "1.0.0",
+  "devDependencies": {
+    "@test/build-tool": "workspace:*"
+  }
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        build_tool_dir.join("package.json"),
+        r#"{"name":"@test/build-tool","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let runtime = WorkspaceMemberLink {
+        name: "@test/runtime".to_string(),
+        version: "1.0.0".to_string(),
+        source_dir: runtime_dir,
+    };
+    let build_tool = WorkspaceMemberLink {
+        name: "@test/build-tool".to_string(),
+        version: "1.0.0".to_string(),
+        source_dir: build_tool_dir,
+    };
+    let mut expanded = vec![runtime.clone()];
+
+    expand_workspace_member_deps_with_transitives(&mut expanded, &[runtime, build_tool]).unwrap();
+
+    assert_eq!(
+        expanded
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["@test/runtime"],
+        "consumed workspace member devDependencies must not become transitives",
+    );
+}
+
 // ── invariant: install_root must be the member dir, not workspace ──
 
 #[tokio::test]

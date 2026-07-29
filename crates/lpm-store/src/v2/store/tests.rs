@@ -800,6 +800,79 @@ fn populate_object_from_local_source_materializes_real_files_for_node_resolution
     );
 }
 
+#[test]
+fn populate_object_from_local_source_excludes_lpm_install_state_at_every_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(source.join(".lpm")).unwrap();
+    std::fs::create_dir_all(source.join("packages/member/.lpm")).unwrap();
+    std::fs::write(
+        source.join("package.json"),
+        b"{\"name\":\"workspace-root\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("packages/member/package.json"),
+        b"{\"name\":\"workspace-member\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    std::fs::write(source.join(".lpm-local-source"), b"package-owned marker\n").unwrap();
+    std::fs::write(source.join(".gitignore"), b".lpm/wrappers/\n").unwrap();
+    std::fs::write(source.join(".gitattributes"), b"lpm.lockb binary\n").unwrap();
+    std::fs::write(source.join(".lpm/install-hash"), b"root state\n").unwrap();
+    std::fs::write(source.join("lpm.lock"), b"root lock\n").unwrap();
+    std::fs::write(source.join("lpm.lockb"), b"root binary lock\n").unwrap();
+    std::fs::write(
+        source.join("packages/member/.lpm/install-hash"),
+        b"member state\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("packages/member/lpm.lock"), b"member lock\n").unwrap();
+    std::fs::write(
+        source.join("packages/member/lpm.lockb"),
+        b"member binary lock\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("packages/member/.gitignore"),
+        b".lpm/wrappers/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("packages/member/.gitattributes"),
+        b"lpm.lockb binary\n",
+    )
+    .unwrap();
+
+    let sri = synthetic_sri(b"populate_local_source_excludes_lpm_state");
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    assert!(
+        object_dir.join(".lpm-local-source").is_file(),
+        "similarly named package-owned files must remain part of the local source"
+    );
+    for relative in [
+        ".lpm",
+        ".gitignore",
+        ".gitattributes",
+        "lpm.lock",
+        "lpm.lockb",
+        "packages/member/.lpm",
+        "packages/member/.gitignore",
+        "packages/member/.gitattributes",
+        "packages/member/lpm.lock",
+        "packages/member/lpm.lockb",
+    ] {
+        assert!(
+            !object_dir.join(relative).exists(),
+            "local-source objects must exclude generated LPM state at {relative}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn populate_object_from_local_source_refreshes_file_set_on_reinstall() {

@@ -850,9 +850,8 @@ function materializeFixture(fixture, projectDir) {
 }
 
 function cleanProject(projectDir) {
-  for (const entry of [
-    'node_modules',
-    '.lpm',
+  const installDirs = new Set(['node_modules', '.lpm']);
+  const installFiles = new Set([
     'lpm.lock',
     'lpm.lockb',
     'package-lock.json',
@@ -860,8 +859,26 @@ function cleanProject(projectDir) {
     'bun.lock',
     'bun.lockb',
     'yarn.lock',
-  ]) {
-    removeTree(path.join(projectDir, entry));
+  ]);
+  const pending = [projectDir];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const target = path.join(current, entry.name);
+      if (installDirs.has(entry.name) || installFiles.has(entry.name)) {
+        removeTree(target);
+      } else if (entry.isDirectory() && entry.name !== '.git') {
+        pending.push(target);
+      }
+    }
   }
 }
 
@@ -1721,6 +1738,29 @@ function runSelfTests() {
     assert.equal(fs.readFileSync(path.join(projectDir, '.npmrc'), 'utf8'), 'shell-emulator=true\n');
   } finally {
     removeTree(npmrcFixtureRoot);
+  }
+  const cleanupFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lpm-readiness-cleanup-test-'));
+  try {
+    const memberDir = path.join(cleanupFixtureRoot, 'packages', 'member');
+    fs.mkdirSync(path.join(cleanupFixtureRoot, 'node_modules'), { recursive: true });
+    fs.mkdirSync(path.join(cleanupFixtureRoot, '.lpm'), { recursive: true });
+    fs.mkdirSync(path.join(memberDir, 'node_modules'), { recursive: true });
+    fs.mkdirSync(path.join(memberDir, '.lpm'), { recursive: true });
+    fs.writeFileSync(path.join(cleanupFixtureRoot, 'lpm.lock'), 'root lock\n');
+    fs.writeFileSync(path.join(memberDir, 'pnpm-lock.yaml'), 'member lock\n');
+    fs.writeFileSync(path.join(memberDir, 'source.js'), 'export default 1;\n');
+
+    cleanProject(cleanupFixtureRoot);
+
+    assert.equal(fs.existsSync(path.join(cleanupFixtureRoot, 'node_modules')), false);
+    assert.equal(fs.existsSync(path.join(cleanupFixtureRoot, '.lpm')), false);
+    assert.equal(fs.existsSync(path.join(cleanupFixtureRoot, 'lpm.lock')), false);
+    assert.equal(fs.existsSync(path.join(memberDir, 'node_modules')), false);
+    assert.equal(fs.existsSync(path.join(memberDir, '.lpm')), false);
+    assert.equal(fs.existsSync(path.join(memberDir, 'pnpm-lock.yaml')), false);
+    assert.equal(fs.readFileSync(path.join(memberDir, 'source.js'), 'utf8'), 'export default 1;\n');
+  } finally {
+    removeTree(cleanupFixtureRoot);
   }
   assert.deepEqual(parseLpmFirewallModes('off,enabled,report'), ['off', 'enforce', 'report']);
   assert.throws(() => parseLpmFirewallModes('enabled,enforce'), /duplicate lpm firewall mode/);

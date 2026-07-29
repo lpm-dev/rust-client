@@ -139,6 +139,24 @@ fn linkable_workspace_packages(
     )
 }
 
+pub(super) fn is_declared_workspace_package_source(
+    project_dir: &Path,
+    source_dir: &Path,
+    package_name: &str,
+    package_version: &str,
+) -> bool {
+    let Ok(Some(workspace)) = crate::workspace_discovery_cache::discover_workspace(project_dir)
+    else {
+        return false;
+    };
+
+    linkable_workspace_packages(&workspace).any(|(package, path)| {
+        package.name.as_deref() == Some(package_name)
+            && package.version.as_deref().unwrap_or("0.0.0") == package_version
+            && path.canonicalize().is_ok_and(|path| path == source_dir)
+    })
+}
+
 /// Interactive confirmation for multi-member workspace mutations.
 ///
 /// Prints the target set (always, in human mode) and asks "Proceed? [y/N]"
@@ -681,11 +699,13 @@ pub(super) fn pre_extract_file_link_workspace_members(
 ///
 /// BFS over `workspace_member_deps` (the seed set: extracted top-
 /// level + any / the invariant additions merged in by the caller),
-/// reading each member's `package.json` and following every
-/// `workspace:` dep to its target in `all_workspace_members`. New
-/// targets are appended to `workspace_member_deps` and enqueued so
-/// chains like `root → foo (workspace:*) → bar (workspace:*) → baz
-/// (workspace:*)` all end up root-linked.
+/// reading each member's `package.json` and following its runtime
+/// `workspace:` dependencies to targets in `all_workspace_members`.
+/// New targets are appended to `workspace_member_deps` and enqueued
+/// so chains like `root → foo (workspace:*) → bar (workspace:*) →
+/// baz (workspace:*)` all end up root-linked. A consumed member's
+/// `devDependencies` are not transitives; direct target development
+/// dependencies have already been extracted into the seed set.
 ///
 /// **Round 5 (online path)** added this BFS after pre_resolve +
 /// merge of `additional_workspace_links`. **Round 6** factored it
@@ -752,12 +772,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
             continue;
         };
-        for field in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
+        for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
             let Some(deps_obj) = value.get(field).and_then(|v| v.as_object()) else {
                 continue;
             };
