@@ -4,7 +4,7 @@
 //!
 //! 1. **Client-side analysis** (all packages): Reads `.lpm-security.json` from
 //!    the store for every installed package (npm + @lpm.dev). Produces a
-//!    severity-tiered summary of 22 behavioral tags.
+//!    severity-tiered summary of behavioral tags.
 //!
 //! 2. **Registry-side analysis** (@lpm.dev only): Fetches AI security findings,
 //!    behavioral tags, vulnerabilities, and lifecycle scripts from the registry
@@ -78,6 +78,7 @@ pub(crate) async fn post_install_security_summary(
     packages: &[SecuritySummaryPackage],
     json_output: bool,
     quiet: bool,
+    fetch_lpm_security_insights: bool,
 ) {
     if packages.is_empty() {
         return;
@@ -131,8 +132,7 @@ pub(crate) async fn post_install_security_summary(
 
     // ── Registry-side enrichment (@lpm.dev only) ─────
 
-    let lpm_packages: Vec<&SecuritySummaryPackage> =
-        packages.iter().filter(|package| package.is_lpm).collect();
+    let lpm_packages = lpm_packages_for_enrichment(packages, fetch_lpm_security_insights);
 
     if !lpm_packages.is_empty() {
         let names: Vec<String> = lpm_packages
@@ -199,6 +199,16 @@ pub(crate) async fn post_install_security_summary(
 
     let total: usize = tag_counts.values().map(|v| v.len()).sum();
     emit_human_security_summary(packages.len(), total, &issues, quiet);
+}
+
+fn lpm_packages_for_enrichment(
+    packages: &[SecuritySummaryPackage],
+    enabled: bool,
+) -> Vec<&SecuritySummaryPackage> {
+    if !enabled {
+        return Vec::new();
+    }
+    packages.iter().filter(|package| package.is_lpm).collect()
 }
 
 fn emit_human_security_summary(
@@ -758,6 +768,33 @@ mod tests {
                 oversized_source_files: vec![],
             },
         }
+    }
+
+    fn summary_package(name: &str, is_lpm: bool) -> SecuritySummaryPackage {
+        SecuritySummaryPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: "https://registry.example.test".to_string(),
+            integrity: None,
+            is_lpm,
+        }
+    }
+
+    #[test]
+    fn disabled_lpm_security_insights_schedules_no_registry_enrichment() {
+        let packages = [
+            summary_package("@lpm.dev/secure", true),
+            summary_package("ordinary", false),
+        ];
+
+        assert!(lpm_packages_for_enrichment(&packages, false).is_empty());
+        assert_eq!(
+            lpm_packages_for_enrichment(&packages, true)
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["@lpm.dev/secure"]
+        );
     }
 
     fn write_cached_analysis_link(

@@ -578,6 +578,9 @@ function extractLpmMetrics(json) {
     fetch_task_max_ms: numberAt(json, ['timing', 'fetch_breakdown', 'task_max_ms']),
     fetch_queue_wait_sum_ms: breakdownStat(fetchBreakdown, 'queue_wait', 'sum_ms'),
     fetch_extract_sum_ms: breakdownStat(fetchBreakdown, 'extract', 'sum_ms'),
+    fetch_source_scan_sum_ns: breakdownStat(fetchBreakdown, 'source_scan', 'sum_ns'),
+    fetch_source_scan_max_ns: breakdownStat(fetchBreakdown, 'source_scan', 'max_ns'),
+    fetch_source_scan_sum_ms: nsToMs(breakdownStat(fetchBreakdown, 'source_scan', 'sum_ns')),
     fetch_finalize_sum_ms: breakdownStat(fetchBreakdown, 'finalize', 'sum_ms'),
     fetch_overlap_selected_count: finiteNumber(fetchOverlap?.selected_count),
     fetch_overlap_dispatched_count: finiteNumber(fetchOverlap?.dispatched_count),
@@ -923,6 +926,9 @@ function summarizeMetrics(rows) {
     'fetch_task_max_ms',
     'fetch_queue_wait_sum_ms',
     'fetch_extract_sum_ms',
+    'fetch_source_scan_sum_ns',
+    'fetch_source_scan_max_ns',
+    'fetch_source_scan_sum_ms',
     'fetch_finalize_sum_ms',
     'fetch_overlap_selected_count',
     'fetch_overlap_dispatched_count',
@@ -1391,6 +1397,10 @@ function breakdownStat(breakdown, bucket, stat) {
   return finiteNumber(breakdown?.[bucket]?.[stat]);
 }
 
+function nsToMs(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value / 1_000_000 : undefined;
+}
+
 function bytesToMb(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return undefined;
@@ -1713,6 +1723,12 @@ function runSelfTests() {
           cache_hits: 7,
         },
       },
+      fetch_breakdown: {
+        source_scan: {
+          sum_ns: 12_500_000,
+          max_ns: 3_750_000,
+        },
+      },
       detail: {
         fetch: {
           overlap: {
@@ -1794,6 +1810,9 @@ function runSelfTests() {
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_walk_ms, 23);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_manifests_fetched, 11);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_cache_hits, 7);
+  assert.equal(currentMetadataMetrics.fetch_source_scan_sum_ns, 12_500_000);
+  assert.equal(currentMetadataMetrics.fetch_source_scan_max_ns, 3_750_000);
+  assert.equal(currentMetadataMetrics.fetch_source_scan_sum_ms, 12.5);
   assert.equal(currentMetadataMetrics.firewall_batch_ms, 31);
   assert.equal(currentMetadataMetrics.firewall_checked_count, 10);
   assert.equal(currentMetadataMetrics.firewall_warn_count, 1);

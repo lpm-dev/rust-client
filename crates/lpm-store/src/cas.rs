@@ -41,7 +41,13 @@ impl PackageStore {
     /// arm.
     pub fn has_tarball(&self, integrity_sri: &str) -> bool {
         match self.tarball_store_path(integrity_sri) {
-            Ok(dir) => is_complete_package_dir(&dir),
+            Ok(dir) => {
+                let complete = is_complete_package_dir(&dir);
+                if complete {
+                    self.backfill_security_cache_if_enabled(&dir, "remote tarball");
+                }
+                complete
+            }
             Err(_) => false,
         }
     }
@@ -73,7 +79,13 @@ impl PackageStore {
     /// its CAS path. Mirrors [`Self::has_tarball`] for the remote arm.
     pub fn has_local_tarball(&self, content_sha256_hex: &str) -> bool {
         match self.tarball_local_store_path(content_sha256_hex) {
-            Ok(dir) => is_complete_package_dir(&dir),
+            Ok(dir) => {
+                let complete = is_complete_package_dir(&dir);
+                if complete {
+                    self.backfill_security_cache_if_enabled(&dir, "local tarball");
+                }
+                complete
+            }
             Err(_) => false,
         }
     }
@@ -115,9 +127,9 @@ impl PackageStore {
     ///
     /// Mirrors [`Self::store_tarball_at_cas_path`] but routes through
     /// [`Self::tarball_local_store_path`]. All TOCTOU + integrity +
-    /// behavioral-analysis machinery is shared via [`Self::store_at_dir`]
-    /// — `.integrity` and `.lpm-security.json` are written in the same
-    /// atomic-rename window.
+    /// behavioral-analysis machinery is shared via [`Self::store_at_dir`].
+    /// `.integrity` and, when analysis is enabled, `.lpm-security.json` are
+    /// written in the same atomic-rename window.
     ///
     /// `content_sha256_hex` MUST be the lowercase-hex SHA-256 of
     /// `tarball_data` — caller's responsibility (same contract as

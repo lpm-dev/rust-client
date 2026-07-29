@@ -25,14 +25,15 @@ pub(crate) use approval::ensure_runtime_npm_firewall_config_authorized;
 pub(crate) use approval::ensure_runtime_npm_firewall_config_authorized_with_effective;
 pub(crate) use approval::record_project_trust_candidate_authorized_from_managed_flow;
 pub use approval::{
-    approval_required_error, authorize_persistent_npm_firewall_mode,
-    authorize_persistent_release_age, authorize_persistent_release_age_policy,
-    authorize_persistent_sandbox_mode, authorize_persistent_script_policy,
-    authorize_persistent_sigstore, authorize_persistent_typosquat_guard,
-    ensure_global_trust_authorized, ensure_global_trust_candidate_authorized_from_trust,
-    ensure_project_policy_authorized, ensure_project_trust_candidate_authorized,
-    ensure_runtime_sigstore_posture, ensure_runtime_sigstore_posture_for_global,
-    ensure_runtime_typosquat_guard_config_authorized,
+    approval_required_error, authorize_persistent_install_time_source_analysis,
+    authorize_persistent_npm_firewall_mode, authorize_persistent_release_age,
+    authorize_persistent_release_age_policy, authorize_persistent_sandbox_mode,
+    authorize_persistent_script_policy, authorize_persistent_sigstore,
+    authorize_persistent_typosquat_guard, ensure_global_trust_authorized,
+    ensure_global_trust_candidate_authorized_from_trust, ensure_project_policy_authorized,
+    ensure_project_trust_candidate_authorized,
+    ensure_runtime_install_time_source_analysis_authorized, ensure_runtime_sigstore_posture,
+    ensure_runtime_sigstore_posture_for_global, ensure_runtime_typosquat_guard_config_authorized,
 };
 pub use helpers::format_unlock_duration;
 pub(crate) use managed_policy::{

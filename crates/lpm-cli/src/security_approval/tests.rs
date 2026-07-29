@@ -120,6 +120,83 @@ fn authorized_posture_round_trips_through_signed_store() {
 }
 
 #[test]
+fn authorized_posture_enables_install_time_source_analysis_by_default() {
+    assert!(AuthorizedPosture::default().install_time_source_analysis());
+}
+
+#[test]
+fn persistent_source_analysis_disable_is_signed_and_reenable_strengthens_without_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        authorize_persistent_install_time_source_analysis(
+            false,
+            false,
+            "lpm config source-analysis --set false",
+        )
+        .unwrap();
+        assert!(
+            !load_authorized_posture()
+                .unwrap()
+                .install_time_source_analysis()
+        );
+
+        without_test_native_auth(|| {
+            authorize_persistent_install_time_source_analysis(
+                true,
+                true,
+                "lpm config source-analysis --set true",
+            )
+        })
+        .unwrap();
+        assert!(
+            load_authorized_posture()
+                .unwrap()
+                .install_time_source_analysis()
+        );
+    });
+}
+
+#[test]
+fn runtime_source_analysis_disable_requires_project_unlock_when_posture_is_enabled() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        persist_authorized_posture(&AuthorizedPosture::default()).unwrap();
+        let error = ensure_runtime_install_time_source_analysis_authorized(&project, true, false)
+            .unwrap_err();
+
+        assert_eq!(error.error_code(), "security_approval_required");
+        assert!(matches!(
+            error,
+            LpmError::SecurityApprovalRequired {
+                ref requested_scopes,
+                ..
+            } if requested_scopes == &["source-analysis-disable"]
+        ));
+    });
+}
+
+#[test]
+fn managed_source_analysis_policy_blocks_persistent_disable() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(temp.path(), "install-time-source-analysis = true\n");
+
+        let error = authorize_persistent_install_time_source_analysis(
+            false,
+            false,
+            "lpm config source-analysis --set false",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "security_floor");
+        assert!(error.to_string().contains("install-time-source-analysis"));
+    });
+}
+
+#[test]
 fn load_authorized_posture_does_not_create_secret_when_existing_file_cannot_verify() {
     let temp = tempdir().unwrap();
     with_file_secret_env(temp.path(), || {
@@ -244,6 +321,7 @@ fn default_unlock_bundle_excludes_trust_capability_and_floor_scopes() {
     let scopes = ApprovalScope::default_unlock_scopes();
     assert!(scopes.contains(&ApprovalScope::CooldownBypass));
     assert!(scopes.contains(&ApprovalScope::SandboxNone));
+    assert!(scopes.contains(&ApprovalScope::SourceAnalysisDisable));
     assert!(!scopes.contains(&ApprovalScope::TrustBulkApprove));
     assert!(!scopes.contains(&ApprovalScope::TrustScopeWiden));
     assert!(!scopes.contains(&ApprovalScope::CapabilityWiden));

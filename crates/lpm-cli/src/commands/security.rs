@@ -23,6 +23,7 @@ pub(crate) enum SecurityScopeSelector {
     CapabilityWiden,
     TyposquatDisable,
     FirewallDisable,
+    SourceAnalysisDisable,
     FloorEdit,
 }
 
@@ -61,6 +62,7 @@ impl SecurityScopeSelector {
             Self::CapabilityWiden => ApprovalScope::CapabilityWiden.as_str(),
             Self::TyposquatDisable => ApprovalScope::TyposquatDisable.as_str(),
             Self::FirewallDisable => ApprovalScope::FirewallDisable.as_str(),
+            Self::SourceAnalysisDisable => ApprovalScope::SourceAnalysisDisable.as_str(),
             Self::FloorEdit => ApprovalScope::FloorEdit.as_str(),
         }
     }
@@ -87,6 +89,7 @@ impl SecurityScopeSelector {
             Self::CapabilityWiden => vec![ApprovalScope::CapabilityWiden],
             Self::TyposquatDisable => vec![ApprovalScope::TyposquatDisable],
             Self::FirewallDisable => vec![ApprovalScope::FirewallDisable],
+            Self::SourceAnalysisDisable => vec![ApprovalScope::SourceAnalysisDisable],
             Self::FloorEdit => vec![ApprovalScope::FloorEdit],
         }
     }

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+use lpm_store::SecurityAnalysisPolicy;
 use lpm_store::v2::{ObjectIntegrityPolicy, PlatformTuple};
 
 /// Atomically write a small state file with owner-only perms (0o600 on Unix).
@@ -188,13 +189,14 @@ const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v8\x00";
 /// Hoisted; this shim follows the flip so callers expecting "the hash
 /// for a default install" get the post-4f shape.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
-    compute_install_hash_v8(
+    compute_install_hash_v10(
         pkg_content,
         lock_content,
         &[],
         lpm_linker::LinkerMode::default(),
         ObjectIntegrityPolicy::Source,
         &PlatformTuple::current(),
+        InstallHashContext::default(),
     )
 }
 
@@ -211,13 +213,14 @@ pub fn compute_install_hash_v3(
     lock_content: &str,
     file_link_manifests: &[u8],
 ) -> String {
-    compute_install_hash_v8(
+    compute_install_hash_v10(
         pkg_content,
         lock_content,
         file_link_manifests,
         lpm_linker::LinkerMode::default(),
         ObjectIntegrityPolicy::Source,
         &PlatformTuple::current(),
+        InstallHashContext::default(),
     )
 }
 
@@ -230,13 +233,14 @@ pub fn compute_install_hash_v6(
     file_link_manifests: &[u8],
     linker_mode: lpm_linker::LinkerMode,
 ) -> String {
-    compute_install_hash_v8(
+    compute_install_hash_v10(
         pkg_content,
         lock_content,
         file_link_manifests,
         linker_mode,
         ObjectIntegrityPolicy::Source,
         &PlatformTuple::current(),
+        InstallHashContext::default(),
     )
 }
 
@@ -249,13 +253,14 @@ pub fn compute_install_hash_v7(
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: ObjectIntegrityPolicy,
 ) -> String {
-    compute_install_hash_v8(
+    compute_install_hash_v10(
         pkg_content,
         lock_content,
         file_link_manifests,
         linker_mode,
         object_integrity_policy,
         &PlatformTuple::current(),
+        InstallHashContext::default(),
     )
 }
 
@@ -329,6 +334,47 @@ pub fn compute_install_hash_v9(
     hasher.update(base.as_bytes());
     hasher.update(b"\x00");
     hasher.update(dependency_engine_key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InstallHashContext<'a> {
+    pub(crate) dependency_engine_key: &'a str,
+    pub(crate) security_analysis_policy: SecurityAnalysisPolicy,
+}
+
+impl Default for InstallHashContext<'static> {
+    fn default() -> Self {
+        Self {
+            dependency_engine_key: "none",
+            security_analysis_policy: SecurityAnalysisPolicy::Enabled,
+        }
+    }
+}
+
+pub(crate) fn compute_install_hash_v10(
+    pkg_content: &str,
+    lock_content: &str,
+    file_link_manifests: &[u8],
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    platform: &PlatformTuple,
+    context: InstallHashContext<'_>,
+) -> String {
+    let base = compute_install_hash_v9(
+        pkg_content,
+        lock_content,
+        file_link_manifests,
+        linker_mode,
+        object_integrity_policy,
+        platform,
+        context.dependency_engine_key,
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-install-hash-v10-source-analysis\0");
+    hasher.update(base.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(context.security_analysis_policy.as_str().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -608,16 +654,25 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
             Ok(policy) => policy,
             Err(_) => return invalid_integrity_state(project_dir, &pkg_content, linker_mode),
         };
+    let security_analysis_policy =
+        match crate::source_analysis_config::read_install_time_source_analysis(&cfg) {
+            Ok(true) => SecurityAnalysisPolicy::Enabled,
+            Ok(false) => SecurityAnalysisPolicy::Disabled,
+            Err(_) => return invalid_integrity_state(project_dir, &pkg_content, linker_mode),
+        };
 
     // Single mtime probe lives inside `check_install_state_with_linker`
     // — no pre-delegation probe here, otherwise the stale path would
     // pay the same filesystem checks twice (once on the early bail,
     // once after delegation re-runs them).
-    check_install_state_with_linker_and_integrity(
+    check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
         project_dir,
         &pkg_content,
         linker_mode,
         object_integrity_policy,
+        "none",
+        lpm_store::StoreVersion::from_env(),
+        security_analysis_policy,
     )
 }
 
@@ -645,11 +700,20 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
             Ok(policy) => policy,
             Err(_) => return invalid_integrity_state(project_dir, pkg_content, linker_mode),
         };
-    check_install_state_with_linker_and_integrity(
+    let security_analysis_policy =
+        match crate::source_analysis_config::read_install_time_source_analysis(&cfg) {
+            Ok(true) => SecurityAnalysisPolicy::Enabled,
+            Ok(false) => SecurityAnalysisPolicy::Disabled,
+            Err(_) => return invalid_integrity_state(project_dir, pkg_content, linker_mode),
+        };
+    check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
         project_dir,
         pkg_content,
         linker_mode,
         object_integrity_policy,
+        "none",
+        lpm_store::StoreVersion::from_env(),
+        security_analysis_policy,
     )
 }
 
@@ -751,18 +815,42 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
     dependency_engine_key: &str,
     store_version: lpm_store::StoreVersion,
 ) -> InstallState {
+    check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+        project_dir,
+        pkg_content,
+        linker_mode,
+        object_integrity_policy,
+        dependency_engine_key,
+        store_version,
+        SecurityAnalysisPolicy::Enabled,
+    )
+}
+
+pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+    project_dir: &Path,
+    pkg_content: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    dependency_engine_key: &str,
+    store_version: lpm_store::StoreVersion,
+    security_analysis_policy: SecurityAnalysisPolicy,
+) -> InstallState {
     let platform = PlatformTuple::current();
     // mtime short-circuit also applies here. The caller may have
     // already read pkg.json for an earlier check, but the fast path still
     // skips the read of lpm.lock + the SHA-256 pass.
+    let hash_context = InstallHashContext {
+        dependency_engine_key,
+        security_analysis_policy,
+    };
     if let Some(state) = try_mtime_fast_path(
         project_dir,
         pkg_content,
         linker_mode,
         object_integrity_policy,
         &platform,
-        dependency_engine_key,
         store_version,
+        hash_context,
     ) {
         return state;
     }
@@ -772,19 +860,21 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
     let nm = project_dir.join("node_modules");
 
     // Read lockfile — empty string if missing (hash will mismatch → needs install)
-    let lock_content = std::fs::read_to_string(&lock_path).unwrap_or_default();
+    let lock_content =
+        lpm_common::read_text_file_capped(&lock_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .unwrap_or_default();
     // Local directory source manifests participate in freshness. Empty
     // bytes for projects without local-source deps preserve the common
     // no-local-source path.
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
-    let current_hash = compute_install_hash_v9(
+    let current_hash = compute_install_hash_v10(
         pkg_content,
         &lock_content,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
         &platform,
-        dependency_engine_key,
+        hash_context,
     );
 
     // Validate that package.json parses into the typed PackageJson struct —
@@ -924,8 +1014,8 @@ fn try_mtime_fast_path(
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: ObjectIntegrityPolicy,
     platform: &PlatformTuple,
-    dependency_engine_key: &str,
     store_version: lpm_store::StoreVersion,
+    context: InstallHashContext<'_>,
 ) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
@@ -1007,13 +1097,18 @@ fn try_mtime_fast_path(
         return None;
     }
 
+    let source_analysis_line = lines.next()?;
+    if source_analysis_line.strip_prefix("a:")? != context.security_analysis_policy.as_str() {
+        return None;
+    }
+
     match lines.next() {
         Some(engine_line) => {
-            if engine_line.strip_prefix("e:")? != dependency_engine_key {
+            if engine_line.strip_prefix("e:")? != context.dependency_engine_key {
                 return None;
             }
         }
-        None if dependency_engine_key == "none" => {}
+        None if context.dependency_engine_key == "none" => {}
         None => return None,
     }
 
@@ -1218,6 +1313,7 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
         InstallHashWriteMetadata {
             node_runtime_fingerprint,
             binary_sidecar_expectation,
+            security_analysis_policy: SecurityAnalysisPolicy::Enabled,
         },
     )
 }
@@ -1225,6 +1321,7 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
 pub(crate) struct KnownInstallHashRuntimeState<'a> {
     pub(crate) node_runtime_fingerprint: Option<&'a str>,
     pub(crate) binary_sidecar_required: bool,
+    pub(crate) security_analysis_policy: SecurityAnalysisPolicy,
 }
 
 pub(crate) fn write_install_hash_with_known_runtime_state(
@@ -1251,6 +1348,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state(
         InstallHashWriteMetadata {
             node_runtime_fingerprint: runtime_state.node_runtime_fingerprint,
             binary_sidecar_expectation: Some(expectation),
+            security_analysis_policy: runtime_state.security_analysis_policy,
         },
     )
 }
@@ -1258,6 +1356,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state(
 struct InstallHashWriteMetadata<'a> {
     node_runtime_fingerprint: Option<&'a str>,
     binary_sidecar_expectation: Option<BinarySidecarExpectation>,
+    security_analysis_policy: SecurityAnalysisPolicy,
 }
 
 fn write_install_hash_with_metadata(
@@ -1286,9 +1385,10 @@ fn write_install_hash_with_metadata(
     let linker_str = linker_mode.as_str();
     let integrity_policy_str = object_integrity_policy.as_str();
     let platform_str = platform_tuple_key(platform);
+    let security_analysis_str = metadata.security_analysis_policy.as_str();
     let node_runtime_fingerprint = metadata.node_runtime_fingerprint.unwrap_or("none");
     let mut content = format!(
-        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\n"
+        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\n"
     );
     match metadata.binary_sidecar_expectation {
         Some(BinarySidecarExpectation::Required) => content.push_str("b:required\n"),
@@ -1912,8 +2012,8 @@ mod tests {
     #[test]
     fn write_install_hash_records_all_fast_path_metadata() {
         // Contract: file content is hash + mtime line + linker line + integrity line +
-        // platform line + dependency-engine line + runtime fingerprint line +
-        // binary-sidecar expectation line.
+        // platform line + source-analysis line + dependency-engine line +
+        // runtime fingerprint line + binary-sidecar expectation line.
         // Pins the on-disk format so a v1 reader still gets the hash on
         // line 1 (legacy compat), AND the mtime fast-path can detect
         // post-install config and platform flips without recomputing the full hash.
@@ -1953,6 +2053,7 @@ mod tests {
             platform_line.starts_with("p:"),
             "expected platform line, got {platform_line:?}"
         );
+        assert_eq!(lines.next(), Some("a:enabled"));
         assert_eq!(lines.next(), Some("e:none"));
         assert_eq!(lines.next(), Some("n:none"));
         assert_eq!(lines.next(), Some("b:required"));
@@ -2235,6 +2336,34 @@ mod tests {
     }
 
     #[test]
+    fn source_analysis_policy_folds_into_install_hash() {
+        let platform = PlatformTuple::current();
+        let enabled = compute_install_hash_v10(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            InstallHashContext::default(),
+        );
+        let disabled = compute_install_hash_v10(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            InstallHashContext {
+                dependency_engine_key: "none",
+                security_analysis_policy: SecurityAnalysisPolicy::Disabled,
+            },
+        );
+
+        assert_ne!(enabled, disabled);
+    }
+
+    #[test]
     fn platform_tuple_folds_into_install_hash() {
         let glibc = PlatformTuple::new("linux", "x64", Some("glibc".into()));
         let musl = PlatformTuple::new("linux", "x64", Some("musl".into()));
@@ -2283,8 +2412,8 @@ mod tests {
             lpm_linker::LinkerMode::Isolated,
             ObjectIntegrityPolicy::Source,
             &platform,
-            "none",
             lpm_store::StoreVersion::V2,
+            InstallHashContext::default(),
         );
         assert!(
             same.is_some_and(|s| s.up_to_date),
@@ -2297,8 +2426,8 @@ mod tests {
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
             &platform,
-            "none",
             lpm_store::StoreVersion::V2,
+            InstallHashContext::default(),
         );
         assert!(
             flipped.is_none(),
@@ -2331,8 +2460,8 @@ mod tests {
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
             &PlatformTuple::current(),
-            "none",
             lpm_store::StoreVersion::V2,
+            InstallHashContext::default(),
         );
         assert!(
             fast.is_none(),
@@ -2366,8 +2495,11 @@ mod tests {
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
             &platform,
-            "1:20.0.0",
             lpm_store::StoreVersion::V2,
+            InstallHashContext {
+                dependency_engine_key: "1:20.0.0",
+                security_analysis_policy: SecurityAnalysisPolicy::Enabled,
+            },
         );
 
         assert!(fast.is_none());

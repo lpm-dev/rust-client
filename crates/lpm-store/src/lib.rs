@@ -27,6 +27,7 @@ mod extraction;
 mod gc;
 mod integrity;
 mod layout;
+mod security_analysis;
 mod store;
 mod timings;
 mod version;
@@ -44,6 +45,7 @@ pub use gc::{GcPreview, GcResult};
 pub use integrity::{
     compute_sri_hash, compute_sri_hash_sha1, compute_sri_hash_sha256, read_stored_integrity,
 };
+pub use security_analysis::SecurityAnalysisPolicy;
 pub use store::PackageStore;
 pub use timings::StageTimings;
 pub use version::StoreVersion;

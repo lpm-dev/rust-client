@@ -117,7 +117,7 @@ pub struct OversizedSourceFileEvidence {
     pub minified_filename: bool,
 }
 
-/// Analyze a package directory for all 22 behavioral tags.
+/// Analyze a package directory for behavioral tags.
 ///
 /// Walks the directory, filters by file extension, reads source files,
 /// strips comments, and runs all tag detectors. Returns a complete
@@ -126,6 +126,21 @@ pub struct OversizedSourceFileEvidence {
 /// Respects per-file (2MB) and per-package (50MB) size limits.
 /// Skips `.min.js` files for source tag analysis (but flags `minified: true`).
 pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
+    analyze_package_with_timings(package_dir).0
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Timing attribution produced alongside a package analysis.
+pub struct PackageAnalysisTimings {
+    /// Nanoseconds spent discovering and scanning source files.
+    pub source_scan_ns: u128,
+}
+
+/// Analyze a package and return source-scan timing attribution.
+pub fn analyze_package_with_timings(
+    package_dir: &Path,
+) -> (PackageAnalysis, PackageAnalysisTimings) {
+    let source_scan_start = std::time::Instant::now();
     // Walk source files
     let source_files = collect_source_files(package_dir);
 
@@ -136,6 +151,7 @@ pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     } else {
         analyze_files_sequential(package_dir, &source_files)
     };
+    let source_scan_ns = source_scan_start.elapsed().as_nanos();
 
     // Set trivial tag at package level (< 10 lines across ALL source files)
     let mut supply_chain_tags = file_result.supply_chain;
@@ -157,14 +173,17 @@ pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     // Build timestamp
     let analyzed_at = chrono::Utc::now().to_rfc3339();
 
-    PackageAnalysis {
-        version: SCHEMA_VERSION,
-        analyzed_at,
-        source: file_result.source,
-        supply_chain: supply_chain_tags,
-        manifest: manifest_tags,
-        meta,
-    }
+    (
+        PackageAnalysis {
+            version: SCHEMA_VERSION,
+            analyzed_at,
+            source: file_result.source,
+            supply_chain: supply_chain_tags,
+            manifest: manifest_tags,
+            meta,
+        },
+        PackageAnalysisTimings { source_scan_ns },
+    )
 }
 
 /// Intermediate result from scanning a single file. Public so the
@@ -687,6 +706,7 @@ pub struct PackageAnalyzer {
     files_scanned: usize,
     bytes_scanned: u64,
     limit_reached: bool,
+    source_scan_ns: u128,
 }
 
 impl PackageAnalyzer {
@@ -763,6 +783,7 @@ impl PackageAnalyzer {
             .unwrap_or_default();
 
         if bytes.len() as u64 > MAX_FILE_SIZE {
+            let scan_start = std::time::Instant::now();
             let sample = oversized_source_sample_from_bytes(bytes);
             let mut comment_buf = Vec::new();
             let result = analyze_oversized_source_sample(
@@ -772,6 +793,9 @@ impl PackageAnalyzer {
                 &mut comment_buf,
             );
             merge_with_limits(self, result);
+            self.source_scan_ns = self
+                .source_scan_ns
+                .saturating_add(scan_start.elapsed().as_nanos());
             return;
         }
 
@@ -780,8 +804,12 @@ impl PackageAnalyzer {
             return;
         }
 
+        let scan_start = std::time::Instant::now();
         let result = analyze_bytes(&filename, bytes);
         self.merge(result);
+        self.source_scan_ns = self
+            .source_scan_ns
+            .saturating_add(scan_start.elapsed().as_nanos());
     }
 
     /// Sample an oversized source file from disk after extraction.
@@ -794,10 +822,14 @@ impl PackageAnalyzer {
         if !Self::should_scan(relative_path, size) || size <= MAX_FILE_SIZE {
             return;
         }
+        let scan_start = std::time::Instant::now();
         let mut comment_buf = Vec::new();
         let result =
             analyze_oversized_source_file(relative_path, full_path, size, &mut comment_buf);
         merge_with_limits(self, result);
+        self.source_scan_ns = self
+            .source_scan_ns
+            .saturating_add(scan_start.elapsed().as_nanos());
     }
 
     /// Record an "oversized minified" file without reading its bytes.
@@ -811,9 +843,18 @@ impl PackageAnalyzer {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         if supply_chain::is_minified_filename(&filename) {
+            let scan_start = std::time::Instant::now();
             let result = oversized_minified_result(relative_path, size);
             merge_with_limits(self, result);
+            self.source_scan_ns = self
+                .source_scan_ns
+                .saturating_add(scan_start.elapsed().as_nanos());
         }
+    }
+
+    /// Return the accumulated time spent running source detectors.
+    pub fn source_scan_ns(&self) -> u128 {
+        self.source_scan_ns
     }
 
     fn merge(&mut self, result: FileAnalysisResult) {
@@ -902,6 +943,30 @@ pub fn write_cached_analysis(
     let path = package_dir.join(".lpm-security.json");
     let json = serde_json::to_string_pretty(analysis).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)
+}
+
+/// Atomically replace `.lpm-security.json` in an already-published package
+/// directory.
+pub fn write_cached_analysis_atomic(
+    package_dir: &Path,
+    analysis: &PackageAnalysis,
+) -> Result<(), std::io::Error> {
+    let path = package_dir.join(".lpm-security.json");
+    let json = serde_json::to_string_pretty(analysis).map_err(std::io::Error::other)?;
+    lpm_common::write_file_atomic(&path, json)
+}
+
+/// Backfill a missing, malformed, or outdated analysis cache.
+///
+/// Returns `true` when a new cache was written and `false` when the existing
+/// cache already uses the current schema.
+pub fn backfill_cached_analysis(package_dir: &Path) -> Result<bool, std::io::Error> {
+    if read_cached_analysis(package_dir).is_some() {
+        return Ok(false);
+    }
+    let analysis = analyze_package(package_dir);
+    write_cached_analysis_atomic(package_dir, &analysis)?;
+    Ok(true)
 }
 
 /// Analyze a package directory, using cache if available.
@@ -1279,6 +1344,44 @@ mod tests {
 		.unwrap();
 
         assert!(read_cached_analysis(dir.path()).is_none());
+    }
+
+    #[test]
+    fn backfill_cached_analysis_replaces_malformed_cache_with_current_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[
+                ("package.json", r#"{"name":"test","license":"MIT"}"#),
+                ("index.js", "eval('code')"),
+            ],
+        );
+        fs::write(dir.path().join(".lpm-security.json"), "{not-json").unwrap();
+
+        assert!(backfill_cached_analysis(dir.path()).unwrap());
+        let cached = read_cached_analysis(dir.path()).unwrap();
+        assert_eq!(cached.version, SCHEMA_VERSION);
+        assert!(cached.source.eval);
+    }
+
+    #[test]
+    fn backfill_cached_analysis_preserves_current_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[
+                ("package.json", r#"{"name":"test","license":"MIT"}"#),
+                ("index.js", "eval('code')"),
+            ],
+        );
+        let analysis = analyze_package(dir.path());
+        write_cached_analysis(dir.path(), &analysis).unwrap();
+        let cache_path = dir.path().join(".lpm-security.json");
+        let before = fs::read(&cache_path).unwrap();
+        fs::write(dir.path().join("index.js"), "module.exports = 42").unwrap();
+
+        assert!(!backfill_cached_analysis(dir.path()).unwrap());
+        assert_eq!(fs::read(cache_path).unwrap(), before);
     }
 
     #[test]

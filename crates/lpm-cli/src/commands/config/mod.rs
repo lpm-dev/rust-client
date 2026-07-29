@@ -6,10 +6,12 @@ mod wizards;
 mod tests;
 
 use crate::install_ui;
+use crate::lpm_insights_config::FETCH_LPM_SECURITY_INSIGHTS_KEY;
 use crate::lpm_skills_config::{AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY};
 use crate::npm_firewall_config::{FIREWALL_CONFIG_SECTION, NpmFirewallMode};
 use crate::prompt::prompt_err;
 use crate::sandbox_config::ResolvedSandboxMode;
+use crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY;
 use lpm_common::{LpmError, LpmRoot};
 use std::io::IsTerminal;
 
@@ -32,14 +34,15 @@ use wizards::{
     format_current_release_age, format_current_typosquat_guard, parse_config_bool,
     parse_firewall_mode_selection, parse_integrity_policy_selection,
     parse_typosquat_guard_selection, persist_firewall_mode_in_config_value,
-    read_auto_install_lpm_skills, read_bool_value, read_firewall_mode, read_integrity_policy,
+    read_auto_install_lpm_skills, read_bool_value, read_fetch_lpm_security_insights,
+    read_firewall_mode, read_install_time_source_analysis, read_integrity_policy,
     read_release_age_override, read_release_age_policy_override, read_sandbox_mode,
     read_sigstore_availability, read_sigstore_scope, read_sigstore_verify, read_string_value,
     read_typosquat_guard_override, reject_looser_typosquat_guard_write, run_firewall_wizard,
-    run_integrity_wizard, run_lpm_skills_wizard, run_release_age_policy_wizard,
-    run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard,
-    run_sigstore_wizard, run_triage_wizard, run_trust_policy_wizard, run_typosquat_wizard,
-    validate_trust_policy_value,
+    run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard, run_lpm_skills_wizard,
+    run_release_age_policy_wizard, run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard,
+    run_signatures_wizard, run_sigstore_wizard, run_source_analysis_wizard, run_triage_wizard,
+    run_trust_policy_wizard, run_typosquat_wizard, validate_trust_policy_value,
 };
 
 /// CLI configuration management.
@@ -50,7 +53,7 @@ use wizards::{
 /// Bare `lpm config` opens a guided editor that routes into the focused
 /// wizards below. The direct forms stay available for scripts and deep links.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, twelve focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
@@ -71,8 +74,13 @@ use wizards::{
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
 /// - `lpm config lpm-skills` owns `auto-install-lpm-skills = true | false`
 ///   for package-published skills from `@lpm.dev/*` packages.
+/// - `lpm config source-analysis` owns
+///   `install-time-source-analysis = true | false`.
+/// - `lpm config lpm-insights` owns
+///   `fetch-lpm-security-insights = true | false`.
+/// - `lpm config lpm-dev` groups the two LPM.dev preferences.
 ///
-/// All twelve default to interactive in a TTY; `--set <value>` is the
+/// Focused settings default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: Option<&str>,
@@ -122,6 +130,15 @@ pub async fn run(
     }
     if action == "lpm-skills" {
         return run_lpm_skills_wizard(&config_path, set, json_output).await;
+    }
+    if action == "lpm-dev" {
+        return run_lpm_dev_wizard(&config_path, set, json_output).await;
+    }
+    if action == "lpm-insights" {
+        return run_lpm_insights_wizard(&config_path, set, json_output).await;
+    }
+    if action == "source-analysis" {
+        return run_source_analysis_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -187,9 +204,18 @@ pub async fn run(
                         &format!("lpm config set {key} {}", requested.as_str()),
                     )?;
                 }
-                SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY => {
+                SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY | FETCH_LPM_SECURITY_INSIGHTS_KEY => {
                     parse_config_bool(value)
                         .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
+                }
+                INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
+                    let requested = parse_config_bool(value)
+                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
+                    crate::security_approval::authorize_persistent_install_time_source_analysis(
+                        requested,
+                        json_output,
+                        &format!("lpm config set {key} {value}"),
+                    )?;
                 }
                 TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
                 INTEGRITY_KEY => {
@@ -234,7 +260,13 @@ pub async fn run(
                     table.remove(key);
                 } else {
                     let value =
-                        if matches!(key, SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY) {
+                        if matches!(
+                            key,
+                            SIGNATURES_KEY
+                                | AUTO_INSTALL_LPM_SKILLS_KEY
+                                | FETCH_LPM_SECURITY_INSIGHTS_KEY
+                                | INSTALL_TIME_SOURCE_ANALYSIS_KEY
+                        ) {
                             toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
                                 LpmError::Registry(format!("`{key}` {message}"))
                             })?)
@@ -262,7 +294,13 @@ pub async fn run(
             }
             write_config(&config_path, &config)?;
             if json_output {
-                let value = if matches!(key, SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY) {
+                let value = if matches!(
+                    key,
+                    SIGNATURES_KEY
+                        | AUTO_INSTALL_LPM_SKILLS_KEY
+                        | FETCH_LPM_SECURITY_INSIGHTS_KEY
+                        | INSTALL_TIME_SOURCE_ANALYSIS_KEY
+                ) {
                     serde_json::Value::Bool(
                         parse_config_bool(value)
                             .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?,
@@ -356,6 +394,13 @@ pub async fn run(
                         &format!("lpm config delete {key}"),
                     )?;
                 }
+                INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
+                    crate::security_approval::authorize_persistent_install_time_source_analysis(
+                        true,
+                        json_output,
+                        &format!("lpm config delete {key}"),
+                    )?;
+                }
                 _ => {}
             }
             let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
@@ -404,7 +449,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, lpm-skills"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, source-analysis, lpm-dev, lpm-skills, lpm-insights"
             )));
         }
     }
@@ -498,9 +543,17 @@ async fn run_guided_config_menu(
                 format!("current: {}", summary.release_age_policy),
             )
             .item(
-                "lpm-skills",
-                "LPM.dev package skills",
-                format!("current: {}", summary.lpm_skills),
+                "source-analysis",
+                "Install-time source analysis",
+                format!("current: {}", summary.source_analysis),
+            )
+            .item(
+                "lpm-dev",
+                "LPM.dev settings",
+                format!(
+                    "skills={}, insights={}",
+                    summary.lpm_skills, summary.lpm_insights
+                ),
             )
             .item("done", "Done", "exit")
             .interact()
@@ -521,7 +574,8 @@ async fn run_guided_config_menu(
             "integrity" => run_integrity_wizard(config_path, None, false).await?,
             "release-age" => run_release_age_wizard(config_path, None, false).await?,
             "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
-            "lpm-skills" => run_lpm_skills_wizard(config_path, None, false).await?,
+            "source-analysis" => run_source_analysis_wizard(config_path, None, false).await?,
+            "lpm-dev" => run_lpm_dev_wizard(config_path, None, false).await?,
             "done" => return Ok(()),
             _ => unreachable!("guided config select returned unexpected setting"),
         }
@@ -558,7 +612,9 @@ struct GuidedConfigSummary {
     integrity_mode: String,
     release_age: String,
     release_age_policy: String,
+    source_analysis: &'static str,
     lpm_skills: &'static str,
+    lpm_insights: &'static str,
 }
 
 fn read_guided_config_summary(
@@ -599,6 +655,8 @@ fn read_guided_config_summary(
             .unwrap_or_default()
             .as_str()
             .to_string(),
+        source_analysis: format_bool_enabled(read_install_time_source_analysis(config_path)?),
         lpm_skills: format_current_lpm_skills(read_auto_install_lpm_skills(config_path)?),
+        lpm_insights: format_bool_enabled(read_fetch_lpm_security_insights(config_path)?),
     })
 }

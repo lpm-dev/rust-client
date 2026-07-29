@@ -5,7 +5,8 @@ use clap::{Args, Subcommand};
 pub(crate) struct ConfigArgs {
     /// Action: get, set, delete, list, scripts, triage, sandbox,
     /// sigstore, signatures, trust-policy, typosquat, firewall, integrity,
-    /// release-age, release-age-policy, lpm-skills.
+    /// release-age, release-age-policy, source-analysis, lpm-dev,
+    /// lpm-skills, lpm-insights.
     /// Omit to open the guided configuration editor.
     pub(crate) action: Option<String>,
     /// Config key (for get/set/delete).
@@ -15,7 +16,8 @@ pub(crate) struct ConfigArgs {
     /// Non-interactive value for the `scripts` / `triage` /
     /// `sandbox` / `sigstore` / `signatures` / `trust-policy` /
     /// `typosquat` / `firewall` / `integrity` / `release-age` /
-    /// `release-age-policy` / `lpm-skills` wizards. Required when stdin
+    /// `release-age-policy` / `source-analysis` / `lpm-skills` /
+    /// `lpm-insights` wizards. Required when stdin
     /// is not a TTY. Examples:
     ///   `lpm config scripts --set triage`
     ///   `lpm config triage --set claude-cli`
@@ -31,6 +33,8 @@ pub(crate) struct ConfigArgs {
     ///   `lpm config release-age --set 3d`
     ///   `lpm config release-age-policy --set strict`
     ///   `lpm config lpm-skills --set false`
+    ///   `lpm config source-analysis --set true`
+    ///   `lpm config lpm-insights --set false`
     #[arg(long = "set", value_name = "VALUE")]
     pub(crate) set: Option<String>,
 }

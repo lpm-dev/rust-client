@@ -1,12 +1,14 @@
 mod common;
 mod firewall;
 mod integrity;
+mod lpm_dev;
 mod lpm_skills;
 mod release_age;
 mod sandbox;
 mod scripts;
 mod signatures;
 mod sigstore;
+mod source_analysis;
 mod triage;
 mod trust_policy;
 mod typosquat;
@@ -58,6 +60,9 @@ pub(in crate::commands::config) use integrity::{
 pub(in crate::commands::config) use integrity::{
     INTEGRITY_SOURCE_HINT, INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT,
 };
+pub(in crate::commands::config) use lpm_dev::{
+    read_fetch_lpm_security_insights, run_lpm_dev_wizard, run_lpm_insights_wizard,
+};
 pub(in crate::commands::config) use lpm_skills::{
     format_current_lpm_skills, read_auto_install_lpm_skills, run_lpm_skills_wizard,
 };
@@ -79,6 +84,9 @@ pub(in crate::commands::config) use signatures::run_signatures_wizard;
 pub(in crate::commands::config) use sigstore::{
     SIGSTORE_AVAILABILITY_VALUES, SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES,
     read_sigstore_availability, read_sigstore_scope, read_sigstore_verify, run_sigstore_wizard,
+};
+pub(in crate::commands::config) use source_analysis::{
+    read_install_time_source_analysis, run_source_analysis_wizard,
 };
 pub(in crate::commands::config) use triage::run_triage_wizard;
 pub(crate) use trust_policy::TRUST_POLICY_KEY;

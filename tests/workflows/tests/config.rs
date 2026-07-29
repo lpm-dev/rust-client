@@ -135,6 +135,79 @@ fn generic_config_set_lpm_skills_rejects_non_boolean_values() {
 }
 
 #[test]
+fn config_lpm_insights_set_false_persists_boolean_json_contract() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-insights","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "lpm-insights", "--set", "false"])
+        .output()
+        .expect("failed to run lpm config lpm-insights --set false");
+
+    assert!(
+        output.status.success(),
+        "lpm config lpm-insights --set false failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "fetch-lpm-security-insights": false
+    }
+    "###);
+    let content = std::fs::read_to_string(config_path(&project)).unwrap();
+    assert!(content.contains("fetch-lpm-security-insights = false"));
+}
+
+#[test]
+fn config_source_analysis_set_true_persists_default_security_posture() {
+    let project = TempProject::empty(r#"{"name":"config-source-analysis","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "source-analysis", "--set", "true"])
+        .output()
+        .expect("failed to run lpm config source-analysis --set true");
+
+    assert!(
+        output.status.success(),
+        "lpm config source-analysis --set true failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "install-time-source-analysis": true
+    }
+    "###);
+    let content = std::fs::read_to_string(config_path(&project)).unwrap();
+    assert!(content.contains("install-time-source-analysis = true"));
+}
+
+#[test]
+fn config_source_analysis_disable_requires_security_approval_in_json_mode() {
+    let project = TempProject::empty(r#"{"name":"config-source-analysis","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "source-analysis", "--set", "false"])
+        .output()
+        .expect("failed to run guarded source-analysis setter");
+
+    let envelope = assertions::assert_security_approval_required(&output);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes
+                .iter()
+                .any(|scope| scope.as_str() == Some("source-analysis-disable"))),
+        "guarded disable must request source-analysis-disable, got:\n{envelope}"
+    );
+    assert!(!config_path(&project).exists());
+}
+
+#[test]
 fn config_set_writes_value_into_isolated_home() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
 

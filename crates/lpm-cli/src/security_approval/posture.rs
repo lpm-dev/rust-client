@@ -49,6 +49,10 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
             posture.firewall_mode = firewall_mode.as_str().to_string();
             sources.firewall_mode = PostureSourceKind::ManagedPolicy;
         }
+        if let Some(install_time_source_analysis) = policy.install_time_source_analysis {
+            posture.install_time_source_analysis = install_time_source_analysis;
+            sources.install_time_source_analysis = PostureSourceKind::ManagedPolicy;
+        }
     }
 
     Ok(EffectiveAuthorizedPosture {
@@ -114,6 +118,15 @@ fn active_runtime_overrides(
             control: crate::npm_firewall_config::FIREWALL_CONFIG_PATH.to_string(),
             value: request_firewall.mode().as_str().to_string(),
             source: request_firewall.source_label().to_string(),
+        });
+    }
+    let requested_source_analysis =
+        crate::source_analysis_config::read_install_time_source_analysis(&global)?;
+    if requested_source_analysis != effective.posture.install_time_source_analysis() {
+        overrides.push(RuntimeOverride {
+            control: crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY.to_string(),
+            value: requested_source_analysis.to_string(),
+            source: "~/.lpm/config.toml install-time-source-analysis".to_string(),
         });
     }
     Ok(overrides)

@@ -76,13 +76,26 @@ pub(super) fn link_target_lookup_key(name: &str, version: &str) -> String {
 }
 
 pub(super) fn local_source_sri_for_target(target: &LinkTarget) -> String {
-    let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
+    local_source_sri(
+        &target.name,
+        &target.version,
+        target.wrapper_id.as_deref(),
+        &target.store_path,
+    )
+}
+
+pub(super) fn local_source_sri(
+    name: &str,
+    version: &str,
+    wrapper_id: Option<&str>,
+    store_path: &Path,
+) -> String {
     let seed = format!(
         "lpm-v2-local-source\0{}\0{}\0{}\0{}",
-        target.name,
-        target.version,
-        wrapper_id,
-        target.store_path.display()
+        name,
+        version,
+        wrapper_id.unwrap_or(""),
+        store_path.display()
     );
     lpm_store::compute_sri_hash(seed.as_bytes())
 }

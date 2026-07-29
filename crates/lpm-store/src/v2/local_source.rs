@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::SecurityAnalysisPolicy;
 use lpm_common::LpmError;
 
 use super::fs_util::{create_fs_symlink, ensure_store_tier_dir_locked, tmp_sibling};
@@ -122,11 +123,14 @@ pub(crate) fn populate_local_source_object_into(
     source_root: &Path,
     tmp_dir: &Path,
     sri: &str,
+    security_analysis_policy: SecurityAnalysisPolicy,
 ) -> Result<(), LpmError> {
     walk_local_source_object(source_root, source_root, tmp_dir, 0)?;
-    let analysis = lpm_security::behavioral::analyze_package(tmp_dir);
-    if let Err(e) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis) {
-        tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
+    if security_analysis_policy.is_enabled() {
+        let analysis = lpm_security::behavioral::analyze_package(tmp_dir);
+        if let Err(e) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis) {
+            tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
+        }
     }
 
     write_tree_object_integrity(tmp_dir)?;

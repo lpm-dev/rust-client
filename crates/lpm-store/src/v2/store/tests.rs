@@ -2560,6 +2560,7 @@ fn extract_object_from_bytes_emits_zero_timings_on_hot_path() {
     let (_, _, timings_hot) = store.extract_object_from_bytes(&tarball, None).unwrap();
     assert_eq!(timings_hot.extract_ms, 0);
     assert_eq!(timings_hot.security_ms, 0);
+    assert_eq!(timings_hot.source_scan_ns, 0);
     assert_eq!(timings_hot.finalize_ms, 0);
     assert_eq!(timings_hot.finalize_permit_wait_ms, 0);
     assert_eq!(timings_hot.finalize_tree_integrity_ms, 0);
@@ -2570,6 +2571,76 @@ fn extract_object_from_bytes_emits_zero_timings_on_hot_path() {
     assert_eq!(timings_hot.dir_count, 0);
     assert_eq!(timings_hot.symlink_count, 0);
     assert_eq!(timings_hot.unpacked_bytes, 0);
+}
+
+#[test]
+fn disabled_source_analysis_skips_fresh_v2_cache_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        crate::SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"unscanned\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"eval('code')"),
+    ]);
+
+    let (path, _, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+
+    assert!(!path.join(".lpm-security.json").exists());
+    assert!(path.join(".integrity").exists());
+}
+
+#[test]
+fn enabled_v2_reuse_backfills_missing_analysis_without_reextracting() {
+    let dir = tempfile::tempdir().unwrap();
+    let disabled = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        crate::SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"backfill\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"eval('code')"),
+    ]);
+    let (path, sri, _) = disabled.extract_object_from_bytes(&tarball, None).unwrap();
+    assert!(!path.join(".lpm-security.json").exists());
+
+    let enabled = Store::at(dir.path());
+    let reused = enabled.reusable_object(&sri).unwrap().unwrap();
+
+    assert_eq!(reused.path, path);
+    assert!(
+        lpm_security::behavioral::read_cached_analysis(&reused.path)
+            .unwrap()
+            .source
+            .eval
+    );
+}
+
+#[test]
+fn v2_fused_extraction_reports_precise_source_scan_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = "eval('code'); const fs = require('fs');\n".repeat(10_000);
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"timed\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", source.as_bytes()),
+    ]);
+
+    let (_, _, timings) = store.extract_object_from_bytes(&tarball, None).unwrap();
+
+    assert!(timings.source_scan_ns > 0);
 }
 
 #[test]
@@ -2768,7 +2839,7 @@ fn find_link_package_dir_locates_populated_entry() {
 
 /// `populate_object_from_v1` copies an extracted v1 package dir
 /// into a v2 object dir atomically, preserving package contents
-/// and `.lpm-security.json` if present.
+/// and a current `.lpm-security.json` cache.
 #[test]
 fn populate_object_from_v1_copies_extracted_package_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -2789,7 +2860,9 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     std::fs::write(v1_pkg_dir.join("index.js"), b"module.exports = 42;").unwrap();
     std::fs::create_dir_all(v1_pkg_dir.join("src")).unwrap();
     std::fs::write(v1_pkg_dir.join("src/inner.js"), b"// inner").unwrap();
-    std::fs::write(v1_pkg_dir.join(".lpm-security.json"), b"{\"tags\":[]}").unwrap();
+    let analysis = lpm_security::behavioral::analyze_package(&v1_pkg_dir);
+    lpm_security::behavioral::write_cached_analysis(&v1_pkg_dir, &analysis).unwrap();
+    let expected_security_cache = std::fs::read(v1_pkg_dir.join(".lpm-security.json")).unwrap();
     std::fs::write(v1_pkg_dir.join(".integrity"), b"sha512-stale").unwrap();
 
     let sri = synthetic_sri(b"populate_object_from_v1");
@@ -2808,10 +2881,10 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
         std::fs::read(object_dir.join("src/inner.js")).unwrap(),
         b"// inner"
     );
-    // `.lpm-security.json` preserved (skips re-analysis).
+    // Current `.lpm-security.json` preserved (skips re-analysis).
     assert_eq!(
         std::fs::read(object_dir.join(".lpm-security.json")).unwrap(),
-        b"{\"tags\":[]}"
+        expected_security_cache
     );
     // `.integrity` rewritten to the caller-supplied SRI rather
     // than v1's stale value.
@@ -2848,6 +2921,55 @@ fn populate_object_from_v1_runs_analysis_when_security_cache_missing() {
         object_dir.join(".lpm-security.json").is_file(),
         "translation must regenerate security cache when v1 didn't ship one"
     );
+}
+
+#[test]
+fn populate_object_from_v1_refreshes_outdated_security_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let v1_pkg_dir = dir.path().join("fake-v1/pkg-outdated-cache/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"outdated-cache\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    std::fs::write(v1_pkg_dir.join("index.js"), b"eval('code')").unwrap();
+    std::fs::write(
+        v1_pkg_dir.join(".lpm-security.json"),
+        br#"{"version":0,"analyzedAt":"2026-01-01T00:00:00Z","source":{},"supplyChain":{},"manifest":{},"meta":{}}"#,
+    )
+    .unwrap();
+
+    let sri = synthetic_sri(b"populate_object_from_v1_outdated_cache");
+    let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
+    let analysis = lpm_security::behavioral::read_cached_analysis(&object_dir).unwrap();
+
+    assert_eq!(analysis.version, lpm_security::behavioral::SCHEMA_VERSION);
+    assert!(analysis.source.eval);
+}
+
+#[test]
+fn disabled_populate_object_from_v1_leaves_missing_security_cache_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        crate::SecurityAnalysisPolicy::Disabled,
+    );
+    let v1_pkg_dir = dir.path().join("fake-v1/pkg-disabled/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"disabled\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    std::fs::write(v1_pkg_dir.join("index.js"), b"eval('code')").unwrap();
+
+    let sri = synthetic_sri(b"populate_object_from_v1_disabled");
+    let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
+
+    assert!(!object_dir.join(".lpm-security.json").exists());
 }
 
 #[test]

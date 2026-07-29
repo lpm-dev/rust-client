@@ -100,7 +100,9 @@ fn guided_config_summary_uses_product_defaults_when_unset() {
             integrity_mode: "source".to_string(),
             release_age: "default (1d)".to_string(),
             release_age_policy: "direct".to_string(),
+            source_analysis: "enabled",
             lpm_skills: "enabled (default)",
+            lpm_insights: "enabled",
         }
     );
 }
@@ -120,6 +122,8 @@ integrity = "tree"
 minimum-release-age-secs = "259200"
 release-age-policy = "strict"
 auto-install-lpm-skills = false
+fetch-lpm-security-insights = false
+install-time-source-analysis = false
 
 [sandbox]
 mode = "strict"
@@ -153,7 +157,9 @@ mode = "enforce"
             integrity_mode: "tree".to_string(),
             release_age: "3d".to_string(),
             release_age_policy: "strict".to_string(),
+            source_analysis: "disabled",
             lpm_skills: "disabled",
+            lpm_insights: "disabled",
         }
     );
 }
@@ -1115,6 +1121,17 @@ fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
     let err = guard_generic_set_against_force_floor(&config, "force-security-floor", "false")
         .unwrap_err();
     assert_eq!(err.error_code(), "security_floor");
+}
+
+#[test]
+fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_force_floor() {
+    let config: toml::Value = toml::from_str("force-security-floor = true\n").unwrap();
+    let err =
+        guard_generic_set_against_force_floor(&config, INSTALL_TIME_SOURCE_ANALYSIS_KEY, " FALSE ")
+            .unwrap_err();
+
+    assert_eq!(err.error_code(), "security_floor");
+    assert!(err.to_string().contains(INSTALL_TIME_SOURCE_ANALYSIS_KEY));
 }
 
 #[test]
