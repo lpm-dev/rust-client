@@ -1378,16 +1378,16 @@ fn get_password_from_keychain_account_with_interaction_notice(
 
 fn resolve_keychain_credential(
     probe: KeychainCredentialProbe,
-    notice: impl FnOnce(),
-    interactive_retry: impl FnOnce() -> Option<String>,
+    _notice: impl FnOnce(),
+    _interactive_retry: impl FnOnce() -> Option<String>,
     fallback: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
     match probe {
         KeychainCredentialProbe::Found(token) => Some(token),
         #[cfg(any(target_os = "macos", test))]
         KeychainCredentialProbe::InteractionRequired => {
-            notice();
-            interactive_retry().or_else(fallback)
+            _notice();
+            _interactive_retry().or_else(fallback)
         }
         KeychainCredentialProbe::NotFound | KeychainCredentialProbe::Failed => fallback(),
     }
