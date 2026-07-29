@@ -452,6 +452,7 @@ function extractLpmMetrics(json) {
     lpmMetadataMetrics(json);
   const fetchBreakdown = at(json, ['timing', 'fetch_breakdown']);
   const fetchOverlap = at(json, ['timing', 'detail', 'fetch', 'overlap']);
+  const fetchOverlapBreakdown = fetchOverlap?.breakdown;
   const firewall =
     at(json, ['timing', 'firewall']) ?? at(json, ['timing', 'detail', 'security', 'firewall']);
   const firewallClient = firewall?.client;
@@ -472,6 +473,14 @@ function extractLpmMetrics(json) {
     metadataAttribution?.version_count_sum,
   );
   const releaseTimeFetch = metadataAttribution?.policy_release_time_fetch;
+  const fetchSourceScanSumNs = sumFinite(
+    breakdownStat(fetchBreakdown, 'source_scan', 'sum_ns'),
+    breakdownStat(fetchOverlapBreakdown, 'source_scan', 'sum_ns'),
+  );
+  const fetchSourceScanMaxNs = maxFinite(
+    breakdownStat(fetchBreakdown, 'source_scan', 'max_ns'),
+    breakdownStat(fetchOverlapBreakdown, 'source_scan', 'max_ns'),
+  );
 
   return {
     duration_ms: numberAt(json, ['duration_ms']),
@@ -578,9 +587,9 @@ function extractLpmMetrics(json) {
     fetch_task_max_ms: numberAt(json, ['timing', 'fetch_breakdown', 'task_max_ms']),
     fetch_queue_wait_sum_ms: breakdownStat(fetchBreakdown, 'queue_wait', 'sum_ms'),
     fetch_extract_sum_ms: breakdownStat(fetchBreakdown, 'extract', 'sum_ms'),
-    fetch_source_scan_sum_ns: breakdownStat(fetchBreakdown, 'source_scan', 'sum_ns'),
-    fetch_source_scan_max_ns: breakdownStat(fetchBreakdown, 'source_scan', 'max_ns'),
-    fetch_source_scan_sum_ms: nsToMs(breakdownStat(fetchBreakdown, 'source_scan', 'sum_ns')),
+    fetch_source_scan_sum_ns: fetchSourceScanSumNs,
+    fetch_source_scan_max_ns: fetchSourceScanMaxNs,
+    fetch_source_scan_sum_ms: nsToMs(fetchSourceScanSumNs),
     fetch_finalize_sum_ms: breakdownStat(fetchBreakdown, 'finalize', 'sum_ms'),
     fetch_overlap_selected_count: finiteNumber(fetchOverlap?.selected_count),
     fetch_overlap_dispatched_count: finiteNumber(fetchOverlap?.dispatched_count),
@@ -682,6 +691,30 @@ function firstFinite(...values) {
     }
   }
   return undefined;
+}
+
+function sumFinite(...values) {
+  let total = 0;
+  let found = false;
+  for (const value of values) {
+    const number = finiteNumber(value);
+    if (number !== undefined) {
+      total += number;
+      found = true;
+    }
+  }
+  return found ? total : undefined;
+}
+
+function maxFinite(...values) {
+  let maximum;
+  for (const value of values) {
+    const number = finiteNumber(value);
+    if (number !== undefined) {
+      maximum = maximum === undefined ? number : Math.max(maximum, number);
+    }
+  }
+  return maximum;
 }
 
 function buildRunSpecs(managers, cells, routes, firewallModes) {
@@ -1747,6 +1780,12 @@ function runSelfTests() {
             },
             task_sum_ms: 19,
             task_max_ms: 7,
+            breakdown: {
+              source_scan: {
+                sum_ns: 8_500_000,
+                max_ns: 4_250_000,
+              },
+            },
             drain_ms: 2,
           },
         },
@@ -1810,9 +1849,17 @@ function runSelfTests() {
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_walk_ms, 23);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_manifests_fetched, 11);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_cache_hits, 7);
-  assert.equal(currentMetadataMetrics.fetch_source_scan_sum_ns, 12_500_000);
-  assert.equal(currentMetadataMetrics.fetch_source_scan_max_ns, 3_750_000);
-  assert.equal(currentMetadataMetrics.fetch_source_scan_sum_ms, 12.5);
+  assert.equal(
+    currentMetadataMetrics.fetch_source_scan_sum_ns,
+    21_000_000,
+    'source scan sum must include authoritative and overlap fetch tasks',
+  );
+  assert.equal(
+    currentMetadataMetrics.fetch_source_scan_max_ns,
+    4_250_000,
+    'source scan max must include authoritative and overlap fetch tasks',
+  );
+  assert.equal(currentMetadataMetrics.fetch_source_scan_sum_ms, 21);
   assert.equal(currentMetadataMetrics.firewall_batch_ms, 31);
   assert.equal(currentMetadataMetrics.firewall_checked_count, 10);
   assert.equal(currentMetadataMetrics.firewall_warn_count, 1);
@@ -1855,6 +1902,32 @@ function runSelfTests() {
   assert.equal(currentMetadataMetrics.fetch_overlap_buffer_wait_max_ms, 11);
   assert.equal(currentMetadataMetrics.fetch_overlap_task_sum_ms, 19);
   assert.equal(currentMetadataMetrics.fetch_overlap_drain_ms, 2);
+
+  const overlapOnlySourceScanMetrics = extractLpmMetrics({
+    timing: {
+      fetch_breakdown: {
+        source_scan: {
+          sum_ns: 0,
+          max_ns: 0,
+        },
+      },
+      detail: {
+        fetch: {
+          overlap: {
+            breakdown: {
+              source_scan: {
+                sum_ns: 9_000_000,
+                max_ns: 7_000_000,
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(overlapOnlySourceScanMetrics.fetch_source_scan_sum_ns, 9_000_000);
+  assert.equal(overlapOnlySourceScanMetrics.fetch_source_scan_max_ns, 7_000_000);
+  assert.equal(overlapOnlySourceScanMetrics.fetch_source_scan_sum_ms, 9);
 
   const experimentalMetadataMetrics = extractLpmMetrics({
     timing: {
