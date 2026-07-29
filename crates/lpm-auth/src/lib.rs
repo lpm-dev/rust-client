@@ -70,6 +70,7 @@ const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 enum KeychainCredentialProbe {
     Found(String),
     NotFound,
+    #[cfg(any(target_os = "macos", test))]
     InteractionRequired,
     Failed,
 }
@@ -1383,6 +1384,7 @@ fn resolve_keychain_credential(
 ) -> Option<String> {
     match probe {
         KeychainCredentialProbe::Found(token) => Some(token),
+        #[cfg(any(target_os = "macos", test))]
         KeychainCredentialProbe::InteractionRequired => {
             notice();
             interactive_retry().or_else(fallback)
