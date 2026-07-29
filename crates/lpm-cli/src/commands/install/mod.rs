@@ -1512,25 +1512,23 @@ async fn run_with_options_under_store_lock(
                     lpm_common::sanitize_terminal_inline(&warning.message)
                 );
             }
-
-            // Security summary for ALL packages (client-side analysis + registry enrichment)
-            if !no_security_summary {
-                let all_packages: Vec<(String, String, bool)> = packages
-                    .iter()
-                    .map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
-                    .collect();
-                // Use the same injected client for the security summary so
-                // auth handling matches the quality check above.
-                crate::security_check::post_install_security_summary(
-                    client,
-                    &store,
-                    &all_packages,
-                    json_output,
-                    false, // not quiet — show Medium tier too
-                )
-                .await;
-            }
         }
+    }
+
+    if !json_output && !reserve_stdout && !no_security_summary {
+        let all_packages: Vec<(String, String, bool)> = packages
+            .iter()
+            .map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
+            .collect();
+        crate::security_check::post_install_security_summary(
+            client,
+            lpm_root,
+            baseline_index.as_ref(),
+            &all_packages,
+            false,
+            false, // not quiet — show Medium tier too
+        )
+        .await;
     }
 
     // Step 8: Auto-install skills for direct LPM packages

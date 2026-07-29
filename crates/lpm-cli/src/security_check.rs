@@ -15,7 +15,7 @@
 use crate::install_ui;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
-use lpm_store::PackageStore;
+use lpm_store::V2BaselineIndex;
 use std::collections::{HashMap, HashSet};
 
 /// Severity tier for the post-install summary.
@@ -47,7 +47,8 @@ enum SecuritySummaryLine {
 /// tags, vulnerabilities, AI findings, and lifecycle scripts.
 pub async fn post_install_security_summary(
     client: &RegistryClient,
-    store: &PackageStore,
+    lpm_root: &lpm_common::LpmRoot,
+    baseline_index: Option<&V2BaselineIndex>,
     packages: &[(String, String, bool)], // (name, version, is_lpm)
     json_output: bool,
     quiet: bool,
@@ -58,20 +59,34 @@ pub async fn post_install_security_summary(
 
     // ── Client-side analysis (all packages) ──────────
 
+    let empty_baseline_index = V2BaselineIndex::default();
+    let baseline_index = baseline_index.unwrap_or(&empty_baseline_index);
     let show_progress = !json_output && packages.len() > 50;
     if show_progress {
-        install_ui::phase_untrusted(&format!("Analyzing {} packages", packages.len()));
+        install_ui::phase_untrusted(&format!(
+            "Checking cached security results for {} packages",
+            packages.len()
+        ));
     }
 
     let mut tag_counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
 
     for (i, (name, version, _is_lpm)) in packages.iter().enumerate() {
         if show_progress && i % 50 == 0 && i > 0 {
-            install_ui::phase_untrusted(&format!("Analyzed {i}/{} packages", packages.len()));
+            install_ui::phase_untrusted(&format!(
+                "Checked cached security results for {i}/{} packages",
+                packages.len()
+            ));
         }
 
-        let pkg_dir = store.package_dir(name, version);
-        let analysis = match behavioral::read_cached_analysis(&pkg_dir) {
+        let analysis = match lpm_store::find_installed_package_baseline_indexed(
+            baseline_index,
+            lpm_root,
+            name,
+            version,
+        )
+        .and_then(|baseline| behavioral::read_cached_analysis(&baseline.pristine_dir))
+        {
             Some(a) => a,
             None => continue,
         };
@@ -81,7 +96,10 @@ pub async fn post_install_security_summary(
     }
 
     if show_progress {
-        install_ui::done_untrusted(&format!("Analyzed {} packages", packages.len()));
+        install_ui::done_untrusted(&format!(
+            "Checked cached security results for {} packages",
+            packages.len()
+        ));
     }
 
     // ── Registry-side enrichment (@lpm.dev only) ─────

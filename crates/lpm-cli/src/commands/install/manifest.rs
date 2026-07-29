@@ -1160,6 +1160,7 @@ pub async fn run_add_packages(
         maybe_test_panic("after-finalize");
 
         cleanup_unused_catalogs_after_install(project_dir)?;
+        reconcile_finalized_add_install_state(project_dir)?;
 
         // 6. All steps succeeded — commit the transaction so the manifest
         // edits persist.
@@ -1654,6 +1655,9 @@ pub async fn run_install_filtered_add(
         }
 
         cleanup_unused_catalogs_after_install(&workspace_root_for_config)?;
+        for install_root in &member_install_roots {
+            reconcile_finalized_add_install_state(install_root)?;
+        }
 
         // All members succeeded — persist every staged + finalized manifest.
         tx.commit();
@@ -1668,4 +1672,57 @@ pub async fn run_install_filtered_add(
     js_result
     })
     .await
+}
+
+fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmError> {
+    let package_json_path = project_dir.join("package.json");
+    let package_json = lpm_common::read_text_file_capped(
+        &package_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read finalized {}: {e}",
+            package_json_path.display(),
+        ))
+    })?;
+    let package: lpm_workspace::PackageJson = serde_json::from_str(&package_json).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to parse finalized {}: {e}",
+            package_json_path.display(),
+        ))
+    })?;
+
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to read {} after finalizing package.json: {e}",
+            lockfile_path.display(),
+        ))
+    })?;
+    let importer = lockfile.importers.entry(".".to_string()).or_default();
+    let dependencies = package.dependencies.into_iter().collect();
+    let dev_dependencies = package.dev_dependencies.into_iter().collect();
+    let optional_dependencies = package.optional_dependencies.into_iter().collect();
+    let peer_dependencies = package.peer_dependencies.into_iter().collect();
+    let importer_changed = importer.dependencies != dependencies
+        || importer.dev_dependencies != dev_dependencies
+        || importer.optional_dependencies != optional_dependencies
+        || importer.peer_dependencies != peer_dependencies;
+
+    if !importer_changed {
+        return Ok(());
+    }
+
+    importer.dependencies = dependencies;
+    importer.dev_dependencies = dev_dependencies;
+    importer.optional_dependencies = optional_dependencies;
+    importer.peer_dependencies = peer_dependencies;
+    lockfile.write_all(&lockfile_path).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to reconcile {} with finalized package.json: {e}",
+            lockfile_path.display(),
+        ))
+    })?;
+    super::state::refresh_post_install_hash_after_manifest_finalize(project_dir)
 }

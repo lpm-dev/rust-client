@@ -6,19 +6,49 @@ pub(super) fn write_post_install_hash(
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
-    let pkg = lpm_common::read_text_file_capped(
-        &project_dir.join("package.json"),
+    let lock = lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.lock"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .unwrap_or_default();
-    let lock = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
-    let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
-    let platform = lpm_store::v2::PlatformTuple::current();
     let dependency_engine_key = dependency_engine_policy.freshness_key(&lock);
     let node_runtime_fingerprint = match dependency_engine_key.as_str() {
         "none" | "legacy" => None,
         _ => dependency_engine_policy.resolved_node_runtime_fingerprint(),
     };
+    if let Err(e) = write_post_install_hash_with_context(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        &dependency_engine_key,
+        node_runtime_fingerprint,
+    ) {
+        tracing::warn!(
+            "failed to write `.lpm/install-hash` after install ({e}) — \
+             the next freshness check will fall through to the slow path"
+        );
+    }
+}
+
+fn write_post_install_hash_with_context(
+    project_dir: &Path,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    dependency_engine_key: &str,
+    node_runtime_fingerprint: Option<&str>,
+) -> std::io::Result<()> {
+    let pkg = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .unwrap_or_default();
+    let lock = lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.lock"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .unwrap_or_default();
+    let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
+    let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v9(
         &pkg,
         &lock,
@@ -26,30 +56,97 @@ pub(super) fn write_post_install_hash(
         linker_mode,
         object_integrity_policy,
         &platform,
-        &dependency_engine_key,
+        dependency_engine_key,
     );
     // Lockfile writeback has already created a supported sidecar or removed an
     // unsupported one, so existence records the exact completed install state.
     let binary_sidecar_required = project_dir
         .join(lpm_lockfile::BINARY_LOCKFILE_NAME)
         .exists();
-    if let Err(e) = crate::install_state::write_install_hash_with_known_runtime_state(
+    crate::install_state::write_install_hash_with_known_runtime_state(
         project_dir,
         &hash,
         linker_mode,
         object_integrity_policy,
         &platform,
-        &dependency_engine_key,
+        dependency_engine_key,
         crate::install_state::KnownInstallHashRuntimeState {
             node_runtime_fingerprint,
             binary_sidecar_required,
         },
-    ) {
-        tracing::warn!(
-            "failed to write `.lpm/install-hash` after install ({e}) — \
-             the next freshness check will fall through to the slow path"
-        );
-    }
+    )
+}
+
+pub(super) fn refresh_post_install_hash_after_manifest_finalize(
+    project_dir: &Path,
+) -> Result<(), LpmError> {
+    let state_path = project_dir.join(".lpm").join("install-hash");
+    let content =
+        lpm_common::read_text_file_capped(&state_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Registry(format!(
+                    "failed to read {} after finalizing package.json: {e}",
+                    state_path.display(),
+                ))
+            })?;
+    let mut lines = content.lines();
+    let _stored_hash = lines.next();
+    let _stored_mtimes = lines.next();
+    let linker_mode = lines
+        .next()
+        .and_then(|line| line.strip_prefix("l:"))
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} is missing its linker mode",
+                state_path.display(),
+            ))
+        })
+        .and_then(|value| {
+            lpm_linker::LinkerMode::parse_str(value).map_err(|e| {
+                LpmError::Registry(format!(
+                    "{} contains an invalid linker mode: {e}",
+                    state_path.display(),
+                ))
+            })
+        })?;
+    let object_integrity_policy = lines
+        .next()
+        .and_then(|line| line.strip_prefix("i:"))
+        .and_then(lpm_store::v2::ObjectIntegrityPolicy::parse)
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} contains an invalid object integrity policy",
+                state_path.display(),
+            ))
+        })?;
+    let _stored_platform = lines.next();
+    let dependency_engine_key = lines
+        .next()
+        .and_then(|line| line.strip_prefix("e:"))
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} is missing its dependency engine state",
+                state_path.display(),
+            ))
+        })?;
+    let node_runtime_fingerprint = lines
+        .next()
+        .and_then(|line| line.strip_prefix("n:"))
+        .filter(|value| *value != "none");
+
+    write_post_install_hash_with_context(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        dependency_engine_key,
+        node_runtime_fingerprint,
+    )
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to refresh {} after finalizing package.json: {e}",
+            state_path.display(),
+        ))
+    })
 }
 
 pub(super) struct InstallFreshnessInput<'a> {
