@@ -1,0 +1,30 @@
+---
+source: tests/workflows/tests/install.rs
+expression: dispatcher_contract
+---
+{
+  "summary": {
+    "rpc_count": "[COUNT]",
+    "configured_fanout": "[COUNT]",
+    "inflight_high_water": "[COUNT]",
+    "active_fetch_high_water": "[COUNT]",
+    "pending_high_water": "[COUNT]",
+    "semaphore_wait_count": "[COUNT]",
+    "semaphore_wait_ms": "[DURATION]",
+    "parked_max_depth": "[COUNT]",
+    "tarball_dispatched": "[COUNT]",
+    "peer_prefetch_count": "[COUNT]"
+  },
+  "detail": {
+    "rpc_count": "[COUNT]",
+    "configured_fanout": "[COUNT]",
+    "inflight_high_water": "[COUNT]",
+    "active_fetch_high_water": "[COUNT]",
+    "pending_high_water": "[COUNT]",
+    "semaphore_wait_count": "[COUNT]",
+    "semaphore_wait_ms": "[DURATION]",
+    "parked_max_depth": "[COUNT]",
+    "tarball_dispatched": "[COUNT]",
+    "peer_prefetch_count": "[COUNT]"
+  }
+}

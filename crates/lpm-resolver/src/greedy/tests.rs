@@ -3511,6 +3511,69 @@ async fn fusion_terminates_on_empty_deps() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PACKAGE_COUNT: usize = 6;
+    const FANOUT: usize = 2;
+
+    let server = MockServer::start().await;
+    let mut deps = HashMap::with_capacity(PACKAGE_COUNT);
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("fanout-{index}");
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(50))
+                    .set_body_json(metadata_json(&name, &[])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        deps.insert(name, "^1.0.0".to_string());
+    }
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let result = resolve_greedy_fused(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        FANOUT,
+        None,
+        true,
+    )
+    .await
+    .expect("direct metadata fanout fixture should resolve");
+
+    assert!(
+        result.stage_timing.dispatcher_inflight_high_water <= FANOUT as u64,
+        "active metadata fetch high-water {} exceeded configured fanout {FANOUT}",
+        result.stage_timing.dispatcher_inflight_high_water,
+    );
+    assert_eq!(
+        result.stage_timing.dispatcher_configured_fanout,
+        FANOUT as u64
+    );
+    assert_eq!(result.stage_timing.dispatcher_inflight_high_water, 2);
+    assert_eq!(
+        result.stage_timing.dispatcher_pending_high_water,
+        PACKAGE_COUNT as u64
+    );
+    assert_eq!(
+        result.stage_timing.dispatcher_semaphore_wait_count,
+        (PACKAGE_COUNT - FANOUT) as u64
+    );
+    assert!(result.stage_timing.dispatcher_semaphore_wait_ns > 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_auto_installs_peer_when_sparse_cache_omits_empty_dependency_entry() {
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
 
@@ -3751,6 +3814,10 @@ async fn fusion_pre_batches_worker_routed_npm_root_deps() {
     assert_eq!(
         result.stage_timing.dispatcher_rpc_count, 1,
         "Worker-routed npm root metadata should batch into one dispatcher RPC"
+    );
+    assert_eq!(
+        result.stage_timing.dispatcher_pending_high_water, 2,
+        "both Worker-routed root metadata requests should count as pending"
     );
 }
 
@@ -4215,6 +4282,10 @@ async fn fusion_streaming_worker_batch_streams_follow_up_tail_batch() {
     assert!(names.contains("proxy-tail-stream-a"));
     assert!(names.contains("proxy-tail-stream-b"));
     assert_eq!(result.stage_timing.dispatcher_rpc_count, 2);
+    assert_eq!(
+        result.stage_timing.dispatcher_pending_high_water, 2,
+        "both requests in the streaming Worker tail batch should count as pending"
+    );
 
     server.await.unwrap();
 }
@@ -4329,6 +4400,10 @@ async fn fusion_batches_worker_routed_tail_misses_after_root_batch() {
     assert_eq!(
         result.stage_timing.dispatcher_rpc_count, 2,
         "root batch plus one tail batch should replace two per-package tail fetches"
+    );
+    assert_eq!(
+        result.stage_timing.dispatcher_pending_high_water, 2,
+        "both requests in the synchronous Worker tail batch should count as pending"
     );
 }
 

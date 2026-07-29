@@ -1227,7 +1227,12 @@ pub(super) fn resolve_detail_json(
             "escape_hatch_rpc_count": stage.escape_hatch_rpc_count,
             "dispatcher": {
                 "rpc_count": stage.dispatcher_rpc_count,
+                "configured_fanout": stage.dispatcher_configured_fanout,
                 "inflight_high_water": stage.dispatcher_inflight_high_water,
+                "active_fetch_high_water": stage.dispatcher_inflight_high_water,
+                "pending_high_water": stage.dispatcher_pending_high_water,
+                "semaphore_wait_count": stage.dispatcher_semaphore_wait_count,
+                "semaphore_wait_ms": stage.dispatcher_semaphore_wait_ns as f64 / 1_000_000.0,
                 "parked_max_depth": stage.parked_max_depth,
                 "tarball_dispatched": stage.tarball_dispatched_count,
                 "peer_prefetch_count": stage.peer_prefetch_count,

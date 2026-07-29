@@ -62,6 +62,7 @@ It provides:
 - round-robin interleaving by sample to reduce live-network bias
 - configurable sample count, fixtures, package managers, lpm routes, lpm firewall modes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
+- median, p95, maximum, IQR, and MAD distributions with material tail warnings
 - expected/unexpected warning classification for known noisy installs
 - top-package sweeps from a package-name file with offset/limit chunking
 
@@ -172,15 +173,16 @@ Fixture names built in today:
 - `nest`
 - `vite-react`
 - `vitepress`
+- `vitepress-workspace`
 - `native-sharp`
 
 The harness also accepts `name=/path/to/project` and `pkg:<name>@<version>`
 fixtures for focused checks and top-package sweeps.
 
-`vitepress` prefers `bench/fixtures/vitepress-docs`, a tracked manifest-only
-fixture derived from the VitePress 1.5.0 repository. If that fixture is absent,
-the harness checks the local real-world audit cache and then falls back to a
-generated VitePress install fixture.
+`vitepress` is a generated consumer of the published `vitepress@1.5.0`
+package. `vitepress-workspace` explicitly selects
+`bench/fixtures/vitepress-docs`, the tracked workspace-source fixture used for
+workspace compatibility checks.
 
 For production-default decisions, keep competitor and firewall-enabled runs as
 reference snapshots. Legacy proxy routes remain available for focused routing

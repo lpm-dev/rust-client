@@ -36,10 +36,6 @@ const BUILTIN_FIXTURES = new Map([
   [
     'vitepress',
     {
-      pathCandidates: [
-        'bench/fixtures/vitepress-docs',
-        'bench/realworld-audit/.cache/vitepress-docs',
-      ],
       packageJson: {
         name: 'readiness-vitepress-install',
         version: '1.0.0',
@@ -52,9 +48,16 @@ const BUILTIN_FIXTURES = new Map([
       },
     },
   ],
+  [
+    'vitepress-workspace',
+    {
+      path: 'bench/fixtures/vitepress-docs',
+    },
+  ],
 ]);
 
 const DEFAULT_FIXTURES = ['dogfood', 'nest', 'vitepress'];
+const TAIL_METRICS = ['wall_ms', 'resolve_ms', 'fetch_ms', 'link_ms'];
 const DEFAULT_MANAGERS = ['lpm'];
 const DEFAULT_MODES = ['cold'];
 const DEFAULT_LPM_ROUTES = ['direct'];
@@ -574,7 +577,16 @@ function extractLpmMetrics(json) {
     resolve_pubgrub_ms: finiteNumber(resolveDetail?.pubgrub_ms),
     resolve_platform_skipped_count: finiteNumber(resolveDetail?.platform_skipped),
     resolve_dispatcher_rpc_count: finiteNumber(resolveDispatcher?.rpc_count),
+    resolve_dispatcher_configured_fanout: finiteNumber(resolveDispatcher?.configured_fanout),
     resolve_dispatcher_inflight_high_water: finiteNumber(resolveDispatcher?.inflight_high_water),
+    resolve_dispatcher_active_fetch_high_water: finiteNumber(
+      resolveDispatcher?.active_fetch_high_water,
+    ),
+    resolve_dispatcher_pending_high_water: finiteNumber(resolveDispatcher?.pending_high_water),
+    resolve_dispatcher_semaphore_wait_count: finiteNumber(
+      resolveDispatcher?.semaphore_wait_count,
+    ),
+    resolve_dispatcher_semaphore_wait_ms: finiteNumber(resolveDispatcher?.semaphore_wait_ms),
     resolve_dispatcher_tarball_dispatched_count: finiteNumber(resolveDispatcher?.tarball_dispatched),
     resolve_dispatcher_peer_prefetch_count: finiteNumber(resolveDispatcher?.peer_prefetch_count),
     resolve_streaming_bfs_walk_ms: finiteNumber(streamingBfs?.walk_ms),
@@ -869,6 +881,7 @@ function summarize(rows) {
     const [fixture, spec, mode] = key.split('\0');
     const successful = groupRows.filter((row) => row.exit_code === 0 && !row.parse_error);
     const first = groupRows[0];
+    const metrics = summarizeMetrics(successful);
     out.push({
       fixture,
       manager: first.manager,
@@ -879,7 +892,8 @@ function summarize(rows) {
       mode,
       samples: groupRows.length,
       successful_samples: successful.length,
-      metrics: summarizeMetrics(successful),
+      metrics,
+      tail_warnings: summarizeTailWarnings(metrics),
     });
   }
   out.sort((a, b) =>
@@ -944,7 +958,12 @@ function summarizeMetrics(rows) {
     'resolve_pubgrub_ms',
     'resolve_platform_skipped_count',
     'resolve_dispatcher_rpc_count',
+    'resolve_dispatcher_configured_fanout',
     'resolve_dispatcher_inflight_high_water',
+    'resolve_dispatcher_active_fetch_high_water',
+    'resolve_dispatcher_pending_high_water',
+    'resolve_dispatcher_semaphore_wait_count',
+    'resolve_dispatcher_semaphore_wait_ms',
     'resolve_dispatcher_tarball_dispatched_count',
     'resolve_dispatcher_peer_prefetch_count',
     'resolve_streaming_bfs_walk_ms',
@@ -1012,14 +1031,49 @@ function summarizeMetrics(rows) {
   ];
   return Object.fromEntries(
     keys
-      .map((key) => [key, medianMin(rows, key)])
+      .map((key) => [key, metricDistribution(rows, key)])
       .filter(([, value]) => value != null),
   );
 }
 
+function summarizeTailWarnings(metrics) {
+  const warnings = [];
+  for (const metric of TAIL_METRICS) {
+    const distribution = metrics[metric];
+    if (!distribution || distribution.median <= 0) {
+      continue;
+    }
+    const reasons = [];
+    if (
+      distribution.p95 - distribution.median >= 25 &&
+      distribution.p95 >= distribution.median * 1.5
+    ) {
+      reasons.push('p95');
+    }
+    if (
+      distribution.max - distribution.median >= 50 &&
+      distribution.max >= distribution.median * 2
+    ) {
+      reasons.push('max');
+    }
+    if (reasons.length > 0) {
+      warnings.push({
+        metric,
+        median: distribution.median,
+        p95: distribution.p95,
+        max: distribution.max,
+        p95_to_median: roundDistributionValue(distribution.p95 / distribution.median),
+        max_to_median: roundDistributionValue(distribution.max / distribution.median),
+        reasons,
+      });
+    }
+  }
+  return warnings;
+}
+
 function renderSummaryMarkdown(summary) {
   const lines = [
-    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Firewall med/min | FW chunks | FW chunk sum | FW chunk max | Fetch med/min | Link med/min | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
+    '| Fixture | Spec | Mode | OK | Wall med/p95/max | Resolve med/p95/max | Firewall med/min | FW chunks | FW chunk sum | FW chunk max | Fetch med/p95/max | Link med/p95/max | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
     '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const row of summary) {
@@ -1041,8 +1095,25 @@ function renderSummaryMarkdown(summary) {
       ? `${one(m.firewall_warn_count)}/${one(m.firewall_block_count)}/${one(m.firewall_unknown_count)}`
       : 'n/a';
     lines.push(
-      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${one(m.firewall_chunk_count)} | ${stat(m.firewall_chunk_sum_ms)} | ${stat(m.firewall_chunk_max_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
+      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${tailStat(m.wall_ms)} | ${tailStat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${one(m.firewall_chunk_count)} | ${stat(m.firewall_chunk_sum_ms)} | ${stat(m.firewall_chunk_max_ms)} | ${tailStat(m.fetch_ms)} | ${tailStat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
     );
+  }
+  const tailWarnings = summary.flatMap((row) =>
+    (row.tail_warnings ?? []).map((warning) => ({ row, warning })),
+  );
+  if (tailWarnings.length > 0) {
+    lines.push(
+      '',
+      '## Tail latency warnings',
+      '',
+      '| Fixture | Spec | Mode | Metric | Median | p95 | Max | p95/med | max/med | Trigger |',
+      '| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |',
+    );
+    for (const { row, warning } of tailWarnings) {
+      lines.push(
+        `| ${row.fixture} | ${row.spec} | ${row.mode} | ${warning.metric} | ${warning.median} | ${warning.p95} | ${warning.max} | ${warning.p95_to_median}× | ${warning.max_to_median}× | ${warning.reasons.join(', ')} |`,
+      );
+    }
   }
   return lines.join('\n');
 }
@@ -1614,6 +1685,31 @@ function isWarningLikeLine(line) {
 function runSelfTests() {
   assert.deepEqual(parseModes('cold,warm,up-to-date'), ['cold', 'warm', 'up-to-date']);
   assert.throws(() => parseModes('repeat'), /unsupported mode/);
+  const tailSummary = summarize([
+    { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 100 },
+    { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 110 },
+    { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 120 },
+    { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 130 },
+    { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 500 },
+  ]);
+  assert.equal(tailSummary[0]?.metrics.wall_ms.p95, 426);
+  assert.equal(tailSummary[0]?.metrics.wall_ms.max, 500);
+  assert.equal(tailSummary[0]?.metrics.wall_ms.iqr, 20);
+  assert.equal(tailSummary[0]?.metrics.wall_ms.mad, 10);
+  assert.equal(tailSummary[0]?.tail_warnings[0]?.metric, 'wall_ms');
+  assert.match(renderSummaryMarkdown(tailSummary), /Tail latency warnings/);
+  const [vitepressFixture] = parseFixtures('vitepress');
+  assert.equal(
+    vitepressFixture.source.kind,
+    'generated',
+    'the default VitePress benchmark must exercise the published package graph',
+  );
+  const [vitepressWorkspaceFixture] = parseFixtures('vitepress-workspace');
+  assert.equal(
+    vitepressWorkspaceFixture.source.kind,
+    'path',
+    'the checked-out VitePress workspace must remain available under an explicit fixture name',
+  );
   const npmrcFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lpm-readiness-self-test-'));
   try {
     const sourceDir = path.join(npmrcFixtureRoot, 'source');
@@ -1746,7 +1842,12 @@ function runSelfTests() {
         platform_skipped: 4,
         dispatcher: {
           rpc_count: 6,
+          configured_fanout: 32,
           inflight_high_water: 2,
+          active_fetch_high_water: 2,
+          pending_high_water: 7,
+          semaphore_wait_count: 3,
+          semaphore_wait_ms: 14.5,
           tarball_dispatched: 8,
           peer_prefetch_count: 1,
         },
@@ -1843,7 +1944,12 @@ function runSelfTests() {
   assert.equal(currentMetadataMetrics.resolve_pubgrub_ms, 17);
   assert.equal(currentMetadataMetrics.resolve_platform_skipped_count, 4);
   assert.equal(currentMetadataMetrics.resolve_dispatcher_rpc_count, 6);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_configured_fanout, 32);
   assert.equal(currentMetadataMetrics.resolve_dispatcher_inflight_high_water, 2);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_active_fetch_high_water, 2);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_pending_high_water, 7);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_semaphore_wait_count, 3);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_semaphore_wait_ms, 14.5);
   assert.equal(currentMetadataMetrics.resolve_dispatcher_tarball_dispatched_count, 8);
   assert.equal(currentMetadataMetrics.resolve_dispatcher_peer_prefetch_count, 1);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_walk_ms, 23);
@@ -1965,7 +2071,7 @@ function stripAnsi(value) {
   return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
 }
 
-function medianMin(rows, key) {
+function metricDistribution(rows, key) {
   const values = rows
     .map((row) => row[key])
     .filter((value) => typeof value === 'number' && Number.isFinite(value))
@@ -1973,13 +2079,36 @@ function medianMin(rows, key) {
   if (values.length === 0) {
     return null;
   }
+  const median = percentile(values, 0.5);
+  const deviations = values.map((value) => Math.abs(value - median)).sort((a, b) => a - b);
+  const q1 = percentile(values, 0.25);
+  const q3 = percentile(values, 0.75);
   return {
-    median:
-      values.length % 2 === 1
-        ? values[Math.floor(values.length / 2)]
-        : (values[values.length / 2 - 1] + values[values.length / 2]) / 2,
+    samples: values.length,
+    median,
     min: values[0],
+    p95: percentile(values, 0.95),
+    max: values[values.length - 1],
+    iqr: roundDistributionValue(q3 - q1),
+    mad: percentile(deviations, 0.5),
   };
+}
+
+function percentile(sortedValues, probability) {
+  const position = (sortedValues.length - 1) * probability;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) {
+    return sortedValues[lower];
+  }
+  const weight = position - lower;
+  return roundDistributionValue(
+    sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * weight,
+  );
+}
+
+function roundDistributionValue(value) {
+  return Number(value.toFixed(6));
 }
 
 function runFailed(row) {
@@ -1988,6 +2117,10 @@ function runFailed(row) {
 
 function stat(value) {
   return value ? `${value.median}/${value.min}` : 'n/a';
+}
+
+function tailStat(value) {
+  return value ? `${value.median}/${value.p95}/${value.max}` : 'n/a';
 }
 
 function formatMs(value) {

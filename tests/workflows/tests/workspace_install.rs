@@ -109,6 +109,51 @@ fn install_recursive_installs_workspace_root_and_every_member() {
 }
 
 #[test]
+fn recursive_install_resolves_workspace_protocol_to_named_root_package() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "vitepress",
+  "version": "1.5.0",
+  "private": true
+}"#,
+    );
+    project.write_file("pnpm-workspace.yaml", "packages:\n  - docs\n");
+    project.write_file(
+        "docs/package.json",
+        r#"{
+  "name": "docs",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "vitepress": "workspace:*"
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with a member depending on the workspace root");
+
+    assert_install_succeeded(
+        &output,
+        "workspace protocol should resolve a named workspace root",
+    );
+    let linked_manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("docs/node_modules/vitepress/package.json"))
+            .expect("linked workspace root should expose its package manifest");
+    assert_eq!(
+        (
+            linked_manifest["name"].as_str(),
+            linked_manifest["version"].as_str(),
+        ),
+        (Some("vitepress"), Some("1.5.0")),
+    );
+}
+
+#[test]
 fn recursive_short_flag_before_install_installs_the_workspace() {
     let project = workspace_project();
     let output = lpm(&project)

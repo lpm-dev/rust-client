@@ -271,14 +271,20 @@ pub struct StageTiming {
     /// escape_hatch_rpc_count` (modulo arm) is a sanity check on the
     /// instrumentation.
     pub dispatcher_rpc_count: u64,
-    /// Peak `metadata_jobs.len()` observed between queue-drain and
-    /// bounded-await steps of the fused dispatcher loop. Confirms the metadata
-    /// semaphore is the binding constraint when this approaches the
-    /// configured fanout; if it sits well below, the binding
-    /// constraint is something upstream (h2 single-connection flow
-    /// control, h1-pool socket count, or a serialization in
-    /// `process_edge`).
+    /// Configured permit count for direct metadata fetches in the fused
+    /// dispatcher. Zero on resolver arms that do not use this semaphore.
+    pub dispatcher_configured_fanout: u64,
+    /// Peak number of direct metadata fetches holding semaphore permits.
+    /// This value cannot exceed [`Self::dispatcher_configured_fanout`].
     pub dispatcher_inflight_high_water: u64,
+    /// Peak number of canonical metadata requests pending in the resolver
+    /// dispatcher, including direct jobs waiting for permits and Worker root
+    /// or tail batch candidates.
+    pub dispatcher_pending_high_water: u64,
+    /// Number of direct metadata jobs that had to wait for a semaphore permit.
+    pub dispatcher_semaphore_wait_count: u64,
+    /// Total direct metadata semaphore wait time in nanoseconds.
+    pub dispatcher_semaphore_wait_ns: u64,
     /// `max(parked.values().map(|v| v.len()))` over the
     /// life of the fused dispatcher loop. Catches pathological
     /// parking — e.g., every edge in the tree blocked on one slow

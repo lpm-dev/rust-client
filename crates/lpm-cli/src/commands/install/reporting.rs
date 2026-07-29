@@ -289,8 +289,19 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // the post-loop drain pass.
                            "dispatcher": {
                                "rpc_count": resolver_stage_timing.dispatcher_rpc_count,
+                               "configured_fanout":
+                                   resolver_stage_timing.dispatcher_configured_fanout,
                                "inflight_high_water":
                                    resolver_stage_timing.dispatcher_inflight_high_water,
+                               "active_fetch_high_water":
+                                   resolver_stage_timing.dispatcher_inflight_high_water,
+                               "pending_high_water":
+                                   resolver_stage_timing.dispatcher_pending_high_water,
+                               "semaphore_wait_count":
+                                   resolver_stage_timing.dispatcher_semaphore_wait_count,
+                               "semaphore_wait_ms":
+                                   resolver_stage_timing.dispatcher_semaphore_wait_ns as f64
+                                       / 1_000_000.0,
                                "parked_max_depth": resolver_stage_timing.parked_max_depth,
                                "tarball_dispatched":
                                    resolver_stage_timing.tarball_dispatched_count,
