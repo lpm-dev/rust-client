@@ -558,6 +558,18 @@ async fn run_with_options_under_store_lock(
         min_release_age_exclude,
         timing,
     })?;
+    let security_analysis_policy =
+        if crate::source_analysis_config::resolve_install_time_source_analysis(
+            &global_config,
+            project_dir,
+            json_output,
+        )? {
+            lpm_store::SecurityAnalysisPolicy::Enabled
+        } else {
+            lpm_store::SecurityAnalysisPolicy::Disabled
+        };
+    let fetch_lpm_security_insights =
+        crate::lpm_insights_config::read_fetch_lpm_security_insights(&global_config)?;
     let requested_v2_mode = store_version.is_v2();
     let no_skills = !lpm_skills_preference.resolve(&global_config)?;
     let mut slow_package_timings = SlowPackageTimings::default();
@@ -569,6 +581,7 @@ async fn run_with_options_under_store_lock(
         completed: freshness_completed,
     } = run_install_freshness_phase(InstallFreshnessInput {
         client,
+        lpm_root,
         project_dir,
         pkg_json_path: &pkg_json_path,
         lockfile_path: &lockfile_path,
@@ -582,6 +595,7 @@ async fn run_with_options_under_store_lock(
         strict_peer_dependencies,
         linker_mode,
         object_integrity_policy,
+        security_analysis_policy,
         dependency_engine_policy: dependency_engine_policy.as_ref(),
         store_version,
         compatibility_bin_names,
@@ -776,6 +790,7 @@ async fn run_with_options_under_store_lock(
             override_set: &override_set,
             linker_mode,
             object_integrity_policy,
+            security_analysis_policy,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
         })
         .await?;
@@ -839,6 +854,7 @@ async fn run_with_options_under_store_lock(
             production_dependency_names: &production_dependency_names,
             store_version,
             object_integrity_policy,
+            security_analysis_policy,
             lpm_root,
             json_output,
             verify_registry_signatures,
@@ -898,7 +914,8 @@ async fn run_with_options_under_store_lock(
     // tarballs into the real store during the resolve phase. Post-resolve,
     // the fetch loop rebinds to the same handle (cheap Arc-style clone
     // underneath).
-    let store = PackageStore::from_root(lpm_root);
+    let store =
+        PackageStore::from_root_with_security_analysis_policy(lpm_root, security_analysis_policy);
     // `lpm_root` stays in function scope so post-install helpers can reach
     // the v2 store via `find_installed_package_baseline`. Those helpers need
     // the actual install root to find v2-installed scripted packages for
@@ -911,9 +928,10 @@ async fn run_with_options_under_store_lock(
     // allocation-free.
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
         Some(std::sync::Arc::new(
-            lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+            lpm_store::v2::Store::from_lpm_root_with_policies(
                 lpm_root,
                 object_integrity_policy,
+                security_analysis_policy,
             ),
         ))
     } else {
@@ -1533,6 +1551,7 @@ async fn run_with_options_under_store_lock(
             &all_packages,
             false,
             false, // not quiet — show Medium tier too
+            fetch_lpm_security_insights,
         )
         .await;
     }
@@ -1796,6 +1815,7 @@ async fn run_with_options_under_store_lock(
         project_dir,
         linker_mode,
         object_integrity_policy,
+        security_analysis_policy,
         dependency_engine_policy.as_ref(),
     );
 

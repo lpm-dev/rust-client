@@ -15,9 +15,13 @@ pub struct StageTimings {
     /// Time in `extract_tarball_from_file` (gzip decompress + tar walk
     /// + write-to-disk into the staging temp dir).
     pub extract_ms: u128,
-    /// Time in `lpm_security::behavioral::analyze_package` plus the
-    /// `.lpm-security.json` cache write.
+    /// Post-extraction security finalization and cache-write time. On
+    /// two-pass extraction paths this also contains the source scan.
     pub security_ms: u128,
+    /// Source-analysis attribution. This is nested inside `extract_ms` on
+    /// fused paths and `security_ms` on two-pass paths, so it must not be
+    /// added to totals.
+    pub source_scan_ns: u128,
     /// Time in integrity write + atomic rename + any remaining store
     /// bookkeeping before the package becomes visible.
     pub finalize_ms: u128,

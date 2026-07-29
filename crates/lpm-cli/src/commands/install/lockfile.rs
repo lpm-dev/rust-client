@@ -444,6 +444,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) override_set: &'a OverrideSet,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
 }
 
@@ -466,6 +467,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         override_set,
         linker_mode,
         object_integrity_policy,
+        security_analysis_policy,
         dependency_engine_policy,
     } = input;
 
@@ -539,6 +541,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         project_dir,
         linker_mode,
         object_integrity_policy,
+        security_analysis_policy,
         dependency_engine_policy,
     );
     Ok(())
@@ -635,6 +638,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) production_dependency_names: &'a HashSet<String>,
     pub(super) store_version: lpm_store::StoreVersion,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) lpm_root: &'a lpm_common::LpmRoot,
     pub(super) json_output: bool,
     pub(super) verify_registry_signatures: bool,
@@ -687,6 +691,7 @@ pub(super) async fn run_offline_install_phase(
         production_dependency_names,
         store_version,
         object_integrity_policy,
+        security_analysis_policy,
         lpm_root,
         json_output,
         verify_registry_signatures,
@@ -808,12 +813,14 @@ pub(super) async fn run_offline_install_phase(
         ));
     }
 
-    let store = PackageStore::from_root(lpm_root);
+    let store =
+        PackageStore::from_root_with_security_analysis_policy(lpm_root, security_analysis_policy);
     let requested_v2_mode = store_version.is_v2();
     let store_v2 = requested_v2_mode.then(|| {
-        lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+        lpm_store::v2::Store::from_lpm_root_with_policies(
             lpm_root,
             object_integrity_policy,
+            security_analysis_policy,
         )
     });
     let mut missing = Vec::new();

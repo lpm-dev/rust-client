@@ -112,6 +112,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install readiness bench helper tests
+        run: node bench/scripts/run-install-readiness.mjs --self-test
+
       - name: npm wrapper tests
         run: npm --prefix npm/cli test
 

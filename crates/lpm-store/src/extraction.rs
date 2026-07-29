@@ -42,6 +42,7 @@ impl PackageStore {
         // Fast path: already stored
         if dir.exists() {
             if is_complete_package_dir(&dir) {
+                self.backfill_security_cache_if_enabled(&dir, label);
                 tracing::debug!("store hit: {label}");
                 return Ok(dir);
             }
@@ -96,15 +97,17 @@ impl PackageStore {
         // Done BEFORE the atomic rename so the analysis result is included
         // atomically — when the package dir becomes visible, the security
         // cache is already present. Analysis failure is non-fatal (warn only).
-        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
-        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-            tracing::warn!("failed to write .lpm-security.json for {label}: {e}");
-        } else {
-            tracing::debug!(
-                "security analysis: {label} — {} files scanned, {} bytes",
-                analysis.meta.files_scanned,
-                analysis.meta.bytes_scanned
-            );
+        if self.security_analysis_policy().is_enabled() {
+            let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
+            if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+                tracing::warn!("failed to write .lpm-security.json for {label}: {e}");
+            } else {
+                tracing::debug!(
+                    "security analysis: {label} — {} files scanned, {} bytes",
+                    analysis.meta.files_scanned,
+                    analysis.meta.bytes_scanned
+                );
+            }
         }
 
         // Atomic rename — if another thread already completed, rename fails (that's OK)
@@ -202,6 +205,7 @@ impl PackageStore {
         // Fast path: already stored.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
+                self.backfill_security_cache_if_enabled(&dir, &format!("{name}@{version}"));
                 tracing::debug!("store hit: {name}@{version}");
                 // We didn't actually touch the stream — caller must have
                 // pre-checked via `has_package()` to avoid wasted network.
@@ -281,6 +285,7 @@ impl PackageStore {
         // source files stream to disk first, then the inspector asks the
         // analyzer to read bounded head/tail samples from the written file.
         // Non-source files stream through unchanged.
+        let source_analysis_enabled = self.security_analysis_policy().is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
 
         // `&mut HashingReader` satisfies `impl Read` via the blanket impl
@@ -291,8 +296,14 @@ impl PackageStore {
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
             extractor_reader,
             &tmp_dir,
-            lpm_security::behavioral::PackageAnalyzer::should_buffer_source,
+            |path, size| {
+                source_analysis_enabled
+                    && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
+            },
             |entry| {
+                if !source_analysis_enabled {
+                    return;
+                }
                 if let Some(bytes) = entry.bytes {
                     analyzer.borrow_mut().feed(entry.relative_path, bytes);
                 } else {
@@ -366,12 +377,16 @@ impl PackageStore {
         // level tag analysis, merge dedup'd URL domains, compute the
         // package-level `trivial` tag, and serialize to
         // `.lpm-security.json`. Per-source-file bytes are not re-read.
-        let security_start = std::time::Instant::now();
-        let analysis = analyzer.into_inner().finalize(&tmp_dir);
-        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-            tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+        if source_analysis_enabled {
+            let security_start = std::time::Instant::now();
+            let analyzer = analyzer.into_inner();
+            timings.source_scan_ns = analyzer.source_scan_ns();
+            let analysis = analyzer.finalize(&tmp_dir);
+            if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+                tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+            }
+            timings.security_ms = security_start.elapsed().as_millis();
         }
-        timings.security_ms = security_start.elapsed().as_millis();
 
         // Finalize: write integrity, atomic rename.
         let finalize_start = std::time::Instant::now();
@@ -404,11 +419,11 @@ impl PackageStore {
     /// [`StageTimings`] breakdown (extract / security / finalize) for the
     /// caller. On the store-hit fast path every field is zero.
     ///
-    /// `extract_ms` covers `extract_tarball_from_file`; `security_ms` covers
-    /// `analyze_package` + `.lpm-security.json` write; `finalize_ms` covers
-    /// the `.integrity` file write plus the atomic rename. The sum of the
-    /// three is the wall-clock of the miss path excluding the initial
-    /// `dir.exists()` stat.
+    /// `extract_ms` covers `extract_tarball_from_file`; when analysis is
+    /// enabled, `security_ms` covers `analyze_package` plus the cache write;
+    /// `finalize_ms` covers the `.integrity` file write plus the atomic rename.
+    /// The sum of the three is the wall-clock of the miss path excluding the
+    /// initial `dir.exists()` stat.
     pub fn store_package_from_file_timed(
         &self,
         name: &str,
@@ -424,6 +439,7 @@ impl PackageStore {
         // general-purpose API contract.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
+                self.backfill_security_cache_if_enabled(&dir, &format!("{name}@{version}"));
                 tracing::debug!("store hit: {name}@{version}");
                 return Ok((dir, timings));
             }
@@ -470,23 +486,26 @@ impl PackageStore {
             return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
         }
 
-        // Security analysis runs on the extracted tree before the
-        // atomic rename so `.lpm-security.json` is visible atomically
-        // alongside the package. Measured separately from finalize to
-        // expose the second-filesystem-pass cost (the fused-scan path
-        // in `stream_and_store_package` eliminates it).
-        let security_start = std::time::Instant::now();
-        let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
-        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-            tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
-        } else {
-            tracing::debug!(
-                "security analysis: {name}@{version} — {} files scanned, {} bytes",
-                analysis.meta.files_scanned,
-                analysis.meta.bytes_scanned
-            );
+        // When enabled, security analysis runs on the extracted tree before
+        // the atomic rename so the cache is published with the package.
+        // Measured separately from finalize to expose the second-filesystem-
+        // pass cost that the fused stream path eliminates.
+        if self.security_analysis_policy().is_enabled() {
+            let security_start = std::time::Instant::now();
+            let (analysis, analysis_timings) =
+                lpm_security::behavioral::analyze_package_with_timings(&tmp_dir);
+            timings.source_scan_ns = analysis_timings.source_scan_ns;
+            if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+                tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+            } else {
+                tracing::debug!(
+                    "security analysis: {name}@{version} — {} files scanned, {} bytes",
+                    analysis.meta.files_scanned,
+                    analysis.meta.bytes_scanned
+                );
+            }
+            timings.security_ms = security_start.elapsed().as_millis();
         }
-        timings.security_ms = security_start.elapsed().as_millis();
 
         // Finalize: atomic rename into the visible path.
         let rename_start = std::time::Instant::now();
@@ -788,6 +807,77 @@ mod tests {
         assert_eq!(analysis["source"]["network"], false);
         assert_eq!(analysis["manifest"]["copyleftLicense"], false);
         assert_eq!(analysis["manifest"]["noLicense"], false);
+    }
+
+    #[test]
+    fn disabled_source_analysis_skips_fresh_v1_cache_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at_with_security_analysis_policy(
+            dir.path(),
+            crate::SecurityAnalysisPolicy::Disabled,
+        );
+        let tarball = create_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"unscanned\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"eval('code')"),
+        ]);
+
+        let path = store.store_package("unscanned", "1.0.0", &tarball).unwrap();
+
+        assert!(!path.join(".lpm-security.json").exists());
+        assert!(path.join(".integrity").exists());
+    }
+
+    #[test]
+    fn enabled_v1_cache_hit_backfills_missing_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let disabled = PackageStore::at_with_security_analysis_policy(
+            dir.path(),
+            crate::SecurityAnalysisPolicy::Disabled,
+        );
+        let tarball = create_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"backfill\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"eval('code')"),
+        ]);
+        let path = disabled
+            .store_package("backfill", "1.0.0", &tarball)
+            .unwrap();
+        assert!(!path.join(".lpm-security.json").exists());
+
+        let enabled = PackageStore::at(dir.path());
+        assert!(enabled.has_package("backfill", "1.0.0"));
+
+        let analysis = lpm_security::behavioral::read_cached_analysis(&path).unwrap();
+        assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn enabled_v1_cache_hit_replaces_outdated_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"outdated\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"eval('code')"),
+        ]);
+        let path = store.store_package("outdated", "1.0.0", &tarball).unwrap();
+        let cache_path = path.join(".lpm-security.json");
+        let mut cache: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        cache["version"] = serde_json::json!(0);
+        std::fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+        assert!(store.has_package("outdated", "1.0.0"));
+
+        let analysis = lpm_security::behavioral::read_cached_analysis(&path).unwrap();
+        assert_eq!(analysis.version, lpm_security::behavioral::SCHEMA_VERSION);
     }
 
     #[test]

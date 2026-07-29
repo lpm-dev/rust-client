@@ -91,6 +91,14 @@ pub(super) fn managed_policy_blocks_scope(
         {
             Some(crate::npm_firewall_config::FIREWALL_CONFIG_PATH)
         }
+        ApprovalScope::SourceAnalysisDisable
+            if matches!(
+                effective.sources.install_time_source_analysis,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
+        }
         _ => None,
     }?;
     Some(managed_policy_scope_error(
@@ -133,6 +141,9 @@ pub(super) fn managed_policy_blocks_scope_direct(
         }
         ApprovalScope::FirewallDisable if policy.firewall_mode.is_some() => {
             Some(crate::npm_firewall_config::FIREWALL_CONFIG_PATH)
+        }
+        ApprovalScope::SourceAnalysisDisable if policy.install_time_source_analysis.is_some() => {
+            Some(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
         }
         _ => None,
     }?;
@@ -807,6 +818,94 @@ pub fn authorize_persistent_npm_firewall_mode(
     }
     posture.firewall_mode = requested.as_str().to_string();
     persist_authorized_posture(&posture)
+}
+
+pub fn authorize_persistent_install_time_source_analysis(
+    requested: bool,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.install_time_source_analysis();
+    let weakens_current = !requested && current;
+    if weakens_current
+        && matches!(
+            effective.sources.install_time_source_analysis,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        let err = managed_policy_write_error(
+            managed_policy,
+            crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY,
+            requested.to_string(),
+            current.to_string(),
+        );
+        record_persistent_guarded_attempt(
+            ApprovalScope::SourceAnalysisDisable,
+            false,
+            &err.to_string(),
+        );
+        return Err(err);
+    }
+
+    let mut posture = load_authorized_posture()?;
+    if weakens_current {
+        confirm_persistent_weakening(
+            ApprovalScope::SourceAnalysisDisable,
+            json_output,
+            command_hint,
+            "Disabling install-time source analysis weakens the approved machine posture.",
+        )?;
+    } else if requested == current
+        && (!matches!(
+            effective.approved_posture_source,
+            PostureSourceKind::ApprovedStore
+        ) || posture.install_time_source_analysis == requested)
+    {
+        return Ok(());
+    }
+    posture.install_time_source_analysis = requested;
+    persist_authorized_posture(&posture)
+}
+
+pub fn ensure_runtime_install_time_source_analysis_authorized(
+    project_dir: &Path,
+    json_output: bool,
+    requested: bool,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if requested || !effective.posture.install_time_source_analysis() {
+        return Ok(());
+    }
+    if let Some(err) = managed_policy_blocks_scope(&effective, ApprovalScope::SourceAnalysisDisable)
+    {
+        record_audit_event(
+            AuditRecord::new(
+                "guarded-attempt",
+                false,
+                vec![ApprovalScope::SourceAnalysisDisable.as_str().to_string()],
+            )
+            .project_root(canonical_project_root(project_dir))
+            .source(ApprovalSource::GlobalConfig)
+            .detail(
+                "runtime install-time source analysis is weaker than managed policy".to_string(),
+            ),
+        );
+        return Err(err);
+    }
+    ensure_project_unlock(
+        ApprovalScope::SourceAnalysisDisable,
+        project_dir,
+        json_output,
+        ApprovalSource::GlobalConfig,
+        "The persisted global setting disables install-time source analysis for this project.",
+        None,
+        &[],
+    )
 }
 
 pub fn ensure_runtime_typosquat_guard_config_authorized(

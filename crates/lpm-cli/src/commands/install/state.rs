@@ -4,6 +4,7 @@ pub(super) fn write_post_install_hash(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
     let lock = lpm_common::read_text_file_capped(
@@ -20,6 +21,7 @@ pub(super) fn write_post_install_hash(
         project_dir,
         linker_mode,
         object_integrity_policy,
+        security_analysis_policy,
         &dependency_engine_key,
         node_runtime_fingerprint,
     ) {
@@ -34,6 +36,7 @@ fn write_post_install_hash_with_context(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_key: &str,
     node_runtime_fingerprint: Option<&str>,
 ) -> std::io::Result<()> {
@@ -49,14 +52,17 @@ fn write_post_install_hash_with_context(
     .unwrap_or_default();
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
-    let hash = crate::install_state::compute_install_hash_v9(
+    let hash = crate::install_state::compute_install_hash_v10(
         &pkg,
         &lock,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
         &platform,
-        dependency_engine_key,
+        crate::install_state::InstallHashContext {
+            dependency_engine_key,
+            security_analysis_policy,
+        },
     );
     // Lockfile writeback has already created a supported sidecar or removed an
     // unsupported one, so existence records the exact completed install state.
@@ -73,6 +79,7 @@ fn write_post_install_hash_with_context(
         crate::install_state::KnownInstallHashRuntimeState {
             node_runtime_fingerprint,
             binary_sidecar_required,
+            security_analysis_policy,
         },
     )
 }
@@ -120,6 +127,16 @@ pub(super) fn refresh_post_install_hash_after_manifest_finalize(
             ))
         })?;
     let _stored_platform = lines.next();
+    let security_analysis_policy = match lines.next().and_then(|line| line.strip_prefix("a:")) {
+        Some("enabled") => lpm_store::SecurityAnalysisPolicy::Enabled,
+        Some("disabled") => lpm_store::SecurityAnalysisPolicy::Disabled,
+        _ => {
+            return Err(LpmError::Registry(format!(
+                "{} is missing its source-analysis policy",
+                state_path.display(),
+            )));
+        }
+    };
     let dependency_engine_key = lines
         .next()
         .and_then(|line| line.strip_prefix("e:"))
@@ -138,6 +155,7 @@ pub(super) fn refresh_post_install_hash_after_manifest_finalize(
         project_dir,
         linker_mode,
         object_integrity_policy,
+        security_analysis_policy,
         dependency_engine_key,
         node_runtime_fingerprint,
     )
@@ -151,6 +169,7 @@ pub(super) fn refresh_post_install_hash_after_manifest_finalize(
 
 pub(super) struct InstallFreshnessInput<'a> {
     pub(super) client: &'a RegistryClient,
+    pub(super) lpm_root: &'a lpm_common::LpmRoot,
     pub(super) project_dir: &'a Path,
     pub(super) pkg_json_path: &'a Path,
     pub(super) lockfile_path: &'a Path,
@@ -164,6 +183,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) strict_peer_dependencies: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) store_version: lpm_store::StoreVersion,
     pub(super) compatibility_bin_names: &'a [String],
@@ -199,13 +219,14 @@ pub(super) async fn run_install_freshness_phase(
         input.dependency_engine_policy,
     );
     let install_state =
-        crate::install_state::check_install_state_with_linker_integrity_and_dependency_engine(
+        crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
             input.project_dir,
             &pkg_content_for_state,
             input.linker_mode,
             input.object_integrity_policy,
             &dependency_engine_key,
             input.store_version,
+            input.security_analysis_policy,
         );
     let setup_install_state_ms = setup_state_t.elapsed().as_millis();
     let compatibility_bins_ready = !input.store_version.is_v2()
@@ -249,12 +270,22 @@ pub(super) async fn run_install_freshness_phase(
     } else {
         None
     };
+    let source_analysis_caches_ready = fast_path_packages.as_deref().is_none_or(|packages| {
+        source_analysis_caches_are_current(
+            input.lpm_root,
+            input.project_dir,
+            packages,
+            input.store_version,
+            input.security_analysis_policy,
+        )
+    });
     let fast_path_policy_extension_stats = match (
         fast_path_packages.as_deref(),
         input.policy_extension_configs.is_empty(),
+        source_analysis_caches_ready,
     ) {
-        (Some(_), true) => None,
-        (Some(packages), false) => Some(
+        (Some(_), true, true) => None,
+        (Some(packages), false, true) => Some(
             run_policy_extensions(
                 input.policy_extension_configs,
                 input.project_dir,
@@ -263,10 +294,11 @@ pub(super) async fn run_install_freshness_phase(
             )
             .await?,
         ),
-        (None, _) => None,
+        _ => None,
     };
     if fast_path_base_eligible
         && let Some(fast_path_packages) = fast_path_packages.as_deref()
+        && source_analysis_caches_ready
         && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
         let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
@@ -290,6 +322,7 @@ pub(super) async fn run_install_freshness_phase(
                 input.project_dir,
                 input.linker_mode,
                 input.object_integrity_policy,
+                input.security_analysis_policy,
                 input.dependency_engine_policy,
             );
         }
@@ -368,6 +401,69 @@ pub(super) async fn run_install_freshness_phase(
         cleanup_catalogs_in_pipeline,
         completed: false,
     })
+}
+
+pub(super) fn source_analysis_caches_are_current(
+    lpm_root: &lpm_common::LpmRoot,
+    project_dir: &Path,
+    packages: &[InstallPackage],
+    store_version: lpm_store::StoreVersion,
+    policy: lpm_store::SecurityAnalysisPolicy,
+) -> bool {
+    if !policy.is_enabled() {
+        return true;
+    }
+
+    let store_v1 = PackageStore::from_root(lpm_root);
+    let store_v2 = store_version
+        .is_v2()
+        .then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
+    let mut checked = HashSet::with_capacity(packages.len());
+    for package in packages {
+        let package_dir = if let Some(store_v2) = store_v2.as_ref() {
+            let sri = match package.source_kind() {
+                Ok(lpm_lockfile::Source::Directory { .. })
+                | Ok(lpm_lockfile::Source::Link { .. }) => {
+                    let Some(source_dir) =
+                        package.store_path_source_aware(&store_v1, project_dir, None)
+                    else {
+                        return false;
+                    };
+                    Cow::Owned(local_source_sri(
+                        &package.name,
+                        &package.version,
+                        package.wrapper_id_for_source().as_deref(),
+                        &source_dir,
+                    ))
+                }
+                _ => {
+                    let Some(sri) = package.integrity.as_deref() else {
+                        return false;
+                    };
+                    Cow::Borrowed(sri)
+                }
+            };
+            match store_v2.paths().object_dir(sri.as_ref()) {
+                Ok(path) => path,
+                Err(_) => return false,
+            }
+        } else {
+            match package.source_kind() {
+                Ok(lpm_lockfile::Source::Directory { .. })
+                | Ok(lpm_lockfile::Source::Link { .. }) => continue,
+                _ => match package.store_path_source_aware(&store_v1, project_dir, None) {
+                    Some(path) => path,
+                    None => return false,
+                },
+            }
+        };
+        if checked.insert(package_dir.clone())
+            && lpm_security::behavioral::read_cached_analysis(&package_dir).is_none()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn dependency_engine_freshness_key_for_state(

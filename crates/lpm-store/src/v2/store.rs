@@ -38,11 +38,11 @@ use super::tree_hash::{
     ExtractedObjectStats, ObjectTreeStats, TreeIntegrities, compute_object_tree_integrities,
     compute_tree_metadata_integrity,
 };
-use crate::StageTimings;
 use crate::v2::graph_key::GraphKey;
 use crate::v2::link_meta::{
     LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform, validate_name_for_path_join,
 };
+use crate::{SecurityAnalysisPolicy, StageTimings};
 
 /// v2 layout version segment under `~/.lpm/store/`. Bumped whenever
 /// the on-disk shape changes; lpm reading a higher-numbered store
@@ -477,6 +477,9 @@ pub struct LinkEntryTimings {
 pub struct Store {
     paths: StoreV2Paths,
     object_integrity_policy: ObjectIntegrityPolicy,
+    security_analysis_policy: SecurityAnalysisPolicy,
+    #[cfg(test)]
+    object_publish_barriers: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 impl Store {
@@ -492,9 +495,25 @@ impl Store {
         lpm_root: &LpmRoot,
         object_integrity_policy: ObjectIntegrityPolicy,
     ) -> Self {
+        Self::from_lpm_root_with_policies(
+            lpm_root,
+            object_integrity_policy,
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    /// Create a v2 store with explicit integrity and source-analysis policies.
+    pub fn from_lpm_root_with_policies(
+        lpm_root: &LpmRoot,
+        object_integrity_policy: ObjectIntegrityPolicy,
+        security_analysis_policy: SecurityAnalysisPolicy,
+    ) -> Self {
         Self {
             paths: StoreV2Paths::from_lpm_root(lpm_root),
             object_integrity_policy,
+            security_analysis_policy,
+            #[cfg(test)]
+            object_publish_barriers: None,
         }
     }
 
@@ -507,10 +526,36 @@ impl Store {
         root: impl Into<PathBuf>,
         object_integrity_policy: ObjectIntegrityPolicy,
     ) -> Self {
+        Self::at_with_policies(
+            root,
+            object_integrity_policy,
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    /// Create a v2 store at a specific path with explicit policies.
+    pub fn at_with_policies(
+        root: impl Into<PathBuf>,
+        object_integrity_policy: ObjectIntegrityPolicy,
+        security_analysis_policy: SecurityAnalysisPolicy,
+    ) -> Self {
         Self {
             paths: StoreV2Paths::at(root),
             object_integrity_policy,
+            security_analysis_policy,
+            #[cfg(test)]
+            object_publish_barriers: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_object_publish_barriers(
+        mut self,
+        arrived: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.object_publish_barriers = Some((arrived, resume));
+        self
     }
 
     /// The path helper this Store wraps.
@@ -520,6 +565,11 @@ impl Store {
 
     pub fn object_integrity_policy(&self) -> ObjectIntegrityPolicy {
         self.object_integrity_policy
+    }
+
+    /// Return the policy used for extraction and cache-hit backfills.
+    pub fn security_analysis_policy(&self) -> SecurityAnalysisPolicy {
+        self.security_analysis_policy
     }
 
     /// Ensure the cached compatibility-island root exists with store-tier
@@ -560,6 +610,7 @@ impl Store {
         else {
             return Ok(None);
         };
+        self.backfill_security_cache_if_enabled(&object_dir, sri);
         Ok(Some(ReusableObject {
             path: object_dir,
             object_integrity,
@@ -598,6 +649,7 @@ impl Store {
             timings.total_ms = total_start.elapsed().as_millis();
             return Ok((None, timings));
         };
+        self.backfill_security_cache_if_enabled(&object_dir, sri);
         timings.total_ms = total_start.elapsed().as_millis();
         Ok((
             Some(ReusableObject {
@@ -609,19 +661,18 @@ impl Store {
     }
 
     /// Extract the supplied tarball bytes into
-    /// `objects/<algo>-<hex>/`, run behavioral security analysis, write
-    /// the cache file, and atomically rename into place. Idempotent:
-    /// returns the existing object dir if it's already populated.
+    /// `objects/<algo>-<hex>/`, optionally run behavioral security analysis,
+    /// and atomically rename into place. Idempotent: returns the existing
+    /// object dir if it's already populated.
     ///
     /// Atomic via the standard `dir.with_extension(tmp.<pid>.<tid>)` →
-    /// `rename` pattern. `.integrity` and `.lpm-security.json` are
-    /// staged inside the tmp dir before the rename, so the published
-    /// entry is observable only with both files present.
+    /// `rename` pattern. `.integrity` and, when source analysis is enabled,
+    /// `.lpm-security.json` are staged inside the tmp dir before the rename.
     ///
-    /// Behavioral security analysis lives next to the OBJECT, not next
-    /// to each link entry — the analysis is a property of the content
-    /// bytes, so link entries sharing a `source_sri` share the result.
-    /// This matches v1's placement at
+    /// When enabled, behavioral security analysis lives next to the OBJECT,
+    /// not next to each link entry — the analysis is a property of the
+    /// content bytes, so link entries sharing a `source_sri` share the
+    /// result. This matches v1's placement at
     /// `<HOME>/.lpm/store/v1/<pkg>/<version>/.lpm-security.json`.
     ///
     /// Uses the fused extractor+analyzer path:
@@ -679,6 +730,7 @@ impl Store {
             && let Some(object_integrity) =
                 object_integrity_or_remove(&object_dir, "before re-extract", sri, policy)?
         {
+            self.backfill_security_cache_if_enabled(&object_dir, sri);
             tracing::debug!(
                 target = %object_dir.display(),
                 "v2 store: object hit"
@@ -714,16 +766,23 @@ impl Store {
         // `RefCell` wraps the analyzer so the `FnMut` closure can mutate
         // it without exclusive borrows escaping the call site.
         let extract_start = std::time::Instant::now();
+        let source_analysis_enabled = self.security_analysis_policy.is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
         let extracted_stats = std::cell::RefCell::new(ExtractedObjectStats::default());
         let extract_result = lpm_extractor::extract_tarball_with_inspector(
             tarball_data,
             &tmp_dir,
-            lpm_security::behavioral::PackageAnalyzer::should_buffer_source,
+            |path, size| {
+                source_analysis_enabled
+                    && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
+            },
             |entry| {
                 extracted_stats
                     .borrow_mut()
                     .record_file(entry.relative_path, entry.size);
+                if !source_analysis_enabled {
+                    return;
+                }
                 if let Some(bytes) = entry.bytes {
                     analyzer.borrow_mut().feed(entry.relative_path, bytes);
                 } else {
@@ -745,15 +804,19 @@ impl Store {
         // rename so the cache file is part of the atomically-published
         // state. Analysis failures are non-fatal: warn and continue
         // (subsequent installs will retry).
-        let security_start = std::time::Instant::now();
-        let analysis = analyzer.into_inner().finalize(&tmp_dir);
-        if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-            tracing::warn!(
-                target = %tmp_dir.display(),
-                "v2 store: failed to write .lpm-security.json: {e}"
-            );
+        if source_analysis_enabled {
+            let security_start = std::time::Instant::now();
+            let analyzer = analyzer.into_inner();
+            timings.source_scan_ns = analyzer.source_scan_ns();
+            let analysis = analyzer.finalize(&tmp_dir);
+            if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+                tracing::warn!(
+                    target = %tmp_dir.display(),
+                    "v2 store: failed to write .lpm-security.json: {e}"
+                );
+            }
+            timings.security_ms = security_start.elapsed().as_millis();
         }
-        timings.security_ms = security_start.elapsed().as_millis();
 
         let finalize_permit_wait_start = std::time::Instant::now();
         let _finalize_permit = v2_finalize_limiter().map(|limiter| limiter.acquire());
@@ -796,6 +859,11 @@ impl Store {
             )));
         }
 
+        #[cfg(test)]
+        if let Some((arrived, resume)) = &self.object_publish_barriers {
+            arrived.wait();
+            resume.wait();
+        }
         let rename_start = std::time::Instant::now();
         let rename_result = std::fs::rename(&tmp_dir, &object_dir);
         timings.finalize_rename_ms = rename_start.elapsed().as_millis();
@@ -829,6 +897,7 @@ impl Store {
                         object_dir.display()
                     ))
                 })?;
+                self.backfill_security_cache_if_enabled(&object_dir, sri);
                 Ok(ExtractedObject {
                     path: object_dir,
                     source_sri: sri.to_string(),
@@ -1473,7 +1542,9 @@ impl Store {
         // If v1 didn't ship a security cache (rare, but possible on
         // a stale or partial v1 entry), re-run analysis so the v2
         // post-write contract holds.
-        if !tmp_dir.join(".lpm-security.json").is_file() {
+        if self.security_analysis_policy.is_enabled()
+            && lpm_security::behavioral::read_cached_analysis(&tmp_dir).is_none()
+        {
             let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
             if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
                 tracing::warn!("v2 translation: failed to write .lpm-security.json: {e}");
@@ -1503,6 +1574,23 @@ impl Store {
                     policy,
                 )
             })
+    }
+
+    fn backfill_security_cache_if_enabled(&self, object_dir: &Path, sri: &str) {
+        if !self.security_analysis_policy.is_enabled() {
+            return;
+        }
+        match lpm_security::behavioral::backfill_cached_analysis(object_dir) {
+            Ok(true) => tracing::debug!(
+                target = %object_dir.display(),
+                "v2 store: backfilled security analysis cache for {sri}"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                target = %object_dir.display(),
+                "v2 store: failed to backfill .lpm-security.json for {sri}: {error}"
+            ),
+        }
     }
 
     /// Populate `objects/<sri>/` from a live local source directory.
@@ -1536,7 +1624,12 @@ impl Store {
         create_tmp_dir_locked(&tmp_dir)
             .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
-        if let Err(e) = populate_local_source_object_into(&canonical_source, &tmp_dir, sri) {
+        if let Err(e) = populate_local_source_object_into(
+            &canonical_source,
+            &tmp_dir,
+            sri,
+            self.security_analysis_policy,
+        ) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(e);
         }

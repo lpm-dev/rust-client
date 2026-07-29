@@ -3272,6 +3272,7 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
             "integrity_ms",
             "extract_ms",
             "security_ms",
+            "source_scan_ns",
             "finalize_permit_wait_ms",
             "finalize_ms",
             "finalize_tree_integrity_ms",
@@ -3288,6 +3289,13 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
                 "fetch task trace row must include {field}; got {row:#}"
             );
         }
+    }
+    let source_scan = &envelope["timing"]["fetch_breakdown"]["source_scan"];
+    for field in ["sum_ns", "max_ns"] {
+        assert!(
+            source_scan[field].as_u64().is_some(),
+            "timing.fetch_breakdown.source_scan.{field} must be numeric; got {source_scan:#}"
+        );
     }
     let metadata = envelope["timing"]["detail"]["metadata"]
         .as_array()
@@ -4234,6 +4242,146 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
     assert!(
         !project.home().join(".lpm/store/v1").exists(),
         "default online and offline installs must not write the v1 store"
+    );
+}
+
+#[tokio::test]
+async fn install_reenable_source_analysis_backfills_v2_cache_without_tarball_redownload() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "source-analysis-backfill",
+        "1.0.0",
+        &[("behavior.js", b"eval('source-analysis-backfill')")],
+    );
+    mock.with_package("source-analysis-backfill", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "source-analysis-backfill-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "source-analysis-backfill": "1.0.0"
+        }
+    }"#,
+    );
+    let config_path = project.home().join(".lpm/config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "install-time-source-analysis = false\n").unwrap();
+    write_signed_unlock(&project, &["source-analysis-disable"]);
+
+    let disabled = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to install with source analysis disabled");
+    assert!(
+        disabled.status.success(),
+        "disabled source-analysis install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&disabled.stdout),
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at_with_policies(
+        project.home().join(".lpm/store/v2"),
+        lpm_store::v2::ObjectIntegrityPolicy::Source,
+        lpm_store::SecurityAnalysisPolicy::Disabled,
+    );
+    let object_dir = v2_store.paths().object_dir(&sri).unwrap();
+    assert!(
+        !object_dir.join(".lpm-security.json").exists(),
+        "disabled install must not create an analysis cache"
+    );
+    let initial_tarball_requests = mock
+        .tarball_request_count("source-analysis-backfill", "1.0.0")
+        .await;
+    assert_eq!(initial_tarball_requests, 1);
+
+    std::fs::write(&config_path, "install-time-source-analysis = true\n").unwrap();
+    let enabled = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to reinstall after enabling source analysis");
+    assert!(
+        enabled.status.success(),
+        "re-enabled source-analysis install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&enabled.stdout),
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    assert_eq!(
+        mock.tarball_request_count("source-analysis-backfill", "1.0.0")
+            .await,
+        initial_tarball_requests,
+        "re-enabling source analysis must reuse extracted bytes"
+    );
+    let analysis = lpm_security::behavioral::read_cached_analysis(&object_dir)
+        .expect("re-enabled install must backfill a current cache");
+    assert_eq!(analysis.version, lpm_security::behavioral::SCHEMA_VERSION);
+    assert!(analysis.source.eval);
+}
+
+#[tokio::test]
+async fn install_disabled_lpm_insights_skips_enrichment_request_but_keeps_local_findings() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "@lpm.dev/local-findings",
+        "1.0.0",
+        &[("behavior.js", b"eval('local-finding')")],
+    );
+    mock.with_package("@lpm.dev/local-findings", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "disabled-lpm-insights-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "@lpm.dev/local-findings": "1.0.0"
+        }
+    }"#,
+    );
+    let config_path = project.home().join(".lpm/config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "fetch-lpm-security-insights = false\n").unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("failed to install with LPM insights disabled");
+    assert!(
+        output.status.success(),
+        "install with LPM insights disabled failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("eval()"),
+        "local behavioral findings must remain in the install summary; stderr:\n{stderr}"
+    );
+
+    let batch_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available")
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/registry/batch-metadata")
+        .count();
+    assert_eq!(
+        batch_requests, 1,
+        "disabled LPM insights must leave only the resolver batch request"
     );
 }
 

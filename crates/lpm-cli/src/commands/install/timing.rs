@@ -36,10 +36,14 @@ pub(super) struct TaskTimings {
     /// Time in `extract_tarball_from_file` (gzip decompress, tar walk,
     /// and write-to-staging). Mirrors [`lpm_store::StageTimings::extract_ms`].
     pub(super) extract_ms: u128,
-    /// Time in the behavioral security scan + `.lpm-security.json` cache
-    /// write. The second-filesystem-pass cost that targets.
+    /// Post-extraction security finalization and cache-write time. On
+    /// two-pass extraction paths this also contains the source scan.
     /// Mirrors [`lpm_store::StageTimings::security_ms`].
     pub(super) security_ms: u128,
+    /// Source-analysis attribution nested inside extraction on fused paths
+    /// and security time on two-pass paths. Kept in nanoseconds so small
+    /// packages do not round to zero.
+    pub(super) source_scan_ns: u128,
     /// Time in `.integrity` write + atomic rename into the store path.
     /// Mirrors [`lpm_store::StageTimings::finalize_ms`].
     pub(super) finalize_ms: u128,
@@ -71,6 +75,7 @@ impl TaskTimings {
             extract_permit_wait_ms,
             extract_ms: stage.extract_ms,
             security_ms: stage.security_ms,
+            source_scan_ns: stage.source_scan_ns,
             finalize_ms: stage.finalize_ms,
             finalize_permit_wait_ms: stage.finalize_permit_wait_ms,
             finalize_tree_integrity_ms: stage.finalize_tree_integrity_ms,
@@ -133,6 +138,8 @@ pub(super) struct FetchBreakdown {
     pub(super) extract_max_ms: u128,
     pub(super) security_sum_ms: u128,
     pub(super) security_max_ms: u128,
+    pub(super) source_scan_sum_ns: u128,
+    pub(super) source_scan_max_ns: u128,
     pub(super) finalize_permit_wait_sum_ms: u128,
     pub(super) finalize_permit_wait_max_ms: u128,
     pub(super) finalize_sum_ms: u128,
@@ -365,6 +372,8 @@ impl FetchBreakdown {
         self.extract_max_ms = self.extract_max_ms.max(t.extract_ms);
         self.security_sum_ms += t.security_ms;
         self.security_max_ms = self.security_max_ms.max(t.security_ms);
+        self.source_scan_sum_ns = self.source_scan_sum_ns.saturating_add(t.source_scan_ns);
+        self.source_scan_max_ns = self.source_scan_max_ns.max(t.source_scan_ns);
         self.finalize_permit_wait_sum_ms += t.finalize_permit_wait_ms;
         self.finalize_permit_wait_max_ms = self
             .finalize_permit_wait_max_ms
@@ -386,6 +395,7 @@ impl FetchBreakdown {
             "extract_permit_wait": { "sum_ms": self.extract_permit_wait_sum_ms, "max_ms": self.extract_permit_wait_max_ms },
             "extract":     { "sum_ms": self.extract_sum_ms,     "max_ms": self.extract_max_ms     },
             "security":    { "sum_ms": self.security_sum_ms,    "max_ms": self.security_max_ms    },
+            "source_scan": { "sum_ns": self.source_scan_sum_ns, "max_ns": self.source_scan_max_ns },
             "finalize_permit_wait": { "sum_ms": self.finalize_permit_wait_sum_ms, "max_ms": self.finalize_permit_wait_max_ms },
             "finalize":    { "sum_ms": self.finalize_sum_ms,    "max_ms": self.finalize_max_ms    },
         })
@@ -893,6 +903,7 @@ impl SlowPackageTimings {
                         "extract_permit_wait_ms": timings.extract_permit_wait_ms,
                         "extract_ms": timings.extract_ms,
                         "security_ms": timings.security_ms,
+                        "source_scan_ns": timings.source_scan_ns,
                         "finalize_permit_wait_ms": timings.finalize_permit_wait_ms,
                         "finalize_ms": timings.finalize_ms,
                         "finalize_tree_integrity_ms": timings.finalize_tree_integrity_ms,
@@ -1417,6 +1428,7 @@ mod tests {
                 extract_permit_wait_ms: 9,
                 extract_ms: 5,
                 security_ms: 6,
+                source_scan_ns: 6_500_000,
                 finalize_permit_wait_ms: 7,
                 finalize_ms: 8,
                 finalize_tree_integrity_ms: 9,
@@ -1442,6 +1454,7 @@ mod tests {
         assert_eq!(row["extract_permit_wait_ms"], 9);
         assert_eq!(row["extract_ms"], 5);
         assert_eq!(row["security_ms"], 6);
+        assert_eq!(row["source_scan_ns"], 6_500_000u64);
         assert_eq!(row["finalize_permit_wait_ms"], 7);
         assert_eq!(row["finalize_ms"], 8);
         assert_eq!(row["finalize_tree_integrity_ms"], 9);

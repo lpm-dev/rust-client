@@ -590,7 +590,7 @@ fn reconcile_finalized_add_rebuilds_complete_importer_after_catalog_cleanup() {
     std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
     std::fs::write(
         dir.path().join(".lpm").join("install-hash"),
-        "stale-hash\n0:0\nl:hoisted\ni:source\np:test\ne:none\nn:none\n",
+        "stale-hash\n0:0\nl:hoisted\ni:source\np:test\na:enabled\ne:none\nn:none\n",
     )
     .unwrap();
 

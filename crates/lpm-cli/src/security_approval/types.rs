@@ -17,10 +17,11 @@ pub enum ApprovalScope {
     CapabilityWiden,
     TyposquatDisable,
     FirewallDisable,
+    SourceAnalysisDisable,
     FloorEdit,
 }
 
-const ALL_APPROVAL_SCOPES: [ApprovalScope; 15] = [
+const ALL_APPROVAL_SCOPES: [ApprovalScope; 16] = [
     ApprovalScope::CooldownBypass,
     ApprovalScope::CooldownWindow,
     ApprovalScope::ProvenanceIgnoreDrift,
@@ -35,10 +36,11 @@ const ALL_APPROVAL_SCOPES: [ApprovalScope; 15] = [
     ApprovalScope::CapabilityWiden,
     ApprovalScope::TyposquatDisable,
     ApprovalScope::FirewallDisable,
+    ApprovalScope::SourceAnalysisDisable,
     ApprovalScope::FloorEdit,
 ];
 
-const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 11] = [
+const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 12] = [
     ApprovalScope::CooldownBypass,
     ApprovalScope::CooldownWindow,
     ApprovalScope::ProvenanceIgnoreDrift,
@@ -50,6 +52,7 @@ const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 11] = [
     ApprovalScope::SandboxAllowDegraded,
     ApprovalScope::TyposquatDisable,
     ApprovalScope::FirewallDisable,
+    ApprovalScope::SourceAnalysisDisable,
 ];
 
 impl ApprovalScope {
@@ -77,6 +80,7 @@ impl ApprovalScope {
             Self::CapabilityWiden => "capability-widen",
             Self::TyposquatDisable => "typosquat-disable",
             Self::FirewallDisable => "firewall-disable",
+            Self::SourceAnalysisDisable => "source-analysis-disable",
             Self::FloorEdit => "floor-edit",
         }
     }
@@ -125,6 +129,8 @@ pub struct AuthorizedPosture {
     pub typosquat_guard: String,
     #[serde(default = "default_firewall_mode_string")]
     pub firewall_mode: String,
+    #[serde(default = "default_install_time_source_analysis")]
+    pub install_time_source_analysis: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -137,6 +143,7 @@ pub struct AuthorizedPostureView {
     pub sigstore_verify: String,
     pub typosquat_guard: String,
     pub firewall_mode: String,
+    pub install_time_source_analysis: bool,
 }
 
 fn default_release_age_policy_string() -> String {
@@ -155,6 +162,10 @@ fn default_firewall_mode_string() -> String {
         .to_string()
 }
 
+fn default_install_time_source_analysis() -> bool {
+    true
+}
+
 impl Default for AuthorizedPosture {
     fn default() -> Self {
         Self {
@@ -168,6 +179,7 @@ impl Default for AuthorizedPosture {
             sigstore_verify: "deny".to_string(),
             typosquat_guard: default_typosquat_guard_string(),
             firewall_mode: default_firewall_mode_string(),
+            install_time_source_analysis: default_install_time_source_analysis(),
         }
     }
 }
@@ -212,6 +224,10 @@ impl AuthorizedPosture {
         crate::npm_firewall_config::NpmFirewallMode::parse(&self.firewall_mode).unwrap_or_default()
     }
 
+    pub fn install_time_source_analysis(&self) -> bool {
+        self.install_time_source_analysis
+    }
+
     pub fn to_view(&self) -> AuthorizedPostureView {
         AuthorizedPostureView {
             script_policy: self.script_policy.clone(),
@@ -222,6 +238,7 @@ impl AuthorizedPosture {
             sigstore_verify: self.sigstore_verify.clone(),
             typosquat_guard: self.typosquat_guard().as_str().to_string(),
             firewall_mode: self.firewall_mode().as_str().to_string(),
+            install_time_source_analysis: self.install_time_source_analysis,
         }
     }
 }
@@ -244,6 +261,7 @@ pub struct EffectivePostureSources {
     pub sigstore_verify: PostureSourceKind,
     pub typosquat_guard: PostureSourceKind,
     pub firewall_mode: PostureSourceKind,
+    pub install_time_source_analysis: PostureSourceKind,
 }
 
 impl EffectivePostureSources {
@@ -257,6 +275,7 @@ impl EffectivePostureSources {
             sigstore_verify: base,
             typosquat_guard: base,
             firewall_mode: base,
+            install_time_source_analysis: base,
         }
     }
 }
@@ -357,6 +376,7 @@ pub(super) struct ManagedPolicy {
     pub(super) sigstore_verify: Option<EnforceMode>,
     pub(super) typosquat_guard: Option<crate::commands::config::TyposquatGuardSelection>,
     pub(super) firewall_mode: Option<crate::npm_firewall_config::NpmFirewallMode>,
+    pub(super) install_time_source_analysis: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

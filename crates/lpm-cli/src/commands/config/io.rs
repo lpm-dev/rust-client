@@ -1,10 +1,11 @@
 use crate::sandbox_config::ResolvedSandboxMode;
+use crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY;
 use lpm_common::LpmError;
 
 use super::global_config::global_config_view_from_value;
 use super::wizards::{
     RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, SCRIPT_POLICY_KEY, TYPOSQUAT_GUARD_KEY,
-    TyposquatGuardSelection, reject_looser_typosquat_guard_write,
+    TyposquatGuardSelection, parse_config_bool, reject_looser_typosquat_guard_write,
 };
 
 pub(super) fn read_config(path: &std::path::Path) -> Result<toml::Value, LpmError> {
@@ -80,6 +81,16 @@ pub(super) fn guard_generic_set_against_force_floor(
             if let Some(requested) = TyposquatGuardSelection::parse(value) {
                 reject_looser_typosquat_guard_write(&global, requested)?;
             }
+        }
+        INSTALL_TIME_SOURCE_ANALYSIS_KEY
+            if crate::security_floor::force_security_floor_enabled(&global)
+                && matches!(parse_config_bool(value), Ok(false)) =>
+        {
+            return Err(crate::security_floor::security_floor_write_error(
+                INSTALL_TIME_SOURCE_ANALYSIS_KEY,
+                value,
+                "true",
+            ));
         }
         _ => {}
     }

@@ -806,6 +806,20 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         .transpose()?
         .map(|raw| parse_policy_firewall(&path, raw))
         .transpose()?;
+    let install_time_source_analysis = table
+        .get(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                managed_policy_error(
+                    &path,
+                    format!(
+                        "must set `{}` to a boolean",
+                        crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY
+                    ),
+                )
+            })
+        })
+        .transpose()?;
 
     let mut enforced_controls = Vec::new();
     if script_policy.is_some() {
@@ -832,6 +846,10 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if firewall_mode.is_some() {
         enforced_controls.push("firewall.mode".to_string());
     }
+    if install_time_source_analysis.is_some() {
+        enforced_controls
+            .push(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY.to_string());
+    }
 
     Ok(Some(ManagedPolicy {
         status: ManagedPolicyStatus {
@@ -848,6 +866,7 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         sigstore_verify,
         typosquat_guard,
         firewall_mode,
+        install_time_source_analysis,
     }))
 }
 

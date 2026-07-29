@@ -149,6 +149,66 @@ fn fast_exit_on_empty_project() {
     );
 }
 
+#[test]
+fn v1_local_sources_do_not_require_a_store_analysis_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path().join(".lpm-home"));
+    let mut package = super::fake_pkg("local-package", "1.0.0", true);
+    package.source = "directory+packages/local-package".to_string();
+
+    assert!(super::super::state::source_analysis_caches_are_current(
+        &lpm_root,
+        dir.path(),
+        &[package],
+        lpm_store::StoreVersion::V1,
+        lpm_store::SecurityAnalysisPolicy::Enabled,
+    ));
+}
+
+#[test]
+fn v2_local_source_requires_its_synthetic_object_analysis_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("packages").join("local-package");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("package.json"),
+        r#"{"name":"local-package","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(source_dir.join("index.js"), "eval('local')").unwrap();
+
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path().join(".lpm-home"));
+    let mut package = super::fake_pkg("local-package", "1.0.0", true);
+    package.source = "directory+packages/local-package".to_string();
+    let source_sri = super::super::local_source_sri(
+        &package.name,
+        &package.version,
+        package.wrapper_id_for_source().as_deref(),
+        &source_dir.canonicalize().unwrap(),
+    );
+    let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+    let object_dir = store
+        .populate_object_from_local_source(&source_dir, &source_sri)
+        .unwrap();
+
+    assert!(super::super::state::source_analysis_caches_are_current(
+        &lpm_root,
+        dir.path(),
+        std::slice::from_ref(&package),
+        lpm_store::StoreVersion::V2,
+        lpm_store::SecurityAnalysisPolicy::Enabled,
+    ));
+
+    std::fs::remove_file(object_dir.join(".lpm-security.json")).unwrap();
+    assert!(!super::super::state::source_analysis_caches_are_current(
+        &lpm_root,
+        dir.path(),
+        &[package],
+        lpm_store::StoreVersion::V2,
+        lpm_store::SecurityAnalysisPolicy::Enabled,
+    ));
+}
+
 /// Verify that --force is defined as a CLI flag on the Install command.
 /// This is a structural test — ensures the flag doesn't get accidentally removed.
 #[test]

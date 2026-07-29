@@ -3262,8 +3262,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            8,
-            "install-hash MUST contain 8 lines (hash + m: + l: + i: + p: + e: + n: + b:), got:\n{on_disk}\n\
+            9,
+            "install-hash MUST contain 9 lines (hash + m: + l: + i: + p: + a: + e: + n: + b:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
@@ -3292,16 +3292,20 @@ mod tests {
             lines[4]
         );
         assert_eq!(
-            lines[5], "e:none",
-            "line 6 must record unconstrained dependency engines"
+            lines[5], "a:enabled",
+            "line 6 must record install-time source analysis"
         );
         assert_eq!(
-            lines[6], "n:none",
-            "line 7 must reserve Node runtime fingerprint metadata"
+            lines[6], "e:none",
+            "line 7 must record unconstrained dependency engines"
         );
         assert_eq!(
-            lines[7], "b:required",
-            "line 8 must record the binary lockfile expectation"
+            lines[7], "n:none",
+            "line 8 must reserve Node runtime fingerprint metadata"
+        );
+        assert_eq!(
+            lines[8], "b:required",
+            "line 9 must record the binary lockfile expectation"
         );
 
         // Round-trip: needs_install reads the complete shape as up-to-date.
