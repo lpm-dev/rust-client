@@ -1674,7 +1674,7 @@ pub async fn run_install_filtered_add(
     .await
 }
 
-fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmError> {
+pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmError> {
     let package_json_path = project_dir.join("package.json");
     let package_json = lpm_common::read_text_file_capped(
         &package_json_path,
@@ -1700,24 +1700,18 @@ fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmEr
             lockfile_path.display(),
         ))
     })?;
-    let importer = lockfile.importers.entry(".".to_string()).or_default();
-    let dependencies = package.dependencies.into_iter().collect();
-    let dev_dependencies = package.dev_dependencies.into_iter().collect();
-    let optional_dependencies = package.optional_dependencies.into_iter().collect();
-    let peer_dependencies = package.peer_dependencies.into_iter().collect();
-    let importer_changed = importer.dependencies != dependencies
-        || importer.dev_dependencies != dev_dependencies
-        || importer.optional_dependencies != optional_dependencies
-        || importer.peer_dependencies != peer_dependencies;
+    let auto_install_peers = lockfile
+        .importers
+        .get(".")
+        .and_then(|importer| importer.auto_install_peers)
+        .unwrap_or(true);
+    let importer = finalized_importer_snapshot(project_dir, &package, auto_install_peers)?;
 
-    if !importer_changed {
+    if lockfile.importers.get(".") == Some(&importer) {
         return Ok(());
     }
 
-    importer.dependencies = dependencies;
-    importer.dev_dependencies = dev_dependencies;
-    importer.optional_dependencies = optional_dependencies;
-    importer.peer_dependencies = peer_dependencies;
+    lockfile.importers.insert(".".to_string(), importer);
     lockfile.write_all(&lockfile_path).map_err(|e| {
         LpmError::Registry(format!(
             "failed to reconcile {} with finalized package.json: {e}",
@@ -1725,4 +1719,48 @@ fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmEr
         ))
     })?;
     super::state::refresh_post_install_hash_after_manifest_finalize(project_dir)
+}
+
+fn finalized_importer_snapshot(
+    project_dir: &Path,
+    package: &lpm_workspace::PackageJson,
+    auto_install_peers: bool,
+) -> Result<lpm_lockfile::ImporterSnapshot, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(project_dir).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to rediscover workspace after finalizing package.json: {e}"
+        ))
+    })?;
+    let catalogs = workspace.as_ref().map_or(&package.catalogs, |workspace| {
+        &workspace.root_package.catalogs
+    });
+    let raw_lpm_overrides = package
+        .lpm
+        .as_ref()
+        .map(|lpm| &lpm.overrides)
+        .cloned()
+        .unwrap_or_default();
+    let (lpm_overrides, _) =
+        resolve_catalog_protocol_in_override_map(&raw_lpm_overrides, catalogs)?;
+    let (overrides, _) = resolve_catalog_protocol_in_override_map(&package.overrides, catalogs)?;
+    let (resolutions, _) =
+        resolve_catalog_protocol_in_override_map(&package.resolutions, catalogs)?;
+    let current_patches = package
+        .lpm
+        .as_ref()
+        .map(|lpm| &lpm.patched_dependencies)
+        .cloned()
+        .unwrap_or_default();
+    let patch_fingerprint =
+        (!current_patches.is_empty()).then(|| patch_state::compute_fingerprint(&current_patches));
+
+    Ok(validation::importer_snapshot_for_current_manifest(
+        package,
+        lpm_overrides.as_ref(),
+        overrides.as_ref(),
+        resolutions.as_ref(),
+        catalogs,
+        patch_fingerprint.as_deref(),
+        auto_install_peers,
+    ))
 }

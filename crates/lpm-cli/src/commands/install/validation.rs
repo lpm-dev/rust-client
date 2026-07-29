@@ -58,7 +58,7 @@ fn peer_rules_fingerprint(pkg: &lpm_workspace::PackageJson) -> Option<String> {
     Some(format!("sha256-{}", hex::encode(Sha256::digest(bytes))))
 }
 
-fn importer_snapshot_for_current_manifest(
+pub(super) fn importer_snapshot_for_current_manifest(
     pkg: &lpm_workspace::PackageJson,
     lpm_overrides: &HashMap<String, String>,
     overrides: &HashMap<String, String>,

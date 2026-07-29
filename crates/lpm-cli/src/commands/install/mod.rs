@@ -1516,9 +1516,15 @@ async fn run_with_options_under_store_lock(
     }
 
     if !json_output && !reserve_stdout && !no_security_summary {
-        let all_packages: Vec<(String, String, bool)> = packages
+        let all_packages: Vec<crate::security_check::SecuritySummaryPackage> = packages
             .iter()
-            .map(|p| (p.name.clone(), p.version.clone(), p.is_lpm))
+            .map(|package| crate::security_check::SecuritySummaryPackage {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: package.source.clone(),
+                integrity: package.integrity.clone(),
+                is_lpm: package.is_lpm,
+            })
             .collect();
         crate::security_check::post_install_security_summary(
             client,

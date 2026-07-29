@@ -43,6 +43,7 @@ use security_framework::passwords::{
 use security_framework::{
     base::Error as MacosSecurityError,
     item::{ItemClass, ItemSearchOptions, SearchResult},
+    os::macos::keychain::SecKeychain,
     os::macos::passwords::find_generic_password as macos_find_generic_password,
 };
 
@@ -1393,9 +1394,20 @@ fn resolve_keychain_credential(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn resolve_keychain_probe_with_legacy_lookup(
+    modern_probe: KeychainCredentialProbe,
+    legacy_lookup: impl FnOnce() -> KeychainCredentialProbe,
+) -> KeychainCredentialProbe {
+    match modern_probe {
+        KeychainCredentialProbe::NotFound => legacy_lookup(),
+        other => other,
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn probe_keychain_credential(service: &str, account: &str) -> KeychainCredentialProbe {
-    match get_password_from_macos_keychain_noninteractive(service, account) {
+    let modern_probe = match get_password_from_macos_keychain_noninteractive(service, account) {
         MacosKeychainLookup::Found(token) => KeychainCredentialProbe::Found(token),
         MacosKeychainLookup::NotFound => KeychainCredentialProbe::NotFound,
         MacosKeychainLookup::InteractionRequired => KeychainCredentialProbe::InteractionRequired,
@@ -1405,7 +1417,28 @@ fn probe_keychain_credential(service: &str, account: &str) -> KeychainCredential
             );
             KeychainCredentialProbe::Failed
         }
-    }
+    };
+
+    resolve_keychain_probe_with_legacy_lookup(modern_probe, || {
+        match get_token_from_macos_keychain_legacy_noninteractive(service, account) {
+            MacosKeychainLookup::Found(token) => {
+                if let Err(error) = set_password_in_macos_keychain(service, account, &token) {
+                    tracing::debug!("legacy keychain item migration failed for {account}: {error}");
+                }
+                KeychainCredentialProbe::Found(token)
+            }
+            MacosKeychainLookup::NotFound => KeychainCredentialProbe::NotFound,
+            MacosKeychainLookup::InteractionRequired => {
+                KeychainCredentialProbe::InteractionRequired
+            }
+            MacosKeychainLookup::Failed(error) => {
+                tracing::debug!(
+                    "noninteractive legacy Security.framework keychain lookup failed for {account}: {error}"
+                );
+                KeychainCredentialProbe::Failed
+            }
+        }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1508,7 +1541,46 @@ fn token_from_keychain_password(password: Vec<u8>) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_legacy_keychain_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(target_os = "macos")]
+fn get_token_from_macos_keychain_legacy_noninteractive(
+    service: &str,
+    account: &str,
+) -> MacosKeychainLookup {
+    let _lock = macos_legacy_keychain_lock();
+    let interaction_was_allowed = match SecKeychain::user_interaction_allowed() {
+        Ok(allowed) => allowed,
+        Err(error) => return MacosKeychainLookup::Failed(error),
+    };
+    let _interaction_guard = if interaction_was_allowed {
+        match SecKeychain::disable_user_interaction() {
+            Ok(guard) => Some(guard),
+            Err(error) => return MacosKeychainLookup::Failed(error),
+        }
+    } else {
+        None
+    };
+
+    match macos_find_generic_password(None, service, account) {
+        Ok((password, _item)) => token_from_keychain_password(password.as_ref().to_vec())
+            .map_or(MacosKeychainLookup::NotFound, MacosKeychainLookup::Found),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => MacosKeychainLookup::NotFound,
+        Err(error) if error.code() == ERR_SEC_INTERACTION_NOT_ALLOWED => {
+            MacosKeychainLookup::InteractionRequired
+        }
+        Err(error) => MacosKeychainLookup::Failed(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn get_token_from_macos_keychain_legacy(service: &str, account: &str) -> Option<String> {
+    let _lock = macos_legacy_keychain_lock();
     match macos_find_generic_password(None, service, account) {
         Ok((password, _item)) => token_from_keychain_password(password.as_ref().to_vec()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => None,
@@ -2166,6 +2238,23 @@ mod tests {
         assert_eq!(credential.as_deref(), Some("file-token"));
         assert_eq!(notices.get(), 0);
         assert_eq!(retries.get(), 0);
+    }
+
+    #[test]
+    fn conditional_keychain_probe_uses_legacy_lookup_after_modern_miss() {
+        let legacy_lookups = std::cell::Cell::new(0);
+
+        let credential =
+            resolve_keychain_probe_with_legacy_lookup(KeychainCredentialProbe::NotFound, || {
+                legacy_lookups.set(legacy_lookups.get() + 1);
+                KeychainCredentialProbe::Found("legacy-token".to_string())
+            });
+
+        assert!(matches!(
+            credential,
+            KeychainCredentialProbe::Found(token) if token == "legacy-token"
+        ));
+        assert_eq!(legacy_lookups.get(), 1);
     }
 
     #[test]

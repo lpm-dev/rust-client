@@ -79,6 +79,7 @@ pub enum PackageBaselineLayout {
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
     by_coords: HashMap<(String, String), InstalledPackageBaseline>,
+    by_integrity: HashMap<String, InstalledPackageBaseline>,
 }
 
 impl V2BaselineIndex {
@@ -127,6 +128,7 @@ impl V2BaselineIndex {
         let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let links_root = store_v2.paths().links_root();
         let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
+        let mut by_integrity: HashMap<String, InstalledPackageBaseline> = HashMap::new();
 
         // Seeds: every direct symlink under `<project>/node_modules/`
         // whose target lives inside `<links_root>/<key>/`. Direct-bin
@@ -223,14 +225,18 @@ impl V2BaselineIndex {
             // walk inserts before the BFS, and BFS itself is FIFO, so
             // the chosen entry is whichever is closer to the project
             // root in the symlink graph.
+            let baseline = InstalledPackageBaseline {
+                package_dir,
+                pristine_dir,
+                integrity: meta_sri.clone(),
+                layout: PackageBaselineLayout::V2,
+            };
+            by_integrity
+                .entry(meta_sri)
+                .or_insert_with(|| baseline.clone());
             by_coords
                 .entry((meta_name, meta_version))
-                .or_insert(InstalledPackageBaseline {
-                    package_dir,
-                    pristine_dir,
-                    integrity: meta_sri,
-                    layout: PackageBaselineLayout::V2,
-                });
+                .or_insert(baseline);
             for dep in &meta_deps {
                 // `LinkMeta.deps` carries the full 64-hex digest; the
                 // on-disk dir name uses the first 16 chars. See
@@ -261,7 +267,10 @@ impl V2BaselineIndex {
             }
         }
 
-        Ok(Self { by_coords })
+        Ok(Self {
+            by_coords,
+            by_integrity,
+        })
     }
 
     /// Walk every v2 link entry under `lpm_root` once and produce an
@@ -280,17 +289,9 @@ impl V2BaselineIndex {
     pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
         let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
+        let mut by_integrity: HashMap<String, InstalledPackageBaseline> = HashMap::new();
         for (link_dir, meta) in store_v2.iter_link_entries()? {
             let key = (meta.name.clone(), meta.version.clone());
-            // First-match wins. `iter_link_entries` returns directory
-            // order, which matches the legacy linear scan's
-            // tie-breaking. Re-running this walk twice on the same
-            // disk state must produce the same map; that's why we
-            // skip the insert when a coord is already populated
-            // rather than overwrite.
-            if by_coords.contains_key(&key) {
-                continue;
-            }
             let package_dir = link_dir.join("node_modules").join(&meta.name);
             if !package_dir.exists() {
                 // Sidecar present but link entry missing the package
@@ -303,23 +304,37 @@ impl V2BaselineIndex {
                 Ok(p) if p.exists() => p,
                 _ => package_dir.clone(),
             };
-            by_coords.insert(
-                key,
-                InstalledPackageBaseline {
-                    package_dir,
-                    pristine_dir,
-                    integrity: meta.source_sri,
-                    layout: PackageBaselineLayout::V2,
-                },
-            );
+            let baseline = InstalledPackageBaseline {
+                package_dir,
+                pristine_dir,
+                integrity: meta.source_sri.clone(),
+                layout: PackageBaselineLayout::V2,
+            };
+            by_integrity
+                .entry(meta.source_sri)
+                .or_insert_with(|| baseline.clone());
+            // Coordinate lookup retains its legacy first-match semantics,
+            // while the integrity index keeps distinct source bytes.
+            by_coords.entry(key).or_insert(baseline);
         }
-        Ok(Self { by_coords })
+        Ok(Self {
+            by_coords,
+            by_integrity,
+        })
     }
 
     /// O(1) lookup. `None` means no v2 link entry covers the
     /// `(name, version)` pair — caller should fall back to v1.
     pub fn lookup(&self, name: &str, version: &str) -> Option<&InstalledPackageBaseline> {
         self.by_coords.get(&(name.to_string(), version.to_string()))
+    }
+
+    /// O(1) lookup by the package tarball's SRI identity.
+    ///
+    /// Unlike [`Self::lookup`], this remains unambiguous when different
+    /// registries provide different bytes for the same package coordinates.
+    pub fn lookup_by_integrity(&self, integrity: &str) -> Option<&InstalledPackageBaseline> {
+        self.by_integrity.get(integrity)
     }
 }
 
@@ -458,6 +473,41 @@ pub fn find_installed_package_baseline_indexed(
         });
     }
     None
+}
+
+/// Resolve an indexed baseline using the source integrity when available.
+///
+/// An integrity-qualified v2 miss does not fall back to a coordinate-only v2
+/// match because that could select different bytes from another registry.
+/// The v1 fallback is accepted only when its recorded integrity matches.
+pub fn find_installed_package_baseline_by_identity_indexed(
+    index: &V2BaselineIndex,
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+) -> Option<InstalledPackageBaseline> {
+    let Some(expected_integrity) = integrity else {
+        return find_installed_package_baseline_indexed(index, lpm_root, name, version);
+    };
+
+    if let Some(baseline) = index.lookup_by_integrity(expected_integrity) {
+        return Some(baseline.clone());
+    }
+
+    let store_v1 = PackageStore::from_root(lpm_root);
+    let package_dir = store_v1.package_dir(name, version);
+    let recorded_integrity = read_stored_integrity(&package_dir)?;
+    if recorded_integrity != expected_integrity {
+        return None;
+    }
+
+    Some(InstalledPackageBaseline {
+        package_dir: package_dir.clone(),
+        pristine_dir: package_dir,
+        integrity: recorded_integrity,
+        layout: PackageBaselineLayout::V1,
+    })
 }
 
 /// Resolve a package's installed source bytes + integrity in a
