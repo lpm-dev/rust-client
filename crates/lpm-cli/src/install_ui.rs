@@ -605,6 +605,30 @@ pub fn short_registry_host(url: &str) -> String {
         )
 }
 
+pub fn safe_package_source_identity(raw: &str) -> String {
+    let Ok(source) = lpm_lockfile::Source::parse(raw) else {
+        return "unknown-source".to_owned();
+    };
+    let source_id = source.source_id();
+    match source {
+        lpm_lockfile::Source::Registry { url } => {
+            let Ok(parsed) = reqwest::Url::parse(&url) else {
+                return format!("registry:{source_id}");
+            };
+            let origin = parsed.origin().ascii_serialization();
+            if origin == "null" {
+                format!("registry:{source_id}")
+            } else {
+                format!("registry+{origin}")
+            }
+        }
+        lpm_lockfile::Source::Tarball { .. } => format!("tarball:{source_id}"),
+        lpm_lockfile::Source::Directory { .. } => format!("directory:{source_id}"),
+        lpm_lockfile::Source::Link { .. } => format!("link:{source_id}"),
+        lpm_lockfile::Source::Git { .. } => format!("git:{source_id}"),
+    }
+}
+
 /// Success terminus: `✓ {msg}`.
 pub fn done(msg: &'static str) {
     emit_line(LineKind::Done, msg);
@@ -934,7 +958,8 @@ pub fn format_audit_advisory(
 mod tests {
     use super::{
         LineKind, TerminalLine, assert_positional_terminal_format, format_line,
-        spinner_animation_enabled, static_spin_fallback_line, usage_bar_filled_cells,
+        safe_package_source_identity, spinner_animation_enabled, static_spin_fallback_line,
+        usage_bar_filled_cells,
     };
     use std::borrow::Cow;
 
@@ -1014,5 +1039,23 @@ mod tests {
     fn terminal_line_format_rejects_implicit_named_capture() {
         let result = std::panic::catch_unwind(|| assert_positional_terminal_format("{field}"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn package_source_identity_keeps_only_registry_origin() {
+        let identity = safe_package_source_identity(
+            "registry+https://user:password@example.test/private?token=secret#fragment",
+        );
+
+        assert_eq!(identity, "registry+https://example.test");
+    }
+
+    #[test]
+    fn package_source_identity_uses_opaque_id_for_non_registry_source() {
+        let identity =
+            safe_package_source_identity("git+https://user:password@example.test/private.git");
+
+        assert!(identity.starts_with("git:g-"));
+        assert!(!identity.contains("example.test"));
     }
 }

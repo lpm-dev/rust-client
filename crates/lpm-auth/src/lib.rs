@@ -1477,6 +1477,7 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
 
 #[cfg(target_os = "macos")]
 fn get_password_from_macos_keychain_native(service: &str, account: &str) -> MacosKeychainLookup {
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     match macos_get_generic_password(service, account) {
         Ok(password) => token_from_keychain_password(password)
             .map_or(MacosKeychainLookup::NotFound, MacosKeychainLookup::Found),
@@ -1508,6 +1509,7 @@ fn get_password_from_macos_keychain_noninteractive(
     let context_ptr = std::ptr::from_ref(&*context).cast::<std::ffi::c_void>();
     let context_value = unsafe { CFType::wrap_under_get_rule(context_ptr) };
 
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     let result = ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service(service)
@@ -1541,19 +1543,11 @@ fn token_from_keychain_password(password: Vec<u8>) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_legacy_keychain_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[cfg(target_os = "macos")]
 fn get_token_from_macos_keychain_legacy_noninteractive(
     service: &str,
     account: &str,
 ) -> MacosKeychainLookup {
-    let _lock = macos_legacy_keychain_lock();
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     let interaction_was_allowed = match SecKeychain::user_interaction_allowed() {
         Ok(allowed) => allowed,
         Err(error) => return MacosKeychainLookup::Failed(error),
@@ -1580,7 +1574,7 @@ fn get_token_from_macos_keychain_legacy_noninteractive(
 
 #[cfg(target_os = "macos")]
 fn get_token_from_macos_keychain_legacy(service: &str, account: &str) -> Option<String> {
-    let _lock = macos_legacy_keychain_lock();
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     match macos_find_generic_password(None, service, account) {
         Ok((password, _item)) => token_from_keychain_password(password.as_ref().to_vec()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => None,
@@ -1595,12 +1589,14 @@ fn get_token_from_macos_keychain_legacy(service: &str, account: &str) -> Option<
 
 #[cfg(target_os = "macos")]
 fn set_password_in_macos_keychain(service: &str, account: &str, token: &str) -> Result<(), String> {
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     macos_set_generic_password(service, account, token.as_bytes())
         .map_err(|error| format!("keychain write error: {error}"))
 }
 
 #[cfg(target_os = "macos")]
 fn clear_password_from_macos_keychain(service: &str, account: &str) -> Result<(), String> {
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     match macos_delete_generic_password(service, account) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
@@ -1715,7 +1711,8 @@ fn get_encryption_key() -> Result<String, String> {
         .join(".key");
 
     if !force_file_auth() {
-        // Try keyring first
+        #[cfg(target_os = "macos")]
+        let _lock = lpm_common::platform::macos_keychain_operation_lock();
         if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
             && let Ok(key) = entry.get_password()
         {
@@ -1742,10 +1739,15 @@ fn get_encryption_key() -> Result<String, String> {
         .collect();
 
     // Store in keyring; only fall back to file if keyring is unavailable
-    let keyring_ok = !force_file_auth()
-        && keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
+    let keyring_ok = if force_file_auth() {
+        false
+    } else {
+        #[cfg(target_os = "macos")]
+        let _lock = lpm_common::platform::macos_keychain_operation_lock();
+        keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
             .and_then(|entry| entry.set_password(&key))
-            .is_ok();
+            .is_ok()
+    };
 
     if !keyring_ok {
         let dir = key_path.parent().unwrap();
@@ -2359,6 +2361,38 @@ mod tests {
     fn keychain_password_bytes_ignore_empty_or_invalid_values() {
         assert_eq!(token_from_keychain_password(b" \n\t".to_vec()), None);
         assert_eq!(token_from_keychain_password(vec![0xff, 0xfe]), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn modern_keychain_read_waits_for_process_interaction_lock() {
+        let lock = lpm_common::platform::macos_keychain_operation_lock();
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_started = std::sync::Arc::clone(&started);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let service = format!("lpm-cli.lock-test.{}", std::process::id());
+
+        let worker = std::thread::spawn(move || {
+            worker_started.wait();
+            let _ = get_password_from_macos_keychain_native(&service, "missing-account");
+            finished_tx.send(()).unwrap();
+        });
+        started.wait();
+
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "modern Keychain reads must share the lock that guards the process-wide interaction state"
+        );
+
+        drop(lock);
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        );
+        worker.join().unwrap();
     }
 
     #[cfg(target_os = "macos")]

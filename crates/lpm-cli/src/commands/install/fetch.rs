@@ -2993,31 +2993,8 @@ pub(super) fn invalidate_metadata_routed(
     }
 }
 
-fn sanitized_registry_identity(url: &str, source_id: &str) -> String {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return format!("registry:{source_id}");
-    };
-    let origin = parsed.origin().ascii_serialization();
-    if origin == "null" {
-        format!("registry:{source_id}")
-    } else {
-        format!("registry+{origin}")
-    }
-}
-
 fn sanitized_source_identity(package: &InstallPackage) -> String {
-    let Ok(source) = package.source_kind() else {
-        return "unknown-source".to_string();
-    };
-    match &source {
-        lpm_lockfile::Source::Registry { url } => {
-            sanitized_registry_identity(url, &source.source_id())
-        }
-        lpm_lockfile::Source::Tarball { .. } => format!("tarball:{}", source.source_id()),
-        lpm_lockfile::Source::Directory { .. } => format!("directory:{}", source.source_id()),
-        lpm_lockfile::Source::Link { .. } => format!("link:{}", source.source_id()),
-        lpm_lockfile::Source::Git { .. } => format!("git:{}", source.source_id()),
-    }
+    install_ui::safe_package_source_identity(&package.source)
 }
 
 fn upgrade_command_for_root_links(

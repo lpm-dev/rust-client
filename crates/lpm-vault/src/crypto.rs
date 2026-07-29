@@ -104,6 +104,8 @@ fn force_file_wrapping_key() -> bool {
 
 /// Read the wrapping key from the system keyring.
 fn read_wrapping_key_from_keyring() -> Option<[u8; 32]> {
+    #[cfg(target_os = "macos")]
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT).ok()?;
     let hex_key = entry.get_password().ok()?;
     let bytes = hex::decode(hex_key.trim()).ok()?;
@@ -117,6 +119,8 @@ fn read_wrapping_key_from_keyring() -> Option<[u8; 32]> {
 
 /// Store the wrapping key in the system keyring.
 fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
     let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)
         .map_err(|e| format!("keyring entry error: {e}"))?;
     entry

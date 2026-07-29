@@ -707,11 +707,7 @@ fn build_severity_groups(counts: &HashMap<&'static str, HashSet<String>>) -> Vec
                     }
                     let source = fields.next().unwrap_or("");
                     let integrity = fields.next().unwrap_or("");
-                    let source = source
-                        .strip_prefix("registry+https://")
-                        .or_else(|| source.strip_prefix("registry+http://"))
-                        .unwrap_or(source)
-                        .trim_end_matches('/');
+                    let source = install_ui::safe_package_source_identity(source);
                     let integrity_preview: String = integrity.chars().take(20).collect();
                     if integrity_preview.is_empty() {
                         format!("{coordinate} ({source})")
@@ -1069,6 +1065,39 @@ mod tests {
                 .packages
                 .iter()
                 .any(|package| package.contains("registry.example.com"))
+        );
+    }
+
+    #[test]
+    fn severity_groups_redact_registry_credentials_and_url_components() {
+        let package = SecuritySummaryPackage {
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://user:password@example.test/private?token=query-secret"
+                .to_string(),
+            integrity: Some("sha512-source-a".to_string()),
+            is_lpm: false,
+        };
+        let sibling = SecuritySummaryPackage {
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://registry.npmjs.org".to_string(),
+            integrity: Some("sha512-source-b".to_string()),
+            is_lpm: false,
+        };
+        let counts = HashMap::from([(
+            "eval",
+            HashSet::from([package.finding_key(), sibling.finding_key()]),
+        )]);
+
+        let issues = build_severity_groups(&counts);
+
+        assert_eq!(
+            issues[0].packages,
+            [
+                "duplicate@1.0.0 (registry+https://example.test, sha512-source-a…)",
+                "duplicate@1.0.0 (registry+https://registry.npmjs.org, sha512-source-b…)",
+            ]
         );
     }
 
