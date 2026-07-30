@@ -885,10 +885,12 @@ fn recursive_install_preserves_member_trust_approval_gates() {
     assert_target_not_installed(&project, "packages/trusted");
 }
 
-// ─── Unified workspace resolution ────────────────────────────────
+// ─── Recursive workspace importer isolation ─────────────────────
 
 use support::lpm_with_registry;
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+};
 
 async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)]) {
     let mut batch = Vec::with_capacity(packages.len());
@@ -916,14 +918,219 @@ async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)])
     mock.with_batch_metadata(batch).await;
 }
 
+fn peer_sensitive_workspace_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+  "name": "peer-sensitive-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/with-runtime/package.json",
+        r#"{
+  "name": "@fixture/with-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0",
+    "peer-runtime": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/without-runtime/package.json",
+        r#"{
+  "name": "@fixture/without-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0"
+  }
+}"#,
+    );
+    project
+}
+
+fn peer_sensitive_standalone_project(with_runtime: bool) -> TempProject {
+    TempProject::empty(if with_runtime {
+        r#"{
+  "name": "peer-sensitive-standalone-with-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0",
+    "peer-runtime": "1.0.0"
+  }
+}"#
+    } else {
+        r#"{
+  "name": "peer-sensitive-standalone-without-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0"
+  }
+}"#
+    })
+}
+
+async fn mount_peer_sensitive_workspace_packages(mock: &MockRegistry) {
+    let plugin_manifest = serde_json::json!({
+        "name": "peer-plugin",
+        "version": "1.0.0",
+        "peerDependencies": {
+            "peer-runtime": "*"
+        }
+    });
+    let plugin_tarball = make_tarball_from_pkg_json(plugin_manifest.clone(), &[]);
+    let plugin_metadata = serde_json::json!({
+        "name": "peer-plugin",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "peer-plugin",
+                "version": "1.0.0",
+                "peerDependencies": {
+                    "peer-runtime": "*"
+                },
+                "dist": {
+                    "tarball": mock.tarball_url("peer-plugin", "1.0.0"),
+                    "integrity": compute_integrity(&plugin_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+
+    let runtime_v1_tarball = make_tarball("peer-runtime", "1.0.0");
+    let runtime_v2_tarball = make_tarball("peer-runtime", "2.0.0");
+    let runtime_metadata = serde_json::json!({
+        "name": "peer-runtime",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "peer-runtime",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("peer-runtime", "1.0.0"),
+                    "integrity": compute_integrity(&runtime_v1_tarball)
+                },
+                "dependencies": {}
+            },
+            "2.0.0": {
+                "name": "peer-runtime",
+                "version": "2.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("peer-runtime", "2.0.0"),
+                    "integrity": compute_integrity(&runtime_v2_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "2.0.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+
+    mock.with_package_metadata_and_tarballs(
+        "peer-plugin",
+        plugin_metadata.clone(),
+        &[("1.0.0", plugin_tarball)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        "peer-runtime",
+        runtime_metadata.clone(),
+        &[("1.0.0", runtime_v1_tarball), ("2.0.0", runtime_v2_tarball)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![plugin_metadata, runtime_metadata])
+        .await;
+}
+
+fn member_package_graph(project: &TempProject, member: &str) -> Vec<(String, String, Vec<String>)> {
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join(member).join("lpm.lock"))
+        .unwrap_or_else(|error| panic!("read {member}/lpm.lock: {error}"));
+    lockfile
+        .packages
+        .into_iter()
+        .map(|package| (package.name, package.version, package.peers))
+        .collect()
+}
+
 #[tokio::test]
-async fn recursive_install_slices_shared_resolution_per_member_lockfile() {
+async fn recursive_install_preserves_importer_local_peer_contexts_in_parallel() {
+    let mock = MockRegistry::start().await;
+    mount_peer_sensitive_workspace_packages(&mock).await;
+
+    let standalone_with_runtime = peer_sensitive_standalone_project(true);
+    let with_runtime_output = lpm_with_registry(&standalone_with_runtime, &mock.url())
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run standalone install with a direct peer runtime");
+    assert_install_succeeded(
+        &with_runtime_output,
+        "standalone install with a direct peer runtime should succeed",
+    );
+    let standalone_without_runtime = peer_sensitive_standalone_project(false);
+    let without_runtime_output = lpm_with_registry(&standalone_without_runtime, &mock.url())
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run standalone install without a direct peer runtime");
+    assert_install_succeeded(
+        &without_runtime_output,
+        "standalone install without a direct peer runtime should succeed",
+    );
+
+    let expected_with_runtime = member_package_graph(&standalone_with_runtime, "");
+    let expected_without_runtime = member_package_graph(&standalone_without_runtime, "");
+    assert_ne!(
+        expected_with_runtime, expected_without_runtime,
+        "the fixture must produce distinct independent importer graphs",
+    );
+
+    for attempt in 1..=3 {
+        let recursive = peer_sensitive_workspace_project();
+        let recursive_output = lpm_with_registry(&recursive, &mock.url())
+            .arg("install")
+            .arg("--recursive")
+            .arg("--workspace-concurrency")
+            .arg("4")
+            .args(INSTALL_FLAGS)
+            .output()
+            .unwrap_or_else(|error| panic!("run recursive install attempt {attempt}: {error}"));
+        assert_install_succeeded(
+            &recursive_output,
+            &format!("recursive install attempt {attempt} should succeed"),
+        );
+
+        assert_eq!(
+            member_package_graph(&recursive, "packages/with-runtime"),
+            expected_with_runtime,
+            "attempt {attempt} changed the importer graph that declares peer-runtime directly",
+        );
+        assert_eq!(
+            member_package_graph(&recursive, "packages/without-runtime"),
+            expected_without_runtime,
+            "attempt {attempt} leaked another importer's direct peer into the peer-autoinstall graph",
+        );
+    }
+}
+
+#[tokio::test]
+async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
     let mock = MockRegistry::start().await;
     mount_registry_packages(&mock, &[("shared-dep", "1.0.0"), ("web-only-dep", "2.0.0")]).await;
 
     let project = TempProject::empty(
         r#"{
-  "name": "unified-root",
+  "name": "importer-scoped-root",
   "version": "1.0.0",
   "private": true,
   "workspaces": ["packages/*"]
@@ -956,15 +1163,12 @@ async fn recursive_install_slices_shared_resolution_per_member_lockfile() {
     let output = lpm_with_registry(&project, &mock.url())
         .arg("install")
         .arg("--recursive")
+        .arg("--workspace-concurrency")
+        .arg("4")
         .args(INSTALL_FLAGS)
         .output()
         .expect("run recursive install against the mock registry");
-    assert_install_succeeded(&output, "unified recursive install should succeed");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Using workspace resolution"),
-        "at least one member should consume the shared workspace resolution: {stderr}",
-    );
+    assert_install_succeeded(&output, "recursive install should succeed");
 
     for member in ["packages/core", "packages/web"] {
         assert_target_installed(&project, member);
@@ -1050,6 +1254,8 @@ async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
     let output = lpm_with_registry(&project, &mock.url())
         .arg("install")
         .arg("--recursive")
+        .arg("--workspace-concurrency")
+        .arg("4")
         .args(INSTALL_FLAGS)
         .output()
         .expect("run recursive install with conflicting member specs");

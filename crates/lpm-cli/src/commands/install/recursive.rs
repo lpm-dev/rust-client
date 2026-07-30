@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
-const WORKSPACE_INSTALL_DEFAULT_MAX_CONCURRENCY: usize = 4;
+const WORKSPACE_INSTALL_DEFAULT_CONCURRENCY: usize = 1;
 
 pub(crate) struct RecursiveInstallOptions {
     pub(crate) json_output: bool,
@@ -103,13 +103,6 @@ pub(crate) async fn run_recursive_workspace_install(
 
     let concurrency =
         resolve_workspace_install_concurrency(options.workspace_concurrency, targets.len());
-    let unified_plan = unified_resolve::build_workspace_resolve_plan(
-        &workspace,
-        &targets
-            .iter()
-            .map(|target| (target.path.clone(), target.kind == "root"))
-            .collect::<Vec<_>>(),
-    );
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);
     let started = Instant::now();
@@ -155,7 +148,6 @@ pub(crate) async fn run_recursive_workspace_install(
                         &lpm_root,
                         Arc::clone(&active_workspace),
                         Arc::clone(&options),
-                        unified_plan.clone(),
                         &mut outcomes,
                     );
                 }
@@ -219,7 +211,6 @@ fn spawn_workspace_target_install(
     lpm_root: &lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
-    unified_plan: Option<Arc<unified_resolve::WorkspaceResolvePlan>>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
@@ -232,15 +223,8 @@ fn spawn_workspace_target_install(
     let client = client.clone_with_config();
     let lpm_root = lpm_root.clone();
     in_flight.spawn_local(async move {
-        let result = run_workspace_target_install(
-            plan,
-            client,
-            lpm_root,
-            base_workspace,
-            options,
-            unified_plan,
-        )
-        .await;
+        let result =
+            run_workspace_target_install(plan, client, lpm_root, base_workspace, options).await;
         (index, result)
     });
 }
@@ -251,7 +235,6 @@ async fn run_workspace_target_install(
     lpm_root: lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
-    unified_plan: Option<Arc<unified_resolve::WorkspaceResolvePlan>>,
 ) -> Result<TargetTaskResult, LpmError> {
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
@@ -317,19 +300,12 @@ async fn run_workspace_target_install(
         Some(capture) => {
             crate::workspace_discovery_cache::scope(
                 Arc::clone(&scoped_workspace),
-                unified_resolve::scope_if(
-                    unified_plan,
-                    report_capture::scope(Arc::clone(capture), install),
-                ),
+                report_capture::scope(Arc::clone(capture), install),
             )
             .await?;
         }
         None => {
-            crate::workspace_discovery_cache::scope(
-                Arc::clone(&scoped_workspace),
-                unified_resolve::scope_if(unified_plan, install),
-            )
-            .await?;
+            crate::workspace_discovery_cache::scope(Arc::clone(&scoped_workspace), install).await?;
         }
     }
 
@@ -355,12 +331,7 @@ fn resolve_workspace_install_concurrency(
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|value| *value > 0)
     });
-    let limit = configured.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(WORKSPACE_INSTALL_DEFAULT_MAX_CONCURRENCY)
-            .clamp(1, WORKSPACE_INSTALL_DEFAULT_MAX_CONCURRENCY)
-    });
+    let limit = configured.unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY);
     limit.min(target_count.max(1))
 }
 
@@ -643,4 +614,19 @@ fn attach_aggregate_telemetry(report: &mut serde_json::Value, wall_ms: u64) {
 
 fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recursive_workspace_install_defaults_to_sequential_execution() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            ENV_WORKSPACE_CONCURRENCY,
+            None::<std::ffi::OsString>,
+        )]);
+
+        assert_eq!(resolve_workspace_install_concurrency(None, 4), 1);
+    }
 }

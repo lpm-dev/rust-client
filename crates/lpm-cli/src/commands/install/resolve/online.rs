@@ -47,11 +47,6 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) streaming_fetch: bool,
     pub(in crate::commands::install) dependency_engine_policy:
         Arc<crate::engine_check::DependencyEnginePolicy>,
-    /// Slice of a shared workspace resolution (see
-    /// `unified_resolve`). When set, the phase skips its own resolver
-    /// pass and feeds the slice through the common post-resolve tail.
-    pub(in crate::commands::install) workspace_preresolved:
-        Option<crate::commands::install::unified_resolve::PreresolvedWorkspacePackages>,
 }
 
 pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
@@ -129,7 +124,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         strict_integrity,
         streaming_fetch,
         dependency_engine_policy,
-        workspace_preresolved,
     } = input;
 
     let NonRegistryPreResolveResult {
@@ -189,22 +183,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let mut auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
     let mut linker_mode = linker_mode;
 
-    enum ResolutionSource {
-        Lockfile(LockfileFastPath),
-        WorkspacePreresolved(
-            crate::commands::install::unified_resolve::PreresolvedWorkspacePackages,
-        ),
-        Fresh,
-    }
-    let resolution_source = match (lockfile_result, workspace_preresolved) {
-        (Some(fast_path), _) => ResolutionSource::Lockfile(fast_path),
-        (None, Some(preresolved)) => ResolutionSource::WorkspacePreresolved(preresolved),
-        (None, None) => ResolutionSource::Fresh,
-    };
-
     let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
-        match resolution_source {
-            ResolutionSource::Lockfile(fast_path) => {
+        match lockfile_result {
+            Some(fast_path) => {
                 if !json_output {
                     output::info_line(crate::install_ui::terminal_line!(
                         "Using lockfile ({} packages)",
@@ -217,26 +198,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 needs_binary_upgrade = fast_path.needs_binary_upgrade;
                 (fast_path.packages, 0u128, true, 0usize, HashMap::new())
             }
-            ResolutionSource::WorkspacePreresolved(preresolved) => {
-                resolved_with = "workspace-unified";
-                if preresolved.auto_isolated_peer_conflicts {
-                    auto_isolated_peer_conflicts = true;
-                    linker_mode = preresolved.linker_mode;
-                }
-                ambient_peer_installs_for_lockfile = preresolved.ambient_peer_installs;
-                let mut packages = preresolved.packages;
-                packages.extend(tarball_url_install_pkgs.iter().cloned());
-                apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
-                enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
-                if !json_output {
-                    output::info_line(crate::install_ui::terminal_line!(
-                        "Using workspace resolution ({} packages)",
-                        install_ui::bold(&packages.len().to_string())
-                    ));
-                }
-                (packages, 0u128, false, 0usize, HashMap::new())
-            }
-            ResolutionSource::Fresh => {
+            None => {
                 let resolve_start = Instant::now();
                 let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
                 let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
