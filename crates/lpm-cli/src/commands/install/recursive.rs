@@ -102,8 +102,11 @@ pub(crate) async fn run_recursive_workspace_install(
         return Ok(());
     }
 
-    let lockfile_replay_ready = workspace_targets_need_materialization(&targets)
+    let targets_need_materialization = workspace_targets_need_materialization(&targets);
+    let lockfile_replay_ready = targets_need_materialization
         && workspace_targets_are_lockfile_replay_ready(&workspace, &targets, &options);
+    let share_local_source_populations =
+        targets.iter().all(|target| !target.lifecycle.has_scripts());
     let automatic_parallel_replay =
         explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
             && lockfile_replay_ready;
@@ -115,11 +118,17 @@ pub(crate) async fn run_recursive_workspace_install(
     tracing::debug!(
         concurrency,
         lockfile_replay_ready,
+        share_local_source_populations,
         automatic_parallel_replay,
         "selected recursive workspace install concurrency"
     );
-    let materialization_coordinator = lockfile_replay_ready.then(|| {
-        Arc::new(workspace_materialization::WorkspaceMaterializationCoordinator::default())
+    let materialization_coordinator = targets_need_materialization.then(|| {
+        Arc::new(
+            workspace_materialization::WorkspaceMaterializationCoordinator::new(
+                lockfile_replay_ready,
+                share_local_source_populations,
+            ),
+        )
     });
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);

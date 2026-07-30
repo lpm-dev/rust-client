@@ -1,4 +1,5 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::Path;
 
 use crate::SecurityAnalysisPolicy;
@@ -10,6 +11,7 @@ use super::integrity::{
     local_source_sentinel_path, remove_object_metadata_dir_best_effort,
     write_tree_object_integrity,
 };
+use super::tree_hash::is_object_metadata_sidecar_name;
 
 fn is_complete_local_source_object_dir(dir: &Path) -> bool {
     is_complete_object_dir(dir) && has_local_source_sentinel(dir)
@@ -157,6 +159,261 @@ fn is_excluded_local_source_entry(name: &OsStr) -> bool {
         || name == ".lpm"
         || name == "lpm.lock"
         || name == "lpm.lockb"
+}
+
+pub(crate) fn local_source_snapshot_matches(
+    source_root: &Path,
+    object_root: &Path,
+) -> Result<bool, LpmError> {
+    if !is_complete_local_source_object_dir(object_root) {
+        return Ok(false);
+    }
+    local_source_snapshot_dirs_match(source_root, object_root, object_root, 0)
+}
+
+fn local_source_snapshot_dirs_match(
+    source_dir: &Path,
+    object_dir: &Path,
+    object_root: &Path,
+    depth: usize,
+) -> Result<bool, LpmError> {
+    if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
+        return Err(LpmError::Store(format!(
+            "v2 local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            source_dir.display()
+        )));
+    }
+
+    let source_entries =
+        read_snapshot_entries(source_dir, |_, name| is_excluded_local_source_entry(name))?;
+    let object_entries = read_snapshot_entries(object_dir, |dir, name| {
+        is_object_metadata_sidecar_name(object_root, dir, name)
+    })?;
+    if source_entries.len() != object_entries.len() {
+        return Ok(false);
+    }
+
+    let mut source_path = source_dir.to_path_buf();
+    let mut object_path = object_dir.to_path_buf();
+    for (source, object) in source_entries.iter().zip(&object_entries) {
+        if source.name != object.name {
+            return Ok(false);
+        }
+        source_path.push(&source.name);
+        object_path.push(&object.name);
+
+        let source_type = source.metadata.file_type();
+        let object_type = object.metadata.file_type();
+        let matches = if source_type.is_dir() {
+            object_type.is_dir()
+                && local_source_snapshot_dirs_match(
+                    &source_path,
+                    &object_path,
+                    object_root,
+                    depth + 1,
+                )?
+        } else if source_type.is_file() {
+            object_type.is_file()
+                && regular_files_match(
+                    &source_path,
+                    &source.metadata,
+                    &object_path,
+                    &object.metadata,
+                )?
+        } else if source_type.is_symlink() {
+            symlink_snapshot_entry_matches(&source_path, &object_path, &object.metadata)?
+        } else {
+            false
+        };
+
+        source_path.pop();
+        object_path.pop();
+        if !matches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+struct SnapshotEntry {
+    name: OsString,
+    metadata: std::fs::Metadata,
+}
+
+fn read_snapshot_entries(
+    dir: &Path,
+    exclude: impl Fn(&Path, &OsStr) -> bool,
+) -> Result<Vec<SnapshotEntry>, LpmError> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to read local-source snapshot directory {}: {error}",
+            dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            LpmError::Store(format!(
+                "failed to enumerate local-source snapshot entry: {error}"
+            ))
+        })?;
+        let name = entry.file_name();
+        if exclude(dir, &name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect local-source snapshot entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        entries.push(SnapshotEntry { name, metadata });
+    }
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+fn symlink_snapshot_entry_matches(
+    source_path: &Path,
+    object_path: &Path,
+    object_metadata: &std::fs::Metadata,
+) -> Result<bool, LpmError> {
+    let resolved = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    match std::fs::metadata(&resolved) {
+        Ok(source_metadata) if source_metadata.is_file() => {
+            if !object_metadata.file_type().is_file() {
+                return Ok(false);
+            }
+            regular_files_match(&resolved, &source_metadata, object_path, object_metadata)
+        }
+        _ if object_metadata.file_type().is_symlink() => std::fs::read_link(object_path)
+            .map(|target| target == resolved)
+            .map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to inspect local-source snapshot symlink {}: {error}",
+                    object_path.display()
+                ))
+            }),
+        _ => Ok(false),
+    }
+}
+
+fn regular_files_match(
+    source_path: &Path,
+    source_metadata: &std::fs::Metadata,
+    object_path: &Path,
+    object_metadata: &std::fs::Metadata,
+) -> Result<bool, LpmError> {
+    if !regular_file_metadata_matches(source_metadata, object_metadata) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if source_metadata.dev() == object_metadata.dev()
+            && source_metadata.ino() == object_metadata.ino()
+        {
+            return Ok(true);
+        }
+    }
+
+    let mut source = std::fs::File::open(source_path).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to read local source file {}: {error}",
+            source_path.display()
+        ))
+    })?;
+    let mut object = std::fs::File::open(object_path).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to read local-source snapshot file {}: {error}",
+            object_path.display()
+        ))
+    })?;
+    let mut source_buffer = [0u8; 8192];
+    let mut object_buffer = [0u8; 8192];
+    loop {
+        let source_read = source.read(&mut source_buffer).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to read local source file {}: {error}",
+                source_path.display()
+            ))
+        })?;
+        let object_read = object.read(&mut object_buffer).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to read local-source snapshot file {}: {error}",
+                object_path.display()
+            ))
+        })?;
+        if source_read != object_read
+            || source_buffer[..source_read] != object_buffer[..object_read]
+        {
+            return Ok(false);
+        }
+        if source_read == 0 {
+            break;
+        }
+    }
+
+    let source_after = source.metadata().map_err(|error| {
+        LpmError::Store(format!(
+            "failed to recheck local source file {}: {error}",
+            source_path.display()
+        ))
+    })?;
+    let object_after = object.metadata().map_err(|error| {
+        LpmError::Store(format!(
+            "failed to recheck local-source snapshot file {}: {error}",
+            object_path.display()
+        ))
+    })?;
+    Ok(metadata_unchanged(source_metadata, &source_after)
+        && metadata_unchanged(object_metadata, &object_after))
+}
+
+fn regular_file_metadata_matches(
+    source_metadata: &std::fs::Metadata,
+    object_metadata: &std::fs::Metadata,
+) -> bool {
+    if source_metadata.len() != object_metadata.len() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        source_metadata.permissions().mode() & 0o7777
+            == object_metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        source_metadata.permissions().readonly() == object_metadata.permissions().readonly()
+    }
+}
+
+fn metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if before.len() != after.len()
+        || before.permissions().readonly() != after.permissions().readonly()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.mode() == after.mode()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 pub(crate) fn populate_local_source_object_into(

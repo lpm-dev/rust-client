@@ -359,6 +359,7 @@ pub(super) async fn run_online_fetch_phase(
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
     if v2_mode {
+        let workspace_coordinator = workspace_materialization::current();
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_mode implies v2 store handle is available");
@@ -370,7 +371,21 @@ pub(super) async fn run_online_fetch_phase(
                 continue;
             }
             let sri = local_source_sri_for_target(target);
-            store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+            if let Some(coordinator) = workspace_coordinator.as_ref() {
+                coordinator
+                    .populate_local_source(
+                        target.store_path.clone(),
+                        sri,
+                        Arc::clone(
+                            store_v2_handle
+                                .as_ref()
+                                .expect("v2_mode implies v2 store handle is available"),
+                        ),
+                    )
+                    .await?;
+            } else {
+                store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+            }
         }
     }
     // Under v2 mode, `link_packages_v2` needs the full LinkTarget set in one

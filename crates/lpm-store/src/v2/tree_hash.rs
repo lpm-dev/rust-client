@@ -67,9 +67,29 @@ pub(crate) fn compute_object_tree_integrities(dir: &Path) -> Result<TreeIntegrit
 }
 
 pub(crate) fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
+    #[cfg(target_os = "macos")]
+    match compute_tree_metadata_integrity_bulk(dir) {
+        Ok(integrity) => return Ok(integrity),
+        Err(error) => tracing::trace!(
+            target = %dir.display(),
+            "v2 store: bulk metadata walk unavailable, using portable walker: {error}"
+        ),
+    }
+    compute_tree_metadata_integrity_portable(dir)
+}
+
+fn compute_tree_metadata_integrity_portable(dir: &Path) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
     hash_object_tree_dir(dir, dir, None, &mut hasher, None)?;
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn metadata_hash_implementations_match_for_test(dir: &Path) -> Result<bool, LpmError> {
+    Ok(
+        compute_tree_metadata_integrity_bulk(dir)?
+            == compute_tree_metadata_integrity_portable(dir)?,
+    )
 }
 
 fn hash_object_tree_dir(
@@ -217,6 +237,345 @@ fn hash_object_tree_dir_inner(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn compute_tree_metadata_integrity_bulk(dir: &Path) -> Result<String, LpmError> {
+    let mut hasher = Sha256::new();
+    let mut relative = Vec::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    hash_tree_metadata_dir_bulk(dir, dir, &mut relative, &mut hasher, &mut buffer)?;
+    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+}
+
+#[cfg(target_os = "macos")]
+fn hash_tree_metadata_dir_bulk(
+    root: &Path,
+    dir: &Path,
+    relative: &mut Vec<u8>,
+    hasher: &mut Sha256,
+    buffer: &mut [u8],
+) -> Result<(), LpmError> {
+    let entries = read_bulk_metadata_entries(dir, buffer)?;
+    let mut path = dir.to_path_buf();
+    for entry in entries {
+        if is_object_metadata_sidecar_name(root, dir, &entry.name) {
+            continue;
+        }
+        let relative_len = relative.len();
+        if relative_len != 0 {
+            relative.push(b'/');
+        }
+        push_os_str_bytes(relative, &entry.name);
+        path.push(&entry.name);
+
+        let result = match entry.kind {
+            MacosEntryKind::Directory => {
+                hash_tree_metadata_fields(
+                    hasher,
+                    b"dir",
+                    relative,
+                    entry.mode,
+                    entry.len,
+                    entry.modified_time_nanos,
+                    entry.change_time_nanos,
+                    &[],
+                );
+                hash_tree_metadata_dir_bulk(root, &path, relative, hasher, buffer)
+            }
+            MacosEntryKind::File => {
+                hash_tree_metadata_fields(
+                    hasher,
+                    b"file",
+                    relative,
+                    entry.mode,
+                    entry.len,
+                    entry.modified_time_nanos,
+                    entry.change_time_nanos,
+                    &[],
+                );
+                Ok(())
+            }
+            MacosEntryKind::Symlink => {
+                let target = std::fs::read_link(&path).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to read v2 object symlink {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let mut target_bytes = Vec::new();
+                push_os_str_bytes(&mut target_bytes, target.as_os_str());
+                hash_tree_metadata_fields(
+                    hasher,
+                    b"symlink",
+                    relative,
+                    entry.mode,
+                    target_bytes.len() as u64,
+                    entry.modified_time_nanos,
+                    entry.change_time_nanos,
+                    &target_bytes,
+                );
+                Ok(())
+            }
+            MacosEntryKind::Unsupported => Err(LpmError::Store(format!(
+                "unsupported v2 object entry type at {}",
+                path.display()
+            ))),
+        };
+        path.pop();
+        relative.truncate(relative_len);
+        result?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Unsupported,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosMetadataEntry {
+    name: OsString,
+    kind: MacosEntryKind,
+    mode: u32,
+    len: u64,
+    modified_time_nanos: i128,
+    change_time_nanos: i128,
+}
+
+#[cfg(target_os = "macos")]
+fn read_bulk_metadata_entries(
+    dir: &Path,
+    buffer: &mut [u8],
+) -> Result<Vec<MacosMetadataEntry>, LpmError> {
+    use std::os::fd::AsRawFd;
+
+    let directory = std::fs::File::open(dir).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to read v2 object tree at {}: {error}",
+            dir.display()
+        ))
+    })?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS
+            | libc::ATTR_CMN_NAME
+            | libc::ATTR_CMN_OBJTYPE
+            | libc::ATTR_CMN_MODTIME
+            | libc::ATTR_CMN_CHGTIME
+            | libc::ATTR_CMN_ACCESSMASK,
+        volattr: 0,
+        dirattr: libc::ATTR_DIR_DATALENGTH,
+        fileattr: libc::ATTR_FILE_DATALENGTH,
+        forkattr: 0,
+    };
+    let mut entries = Vec::new();
+    loop {
+        // SAFETY: `directory` remains open for the call; `attributes` is fully
+        // initialized; and `buffer` exposes a valid writable region of the
+        // supplied length. The kernel reports record counts and each record is
+        // bounds-checked before any returned bytes are interpreted.
+        let count = unsafe {
+            libc::getattrlistbulk(
+                directory.as_raw_fd(),
+                std::ptr::addr_of_mut!(attributes).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        if count < 0 {
+            return Err(LpmError::Store(format!(
+                "failed to enumerate v2 object metadata at {}: {}",
+                dir.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        if count == 0 {
+            break;
+        }
+
+        let mut offset = 0_usize;
+        for _ in 0..count {
+            let group_start = offset;
+            let group_len = read_bulk_u32(buffer, &mut offset, buffer.len())
+                .and_then(|len| usize::try_from(len).ok())
+                .filter(|len| *len >= std::mem::size_of::<u32>())
+                .ok_or_else(|| malformed_bulk_record(dir))?;
+            let group_end = group_start
+                .checked_add(group_len)
+                .filter(|end| *end <= buffer.len())
+                .ok_or_else(|| malformed_bulk_record(dir))?;
+            entries.push(parse_bulk_metadata_entry(
+                dir,
+                buffer,
+                &mut offset,
+                group_end,
+            )?);
+            offset = group_end;
+        }
+    }
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_bulk_metadata_entry(
+    dir: &Path,
+    buffer: &[u8],
+    offset: &mut usize,
+    group_end: usize,
+) -> Result<MacosMetadataEntry, LpmError> {
+    const REQUIRED_COMMON_ATTRIBUTES: u32 = libc::ATTR_CMN_NAME
+        | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_CHGTIME
+        | libc::ATTR_CMN_ACCESSMASK;
+
+    let returned_common =
+        read_bulk_u32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    let _returned_volume =
+        read_bulk_u32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    let returned_directory =
+        read_bulk_u32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    let returned_file =
+        read_bulk_u32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    let _returned_fork =
+        read_bulk_u32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    if returned_common & REQUIRED_COMMON_ATTRIBUTES != REQUIRED_COMMON_ATTRIBUTES {
+        return Err(LpmError::Store(format!(
+            "bulk metadata attributes unavailable at {}",
+            dir.display()
+        )));
+    }
+
+    let name_reference_offset = *offset;
+    let name_data_offset =
+        read_bulk_i32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    let name_len = read_bulk_u32(buffer, offset, group_end)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    let name_start = i64::try_from(name_reference_offset)
+        .ok()
+        .and_then(|base| base.checked_add(i64::from(name_data_offset)))
+        .and_then(|start| usize::try_from(start).ok())
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    let name_end = name_start
+        .checked_add(name_len)
+        .filter(|end| *end <= group_end)
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    let name_bytes = buffer
+        .get(name_start..name_end)
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    let name_bytes = name_bytes
+        .strip_suffix(&[0])
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    use std::os::unix::ffi::OsStringExt;
+    let name = OsString::from_vec(name_bytes.to_vec());
+
+    let object_type =
+        read_bulk_u32(buffer, offset, group_end).ok_or_else(|| malformed_bulk_record(dir))?;
+    let modified_time_nanos = read_bulk_timespec_nanos(buffer, offset, group_end)
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    let change_time_nanos = read_bulk_timespec_nanos(buffer, offset, group_end)
+        .ok_or_else(|| malformed_bulk_record(dir))?;
+    let mode = read_bulk_u32(buffer, offset, group_end)
+        .ok_or_else(|| malformed_bulk_record(dir))?
+        & 0o7777;
+
+    let kind = match object_type {
+        1 => MacosEntryKind::File,
+        2 => MacosEntryKind::Directory,
+        5 => MacosEntryKind::Symlink,
+        _ => MacosEntryKind::Unsupported,
+    };
+    let directory_len = if returned_directory & libc::ATTR_DIR_DATALENGTH != 0 {
+        Some(
+            read_bulk_i64(buffer, offset, group_end)
+                .and_then(|len| u64::try_from(len).ok())
+                .ok_or_else(|| malformed_bulk_record(dir))?,
+        )
+    } else {
+        None
+    };
+    let file_len = if returned_file & libc::ATTR_FILE_DATALENGTH != 0 {
+        Some(
+            read_bulk_i64(buffer, offset, group_end)
+                .and_then(|len| u64::try_from(len).ok())
+                .ok_or_else(|| malformed_bulk_record(dir))?,
+        )
+    } else {
+        None
+    };
+    let len = match kind {
+        MacosEntryKind::Directory => directory_len,
+        MacosEntryKind::File => file_len,
+        MacosEntryKind::Symlink => Some(0),
+        MacosEntryKind::Unsupported => Some(file_len.or(directory_len).unwrap_or_default()),
+    }
+    .ok_or_else(|| {
+        LpmError::Store(format!(
+            "bulk metadata length unavailable at {}",
+            dir.join(&name).display()
+        ))
+    })?;
+
+    Ok(MacosMetadataEntry {
+        name,
+        kind,
+        mode,
+        len,
+        modified_time_nanos,
+        change_time_nanos,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn malformed_bulk_record(dir: &Path) -> LpmError {
+    LpmError::Store(format!(
+        "malformed bulk metadata record while reading {}",
+        dir.display()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bulk_u32(buffer: &[u8], offset: &mut usize, end: usize) -> Option<u32> {
+    let field_end = offset.checked_add(std::mem::size_of::<u32>())?;
+    if field_end > end {
+        return None;
+    }
+    let bytes: [u8; 4] = buffer.get(*offset..field_end)?.try_into().ok()?;
+    *offset = field_end;
+    Some(u32::from_ne_bytes(bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bulk_i32(buffer: &[u8], offset: &mut usize, end: usize) -> Option<i32> {
+    read_bulk_u32(buffer, offset, end).map(|value| i32::from_ne_bytes(value.to_ne_bytes()))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bulk_i64(buffer: &[u8], offset: &mut usize, end: usize) -> Option<i64> {
+    let field_end = offset.checked_add(std::mem::size_of::<i64>())?;
+    if field_end > end {
+        return None;
+    }
+    let bytes: [u8; 8] = buffer.get(*offset..field_end)?.try_into().ok()?;
+    *offset = field_end;
+    Some(i64::from_ne_bytes(bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bulk_timespec_nanos(buffer: &[u8], offset: &mut usize, end: usize) -> Option<i128> {
+    let seconds = i128::from(read_bulk_i64(buffer, offset, end)?);
+    let nanoseconds = i128::from(read_bulk_i64(buffer, offset, end)?);
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanoseconds)
+}
+
 struct ObjectTreeEntry {
     file_name: OsString,
     metadata: std::fs::Metadata,
@@ -229,14 +588,37 @@ fn hash_tree_metadata_record(
     metadata: &std::fs::Metadata,
     payload: &[u8],
 ) {
+    hash_tree_metadata_fields(
+        hasher,
+        kind,
+        relative,
+        object_entry_mode(metadata),
+        metadata.len(),
+        modified_time_nanos(metadata),
+        change_time_nanos(metadata),
+        payload,
+    );
+}
+
+#[expect(clippy::too_many_arguments)]
+fn hash_tree_metadata_fields(
+    hasher: &mut Sha256,
+    kind: &[u8],
+    relative: &[u8],
+    mode: u32,
+    len: u64,
+    modified_time_nanos: i128,
+    change_time_nanos: i128,
+    payload: &[u8],
+) {
     hasher.update(kind);
     hasher.update(b"\0");
     hasher.update(relative);
     hasher.update(b"\0");
-    hasher.update(object_entry_mode(metadata).to_le_bytes());
-    hasher.update(metadata.len().to_le_bytes());
-    hasher.update(modified_time_nanos(metadata).to_le_bytes());
-    hasher.update(change_time_nanos(metadata).to_le_bytes());
+    hasher.update(mode.to_le_bytes());
+    hasher.update(len.to_le_bytes());
+    hasher.update(modified_time_nanos.to_le_bytes());
+    hasher.update(change_time_nanos.to_le_bytes());
     hasher.update((payload.len() as u64).to_le_bytes());
     hasher.update(payload);
 }

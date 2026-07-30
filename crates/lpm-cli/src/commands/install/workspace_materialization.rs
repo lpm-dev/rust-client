@@ -127,19 +127,108 @@ struct LinkMaterializationKey {
     source_sri: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct LocalSourcePopulationKey {
+    source_dir: std::path::PathBuf,
+    source_sri: String,
+}
+
 pub(super) struct WorkspaceMaterializationCoordinator {
+    share_object_validations: bool,
+    share_local_source_populations: bool,
     object_validations: SingleFlight<String, ObjectValidation, SharedMaterializationError>,
+    local_source_populations:
+        SingleFlight<LocalSourcePopulationKey, std::path::PathBuf, SharedMaterializationError>,
     link_materializations:
         SingleFlight<LinkMaterializationKey, LinkMaterialization, SharedMaterializationError>,
 }
 
+impl Default for WorkspaceMaterializationCoordinator {
+    fn default() -> Self {
+        Self::new(true, true)
+    }
+}
+
 impl WorkspaceMaterializationCoordinator {
+    pub(super) fn new(
+        share_object_validations: bool,
+        share_local_source_populations: bool,
+    ) -> Self {
+        Self {
+            share_object_validations,
+            share_local_source_populations,
+            object_validations: SingleFlight::default(),
+            local_source_populations: SingleFlight::default(),
+            link_materializations: SingleFlight::default(),
+        }
+    }
+
+    pub(super) async fn populate_local_source(
+        &self,
+        source_dir: std::path::PathBuf,
+        source_sri: String,
+        store: Arc<lpm_store::v2::Store>,
+    ) -> Result<Coordinated<std::path::PathBuf>, LpmError> {
+        if !self.share_local_source_populations {
+            let object_dir = tokio::task::spawn_blocking(move || {
+                store.populate_object_from_local_source(&source_dir, &source_sri)
+            })
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!("v2 local-source task panicked: {error}"))
+            })??;
+            return Ok(Coordinated {
+                value: object_dir,
+                performed: true,
+            });
+        }
+
+        let key = LocalSourcePopulationKey {
+            source_dir,
+            source_sri,
+        };
+        let operation_key = key.clone();
+        self.local_source_populations
+            .run(key, || async move {
+                tokio::task::spawn_blocking(move || {
+                    store.populate_object_from_local_source(
+                        &operation_key.source_dir,
+                        &operation_key.source_sri,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    SharedMaterializationError::Registry(Arc::from(format!(
+                        "v2 local-source task panicked: {error}"
+                    )))
+                })?
+                .map_err(SharedMaterializationError::from)
+            })
+            .await
+            .map_err(LpmError::from)
+    }
+
     pub(super) async fn validate_object(
         &self,
         source_sri: String,
         store: Arc<lpm_store::v2::Store>,
     ) -> Result<Coordinated<ObjectValidation>, LpmError> {
+        if !self.share_object_validations {
+            let validation = tokio::task::spawn_blocking(move || {
+                store
+                    .reusable_object_with_timings(&source_sri)
+                    .map(|(reusable, timings)| ObjectValidation { reusable, timings })
+            })
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!("v2 cache check task panicked: {error}"))
+            })??;
+            return Ok(Coordinated {
+                value: validation,
+                performed: true,
+            });
+        }
+
         let operation_sri = source_sri.clone();
         self.object_validations
             .run(source_sri, || async move {
@@ -298,6 +387,62 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_workspace_validation_does_not_cache_a_missing_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        let source_sri = lpm_store::compute_sri_hash(b"missing-object");
+        let coordinator = WorkspaceMaterializationCoordinator::new(false, true);
+
+        let first = coordinator
+            .validate_object(source_sri.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        let second = coordinator
+            .validate_object(source_sri, store)
+            .await
+            .unwrap();
+
+        assert!(first.performed);
+        assert!(second.performed);
+        assert!(first.value.reusable.is_none());
+        assert!(second.value.reusable.is_none());
+    }
+
+    #[tokio::test]
+    async fn recursive_workspace_populates_a_shared_local_source_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("workspace-package");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"workspace-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("index.js"), b"module.exports = 1;\n").unwrap();
+        let source_sri = lpm_store::compute_sri_hash(b"shared-local-source");
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        let coordinator = WorkspaceMaterializationCoordinator::new(true, true);
+
+        let (first, second) = tokio::join!(
+            coordinator.populate_local_source(
+                source.clone(),
+                source_sri.clone(),
+                Arc::clone(&store),
+            ),
+            coordinator.populate_local_source(source, source_sri, store),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(
+            usize::from(first.performed) + usize::from(second.performed),
+            1
+        );
+        assert_eq!(first.value, second.value);
+        assert!(first.value.join("package.json").is_file());
     }
 
     #[test]

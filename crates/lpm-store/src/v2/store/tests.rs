@@ -8,12 +8,15 @@ use crate::v2::fs_util::{
 use crate::v2::graph_key::{GraphKeyInputs, LinkerModeTag, PeerEntry};
 use crate::v2::integrity::{
     OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME, has_local_source_sentinel,
-    is_complete_object_dir, is_verified_object_dir, read_object_integrity, read_tree_snapshot,
-    remove_unusable_object_dir, source_object_integrity, valid_sha256_integrity,
-    write_source_object_integrity, write_tree_object_integrity, write_tree_snapshot,
+    is_complete_object_dir, is_verified_object_dir, local_source_sentinel_path,
+    read_object_integrity, read_tree_snapshot, remove_unusable_object_dir, source_object_integrity,
+    valid_sha256_integrity, write_source_object_integrity, write_tree_object_integrity,
+    write_tree_snapshot,
 };
 use crate::v2::link_meta::LinkMetaPlatform;
 use crate::v2::platform::PlatformTuple;
+#[cfg(target_os = "macos")]
+use crate::v2::tree_hash::metadata_hash_implementations_match_for_test;
 use crate::v2::tree_hash::{ObjectTreeStats, TreeIntegrities, compute_tree_metadata_integrity};
 
 fn macos_arm64() -> PlatformTuple {
@@ -3357,6 +3360,94 @@ fn repeated_local_source_populate_keeps_identical_snapshot_in_place() {
 }
 
 #[test]
+fn unchanged_local_source_populate_does_not_rewrite_snapshot_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let sri = synthetic_sri(b"unchanged_local_source_populate_does_not_rewrite_snapshot_metadata");
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    let sentinel = local_source_sentinel_path(&object_dir).unwrap();
+    let preserved_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
+    std::fs::File::options()
+        .write(true)
+        .open(&sentinel)
+        .unwrap()
+        .set_modified(preserved_time)
+        .unwrap();
+
+    store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::metadata(sentinel).unwrap().modified().unwrap(),
+        preserved_time,
+        "an unchanged local source must reuse its validated snapshot without metadata writes",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_source_refresh_detects_content_changes_after_mtime_is_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let source_file = source.join("src/module-0.js");
+    let original_mtime = std::fs::metadata(&source_file).unwrap().modified().unwrap();
+    let sri =
+        synthetic_sri(b"local_source_refresh_detects_content_changes_after_mtime_is_restored");
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    std::fs::write(&source_file, b"module.exports = 'changed';").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&source_file)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+    store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(object_dir.join("src/module-0.js")).unwrap(),
+        "module.exports = 'changed';",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_source_reuse_repairs_a_tampered_stored_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let sri = synthetic_sri(b"local_source_reuse_repairs_a_tampered_stored_snapshot");
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    let stored_file = object_dir.join("src/module-0.js");
+    std::fs::remove_file(&stored_file).unwrap();
+    std::fs::write(&stored_file, b"module.exports = 'tampered';").unwrap();
+
+    store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(stored_file).unwrap(),
+        std::fs::read(source.join("src/module-0.js")).unwrap(),
+        "reuse must compare the live source and validate the stored tree before accepting it",
+    );
+}
+
+#[test]
 fn concurrent_local_source_populates_never_break_tree_validation() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
@@ -3385,6 +3476,30 @@ fn concurrent_local_source_populates_never_break_tree_validation() {
             });
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_bulk_metadata_hash_matches_the_portable_walker() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    std::fs::create_dir_all(root.join("nested/empty")).unwrap();
+    std::fs::write(root.join("package.json"), br#"{"name":"bulk-hash"}"#).unwrap();
+    std::fs::write(root.join("nested/executable.js"), b"module.exports = 1;\n").unwrap();
+    let mut permissions = std::fs::metadata(root.join("nested/executable.js"))
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.join("nested/executable.js"), permissions).unwrap();
+    symlink("nested/executable.js", root.join("entry.js")).unwrap();
+    std::fs::write(root.join(".integrity"), b"store metadata").unwrap();
+
+    assert!(
+        metadata_hash_implementations_match_for_test(&root).unwrap(),
+        "the bulk walker must hash the same paths and metadata fields as the portable walker",
+    );
 }
 
 #[test]
