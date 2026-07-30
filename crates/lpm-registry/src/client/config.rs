@@ -273,6 +273,7 @@ impl RegistryClient {
             token: None,
             cache_dir,
             pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            metadata_memory_cache: None,
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
@@ -673,6 +674,7 @@ impl RegistryClient {
             // Share the pending-writes tracker so flush() drains writes
             // queued by ANY clone of this client.
             pending_cache_writes: Arc::clone(&self.pending_cache_writes),
+            metadata_memory_cache: self.metadata_memory_cache.as_ref().map(Arc::clone),
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
@@ -682,6 +684,17 @@ impl RegistryClient {
             worker_metadata_http3_enabled: self.worker_metadata_http3_enabled,
             worker_metadata_http3_client: Arc::clone(&self.worker_metadata_http3_client),
         }
+    }
+
+    /// Clone this client with a fresh command-scoped immutable metadata cache.
+    ///
+    /// Clones derived from the returned client share the cache. The cache is
+    /// intentionally opt-in so long-lived callers retain normal disk-cache
+    /// TTL and revalidation behavior.
+    pub fn clone_with_metadata_memory_cache(&self) -> Self {
+        let mut client = self.clone_with_config();
+        client.metadata_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+        client
     }
 
     /// Clone transport, TLS, routing, and cache configuration without any

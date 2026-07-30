@@ -43,6 +43,7 @@ struct WorkspaceInstallTarget {
     path: PathBuf,
     kind: &'static str,
     lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle,
+    resolve_ahead_eligible: bool,
     // Indices of targets that must complete before this one starts:
     // workspace dependency edges, the sequential chain between
     // script-bearing targets, and (for the root) every member.
@@ -110,13 +111,30 @@ pub(crate) async fn run_recursive_workspace_install(
     let automatic_parallel_replay =
         explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
             && lockfile_replay_ready;
+    let resolve_ahead = targets_need_materialization
+        && !lockfile_replay_ready
+        && !options.offline
+        && !options.force
+        && explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
+        && targets.len() > 1
+        && targets
+            .iter()
+            .all(|target| !target.lifecycle.has_scripts() && target.resolve_ahead_eligible);
     let concurrency = resolve_workspace_install_concurrency(
         options.workspace_concurrency,
         targets.len(),
         automatic_parallel_replay,
     );
+    let resolution_concurrency = automatic_workspace_resolution_concurrency(
+        targets.len(),
+        std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY),
+    );
     tracing::debug!(
         concurrency,
+        resolution_concurrency,
+        resolve_ahead,
         lockfile_replay_ready,
         share_local_source_populations,
         automatic_parallel_replay,
@@ -130,6 +148,16 @@ pub(crate) async fn run_recursive_workspace_install(
             ),
         )
     });
+    let resolution_coordinator = resolve_ahead.then(|| {
+        Arc::new(workspace_resolution::WorkspaceResolutionCoordinator::new(
+            targets.len(),
+            resolution_concurrency,
+        ))
+    });
+    let workspace_client = resolution_coordinator
+        .as_ref()
+        .map(|_| client.clone_with_metadata_memory_cache());
+    let client = workspace_client.as_ref().unwrap_or(client);
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);
     let started = Instant::now();
@@ -145,6 +173,8 @@ pub(crate) async fn run_recursive_workspace_install(
     let scheduler = local_tasks.run_until(async {
         let mut active_workspace = Arc::new(workspace);
         let target_count = targets.len();
+        let scheduling_order =
+            workspace_target_scheduling_order(&targets, resolution_coordinator.is_some());
         let mut plans: Vec<Option<WorkspaceInstallTarget>> = targets.drain(..).map(Some).collect();
         let mut done = vec![false; target_count];
         let mut started_at = vec![None::<Instant>; target_count];
@@ -155,13 +185,19 @@ pub(crate) async fn run_recursive_workspace_install(
 
         loop {
             if first_error.is_none() {
-                for index in 0..target_count {
-                    if in_flight.len() >= concurrency {
+                for &index in &scheduling_order {
+                    let scheduler_limit = if resolution_coordinator.is_some() {
+                        target_count
+                    } else {
+                        concurrency
+                    };
+                    if in_flight.len() >= scheduler_limit {
                         break;
                     }
-                    let ready = plans[index]
-                        .as_ref()
-                        .is_some_and(|plan| plan.schedule_after.iter().all(|dep| done[*dep]));
+                    let ready = plans[index].as_ref().is_some_and(|plan| {
+                        resolution_coordinator.is_some()
+                            || plan.schedule_after.iter().all(|dep| done[*dep])
+                    });
                     if !ready {
                         continue;
                     }
@@ -176,6 +212,7 @@ pub(crate) async fn run_recursive_workspace_install(
                         Arc::clone(&active_workspace),
                         Arc::clone(&options),
                         materialization_coordinator.as_ref().map(Arc::clone),
+                        resolution_coordinator.as_ref().map(Arc::clone),
                         &mut outcomes,
                     );
                 }
@@ -203,9 +240,12 @@ pub(crate) async fn run_recursive_workspace_install(
                         first_error = Some(error);
                     }
                     outcomes[index] = None;
+                    if resolution_coordinator.is_some() {
+                        in_flight.abort_all();
+                    }
                 }
                 Err(join_error) => {
-                    if first_error.is_none() {
+                    if first_error.is_none() && !join_error.is_cancelled() {
                         first_error = Some(LpmError::Script(format!(
                             "workspace install worker failed: {join_error}"
                         )));
@@ -242,6 +282,7 @@ fn spawn_workspace_target_install(
     materialization_coordinator: Option<
         Arc<workspace_materialization::WorkspaceMaterializationCoordinator>,
     >,
+    resolution_coordinator: Option<Arc<workspace_resolution::WorkspaceResolutionCoordinator>>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
@@ -255,8 +296,14 @@ fn spawn_workspace_target_install(
     let lpm_root = lpm_root.clone();
     in_flight.spawn_local(async move {
         let install = run_workspace_target_install(plan, client, lpm_root, base_workspace, options);
-        let result = match materialization_coordinator {
-            Some(coordinator) => workspace_materialization::scope(coordinator, install).await,
+        let install = async {
+            match materialization_coordinator {
+                Some(coordinator) => workspace_materialization::scope(coordinator, install).await,
+                None => install.await,
+            }
+        };
+        let result = match resolution_coordinator {
+            Some(coordinator) => workspace_resolution::scope(coordinator, index, install).await,
             None => install.await,
         };
         (index, result)
@@ -394,6 +441,48 @@ fn automatic_workspace_install_concurrency(
     available_parallelism
         .clamp(1, WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY)
         .min(target_count.max(1))
+}
+
+fn automatic_workspace_resolution_concurrency(
+    target_count: usize,
+    available_parallelism: usize,
+) -> usize {
+    available_parallelism
+        .clamp(1, WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY)
+        .min(target_count.max(1))
+}
+
+fn workspace_target_scheduling_order(
+    targets: &[WorkspaceInstallTarget],
+    resolve_ahead: bool,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    if resolve_ahead
+        && let Some(root_position) = targets.iter().position(|target| target.kind == "root")
+    {
+        let root_index = order.remove(root_position);
+        order.insert(0, root_index);
+    }
+    order
+}
+
+fn dependency_specifier_allows_resolution_ahead(raw: &str) -> bool {
+    matches!(
+        lpm_resolver::Specifier::parse(raw),
+        Ok(lpm_resolver::Specifier::SemverRange(_)
+            | lpm_resolver::Specifier::NpmAlias { .. }
+            | lpm_resolver::Specifier::Workspace(_))
+    )
+}
+
+fn package_allows_resolution_ahead(package: &lpm_workspace::PackageJson) -> bool {
+    package
+        .dependencies
+        .values()
+        .chain(package.dev_dependencies.values())
+        .chain(package.optional_dependencies.values())
+        .chain(package.peer_dependencies.values())
+        .all(|specifier| dependency_specifier_allows_resolution_ahead(specifier))
 }
 
 fn workspace_targets_need_materialization(targets: &[WorkspaceInstallTarget]) -> bool {
@@ -595,6 +684,7 @@ fn select_workspace_install_targets(
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
                 &member.package,
             ),
+            resolve_ahead_eligible: package_allows_resolution_ahead(&member.package),
             schedule_after: if workspace_edges_usable {
                 graph.edges[id]
                     .iter()
@@ -638,6 +728,7 @@ fn select_workspace_install_targets(
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
                 &workspace.root_package,
             ),
+            resolve_ahead_eligible: package_allows_resolution_ahead(&workspace.root_package),
             schedule_after,
         });
     }
@@ -808,6 +899,59 @@ mod tests {
     }
 
     #[test]
+    fn recursive_workspace_install_bounds_fresh_resolution_parallelism() {
+        assert_eq!(automatic_workspace_resolution_concurrency(8, 8), 3);
+        assert_eq!(automatic_workspace_resolution_concurrency(2, 8), 2);
+        assert_eq!(automatic_workspace_resolution_concurrency(8, 1), 1);
+    }
+
+    #[test]
+    fn recursive_workspace_install_starts_root_resolution_first_without_reordering_commits() {
+        let package = replay_ready_package();
+        let member_a = workspace_target("member-a", "member", &package);
+        let member_b = workspace_target("member-b", "member", &package);
+        let root = workspace_target("root", "root", &package);
+
+        assert_eq!(
+            workspace_target_scheduling_order(&[member_a, member_b, root], true),
+            vec![2, 0, 1],
+        );
+    }
+
+    #[test]
+    fn recursive_workspace_resolution_accepts_registry_alias_and_workspace_specifiers() {
+        for specifier in [
+            "^1.2.3",
+            "latest",
+            "npm:lodash@^4.17.0",
+            "jsr:@std/path@^1.0.0",
+            "workspace:*",
+        ] {
+            assert!(
+                dependency_specifier_allows_resolution_ahead(specifier),
+                "{specifier} should be eligible for resolve-ahead"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_workspace_resolution_rejects_source_and_malformed_specifiers() {
+        for specifier in [
+            "file:../local-package",
+            "link:../local-package",
+            "git+https://github.com/example/package.git",
+            "github:example/package",
+            "https://example.com/package.tgz",
+            "unsupported:package",
+        ] {
+            assert!(
+                !dependency_specifier_allows_resolution_ahead(specifier),
+                "{specifier} must stay on the dependency-ordered path"
+            );
+        }
+    }
+
+    #[test]
     fn recursive_workspace_install_caps_automatic_parallelism_by_target_count() {
         assert_eq!(automatic_workspace_install_concurrency(2, true, 8), 2);
     }
@@ -932,6 +1076,22 @@ mod tests {
             path: path.to_path_buf(),
             kind: "root",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
+            resolve_ahead_eligible: package_allows_resolution_ahead(package),
+            schedule_after: Vec::new(),
+        }
+    }
+
+    fn workspace_target(
+        path: &str,
+        kind: &'static str,
+        package: &lpm_workspace::PackageJson,
+    ) -> WorkspaceInstallTarget {
+        WorkspaceInstallTarget {
+            name: path.to_string(),
+            path: PathBuf::from(path),
+            kind,
+            lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
+            resolve_ahead_eligible: package_allows_resolution_ahead(package),
             schedule_after: Vec::new(),
         }
     }

@@ -182,6 +182,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
     let mut auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
     let mut linker_mode = linker_mode;
+    let resolve_ahead = workspace_resolution::active();
 
     let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
         match lockfile_result {
@@ -228,9 +229,13 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let preflight_disables_tarball_prefetch = npm_firewall_mode
                         .disables_tarball_prefetch()
                         || policy_extensions_disable_tarball_prefetch(policy_extension_configs);
-                    let fetch_overlap_downloads_during_resolve =
-                        fetch_overlap_allowed_local && !preflight_disables_tarball_prefetch;
+                    let fetch_overlap_downloads_during_resolve = fetch_overlap_allowed_local
+                        && !resolve_ahead
+                        && !preflight_disables_tarball_prefetch;
                     if preflight_disables_tarball_prefetch && fetch_overlap_allowed_local {
+                        post_firewall_fetch_overlap_allowed = true;
+                    }
+                    if resolve_ahead && fetch_overlap_allowed_local {
                         post_firewall_fetch_overlap_allowed = true;
                     }
                     let npm_fanout = positive_usize_env_or_default(
@@ -257,7 +262,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         fetch_semaphore.clone(),
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch()
+                        if resolve_ahead
+                            || npm_firewall_mode.disables_tarball_prefetch()
                             || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
                         {
                             HashMap::new()
@@ -335,7 +341,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         override_set.clone(),
                         route_table.clone(),
                         npm_fanout,
-                        Some(spec_tx),
+                        (!resolve_ahead).then_some(spec_tx),
                         shared_cache,
                         auto_install_peers,
                         !omit_policy.optional,
@@ -401,7 +407,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch()
+                        if resolve_ahead
+                            || npm_firewall_mode.disables_tarball_prefetch()
                             || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
                         {
                             HashMap::new()

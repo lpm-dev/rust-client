@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, write_npm_firewall_global_config};
 
 const INSTALL_FLAGS: &[&str] = &[
     "--no-security-summary",
@@ -1163,8 +1163,6 @@ async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
     let output = lpm_with_registry(&project, &mock.url())
         .arg("install")
         .arg("--recursive")
-        .arg("--workspace-concurrency")
-        .arg("4")
         .args(INSTALL_FLAGS)
         .output()
         .expect("run recursive install against the mock registry");
@@ -1208,6 +1206,73 @@ async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
     assert!(
         web_lock.contains("shared-dep") && web_lock.contains("web-only-dep"),
         "web lockfile must record both of its direct dependencies: {web_lock}",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_keeps_root_firewall_block_ahead_of_fetch_and_after_member_commit() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[("member-allowed", "1.0.0"), ("root-blocked", "1.0.0")],
+    )
+    .await;
+    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+        .await;
+    mock.with_npm_firewall_block("root-blocked", "1.0.0").await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "firewall-ordered-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "root-blocked": "^1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "@fixture/member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "member-allowed": "^1.0.0"
+  }
+}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with a blocked root dependency");
+
+    assert!(
+        !output.status.success(),
+        "root firewall block must fail recursive install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("blocked by LPM npm firewall"),
+        "recursive root error must retain firewall guidance: {combined}",
+    );
+    assert_target_installed(&project, "packages/member");
+    assert_target_not_installed(&project, "");
+    assert_eq!(
+        mock.tarball_request_count("root-blocked", "1.0.0").await,
+        0,
+        "firewall must block the root tarball before resolve-ahead fetch overlap",
     );
 }
 

@@ -56,6 +56,7 @@ mod timing;
 mod validation;
 mod workspace;
 mod workspace_materialization;
+mod workspace_resolution;
 
 use accounting::*;
 use catalog::*;
@@ -762,6 +763,7 @@ async fn run_with_options_under_store_lock(
     })?;
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
+        workspace_resolution::wait_for_commit().await;
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             policy_extension_configs: &policy_extension_configs,
@@ -1074,6 +1076,7 @@ async fn run_with_options_under_store_lock(
                 .or_insert_with(|| deps.clone());
         }
 
+        workspace_resolution::wait_for_commit().await;
         return experimental_resolver::run(
             arc_client.clone(),
             project_dir,
@@ -1109,34 +1112,7 @@ async fn run_with_options_under_store_lock(
 
     let fetch_coord: Arc<FetchCoordinator> = FetchCoordinator::process_global();
 
-    let OnlineResolutionPhaseResult {
-        packages,
-        packages_for_lockfile,
-        resolve_ms,
-        used_lockfile,
-        platform_skipped,
-        latest_stable_versions,
-        applied_overrides,
-        peer_conflicts,
-        peer_warnings,
-        ambient_peer_installs_for_lockfile,
-        spec_tracker,
-        speculation_join,
-        mut fetch_overlap_join,
-        mut npm_firewall_preflight_join,
-        post_firewall_fetch_overlap_allowed,
-        resolved_with,
-        streaming_metrics,
-        initial_batch_ms,
-        resolver_stage_timing,
-        fast_path_lockfile,
-        lockfile_peer_context_authoritative,
-        needs_binary_upgrade,
-        wf_setup_ms,
-        wf_resolve_end_ms,
-        auto_isolated_peer_conflicts,
-        linker_mode,
-    } = run_online_resolution_phase(OnlineResolutionPhaseInput {
+    let online_resolution = run_online_resolution_phase(OnlineResolutionPhaseInput {
         start,
         lockfile_result,
         arc_client: arc_client.clone(),
@@ -1180,7 +1156,36 @@ async fn run_with_options_under_store_lock(
         resolver_min_age_secs,
         override_set: override_set.clone(),
     })
-    .await?;
+    .await;
+    workspace_resolution::wait_for_commit().await;
+    let OnlineResolutionPhaseResult {
+        packages,
+        packages_for_lockfile,
+        resolve_ms,
+        used_lockfile,
+        platform_skipped,
+        latest_stable_versions,
+        applied_overrides,
+        peer_conflicts,
+        peer_warnings,
+        ambient_peer_installs_for_lockfile,
+        spec_tracker,
+        speculation_join,
+        mut fetch_overlap_join,
+        mut npm_firewall_preflight_join,
+        post_firewall_fetch_overlap_allowed,
+        resolved_with,
+        streaming_metrics,
+        initial_batch_ms,
+        resolver_stage_timing,
+        fast_path_lockfile,
+        lockfile_peer_context_authoritative,
+        needs_binary_upgrade,
+        wf_setup_ms,
+        wf_resolve_end_ms,
+        auto_isolated_peer_conflicts,
+        linker_mode,
+    } = online_resolution?;
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,

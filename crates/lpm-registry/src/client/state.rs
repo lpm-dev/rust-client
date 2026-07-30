@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) type MetadataMemoryCache = Arc<std::sync::Mutex<HashMap<String, Arc<PackageMetadata>>>>;
+
 /// Result of a verified tarball download. The tarball is spooled to a temp file
 /// on disk — only the SRI hash and byte count are kept in memory.
 #[derive(Debug)]
@@ -90,6 +92,11 @@ pub struct RegistryClient {
     /// `Mutex` acquire + `Vec` push per write — sub-µs vs the ms-scale
     /// `std::fs::write` it tracks.
     pub(super) pending_cache_writes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Optional command-scoped immutable packument cache. Recursive
+    /// workspace installs enable it on client clones so independent
+    /// importer resolvers can reuse one parsed registry response without
+    /// sharing resolver state.
+    pub(super) metadata_memory_cache: Option<MetadataMemoryCache>,
     /// When set, `write_metadata_cache` runs the file write inline on the
     /// calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. Used by mock-server tests where

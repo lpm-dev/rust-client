@@ -35,6 +35,51 @@ pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V3\n";
 impl RegistryClient {
     // ─── Metadata Cache ──────────────────────────────────────────────
 
+    pub(super) fn direct_metadata_memory_cache_key(&self, cache_key: &str) -> String {
+        use std::fmt::Write as _;
+
+        let registry = &self.npm_registry_url;
+        let mut key = String::with_capacity(registry.len() + cache_key.len() + 32);
+        write!(key, "direct:{}:", registry.len())
+            .expect("writing registry length to a String cannot fail");
+        key.push_str(registry);
+        key.push(':');
+        key.push_str(cache_key);
+        key
+    }
+
+    pub(super) fn read_metadata_memory_cache(&self, key: &str) -> Option<PackageMetadata> {
+        let cached = self
+            .metadata_memory_cache
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned();
+        cached.map(|metadata| metadata.as_ref().clone())
+    }
+
+    pub(super) fn remember_metadata_for_command(&self, key: &str, metadata: &PackageMetadata) {
+        let Some(cache) = &self.metadata_memory_cache else {
+            return;
+        };
+        let metadata = Arc::new(metadata.clone());
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key.to_owned())
+            .or_insert(metadata);
+    }
+
+    fn invalidate_metadata_memory_cache(&self, key: &str) {
+        if let Some(cache) = &self.metadata_memory_cache {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key);
+        }
+    }
+
     pub(super) fn cache_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = self.cache_dir.as_ref()?;
         use sha2::{Digest, Sha256};
@@ -63,6 +108,8 @@ impl RegistryClient {
         } else {
             format!("npm:{package_name}")
         };
+        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
+        self.invalidate_metadata_memory_cache(&memory_cache_key);
         if let Some(path) = self.cache_path(&cache_key)
             && path.exists()
         {
@@ -79,6 +126,8 @@ impl RegistryClient {
     /// metadata cache.
     pub fn invalidate_npm_version_metadata_cache(&self, package_name: &str, version: &str) {
         let cache_key = format!("npm-version:{package_name}@{version}");
+        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
+        self.invalidate_metadata_memory_cache(&memory_cache_key);
         if let Some(path) = self.cache_path(&cache_key)
             && path.exists()
         {
@@ -105,6 +154,7 @@ impl RegistryClient {
             "npm:{}:{url}",
             principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
         );
+        self.invalidate_metadata_memory_cache(&cache_key);
         if let Some(path) = self.cache_path(&cache_key)
             && path.exists()
         {

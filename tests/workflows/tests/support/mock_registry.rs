@@ -741,6 +741,45 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_npm_firewall_allow(&self, name: &str, version: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-firewall/verdicts"))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .and(body_string_contains(format!("\"version\":\"{version}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestId": "test-firewall-allow",
+                "policyMode": "enforce",
+                "summary": {
+                    "total": 1,
+                    "allow": 1,
+                    "warn": 0,
+                    "block": 0,
+                    "unknown": 0,
+                    "matched": 1
+                },
+                "decisions": [{
+                    "decisionId": "dec_test_allow",
+                    "name": name,
+                    "version": version,
+                    "action": "allow",
+                    "verdict": "clean",
+                    "reason": "test allowed package",
+                    "matchSource": "package",
+                    "matchedKey": format!("package:npm:{name}@{version}"),
+                    "policyMode": "enforce",
+                    "enqueueScan": false,
+                    "scannedAt": null,
+                    "scanRunId": null,
+                    "reportPath": null,
+                    "confidence": 1.0
+                }]
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a `/api/registry/-/whoami` endpoint returning a test user.
     pub async fn with_whoami(&self, username: &str, email: &str) -> &Self {
         Mock::given(method("GET"))
