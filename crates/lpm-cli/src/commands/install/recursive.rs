@@ -102,20 +102,25 @@ pub(crate) async fn run_recursive_workspace_install(
         return Ok(());
     }
 
-    let lockfile_replay_ready =
+    let lockfile_replay_ready = workspace_targets_need_materialization(&targets)
+        && workspace_targets_are_lockfile_replay_ready(&workspace, &targets, &options);
+    let automatic_parallel_replay =
         explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
-            && workspace_targets_need_materialization(&targets)
-            && workspace_targets_are_lockfile_replay_ready(&workspace, &targets, &options);
+            && lockfile_replay_ready;
     let concurrency = resolve_workspace_install_concurrency(
         options.workspace_concurrency,
         targets.len(),
-        lockfile_replay_ready,
+        automatic_parallel_replay,
     );
     tracing::debug!(
         concurrency,
         lockfile_replay_ready,
+        automatic_parallel_replay,
         "selected recursive workspace install concurrency"
     );
+    let materialization_coordinator = lockfile_replay_ready.then(|| {
+        Arc::new(workspace_materialization::WorkspaceMaterializationCoordinator::default())
+    });
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);
     let started = Instant::now();
@@ -161,6 +166,7 @@ pub(crate) async fn run_recursive_workspace_install(
                         &lpm_root,
                         Arc::clone(&active_workspace),
                         Arc::clone(&options),
+                        materialization_coordinator.as_ref().map(Arc::clone),
                         &mut outcomes,
                     );
                 }
@@ -224,6 +230,9 @@ fn spawn_workspace_target_install(
     lpm_root: &lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
+    materialization_coordinator: Option<
+        Arc<workspace_materialization::WorkspaceMaterializationCoordinator>,
+    >,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
@@ -236,8 +245,11 @@ fn spawn_workspace_target_install(
     let client = client.clone_with_config();
     let lpm_root = lpm_root.clone();
     in_flight.spawn_local(async move {
-        let result =
-            run_workspace_target_install(plan, client, lpm_root, base_workspace, options).await;
+        let install = run_workspace_target_install(plan, client, lpm_root, base_workspace, options);
+        let result = match materialization_coordinator {
+            Some(coordinator) => workspace_materialization::scope(coordinator, install).await,
+            None => install.await,
+        };
         (index, result)
     });
 }

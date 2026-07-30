@@ -142,6 +142,19 @@ pub struct LinkPlanV2 {
 }
 
 impl LinkPlanV2 {
+    /// Return the exact materialization key derived for `target`.
+    pub fn graph_key_for(&self, target: &V2Target) -> Result<Arc<GraphKey>, LpmError> {
+        self.key_map
+            .get_for(&target.target)
+            .cloned()
+            .ok_or_else(|| {
+                LpmError::Store(format!(
+                    "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
+                    target.target.name, target.target.version
+                ))
+            })
+    }
+
     /// Are all targets ready for the event-driven path? True iff every
     /// `LinkTarget.peers` is already populated (resolver-threaded
     /// greedy-fusion path) and `ensure_peer_context` made no

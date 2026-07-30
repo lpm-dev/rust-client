@@ -55,6 +55,7 @@ mod tests;
 mod timing;
 mod validation;
 mod workspace;
+mod workspace_materialization;
 
 use accounting::*;
 use catalog::*;

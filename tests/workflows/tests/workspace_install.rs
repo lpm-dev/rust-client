@@ -1212,6 +1212,157 @@ async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
 }
 
 #[tokio::test]
+async fn warm_recursive_replay_preserves_each_importers_root_links_and_bin_shims() {
+    let mock = MockRegistry::start().await;
+    let shared_manifest = serde_json::json!({
+        "name": "shared-tool",
+        "version": "1.0.0",
+        "bin": {
+            "shared-tool": "cli.js"
+        }
+    });
+    let shared_tarball = make_tarball_from_pkg_json(
+        shared_manifest.clone(),
+        &[("cli.js", b"#!/usr/bin/env node\n")],
+    );
+    let shared_metadata = serde_json::json!({
+        "name": "shared-tool",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "shared-tool",
+                "version": "1.0.0",
+                "bin": {
+                    "shared-tool": "cli.js"
+                },
+                "dist": {
+                    "tarball": mock.tarball_url("shared-tool", "1.0.0"),
+                    "integrity": compute_integrity(&shared_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    let private_tarball = make_tarball("second-only", "1.0.0");
+    let private_metadata = serde_json::json!({
+        "name": "second-only",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "second-only",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("second-only", "1.0.0"),
+                    "integrity": compute_integrity(&private_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_package_metadata_and_tarballs(
+        "shared-tool",
+        shared_metadata.clone(),
+        &[("1.0.0", shared_tarball)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        "second-only",
+        private_metadata.clone(),
+        &[("1.0.0", private_tarball)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![shared_metadata, private_metadata])
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "warm-replay-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "shared-tool": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/first/package.json",
+        r#"{
+  "name": "@fixture/first",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-tool": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/second/package.json",
+        r#"{
+  "name": "@fixture/second",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-tool": "1.0.0",
+    "second-only": "1.0.0"
+  }
+}"#,
+    );
+
+    let seed = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed importer-local lockfiles and store entries");
+    assert_install_succeeded(&seed, "initial recursive install should succeed");
+
+    for target in ["", "packages/first", "packages/second"] {
+        let node_modules = project.path().join(target).join("node_modules");
+        std::fs::remove_dir_all(&node_modules).unwrap_or_else(|error| {
+            panic!(
+                "remove {} before warm replay: {error}",
+                node_modules.display()
+            )
+        });
+    }
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run warm recursive lockfile replay");
+    assert_install_succeeded(&replay, "warm recursive replay should succeed");
+
+    for target in ["", "packages/first", "packages/second"] {
+        let node_modules = project.path().join(target).join("node_modules");
+        assert!(
+            node_modules.join("shared-tool/package.json").is_file()
+                && node_modules.join(".bin/shared-tool").exists(),
+            "{} must receive its own shared root link and bin shim",
+            node_modules.display(),
+        );
+    }
+    assert!(
+        !project
+            .path()
+            .join("packages/first/node_modules/second-only")
+            .exists(),
+        "the first importer must not receive the second importer's private dependency",
+    );
+    assert!(
+        project
+            .path()
+            .join("packages/second/node_modules/second-only/package.json")
+            .is_file(),
+        "the second importer must retain its private dependency",
+    );
+}
+
+#[tokio::test]
 async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
     let mock = MockRegistry::start().await;
     mount_registry_packages(
