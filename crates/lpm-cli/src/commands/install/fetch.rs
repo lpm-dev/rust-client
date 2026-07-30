@@ -38,6 +38,15 @@ impl FetchCoordinator {
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
+
+    /// Concurrent installs in one process (recursive workspace targets)
+    /// share one lock table so a tarball needed by several targets is
+    /// downloaded and extracted once — the post-lock store re-checks
+    /// turn every waiter into a cache hit.
+    pub(super) fn process_global() -> Arc<Self> {
+        static GLOBAL: std::sync::OnceLock<Arc<FetchCoordinator>> = std::sync::OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(Default::default))
+    }
 }
 
 /// Default concurrent-tarball-download pool size. Overridable per-invocation

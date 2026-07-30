@@ -525,7 +525,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                 serde_json::Value::Array(targets.iter().map(|s| serde_json::json!(s)).collect());
         }
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        report_capture::emit_install_json(&json);
     } else if emit_install_report {
         output::success("No dependencies to install");
     }

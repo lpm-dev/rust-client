@@ -6,8 +6,9 @@ use lpm_common::LpmError;
 
 use super::fs_util::{create_fs_symlink, ensure_store_tier_dir_locked, tmp_sibling};
 use super::integrity::{
-    has_local_source_sentinel, is_complete_object_dir, local_source_sentinel_path,
-    remove_object_metadata_dir_best_effort, write_tree_object_integrity,
+    OBJECT_INTEGRITY_FILENAME, has_local_source_sentinel, is_complete_object_dir,
+    local_source_sentinel_path, remove_object_metadata_dir_best_effort,
+    write_tree_object_integrity,
 };
 
 fn is_complete_local_source_object_dir(dir: &Path) -> bool {
@@ -39,6 +40,16 @@ pub(crate) fn replace_local_source_object(
 ) -> Result<(), LpmError> {
     if !object_dir.exists() {
         return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
+    }
+
+    // An unchanged source tree produces a byte-identical snapshot.
+    // Keeping the published object avoids the backup/replace rename
+    // window, which a concurrent reader (validation or linking in a
+    // sibling install) could otherwise observe as a mixed tree.
+    if existing_snapshot_matches_replacement(tmp_dir, object_dir) {
+        let _ = std::fs::remove_dir_all(tmp_dir);
+        write_local_source_sentinel(object_dir, source_root)?;
+        return Ok(());
     }
 
     write_local_source_sentinel(object_dir, source_root)?;
@@ -93,6 +104,21 @@ pub(crate) fn replace_local_source_object(
                 object_dir.display()
             )))
         }
+    }
+}
+
+fn existing_snapshot_matches_replacement(tmp_dir: &Path, object_dir: &Path) -> bool {
+    if !is_complete_local_source_object_dir(object_dir) {
+        return false;
+    }
+    let content_integrity = |dir: &Path| {
+        std::fs::read_to_string(dir.join(OBJECT_INTEGRITY_FILENAME))
+            .map(|raw| raw.trim().to_owned())
+            .ok()
+    };
+    match (content_integrity(tmp_dir), content_integrity(object_dir)) {
+        (Some(fresh), Some(existing)) => fresh == existing,
+        _ => false,
     }
 }
 

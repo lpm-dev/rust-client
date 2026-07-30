@@ -1,6 +1,6 @@
 ---
 source: tests/workflows/tests/workspace_install.rs
-assertion_line: 243
+assertion_line: 612
 expression: envelope
 ---
 {
@@ -15,33 +15,119 @@ expression: envelope
       "path": "<workspace>/packages/core",
       "kind": "member",
       "status": "success",
-      "duration_ms": "<duration>"
+      "duration_ms": "<duration>",
+      "no_dependencies": true,
+      "security": {
+        "policy_extensions": {
+          "enabled": false,
+          "configured_count": 0,
+          "ran_count": 0,
+          "candidate_count": 0,
+          "duration_ms": 0,
+          "allow_count": 0,
+          "warn_count": 0,
+          "block_count": 0,
+          "error_count": 0,
+          "extensions": []
+        }
+      }
     },
     {
       "name": "@fixture/unrelated",
       "path": "<workspace>/packages/unrelated",
       "kind": "member",
       "status": "success",
-      "duration_ms": "<duration>"
+      "duration_ms": "<duration>",
+      "no_dependencies": true,
+      "security": {
+        "policy_extensions": {
+          "enabled": false,
+          "configured_count": 0,
+          "ran_count": 0,
+          "candidate_count": 0,
+          "duration_ms": 0,
+          "allow_count": 0,
+          "warn_count": 0,
+          "block_count": 0,
+          "error_count": 0,
+          "extensions": []
+        }
+      }
     },
     {
       "name": "@fixture/web",
       "path": "<workspace>/packages/web",
       "kind": "member",
       "status": "success",
-      "duration_ms": "<duration>"
+      "duration_ms": "<duration>",
+      "count": 1,
+      "downloaded": 0,
+      "cached": 1,
+      "linked": 1,
+      "symlinked": 1,
+      "used_lockfile": false,
+      "security": {
+        "firewall": {
+          "enabled": false,
+          "mode": "off",
+          "lookup_mode": "package_only",
+          "checked_count": 0,
+          "batch_ms": 0,
+          "chunk_count": 0,
+          "chunk_sum_ms": 0,
+          "chunk_max_ms": 0,
+          "allow_count": 0,
+          "warn_count": 0,
+          "block_count": 0,
+          "unknown_count": 0,
+          "matched_count": 0,
+          "rpc_failed": false,
+          "offline_skipped": false
+        },
+        "policy_extensions": {
+          "enabled": false,
+          "configured_count": 0,
+          "ran_count": 0,
+          "candidate_count": 0,
+          "duration_ms": 0,
+          "allow_count": 0,
+          "warn_count": 0,
+          "block_count": 0,
+          "error_count": 0,
+          "extensions": []
+        }
+      }
     },
     {
       "name": "workspace-root",
       "path": "<workspace>",
       "kind": "root",
       "status": "success",
-      "duration_ms": "<duration>"
+      "duration_ms": "<duration>",
+      "no_dependencies": true,
+      "security": {
+        "policy_extensions": {
+          "enabled": false,
+          "configured_count": 0,
+          "ran_count": 0,
+          "candidate_count": 0,
+          "duration_ms": 0,
+          "allow_count": 0,
+          "warn_count": 0,
+          "block_count": 0,
+          "error_count": 0,
+          "extensions": []
+        }
+      }
     }
   ],
   "summary": {
     "total": 4,
     "succeeded": 4,
     "failed": 0
-  }
+  },
+  "count": 1,
+  "downloaded": 0,
+  "cached": 1,
+  "linked": 1
 }

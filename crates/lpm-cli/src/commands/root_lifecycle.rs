@@ -33,7 +33,10 @@ impl RootProjectLifecycle {
         let pkg_json_path = project_dir.join("package.json");
         let pkg = lpm_workspace::read_package_json(&pkg_json_path)
             .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+        Ok(Self::from_package(&pkg))
+    }
 
+    pub fn from_package(pkg: &lpm_workspace::PackageJson) -> Self {
         let dev_preinstall = script_for_phase(&pkg.scripts, DEV_PREINSTALL);
         let mut after_install = Vec::with_capacity(AFTER_INSTALL_PHASES.len());
         for phase in AFTER_INSTALL_PHASES {
@@ -42,12 +45,20 @@ impl RootProjectLifecycle {
             }
         }
 
-        Ok(Self {
-            package_name: pkg.name,
-            package_version: pkg.version,
+        Self {
+            package_name: pkg.name.clone(),
+            package_version: pkg.version.clone(),
             dev_preinstall,
             after_install,
-        })
+        }
+    }
+
+    pub fn has_dev_preinstall(&self) -> bool {
+        self.dev_preinstall.is_some()
+    }
+
+    pub fn has_scripts(&self) -> bool {
+        self.dev_preinstall.is_some() || !self.after_install.is_empty()
     }
 
     pub fn run_dev_preinstall(

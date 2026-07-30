@@ -650,7 +650,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             json["audit_summary"] = serde_json::to_value(counts).unwrap_or(serde_json::Value::Null);
         }
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        report_capture::emit_install_json(&json);
     } else {
         // print the override apply summary BEFORE
         // the success line so it doesn't get lost at the bottom of the

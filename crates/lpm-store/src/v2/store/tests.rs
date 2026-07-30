@@ -3289,3 +3289,148 @@ fn copy_dir_recursively_skips_symlinks_from_v1_source() {
         "symlink must be skipped — refusing to migrate v1→v2 symlinks",
     );
 }
+
+fn write_local_source_fixture(root: &Path) {
+    std::fs::create_dir_all(root.join("src/nested")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        b"{\"name\":\"local-source\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    for index in 0..12 {
+        std::fs::write(
+            root.join(format!("src/module-{index}.js")),
+            format!("module.exports = {index};"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("src/nested/util-{index}.js")),
+            format!("exports.util = {index};"),
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_local_source_populate_keeps_identical_snapshot_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let sri = synthetic_sri(b"repeated_local_source_populate_keeps_identical_snapshot_in_place");
+
+    let first = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    let first_ino = std::fs::metadata(&first).unwrap().ino();
+
+    let second = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        std::fs::metadata(&second).unwrap().ino(),
+        first_ino,
+        "an unchanged source must keep the published snapshot in place instead of swapping it",
+    );
+
+    std::fs::write(
+        source.join("src/module-0.js"),
+        b"module.exports = 'changed';",
+    )
+    .unwrap();
+    let third = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    assert_ne!(
+        std::fs::metadata(&third).unwrap().ino(),
+        first_ino,
+        "a changed source must still refresh the snapshot",
+    );
+    assert_eq!(
+        std::fs::read_to_string(third.join("src/module-0.js")).unwrap(),
+        "module.exports = 'changed';",
+    );
+}
+
+#[test]
+fn concurrent_local_source_populates_never_break_tree_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let sri = synthetic_sri(b"concurrent_local_source_populates_never_break_tree_validation");
+
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..12 {
+                    store
+                        .populate_object_from_local_source(&source, &sri)
+                        .unwrap();
+                    let verified =
+                        is_verified_object_dir(&object_dir, &sri, ObjectIntegrityPolicy::Tree)
+                            .expect("concurrent populate must never leave a mixed snapshot tree");
+                    assert!(
+                        verified,
+                        "published snapshot must stay complete and verified"
+                    );
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn tree_hash_ignores_in_flight_atomic_sidecar_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"tree_hash_ignores_in_flight_atomic_sidecar_rewrites");
+    let object_dir = write_tree_object(
+        &store,
+        &sri,
+        &[
+            ("package.json", b"{\"name\":\"sidecar-rewrites\"}"),
+            ("index.js", b"module.exports = 1;"),
+        ],
+    );
+    let baseline = crate::v2::tree_hash::compute_object_tree_integrities(&object_dir)
+        .unwrap()
+        .content;
+    let snapshot_bytes = std::fs::read(object_dir.join(TREE_SNAPSHOT_FILENAME)).unwrap();
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut mismatch = None;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                lpm_common::write_file_atomic(
+                    &object_dir.join(TREE_SNAPSHOT_FILENAME),
+                    &snapshot_bytes,
+                )
+                .unwrap();
+            }
+        });
+        for _ in 0..200 {
+            let hashed = crate::v2::tree_hash::compute_object_tree_integrities(&object_dir)
+                .unwrap()
+                .content;
+            if hashed != baseline {
+                mismatch = Some(hashed);
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+    });
+    assert_eq!(
+        mismatch, None,
+        "an in-flight atomic sidecar rewrite must not perturb the tree hash (baseline {baseline})",
+    );
+}

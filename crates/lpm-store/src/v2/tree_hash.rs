@@ -358,4 +358,8 @@ pub(crate) fn is_object_metadata_sidecar_name(root: &Path, dir: &Path, name: &Os
         || name.starts_with("..lpm-tree-snapshot.json.tmp.")
         || name.starts_with(".lpm-object-integrity.tmp.")
         || name.starts_with("..lpm-object-integrity.tmp.")
+        // In-flight `write_file_atomic` rewrites of the sidecars above
+        // stage `.lpm-<random>` temporaries in the object root; a
+        // concurrent tree hash must not observe them.
+        || lpm_common::atomic_write::is_atomic_temp_name(name)
 }

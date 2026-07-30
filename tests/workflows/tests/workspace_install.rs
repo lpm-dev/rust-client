@@ -613,6 +613,112 @@ fn recursive_install_json_emits_one_workspace_envelope() {
 }
 
 #[test]
+fn repeated_recursive_json_install_reports_up_to_date_targets() {
+    let project = workspace_project();
+    let seed = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed recursive workspace install");
+    assert_install_succeeded(&seed, "seed recursive install should succeed");
+
+    let output = lpm(&project)
+        .arg("--json")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("rerun recursive workspace install with JSON output");
+    assert_install_succeeded(&output, "repeated recursive JSON install should succeed");
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value");
+    assert_eq!(envelope["success"], true);
+    assert_eq!(
+        envelope["up_to_date"], true,
+        "aggregate up_to_date should be true when every target fast-exits: {envelope}",
+    );
+    for target in envelope["targets"]
+        .as_array()
+        .expect("targets should be an array")
+    {
+        assert_eq!(
+            target["up_to_date"], true,
+            "every target should fast-exit on rerun: {target}",
+        );
+    }
+}
+
+#[test]
+fn recursive_json_install_with_timing_reports_per_target_and_aggregate_phases() {
+    let project = workspace_project();
+    let output = lpm(&project)
+        .arg("--json")
+        .arg("install")
+        .arg("--recursive")
+        .arg("--timing")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive workspace install with timing telemetry");
+    assert_install_succeeded(
+        &output,
+        "recursive JSON install with --timing should succeed",
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value");
+    let aggregate = envelope["timing"]
+        .as_object()
+        .expect("aggregate timing should be present with --timing");
+    for phase in ["resolve_ms", "fetch_ms", "link_ms", "total_ms"] {
+        assert!(
+            aggregate.get(phase).is_some_and(serde_json::Value::is_u64),
+            "aggregate timing should report {phase}: {envelope}",
+        );
+    }
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets should be an array");
+    assert!(
+        targets
+            .iter()
+            .any(|target| target["timing"].as_object().is_some()),
+        "per-target timing should be embedded with --timing: {envelope}",
+    );
+}
+
+#[test]
+fn recursive_install_respects_workspace_concurrency_flag() {
+    let project = workspace_project();
+    let output = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .arg("--workspace-concurrency")
+        .arg("1")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive workspace install with a concurrency cap");
+    assert_install_succeeded(&output, "recursive install with --workspace-concurrency 1");
+    for target in ["", "packages/core", "packages/web", "packages/unrelated"] {
+        assert_target_installed(&project, target);
+    }
+
+    let rejected = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .arg("--workspace-concurrency")
+        .arg("0")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive workspace install with an invalid concurrency");
+    assert!(
+        !rejected.status.success(),
+        "--workspace-concurrency 0 should be rejected at the CLI layer",
+    );
+}
+
+#[test]
 fn recursive_install_runs_lifecycle_scripts_in_dependency_order() {
     let project = TempProject::empty(
         r#"{
@@ -777,4 +883,186 @@ fn recursive_install_preserves_member_trust_approval_gates() {
     );
     assert_target_not_installed(&project, "");
     assert_target_not_installed(&project, "packages/trusted");
+}
+
+// ─── Unified workspace resolution ────────────────────────────────
+
+use support::lpm_with_registry;
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+
+async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)]) {
+    let mut batch = Vec::with_capacity(packages.len());
+    for (name, version) in packages {
+        let tarball = make_tarball(name, version);
+        mock.with_package(name, version, &tarball).await;
+        let integrity = compute_integrity(&tarball);
+        batch.push(serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                *version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url()),
+                        "integrity": integrity,
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { *version: "2025-01-01T00:00:00.000Z" }
+        }));
+    }
+    mock.with_batch_metadata(batch).await;
+}
+
+#[tokio::test]
+async fn recursive_install_slices_shared_resolution_per_member_lockfile() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("shared-dep", "1.0.0"), ("web-only-dep", "2.0.0")]).await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "unified-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/core/package.json",
+        r#"{
+  "name": "@fixture/core",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-dep": "^1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/web/package.json",
+        r#"{
+  "name": "@fixture/web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-dep": "^1.0.0",
+    "web-only-dep": "^2.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install against the mock registry");
+    assert_install_succeeded(&output, "unified recursive install should succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Using workspace resolution"),
+        "at least one member should consume the shared workspace resolution: {stderr}",
+    );
+
+    for member in ["packages/core", "packages/web"] {
+        assert_target_installed(&project, member);
+    }
+    assert!(
+        project
+            .path()
+            .join("packages/core/node_modules/shared-dep")
+            .exists(),
+        "core must link its shared dependency",
+    );
+    assert!(
+        project
+            .path()
+            .join("packages/web/node_modules/web-only-dep")
+            .exists(),
+        "web must link its own dependency",
+    );
+    assert!(
+        !project
+            .path()
+            .join("packages/core/node_modules/web-only-dep")
+            .exists(),
+        "core must not receive web's dependency from the shared resolution",
+    );
+
+    let core_lock = project.read_file("packages/core/lpm.lock");
+    assert!(
+        core_lock.contains("shared-dep"),
+        "core lockfile must record its direct dependency: {core_lock}",
+    );
+    assert!(
+        !core_lock.contains("web-only-dep"),
+        "core lockfile must not leak web's dependency from the shared resolution: {core_lock}",
+    );
+    let web_lock = project.read_file("packages/web/lpm.lock");
+    assert!(
+        web_lock.contains("shared-dep") && web_lock.contains("web-only-dep"),
+        "web lockfile must record both of its direct dependencies: {web_lock}",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[("contested-dep", "1.0.0"), ("contested-dep", "2.0.0")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "conflicted-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/one/package.json",
+        r#"{
+  "name": "@fixture/one",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "contested-dep": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/two/package.json",
+        r#"{
+  "name": "@fixture/two",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "contested-dep": "2.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with conflicting member specs");
+    assert_install_succeeded(&output, "conflicting member specs should still install");
+
+    let one_manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file("packages/one/node_modules/contested-dep/package.json"),
+    )
+    .expect("member one should link contested-dep");
+    assert_eq!(one_manifest["version"], "1.0.0");
+    let two_manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file("packages/two/node_modules/contested-dep/package.json"),
+    )
+    .expect("member two should link contested-dep");
+    assert_eq!(two_manifest["version"], "2.0.0");
 }

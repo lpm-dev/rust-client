@@ -1,5 +1,28 @@
 use super::*;
 
+/// Coalesce concurrent packument fetches for one cache key.
+///
+/// Concurrent installs in one process (recursive workspace targets)
+/// resolve heavily overlapping dependency trees; without coalescing,
+/// every install re-fetches the same packument over the network at the
+/// same moment and none of them can hit the shared disk cache. The
+/// first caller through this guard fetches and writes the cache; every
+/// waiter re-reads the cache after acquiring the guard and turns into
+/// a cache hit.
+async fn metadata_fetch_flight_guard(cache_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    static FLIGHTS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let flight = {
+        let mut flights = FLIGHTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(flights.entry(cache_key.to_owned()).or_default())
+    };
+    flight.lock_owned().await
+}
+
 #[derive(serde::Deserialize)]
 struct NdjsonBatchEntry {
     name: String,
@@ -865,6 +888,17 @@ impl RegistryClient {
         }
         crate::timing::record_metadata_cache_miss();
 
+        let _flight = if use_cache {
+            let flight = metadata_fetch_flight_guard(&cache_key).await;
+            if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+                tracing::debug!("metadata cache hit (coalesced): {scoped}");
+                return Ok(cached);
+            }
+            Some(flight)
+        } else {
+            None
+        };
+
         // npm registries expect raw scoped names in the path:
         // /api/registry/@lpm.dev/owner.package (NOT percent-encoded)
         let url = format!("{}/api/registry/{scoped}", self.base_url);
@@ -934,6 +968,12 @@ impl RegistryClient {
             return Ok(cached);
         }
         crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&cache_key).await;
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (coalesced): npm:{name}");
+            return Ok(cached);
+        }
 
         // Past this point the call WILL hit a registry (proxy or upstream).
         // `record_rpc` fires in each tier's exit path (success or error)
@@ -1079,6 +1119,12 @@ impl RegistryClient {
         }
         crate::timing::record_metadata_cache_miss();
 
+        let _flight = metadata_fetch_flight_guard(&cache_key).await;
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (direct, coalesced): npm:{name}");
+            return Ok(cached);
+        }
+
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
@@ -1160,6 +1206,23 @@ impl RegistryClient {
         }
         timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&cache_key).await;
+        let coalesced_read_start = std::time::Instant::now();
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            timings.cache_read_ms = timings
+                .cache_read_ms
+                .saturating_add(coalesced_read_start.elapsed().as_millis());
+            timings.cache_hit = true;
+            tracing::debug!("metadata cache hit (direct, coalesced): npm:{name}");
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
+        }
+        timings.cache_read_ms = timings
+            .cache_read_ms
+            .saturating_add(coalesced_read_start.elapsed().as_millis());
 
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -1269,6 +1332,25 @@ impl RegistryClient {
         }
         timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&cache_key).await;
+        let coalesced_read_start = std::time::Instant::now();
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && package_metadata_matches_version_doc(name, version, &cached)
+        {
+            timings.cache_read_ms = timings
+                .cache_read_ms
+                .saturating_add(coalesced_read_start.elapsed().as_millis());
+            timings.cache_hit = true;
+            tracing::debug!("metadata cache hit (direct version, coalesced): npm:{name}@{version}");
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
+        }
+        timings.cache_read_ms = timings
+            .cache_read_ms
+            .saturating_add(coalesced_read_start.elapsed().as_millis());
 
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {

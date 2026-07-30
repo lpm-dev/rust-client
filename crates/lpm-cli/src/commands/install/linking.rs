@@ -792,7 +792,7 @@ pub(super) async fn run_link_and_finish(
                 .collect(),
         );
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        report_capture::emit_install_json(&json);
     } else if emit_install_report {
         // patch summary in human mode.
         // invariant : use the filtered summary so a no-op

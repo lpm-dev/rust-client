@@ -41,6 +41,7 @@ mod patches;
 mod peer;
 pub(crate) mod policy_extensions;
 mod recursive;
+mod report_capture;
 mod reporting;
 mod resolve;
 mod setup;
@@ -52,6 +53,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 mod timing;
+mod unified_resolve;
 mod validation;
 mod workspace;
 
@@ -691,24 +693,10 @@ async fn run_with_options_under_store_lock(
     )?;
     reject_remote_tarball_url_deps_with_policy_extensions(&policy_extension_configs, &deps)?;
 
-    let resolver_excludes = minimum_release_age_exclude
-        .iter()
-        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
-    let resolver_policy = if release_age_policy.is_strict() {
-        lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
-            resolver_min_age_secs,
-            resolver_trust_policy,
-            resolver_excludes,
-        )
-    } else {
-        let direct_release_age_canonicals = direct_release_age_canonicals(&deps);
-        lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
-            resolver_min_age_secs,
-            resolver_trust_policy,
-            resolver_excludes,
-            direct_release_age_canonicals,
-        )
-    };
+    // Snapshot for release-age direct canonicals: the policy's direct
+    // set is defined by the manifest-declared roots, not by whatever
+    // the workspace pre-resolve later injects into `deps`.
+    let release_age_direct_snapshot = deps.clone();
     let minimum_release_age_exclude: std::collections::HashSet<String> =
         minimum_release_age_exclude.into_iter().collect();
 
@@ -832,6 +820,47 @@ async fn run_with_options_under_store_lock(
     if requested_v2_mode {
         workspace_member_deps.clear();
     }
+
+    // A trigger widens `deps` to the workspace resolve-group union
+    // here — after workspace pre-resolve so its baseline labels cover
+    // everything its own pipeline injected, and before the resolver
+    // policy derives from `deps` so release-age treats every union
+    // root as direct.
+    let mut unified_role = unified_resolve::prepare_role(
+        project_dir,
+        &lockfile_path,
+        force,
+        offline,
+        frozen_lockfile_active,
+        &mut deps,
+    );
+
+    let resolver_excludes = minimum_release_age_exclude
+        .iter()
+        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
+    let resolver_policy = if release_age_policy.is_strict() {
+        lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
+            resolver_min_age_secs,
+            resolver_trust_policy,
+            resolver_excludes,
+        )
+    } else {
+        // Union extras are other targets' manifest directs; they get
+        // the same direct release-age treatment their own resolve
+        // would have applied.
+        let mut direct_canonicals = direct_release_age_canonicals(&release_age_direct_snapshot);
+        if let Some(extras) = unified_role.union_extra_release_age_canonicals(&deps) {
+            direct_canonicals.extend(extras);
+            direct_canonicals.sort_by_key(ToString::to_string);
+            direct_canonicals.dedup();
+        }
+        lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
+            resolver_min_age_secs,
+            resolver_trust_policy,
+            resolver_excludes,
+            direct_canonicals,
+        )
+    };
 
     if offline {
         return run_offline_install_phase(OfflineInstallInput {
@@ -1100,10 +1129,12 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
-    let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
+    let fetch_coord: Arc<FetchCoordinator> = FetchCoordinator::process_global();
+    let workspace_preresolved = unified_resolve::preresolved_for_waiter(&unified_role, &deps).await;
+
     let OnlineResolutionPhaseResult {
-        packages,
-        packages_for_lockfile,
+        mut packages,
+        mut packages_for_lockfile,
         resolve_ms,
         used_lockfile,
         platform_skipped,
@@ -1111,7 +1142,7 @@ async fn run_with_options_under_store_lock(
         applied_overrides,
         peer_conflicts,
         peer_warnings,
-        ambient_peer_installs_for_lockfile,
+        mut ambient_peer_installs_for_lockfile,
         spec_tracker,
         speculation_join,
         mut fetch_overlap_join,
@@ -1171,8 +1202,22 @@ async fn run_with_options_under_store_lock(
         dependency_engine_policy: dependency_engine_policy.clone(),
         resolver_min_age_secs,
         override_set: override_set.clone(),
+        workspace_preresolved,
     })
     .await?;
+
+    // A trigger resolved the whole group union above; publish it for
+    // the waiting targets and reduce this pipeline's package sets to
+    // its own slice before policy checks, fetch, link, and lockfile.
+    unified_resolve::publish_and_reduce_trigger(
+        &mut unified_role,
+        &deps,
+        &mut packages,
+        &mut packages_for_lockfile,
+        &mut ambient_peer_installs_for_lockfile,
+        auto_isolated_peer_conflicts,
+        linker_mode,
+    );
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
