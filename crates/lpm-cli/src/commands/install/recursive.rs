@@ -1,12 +1,13 @@
 use super::*;
 use lpm_task::graph::WorkspaceGraph;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
 const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
 const WORKSPACE_INSTALL_DEFAULT_CONCURRENCY: usize = 1;
+const WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY: usize = 3;
 
 pub(crate) struct RecursiveInstallOptions {
     pub(crate) json_output: bool,
@@ -101,8 +102,20 @@ pub(crate) async fn run_recursive_workspace_install(
         return Ok(());
     }
 
-    let concurrency =
-        resolve_workspace_install_concurrency(options.workspace_concurrency, targets.len());
+    let lockfile_replay_ready =
+        explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
+            && workspace_targets_need_materialization(&targets)
+            && workspace_targets_are_lockfile_replay_ready(&workspace, &targets, &options);
+    let concurrency = resolve_workspace_install_concurrency(
+        options.workspace_concurrency,
+        targets.len(),
+        lockfile_replay_ready,
+    );
+    tracing::debug!(
+        concurrency,
+        lockfile_replay_ready,
+        "selected recursive workspace install concurrency"
+    );
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);
     let started = Instant::now();
@@ -324,15 +337,148 @@ async fn run_workspace_target_install(
 fn resolve_workspace_install_concurrency(
     cli_override: Option<NonZeroUsize>,
     target_count: usize,
+    lockfile_replay_ready: bool,
 ) -> usize {
-    let configured = cli_override.map(NonZeroUsize::get).or_else(|| {
+    let configured = explicit_workspace_install_concurrency(cli_override);
+    let limit = configured.unwrap_or_else(|| {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY);
+        automatic_workspace_install_concurrency(
+            target_count,
+            lockfile_replay_ready,
+            available_parallelism,
+        )
+    });
+    limit.min(target_count.max(1))
+}
+
+fn explicit_workspace_install_concurrency(cli_override: Option<NonZeroUsize>) -> Option<usize> {
+    cli_override.map(NonZeroUsize::get).or_else(|| {
         std::env::var(ENV_WORKSPACE_CONCURRENCY)
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|value| *value > 0)
-    });
-    let limit = configured.unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY);
-    limit.min(target_count.max(1))
+    })
+}
+
+fn automatic_workspace_install_concurrency(
+    target_count: usize,
+    lockfile_replay_ready: bool,
+    available_parallelism: usize,
+) -> usize {
+    if !lockfile_replay_ready {
+        return WORKSPACE_INSTALL_DEFAULT_CONCURRENCY;
+    }
+    available_parallelism
+        .clamp(1, WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY)
+        .min(target_count.max(1))
+}
+
+fn workspace_targets_need_materialization(targets: &[WorkspaceInstallTarget]) -> bool {
+    targets
+        .iter()
+        .any(|target| !target.path.join("node_modules").is_dir())
+}
+
+fn workspace_targets_are_lockfile_replay_ready(
+    workspace: &lpm_workspace::Workspace,
+    targets: &[WorkspaceInstallTarget],
+    options: &RecursiveInstallOptions,
+) -> bool {
+    if options.force
+        || options.offline
+        || targets
+            .iter()
+            .any(|target| target.lifecycle.has_dev_preinstall())
+    {
+        return false;
+    }
+
+    let Ok(global_config) = crate::commands::config::GlobalConfig::load_checked() else {
+        return false;
+    };
+    let global_auto_install_peers = global_config.get_bool("auto-install-peers");
+
+    let mut packages_by_path = HashMap::with_capacity(workspace.members.len() + 1);
+    packages_by_path.insert(workspace.root.as_path(), &workspace.root_package);
+    for member in &workspace.members {
+        packages_by_path.insert(member.path.as_path(), &member.package);
+    }
+
+    targets.iter().all(|target| {
+        let Some(package) = packages_by_path.get(target.path.as_path()).copied() else {
+            return false;
+        };
+        target_lockfile_is_replay_ready(workspace, &target.path, package, global_auto_install_peers)
+    })
+}
+
+fn target_lockfile_is_replay_ready(
+    workspace: &lpm_workspace::Workspace,
+    project_dir: &Path,
+    package: &lpm_workspace::PackageJson,
+    global_auto_install_peers: Option<bool>,
+) -> bool {
+    if package
+        .lpm
+        .as_ref()
+        .is_some_and(|lpm| !lpm.patched_dependencies.is_empty())
+    {
+        return false;
+    }
+
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
+        return false;
+    };
+    let auto_install_peers = package
+        .lpm
+        .as_ref()
+        .and_then(|lpm| lpm.auto_install_peers)
+        .or(global_auto_install_peers)
+        .unwrap_or(true);
+    if lockfile_needs_peer_state_repair(&lockfile, auto_install_peers)
+        || lockfile_needs_dependency_engine_repair(&lockfile)
+    {
+        return false;
+    }
+
+    let mut deps = manifest_install_deps(package);
+    if normalize_jsr_manifest_deps(&mut deps).is_err()
+        || deps
+            .values()
+            .any(|specifier| specifier.starts_with("file:") || specifier.starts_with("link:"))
+        || extract_workspace_protocol_deps(&mut deps, workspace).is_err()
+    {
+        return false;
+    }
+    let catalogs = &workspace.root_package.catalogs;
+    let Ok(mut catalog_resolutions) = lpm_workspace::resolve_catalog_protocol(&mut deps, catalogs)
+    else {
+        return false;
+    };
+    let Ok(overrides) = prepare_override_resolution_state(OverrideResolutionInput {
+        package,
+        workspace: Some(workspace),
+        catalog_resolutions: &mut catalog_resolutions,
+    }) else {
+        return false;
+    };
+    let current_importer = validation::importer_snapshot_for_current_manifest(
+        package,
+        &overrides.lpm_overrides,
+        overrides.overrides.as_ref(),
+        overrides.resolutions.as_ref(),
+        overrides.override_catalogs,
+        None,
+        auto_install_peers,
+    );
+    if lockfile.importers.get(".") != Some(&current_importer) {
+        return false;
+    }
+
+    lockfile_satisfies_fast_path(&lockfile, &deps, &catalog_resolutions, false, false)
 }
 
 fn select_workspace_install_targets(
@@ -627,6 +773,209 @@ mod tests {
             None::<std::ffi::OsString>,
         )]);
 
-        assert_eq!(resolve_workspace_install_concurrency(None, 4), 1);
+        assert_eq!(resolve_workspace_install_concurrency(None, 4, false), 1);
+    }
+
+    #[test]
+    fn recursive_workspace_install_parallelizes_proven_lockfile_replays() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            ENV_WORKSPACE_CONCURRENCY,
+            None::<std::ffi::OsString>,
+        )]);
+
+        assert_eq!(automatic_workspace_install_concurrency(8, true, 8), 3);
+    }
+
+    #[test]
+    fn recursive_workspace_install_caps_automatic_parallelism_by_target_count() {
+        assert_eq!(automatic_workspace_install_concurrency(2, true, 8), 2);
+    }
+
+    #[test]
+    fn recursive_workspace_install_keeps_automatic_parallelism_within_available_cpus() {
+        assert_eq!(automatic_workspace_install_concurrency(8, true, 2), 2);
+    }
+
+    #[test]
+    fn recursive_workspace_install_cli_concurrency_overrides_automatic_policy() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            ENV_WORKSPACE_CONCURRENCY,
+            Some(std::ffi::OsString::from("2")),
+        )]);
+
+        assert_eq!(
+            resolve_workspace_install_concurrency(NonZeroUsize::new(3), 8, false),
+            3,
+        );
+    }
+
+    #[test]
+    fn recursive_workspace_install_env_concurrency_overrides_automatic_policy() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            ENV_WORKSPACE_CONCURRENCY,
+            Some(std::ffi::OsString::from("3")),
+        )]);
+
+        assert_eq!(resolve_workspace_install_concurrency(None, 8, false), 3);
+    }
+
+    #[test]
+    fn recursive_workspace_install_rejects_missing_lockfile_for_automatic_parallelism() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let package = replay_ready_package();
+        let workspace = replay_ready_workspace(directory.path(), package.clone());
+
+        assert!(!target_lockfile_is_replay_ready(
+            &workspace,
+            directory.path(),
+            &package,
+            None,
+        ));
+    }
+
+    #[test]
+    fn recursive_workspace_install_rejects_malformed_lockfile_for_automatic_parallelism() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let package = replay_ready_package();
+        let workspace = replay_ready_workspace(directory.path(), package.clone());
+        std::fs::write(
+            directory.path().join(lpm_lockfile::LOCKFILE_NAME),
+            "not a lockfile\n",
+        )
+        .expect("write malformed lockfile");
+
+        assert!(!target_lockfile_is_replay_ready(
+            &workspace,
+            directory.path(),
+            &package,
+            None,
+        ));
+    }
+
+    #[test]
+    fn recursive_workspace_install_rejects_stale_importer_for_automatic_parallelism() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let package = replay_ready_package();
+        let workspace = replay_ready_workspace(directory.path(), package.clone());
+        write_replay_ready_lockfile(directory.path(), &package, "^4.16.0");
+
+        assert!(!target_lockfile_is_replay_ready(
+            &workspace,
+            directory.path(),
+            &package,
+            None,
+        ));
+    }
+
+    #[test]
+    fn recursive_workspace_install_accepts_current_lockfile_for_automatic_parallelism() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let package = replay_ready_package();
+        let workspace = replay_ready_workspace(directory.path(), package.clone());
+        write_replay_ready_lockfile(directory.path(), &package, "^4.17.0");
+
+        assert!(target_lockfile_is_replay_ready(
+            &workspace,
+            directory.path(),
+            &package,
+            None,
+        ));
+    }
+
+    #[test]
+    fn recursive_workspace_install_skips_lockfile_preflight_when_targets_are_materialized() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        std::fs::create_dir(directory.path().join("node_modules"))
+            .expect("create materialized node_modules");
+        let package = replay_ready_package();
+        let targets = vec![replay_ready_target(directory.path(), &package)];
+
+        assert!(!workspace_targets_need_materialization(&targets));
+    }
+
+    #[test]
+    fn recursive_workspace_install_checks_lockfiles_when_a_target_needs_materialization() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let package = replay_ready_package();
+        let targets = vec![replay_ready_target(directory.path(), &package)];
+
+        assert!(workspace_targets_need_materialization(&targets));
+    }
+
+    fn replay_ready_target(
+        path: &Path,
+        package: &lpm_workspace::PackageJson,
+    ) -> WorkspaceInstallTarget {
+        WorkspaceInstallTarget {
+            name: "replay-ready".to_string(),
+            path: path.to_path_buf(),
+            kind: "root",
+            lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
+            schedule_after: Vec::new(),
+        }
+    }
+
+    fn replay_ready_package() -> lpm_workspace::PackageJson {
+        let mut package = lpm_workspace::PackageJson {
+            name: Some("replay-ready".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..lpm_workspace::PackageJson::default()
+        };
+        package
+            .dependencies
+            .insert("lodash".to_string(), "^4.17.0".to_string());
+        package
+    }
+
+    fn replay_ready_workspace(
+        root: &Path,
+        package: lpm_workspace::PackageJson,
+    ) -> lpm_workspace::Workspace {
+        lpm_workspace::Workspace {
+            root: root.to_path_buf(),
+            root_package: package,
+            members: Vec::new(),
+        }
+    }
+
+    fn write_replay_ready_lockfile(
+        project_dir: &Path,
+        package: &lpm_workspace::PackageJson,
+        importer_spec: &str,
+    ) {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        let mut importer = validation::importer_snapshot_for_current_manifest(
+            package,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            true,
+        );
+        importer
+            .dependencies
+            .insert("lodash".to_string(), importer_spec.to_string());
+        lockfile.importers.insert(".".to_string(), importer);
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            node_engine: None,
+            optional: false,
+            dependencies: Vec::new(),
+            alias_dependencies: Vec::new(),
+            peers: Vec::new(),
+            tarball: None,
+        });
+        lockfile
+            .write_to_file(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("write replay-ready lockfile");
     }
 }
