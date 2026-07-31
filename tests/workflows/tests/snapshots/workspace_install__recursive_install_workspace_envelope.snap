@@ -1,6 +1,5 @@
 ---
 source: tests/workflows/tests/workspace_install.rs
-assertion_line: 612
 expression: envelope
 ---
 {
@@ -17,6 +16,17 @@ expression: envelope
       "status": "success",
       "duration_ms": "<duration>",
       "no_dependencies": true,
+      "counts": {
+        "scope": "target",
+        "resolved_package_row_count": 0,
+        "authoritative_fetch_candidate_count": 0,
+        "store_reuse_observation_count": 0,
+        "store_reuse_may_include_same_command_population": true,
+        "linker_entry_created_count": 0,
+        "linker_entry_reused_count": 0,
+        "project_root_symlink_created_count": 0,
+        "bin_link_created_count": 0
+      },
       "security": {
         "policy_extensions": {
           "enabled": false,
@@ -39,6 +49,17 @@ expression: envelope
       "status": "success",
       "duration_ms": "<duration>",
       "no_dependencies": true,
+      "counts": {
+        "scope": "target",
+        "resolved_package_row_count": 0,
+        "authoritative_fetch_candidate_count": 0,
+        "store_reuse_observation_count": 0,
+        "store_reuse_may_include_same_command_population": true,
+        "linker_entry_created_count": 0,
+        "linker_entry_reused_count": 0,
+        "project_root_symlink_created_count": 0,
+        "bin_link_created_count": 0
+      },
       "security": {
         "policy_extensions": {
           "enabled": false,
@@ -65,6 +86,17 @@ expression: envelope
       "cached": 1,
       "linked": 1,
       "symlinked": 1,
+      "counts": {
+        "scope": "target",
+        "resolved_package_row_count": 1,
+        "authoritative_fetch_candidate_count": 0,
+        "store_reuse_observation_count": 1,
+        "store_reuse_may_include_same_command_population": true,
+        "linker_entry_created_count": 1,
+        "linker_entry_reused_count": 0,
+        "project_root_symlink_created_count": 1,
+        "bin_link_created_count": 0
+      },
       "used_lockfile": false,
       "security": {
         "firewall": {
@@ -105,6 +137,17 @@ expression: envelope
       "status": "success",
       "duration_ms": "<duration>",
       "no_dependencies": true,
+      "counts": {
+        "scope": "target",
+        "resolved_package_row_count": 0,
+        "authoritative_fetch_candidate_count": 0,
+        "store_reuse_observation_count": 0,
+        "store_reuse_may_include_same_command_population": true,
+        "linker_entry_created_count": 0,
+        "linker_entry_reused_count": 0,
+        "project_root_symlink_created_count": 0,
+        "bin_link_created_count": 0
+      },
       "security": {
         "policy_extensions": {
           "enabled": false,
@@ -129,5 +172,18 @@ expression: envelope
   "count": 1,
   "downloaded": 0,
   "cached": 1,
-  "linked": 1
+  "linked": 1,
+  "counts": {
+    "scope": "recursive_command",
+    "aggregation": "sum_of_target_observations",
+    "work_is_cumulative": true,
+    "resolved_package_row_count": 1,
+    "authoritative_fetch_candidate_count": 0,
+    "store_reuse_observation_count": 1,
+    "store_reuse_may_include_same_command_population": true,
+    "linker_entry_created_count": 1,
+    "linker_entry_reused_count": 0,
+    "project_root_symlink_created_count": 1,
+    "bin_link_created_count": 0
+  }
 }

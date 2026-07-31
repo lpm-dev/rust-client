@@ -918,6 +918,81 @@ async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)])
     mock.with_batch_metadata(batch).await;
 }
 
+async fn mount_importer_context_packages(mock: &MockRegistry) {
+    let parent_manifest = serde_json::json!({
+        "name": "context-parent",
+        "version": "1.0.0",
+        "dependencies": {
+            "context-child": "^1.0.0"
+        }
+    });
+    let parent_tarball = make_tarball_from_pkg_json(parent_manifest, &[]);
+    let child_v1_tarball = make_tarball("context-child", "1.0.0");
+    let child_v11_tarball = make_tarball("context-child", "1.1.0");
+    let parent_metadata = serde_json::json!({
+        "name": "context-parent",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "context-parent",
+                "version": "1.0.0",
+                "dependencies": {
+                    "context-child": "^1.0.0"
+                },
+                "dist": {
+                    "tarball": mock.tarball_url("context-parent", "1.0.0"),
+                    "integrity": compute_integrity(&parent_tarball)
+                }
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    let child_metadata = serde_json::json!({
+        "name": "context-child",
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": "2099-01-01T00:00:00.000Z",
+        "versions": {
+            "1.0.0": {
+                "name": "context-child",
+                "version": "1.0.0",
+                "dependencies": {},
+                "dist": {
+                    "tarball": mock.tarball_url("context-child", "1.0.0"),
+                    "integrity": compute_integrity(&child_v1_tarball)
+                }
+            },
+            "1.1.0": {
+                "name": "context-child",
+                "version": "1.1.0",
+                "dependencies": {},
+                "dist": {
+                    "tarball": mock.tarball_url("context-child", "1.1.0"),
+                    "integrity": compute_integrity(&child_v11_tarball)
+                }
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2099-01-01T00:00:00.000Z"
+        }
+    });
+
+    mock.with_package_metadata_and_tarballs(
+        "context-parent",
+        parent_metadata.clone(),
+        &[("1.0.0", parent_tarball)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        "context-child",
+        child_metadata.clone(),
+        &[("1.0.0", child_v1_tarball), ("1.1.0", child_v11_tarball)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![parent_metadata, child_metadata])
+        .await;
+}
+
 fn peer_sensitive_workspace_project() -> TempProject {
     let project = TempProject::empty(
         r#"{
@@ -1062,6 +1137,13 @@ fn member_package_graph(project: &TempProject, member: &str) -> Vec<(String, Str
         .collect()
 }
 
+fn member_package_version(project: &TempProject, member: &str, name: &str) -> String {
+    member_package_graph(project, member)
+        .into_iter()
+        .find_map(|(package, version, _)| (package == name).then_some(version))
+        .unwrap_or_else(|| panic!("{member}/lpm.lock should contain {name}"))
+}
+
 #[tokio::test]
 async fn recursive_install_preserves_importer_local_peer_contexts_in_parallel() {
     let mock = MockRegistry::start().await;
@@ -1100,8 +1182,6 @@ async fn recursive_install_preserves_importer_local_peer_contexts_in_parallel() 
         let recursive_output = lpm_with_registry(&recursive, &mock.url())
             .arg("install")
             .arg("--recursive")
-            .arg("--workspace-concurrency")
-            .arg("4")
             .args(INSTALL_FLAGS)
             .output()
             .unwrap_or_else(|error| panic!("run recursive install attempt {attempt}: {error}"));
@@ -1206,6 +1286,131 @@ async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
     assert!(
         web_lock.contains("shared-dep") && web_lock.contains("web-only-dep"),
         "web lockfile must record both of its direct dependencies: {web_lock}",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_preserves_importer_local_overrides_with_shared_metadata() {
+    let mock = MockRegistry::start().await;
+    mount_importer_context_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "override-context-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/old/package.json",
+        r#"{
+  "name": "@fixture/old-override",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-parent": "1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAgeExclude": ["context-child"],
+    "overrides": {
+      "context-child": "1.0.0"
+    }
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/new/package.json",
+        r#"{
+  "name": "@fixture/new-override",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-parent": "1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAgeExclude": ["context-child"],
+    "overrides": {
+      "context-child": "1.1.0"
+    }
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with importer-local overrides");
+    assert_install_succeeded(&output, "recursive override install should succeed");
+
+    assert_eq!(
+        member_package_version(&project, "packages/old", "context-child"),
+        "1.0.0",
+    );
+    assert_eq!(
+        member_package_version(&project, "packages/new", "context-child"),
+        "1.1.0",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_preserves_importer_local_release_age_policies_with_shared_metadata() {
+    let mock = MockRegistry::start().await;
+    mount_importer_context_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "release-age-context-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/unrestricted/package.json",
+        r#"{
+  "name": "@fixture/unrestricted",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-child": "^1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAge": 86400,
+    "minimumReleaseAgeExclude": ["context-child"]
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/cooldown/package.json",
+        r#"{
+  "name": "@fixture/cooldown",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-child": "^1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAge": 86400
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with importer-local release-age policies");
+    assert_install_succeeded(&output, "recursive release-age install should succeed");
+
+    assert_eq!(
+        member_package_version(&project, "packages/unrestricted", "context-child"),
+        "1.1.0",
+    );
+    assert_eq!(
+        member_package_version(&project, "packages/cooldown", "context-child"),
+        "1.0.0",
     );
 }
 
@@ -1470,8 +1675,6 @@ async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
     let output = lpm_with_registry(&project, &mock.url())
         .arg("install")
         .arg("--recursive")
-        .arg("--workspace-concurrency")
-        .arg("4")
         .args(INSTALL_FLAGS)
         .output()
         .expect("run recursive install with conflicting member specs");
