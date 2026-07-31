@@ -705,6 +705,13 @@ impl RegistryClient {
         client
     }
 
+    /// Detach command-scoped metadata sharing while preserving transport
+    /// configuration and persistent cache behavior.
+    pub fn without_metadata_memory_cache(mut self) -> Self {
+        self.metadata_memory_cache = None;
+        self
+    }
+
     /// Clone transport, TLS, routing, and cache configuration without any
     /// bearer or refresh-backed session.
     ///
