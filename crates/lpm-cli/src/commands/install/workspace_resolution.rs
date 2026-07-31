@@ -6,6 +6,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 pub(super) struct WorkspaceResolutionCoordinator {
     resolution_permits: Arc<Semaphore>,
     completed: Box<[TargetCompletion]>,
+    fetch_overlap_hub: Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>,
 }
 
 impl WorkspaceResolutionCoordinator {
@@ -15,6 +16,7 @@ impl WorkspaceResolutionCoordinator {
             completed: (0..target_count)
                 .map(|_| TargetCompletion::default())
                 .collect(),
+            fetch_overlap_hub: Arc::new(super::fetch_overlap::WorkspaceFetchOverlapHub::new()),
         }
     }
 
@@ -117,6 +119,12 @@ where
 
 pub(super) fn active() -> bool {
     ACTIVE_TASK.try_with(|_| ()).is_ok()
+}
+
+pub(super) fn fetch_overlap_hub() -> Option<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>> {
+    ACTIVE_TASK
+        .try_with(|task| Arc::clone(&task.coordinator.fetch_overlap_hub))
+        .ok()
 }
 
 pub(super) async fn wait_for_commit() -> u128 {

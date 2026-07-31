@@ -269,6 +269,20 @@ impl RouteTable {
         self.mode
     }
 
+    /// Whether immutable registry artifacts may be shared with another
+    /// importer using the same command-scoped client.
+    ///
+    /// This deliberately accepts only the default routing universe. Any
+    /// configured registry, credential, or TLS override keeps that importer
+    /// on its own fetch dispatcher until those contexts have a
+    /// security-preserving equivalence fingerprint.
+    pub fn supports_workspace_fetch_sharing(&self) -> bool {
+        self.npmrc.default_registry.is_none()
+            && self.npmrc.scope_registries.is_empty()
+            && self.npmrc.origin_auth.is_empty()
+            && self.npmrc.tls.is_empty()
+    }
+
     /// The **request-aware effective-origin set** for
     /// `with_tls_overrides_for`'s eager-build pass.
     ///
@@ -458,6 +472,37 @@ mod tests {
         assert_eq!(table.route_for_package("react"), UpstreamRoute::NpmDirect);
         let table = RouteTable::from_mode_only(RouteMode::Proxy);
         assert_eq!(table.route_for_package("react"), UpstreamRoute::LpmWorker);
+    }
+
+    #[test]
+    fn default_route_table_supports_workspace_fetch_sharing() {
+        let table = RouteTable::from_mode_only(RouteMode::Direct);
+
+        assert!(table.supports_workspace_fetch_sharing());
+    }
+
+    #[test]
+    fn custom_registry_route_table_does_not_support_workspace_fetch_sharing() {
+        let npmrc = NpmrcConfig::parse("registry=https://registry.example.test", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("valid npmrc");
+
+        assert!(!table.supports_workspace_fetch_sharing());
+    }
+
+    #[test]
+    fn authenticated_route_table_does_not_support_workspace_fetch_sharing() {
+        let npmrc = NpmrcConfig::parse("//registry.npmjs.org/:_authToken=secret", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("valid npmrc");
+
+        assert!(!table.supports_workspace_fetch_sharing());
+    }
+
+    #[test]
+    fn tls_overridden_route_table_does_not_support_workspace_fetch_sharing() {
+        let npmrc = NpmrcConfig::parse("strict-ssl=true", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("valid npmrc");
+
+        assert!(!table.supports_workspace_fetch_sharing());
     }
 
     #[test]

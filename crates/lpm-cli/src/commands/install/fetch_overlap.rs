@@ -4,7 +4,7 @@ const ENV_FETCH_OVERLAP: &str = "LPM_FETCH_OVERLAP";
 const ENV_FETCH_OVERLAP_MIN_SELECTED: &str = "LPM_FETCH_OVERLAP_MIN_SELECTED";
 const DEFAULT_FETCH_OVERLAP_MIN_SELECTED: usize = 64;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct FetchOverlapOutcome {
     pub(super) key: String,
     pub(super) package_display: String,
@@ -19,6 +19,228 @@ enum FetchOverlapTaskStatus {
     CacheHit,
     SkippedPlatform,
     Failed,
+}
+
+struct WorkspaceFetchRequestContext {
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    store: PackageStore,
+    store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
+    fetch_semaphore: Arc<Semaphore>,
+    fetch_coord: Arc<FetchCoordinator>,
+    project_dir: PathBuf,
+    gate_stats: Arc<GateStats>,
+    fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
+    streaming_fetch: bool,
+}
+
+struct WorkspaceFetchPool {
+    store: PackageStore,
+    store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
+    fetch_semaphore: Arc<Semaphore>,
+    fetch_coord: Arc<FetchCoordinator>,
+    fetch_extract_limiter: FetchExtractLimiter,
+}
+
+impl WorkspaceFetchPool {
+    fn from_context(context: &WorkspaceFetchRequestContext) -> Self {
+        Self {
+            store: context.store.clone(),
+            store_v2_handle: context.store_v2_handle.clone(),
+            fetch_semaphore: context.fetch_semaphore.clone(),
+            fetch_coord: context.fetch_coord.clone(),
+            fetch_extract_limiter: context.fetch_extract_limiter.clone(),
+        }
+    }
+}
+
+struct WorkspaceFetchCompletion {
+    status: Arc<FetchOverlapTaskStatus>,
+    dispatched: bool,
+}
+
+struct WorkspaceFetchSubscriber {
+    tx: tokio::sync::oneshot::Sender<WorkspaceFetchCompletion>,
+    dispatched: bool,
+}
+
+enum WorkspaceFetchState {
+    Running(Vec<WorkspaceFetchSubscriber>),
+    Complete(Arc<FetchOverlapTaskStatus>),
+}
+
+struct WorkspaceFetchRequest {
+    package: InstallPackage,
+    context: Arc<WorkspaceFetchRequestContext>,
+    completion: tokio::sync::oneshot::Sender<WorkspaceFetchCompletion>,
+}
+
+pub(super) struct WorkspaceFetchOverlapHub {
+    tx: tokio::sync::mpsc::UnboundedSender<WorkspaceFetchRequest>,
+}
+
+impl WorkspaceFetchOverlapHub {
+    pub(super) fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run_workspace_fetch_overlap_hub(rx));
+        Self { tx }
+    }
+
+    fn dispatch(
+        &self,
+        package: InstallPackage,
+        context: Arc<WorkspaceFetchRequestContext>,
+    ) -> tokio::sync::oneshot::Receiver<WorkspaceFetchCompletion> {
+        let (completion, rx) = tokio::sync::oneshot::channel();
+        let request = WorkspaceFetchRequest {
+            package,
+            context,
+            completion,
+        };
+        if let Err(error) = self.tx.send(request) {
+            let _ = error.0.completion.send(WorkspaceFetchCompletion {
+                status: Arc::new(FetchOverlapTaskStatus::Failed),
+                dispatched: false,
+            });
+        }
+        rx
+    }
+}
+
+async fn run_workspace_fetch_overlap_hub(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkspaceFetchRequest>,
+) {
+    let mut pool = None;
+    let mut states: HashMap<String, WorkspaceFetchState> = HashMap::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut identities_by_task = HashMap::new();
+
+    loop {
+        tokio::select! {
+            request = rx.recv() => {
+                let Some(request) = request else {
+                    break;
+                };
+                let identity = workspace_fetch_identity(&request.package);
+                match states.get_mut(&identity) {
+                    Some(WorkspaceFetchState::Running(subscribers)) => {
+                        subscribers.push(WorkspaceFetchSubscriber {
+                            tx: request.completion,
+                            dispatched: false,
+                        });
+                    }
+                    Some(WorkspaceFetchState::Complete(status)) => {
+                        let _ = request.completion.send(WorkspaceFetchCompletion {
+                            status: Arc::clone(status),
+                            dispatched: false,
+                        });
+                    }
+                    None => {
+                        let shared_pool =
+                            pool.get_or_insert_with(|| WorkspaceFetchPool::from_context(&request.context));
+                        let context = request.context;
+                        let package = request.package;
+                        let identity_for_task = identity.clone();
+                        let abort_handle = tasks.spawn(fetch_selected_package(
+                            package,
+                            context.client.clone(),
+                            context.route_table.clone(),
+                            shared_pool.store.clone(),
+                            shared_pool.store_v2_handle.clone(),
+                            shared_pool.fetch_semaphore.clone(),
+                            shared_pool.fetch_coord.clone(),
+                            context.project_dir.clone(),
+                            context.gate_stats.clone(),
+                            shared_pool.fetch_extract_limiter.clone(),
+                            context.install_accounting,
+                            context.streaming_fetch,
+                            ArtifactSelection::FreshResolution,
+                        ));
+                        identities_by_task.insert(abort_handle.id(), identity_for_task);
+                        states.insert(
+                            identity,
+                            WorkspaceFetchState::Running(vec![WorkspaceFetchSubscriber {
+                                tx: request.completion,
+                                dispatched: true,
+                            }]),
+                        );
+                    }
+                }
+            }
+            joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok((id, status))) => {
+                        if let Some(identity) = identities_by_task.remove(&id) {
+                            finish_workspace_fetch(&mut states, identity, Arc::new(status));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        if let Some(identity) = identities_by_task.remove(&error.id()) {
+                            finish_workspace_fetch(
+                                &mut states,
+                                identity,
+                                Arc::new(FetchOverlapTaskStatus::Failed),
+                            );
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    tasks.abort_all();
+    let failed = Arc::new(FetchOverlapTaskStatus::Failed);
+    for state in states.into_values() {
+        if let WorkspaceFetchState::Running(subscribers) = state {
+            for subscriber in subscribers {
+                let _ = subscriber.tx.send(WorkspaceFetchCompletion {
+                    status: Arc::clone(&failed),
+                    dispatched: subscriber.dispatched,
+                });
+            }
+        }
+    }
+}
+
+fn finish_workspace_fetch(
+    states: &mut HashMap<String, WorkspaceFetchState>,
+    identity: String,
+    status: Arc<FetchOverlapTaskStatus>,
+) {
+    let Some(WorkspaceFetchState::Running(subscribers)) =
+        states.insert(identity, WorkspaceFetchState::Complete(Arc::clone(&status)))
+    else {
+        return;
+    };
+    for subscriber in subscribers {
+        let _ = subscriber.tx.send(WorkspaceFetchCompletion {
+            status: Arc::clone(&status),
+            dispatched: subscriber.dispatched,
+        });
+    }
+}
+
+fn workspace_fetch_identity(package: &InstallPackage) -> String {
+    let mut identity = install_pkg_key(package);
+    identity.push('\0');
+    match package.integrity.as_deref() {
+        Some(integrity) => {
+            identity.push('1');
+            identity.push_str(integrity);
+        }
+        None => identity.push('0'),
+    }
+    identity.push('\0');
+    match package.tarball_url.as_deref() {
+        Some(url) => {
+            identity.push('1');
+            identity.push_str(url);
+        }
+        None => identity.push('0'),
+    }
+    identity
 }
 
 pub(super) struct FetchOverlapDrain {
@@ -186,6 +408,121 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
 
     FetchOverlapJoin {
         handle: Some(handle),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
+    hub: Arc<WorkspaceFetchOverlapHub>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<lpm_resolver::SelectedPackageEvent>,
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    store: PackageStore,
+    store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
+    fetch_semaphore: Arc<Semaphore>,
+    fetch_coord: Arc<FetchCoordinator>,
+    project_dir: PathBuf,
+    gate_stats: Arc<GateStats>,
+    fetch_extract_limiter: FetchExtractLimiter,
+    install_accounting: ManagedInstallAccounting,
+    dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
+    streaming_fetch: bool,
+) -> FetchOverlapJoin {
+    let context = Arc::new(WorkspaceFetchRequestContext {
+        client,
+        route_table,
+        store,
+        store_v2_handle,
+        fetch_semaphore,
+        fetch_coord,
+        project_dir,
+        gate_stats,
+        fetch_extract_limiter,
+        install_accounting,
+        streaming_fetch,
+    });
+    let handle = tokio::spawn(async move {
+        let mut seen = HashSet::new();
+        let mut completions = Vec::new();
+        let mut outcomes = Vec::new();
+        let mut stats = FetchOverlapStats::default();
+
+        while let Some(event) = rx.recv().await {
+            stats.selected_count = stats.selected_count.saturating_add(1);
+            let package =
+                install_package_from_selected_event(event, &context.route_table, &context.client);
+            if package.optional {
+                stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
+                continue;
+            }
+            if !dependency_engine_policy
+                .allows_dependency_materialization(package.node_engine.as_deref())
+            {
+                stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
+                continue;
+            }
+            if !package_platform_compatible(&package) {
+                stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
+                continue;
+            }
+            let identity = workspace_fetch_identity(&package);
+            if seen.insert(identity) {
+                completions.push(hub.dispatch(package, Arc::clone(&context)));
+            }
+        }
+
+        for completion in completions {
+            match completion.await {
+                Ok(completion) => {
+                    record_workspace_fetch_completion(completion, &mut stats, &mut outcomes);
+                }
+                Err(_) => {
+                    stats.failed_count = stats.failed_count.saturating_add(1);
+                }
+            }
+        }
+
+        FetchOverlapDrain { outcomes, stats }
+    });
+
+    FetchOverlapJoin {
+        handle: Some(handle),
+    }
+}
+
+fn record_workspace_fetch_completion(
+    completion: WorkspaceFetchCompletion,
+    stats: &mut FetchOverlapStats,
+    outcomes: &mut Vec<FetchOverlapOutcome>,
+) {
+    if completion.dispatched {
+        stats.dispatched_count = stats.dispatched_count.saturating_add(1);
+    }
+    match completion.status.as_ref() {
+        FetchOverlapTaskStatus::Completed(outcome) => {
+            if completion.dispatched {
+                stats.completed_count = stats.completed_count.saturating_add(1);
+                if let Some(timings) = outcome.timings {
+                    stats.record_task(timings);
+                }
+            }
+            outcomes.push((**outcome).clone());
+        }
+        FetchOverlapTaskStatus::CacheHit => {
+            if completion.dispatched {
+                stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
+            }
+        }
+        FetchOverlapTaskStatus::SkippedPlatform => {
+            if completion.dispatched {
+                stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
+            }
+        }
+        FetchOverlapTaskStatus::Failed => {
+            if completion.dispatched {
+                stats.failed_count = stats.failed_count.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -495,6 +832,28 @@ async fn fetch_selected_package(
 mod tests {
     use super::*;
 
+    fn workspace_fetch_package(integrity: &str, tarball_url: &str) -> InstallPackage {
+        InstallPackage {
+            name: "shared-package".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://registry.npmjs.org".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: false,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: Some(integrity.to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+            tarball_url: Some(tarball_url.to_string()),
+            metadata_checked_for_tarball: true,
+        }
+    }
+
     #[test]
     fn fetch_overlap_defaults_on_for_fresh_fusion_installs() {
         assert!(fetch_overlap_enabled_from_value(true, false, false, None));
@@ -524,5 +883,70 @@ mod tests {
     #[test]
     fn fetch_overlap_min_selected_default_skips_tiny_graphs() {
         assert_eq!(DEFAULT_FETCH_OVERLAP_MIN_SELECTED, 64);
+    }
+
+    #[test]
+    fn workspace_fetch_identity_ignores_importer_graph_projection() {
+        let first = workspace_fetch_package("sha512-shared", "https://registry.test/shared.tgz");
+        let mut second = first.clone();
+        second.dependencies = vec![("child".to_string(), "2.0.0".to_string())];
+        second.peers = vec![("peer".to_string(), "3.0.0".to_string())];
+        second.is_direct = true;
+        second.root_link_names = Some(vec!["alias".to_string()]);
+
+        assert_eq!(
+            workspace_fetch_identity(&first),
+            workspace_fetch_identity(&second)
+        );
+    }
+
+    #[test]
+    fn workspace_fetch_identity_separates_integrity_expectations() {
+        let first = workspace_fetch_package("sha512-first", "https://registry.test/shared.tgz");
+        let second = workspace_fetch_package("sha512-second", "https://registry.test/shared.tgz");
+
+        assert_ne!(
+            workspace_fetch_identity(&first),
+            workspace_fetch_identity(&second)
+        );
+    }
+
+    #[test]
+    fn workspace_fetch_identity_separates_tarball_urls() {
+        let first = workspace_fetch_package("sha512-shared", "https://registry.test/first.tgz");
+        let second = workspace_fetch_package("sha512-shared", "https://registry.test/second.tgz");
+
+        assert_ne!(
+            workspace_fetch_identity(&first),
+            workspace_fetch_identity(&second)
+        );
+    }
+
+    #[test]
+    fn workspace_fetch_completion_fans_out_without_double_counting_dispatch() {
+        let (owner_tx, mut owner_rx) = tokio::sync::oneshot::channel();
+        let (reuse_tx, mut reuse_rx) = tokio::sync::oneshot::channel();
+        let mut states = HashMap::from([(
+            "shared".to_string(),
+            WorkspaceFetchState::Running(vec![
+                WorkspaceFetchSubscriber {
+                    tx: owner_tx,
+                    dispatched: true,
+                },
+                WorkspaceFetchSubscriber {
+                    tx: reuse_tx,
+                    dispatched: false,
+                },
+            ]),
+        )]);
+
+        finish_workspace_fetch(
+            &mut states,
+            "shared".to_string(),
+            Arc::new(FetchOverlapTaskStatus::CacheHit),
+        );
+
+        assert!(owner_rx.try_recv().expect("owner completion").dispatched);
+        assert!(!reuse_rx.try_recv().expect("reuse completion").dispatched);
     }
 }

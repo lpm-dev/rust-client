@@ -312,6 +312,27 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                     },
                                 ));
                             Some(selected_tx)
+                        } else if route_table.supports_workspace_fetch_sharing()
+                            && let Some(hub) = workspace_resolution::fetch_overlap_hub()
+                        {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            fetch_overlap_join = Some(spawn_workspace_fetch_overlap_dispatcher(
+                                hub,
+                                rx,
+                                arc_client.clone(),
+                                route_table.clone(),
+                                store.clone(),
+                                store_v2_handle.clone(),
+                                fetch_semaphore.clone(),
+                                fetch_coord.clone(),
+                                project_dir.to_path_buf(),
+                                gate_stats.clone(),
+                                fetch_extract_limiter.clone(),
+                                install_accounting,
+                                dependency_engine_policy.clone(),
+                                streaming_fetch,
+                            ));
+                            Some(tx)
                         } else {
                             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                             fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
