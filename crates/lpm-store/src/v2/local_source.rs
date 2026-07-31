@@ -159,6 +159,9 @@ fn is_excluded_local_source_entry(name: &OsStr) -> bool {
         || name == ".lpm"
         || name == "lpm.lock"
         || name == "lpm.lockb"
+        || name
+            .to_str()
+            .is_some_and(lpm_common::atomic_write::is_atomic_temp_name)
 }
 
 pub(crate) fn local_source_snapshot_matches(
@@ -542,4 +545,17 @@ fn materialize_local_source_file(src: &Path, dst: &Path) -> Result<(), LpmError>
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_excluded_local_source_entry;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn atomic_write_temporary_files_are_excluded_from_local_source_snapshots() {
+        assert!(is_excluded_local_source_entry(OsStr::new(
+            ".lpm-0123456789abcdef"
+        )));
+    }
 }
