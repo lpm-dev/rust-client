@@ -9,7 +9,7 @@ pub(super) type FetchExtractLimiter = Option<Arc<tokio::sync::Semaphore>>;
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
 // APFS store finalization contends on filesystem metadata above this width.
-const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 6;
+const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ArtifactSelection {
@@ -2122,10 +2122,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_six_for_experimental_installer() {
+    fn fetch_extract_permits_default_to_four_for_experimental_installer() {
         assert_eq!(
             configured_fetch_extract_permits(None, Some("1"), false),
-            Some(6)
+            Some(4)
         );
     }
 
@@ -2146,8 +2146,8 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_six_for_macos_v2_installs() {
-        assert_eq!(platform_default_fetch_extract_permits(true, true), Some(6));
+    fn fetch_extract_permits_default_to_four_for_macos_v2_installs() {
+        assert_eq!(platform_default_fetch_extract_permits(true, true), Some(4));
     }
 
     #[test]
