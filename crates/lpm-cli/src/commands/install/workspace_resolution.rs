@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -9,7 +9,7 @@ pub(super) struct WorkspaceResolutionCoordinator {
     completed: Box<[TargetCompletion]>,
     prepared_count: std::sync::atomic::AtomicUsize,
     all_prepared: Notify,
-    fetch_overlap_hub: Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>,
+    fetch_overlap_hub: OnceLock<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>>,
 }
 
 impl WorkspaceResolutionCoordinator {
@@ -24,7 +24,7 @@ impl WorkspaceResolutionCoordinator {
                 .collect(),
             prepared_count: std::sync::atomic::AtomicUsize::new(0),
             all_prepared: Notify::new(),
-            fetch_overlap_hub: Arc::new(super::fetch_overlap::WorkspaceFetchOverlapHub::new()),
+            fetch_overlap_hub: OnceLock::new(),
         }
     }
 
@@ -40,6 +40,18 @@ impl WorkspaceResolutionCoordinator {
             resolution_finished: std::sync::atomic::AtomicBool::new(false),
             commit_entered: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn fetch_overlap_hub(&self) -> Arc<super::fetch_overlap::WorkspaceFetchOverlapHub> {
+        Arc::clone(
+            self.fetch_overlap_hub
+                .get_or_init(|| Arc::new(super::fetch_overlap::WorkspaceFetchOverlapHub::new())),
+        )
+    }
+
+    #[cfg(test)]
+    fn fetch_overlap_hub_initialized(&self) -> bool {
+        self.fetch_overlap_hub.get().is_some()
     }
 }
 
@@ -173,7 +185,7 @@ pub(super) fn active() -> bool {
 
 pub(super) fn fetch_overlap_hub() -> Option<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>> {
     ACTIVE_TASK
-        .try_with(|task| Arc::clone(&task.coordinator.fetch_overlap_hub))
+        .try_with(|task| task.coordinator.fetch_overlap_hub())
         .ok()
 }
 
@@ -203,6 +215,22 @@ pub(super) async fn wait_for_commit() -> u128 {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn workspace_fetch_hub_is_not_initialized_until_fresh_resolution_needs_it() {
+        let coordinator = WorkspaceResolutionCoordinator::new(4, 4);
+
+        assert!(!coordinator.fetch_overlap_hub_initialized());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_fetch_hub_initializes_when_fresh_resolution_requests_it() {
+        let coordinator = WorkspaceResolutionCoordinator::new(4, 4);
+
+        let _hub = coordinator.fetch_overlap_hub();
+
+        assert!(coordinator.fetch_overlap_hub_initialized());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn every_importer_prepares_before_the_first_commit() {
