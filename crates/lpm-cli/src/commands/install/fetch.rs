@@ -301,6 +301,20 @@ pub(super) async fn run_online_fetch_phase(
     let fetch_plan_start = Instant::now();
     let mut fetch_stage_timings = FetchStageTimings::default();
     let v2_link_task_timings = V2LinkTaskTimings::default();
+    let preclassification_overlap_drain = if fetch_overlap_join
+        .as_ref()
+        .is_some_and(FetchOverlapJoin::workspace_shared)
+    {
+        Some(
+            fetch_overlap_join
+                .take()
+                .expect("workspace-shared overlap join is present")
+                .drain()
+                .await?,
+        )
+    } else {
+        None
+    };
 
     // Aggregation buffer for fetch writeback. Populated inside the fetch
     // block with final-URL pairs only when the final URL diverges from the
@@ -392,8 +406,10 @@ pub(super) async fn run_online_fetch_phase(
     // Under v2 mode, `link_packages_v2` needs the full LinkTarget set in one
     // batch so the GraphKey pre-pass can resolve cross-references. The v2
     // event-driven path below uses a separate prepare/one/finalize split.
-    let event_driven_link =
-        !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
+    let event_driven_link = !workspace_resolution::active()
+        && !serial_link
+        && !v2_mode
+        && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
     // Collection of per-package link handles. Cached packages push into this
     // before the fetch loop; fetch tasks push as each tarball materializes.
@@ -575,13 +591,8 @@ pub(super) async fn run_online_fetch_phase(
     fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
     let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
-    // Stale-entry cleanup runs once, up front. It must happen before any
-    // per-package link spawn touches `.lpm/` so the `read_dir` scan sees a
-    // stable snapshot.
-    //
-    // Under v2 event-driven linking, `link_v2_prepare` already ran
-    // `cleanup_v1_state`, so this v1-shaped cleanup is skipped. Running it
-    // would wipe node_modules a second time with no benefit.
+    // The v1 event-driven path mutates project-local wrappers, so recursive
+    // resolve-ahead disables it until the deterministic commit turn.
     if event_driven_link {
         lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
     }
@@ -1995,8 +2006,14 @@ pub(super) async fn run_online_fetch_phase(
         fetch_stage_timings.download_wall_ms = download_wall_start.elapsed().as_millis();
     }
 
-    if let Some(join) = fetch_overlap_join.take() {
-        let drain = join.drain().await?;
+    let overlap_drain = match preclassification_overlap_drain {
+        Some(drain) => Some(drain),
+        None => match fetch_overlap_join.take() {
+            Some(join) => Some(join.drain().await?),
+            None => None,
+        },
+    };
+    if let Some(drain) = overlap_drain {
         fetch_stage_timings.overlap = drain.stats;
         for outcome in drain.outcomes {
             if let Some(sri) = outcome.computed_sri {

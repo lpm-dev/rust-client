@@ -74,10 +74,8 @@ pub(crate) use firewall::{
     registry_materialization_route_is_public_npm,
     run_prepared_npm_firewall_materialization_preflight,
 };
+pub use gitignore::ensure_skills_gitignore;
 use gitignore::*;
-pub use gitignore::{
-    ensure_lpm_hoisted_gitignore, ensure_lpm_wrappers_gitignore, ensure_skills_gitignore,
-};
 use lifecycle::*;
 use linking::*;
 use lockfile::*;
@@ -635,18 +633,10 @@ async fn run_with_options_under_store_lock(
     // a real install when either migration is owed; here we just
     // clear the old state. Idempotent — calling on a project without
     // legacy state is a no-op.
-    migrate_legacy_wrapper_layout(project_dir, json_output);
-
-    // + hoisted-symmetry — ensure `.gitignore` contains
-    // BOTH `.lpm/wrappers/` (isolated) and `.lpm/hoisted/` so neither
-    // mode's project-local state can accidentally land in commits.
-    // Runtime "ensure once" pattern (matches the existing skills
-    // helper); idempotent for projects that already have either
-    // entry. Both run unconditionally because the user's mode could
-    // change between installs and a project already on one mode may
-    // accumulate the other mode's state during a future toggle.
-    ensure_lpm_wrappers_gitignore(project_dir);
-    ensure_lpm_hoisted_gitignore(project_dir);
+    let defer_project_linker_layout_maintenance = workspace_resolution::active();
+    if !defer_project_linker_layout_maintenance {
+        maintain_project_linker_layout(project_dir, json_output);
+    }
 
     // Surface silent additions to `trustedDependencies`
     // BEFORE the install pipeline does any work.
@@ -764,6 +754,9 @@ async fn run_with_options_under_store_lock(
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
         workspace_resolution::wait_for_commit().await;
+        if defer_project_linker_layout_maintenance {
+            maintain_project_linker_layout(project_dir, json_output);
+        }
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             policy_extension_configs: &policy_extension_configs,
@@ -964,13 +957,7 @@ async fn run_with_options_under_store_lock(
     // (every `rm -rf` is a no-op on already-clean state). A crash
     // mid-migration leaves a half-wiped project; the next install
     // re-runs the same wipes and re-attempts the v2 install.
-    if store_v2_handle.is_some() && needs_v2_migration(project_dir) {
-        if !json_output {
-            output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
-        }
-        migrate_v1_to_v2(project_dir)
-            .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
-    }
+    let project_needs_v2_migration = store_v2_handle.is_some() && needs_v2_migration(project_dir);
 
     let experimental_resolver_requested = experimental_resolver::enabled();
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
@@ -1077,6 +1064,10 @@ async fn run_with_options_under_store_lock(
         }
 
         workspace_resolution::wait_for_commit().await;
+        if defer_project_linker_layout_maintenance {
+            maintain_project_linker_layout(project_dir, json_output);
+        }
+        apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
         return experimental_resolver::run(
             arc_client.clone(),
             project_dir,
@@ -1157,7 +1148,7 @@ async fn run_with_options_under_store_lock(
         override_set: override_set.clone(),
     })
     .await;
-    let wf_commit_wait_ms = workspace_resolution::wait_for_commit().await;
+    workspace_resolution::finish_resolution();
     let OnlineResolutionPhaseResult {
         packages,
         packages_for_lockfile,
@@ -1210,7 +1201,11 @@ async fn run_with_options_under_store_lock(
         })
         .await?
     };
-    if post_firewall_fetch_overlap_allowed && fetch_overlap_join.is_none() && !packages.is_empty() {
+    if post_firewall_fetch_overlap_allowed
+        && fetch_overlap_join.is_none()
+        && !packages.is_empty()
+        && !workspace_resolution::active()
+    {
         fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
             packages.clone(),
             arc_client.clone(),
@@ -1248,6 +1243,15 @@ async fn run_with_options_under_store_lock(
         .await?;
     }
     let lockfile_provenance = prior_verified_provenance;
+    let workspace_fetch_is_shared = fetch_overlap_join
+        .as_ref()
+        .is_some_and(FetchOverlapJoin::workspace_shared);
+    let wf_materialization_wait_ms = if workspace_resolution::active() && !workspace_fetch_is_shared
+    {
+        workspace_resolution::wait_for_materialization().await
+    } else {
+        0
+    };
 
     let OnlineFetchPhaseResult {
         packages,
@@ -1258,7 +1262,7 @@ async fn run_with_options_under_store_lock(
         v2_mode,
         v2_event_driven,
         v2_plan,
-        v2_event_link_handles,
+        mut v2_event_link_handles,
         mut v2_link_task_timings,
         fetch_ms,
         waterfall_start_ms: wf_fetch_start_ms,
@@ -1316,6 +1320,26 @@ async fn run_with_options_under_store_lock(
     })
     .await?;
 
+    let prepared_v2_link_tasks = if workspace_resolution::active() && v2_event_driven {
+        let handles = std::mem::take(&mut v2_event_link_handles);
+        Some(
+            prepare_v2_link_tasks(
+                handles,
+                &mut v2_link_task_timings,
+                &mut slow_package_timings,
+                timing_detail_mode,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let wf_commit_wait_ms = workspace_resolution::wait_for_commit().await;
+    if defer_project_linker_layout_maintenance {
+        maintain_project_linker_layout(project_dir, json_output);
+    }
+    apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
+
     let link_phase = run_online_link_phase(OnlineLinkPhaseInput {
         start,
         project_dir,
@@ -1329,6 +1353,7 @@ async fn run_with_options_under_store_lock(
         v2_event_driven,
         v2_plan: v2_plan.as_deref(),
         v2_event_link_handles,
+        prepared_v2_link_tasks,
         v2_link_task_timings: &mut v2_link_task_timings,
         slow_package_timings: &mut slow_package_timings,
         timing_detail_mode,
@@ -1766,6 +1791,7 @@ async fn run_with_options_under_store_lock(
             gate_stats: gate_stats.as_ref(),
             wf_setup_ms,
             wf_resolve_end_ms,
+            wf_materialization_wait_ms,
             wf_commit_wait_ms,
             wf_fetch_start_ms,
             wf_fetch_end_ms,

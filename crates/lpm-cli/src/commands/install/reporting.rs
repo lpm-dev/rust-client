@@ -40,6 +40,7 @@ pub(super) struct OnlineInstallReportInput<'a> {
     pub(super) gate_stats: &'a GateStats,
     pub(super) wf_setup_ms: u128,
     pub(super) wf_resolve_end_ms: u128,
+    pub(super) wf_materialization_wait_ms: u128,
     pub(super) wf_commit_wait_ms: u128,
     pub(super) wf_fetch_start_ms: u128,
     pub(super) wf_fetch_end_ms: u128,
@@ -111,6 +112,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         gate_stats,
         wf_setup_ms,
         wf_resolve_end_ms,
+        wf_materialization_wait_ms,
         wf_commit_wait_ms,
         wf_fetch_start_ms,
         wf_fetch_end_ms,
@@ -155,8 +157,12 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             None
         };
         let resolve_wall_ms = wf_resolve_end_ms.saturating_sub(wf_setup_ms);
-        let post_resolve_ms =
-            post_resolve_work_ms(wf_resolve_end_ms, wf_commit_wait_ms, wf_fetch_start_ms);
+        let post_resolve_ms = post_resolve_work_ms(
+            wf_resolve_end_ms,
+            wf_materialization_wait_ms,
+            wf_fetch_start_ms,
+        );
+        let pre_link_ms = pre_link_work_ms(wf_fetch_end_ms, wf_commit_wait_ms, wf_link_start_ms);
         let fetch_wall_ms = wf_fetch_end_ms.saturating_sub(wf_fetch_start_ms);
         let counts = InstallCountSemantics {
             resolved_package_row_count: packages.len(),
@@ -202,11 +208,12 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                        "waterfall": {
                            "setup_ms": wf_setup_ms,
                            "resolve_ms": wf_resolve_end_ms.saturating_sub(wf_setup_ms),
+                           "materialization_wait_ms": wf_materialization_wait_ms,
                            "commit_wait_ms": wf_commit_wait_ms,
                            "post_resolve_work_ms": post_resolve_ms,
                            "pre_fetch_ms": post_resolve_ms,
                            "fetch_ms": wf_fetch_end_ms.saturating_sub(wf_fetch_start_ms),
-                           "pre_link_ms": wf_link_start_ms.saturating_sub(wf_fetch_end_ms),
+                           "pre_link_ms": pre_link_ms,
                            "link_ms": wf_link_end_ms.saturating_sub(wf_link_start_ms),
                            "link_await_ms": wf_link_await_ms,
                            "link_finalize_ms": wf_link_finalize_ms,

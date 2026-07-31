@@ -493,6 +493,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                 "waterfall": {
                     "setup_ms": total_ms,
                     "resolve_ms": 0u128,
+                    "materialization_wait_ms": 0u128,
                     "commit_wait_ms": 0u128,
                     "post_resolve_work_ms": 0u128,
                     "pre_fetch_ms": 0u128,

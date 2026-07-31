@@ -1012,6 +1012,7 @@ fn attach_aggregate_telemetry(
     let resolve_ms = timing_sum("resolve_ms");
     let fetch_ms = timing_sum("fetch_ms");
     let link_ms = timing_sum("link_ms");
+    let materialization_wait_ms = waterfall_sum("materialization_wait_ms");
     let commit_wait_ms = waterfall_sum("commit_wait_ms");
     let post_resolve_work_ms = waterfall_sum("post_resolve_work_ms");
     let aggregate_counts = serde_json::json!({
@@ -1053,6 +1054,7 @@ fn attach_aggregate_telemetry(
             },
             "wait": {
                 "aggregation": "sum_of_target_wall_clock",
+                "target_materialization_sum_ms": materialization_wait_ms,
                 "target_commit_sum_ms": commit_wait_ms,
             },
             "work": {

@@ -1415,7 +1415,7 @@ async fn recursive_install_preserves_importer_local_release_age_policies_with_sh
 }
 
 #[tokio::test]
-async fn recursive_install_keeps_root_firewall_block_ahead_of_fetch_and_after_member_commit() {
+async fn recursive_install_commits_no_importer_when_root_firewall_blocks() {
     let mock = MockRegistry::start().await;
     mount_registry_packages(
         &mock,
@@ -1472,13 +1472,135 @@ async fn recursive_install_keeps_root_firewall_block_ahead_of_fetch_and_after_me
         combined.contains("blocked by LPM npm firewall"),
         "recursive root error must retain firewall guidance: {combined}",
     );
-    assert_target_installed(&project, "packages/member");
+    assert_target_not_installed(&project, "packages/member");
     assert_target_not_installed(&project, "");
     assert_eq!(
         mock.tarball_request_count("root-blocked", "1.0.0").await,
         0,
         "firewall must block the root tarball before resolve-ahead fetch overlap",
     );
+}
+
+#[tokio::test]
+async fn recursive_firewall_preflight_does_not_launch_importer_local_tarball_waterfalls() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[("member-allowed", "1.0.0"), ("root-allowed", "1.0.0")],
+    )
+    .await;
+    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+        .await;
+    mock.with_npm_firewall_allow("root-allowed", "1.0.0").await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "firewall-waterfall-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "root-allowed": "^1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "@fixture/firewall-waterfall-member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "member-allowed": "^1.0.0"
+  }
+}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .arg("install")
+        .arg("--recursive")
+        .arg("--json")
+        .arg("--timing")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with importer-scoped firewall preflights");
+    assert_install_succeeded(
+        &output,
+        "recursive firewall install should serialize importer-local materialization",
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recursive install must emit JSON");
+    let targets = report["targets"]
+        .as_array()
+        .expect("recursive report must contain targets");
+    assert!(
+        targets.iter().all(|target| {
+            target["timing"]["detail"]["fetch"]["overlap"]["dispatched_count"].as_u64() == Some(0)
+        }),
+        "firewall-scoped importers must not launch competing tarball waterfalls: {report:#}"
+    );
+}
+
+#[tokio::test]
+async fn recursive_firewall_fetch_failure_commits_no_importer() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("member-allowed", "1.0.0")]).await;
+    mock.with_full_package_metadata(
+        "root-missing-tarball",
+        "1.0.0",
+        &[("1.0.0", serde_json::json!({}), None)],
+    )
+    .await;
+    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+        .await;
+    mock.with_npm_firewall_allow("root-missing-tarball", "1.0.0")
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "firewall-fetch-failure-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "root-missing-tarball": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "@fixture/firewall-fetch-failure-member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "member-allowed": "1.0.0"
+  }
+}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive firewall install with a missing root tarball");
+    assert!(
+        !output.status.success(),
+        "recursive install must fail when an importer cannot materialize its graph\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert_target_not_installed(&project, "packages/member");
+    assert_target_not_installed(&project, "");
 }
 
 #[tokio::test]

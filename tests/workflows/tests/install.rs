@@ -10063,6 +10063,11 @@ fn recursive_install_timing_distinguishes_command_work_from_target_observations(
         assert_eq!(target["timing"]["work_is_cumulative"], false);
         assert_eq!(target["timing"]["phase_aggregation"], "target_wall_clock");
         assert!(
+            target["timing"]["waterfall"]["materialization_wait_ms"].is_number(),
+            "target timing must separate serialized materialization waiting from command work: \
+             {target:#}"
+        );
+        assert!(
             target["timing"]["waterfall"]["commit_wait_ms"].is_number(),
             "target timing must separate importer commit waiting from post-resolve work: \
              {target:#}"
@@ -10093,6 +10098,8 @@ fn recursive_install_timing_distinguishes_command_work_from_target_observations(
             "work_is_cumulative": targets[0]["timing"]["work_is_cumulative"],
             "phase_aggregation": targets[0]["timing"]["phase_aggregation"],
             "waterfall": {
+                "materialization_wait_ms":
+                    targets[0]["timing"]["waterfall"]["materialization_wait_ms"],
                 "commit_wait_ms": targets[0]["timing"]["waterfall"]["commit_wait_ms"],
                 "post_resolve_work_ms":
                     targets[0]["timing"]["waterfall"]["post_resolve_work_ms"],
@@ -10106,11 +10113,248 @@ fn recursive_install_timing_distinguishes_command_work_from_target_observations(
         ".timing.work.target_post_resolve_sum_ms" => "[DURATION]",
         ".timing.work.target_fetch_sum_ms" => "[DURATION]",
         ".timing.work.target_link_sum_ms" => "[DURATION]",
+        ".timing.wait.target_materialization_sum_ms" => "[DURATION]",
         ".timing.wait.target_commit_sum_ms" => "[DURATION]",
+        ".target.waterfall.materialization_wait_ms" => "[DURATION]",
         ".target.waterfall.commit_wait_ms" => "[DURATION]",
         ".target.waterfall.post_resolve_work_ms" => "[DURATION]",
         ".target.waterfall.pre_fetch_ms" => "[DURATION]",
     });
+}
+
+#[tokio::test]
+async fn recursive_install_does_not_commit_any_importer_when_preparation_fails() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-atomic-prepare-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/a-valid/package.json",
+        r#"{
+  "name": "a-valid",
+  "version": "1.0.0",
+  "dependencies": { "valid-dependency": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/z-failing/package.json",
+        r#"{
+  "name": "z-failing",
+  "version": "1.0.0",
+  "dependencies": { "missing-tarball": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/z-failing/.lpm/wrappers/stale@1.0.0/ghost",
+        "existing project state",
+    );
+    project.write_file(
+        "packages/a-valid/node_modules/.lpm/legacy@1.0.0/node_modules/legacy/package.json",
+        r#"{"name":"legacy","version":"1.0.0"}"#,
+    );
+    project.write_file("packages/a-valid/.gitignore", "existing-ignore\n");
+
+    let mock = MockRegistry::start().await;
+    let valid_tarball = make_tarball("valid-dependency", "1.0.0");
+    mock.with_package("valid-dependency", "1.0.0", &valid_tarball)
+        .await;
+    mock.with_full_package_metadata(
+        "missing-tarball",
+        "1.0.0",
+        &[("1.0.0", serde_json::json!({}), None)],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install with one failing importer");
+
+    assert!(
+        !output.status.success(),
+        "recursive install must fail when one importer cannot prepare\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    for importer in ["packages/z-failing", ""] {
+        let importer_dir = project.path().join(importer);
+        assert!(
+            !importer_dir.join("node_modules").exists(),
+            "preparation failure must not commit node_modules for {}",
+            importer_dir.display()
+        );
+        assert!(
+            !importer_dir.join("lpm.lock").exists() && !importer_dir.join("lpm.lockb").exists(),
+            "preparation failure must not commit lockfiles for {}",
+            importer_dir.display()
+        );
+    }
+    let valid_importer = project.path().join("packages/a-valid");
+    assert!(
+        !valid_importer
+            .join("node_modules/valid-dependency")
+            .exists(),
+        "preparation failure must not link the prepared dependency"
+    );
+    assert!(
+        !valid_importer.join("lpm.lock").exists() && !valid_importer.join("lpm.lockb").exists(),
+        "preparation failure must not commit the valid importer's lockfiles"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            project
+                .path()
+                .join("packages/z-failing/.lpm/wrappers/stale@1.0.0/ghost")
+        )
+        .expect("preparation failure must preserve existing project state"),
+        "existing project state"
+    );
+    assert!(
+        valid_importer
+            .join("node_modules/.lpm/legacy@1.0.0/node_modules/legacy/package.json")
+            .exists(),
+        "preparation failure must preserve the existing linker layout"
+    );
+    assert_eq!(
+        std::fs::read_to_string(valid_importer.join(".gitignore"))
+            .expect("preparation failure must preserve the existing gitignore"),
+        "existing-ignore\n"
+    );
+}
+
+#[tokio::test]
+async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
+    fn workspace_fixture() -> TempProject {
+        let project = TempProject::empty(
+            r#"{
+  "name": "recursive-determinism-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "shared-dependency": "^1.0.0" }
+}"#,
+        );
+        project.write_file(
+            "packages/a/package.json",
+            r#"{
+  "name": "importer-a",
+  "version": "1.0.0",
+  "dependencies": {
+    "peer-host": "1.0.0",
+    "react": "18.3.1",
+    "shared-dependency": "^1.0.0"
+  }
+}"#,
+        );
+        project.write_file(
+            "packages/b/package.json",
+            r#"{
+  "name": "importer-b",
+  "version": "1.0.0",
+  "dependencies": { "shared-dependency": "^1.0.0" }
+}"#,
+        );
+        project
+    }
+
+    fn lockfile_bytes(project: &TempProject) -> Vec<Vec<u8>> {
+        ["lpm.lock", "packages/a/lpm.lock", "packages/b/lpm.lock"]
+            .into_iter()
+            .map(|path| {
+                std::fs::read(project.path().join(path))
+                    .unwrap_or_else(|error| panic!("read {path}: {error}"))
+            })
+            .collect()
+    }
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-host",
+            "version": "1.0.0",
+            "peerDependencies": { "react": "^18.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({ "name": "react", "version": "18.3.1" }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({ "name": "shared-dependency", "version": "1.0.0" }),
+        &[],
+    )
+    .await;
+
+    let sequential = workspace_fixture();
+    let sequential_output = lpm_with_registry(&sequential, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_WORKSPACE_CONCURRENCY", "1")
+        .args([
+            "install",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run sequential recursive install");
+    assert!(
+        sequential_output.status.success(),
+        "sequential recursive install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sequential_output.stdout),
+        String::from_utf8_lossy(&sequential_output.stderr)
+    );
+
+    let resolve_ahead = workspace_fixture();
+    let resolve_ahead_output = lpm_with_registry(&resolve_ahead, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--json",
+            "--timing",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run resolve-ahead recursive install");
+    assert!(
+        resolve_ahead_output.status.success(),
+        "resolve-ahead recursive install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&resolve_ahead_output.stdout),
+        String::from_utf8_lossy(&resolve_ahead_output.stderr)
+    );
+    let resolve_ahead_report: serde_json::Value =
+        serde_json::from_slice(&resolve_ahead_output.stdout)
+            .expect("resolve-ahead install must emit JSON");
+    assert_eq!(
+        resolve_ahead_report["counts"]["authoritative_fetch_candidate_count"].as_u64(),
+        Some(0),
+        "the workspace-shared waterfall must materialize selected artifacts before importer classification"
+    );
+
+    assert_eq!(
+        lockfile_bytes(&resolve_ahead),
+        lockfile_bytes(&sequential),
+        "resolve-ahead importer lockfiles must be byte-identical to sequential resolution"
+    );
 }
 
 /// `lpm install --offline` re-runs the workspace-member BFS expansion

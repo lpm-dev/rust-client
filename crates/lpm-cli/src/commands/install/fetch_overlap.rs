@@ -250,6 +250,7 @@ pub(super) struct FetchOverlapDrain {
 
 pub(super) struct FetchOverlapJoin {
     handle: Option<tokio::task::JoinHandle<FetchOverlapDrain>>,
+    workspace_shared: bool,
 }
 
 struct BufferedSelectedPackage {
@@ -258,6 +259,10 @@ struct BufferedSelectedPackage {
 }
 
 impl FetchOverlapJoin {
+    pub(super) fn workspace_shared(&self) -> bool {
+        self.workspace_shared
+    }
+
     pub(super) async fn drain(mut self) -> Result<FetchOverlapDrain, LpmError> {
         let start = Instant::now();
         let handle = self.handle.take().ok_or_else(|| {
@@ -408,6 +413,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
 
     FetchOverlapJoin {
         handle: Some(handle),
+        workspace_shared: false,
     }
 }
 
@@ -487,6 +493,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
 
     FetchOverlapJoin {
         handle: Some(handle),
+        workspace_shared: true,
     }
 }
 
@@ -579,6 +586,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
 
     FetchOverlapJoin {
         handle: Some(handle),
+        workspace_shared: false,
     }
 }
 

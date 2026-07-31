@@ -488,6 +488,21 @@ pub(super) fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(super) fn apply_v2_migration(
+    project_dir: &Path,
+    migration_needed: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if !migration_needed {
+        return Ok(());
+    }
+    if !json_output {
+        output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
+    }
+    migrate_v1_to_v2(project_dir)
+        .map_err(|error| LpmError::Registry(format!("v1→v2 migration failed: {error}")))
+}
+
 /// pre-resolve
 /// non-registry dependencies from the manifest before the PubGrub
 /// resolver runs.

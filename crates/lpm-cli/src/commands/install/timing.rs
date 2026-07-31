@@ -35,11 +35,21 @@ pub(super) fn attach_target_timing_semantics(timing: &mut serde_json::Value) {
 
 pub(super) fn post_resolve_work_ms(
     resolve_end_ms: u128,
-    commit_wait_ms: u128,
+    materialization_wait_ms: u128,
     fetch_start_ms: u128,
 ) -> u128 {
     fetch_start_ms
         .saturating_sub(resolve_end_ms)
+        .saturating_sub(materialization_wait_ms)
+}
+
+pub(super) fn pre_link_work_ms(
+    fetch_end_ms: u128,
+    commit_wait_ms: u128,
+    link_start_ms: u128,
+) -> u128 {
+    link_start_ms
+        .saturating_sub(fetch_end_ms)
         .saturating_sub(commit_wait_ms)
 }
 
@@ -1393,9 +1403,15 @@ mod tests {
     }
 
     #[test]
-    fn post_resolve_work_excludes_serialized_importer_commit_wait() {
+    fn post_resolve_work_excludes_serialized_materialization_wait() {
         assert_eq!(post_resolve_work_ms(100, 70, 185), 15);
         assert_eq!(post_resolve_work_ms(100, 90, 150), 0);
+    }
+
+    #[test]
+    fn pre_link_work_excludes_serialized_importer_commit_wait() {
+        assert_eq!(pre_link_work_ms(200, 70, 285), 15);
+        assert_eq!(pre_link_work_ms(200, 90, 250), 0);
     }
 
     #[test]

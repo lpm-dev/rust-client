@@ -15,6 +15,7 @@ expression: contract
     },
     "wait": {
       "aggregation": "sum_of_target_wall_clock",
+      "target_materialization_sum_ms": "[DURATION]",
       "target_commit_sum_ms": "[DURATION]"
     },
     "process_scope": "recursive_command"
@@ -48,6 +49,7 @@ expression: contract
     "work_is_cumulative": false,
     "phase_aggregation": "target_wall_clock",
     "waterfall": {
+      "materialization_wait_ms": "[DURATION]",
       "commit_wait_ms": "[DURATION]",
       "post_resolve_work_ms": "[DURATION]",
       "pre_fetch_ms": "[DURATION]"
