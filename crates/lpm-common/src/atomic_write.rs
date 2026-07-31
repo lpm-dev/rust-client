@@ -177,6 +177,21 @@ fn random_temp_path(parent: &Path) -> io::Result<PathBuf> {
     Ok(parent.join(format!(".lpm-{encoded}")))
 }
 
+/// Whether `name` matches the transient temporary-file shape produced by
+/// [`write_file_atomic`] (`.lpm-` + the URL-safe base64 of
+/// [`TEMP_RANDOM_BYTES`] random bytes). Directory scans that must not
+/// observe in-flight rewrites — the v2 store tree hash in particular —
+/// use this to skip the temporary while a sibling replaces a sidecar.
+pub fn is_atomic_temp_name(name: &str) -> bool {
+    const ENCODED_LEN: usize = TEMP_RANDOM_BYTES.div_ceil(3) * 4 - (3 - TEMP_RANDOM_BYTES % 3) % 3;
+    name.strip_prefix(".lpm-").is_some_and(|suffix| {
+        suffix.len() == ENCODED_LEN
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    })
+}
+
 fn create_temporary(
     parent: &Path,
     exact_mode: Option<u32>,

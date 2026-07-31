@@ -98,6 +98,12 @@ pub(super) fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: boo
     }
 }
 
+pub(super) fn maintain_project_linker_layout(project_dir: &Path, json_output: bool) {
+    migrate_legacy_wrapper_layout(project_dir, json_output);
+    ensure_lpm_wrappers_gitignore(project_dir);
+    ensure_lpm_hoisted_gitignore(project_dir);
+}
+
 /// — ensure `.gitignore` contains an entry for
 /// `.lpm/wrappers/`.
 ///

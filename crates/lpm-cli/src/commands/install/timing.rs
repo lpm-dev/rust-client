@@ -1,5 +1,58 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct InstallCountSemantics {
+    pub(super) resolved_package_row_count: usize,
+    pub(super) authoritative_fetch_candidate_count: usize,
+    pub(super) store_reuse_observation_count: usize,
+    pub(super) linker_entry_created_count: usize,
+    pub(super) linker_entry_reused_count: usize,
+    pub(super) project_root_symlink_created_count: usize,
+    pub(super) bin_link_created_count: usize,
+}
+
+impl InstallCountSemantics {
+    pub(super) fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "scope": "target",
+            "resolved_package_row_count": self.resolved_package_row_count,
+            "authoritative_fetch_candidate_count": self.authoritative_fetch_candidate_count,
+            "store_reuse_observation_count": self.store_reuse_observation_count,
+            "store_reuse_may_include_same_command_population": true,
+            "linker_entry_created_count": self.linker_entry_created_count,
+            "linker_entry_reused_count": self.linker_entry_reused_count,
+            "project_root_symlink_created_count": self.project_root_symlink_created_count,
+            "bin_link_created_count": self.bin_link_created_count,
+        })
+    }
+}
+
+pub(super) fn attach_target_timing_semantics(timing: &mut serde_json::Value) {
+    timing["scope"] = serde_json::json!("target");
+    timing["work_is_cumulative"] = serde_json::json!(false);
+    timing["phase_aggregation"] = serde_json::json!("target_wall_clock");
+}
+
+pub(super) fn post_resolve_work_ms(
+    resolve_end_ms: u128,
+    materialization_wait_ms: u128,
+    fetch_start_ms: u128,
+) -> u128 {
+    fetch_start_ms
+        .saturating_sub(resolve_end_ms)
+        .saturating_sub(materialization_wait_ms)
+}
+
+pub(super) fn pre_link_work_ms(
+    fetch_end_ms: u128,
+    commit_wait_ms: u128,
+    link_start_ms: u128,
+) -> u128 {
+    link_start_ms
+        .saturating_sub(fetch_end_ms)
+        .saturating_sub(commit_wait_ms)
+}
+
 /// Per-package fetch-stage timings collected inside one download task.
 ///
 /// Populated by the parallel download loop and folded into a
@@ -438,8 +491,11 @@ impl FetchOverlapStats {
 
     pub(super) fn to_json(self) -> serde_json::Value {
         serde_json::json!({
+            "scope": "target",
+            "kind": "tarball_fetch_overlap",
             "selected_count": self.selected_count,
             "dispatched_count": self.dispatched_count,
+            "tarball_dispatch_count": self.dispatched_count,
             "completed_count": self.completed_count,
             "cache_hit_count": self.cache_hit_count,
             "failed_count": self.failed_count,
@@ -1017,6 +1073,7 @@ pub(super) fn metadata_detail_json_from_snapshots(
             .iter()
             .map(|snapshot| {
                 let mut entry = serde_json::json!({
+                    "scope": "install_process",
                     "purpose": snapshot.purpose,
                     "rpc_ms": snapshot.rpc.as_millis(),
                     "rpc_count": snapshot.rpc_count,
@@ -1047,7 +1104,7 @@ pub(super) fn metadata_detail_json_from_snapshots(
     )
 }
 
-fn metadata_fetch_detail_json_from_snapshot(
+pub(super) fn metadata_fetch_detail_json_from_snapshot(
     snapshot: &lpm_registry::timing::MetadataFetchDetailSnapshot,
     mode: TimingDetailMode,
 ) -> serde_json::Value {
@@ -1195,6 +1252,25 @@ fn metadata_fetch_bucket_json(
     )
 }
 
+pub(super) fn metadata_dispatcher_json(stage: &lpm_resolver::StageTiming) -> serde_json::Value {
+    serde_json::json!({
+        "scope": "resolver_pass",
+        "kind": "metadata",
+        "rpc_count": stage.dispatcher_rpc_count,
+        "configured_fanout": stage.dispatcher_configured_fanout,
+        "inflight_high_water": stage.dispatcher_inflight_high_water,
+        "active_fetch_high_water": stage.dispatcher_inflight_high_water,
+        "pending_high_water": stage.dispatcher_pending_high_water,
+        "semaphore_wait_count": stage.dispatcher_semaphore_wait_count,
+        "semaphore_wait_ms": stage.dispatcher_semaphore_wait_ns as f64 / 1_000_000.0,
+        "parked_max_depth": stage.parked_max_depth,
+        "tarball_dispatched": stage.tarball_dispatched_count,
+        "selected_version_event_count": stage.tarball_dispatched_count,
+        "tarball_downloads_included": false,
+        "peer_prefetch_count": stage.peer_prefetch_count,
+    })
+}
+
 pub(super) fn resolve_detail_json(
     resolve_wall_ms: u128,
     initial_batch_ms: u128,
@@ -1208,6 +1284,7 @@ pub(super) fn resolve_detail_json(
         .find(|snapshot| snapshot.purpose == "resolve")
         .unwrap_or(&default_metadata);
     let pubgrub_core_estimate_ms = stage.pubgrub_ms.saturating_sub(stage.followup_rpc_ms);
+    let metadata_dispatcher = metadata_dispatcher_json(stage);
     let mut json = serde_json::json!({
         "wall_ms": resolve_wall_ms,
         "initial_batch_ms": initial_batch_ms,
@@ -1225,18 +1302,8 @@ pub(super) fn resolve_detail_json(
             "followup_rpc_count": stage.followup_rpc_count,
             "walker_rpc_count": stage.walker_rpc_count,
             "escape_hatch_rpc_count": stage.escape_hatch_rpc_count,
-            "dispatcher": {
-                "rpc_count": stage.dispatcher_rpc_count,
-                "configured_fanout": stage.dispatcher_configured_fanout,
-                "inflight_high_water": stage.dispatcher_inflight_high_water,
-                "active_fetch_high_water": stage.dispatcher_inflight_high_water,
-                "pending_high_water": stage.dispatcher_pending_high_water,
-                "semaphore_wait_count": stage.dispatcher_semaphore_wait_count,
-                "semaphore_wait_ms": stage.dispatcher_semaphore_wait_ns as f64 / 1_000_000.0,
-                "parked_max_depth": stage.parked_max_depth,
-                "tarball_dispatched": stage.tarball_dispatched_count,
-                "peer_prefetch_count": stage.peer_prefetch_count,
-            },
+            "dispatcher": metadata_dispatcher,
+            "metadata_dispatcher": metadata_dispatcher,
         },
         "cpu": {
             "parse_ndjson_ms": stage.parse_ndjson_ms,
@@ -1315,6 +1382,47 @@ pub(super) fn resolve_detail_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_count_semantics_distinguishes_store_reuse_from_linker_entry_creation() {
+        let counts = InstallCountSemantics {
+            resolved_package_row_count: 7,
+            authoritative_fetch_candidate_count: 3,
+            store_reuse_observation_count: 4,
+            linker_entry_created_count: 2,
+            linker_entry_reused_count: 5,
+            project_root_symlink_created_count: 6,
+            bin_link_created_count: 1,
+        }
+        .to_json();
+
+        assert_eq!(counts["store_reuse_observation_count"], 4);
+        assert_eq!(counts["linker_entry_created_count"], 2);
+        assert_eq!(counts["linker_entry_reused_count"], 5);
+        assert_eq!(counts["project_root_symlink_created_count"], 6);
+    }
+
+    #[test]
+    fn post_resolve_work_excludes_serialized_materialization_wait() {
+        assert_eq!(post_resolve_work_ms(100, 70, 185), 15);
+        assert_eq!(post_resolve_work_ms(100, 90, 150), 0);
+    }
+
+    #[test]
+    fn pre_link_work_excludes_serialized_importer_commit_wait() {
+        assert_eq!(pre_link_work_ms(200, 70, 285), 15);
+        assert_eq!(pre_link_work_ms(200, 90, 250), 0);
+    }
+
+    #[test]
+    fn target_timing_marks_phase_durations_as_non_cumulative_wall_clock() {
+        let mut timing = serde_json::json!({});
+        attach_target_timing_semantics(&mut timing);
+
+        assert_eq!(timing["scope"], "target");
+        assert_eq!(timing["work_is_cumulative"], false);
+        assert_eq!(timing["phase_aggregation"], "target_wall_clock");
+    }
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_when_overlap_enabled() {
@@ -1810,6 +1918,7 @@ mod tests {
         stats.record_buffered_event();
         stats.record_buffered_event();
         stats.record_buffered_dispatch(7);
+        stats.dispatched_count = 1;
         stats.skipped_optional_count = 3;
         stats.skipped_engine_count = 2;
 
@@ -1818,6 +1927,9 @@ mod tests {
         assert_eq!(json["buffered_count"], 2);
         assert_eq!(json["buffered_dispatch_count"], 1);
         assert_eq!(json["buffered_undispatched_count"], 1);
+        assert_eq!(json["scope"], "target");
+        assert_eq!(json["kind"], "tarball_fetch_overlap");
+        assert_eq!(json["tarball_dispatch_count"], 1);
         assert_eq!(json["buffer_wait"]["sum_ms"], 7);
         assert_eq!(json["buffer_wait"]["max_ms"], 7);
         assert_eq!(json["skipped_optional_count"], 3);

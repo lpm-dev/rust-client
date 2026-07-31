@@ -251,7 +251,8 @@ impl RegistryClient {
             }
         }
         let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
-        let http = HttpClients::from_default_client(default_client);
+        let policy_metadata_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = HttpClients::from_default_clients(default_client, policy_metadata_client);
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
         // `None` here is a graceful degradation: if we can't even resolve a
@@ -273,6 +274,7 @@ impl RegistryClient {
             token: None,
             cache_dir,
             pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            metadata_memory_cache: None,
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
@@ -481,10 +483,17 @@ impl RegistryClient {
             CONNECT_TIMEOUT,
             READ_TIMEOUT,
             tls,
+            default_identity.clone(),
+        )?;
+        let policy_metadata_client = Self::build_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            tls,
             default_identity,
         )?;
         let default_cached = CachedClient {
             client: default_reqwest_client,
+            policy_metadata_client,
             identity_fp: default_identity_fp,
         };
         // Eager per-origin builds — only for origins in the supplied set
@@ -673,6 +682,7 @@ impl RegistryClient {
             // Share the pending-writes tracker so flush() drains writes
             // queued by ANY clone of this client.
             pending_cache_writes: Arc::clone(&self.pending_cache_writes),
+            metadata_memory_cache: self.metadata_memory_cache.as_ref().map(Arc::clone),
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
@@ -682,6 +692,24 @@ impl RegistryClient {
             worker_metadata_http3_enabled: self.worker_metadata_http3_enabled,
             worker_metadata_http3_client: Arc::clone(&self.worker_metadata_http3_client),
         }
+    }
+
+    /// Clone this client with a fresh command-scoped immutable metadata cache.
+    ///
+    /// Clones derived from the returned client share the cache. The cache is
+    /// intentionally opt-in so long-lived callers retain normal disk-cache
+    /// TTL and revalidation behavior.
+    pub fn clone_with_metadata_memory_cache(&self) -> Self {
+        let mut client = self.clone_with_config();
+        client.metadata_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+        client
+    }
+
+    /// Detach command-scoped metadata sharing while preserving transport
+    /// configuration and persistent cache behavior.
+    pub fn without_metadata_memory_cache(mut self) -> Self {
+        self.metadata_memory_cache = None;
+        self
     }
 
     /// Clone transport, TLS, routing, and cache configuration without any

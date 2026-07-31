@@ -57,24 +57,40 @@ pub(super) fn spawn_v2_link_task(
     store: std::sync::Arc<lpm_store::v2::Store>,
     semaphore: Arc<Semaphore>,
 ) -> V2LinkHandle {
+    let workspace_coordinator = workspace_materialization::current();
     tokio::spawn(async move {
         let _permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| LpmError::Registry("v2 link semaphore closed".into()))?;
-        tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-            let (materialized, freshly_populated, timings) =
-                lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store)?;
+        let start = Instant::now();
+        if let Some(coordinator) = workspace_coordinator {
+            let coordinated = coordinator.materialize_link(plan, target, store).await?;
+            let materialization = coordinated.value;
             Ok(V2LinkTaskResult {
-                materialized,
-                freshly_populated,
+                materialized: materialization.materialized,
+                freshly_populated: coordinated.performed && materialization.freshly_populated,
                 ms: start.elapsed().as_millis(),
-                timings,
+                timings: if coordinated.performed {
+                    materialization.timings
+                } else {
+                    lpm_store::v2::LinkEntryTimings::default()
+                },
             })
-        })
-        .await
-        .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let (materialized, freshly_populated, timings) =
+                    lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store)?;
+                Ok(V2LinkTaskResult {
+                    materialized,
+                    freshly_populated,
+                    ms: start.elapsed().as_millis(),
+                    timings,
+                })
+            })
+            .await
+            .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))?
+        }
     })
 }
 
@@ -109,21 +125,42 @@ pub(super) async fn prevalidate_v2_reusable_objects(
 
     let candidate_count = candidates.len();
     let concurrency = v2_cache_check_concurrency(candidate_count);
+    let workspace_coordinator = workspace_materialization::current();
     let mut checks = futures::stream::iter(candidates.into_iter().map(|(key, sri)| {
         let store_v2 = Arc::clone(&store_v2);
-        tokio::task::spawn_blocking(move || {
-            store_v2
-                .reusable_object_with_timings(&sri)
-                .map(|(hit, timings)| (key, hit, timings))
-        })
+        let workspace_coordinator = workspace_coordinator.as_ref().map(Arc::clone);
+        async move {
+            if let Some(coordinator) = workspace_coordinator {
+                let coordinated = coordinator.validate_object(sri, store_v2).await?;
+                let validation = coordinated.value;
+                Ok::<_, LpmError>((
+                    key,
+                    validation.reusable,
+                    if coordinated.performed {
+                        validation.timings
+                    } else {
+                        lpm_store::v2::ReusableObjectCheckTimings::default()
+                    },
+                ))
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    store_v2
+                        .reusable_object_with_timings(&sri)
+                        .map(|(hit, timings)| (key, hit, timings))
+                })
+                .await
+                .map_err(|error| {
+                    LpmError::Registry(format!("v2 cache check task panicked: {error}"))
+                })?
+            }
+        }
     }))
     .buffer_unordered(concurrency);
 
     let mut hits = HashMap::with_capacity(candidate_count);
     let mut validation_timings = V2ReusableValidationTimings::default();
     while let Some(result) = checks.next().await {
-        let (key, hit, timings) = result
-            .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??;
+        let (key, hit, timings) = result?;
         validation_timings.record(timings, hit.is_some());
         if let Some(hit) = hit {
             hits.insert(key, hit);

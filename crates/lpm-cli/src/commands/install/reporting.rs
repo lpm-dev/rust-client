@@ -40,6 +40,8 @@ pub(super) struct OnlineInstallReportInput<'a> {
     pub(super) gate_stats: &'a GateStats,
     pub(super) wf_setup_ms: u128,
     pub(super) wf_resolve_end_ms: u128,
+    pub(super) wf_materialization_wait_ms: u128,
+    pub(super) wf_commit_wait_ms: u128,
     pub(super) wf_fetch_start_ms: u128,
     pub(super) wf_fetch_end_ms: u128,
     pub(super) wf_link_start_ms: u128,
@@ -110,6 +112,8 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         gate_stats,
         wf_setup_ms,
         wf_resolve_end_ms,
+        wf_materialization_wait_ms,
+        wf_commit_wait_ms,
         wf_fetch_start_ms,
         wf_fetch_end_ms,
         wf_link_start_ms,
@@ -153,7 +157,24 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             None
         };
         let resolve_wall_ms = wf_resolve_end_ms.saturating_sub(wf_setup_ms);
+        let post_resolve_ms = post_resolve_work_ms(
+            wf_resolve_end_ms,
+            wf_materialization_wait_ms,
+            wf_fetch_start_ms,
+        );
+        let pre_link_ms = pre_link_work_ms(wf_fetch_end_ms, wf_commit_wait_ms, wf_link_start_ms);
         let fetch_wall_ms = wf_fetch_end_ms.saturating_sub(wf_fetch_start_ms);
+        let counts = InstallCountSemantics {
+            resolved_package_row_count: packages.len(),
+            authoritative_fetch_candidate_count: downloaded,
+            store_reuse_observation_count: cached,
+            linker_entry_created_count: link_result.linked,
+            linker_entry_reused_count: link_result.skipped,
+            project_root_symlink_created_count: link_result.symlinked,
+            bin_link_created_count: link_result.bin_linked,
+        }
+        .to_json();
+        let metadata_dispatcher = metadata_dispatcher_json(resolver_stage_timing);
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
             .map(|p| {
@@ -187,9 +208,12 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                        "waterfall": {
                            "setup_ms": wf_setup_ms,
                            "resolve_ms": wf_resolve_end_ms.saturating_sub(wf_setup_ms),
-                           "pre_fetch_ms": wf_fetch_start_ms.saturating_sub(wf_resolve_end_ms),
+                           "materialization_wait_ms": wf_materialization_wait_ms,
+                           "commit_wait_ms": wf_commit_wait_ms,
+                           "post_resolve_work_ms": post_resolve_ms,
+                           "pre_fetch_ms": post_resolve_ms,
                            "fetch_ms": wf_fetch_end_ms.saturating_sub(wf_fetch_start_ms),
-                           "pre_link_ms": wf_link_start_ms.saturating_sub(wf_fetch_end_ms),
+                           "pre_link_ms": pre_link_ms,
                            "link_ms": wf_link_end_ms.saturating_sub(wf_link_start_ms),
                            "link_await_ms": wf_link_await_ms,
                            "link_finalize_ms": wf_link_finalize_ms,
@@ -287,27 +311,6 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // Each such fetch saved one
         // sequential round-trip from
         // the post-loop drain pass.
-                           "dispatcher": {
-                               "rpc_count": resolver_stage_timing.dispatcher_rpc_count,
-                               "configured_fanout":
-                                   resolver_stage_timing.dispatcher_configured_fanout,
-                               "inflight_high_water":
-                                   resolver_stage_timing.dispatcher_inflight_high_water,
-                               "active_fetch_high_water":
-                                   resolver_stage_timing.dispatcher_inflight_high_water,
-                               "pending_high_water":
-                                   resolver_stage_timing.dispatcher_pending_high_water,
-                               "semaphore_wait_count":
-                                   resolver_stage_timing.dispatcher_semaphore_wait_count,
-                               "semaphore_wait_ms":
-                                   resolver_stage_timing.dispatcher_semaphore_wait_ns as f64
-                                       / 1_000_000.0,
-                               "parked_max_depth": resolver_stage_timing.parked_max_depth,
-                               "tarball_dispatched":
-                                   resolver_stage_timing.tarball_dispatched_count,
-                               "peer_prefetch_count":
-                                   resolver_stage_timing.peer_prefetch_count,
-                           },
         //: streaming-BFS observability per
         // design. Null on warm lockfile-fast-path
         // installs (walker never ran). Field shape:
@@ -432,6 +435,9 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                    "peer_conflicts": [],
                    "peer_issues": peer_issues_json_value(&[], &[]),
                });
+        json["counts"] = counts;
+        json["timing"]["resolve"]["dispatcher"] = metadata_dispatcher.clone();
+        json["timing"]["resolve"]["metadata_dispatcher"] = metadata_dispatcher;
         json["security"] = serde_json::json!({
             "firewall": npm_firewall_stats.to_json(),
             "policy_extensions": policy_extension_stats.to_json(),
@@ -518,6 +524,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             }
             json["timing"]["detail"] = detail;
         }
+        attach_target_timing_semantics(&mut json["timing"]);
         if !emit_timing && let Some(obj) = json.as_object_mut() {
             obj.remove("timing");
         }
@@ -650,7 +657,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             json["audit_summary"] = serde_json::to_value(counts).unwrap_or(serde_json::Value::Null);
         }
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        report_capture::emit_install_json(&json);
     } else {
         // print the override apply summary BEFORE
         // the success line so it doesn't get lost at the bottom of the

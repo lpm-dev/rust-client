@@ -194,6 +194,7 @@ pub(super) struct OnlineLinkPhaseInput<'a> {
     pub(super) v2_event_driven: bool,
     pub(super) v2_plan: Option<&'a lpm_linker::v2::LinkPlanV2>,
     pub(super) v2_event_link_handles: Vec<V2LinkHandle>,
+    pub(super) prepared_v2_link_tasks: Option<PreparedV2LinkTasks>,
     pub(super) v2_link_task_timings: &'a mut V2LinkTaskTimings,
     pub(super) slow_package_timings: &'a mut SlowPackageTimings,
     pub(super) timing_detail_mode: TimingDetailMode,
@@ -215,6 +216,44 @@ pub(super) struct OnlineLinkPhaseResult {
     pub(super) bin_shims_ms: u128,
 }
 
+pub(super) struct PreparedV2LinkTasks {
+    materialized: Vec<MaterializedPackage>,
+    linked_count: usize,
+    await_ms: u128,
+}
+
+pub(super) async fn prepare_v2_link_tasks(
+    handles: Vec<V2LinkHandle>,
+    v2_link_task_timings: &mut V2LinkTaskTimings,
+    slow_package_timings: &mut SlowPackageTimings,
+    timing_detail_mode: TimingDetailMode,
+) -> Result<PreparedV2LinkTasks, LpmError> {
+    let mut materialized = Vec::with_capacity(handles.len());
+    let mut linked_count = 0usize;
+    let started = Instant::now();
+    for handle in handles {
+        let task = handle
+            .await
+            .map_err(|error| LpmError::Registry(format!("v2 link task panicked: {error}")))??;
+        let package_display = timing_detail_mode
+            .trace()
+            .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
+        v2_link_task_timings.record(task.ms, task.freshly_populated);
+        if let Some(package_display) = package_display.as_deref() {
+            slow_package_timings.record_link_v2_one(package_display, task.ms, task.timings);
+        }
+        if task.freshly_populated {
+            linked_count += 1;
+        }
+        materialized.push(task.materialized);
+    }
+    Ok(PreparedV2LinkTasks {
+        materialized,
+        linked_count,
+        await_ms: started.elapsed().as_millis(),
+    })
+}
+
 pub(super) async fn run_online_link_phase(
     input: OnlineLinkPhaseInput<'_>,
 ) -> Result<OnlineLinkPhaseResult, LpmError> {
@@ -230,7 +269,8 @@ pub(super) async fn run_online_link_phase(
         store_v2,
         v2_event_driven,
         v2_plan,
-        mut v2_event_link_handles,
+        v2_event_link_handles,
+        prepared_v2_link_tasks,
         v2_link_task_timings,
         slow_package_timings,
         timing_detail_mode,
@@ -285,27 +325,19 @@ pub(super) async fn run_online_link_phase(
 
         if v2_event_driven {
             let plan = v2_plan.expect("v2_event_driven implies v2_plan is Some");
-            let mut materialized_all: Vec<MaterializedPackage> =
-                Vec::with_capacity(v2_event_link_handles.len());
-            let mut linked_count = 0usize;
-            let link_await_start = Instant::now();
-            for handle in v2_event_link_handles.drain(..) {
-                let task = handle
-                    .await
-                    .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))??;
-                let package_display = timing_detail_mode
-                    .trace()
-                    .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
-                v2_link_task_timings.record(task.ms, task.freshly_populated);
-                if let Some(package_display) = package_display.as_deref() {
-                    slow_package_timings.record_link_v2_one(package_display, task.ms, task.timings);
+            let prepared = match prepared_v2_link_tasks {
+                Some(prepared) => prepared,
+                None => {
+                    prepare_v2_link_tasks(
+                        v2_event_link_handles,
+                        v2_link_task_timings,
+                        slow_package_timings,
+                        timing_detail_mode,
+                    )
+                    .await?
                 }
-                if task.freshly_populated {
-                    linked_count += 1;
-                }
-                materialized_all.push(task.materialized);
-            }
-            await_ms = link_await_start.elapsed().as_millis();
+            };
+            await_ms = prepared.await_ms;
             let link_finalize_start = Instant::now();
             let finalize =
                 lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, package_name)?;
@@ -316,12 +348,12 @@ pub(super) async fn run_online_link_phase(
             bin_shims_ms = finalize.bin_shims_ms;
             let target_total = plan.augmented_targets.len();
             LinkResult {
-                linked: linked_count,
+                linked: prepared.linked_count,
                 symlinked: finalize.symlinked,
                 bin_linked: finalize.bin_count,
-                skipped: target_total.saturating_sub(linked_count),
+                skipped: target_total.saturating_sub(prepared.linked_count),
                 self_referenced: finalize.self_referenced,
-                materialized: materialized_all,
+                materialized: prepared.materialized,
             }
         } else {
             lpm_linker::v2::link_packages_v2_with_compatibility_bin_names(
@@ -723,6 +755,15 @@ pub(super) async fn run_link_and_finish(
             "cached": cached,
             "linked": link_result.linked,
             "symlinked": link_result.symlinked,
+            "counts": InstallCountSemantics {
+                resolved_package_row_count: packages.len(),
+                authoritative_fetch_candidate_count: downloaded,
+                store_reuse_observation_count: cached,
+                linker_entry_created_count: link_result.linked,
+                linker_entry_reused_count: link_result.skipped,
+                project_root_symlink_created_count: link_result.symlinked,
+                bin_link_created_count: link_result.bin_linked,
+            }.to_json(),
             "used_lockfile": used_lockfile,
             "offline": true,
             "duration_ms": elapsed.as_millis() as u64,
@@ -740,6 +781,7 @@ pub(super) async fn run_link_and_finish(
             "warnings": [],
             "errors": [],
         });
+        attach_target_timing_semantics(&mut json["timing"]);
         if !emit_timing && let Some(obj) = json.as_object_mut() {
             obj.remove("timing");
         }
@@ -792,7 +834,7 @@ pub(super) async fn run_link_and_finish(
                 .collect(),
         );
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        report_capture::emit_install_json(&json);
     } else if emit_install_report {
         // patch summary in human mode.
         // invariant : use the filtered summary so a no-op

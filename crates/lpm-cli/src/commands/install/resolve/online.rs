@@ -182,6 +182,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
     let mut auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
     let mut linker_mode = linker_mode;
+    let resolve_ahead = workspace_resolution::active();
 
     let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
         match lockfile_result {
@@ -228,9 +229,13 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let preflight_disables_tarball_prefetch = npm_firewall_mode
                         .disables_tarball_prefetch()
                         || policy_extensions_disable_tarball_prefetch(policy_extension_configs);
-                    let fetch_overlap_downloads_during_resolve =
-                        fetch_overlap_allowed_local && !preflight_disables_tarball_prefetch;
+                    let fetch_overlap_downloads_during_resolve = fetch_overlap_allowed_local
+                        && !resolve_ahead
+                        && !preflight_disables_tarball_prefetch;
                     if preflight_disables_tarball_prefetch && fetch_overlap_allowed_local {
+                        post_firewall_fetch_overlap_allowed = true;
+                    }
+                    if resolve_ahead && fetch_overlap_allowed_local {
                         post_firewall_fetch_overlap_allowed = true;
                     }
                     let npm_fanout = positive_usize_env_or_default(
@@ -257,7 +262,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         fetch_semaphore.clone(),
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch()
+                        if resolve_ahead
+                            || npm_firewall_mode.disables_tarball_prefetch()
                             || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
                         {
                             HashMap::new()
@@ -271,8 +277,12 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     );
                     let selected_package_fetch_overlap_allowed = fetch_overlap_allowed_local
                         && !policy_extensions_disable_tarball_prefetch(policy_extension_configs);
+                    let serialize_fetch_after_workspace_firewall =
+                        resolve_ahead && npm_firewall_mode.is_enabled();
                     let selected_package_tx = if selected_package_fetch_overlap_allowed {
-                        if npm_firewall_mode.is_enabled() {
+                        if serialize_fetch_after_workspace_firewall {
+                            None
+                        } else if npm_firewall_mode.is_enabled() {
                             let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
                             let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
                             fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
@@ -306,6 +316,29 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                     },
                                 ));
                             Some(selected_tx)
+                        } else if route_table.supports_workspace_fetch_sharing()
+                            && let Some(hub) = workspace_resolution::fetch_overlap_hub()
+                        {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            fetch_overlap_join = Some(spawn_workspace_fetch_overlap_dispatcher(
+                                hub,
+                                rx,
+                                arc_client.clone(),
+                                route_table.clone(),
+                                store.clone(),
+                                store_v2_handle.clone(),
+                                fetch_semaphore.clone(),
+                                fetch_coord.clone(),
+                                project_dir.to_path_buf(),
+                                gate_stats.clone(),
+                                fetch_extract_limiter.clone(),
+                                install_accounting,
+                                dependency_engine_policy.clone(),
+                                streaming_fetch,
+                            ));
+                            Some(tx)
+                        } else if resolve_ahead {
+                            None
                         } else {
                             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                             fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
@@ -335,7 +368,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         override_set.clone(),
                         route_table.clone(),
                         npm_fanout,
-                        Some(spec_tx),
+                        (!resolve_ahead).then_some(spec_tx),
                         shared_cache,
                         auto_install_peers,
                         !omit_policy.optional,
@@ -401,7 +434,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch()
+                        if resolve_ahead
+                            || npm_firewall_mode.disables_tarball_prefetch()
                             || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
                         {
                             HashMap::new()

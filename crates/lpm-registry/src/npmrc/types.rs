@@ -219,6 +219,16 @@ pub struct TlsOverrides {
     pub per_origin: HashMap<OriginKey, OriginTlsOverrides>,
 }
 
+impl TlsOverrides {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.extra_roots.is_empty()
+            && self.strict_ssl.is_none()
+            && self.identity_certfile.is_none()
+            && self.identity_keyfile.is_none()
+            && self.per_origin.is_empty()
+    }
+}
+
 /// Origin key for auth lookup: case-insensitive host + optional port.
 ///
 /// `port` is `Option<u16>`:

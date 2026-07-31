@@ -247,6 +247,7 @@ fn rcgen_pem() -> Vec<u8> {
 /// stays None.
 fn cached(client: reqwest::Client) -> CachedClient {
     CachedClient {
+        policy_metadata_client: client.clone(),
         client,
         identity_fp: None,
     }

@@ -1375,6 +1375,44 @@ fn link_packages_v2_wipes_legacy_v1_wrappers() {
 }
 
 #[test]
+fn link_v2_prepare_defers_project_cleanup_until_finalize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let v1_wrappers = project.join(".lpm").join("wrappers").join("stale@1.0.0");
+    std::fs::create_dir_all(&v1_wrappers).unwrap();
+    std::fs::write(v1_wrappers.join("ghost"), b"left over").unwrap();
+
+    let sri = synthetic_sri(b"link_v2_prepare/deferred_cleanup");
+    write_object(
+        &store,
+        &sri,
+        &[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")],
+    );
+
+    let plan = link_v2_prepare(
+        &project,
+        vec![target("x", "1.0.0", &sri, true)],
+        &store,
+        LinkerMode::Isolated,
+    )
+    .unwrap();
+
+    assert!(
+        project.join(".lpm").join("wrappers").exists(),
+        "prepare must not mutate project state before the workspace commit barrier"
+    );
+
+    link_v2_one(&plan, &plan.augmented_targets[0], &store).unwrap();
+    link_v2_finalize(&project, &plan, &store, None).unwrap();
+
+    assert!(
+        !project.join(".lpm").join("wrappers").exists(),
+        "finalize must remove legacy project state at commit time"
+    );
+}
+
+#[test]
 fn link_packages_v2_with_explicit_root_link_names() {
     // `root_link_names = Some([])` means "explicitly no root
     // symlinks" — even for an `is_direct = true` target. Mirrors

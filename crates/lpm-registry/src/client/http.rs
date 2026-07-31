@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientPool {
+    General,
+    PolicyMetadata,
+}
+
 /// Maximum time to establish a TCP + TLS connection.
 ///
 /// Kept conservative — connecting is trivially fast on healthy networks,
@@ -75,13 +81,23 @@ impl HttpClients {
         Some(format!("TLS overrides active: {}", parts.join("; ")))
     }
 
-    /// Build an `HttpClients` whose `default` is the supplied client
-    /// and whose eager/lazy maps are empty. Used by [`RegistryClient::new`]
-    /// before any `.npmrc` is loaded.
+    /// Test helper whose logical pools share the supplied client's
+    /// underlying connection pool.
+    #[cfg(test)]
     pub(super) fn from_default_client(default: reqwest::Client) -> Arc<Self> {
+        Self::from_default_clients(default.clone(), default)
+    }
+
+    /// Build an `HttpClients` with separate general and policy metadata
+    /// connection pools and empty eager/lazy maps.
+    pub(super) fn from_default_clients(
+        default: reqwest::Client,
+        policy_metadata: reqwest::Client,
+    ) -> Arc<Self> {
         Arc::new(Self {
             default: CachedClient {
                 client: default,
+                policy_metadata_client: policy_metadata,
                 identity_fp: None,
             },
             eager: HashMap::new(),
@@ -181,18 +197,32 @@ impl HttpClients {
     /// queue on `lazy.lock()`. The second caller observes the
     /// just-inserted entry and skips the build.
     pub async fn for_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
+        self.for_url_pool(url, ClientPool::General).await
+    }
+
+    /// Resolve the configuration-equivalent client from the dedicated
+    /// policy metadata connection pool.
+    pub async fn for_policy_metadata_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
+        self.for_url_pool(url, ClientPool::PolicyMetadata).await
+    }
+
+    async fn for_url_pool(&self, url: &str, pool: ClientPool) -> Result<reqwest::Client, LpmError> {
+        let select = |cached: &CachedClient| match pool {
+            ClientPool::General => cached.client.clone(),
+            ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
+        };
         let Some(origin) = OriginKey::from_request_url(url) else {
-            return Ok(self.default.client.clone());
+            return Ok(select(&self.default));
         };
         if let Some(c) = self.eager.get(&origin) {
-            return Ok(c.client.clone());
+            return Ok(select(c));
         }
         let any_port = OriginKey {
             host_lower: origin.host_lower.clone(),
             port: None,
         };
         if let Some(c) = self.eager.get(&any_port) {
-            return Ok(c.client.clone());
+            return Ok(select(c));
         }
         // Fast path: no per-origin TLS configured at all → the lazy map is
         // guaranteed empty and the build below would no-op to default. Skip
@@ -201,14 +231,14 @@ impl HttpClients {
         // where many concurrent metadata fetches would otherwise serialize
         // briefly on `lazy.lock().await`.
         if self.tls_overrides.per_origin.is_empty() {
-            return Ok(self.default.client.clone());
+            return Ok(select(&self.default));
         }
         let mut guard = self.lazy.lock().await;
         if let Some(c) = guard.get(&origin) {
-            return Ok(c.client.clone());
+            return Ok(select(c));
         }
         if let Some(c) = guard.get(&any_port) {
-            return Ok(c.client.clone());
+            return Ok(select(c));
         }
         // No client cached. Look up per-origin TLS for this origin.
         let per_origin_tls = self
@@ -218,7 +248,7 @@ impl HttpClients {
             .or_else(|| self.tls_overrides.per_origin.get(&any_port));
         let Some(per_origin_tls) = per_origin_tls else {
             // No per-origin TLS → use default client.
-            return Ok(self.default.client.clone());
+            return Ok(select(&self.default));
         };
         // Build under lock — single-flight per origin.
         let cached = build_per_origin_http_client(
@@ -227,7 +257,7 @@ impl HttpClients {
             &origin,
             self.passphrase.as_ref(),
         )?;
-        let out = cached.client.clone();
+        let out = select(&cached);
         guard.insert(origin, cached);
         Ok(out)
     }
@@ -343,10 +373,17 @@ pub(super) fn build_per_origin_http_client(
         CONNECT_TIMEOUT,
         READ_TIMEOUT,
         &synthetic,
+        identity.clone(),
+    )?;
+    let policy_metadata_client = RegistryClient::build_http_client_with_tls_and_identity(
+        CONNECT_TIMEOUT,
+        READ_TIMEOUT,
+        &synthetic,
         identity,
     )?;
     Ok(CachedClient {
         client,
+        policy_metadata_client,
         identity_fp,
     })
 }

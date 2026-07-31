@@ -132,7 +132,20 @@ pub(crate) fn run() -> Result<()> {
         .build()
         .expect("failed to create tokio runtime");
 
-    runtime.block_on(async_main())
+    // The install pipeline is one very large future, and a recursive
+    // workspace install polls every target's pipeline on the thread
+    // driving `block_on` (their futures are !Send). Debug-build async
+    // frames are large enough that the platform main-thread stack is
+    // not a safe budget for that, so drive the async entry point on a
+    // dedicated thread with an explicit, generous stack.
+    const ASYNC_MAIN_STACK_BYTES: usize = 64 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("lpm-async-main".into())
+        .stack_size(ASYNC_MAIN_STACK_BYTES)
+        .spawn(move || runtime.block_on(async_main()))
+        .expect("failed to spawn async main thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 enum FastLaneAdmission {
@@ -507,6 +520,7 @@ async fn async_main() -> Result<()> {
                 packages,
                 recursive,
                 no_recursive,
+                workspace_concurrency,
                 save_dev,
                 omit,
                 prod,
@@ -980,6 +994,7 @@ async fn async_main() -> Result<()> {
                                 verbose: cli.verbose,
                                 audit_after_install: eff_audit_after_install,
                                 timing: eff_timing,
+                                workspace_concurrency,
                             },
                         )
                         .await

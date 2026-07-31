@@ -41,6 +41,7 @@ mod patches;
 mod peer;
 pub(crate) mod policy_extensions;
 mod recursive;
+mod report_capture;
 mod reporting;
 mod resolve;
 mod setup;
@@ -54,6 +55,8 @@ mod tests;
 mod timing;
 mod validation;
 mod workspace;
+mod workspace_materialization;
+mod workspace_resolution;
 
 use accounting::*;
 use catalog::*;
@@ -71,10 +74,8 @@ pub(crate) use firewall::{
     registry_materialization_route_is_public_npm,
     run_prepared_npm_firewall_materialization_preflight,
 };
+pub use gitignore::ensure_skills_gitignore;
 use gitignore::*;
-pub use gitignore::{
-    ensure_lpm_hoisted_gitignore, ensure_lpm_wrappers_gitignore, ensure_skills_gitignore,
-};
 use lifecycle::*;
 use linking::*;
 use lockfile::*;
@@ -632,18 +633,10 @@ async fn run_with_options_under_store_lock(
     // a real install when either migration is owed; here we just
     // clear the old state. Idempotent — calling on a project without
     // legacy state is a no-op.
-    migrate_legacy_wrapper_layout(project_dir, json_output);
-
-    // + hoisted-symmetry — ensure `.gitignore` contains
-    // BOTH `.lpm/wrappers/` (isolated) and `.lpm/hoisted/` so neither
-    // mode's project-local state can accidentally land in commits.
-    // Runtime "ensure once" pattern (matches the existing skills
-    // helper); idempotent for projects that already have either
-    // entry. Both run unconditionally because the user's mode could
-    // change between installs and a project already on one mode may
-    // accumulate the other mode's state during a future toggle.
-    ensure_lpm_wrappers_gitignore(project_dir);
-    ensure_lpm_hoisted_gitignore(project_dir);
+    let defer_project_linker_layout_maintenance = workspace_resolution::active();
+    if !defer_project_linker_layout_maintenance {
+        maintain_project_linker_layout(project_dir, json_output);
+    }
 
     // Surface silent additions to `trustedDependencies`
     // BEFORE the install pipeline does any work.
@@ -691,24 +684,10 @@ async fn run_with_options_under_store_lock(
     )?;
     reject_remote_tarball_url_deps_with_policy_extensions(&policy_extension_configs, &deps)?;
 
-    let resolver_excludes = minimum_release_age_exclude
-        .iter()
-        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
-    let resolver_policy = if release_age_policy.is_strict() {
-        lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
-            resolver_min_age_secs,
-            resolver_trust_policy,
-            resolver_excludes,
-        )
-    } else {
-        let direct_release_age_canonicals = direct_release_age_canonicals(&deps);
-        lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
-            resolver_min_age_secs,
-            resolver_trust_policy,
-            resolver_excludes,
-            direct_release_age_canonicals,
-        )
-    };
+    // Snapshot for release-age direct canonicals: the policy's direct
+    // set is defined by the manifest-declared roots, not by whatever
+    // the workspace pre-resolve later injects into `deps`.
+    let release_age_direct_snapshot = deps.clone();
     let minimum_release_age_exclude: std::collections::HashSet<String> =
         minimum_release_age_exclude.into_iter().collect();
 
@@ -774,6 +753,10 @@ async fn run_with_options_under_store_lock(
     })?;
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
+        workspace_resolution::wait_for_commit().await;
+        if defer_project_linker_layout_maintenance {
+            maintain_project_linker_layout(project_dir, json_output);
+        }
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             policy_extension_configs: &policy_extension_configs,
@@ -832,6 +815,25 @@ async fn run_with_options_under_store_lock(
     if requested_v2_mode {
         workspace_member_deps.clear();
     }
+
+    let resolver_excludes = minimum_release_age_exclude
+        .iter()
+        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
+    let resolver_policy = if release_age_policy.is_strict() {
+        lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
+            resolver_min_age_secs,
+            resolver_trust_policy,
+            resolver_excludes,
+        )
+    } else {
+        let direct_canonicals = direct_release_age_canonicals(&release_age_direct_snapshot);
+        lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
+            resolver_min_age_secs,
+            resolver_trust_policy,
+            resolver_excludes,
+            direct_canonicals,
+        )
+    };
 
     if offline {
         return run_offline_install_phase(OfflineInstallInput {
@@ -955,13 +957,7 @@ async fn run_with_options_under_store_lock(
     // (every `rm -rf` is a no-op on already-clean state). A crash
     // mid-migration leaves a half-wiped project; the next install
     // re-runs the same wipes and re-attempts the v2 install.
-    if store_v2_handle.is_some() && needs_v2_migration(project_dir) {
-        if !json_output {
-            output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
-        }
-        migrate_v1_to_v2(project_dir)
-            .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
-    }
+    let project_needs_v2_migration = store_v2_handle.is_some() && needs_v2_migration(project_dir);
 
     let experimental_resolver_requested = experimental_resolver::enabled();
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
@@ -1067,6 +1063,11 @@ async fn run_with_options_under_store_lock(
                 .or_insert_with(|| deps.clone());
         }
 
+        workspace_resolution::wait_for_commit().await;
+        if defer_project_linker_layout_maintenance {
+            maintain_project_linker_layout(project_dir, json_output);
+        }
+        apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
         return experimental_resolver::run(
             arc_client.clone(),
             project_dir,
@@ -1100,35 +1101,9 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
-    let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
-    let OnlineResolutionPhaseResult {
-        packages,
-        packages_for_lockfile,
-        resolve_ms,
-        used_lockfile,
-        platform_skipped,
-        latest_stable_versions,
-        applied_overrides,
-        peer_conflicts,
-        peer_warnings,
-        ambient_peer_installs_for_lockfile,
-        spec_tracker,
-        speculation_join,
-        mut fetch_overlap_join,
-        mut npm_firewall_preflight_join,
-        post_firewall_fetch_overlap_allowed,
-        resolved_with,
-        streaming_metrics,
-        initial_batch_ms,
-        resolver_stage_timing,
-        fast_path_lockfile,
-        lockfile_peer_context_authoritative,
-        needs_binary_upgrade,
-        wf_setup_ms,
-        wf_resolve_end_ms,
-        auto_isolated_peer_conflicts,
-        linker_mode,
-    } = run_online_resolution_phase(OnlineResolutionPhaseInput {
+    let fetch_coord: Arc<FetchCoordinator> = FetchCoordinator::process_global();
+
+    let online_resolution = run_online_resolution_phase(OnlineResolutionPhaseInput {
         start,
         lockfile_result,
         arc_client: arc_client.clone(),
@@ -1172,7 +1147,36 @@ async fn run_with_options_under_store_lock(
         resolver_min_age_secs,
         override_set: override_set.clone(),
     })
-    .await?;
+    .await;
+    workspace_resolution::finish_resolution();
+    let OnlineResolutionPhaseResult {
+        packages,
+        packages_for_lockfile,
+        resolve_ms,
+        used_lockfile,
+        platform_skipped,
+        latest_stable_versions,
+        applied_overrides,
+        peer_conflicts,
+        peer_warnings,
+        ambient_peer_installs_for_lockfile,
+        spec_tracker,
+        speculation_join,
+        mut fetch_overlap_join,
+        mut npm_firewall_preflight_join,
+        post_firewall_fetch_overlap_allowed,
+        resolved_with,
+        streaming_metrics,
+        initial_batch_ms,
+        resolver_stage_timing,
+        fast_path_lockfile,
+        lockfile_peer_context_authoritative,
+        needs_binary_upgrade,
+        wf_setup_ms,
+        wf_resolve_end_ms,
+        auto_isolated_peer_conflicts,
+        linker_mode,
+    } = online_resolution?;
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
@@ -1197,7 +1201,11 @@ async fn run_with_options_under_store_lock(
         })
         .await?
     };
-    if post_firewall_fetch_overlap_allowed && fetch_overlap_join.is_none() && !packages.is_empty() {
+    if post_firewall_fetch_overlap_allowed
+        && fetch_overlap_join.is_none()
+        && !packages.is_empty()
+        && !workspace_resolution::active()
+    {
         fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
             packages.clone(),
             arc_client.clone(),
@@ -1235,6 +1243,15 @@ async fn run_with_options_under_store_lock(
         .await?;
     }
     let lockfile_provenance = prior_verified_provenance;
+    let workspace_fetch_is_shared = fetch_overlap_join
+        .as_ref()
+        .is_some_and(FetchOverlapJoin::workspace_shared);
+    let wf_materialization_wait_ms = if workspace_resolution::active() && !workspace_fetch_is_shared
+    {
+        workspace_resolution::wait_for_materialization().await
+    } else {
+        0
+    };
 
     let OnlineFetchPhaseResult {
         packages,
@@ -1245,7 +1262,7 @@ async fn run_with_options_under_store_lock(
         v2_mode,
         v2_event_driven,
         v2_plan,
-        v2_event_link_handles,
+        mut v2_event_link_handles,
         mut v2_link_task_timings,
         fetch_ms,
         waterfall_start_ms: wf_fetch_start_ms,
@@ -1303,6 +1320,26 @@ async fn run_with_options_under_store_lock(
     })
     .await?;
 
+    let prepared_v2_link_tasks = if workspace_resolution::active() && v2_event_driven {
+        let handles = std::mem::take(&mut v2_event_link_handles);
+        Some(
+            prepare_v2_link_tasks(
+                handles,
+                &mut v2_link_task_timings,
+                &mut slow_package_timings,
+                timing_detail_mode,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let wf_commit_wait_ms = workspace_resolution::wait_for_commit().await;
+    if defer_project_linker_layout_maintenance {
+        maintain_project_linker_layout(project_dir, json_output);
+    }
+    apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
+
     let link_phase = run_online_link_phase(OnlineLinkPhaseInput {
         start,
         project_dir,
@@ -1316,6 +1353,7 @@ async fn run_with_options_under_store_lock(
         v2_event_driven,
         v2_plan: v2_plan.as_deref(),
         v2_event_link_handles,
+        prepared_v2_link_tasks,
         v2_link_task_timings: &mut v2_link_task_timings,
         slow_package_timings: &mut slow_package_timings,
         timing_detail_mode,
@@ -1753,6 +1791,8 @@ async fn run_with_options_under_store_lock(
             gate_stats: gate_stats.as_ref(),
             wf_setup_ms,
             wf_resolve_end_ms,
+            wf_materialization_wait_ms,
+            wf_commit_wait_ms,
             wf_fetch_start_ms,
             wf_fetch_end_ms,
             wf_link_start_ms,

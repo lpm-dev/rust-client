@@ -58,7 +58,7 @@ not for one-off hand-timed installs.
 It provides:
 
 - isolated temp project, `HOME`, package-manager cache, and `LPM_HOME`
-- cold, warm-cache, and up-to-date modes
+- cold, lockfile-and-cache-warm rebuild, and up-to-date modes
 - round-robin interleaving by sample to reduce live-network bias
 - configurable sample count, fixtures, package managers, lpm routes, lpm firewall modes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
@@ -66,10 +66,13 @@ It provides:
 - expected/unexpected warning classification for known noisy installs
 - top-package sweeps from a package-name file with offset/limit chunking
 
-Warm mode first seeds the package-manager cache/store, then removes generated
-project install artifacts before the counted run. That means warm numbers are
-cache/store-warm clean-project reinstalls, not repeat no-op installs over an
-already materialized `node_modules`.
+Cold mode starts without generated lockfiles or materialized install state.
+Warm mode first seeds each package manager's cache/store and generated
+lockfiles, then removes `node_modules` and `.lpm` throughout the workspace
+before the counted run while preserving those lockfiles. Warm numbers are
+therefore lockfile-and-cache-warm clean-project reinstalls, not lockfile-cold
+resolutions or repeat no-op installs over an already materialized
+`node_modules`.
 
 Up-to-date mode runs one more install over the project materialized by the
 previous successful install, so it measures the no-op state check.

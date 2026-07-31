@@ -385,9 +385,21 @@ fn emit_manifest_compat_warnings(pkg: &PackageJson, json_output: bool) {
     if json_output {
         return;
     }
+    // Recursive workspace installs run this preflight once per target
+    // against the same workspace-root manifest; dedupe so each issue
+    // is reported once per process instead of once per target.
+    static EMITTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
     for issue in pkg.manifest_compat_issues() {
-        output::warn(&issue.detail);
-        output::field("fix", &issue.remediation);
+        let first_emission = EMITTED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(issue.detail.clone());
+        if first_emission {
+            output::warn(&issue.detail);
+            output::field("fix", &issue.remediation);
+        }
     }
 }
 

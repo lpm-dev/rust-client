@@ -8,7 +8,8 @@ pub(super) type FetchExtractLimiter = Option<Arc<tokio::sync::Semaphore>>;
 
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
-const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 10;
+// APFS store finalization contends on filesystem metadata above this width.
+const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ArtifactSelection {
@@ -37,6 +38,15 @@ impl FetchCoordinator {
         map.entry(key)
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
+    }
+
+    /// Concurrent installs in one process (recursive workspace targets)
+    /// share one lock table so a tarball needed by several targets is
+    /// downloaded and extracted once — the post-lock store re-checks
+    /// turn every waiter into a cache hit.
+    pub(super) fn process_global() -> Arc<Self> {
+        static GLOBAL: std::sync::OnceLock<Arc<FetchCoordinator>> = std::sync::OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(Default::default))
     }
 }
 
@@ -291,6 +301,20 @@ pub(super) async fn run_online_fetch_phase(
     let fetch_plan_start = Instant::now();
     let mut fetch_stage_timings = FetchStageTimings::default();
     let v2_link_task_timings = V2LinkTaskTimings::default();
+    let preclassification_overlap_drain = if fetch_overlap_join
+        .as_ref()
+        .is_some_and(FetchOverlapJoin::workspace_shared)
+    {
+        Some(
+            fetch_overlap_join
+                .take()
+                .expect("workspace-shared overlap join is present")
+                .drain()
+                .await?,
+        )
+    } else {
+        None
+    };
 
     // Aggregation buffer for fetch writeback. Populated inside the fetch
     // block with final-URL pairs only when the final URL diverges from the
@@ -350,6 +374,7 @@ pub(super) async fn run_online_fetch_phase(
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
     if v2_mode {
+        let workspace_coordinator = workspace_materialization::current();
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_mode implies v2 store handle is available");
@@ -361,14 +386,30 @@ pub(super) async fn run_online_fetch_phase(
                 continue;
             }
             let sri = local_source_sri_for_target(target);
-            store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+            if let Some(coordinator) = workspace_coordinator.as_ref() {
+                coordinator
+                    .populate_local_source(
+                        target.store_path.clone(),
+                        sri,
+                        Arc::clone(
+                            store_v2_handle
+                                .as_ref()
+                                .expect("v2_mode implies v2 store handle is available"),
+                        ),
+                    )
+                    .await?;
+            } else {
+                store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+            }
         }
     }
     // Under v2 mode, `link_packages_v2` needs the full LinkTarget set in one
     // batch so the GraphKey pre-pass can resolve cross-references. The v2
     // event-driven path below uses a separate prepare/one/finalize split.
-    let event_driven_link =
-        !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
+    let event_driven_link = !workspace_resolution::active()
+        && !serial_link
+        && !v2_mode
+        && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
     // Collection of per-package link handles. Cached packages push into this
     // before the fetch loop; fetch tasks push as each tarball materializes.
@@ -550,13 +591,8 @@ pub(super) async fn run_online_fetch_phase(
     fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
     let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
-    // Stale-entry cleanup runs once, up front. It must happen before any
-    // per-package link spawn touches `.lpm/` so the `read_dir` scan sees a
-    // stable snapshot.
-    //
-    // Under v2 event-driven linking, `link_v2_prepare` already ran
-    // `cleanup_v1_state`, so this v1-shaped cleanup is skipped. Running it
-    // would wipe node_modules a second time with no benefit.
+    // The v1 event-driven path mutates project-local wrappers, so recursive
+    // resolve-ahead disables it until the deterministic commit turn.
     if event_driven_link {
         lpm_linker::cleanup_stale_entries(project_dir, &link_targets)?;
     }
@@ -1970,8 +2006,14 @@ pub(super) async fn run_online_fetch_phase(
         fetch_stage_timings.download_wall_ms = download_wall_start.elapsed().as_millis();
     }
 
-    if let Some(join) = fetch_overlap_join.take() {
-        let drain = join.drain().await?;
+    let overlap_drain = match preclassification_overlap_drain {
+        Some(drain) => Some(drain),
+        None => match fetch_overlap_join.take() {
+            Some(join) => Some(join.drain().await?),
+            None => None,
+        },
+    };
+    if let Some(drain) = overlap_drain {
         fetch_stage_timings.overlap = drain.stats;
         for outcome in drain.outcomes {
             if let Some(sri) = outcome.computed_sri {
@@ -2080,10 +2122,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_bounded_value_for_experimental_installer() {
+    fn fetch_extract_permits_default_to_four_for_experimental_installer() {
         assert_eq!(
             configured_fetch_extract_permits(None, Some("1"), false),
-            Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
+            Some(4)
         );
     }
 
@@ -2104,11 +2146,8 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_bounded_value_for_macos_v2_installs() {
-        assert_eq!(
-            platform_default_fetch_extract_permits(true, true),
-            Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
-        );
+    fn fetch_extract_permits_default_to_four_for_macos_v2_installs() {
+        assert_eq!(platform_default_fetch_extract_permits(true, true), Some(4));
     }
 
     #[test]

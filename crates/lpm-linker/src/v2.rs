@@ -142,6 +142,19 @@ pub struct LinkPlanV2 {
 }
 
 impl LinkPlanV2 {
+    /// Return the exact materialization key derived for `target`.
+    pub fn graph_key_for(&self, target: &V2Target) -> Result<Arc<GraphKey>, LpmError> {
+        self.key_map
+            .get_for(&target.target)
+            .cloned()
+            .ok_or_else(|| {
+                LpmError::Store(format!(
+                    "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
+                    target.target.name, target.target.version
+                ))
+            })
+    }
+
     /// Are all targets ready for the event-driven path? True iff every
     /// `LinkTarget.peers` is already populated (resolver-threaded
     /// greedy-fusion path) and `ensure_peer_context` made no
@@ -350,18 +363,14 @@ pub fn finalize_existing_link_entries_with_compatibility_bin_names(
 
 /// Step 1 of the event-driven v2 link API.
 ///
-/// Runs the post-resolve, pre-fetch sync work that the install pipeline
-/// can complete without any object on disk:
-/// 1. [`cleanup_v1_state`] — wipes legacy `<project>/.lpm/wrappers/`
-///    and `<project>/.lpm/hoisted/` state. Project `node_modules`
-///    root entries are reconciled during finalize.
-/// 2. [`ensure_peer_context`] — best-effort fill-in for targets whose
+/// Runs the post-resolve, pre-fetch work that does not mutate project state:
+/// 1. [`ensure_peer_context`] — best-effort fill-in for targets whose
 ///    [`LinkTarget::peers`] arrived empty. Reads `package.json` from
 ///    extracted `objects/<sri>/`. Pre-fetch callers that already have
 ///    authoritative peer context should use
 ///    [`link_v2_prepare_with_authoritative_peer_context`] instead of
 ///    doing this disk fallback.
-/// 3. [`derive_graph_keys`] — computes the
+/// 2. [`derive_graph_keys`] — computes the
 ///    `(name, version, wrapper_id) → GraphKey` map. Pure compute over
 ///    in-memory targets, no I/O. Multi-source-same-coords collisions
 ///    surface as a hard error here.
@@ -445,7 +454,7 @@ enum PeerContextMode {
 }
 
 fn link_v2_prepare_inner(
-    project_dir: &Path,
+    _project_dir: &Path,
     targets: Vec<V2Target>,
     store: &Store,
     linker_mode: LinkerMode,
@@ -456,7 +465,6 @@ fn link_v2_prepare_inner(
     // `--features tracy`; filtered at INFO level so it's essentially
     // free in regular builds.
     let _span = tracing::info_span!("linker.prepare", target_count = targets.len(),).entered();
-    cleanup_v1_state(project_dir)?;
     let mut augmented_targets = targets;
     if matches!(peer_context, PeerContextMode::DeriveMissing) {
         ensure_peer_context(&mut augmented_targets, store)?;
@@ -588,6 +596,7 @@ fn link_v2_finalize_inner(
     .entered();
     let augmented_slice = &plan.augmented_targets[..];
     let stage_timer = std::time::Instant::now();
+    cleanup_v1_state(project_dir)?;
     reconcile_project_node_modules(project_dir, augmented_slice, self_package_name, true)?;
     let reconcile_ms = stage_timer.elapsed().as_millis();
     let stage_timer = std::time::Instant::now();

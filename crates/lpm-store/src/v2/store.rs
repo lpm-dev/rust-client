@@ -33,7 +33,9 @@ use super::integrity::{
     source_policy_uses_source_integrity, tree_snapshot_matches, write_object_integrity_for_policy,
     write_tree_snapshot, write_tree_snapshot_best_effort,
 };
-use super::local_source::{populate_local_source_object_into, replace_local_source_object};
+use super::local_source::{
+    local_source_snapshot_matches, populate_local_source_object_into, replace_local_source_object,
+};
 use super::tree_hash::{
     ExtractedObjectStats, ObjectTreeStats, TreeIntegrities, compute_object_tree_integrities,
     compute_tree_metadata_integrity,
@@ -1597,8 +1599,8 @@ impl Store {
     ///
     /// The populated object is a real-file snapshot of the source
     /// tree. The synthetic SRI is a stable identity key rather than a
-    /// content hash, so each populate refreshes the snapshot to pick
-    /// up added, changed, and removed files.
+    /// content hash, so reuse requires comparing the live source with
+    /// the stored tree and validating the stored tree's integrity.
     pub fn populate_object_from_local_source(
         &self,
         source_dir: &Path,
@@ -1611,6 +1613,27 @@ impl Store {
             ))
         })?;
         let object_dir = self.paths.object_dir(sri)?;
+
+        // Concurrent installs in one process (recursive workspace
+        // targets) refresh the same snapshot; serialize per object so
+        // one populate's replace can't swap the tree out from under a
+        // sibling's populate or its identical-content comparison.
+        let populate_lock = local_source_populate_lock(&object_dir);
+        let _populate_guard = populate_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let snapshot_matches = local_source_snapshot_matches(&canonical_source, &object_dir)?;
+        let verified_object = object_integrity_or_remove(
+            &object_dir,
+            "before local-source snapshot reuse or refresh",
+            sri,
+            ObjectIntegrityPolicy::Tree,
+        )?;
+        if snapshot_matches && verified_object.is_some() {
+            self.backfill_security_cache_if_enabled(&object_dir, sri);
+            return Ok(object_dir);
+        }
 
         if let Some(parent) = object_dir.parent() {
             ensure_store_tier_dir_locked(parent)
@@ -2011,6 +2034,20 @@ fn link_tree_matches_object_tree(
 ) -> Result<bool, LpmError> {
     let object_integrities = compute_object_tree_integrities(object_dir)?;
     Ok(link_integrities.content == object_integrities.content)
+}
+
+/// Process-wide per-object mutex serializing local-source snapshot
+/// populates. The map only ever holds one entry per distinct local
+/// source consumed in this process, so it is never pruned.
+fn local_source_populate_lock(object_dir: &Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(locks.entry(object_dir.to_path_buf()).or_default())
 }
 
 #[cfg(test)]

@@ -1401,6 +1401,81 @@ async fn get_npm_metadata_direct_skips_proxy_tier_entirely() {
 }
 
 #[tokio::test]
+async fn command_scoped_metadata_cache_single_flights_independent_resolvers_without_disk_cache() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let package = "shared-importer-package";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(50))
+                .set_body_string(test_metadata_json(package)),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .clone_with_metadata_memory_cache();
+    client.cache_dir = None;
+    let first = client.clone_with_config();
+    let second = client.clone_with_config();
+
+    let (first_result, second_result) = tokio::join!(
+        first.get_npm_metadata_direct(package),
+        second.get_npm_metadata_direct(package),
+    );
+    assert_eq!(first_result.unwrap().name, package);
+    assert_eq!(second_result.unwrap().name, package);
+}
+
+#[tokio::test]
+async fn command_scoped_metadata_cache_keeps_direct_registry_origins_isolated() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first_registry = MockServer::start().await;
+    let second_registry = MockServer::start().await;
+    let package = "shared-route-package";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json("first-registry-result")),
+        )
+        .expect(1)
+        .mount(&first_registry)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json("second-registry-result")),
+        )
+        .expect(1)
+        .mount(&second_registry)
+        .await;
+
+    let mut shared = RegistryClient::new().clone_with_metadata_memory_cache();
+    shared.cache_dir = None;
+    let first = shared
+        .clone_with_config()
+        .with_npm_registry_url(first_registry.uri());
+    let second = shared
+        .clone_with_config()
+        .with_npm_registry_url(second_registry.uri());
+
+    let first_result = first.get_npm_metadata_direct(package).await.unwrap();
+    let second_result = second.get_npm_metadata_direct(package).await.unwrap();
+
+    assert_eq!(first_result.name, "first-registry-result");
+    assert_eq!(second_result.name, "second-registry-result");
+}
+
+#[tokio::test]
 async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

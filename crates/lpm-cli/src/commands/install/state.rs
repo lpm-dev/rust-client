@@ -366,6 +366,10 @@ pub(super) async fn run_install_freshness_phase(
                     "success": true,
                     "up_to_date": true,
                     "duration_ms": total_ms as u64,
+                    "counts": InstallCountSemantics {
+                        resolved_package_row_count: fast_path_packages.len(),
+                        ..InstallCountSemantics::default()
+                    }.to_json(),
                     "timing": {
                         "resolve_ms": 0u128,
                         "fetch_ms": 0u128,
@@ -374,6 +378,9 @@ pub(super) async fn run_install_freshness_phase(
                         "waterfall": {
                             "setup_ms": total_ms,
                             "resolve_ms": 0u128,
+                            "materialization_wait_ms": 0u128,
+                            "commit_wait_ms": 0u128,
+                            "post_resolve_work_ms": 0u128,
                             "pre_fetch_ms": 0u128,
                             "fetch_ms": 0u128,
                             "pre_link_ms": 0u128,
@@ -399,6 +406,7 @@ pub(super) async fn run_install_freshness_phase(
                         0,
                     );
                 }
+                attach_target_timing_semantics(&mut json["timing"]);
                 if !input.emit_timing
                     && let Some(obj) = json.as_object_mut()
                 {
@@ -413,7 +421,7 @@ pub(super) async fn run_install_freshness_phase(
                     &mut json,
                     input.force_security_floor,
                 );
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                report_capture::emit_install_json(&json);
             } else {
                 install_ui::done_untrusted(&format!("Up to date · {total_ms}ms"));
             }
@@ -486,13 +494,48 @@ pub(super) fn source_analysis_caches_are_current(
                 },
             }
         };
-        if checked.insert(package_dir.clone())
-            && lpm_security::behavioral::read_cached_analysis(&package_dir).is_none()
-        {
-            return false;
-        }
+        checked.insert(package_dir);
     }
-    true
+    all_analysis_caches_readable(checked)
+}
+
+/// Verify every store entry has a readable cached analysis. The reads
+/// are independent per-entry file loads, so large projects fan them
+/// out across threads — this runs on the up-to-date fast path where a
+/// sequential scan of hundreds of entries dominates the no-op install.
+fn all_analysis_caches_readable(package_dirs: HashSet<PathBuf>) -> bool {
+    const PARALLEL_THRESHOLD: usize = 64;
+    const MAX_THREADS: usize = 8;
+    if package_dirs.len() < PARALLEL_THRESHOLD {
+        return package_dirs
+            .iter()
+            .all(|dir| lpm_security::behavioral::read_cached_analysis(dir).is_some());
+    }
+
+    let dirs: Vec<PathBuf> = package_dirs.into_iter().collect();
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .clamp(1, MAX_THREADS);
+    let chunk_size = dirs.len().div_ceil(threads);
+    let missing = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for chunk in dirs.chunks(chunk_size) {
+            let missing = &missing;
+            scope.spawn(move || {
+                for dir in chunk {
+                    if missing.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    if lpm_security::behavioral::read_cached_analysis(dir).is_none() {
+                        missing.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    !missing.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn dependency_engine_freshness_key_for_state(

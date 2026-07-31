@@ -40,6 +40,12 @@ pub(crate) struct InstallArgs {
     #[arg(long, conflicts_with = "recursive")]
     pub(crate) no_recursive: bool,
 
+    /// Maximum number of workspace packages a recursive install runs
+    /// concurrently. Defaults to 1; the `LPM_WORKSPACE_CONCURRENCY`
+    /// environment variable overrides the default when this flag is absent.
+    #[arg(long, value_name = "N", conflicts_with = "no_recursive")]
+    pub(crate) workspace_concurrency: Option<std::num::NonZeroUsize>,
+
     /// Save as devDependencies instead of dependencies.
     #[arg(long, short = 'D')]
     pub(crate) save_dev: bool,

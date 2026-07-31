@@ -7,7 +7,8 @@
 //!
 //! Call `reset_all()` before resolution, then `summary()` after.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Drop guard that accumulates elapsed time on drop.
@@ -70,6 +71,8 @@ static RELEASE_AGE_MISSING: AtomicU64 = AtomicU64::new(0);
 static TRUST_POLICY_NS: AtomicU64 = AtomicU64::new(0);
 static TRUST_POLICY_CHECKS: AtomicU64 = AtomicU64::new(0);
 static TRUST_POLICY_REJECTED: AtomicU64 = AtomicU64::new(0);
+static COMMAND_SCOPE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static COMMAND_SCOPE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PolicySummary {
@@ -131,14 +134,43 @@ pub fn policy_summary() -> PolicySummary {
     }
 }
 
-/// Reset all counters. Call before resolution starts.
-pub fn reset_all() {
+fn reset_all_unscoped() {
     to_pubgrub_ranges::reset();
     available_versions::reset();
     ensure_cached::reset();
     choose_version::reset();
     get_dependencies::reset();
     reset_policy();
+}
+
+/// Reset all counters unless a recursive command is collecting one
+/// aggregate across concurrent resolver passes.
+pub fn reset_all() {
+    if !COMMAND_SCOPE_ACTIVE.load(Ordering::Acquire) {
+        reset_all_unscoped();
+    }
+}
+
+/// Guard that keeps resolver profiling cumulative across one command.
+pub struct CommandProfileScope {
+    _exclusive: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Starts an exclusive command aggregate and suppresses resolver resets.
+pub async fn command_scope() -> CommandProfileScope {
+    let lock = Arc::clone(COMMAND_SCOPE_LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))));
+    let exclusive = lock.lock_owned().await;
+    reset_all_unscoped();
+    COMMAND_SCOPE_ACTIVE.store(true, Ordering::Release);
+    CommandProfileScope {
+        _exclusive: exclusive,
+    }
+}
+
+impl Drop for CommandProfileScope {
+    fn drop(&mut self) {
+        COMMAND_SCOPE_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 /// Format a summary of all counters. Returns a multi-line string.
@@ -164,4 +196,33 @@ pub fn summary() -> String {
     lines.push(fmt("get_dependencies", d, c));
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_scopes_do_not_merge_overlapping_resolver_metrics() {
+        let first_scope = command_scope().await;
+        drop(to_pubgrub_ranges::start());
+        reset_all();
+        assert_eq!(to_pubgrub_ranges::read().1, 1);
+
+        let second_acquired = Arc::new(AtomicBool::new(false));
+        let second_acquired_in_task = Arc::clone(&second_acquired);
+        let second = tokio::spawn(async move {
+            let _scope = command_scope().await;
+            second_acquired_in_task.store(true, Ordering::Release);
+            to_pubgrub_ranges::read().1
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!second_acquired.load(Ordering::Acquire));
+
+        drop(first_scope);
+        let second_count = second.await.expect("second resolver command scope task");
+        assert!(second_acquired.load(Ordering::Acquire));
+        assert_eq!(second_count, 0);
+    }
 }

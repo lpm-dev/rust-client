@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, write_npm_firewall_global_config};
 
 const INSTALL_FLAGS: &[&str] = &[
     "--no-security-summary",
@@ -613,6 +613,112 @@ fn recursive_install_json_emits_one_workspace_envelope() {
 }
 
 #[test]
+fn repeated_recursive_json_install_reports_up_to_date_targets() {
+    let project = workspace_project();
+    let seed = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed recursive workspace install");
+    assert_install_succeeded(&seed, "seed recursive install should succeed");
+
+    let output = lpm(&project)
+        .arg("--json")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("rerun recursive workspace install with JSON output");
+    assert_install_succeeded(&output, "repeated recursive JSON install should succeed");
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value");
+    assert_eq!(envelope["success"], true);
+    assert_eq!(
+        envelope["up_to_date"], true,
+        "aggregate up_to_date should be true when every target fast-exits: {envelope}",
+    );
+    for target in envelope["targets"]
+        .as_array()
+        .expect("targets should be an array")
+    {
+        assert_eq!(
+            target["up_to_date"], true,
+            "every target should fast-exit on rerun: {target}",
+        );
+    }
+}
+
+#[test]
+fn recursive_json_install_with_timing_reports_per_target_and_aggregate_phases() {
+    let project = workspace_project();
+    let output = lpm(&project)
+        .arg("--json")
+        .arg("install")
+        .arg("--recursive")
+        .arg("--timing")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive workspace install with timing telemetry");
+    assert_install_succeeded(
+        &output,
+        "recursive JSON install with --timing should succeed",
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value");
+    let aggregate = envelope["timing"]
+        .as_object()
+        .expect("aggregate timing should be present with --timing");
+    for phase in ["resolve_ms", "fetch_ms", "link_ms", "total_ms"] {
+        assert!(
+            aggregate.get(phase).is_some_and(serde_json::Value::is_u64),
+            "aggregate timing should report {phase}: {envelope}",
+        );
+    }
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets should be an array");
+    assert!(
+        targets
+            .iter()
+            .any(|target| target["timing"].as_object().is_some()),
+        "per-target timing should be embedded with --timing: {envelope}",
+    );
+}
+
+#[test]
+fn recursive_install_respects_workspace_concurrency_flag() {
+    let project = workspace_project();
+    let output = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .arg("--workspace-concurrency")
+        .arg("1")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive workspace install with a concurrency cap");
+    assert_install_succeeded(&output, "recursive install with --workspace-concurrency 1");
+    for target in ["", "packages/core", "packages/web", "packages/unrelated"] {
+        assert_target_installed(&project, target);
+    }
+
+    let rejected = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .arg("--workspace-concurrency")
+        .arg("0")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive workspace install with an invalid concurrency");
+    assert!(
+        !rejected.status.success(),
+        "--workspace-concurrency 0 should be rejected at the CLI layer",
+    );
+}
+
+#[test]
 fn recursive_install_runs_lifecycle_scripts_in_dependency_order() {
     let project = TempProject::empty(
         r#"{
@@ -777,4 +883,933 @@ fn recursive_install_preserves_member_trust_approval_gates() {
     );
     assert_target_not_installed(&project, "");
     assert_target_not_installed(&project, "packages/trusted");
+}
+
+// ─── Recursive workspace importer isolation ─────────────────────
+
+use support::lpm_with_registry;
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+};
+
+async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)]) {
+    let mut batch = Vec::with_capacity(packages.len());
+    for (name, version) in packages {
+        let tarball = make_tarball(name, version);
+        mock.with_package(name, version, &tarball).await;
+        let integrity = compute_integrity(&tarball);
+        batch.push(serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                *version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url()),
+                        "integrity": integrity,
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { *version: "2025-01-01T00:00:00.000Z" }
+        }));
+    }
+    mock.with_batch_metadata(batch).await;
+}
+
+async fn mount_importer_context_packages(mock: &MockRegistry) {
+    let parent_manifest = serde_json::json!({
+        "name": "context-parent",
+        "version": "1.0.0",
+        "dependencies": {
+            "context-child": "^1.0.0"
+        }
+    });
+    let parent_tarball = make_tarball_from_pkg_json(parent_manifest, &[]);
+    let child_v1_tarball = make_tarball("context-child", "1.0.0");
+    let child_v11_tarball = make_tarball("context-child", "1.1.0");
+    let parent_metadata = serde_json::json!({
+        "name": "context-parent",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "context-parent",
+                "version": "1.0.0",
+                "dependencies": {
+                    "context-child": "^1.0.0"
+                },
+                "dist": {
+                    "tarball": mock.tarball_url("context-parent", "1.0.0"),
+                    "integrity": compute_integrity(&parent_tarball)
+                }
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    let child_metadata = serde_json::json!({
+        "name": "context-child",
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": "2099-01-01T00:00:00.000Z",
+        "versions": {
+            "1.0.0": {
+                "name": "context-child",
+                "version": "1.0.0",
+                "dependencies": {},
+                "dist": {
+                    "tarball": mock.tarball_url("context-child", "1.0.0"),
+                    "integrity": compute_integrity(&child_v1_tarball)
+                }
+            },
+            "1.1.0": {
+                "name": "context-child",
+                "version": "1.1.0",
+                "dependencies": {},
+                "dist": {
+                    "tarball": mock.tarball_url("context-child", "1.1.0"),
+                    "integrity": compute_integrity(&child_v11_tarball)
+                }
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2099-01-01T00:00:00.000Z"
+        }
+    });
+
+    mock.with_package_metadata_and_tarballs(
+        "context-parent",
+        parent_metadata.clone(),
+        &[("1.0.0", parent_tarball)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        "context-child",
+        child_metadata.clone(),
+        &[("1.0.0", child_v1_tarball), ("1.1.0", child_v11_tarball)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![parent_metadata, child_metadata])
+        .await;
+}
+
+fn peer_sensitive_workspace_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+  "name": "peer-sensitive-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/with-runtime/package.json",
+        r#"{
+  "name": "@fixture/with-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0",
+    "peer-runtime": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/without-runtime/package.json",
+        r#"{
+  "name": "@fixture/without-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0"
+  }
+}"#,
+    );
+    project
+}
+
+fn peer_sensitive_standalone_project(with_runtime: bool) -> TempProject {
+    TempProject::empty(if with_runtime {
+        r#"{
+  "name": "peer-sensitive-standalone-with-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0",
+    "peer-runtime": "1.0.0"
+  }
+}"#
+    } else {
+        r#"{
+  "name": "peer-sensitive-standalone-without-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "peer-plugin": "1.0.0"
+  }
+}"#
+    })
+}
+
+async fn mount_peer_sensitive_workspace_packages(mock: &MockRegistry) {
+    let plugin_manifest = serde_json::json!({
+        "name": "peer-plugin",
+        "version": "1.0.0",
+        "peerDependencies": {
+            "peer-runtime": "*"
+        }
+    });
+    let plugin_tarball = make_tarball_from_pkg_json(plugin_manifest.clone(), &[]);
+    let plugin_metadata = serde_json::json!({
+        "name": "peer-plugin",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "peer-plugin",
+                "version": "1.0.0",
+                "peerDependencies": {
+                    "peer-runtime": "*"
+                },
+                "dist": {
+                    "tarball": mock.tarball_url("peer-plugin", "1.0.0"),
+                    "integrity": compute_integrity(&plugin_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+
+    let runtime_v1_tarball = make_tarball("peer-runtime", "1.0.0");
+    let runtime_v2_tarball = make_tarball("peer-runtime", "2.0.0");
+    let runtime_metadata = serde_json::json!({
+        "name": "peer-runtime",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "peer-runtime",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("peer-runtime", "1.0.0"),
+                    "integrity": compute_integrity(&runtime_v1_tarball)
+                },
+                "dependencies": {}
+            },
+            "2.0.0": {
+                "name": "peer-runtime",
+                "version": "2.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("peer-runtime", "2.0.0"),
+                    "integrity": compute_integrity(&runtime_v2_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "2.0.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+
+    mock.with_package_metadata_and_tarballs(
+        "peer-plugin",
+        plugin_metadata.clone(),
+        &[("1.0.0", plugin_tarball)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        "peer-runtime",
+        runtime_metadata.clone(),
+        &[("1.0.0", runtime_v1_tarball), ("2.0.0", runtime_v2_tarball)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![plugin_metadata, runtime_metadata])
+        .await;
+}
+
+fn member_package_graph(project: &TempProject, member: &str) -> Vec<(String, String, Vec<String>)> {
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join(member).join("lpm.lock"))
+        .unwrap_or_else(|error| panic!("read {member}/lpm.lock: {error}"));
+    lockfile
+        .packages
+        .into_iter()
+        .map(|package| (package.name, package.version, package.peers))
+        .collect()
+}
+
+fn member_package_version(project: &TempProject, member: &str, name: &str) -> String {
+    member_package_graph(project, member)
+        .into_iter()
+        .find_map(|(package, version, _)| (package == name).then_some(version))
+        .unwrap_or_else(|| panic!("{member}/lpm.lock should contain {name}"))
+}
+
+#[tokio::test]
+async fn recursive_install_preserves_importer_local_peer_contexts_in_parallel() {
+    let mock = MockRegistry::start().await;
+    mount_peer_sensitive_workspace_packages(&mock).await;
+
+    let standalone_with_runtime = peer_sensitive_standalone_project(true);
+    let with_runtime_output = lpm_with_registry(&standalone_with_runtime, &mock.url())
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run standalone install with a direct peer runtime");
+    assert_install_succeeded(
+        &with_runtime_output,
+        "standalone install with a direct peer runtime should succeed",
+    );
+    let standalone_without_runtime = peer_sensitive_standalone_project(false);
+    let without_runtime_output = lpm_with_registry(&standalone_without_runtime, &mock.url())
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run standalone install without a direct peer runtime");
+    assert_install_succeeded(
+        &without_runtime_output,
+        "standalone install without a direct peer runtime should succeed",
+    );
+
+    let expected_with_runtime = member_package_graph(&standalone_with_runtime, "");
+    let expected_without_runtime = member_package_graph(&standalone_without_runtime, "");
+    assert_ne!(
+        expected_with_runtime, expected_without_runtime,
+        "the fixture must produce distinct independent importer graphs",
+    );
+
+    for attempt in 1..=3 {
+        let recursive = peer_sensitive_workspace_project();
+        let recursive_output = lpm_with_registry(&recursive, &mock.url())
+            .arg("install")
+            .arg("--recursive")
+            .args(INSTALL_FLAGS)
+            .output()
+            .unwrap_or_else(|error| panic!("run recursive install attempt {attempt}: {error}"));
+        assert_install_succeeded(
+            &recursive_output,
+            &format!("recursive install attempt {attempt} should succeed"),
+        );
+
+        assert_eq!(
+            member_package_graph(&recursive, "packages/with-runtime"),
+            expected_with_runtime,
+            "attempt {attempt} changed the importer graph that declares peer-runtime directly",
+        );
+        assert_eq!(
+            member_package_graph(&recursive, "packages/without-runtime"),
+            expected_without_runtime,
+            "attempt {attempt} leaked another importer's direct peer into the peer-autoinstall graph",
+        );
+    }
+}
+
+#[tokio::test]
+async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("shared-dep", "1.0.0"), ("web-only-dep", "2.0.0")]).await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "importer-scoped-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/core/package.json",
+        r#"{
+  "name": "@fixture/core",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-dep": "^1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/web/package.json",
+        r#"{
+  "name": "@fixture/web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-dep": "^1.0.0",
+    "web-only-dep": "^2.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install against the mock registry");
+    assert_install_succeeded(&output, "recursive install should succeed");
+
+    for member in ["packages/core", "packages/web"] {
+        assert_target_installed(&project, member);
+    }
+    assert!(
+        project
+            .path()
+            .join("packages/core/node_modules/shared-dep")
+            .exists(),
+        "core must link its shared dependency",
+    );
+    assert!(
+        project
+            .path()
+            .join("packages/web/node_modules/web-only-dep")
+            .exists(),
+        "web must link its own dependency",
+    );
+    assert!(
+        !project
+            .path()
+            .join("packages/core/node_modules/web-only-dep")
+            .exists(),
+        "core must not receive web's dependency from the shared resolution",
+    );
+
+    let core_lock = project.read_file("packages/core/lpm.lock");
+    assert!(
+        core_lock.contains("shared-dep"),
+        "core lockfile must record its direct dependency: {core_lock}",
+    );
+    assert!(
+        !core_lock.contains("web-only-dep"),
+        "core lockfile must not leak web's dependency from the shared resolution: {core_lock}",
+    );
+    let web_lock = project.read_file("packages/web/lpm.lock");
+    assert!(
+        web_lock.contains("shared-dep") && web_lock.contains("web-only-dep"),
+        "web lockfile must record both of its direct dependencies: {web_lock}",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_preserves_importer_local_overrides_with_shared_metadata() {
+    let mock = MockRegistry::start().await;
+    mount_importer_context_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "override-context-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/old/package.json",
+        r#"{
+  "name": "@fixture/old-override",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-parent": "1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAgeExclude": ["context-child"],
+    "overrides": {
+      "context-child": "1.0.0"
+    }
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/new/package.json",
+        r#"{
+  "name": "@fixture/new-override",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-parent": "1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAgeExclude": ["context-child"],
+    "overrides": {
+      "context-child": "1.1.0"
+    }
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with importer-local overrides");
+    assert_install_succeeded(&output, "recursive override install should succeed");
+
+    assert_eq!(
+        member_package_version(&project, "packages/old", "context-child"),
+        "1.0.0",
+    );
+    assert_eq!(
+        member_package_version(&project, "packages/new", "context-child"),
+        "1.1.0",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_preserves_importer_local_release_age_policies_with_shared_metadata() {
+    let mock = MockRegistry::start().await;
+    mount_importer_context_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "release-age-context-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/unrestricted/package.json",
+        r#"{
+  "name": "@fixture/unrestricted",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-child": "^1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAge": 86400,
+    "minimumReleaseAgeExclude": ["context-child"]
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/cooldown/package.json",
+        r#"{
+  "name": "@fixture/cooldown",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "context-child": "^1.0.0"
+  },
+  "lpm": {
+    "minimumReleaseAge": 86400
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with importer-local release-age policies");
+    assert_install_succeeded(&output, "recursive release-age install should succeed");
+
+    assert_eq!(
+        member_package_version(&project, "packages/unrestricted", "context-child"),
+        "1.1.0",
+    );
+    assert_eq!(
+        member_package_version(&project, "packages/cooldown", "context-child"),
+        "1.0.0",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_commits_no_importer_when_root_firewall_blocks() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[("member-allowed", "1.0.0"), ("root-blocked", "1.0.0")],
+    )
+    .await;
+    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+        .await;
+    mock.with_npm_firewall_block("root-blocked", "1.0.0").await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "firewall-ordered-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "root-blocked": "^1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "@fixture/member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "member-allowed": "^1.0.0"
+  }
+}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with a blocked root dependency");
+
+    assert!(
+        !output.status.success(),
+        "root firewall block must fail recursive install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("blocked by LPM npm firewall"),
+        "recursive root error must retain firewall guidance: {combined}",
+    );
+    assert_target_not_installed(&project, "packages/member");
+    assert_target_not_installed(&project, "");
+    assert_eq!(
+        mock.tarball_request_count("root-blocked", "1.0.0").await,
+        0,
+        "firewall must block the root tarball before resolve-ahead fetch overlap",
+    );
+}
+
+#[tokio::test]
+async fn recursive_firewall_preflight_does_not_launch_importer_local_tarball_waterfalls() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[("member-allowed", "1.0.0"), ("root-allowed", "1.0.0")],
+    )
+    .await;
+    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+        .await;
+    mock.with_npm_firewall_allow("root-allowed", "1.0.0").await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "firewall-waterfall-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "root-allowed": "^1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "@fixture/firewall-waterfall-member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "member-allowed": "^1.0.0"
+  }
+}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .arg("install")
+        .arg("--recursive")
+        .arg("--json")
+        .arg("--timing")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with importer-scoped firewall preflights");
+    assert_install_succeeded(
+        &output,
+        "recursive firewall install should serialize importer-local materialization",
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recursive install must emit JSON");
+    let targets = report["targets"]
+        .as_array()
+        .expect("recursive report must contain targets");
+    assert!(
+        targets.iter().all(|target| {
+            target["timing"]["detail"]["fetch"]["overlap"]["dispatched_count"].as_u64() == Some(0)
+        }),
+        "firewall-scoped importers must not launch competing tarball waterfalls: {report:#}"
+    );
+}
+
+#[tokio::test]
+async fn recursive_firewall_fetch_failure_commits_no_importer() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("member-allowed", "1.0.0")]).await;
+    mock.with_full_package_metadata(
+        "root-missing-tarball",
+        "1.0.0",
+        &[("1.0.0", serde_json::json!({}), None)],
+    )
+    .await;
+    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+        .await;
+    mock.with_npm_firewall_allow("root-missing-tarball", "1.0.0")
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "firewall-fetch-failure-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "root-missing-tarball": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+  "name": "@fixture/firewall-fetch-failure-member",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "member-allowed": "1.0.0"
+  }
+}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive firewall install with a missing root tarball");
+    assert!(
+        !output.status.success(),
+        "recursive install must fail when an importer cannot materialize its graph\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert_target_not_installed(&project, "packages/member");
+    assert_target_not_installed(&project, "");
+}
+
+#[tokio::test]
+async fn warm_recursive_replay_preserves_each_importers_root_links_and_bin_shims() {
+    let mock = MockRegistry::start().await;
+    let shared_manifest = serde_json::json!({
+        "name": "shared-tool",
+        "version": "1.0.0",
+        "bin": {
+            "shared-tool": "cli.js"
+        }
+    });
+    let shared_tarball = make_tarball_from_pkg_json(
+        shared_manifest.clone(),
+        &[("cli.js", b"#!/usr/bin/env node\n")],
+    );
+    let shared_metadata = serde_json::json!({
+        "name": "shared-tool",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "shared-tool",
+                "version": "1.0.0",
+                "bin": {
+                    "shared-tool": "cli.js"
+                },
+                "dist": {
+                    "tarball": mock.tarball_url("shared-tool", "1.0.0"),
+                    "integrity": compute_integrity(&shared_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    let private_tarball = make_tarball("second-only", "1.0.0");
+    let private_metadata = serde_json::json!({
+        "name": "second-only",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "second-only",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("second-only", "1.0.0"),
+                    "integrity": compute_integrity(&private_tarball)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_package_metadata_and_tarballs(
+        "shared-tool",
+        shared_metadata.clone(),
+        &[("1.0.0", shared_tarball)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        "second-only",
+        private_metadata.clone(),
+        &[("1.0.0", private_tarball)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![shared_metadata, private_metadata])
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "warm-replay-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "shared-tool": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/first/package.json",
+        r#"{
+  "name": "@fixture/first",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-tool": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/second/package.json",
+        r#"{
+  "name": "@fixture/second",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-tool": "1.0.0",
+    "second-only": "1.0.0"
+  }
+}"#,
+    );
+
+    let seed = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed importer-local lockfiles and store entries");
+    assert_install_succeeded(&seed, "initial recursive install should succeed");
+
+    for target in ["", "packages/first", "packages/second"] {
+        let node_modules = project.path().join(target).join("node_modules");
+        std::fs::remove_dir_all(&node_modules).unwrap_or_else(|error| {
+            panic!(
+                "remove {} before warm replay: {error}",
+                node_modules.display()
+            )
+        });
+    }
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run warm recursive lockfile replay");
+    assert_install_succeeded(&replay, "warm recursive replay should succeed");
+
+    for target in ["", "packages/first", "packages/second"] {
+        let node_modules = project.path().join(target).join("node_modules");
+        assert!(
+            node_modules.join("shared-tool/package.json").is_file()
+                && node_modules.join(".bin/shared-tool").exists(),
+            "{} must receive its own shared root link and bin shim",
+            node_modules.display(),
+        );
+    }
+    assert!(
+        !project
+            .path()
+            .join("packages/first/node_modules/second-only")
+            .exists(),
+        "the first importer must not receive the second importer's private dependency",
+    );
+    assert!(
+        project
+            .path()
+            .join("packages/second/node_modules/second-only/package.json")
+            .is_file(),
+        "the second importer must retain its private dependency",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[("contested-dep", "1.0.0"), ("contested-dep", "2.0.0")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "conflicted-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/one/package.json",
+        r#"{
+  "name": "@fixture/one",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "contested-dep": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/two/package.json",
+        r#"{
+  "name": "@fixture/two",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "contested-dep": "2.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with conflicting member specs");
+    assert_install_succeeded(&output, "conflicting member specs should still install");
+
+    let one_manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file("packages/one/node_modules/contested-dep/package.json"),
+    )
+    .expect("member one should link contested-dep");
+    assert_eq!(one_manifest["version"], "1.0.0");
+    let two_manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file("packages/two/node_modules/contested-dep/package.json"),
+    )
+    .expect("member two should link contested-dep");
+    assert_eq!(two_manifest["version"], "2.0.0");
 }

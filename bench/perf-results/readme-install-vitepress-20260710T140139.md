@@ -1,5 +1,14 @@
 # README VitePress Install Benchmark
 
+> **Historical methodology warning (added July 30, 2026):** this result is not
+> an equal-work workspace comparison. npm, pnpm, and Bun recursively installed
+> the tracked workspace, while this LPM revision installed only the root
+> importer and skipped workspace-member dependencies. The LPM columns are
+> root-only and are not comparable with the other managers. The harness also
+> deleted generated lockfiles before every measured warm run for all four
+> managers, so the historical warm row is cache/store-warm but lockfile-cold.
+> This artifact is retained only as a historical record.
+
 - Fixture: `bench/fixtures/vitepress-docs`
 - Samples: `10`
 - Modes: `cold,warm,up-to-date`
@@ -11,7 +20,7 @@
 
 | Benchmark | npm | pnpm | bun | lpm | lpm + Firewall monitor |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Cold install, equal footing | 17,354ms | 6,125ms | 2,455ms | 2,945ms | 3,043ms |
+| Cold install (unequal historical workload) | 17,354ms | 6,125ms | 2,455ms | 2,945ms | 3,043ms |
 | Warm install | 3,819ms | 3,301ms | 451ms | 387ms | 324ms |
 | Up-to-date install | 282ms | 522ms | 77ms | 14ms | 14ms |
 

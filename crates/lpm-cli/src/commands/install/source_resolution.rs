@@ -255,9 +255,12 @@ pub(super) fn configure_install_client_for_routing(
     eager_origins: &[lpm_registry::OriginKey],
     json_output: bool,
 ) -> Result<RegistryClient, LpmError> {
-    let owned_client = client
+    let mut owned_client = client
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
+    if workspace_resolution::active() && !route_table.supports_workspace_fetch_sharing() {
+        owned_client = owned_client.without_metadata_memory_cache();
+    }
     if !json_output && let Some(line) = owned_client.render_effective_tls_summary() {
         output::info(&lpm_common::sanitize_terminal_inline(&line));
     }
@@ -486,6 +489,21 @@ pub(super) fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
         std::fs::remove_file(&install_hash)?;
     }
     Ok(())
+}
+
+pub(super) fn apply_v2_migration(
+    project_dir: &Path,
+    migration_needed: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if !migration_needed {
+        return Ok(());
+    }
+    if !json_output {
+        output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
+    }
+    migrate_v1_to_v2(project_dir)
+        .map_err(|error| LpmError::Registry(format!("v1→v2 migration failed: {error}")))
 }
 
 /// pre-resolve
@@ -2307,4 +2325,66 @@ fn merge_optional_registry_roots(
         }
     }
     optional
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recursive_metadata_sharing_detaches_for_authenticated_route_contexts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let package = "route-isolated-package";
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": package,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/route-isolated-package.tgz",
+                            "integrity": "sha512-test"
+                        }
+                    }
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let shared_client = RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None)
+            .clone_with_metadata_memory_cache();
+        let registry_origin = server.uri().trim_start_matches("http://").to_owned();
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            &format!("//{registry_origin}/:_authToken=test-token"),
+            "test",
+            &|_| None,
+        );
+        let route_table =
+            RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).expect("valid route table");
+        assert!(!route_table.supports_workspace_fetch_sharing());
+
+        let coordinator = Arc::new(workspace_resolution::WorkspaceResolutionCoordinator::new(
+            1, 1,
+        ));
+        workspace_resolution::scope(coordinator, 0, async {
+            let first =
+                configure_install_client_for_routing(&shared_client, &route_table, &[], true)?;
+            let second =
+                configure_install_client_for_routing(&shared_client, &route_table, &[], true)?;
+            assert_eq!(first.get_npm_metadata_direct(package).await?.name, package);
+            assert_eq!(second.get_npm_metadata_direct(package).await?.name, package);
+            Ok::<(), LpmError>(())
+        })
+        .await
+        .expect("route-isolated metadata requests");
+    }
 }

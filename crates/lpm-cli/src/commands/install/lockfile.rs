@@ -484,6 +484,7 @@ pub(super) async fn run_empty_dependency_install_phase(
             "success": true,
             "no_dependencies": true,
             "duration_ms": total_ms as u64,
+            "counts": InstallCountSemantics::default().to_json(),
             "timing": {
                 "resolve_ms": 0u128,
                 "fetch_ms": 0u128,
@@ -492,6 +493,9 @@ pub(super) async fn run_empty_dependency_install_phase(
                 "waterfall": {
                     "setup_ms": total_ms,
                     "resolve_ms": 0u128,
+                    "materialization_wait_ms": 0u128,
+                    "commit_wait_ms": 0u128,
+                    "post_resolve_work_ms": 0u128,
                     "pre_fetch_ms": 0u128,
                     "fetch_ms": 0u128,
                     "pre_link_ms": 0u128,
@@ -517,6 +521,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                 setup_route_table_ms,
             );
         }
+        attach_target_timing_semantics(&mut json["timing"]);
         if !emit_timing && let Some(obj) = json.as_object_mut() {
             obj.remove("timing");
         }
@@ -525,7 +530,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                 serde_json::Value::Array(targets.iter().map(|s| serde_json::json!(s)).collect());
         }
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        report_capture::emit_install_json(&json);
     } else if emit_install_report {
         output::success("No dependencies to install");
     }
@@ -1654,6 +1659,86 @@ pub(super) fn filter_dependency_engine_packages(
     Ok(skipped)
 }
 
+pub(super) fn lockfile_satisfies_fast_path(
+    lockfile: &lpm_lockfile::Lockfile,
+    deps: &HashMap<String, String>,
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    accept_unsafe_sources: bool,
+    emit_warnings: bool,
+) -> bool {
+    if emit_warnings {
+        let insecure_count = lockfile
+            .packages
+            .iter()
+            .filter(|package| {
+                package.source.as_deref().is_some_and(|source| {
+                    source.contains("+http://") || source.starts_with("http://")
+                })
+            })
+            .count();
+        if insecure_count > 0 {
+            tracing::warn!(
+                insecure_count,
+                "lpm.lock contains {insecure_count} package(s) with insecure http:// sources \
+                 (recorded by an earlier `--insecure` install); re-installs honour these without \
+                 re-prompting. Re-resolve the affected entries against an https:// mirror to \
+                 remove the insecure source from the lockfile.",
+            );
+        }
+    }
+
+    for package in &lockfile.packages {
+        if let Some(source) = package.source.as_deref()
+            && !lpm_lockfile::is_safe_source(source)
+        {
+            if accept_unsafe_sources {
+                if emit_warnings {
+                    tracing::debug!(
+                        "package {}@{} non-registry source {} accepted in offline mode",
+                        package.name,
+                        package.version,
+                        source
+                    );
+                }
+                continue;
+            }
+            if emit_warnings {
+                tracing::warn!(
+                    "package {}@{} has unsafe source URL: {} — skipping lockfile fast path",
+                    package.name,
+                    package.version,
+                    source
+                );
+            }
+            return false;
+        }
+    }
+
+    if !lockfile_catalog_snapshots_match_current(lockfile, deps, catalog_resolutions) {
+        if emit_warnings {
+            tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
+        }
+        return false;
+    }
+
+    for (local, requested_spec) in deps {
+        let target = lockfile
+            .root_aliases
+            .get(local)
+            .map_or(local.as_str(), String::as_str);
+        if select_locked_package_for_requested_spec(lockfile, target, requested_spec).is_none() {
+            if emit_warnings {
+                tracing::debug!(
+                    "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
+                );
+            }
+            return false;
+        }
+    }
+
+    true
+}
+
 pub(super) fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -1686,82 +1771,14 @@ pub(super) fn try_lockfile_fast_path(
 
     let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
 
-    // Scan the lockfile for entries with `http://` sources and
-    // emit a single aggregate warn so re-installs against a lockfile
-    // captured under `--insecure` don't proceed silently. The
-    // per-fetch source-safety check still fires later; this one is
-    // about pre-install visibility — operators using
-    // `lpm install` in CI without `--insecure` should see that the
-    // lockfile carries insecure entries before the install runs.
-    let insecure_count = lockfile
-        .packages
-        .iter()
-        .filter(|p| {
-            p.source
-                .as_deref()
-                .is_some_and(|s| s.contains("+http://") || s.starts_with("http://"))
-        })
-        .count();
-    if insecure_count > 0 {
-        tracing::warn!(
-            insecure_count,
-            "lpm.lock contains {insecure_count} package(s) with insecure http:// sources \
-             (recorded by an earlier `--insecure` install); re-installs honour these without \
-             re-prompting. Re-resolve the affected entries against an https:// mirror to \
-             remove the insecure source from the lockfile.",
-        );
-    }
-
-    // Validate all package sources are safe (HTTPS registries or
-    // localhost). **Invariant:** in offline mode (`accept_unsafe_sources
-    // = true`) we trust the lockfile and admit non-registry sources —
-    // the fresh-resolve fallback isn't available offline, so bailing
-    // here would surface a misleading "—offline requires a lockfile"
-    // error. The link-target construction handles every source kind
-    // post-rounds-1-5, so the warm path produces a correct install.
-    for lp in &lockfile.packages {
-        if let Some(ref source) = lp.source
-            && !lpm_lockfile::is_safe_source(source)
-        {
-            if accept_unsafe_sources {
-                tracing::debug!(
-                    "package {}@{} non-registry source {} accepted in offline mode",
-                    lp.name,
-                    lp.version,
-                    source
-                );
-                continue;
-            }
-            tracing::warn!(
-                "package {}@{} has unsafe source URL: {} — skipping lockfile fast path",
-                lp.name,
-                lp.version,
-                source
-            );
-            return None; // Force re-resolution from trusted registries
-        }
-    }
-
-    if !lockfile_catalog_snapshots_match_current(&lockfile, deps, catalog_resolutions) {
-        tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
+    if !lockfile_satisfies_fast_path(
+        &lockfile,
+        deps,
+        catalog_resolutions,
+        accept_unsafe_sources,
+        true,
+    ) {
         return None;
-    }
-
-    // — verify every declared root dep has a lockfile
-    // entry. For aliased roots, check the ALIAS TARGET (looked up via
-    // `lockfile.root_aliases`) rather than the alias key, since the
-    // lockfile is keyed by canonical registry names.
-    for (local, requested_spec) in deps {
-        let target = lockfile
-            .root_aliases
-            .get(local)
-            .map_or(local.as_str(), String::as_str);
-        if select_locked_package_for_requested_spec(&lockfile, target, requested_spec).is_none() {
-            tracing::debug!(
-                "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
-            );
-            return None;
-        }
     }
 
     // Rebuild per-package root_link_names from root_aliases + deps,

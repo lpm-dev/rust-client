@@ -65,6 +65,17 @@ expression: envelope
     "intersections_count": 0,
     "total_count": 0
   },
+  "counts": {
+    "scope": "target",
+    "resolved_package_row_count": 1,
+    "authoritative_fetch_candidate_count": 1,
+    "store_reuse_observation_count": 0,
+    "store_reuse_may_include_same_command_population": true,
+    "linker_entry_created_count": 1,
+    "linker_entry_reused_count": 0,
+    "project_root_symlink_created_count": 1,
+    "bin_link_created_count": 0
+  },
   "overrides_count": 0,
   "overrides_fingerprint": null,
   "applied_patches": [],
