@@ -723,6 +723,15 @@ pub(super) async fn run_link_and_finish(
             "cached": cached,
             "linked": link_result.linked,
             "symlinked": link_result.symlinked,
+            "counts": InstallCountSemantics {
+                resolved_package_row_count: packages.len(),
+                authoritative_fetch_candidate_count: downloaded,
+                store_reuse_observation_count: cached,
+                linker_entry_created_count: link_result.linked,
+                linker_entry_reused_count: link_result.skipped,
+                project_root_symlink_created_count: link_result.symlinked,
+                bin_link_created_count: link_result.bin_linked,
+            }.to_json(),
             "used_lockfile": used_lockfile,
             "offline": true,
             "duration_ms": elapsed.as_millis() as u64,
@@ -740,6 +749,7 @@ pub(super) async fn run_link_and_finish(
             "warnings": [],
             "errors": [],
         });
+        attach_target_timing_semantics(&mut json["timing"]);
         if !emit_timing && let Some(obj) = json.as_object_mut() {
             obj.remove("timing");
         }

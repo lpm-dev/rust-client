@@ -2001,6 +2001,23 @@ async fn install_json_timing_flag_exposes_waterfall_without_detail() {
         envelope["timing"]["waterfall"].is_object(),
         "--timing must emit timing.waterfall; got {envelope:#}"
     );
+    assert_eq!(envelope["timing"]["scope"], "target");
+    assert_eq!(envelope["timing"]["work_is_cumulative"], false);
+    assert_eq!(envelope["timing"]["phase_aggregation"], "target_wall_clock");
+    assert_eq!(envelope["timing"]["waterfall"]["commit_wait_ms"], 0);
+    assert_eq!(
+        envelope["timing"]["waterfall"]["pre_fetch_ms"],
+        envelope["timing"]["waterfall"]["post_resolve_work_ms"]
+    );
+    assert_eq!(envelope["counts"]["scope"], "target");
+    assert_eq!(
+        envelope["counts"]["store_reuse_may_include_same_command_population"],
+        true
+    );
+    assert!(
+        envelope["counts"]["linker_entry_created_count"].is_number(),
+        "counts must distinguish linker entry creation from project links: {envelope:#}"
+    );
     assert!(
         envelope["timing"].get("detail").is_none(),
         "--timing alone must not emit timing.detail; got {envelope:#}"
@@ -2163,6 +2180,14 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         "summary": envelope["timing"]["resolve"]["dispatcher"],
         "detail": detail["resolve"]["scheduler"]["dispatcher"],
     });
+    assert_eq!(
+        envelope["timing"]["resolve"]["metadata_dispatcher"],
+        dispatcher_contract["summary"]
+    );
+    assert_eq!(
+        detail["resolve"]["scheduler"]["metadata_dispatcher"],
+        dispatcher_contract["detail"]
+    );
     for surface in ["summary", "detail"] {
         let dispatcher = &dispatcher_contract[surface];
         for field in [
@@ -2175,6 +2200,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
             "semaphore_wait_ms",
             "parked_max_depth",
             "tarball_dispatched",
+            "selected_version_event_count",
             "peer_prefetch_count",
         ] {
             assert!(
@@ -2186,6 +2212,9 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
             dispatcher["inflight_high_water"], dispatcher["active_fetch_high_water"],
             "{surface} compatibility alias must match active fetch high-water",
         );
+        assert_eq!(dispatcher["scope"], "resolver_pass");
+        assert_eq!(dispatcher["kind"], "metadata");
+        assert_eq!(dispatcher["tarball_downloads_included"], false);
     }
     insta::assert_json_snapshot!("install_json_timing_dispatcher_concurrency", dispatcher_contract, {
         ".summary.rpc_count" => "[COUNT]",
@@ -2197,6 +2226,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         ".summary.semaphore_wait_ms" => "[DURATION]",
         ".summary.parked_max_depth" => "[COUNT]",
         ".summary.tarball_dispatched" => "[COUNT]",
+        ".summary.selected_version_event_count" => "[COUNT]",
         ".summary.peer_prefetch_count" => "[COUNT]",
         ".detail.rpc_count" => "[COUNT]",
         ".detail.configured_fanout" => "[COUNT]",
@@ -2207,6 +2237,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         ".detail.semaphore_wait_ms" => "[DURATION]",
         ".detail.parked_max_depth" => "[COUNT]",
         ".detail.tarball_dispatched" => "[COUNT]",
+        ".detail.selected_version_event_count" => "[COUNT]",
         ".detail.peer_prefetch_count" => "[COUNT]",
     });
     assert!(
@@ -9971,6 +10002,115 @@ fn workspace_repeat_install_json_keeps_the_recursive_workspace_envelope() {
         Some(2),
         "workspace --json repeat install must report each recursive target; got:\n{envelope}"
     );
+}
+
+#[test]
+fn recursive_install_timing_distinguishes_command_work_from_target_observations() {
+    let project = workspace_repeat_project();
+
+    let output = lpm(&project)
+        .env("LPM_TIMING_DETAIL", "trace")
+        .args([
+            "install",
+            "--json",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive lpm install with timing");
+    assert!(
+        output.status.success(),
+        "recursive timing install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recursive install timing must emit JSON");
+    assert_eq!(envelope["timing"]["scope"], "recursive_command");
+    assert_eq!(envelope["timing"]["work_is_cumulative"], true);
+    assert_eq!(
+        envelope["timing"]["phase_aggregation"],
+        "sum_of_target_wall_clock"
+    );
+    assert_eq!(envelope["counts"]["scope"], "recursive_command");
+    assert_eq!(
+        envelope["counts"]["aggregation"],
+        "sum_of_target_observations"
+    );
+    assert_eq!(
+        envelope["counts"]["store_reuse_may_include_same_command_population"],
+        true
+    );
+    assert!(
+        envelope["timing"]["process"]["registry"].is_object(),
+        "recursive process-wide registry metrics must be reported once at the command root: \
+         {envelope:#}"
+    );
+
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("recursive envelope must contain targets");
+    assert!(
+        !targets.is_empty(),
+        "recursive envelope must report targets"
+    );
+    for target in targets {
+        assert_eq!(target["counts"]["scope"], "target");
+        assert_eq!(target["timing"]["scope"], "target");
+        assert_eq!(target["timing"]["work_is_cumulative"], false);
+        assert_eq!(target["timing"]["phase_aggregation"], "target_wall_clock");
+        assert!(
+            target["timing"]["waterfall"]["commit_wait_ms"].is_number(),
+            "target timing must separate importer commit waiting from post-resolve work: \
+             {target:#}"
+        );
+        assert_eq!(
+            target["timing"]["process_global_metrics"]["reported_at"],
+            "timing.process"
+        );
+        assert!(
+            target["timing"]["detail"].get("metadata").is_none(),
+            "process-global metadata must not be repeated as target-local data: {target:#}"
+        );
+    }
+
+    let contract = serde_json::json!({
+        "timing": {
+            "scope": envelope["timing"]["scope"],
+            "work_is_cumulative": envelope["timing"]["work_is_cumulative"],
+            "phase_aggregation": envelope["timing"]["phase_aggregation"],
+            "work": envelope["timing"]["work"],
+            "wait": envelope["timing"]["wait"],
+            "process_scope": envelope["timing"]["process"]["scope"],
+        },
+        "counts": envelope["counts"],
+        "target": {
+            "counts": targets[0]["counts"],
+            "timing_scope": targets[0]["timing"]["scope"],
+            "work_is_cumulative": targets[0]["timing"]["work_is_cumulative"],
+            "phase_aggregation": targets[0]["timing"]["phase_aggregation"],
+            "waterfall": {
+                "commit_wait_ms": targets[0]["timing"]["waterfall"]["commit_wait_ms"],
+                "post_resolve_work_ms":
+                    targets[0]["timing"]["waterfall"]["post_resolve_work_ms"],
+                "pre_fetch_ms": targets[0]["timing"]["waterfall"]["pre_fetch_ms"],
+            },
+            "process_global_metrics": targets[0]["timing"]["process_global_metrics"],
+        },
+    });
+    insta::assert_json_snapshot!("recursive_install_timing_semantics", contract, {
+        ".timing.work.target_resolve_sum_ms" => "[DURATION]",
+        ".timing.work.target_post_resolve_sum_ms" => "[DURATION]",
+        ".timing.work.target_fetch_sum_ms" => "[DURATION]",
+        ".timing.work.target_link_sum_ms" => "[DURATION]",
+        ".timing.wait.target_commit_sum_ms" => "[DURATION]",
+        ".target.waterfall.commit_wait_ms" => "[DURATION]",
+        ".target.waterfall.post_resolve_work_ms" => "[DURATION]",
+        ".target.waterfall.pre_fetch_ms" => "[DURATION]",
+    });
 }
 
 /// `lpm install --offline` re-runs the workspace-member BFS expansion

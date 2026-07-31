@@ -484,6 +484,7 @@ pub(super) async fn run_empty_dependency_install_phase(
             "success": true,
             "no_dependencies": true,
             "duration_ms": total_ms as u64,
+            "counts": InstallCountSemantics::default().to_json(),
             "timing": {
                 "resolve_ms": 0u128,
                 "fetch_ms": 0u128,
@@ -492,6 +493,8 @@ pub(super) async fn run_empty_dependency_install_phase(
                 "waterfall": {
                     "setup_ms": total_ms,
                     "resolve_ms": 0u128,
+                    "commit_wait_ms": 0u128,
+                    "post_resolve_work_ms": 0u128,
                     "pre_fetch_ms": 0u128,
                     "fetch_ms": 0u128,
                     "pre_link_ms": 0u128,
@@ -517,6 +520,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                 setup_route_table_ms,
             );
         }
+        attach_target_timing_semantics(&mut json["timing"]);
         if !emit_timing && let Some(obj) = json.as_object_mut() {
             obj.remove("timing");
         }

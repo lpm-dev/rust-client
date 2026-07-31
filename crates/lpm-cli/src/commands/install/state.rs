@@ -366,6 +366,10 @@ pub(super) async fn run_install_freshness_phase(
                     "success": true,
                     "up_to_date": true,
                     "duration_ms": total_ms as u64,
+                    "counts": InstallCountSemantics {
+                        resolved_package_row_count: fast_path_packages.len(),
+                        ..InstallCountSemantics::default()
+                    }.to_json(),
                     "timing": {
                         "resolve_ms": 0u128,
                         "fetch_ms": 0u128,
@@ -374,6 +378,8 @@ pub(super) async fn run_install_freshness_phase(
                         "waterfall": {
                             "setup_ms": total_ms,
                             "resolve_ms": 0u128,
+                            "commit_wait_ms": 0u128,
+                            "post_resolve_work_ms": 0u128,
                             "pre_fetch_ms": 0u128,
                             "fetch_ms": 0u128,
                             "pre_link_ms": 0u128,
@@ -399,6 +405,7 @@ pub(super) async fn run_install_freshness_phase(
                         0,
                     );
                 }
+                attach_target_timing_semantics(&mut json["timing"]);
                 if !input.emit_timing
                     && let Some(obj) = json.as_object_mut()
                 {

@@ -4,6 +4,8 @@ expression: dispatcher_contract
 ---
 {
   "summary": {
+    "scope": "resolver_pass",
+    "kind": "metadata",
     "rpc_count": "[COUNT]",
     "configured_fanout": "[COUNT]",
     "inflight_high_water": "[COUNT]",
@@ -13,9 +15,13 @@ expression: dispatcher_contract
     "semaphore_wait_ms": "[DURATION]",
     "parked_max_depth": "[COUNT]",
     "tarball_dispatched": "[COUNT]",
+    "selected_version_event_count": "[COUNT]",
+    "tarball_downloads_included": false,
     "peer_prefetch_count": "[COUNT]"
   },
   "detail": {
+    "scope": "resolver_pass",
+    "kind": "metadata",
     "rpc_count": "[COUNT]",
     "configured_fanout": "[COUNT]",
     "inflight_high_water": "[COUNT]",
@@ -25,6 +31,8 @@ expression: dispatcher_contract
     "semaphore_wait_ms": "[DURATION]",
     "parked_max_depth": "[COUNT]",
     "tarball_dispatched": "[COUNT]",
+    "selected_version_event_count": "[COUNT]",
+    "tarball_downloads_included": false,
     "peer_prefetch_count": "[COUNT]"
   }
 }

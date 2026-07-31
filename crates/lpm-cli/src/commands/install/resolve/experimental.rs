@@ -683,6 +683,8 @@ pub(in crate::commands::install) async fn run(
         let waterfall_json = serde_json::json!({
             "setup_ms": setup_ms,
             "resolve_ms": resolve_ms,
+            "commit_wait_ms": 0u128,
+            "post_resolve_work_ms": stage_timings.pre_fetch_overlap_ms,
             "pre_fetch_ms": stage_timings.pre_fetch_overlap_ms,
             "fetch_ms": fetch_ms,
             "pre_link_ms": 0u128,

@@ -1157,7 +1157,7 @@ async fn run_with_options_under_store_lock(
         override_set: override_set.clone(),
     })
     .await;
-    workspace_resolution::wait_for_commit().await;
+    let wf_commit_wait_ms = workspace_resolution::wait_for_commit().await;
     let OnlineResolutionPhaseResult {
         packages,
         packages_for_lockfile,
@@ -1766,6 +1766,7 @@ async fn run_with_options_under_store_lock(
             gate_stats: gate_stats.as_ref(),
             wf_setup_ms,
             wf_resolve_end_ms,
+            wf_commit_wait_ms,
             wf_fetch_start_ms,
             wf_fetch_end_ms,
             wf_link_start_ms,

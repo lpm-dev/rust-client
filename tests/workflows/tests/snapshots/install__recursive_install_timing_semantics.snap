@@ -1,0 +1,60 @@
+---
+source: tests/workflows/tests/install.rs
+expression: contract
+---
+{
+  "timing": {
+    "scope": "recursive_command",
+    "work_is_cumulative": true,
+    "phase_aggregation": "sum_of_target_wall_clock",
+    "work": {
+      "target_resolve_sum_ms": "[DURATION]",
+      "target_post_resolve_sum_ms": "[DURATION]",
+      "target_fetch_sum_ms": "[DURATION]",
+      "target_link_sum_ms": "[DURATION]"
+    },
+    "wait": {
+      "aggregation": "sum_of_target_wall_clock",
+      "target_commit_sum_ms": "[DURATION]"
+    },
+    "process_scope": "recursive_command"
+  },
+  "counts": {
+    "scope": "recursive_command",
+    "aggregation": "sum_of_target_observations",
+    "work_is_cumulative": true,
+    "resolved_package_row_count": 1,
+    "authoritative_fetch_candidate_count": 0,
+    "store_reuse_observation_count": 1,
+    "store_reuse_may_include_same_command_population": true,
+    "linker_entry_created_count": 1,
+    "linker_entry_reused_count": 0,
+    "project_root_symlink_created_count": 1,
+    "bin_link_created_count": 0
+  },
+  "target": {
+    "counts": {
+      "scope": "target",
+      "resolved_package_row_count": 0,
+      "authoritative_fetch_candidate_count": 0,
+      "store_reuse_observation_count": 0,
+      "store_reuse_may_include_same_command_population": true,
+      "linker_entry_created_count": 0,
+      "linker_entry_reused_count": 0,
+      "project_root_symlink_created_count": 0,
+      "bin_link_created_count": 0
+    },
+    "timing_scope": "target",
+    "work_is_cumulative": false,
+    "phase_aggregation": "target_wall_clock",
+    "waterfall": {
+      "commit_wait_ms": "[DURATION]",
+      "post_resolve_work_ms": "[DURATION]",
+      "pre_fetch_ms": "[DURATION]"
+    },
+    "process_global_metrics": {
+      "scope": "recursive_command",
+      "reported_at": "timing.process"
+    }
+  }
+}

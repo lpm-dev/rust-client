@@ -1,15 +1,17 @@
-//! Process-global timing accumulators for metadata RPC work.
+//! Command-scoped timing accumulators for metadata RPC work.
 //!
 //! The resolver needs to know how much of `resolve_ms` was spent on
 //! HTTP round-trips vs NDJSON parsing vs pubgrub backtracking so the
 //! right optimization lever can be pulled. Process globals let
 //! `lpm-registry` report numbers up to `lpm-resolver` without reshaping
-//! every `RegistryClient` signature. Contention is a non-issue because
-//! the resolver is the only consumer and the cold-resolve path is
-//! effectively serial.
+//! every `RegistryClient` signature. A recursive workspace command can
+//! run multiple resolver passes concurrently, so [`command_scope`]
+//! suppresses their per-pass resets and lets the command report one
+//! truthful aggregate instead of racing process-global snapshots.
 //!
 //! Contract:
-//!   1. `reset()` at the start of each resolution pass (idempotent).
+//!   1. `reset()` at the start of each resolution pass (idempotent), or
+//!      [`command_scope`] once before concurrent workspace passes.
 //!   2. The registry client records time and counts as it works —
 //!      every successful batch or per-package metadata call
 //!      contributes to the rpc counters; every NDJSON parse
@@ -25,8 +27,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 static METADATA_RPC_NS: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +40,8 @@ static METADATA_HTTP_11_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_2_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_3_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_UNKNOWN_COUNT: AtomicU32 = AtomicU32::new(0);
+static COMMAND_SCOPE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static COMMAND_SCOPE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 static METADATA_FETCH_DETAIL: OnceLock<MetadataFetchDetailCounters> = OnceLock::new();
 #[cfg(test)]
 static METADATA_FETCH_DETAIL_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -161,10 +165,7 @@ pub async fn with_metadata_purpose<T>(
 /// `task_local!` scoping and equivalent.
 static WALKER_RPC_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Reset all counters to zero. Idempotent. Call once before resolution
-/// starts so `snapshot()` at the end reflects only work from THIS
-/// resolution pass.
-pub fn reset() {
+fn reset_resolution_counters() {
     METADATA_RPC_NS.store(0, Ordering::Relaxed);
     METADATA_RPC_COUNT.store(0, Ordering::Relaxed);
     PARSE_NDJSON_NS.store(0, Ordering::Relaxed);
@@ -176,7 +177,7 @@ pub fn reset() {
     }
 }
 
-pub fn reset_metadata_detail() {
+fn reset_metadata_detail_unscoped() {
     for purpose in METADATA_PURPOSES {
         purpose_counters(purpose).reset();
     }
@@ -188,14 +189,65 @@ pub fn reset_metadata_detail() {
     }
 }
 
-/// Reset install-scoped metadata response protocol counters.
-pub fn reset_metadata_http_versions() {
+fn reset_metadata_http_versions_unscoped() {
     METADATA_HTTP_09_COUNT.store(0, Ordering::Relaxed);
     METADATA_HTTP_10_COUNT.store(0, Ordering::Relaxed);
     METADATA_HTTP_11_COUNT.store(0, Ordering::Relaxed);
     METADATA_HTTP_2_COUNT.store(0, Ordering::Relaxed);
     METADATA_HTTP_3_COUNT.store(0, Ordering::Relaxed);
     METADATA_HTTP_UNKNOWN_COUNT.store(0, Ordering::Relaxed);
+}
+
+fn command_scope_is_active() -> bool {
+    COMMAND_SCOPE_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Reset resolver-pass counters unless a recursive command is collecting
+/// one aggregate across concurrent targets.
+pub fn reset() {
+    if !command_scope_is_active() {
+        reset_resolution_counters();
+    }
+}
+
+pub fn reset_metadata_detail() {
+    if !command_scope_is_active() {
+        reset_metadata_detail_unscoped();
+    }
+}
+
+/// Reset install-scoped metadata response protocol counters.
+pub fn reset_metadata_http_versions() {
+    if !command_scope_is_active() {
+        reset_metadata_http_versions_unscoped();
+    }
+}
+
+/// Keeps process-global registry counters cumulative for one command.
+///
+/// Scopes are exclusive because the underlying accumulators are process-global.
+/// Resolver/setup reset calls become no-ops until the guard drops.
+pub struct CommandTimingScope {
+    _exclusive: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Starts an exclusive command aggregate and suppresses resolver/setup resets.
+pub async fn command_scope() -> CommandTimingScope {
+    let lock = Arc::clone(COMMAND_SCOPE_LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))));
+    let exclusive = lock.lock_owned().await;
+    reset_resolution_counters();
+    reset_metadata_detail_unscoped();
+    reset_metadata_http_versions_unscoped();
+    COMMAND_SCOPE_ACTIVE.store(true, Ordering::Release);
+    CommandTimingScope {
+        _exclusive: exclusive,
+    }
+}
+
+impl Drop for CommandTimingScope {
+    fn drop(&mut self) {
+        COMMAND_SCOPE_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 /// Record wall-clock time spent in a single metadata RPC. Covers
@@ -1164,5 +1216,61 @@ mod tests {
 
         assert_eq!(snapshot_metadata_fetch_detail().calls, 1);
         reset_metadata_detail();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_scope_suppresses_target_resets_until_the_aggregate_is_read() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let _env = ScopedEnv::set("LPM_TIMING_DETAIL", "trace");
+        let scope = command_scope().await;
+
+        record_rpc(Duration::from_millis(7));
+        record_metadata_request("left-pad");
+        record_metadata_cache_miss();
+        record_metadata_http_version(reqwest::Version::HTTP_11);
+        record_metadata_fetch_detail(MetadataFetchDetailRecord {
+            package: "left-pad".to_string(),
+            route: "npm_direct",
+            total_ms: 7,
+            ..MetadataFetchDetailRecord::default()
+        });
+
+        reset();
+        reset_metadata_detail();
+        reset_metadata_http_versions();
+
+        assert_eq!(snapshot().metadata_rpc_count, 1);
+        assert_eq!(snapshot_metadata_detail()[0].request_count, 1);
+        assert_eq!(snapshot_metadata_http_versions().http_11, 1);
+        assert_eq!(snapshot_metadata_fetch_detail().calls, 1);
+
+        drop(scope);
+        reset();
+        reset_metadata_detail();
+        reset_metadata_http_versions();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_scopes_do_not_merge_overlapping_command_metrics() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let first_scope = command_scope().await;
+        record_rpc(Duration::from_millis(7));
+
+        let second_acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_acquired_in_task = std::sync::Arc::clone(&second_acquired);
+        let second = tokio::spawn(async move {
+            let _scope = command_scope().await;
+            second_acquired_in_task.store(true, Ordering::Release);
+            snapshot()
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!second_acquired.load(Ordering::Acquire));
+        assert_eq!(snapshot().metadata_rpc_count, 1);
+
+        drop(first_scope);
+        let second_snapshot = second.await.expect("second command scope task");
+        assert!(second_acquired.load(Ordering::Acquire));
+        assert_eq!(second_snapshot.metadata_rpc_count, 0);
     }
 }

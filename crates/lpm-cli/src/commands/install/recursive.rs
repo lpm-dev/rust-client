@@ -92,6 +92,17 @@ pub(crate) async fn run_recursive_workspace_install(
         changed_files_ignore_pattern,
         test_pattern,
     )?;
+    let timing_detail_mode = TimingDetailMode::from_env();
+    let _registry_timing_scope = if options.timing {
+        Some(lpm_registry::timing::command_scope().await)
+    } else {
+        None
+    };
+    let _resolver_profile_scope = if options.timing {
+        Some(lpm_resolver::profile::command_scope().await)
+    } else {
+        None
+    };
 
     if targets.is_empty() {
         if fail_if_no_match {
@@ -99,7 +110,14 @@ pub(crate) async fn run_recursive_workspace_install(
                 "no workspace packages matched the filter (--fail-if-no-match)".into(),
             ));
         }
-        emit_workspace_install_report(&workspace.root, &[], options.json_output, 0);
+        emit_workspace_install_report(
+            &workspace.root,
+            &[],
+            options.json_output,
+            options.timing,
+            timing_detail_mode,
+            0,
+        );
         return Ok(());
     }
 
@@ -265,6 +283,8 @@ pub(crate) async fn run_recursive_workspace_install(
         &workspace_root,
         &outcomes,
         options.json_output,
+        options.timing,
+        timing_detail_mode,
         duration_ms(started.elapsed()),
     );
     Ok(())
@@ -744,6 +764,7 @@ const TARGET_REPORT_FIELDS: &[&str] = &[
     "cached",
     "linked",
     "symlinked",
+    "counts",
     "used_lockfile",
     "timing",
     "security",
@@ -754,6 +775,8 @@ fn emit_workspace_install_report(
     workspace_root: &Path,
     outcomes: &[WorkspaceInstallOutcome],
     json_output: bool,
+    emit_timing: bool,
+    timing_detail_mode: TimingDetailMode,
     duration_ms: u64,
 ) {
     if json_output {
@@ -770,7 +793,11 @@ fn emit_workspace_install_report(
                 if let Some(report) = &outcome.report {
                     for field in TARGET_REPORT_FIELDS {
                         if let Some(value) = report.get(field) {
-                            target[*field] = value.clone();
+                            target[*field] = if *field == "timing" {
+                                recursive_target_timing(value)
+                            } else {
+                                value.clone()
+                            };
                         }
                     }
                 }
@@ -790,7 +817,7 @@ fn emit_workspace_install_report(
                 "failed": 0,
             },
         });
-        attach_aggregate_telemetry(&mut report, duration_ms);
+        attach_aggregate_telemetry(&mut report, duration_ms, emit_timing, timing_detail_mode);
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
         output::success(&format!(
@@ -801,11 +828,123 @@ fn emit_workspace_install_report(
     }
 }
 
-/// Roll per-target counters and phase timings up to the envelope root
-/// so consumers keep the single-project field surface. Phase sums are
-/// attribution across targets — under concurrent execution they can
-/// exceed the wall-clock `total_ms`.
-fn attach_aggregate_telemetry(report: &mut serde_json::Value, wall_ms: u64) {
+fn recursive_target_timing(source: &serde_json::Value) -> serde_json::Value {
+    let mut timing = source.clone();
+    attach_target_timing_semantics(&mut timing);
+    timing["process_global_metrics"] = serde_json::json!({
+        "scope": "recursive_command",
+        "reported_at": "timing.process",
+    });
+
+    if let Some(resolve) = timing
+        .get_mut("resolve")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for field in [
+            "followup_rpc_ms",
+            "followup_rpc_count",
+            "walker_rpc_count",
+            "escape_hatch_rpc_count",
+            "parse_ndjson_ms",
+            "metadata_http_versions",
+        ] {
+            resolve.remove(field);
+        }
+    }
+
+    if let Some(detail) = timing
+        .get_mut("detail")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        detail.remove("metadata");
+        if let Some(resolve) = detail
+            .get_mut("resolve")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            resolve.remove("metadata");
+            resolve.remove("metadata_fetch");
+            resolve.remove("policy");
+            if let Some(scheduler) = resolve
+                .get_mut("scheduler")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for field in [
+                    "followup_rpc_ms",
+                    "followup_rpc_count",
+                    "walker_rpc_count",
+                    "escape_hatch_rpc_count",
+                ] {
+                    scheduler.remove(field);
+                }
+            }
+            if let Some(cpu) = resolve
+                .get_mut("cpu")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                cpu.remove("parse_ndjson_ms");
+                cpu.remove("pubgrub_core_estimate_ms");
+            }
+        }
+    }
+
+    timing
+}
+
+fn recursive_process_timing(timing_detail_mode: TimingDetailMode) -> serde_json::Value {
+    let registry = lpm_registry::timing::snapshot();
+    let http_versions = lpm_registry::timing::snapshot_metadata_http_versions();
+    let policy = lpm_resolver::profile::policy_summary();
+    let mut process = serde_json::json!({
+        "scope": "recursive_command",
+        "registry": {
+            "metadata_rpc_sum_ms": registry.metadata_rpc.as_millis(),
+            "metadata_rpc_count": registry.metadata_rpc_count,
+            "parse_ndjson_sum_ms": registry.parse_ndjson.as_millis(),
+            "walker_rpc_count": registry.walker_rpc_count,
+            "escape_hatch_rpc_count": registry.escape_hatch_rpc_count,
+            "metadata_http_versions": {
+                "http_09": http_versions.http_09,
+                "http_10": http_versions.http_10,
+                "http_11": http_versions.http_11,
+                "http_2": http_versions.http_2,
+                "http_3": http_versions.http_3,
+                "unknown": http_versions.unknown,
+            },
+        },
+        "resolver_policy": {
+            "release_age": {
+                "sum_ms": policy.release_age.elapsed.as_millis(),
+                "checked_count": policy.release_age.checked_count,
+                "rejected_count": policy.release_age.rejected_count,
+                "missing_count": policy.release_age.missing_count,
+            },
+            "trust": {
+                "sum_ms": policy.trust_policy.elapsed.as_millis(),
+                "checked_count": policy.trust_policy.checked_count,
+                "rejected_count": policy.trust_policy.rejected_count,
+            },
+        },
+    });
+    if timing_detail_mode.enabled() {
+        let metadata = metadata_detail_snapshots();
+        process["metadata"] = metadata_detail_json_from_snapshots(&metadata, timing_detail_mode);
+    }
+    if timing_detail_mode.trace() {
+        let metadata_fetch = lpm_registry::timing::snapshot_metadata_fetch_detail();
+        process["metadata_fetch"] =
+            metadata_fetch_detail_json_from_snapshot(&metadata_fetch, timing_detail_mode);
+    }
+    process
+}
+
+/// Roll per-target counters and phase timings up to the envelope root.
+/// Target phase values are work sums and can exceed command wall time.
+fn attach_aggregate_telemetry(
+    report: &mut serde_json::Value,
+    wall_ms: u64,
+    emit_timing: bool,
+    timing_detail_mode: TimingDetailMode,
+) {
     let Some(targets) = report.get("targets").and_then(serde_json::Value::as_array) else {
         return;
     };
@@ -820,6 +959,17 @@ fn attach_aggregate_telemetry(report: &mut serde_json::Value, wall_ms: u64) {
             }
         }
         present.then_some(total)
+    };
+    let sum_count = |field: &str| -> u64 {
+        targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .get("counts")
+                    .and_then(|counts| counts.get(field))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .fold(0u64, u64::saturating_add)
     };
     let counters: Vec<(&str, Option<u64>)> = vec![
         ("count", sum("count")),
@@ -847,10 +997,38 @@ fn attach_aggregate_telemetry(report: &mut serde_json::Value, wall_ms: u64) {
             })
             .fold(0u64, u64::saturating_add)
     };
-    let any_timing = targets.iter().any(|target| target.get("timing").is_some());
+    let waterfall_sum = |field: &str| -> u64 {
+        targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .get("timing")
+                    .and_then(|timing| timing.get("waterfall"))
+                    .and_then(|waterfall| waterfall.get(field))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .fold(0u64, u64::saturating_add)
+    };
     let resolve_ms = timing_sum("resolve_ms");
     let fetch_ms = timing_sum("fetch_ms");
     let link_ms = timing_sum("link_ms");
+    let commit_wait_ms = waterfall_sum("commit_wait_ms");
+    let post_resolve_work_ms = waterfall_sum("post_resolve_work_ms");
+    let aggregate_counts = serde_json::json!({
+        "scope": "recursive_command",
+        "aggregation": "sum_of_target_observations",
+        "work_is_cumulative": true,
+        "resolved_package_row_count": sum_count("resolved_package_row_count"),
+        "authoritative_fetch_candidate_count":
+            sum_count("authoritative_fetch_candidate_count"),
+        "store_reuse_observation_count": sum_count("store_reuse_observation_count"),
+        "store_reuse_may_include_same_command_population": true,
+        "linker_entry_created_count": sum_count("linker_entry_created_count"),
+        "linker_entry_reused_count": sum_count("linker_entry_reused_count"),
+        "project_root_symlink_created_count":
+            sum_count("project_root_symlink_created_count"),
+        "bin_link_created_count": sum_count("bin_link_created_count"),
+    });
 
     for (field, value) in counters {
         if let Some(value) = value {
@@ -860,12 +1038,30 @@ fn attach_aggregate_telemetry(report: &mut serde_json::Value, wall_ms: u64) {
     if all_up_to_date {
         report["up_to_date"] = serde_json::json!(true);
     }
-    if any_timing {
+    report["counts"] = aggregate_counts;
+    if emit_timing {
         report["timing"] = serde_json::json!({
+            "scope": "recursive_command",
+            "work_is_cumulative": true,
+            "phase_aggregation": "sum_of_target_wall_clock",
             "resolve_ms": resolve_ms,
             "fetch_ms": fetch_ms,
             "link_ms": link_ms,
             "total_ms": wall_ms,
+            "waterfall": {
+                "total_ms": wall_ms,
+            },
+            "wait": {
+                "aggregation": "sum_of_target_wall_clock",
+                "target_commit_sum_ms": commit_wait_ms,
+            },
+            "work": {
+                "target_resolve_sum_ms": resolve_ms,
+                "target_post_resolve_sum_ms": post_resolve_work_ms,
+                "target_fetch_sum_ms": fetch_ms,
+                "target_link_sum_ms": link_ms,
+            },
+            "process": recursive_process_timing(timing_detail_mode),
         });
     }
 }

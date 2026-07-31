@@ -68,12 +68,12 @@ struct WorkspaceResolutionTask {
 }
 
 impl WorkspaceResolutionTask {
-    async fn enter_commit(&self) {
+    async fn enter_commit(&self) -> u128 {
         if self
             .commit_entered
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return 0;
         }
 
         self.resolution_permit
@@ -81,11 +81,16 @@ impl WorkspaceResolutionTask {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
 
-        if let Some(previous) = self.index.checked_sub(1) {
+        let wait_ms = if let Some(previous) = self.index.checked_sub(1) {
+            let wait_started = std::time::Instant::now();
             self.coordinator.completed[previous].wait().await;
-        }
+            wait_started.elapsed().as_millis()
+        } else {
+            0
+        };
         self.commit_entered
             .store(true, std::sync::atomic::Ordering::Release);
+        wait_ms
     }
 }
 
@@ -114,9 +119,11 @@ pub(super) fn active() -> bool {
     ACTIVE_TASK.try_with(|_| ()).is_ok()
 }
 
-pub(super) async fn wait_for_commit() {
+pub(super) async fn wait_for_commit() -> u128 {
     if let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) {
-        task.enter_commit().await;
+        task.enter_commit().await
+    } else {
+        0
     }
 }
 
