@@ -130,8 +130,13 @@ pub struct RegistryClient {
 // Per-origin HTTP client cache
 // ============================================================================
 
-/// A cached HTTP client paired with an opaque fingerprint of the
-/// TLS identity it was built with.
+/// Two configuration-equivalent HTTP clients paired with an opaque
+/// fingerprint of their TLS identity.
+///
+/// `client` handles the general registry waterfall. The separate policy
+/// metadata client keeps large, late release-time responses off that
+/// connection pool so HTTP/2 flow control does not serialize unrelated
+/// abbreviated packuments.
 ///
 /// `identity_fp` is `Some(<16-hex>)` when the client uses a client
 /// certificate (per-origin or global) and `None` for clients with no
@@ -142,6 +147,7 @@ pub struct RegistryClient {
 #[derive(Clone)]
 pub(super) struct CachedClient {
     pub(super) client: reqwest::Client,
+    pub(super) policy_metadata_client: reqwest::Client,
     pub(super) identity_fp: Option<Arc<str>>,
 }
 

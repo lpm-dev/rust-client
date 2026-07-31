@@ -251,7 +251,8 @@ impl RegistryClient {
             }
         }
         let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
-        let http = HttpClients::from_default_client(default_client);
+        let policy_metadata_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let http = HttpClients::from_default_clients(default_client, policy_metadata_client);
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
         // `None` here is a graceful degradation: if we can't even resolve a
@@ -482,10 +483,17 @@ impl RegistryClient {
             CONNECT_TIMEOUT,
             READ_TIMEOUT,
             tls,
+            default_identity.clone(),
+        )?;
+        let policy_metadata_client = Self::build_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            tls,
             default_identity,
         )?;
         let default_cached = CachedClient {
             client: default_reqwest_client,
+            policy_metadata_client,
             identity_fp: default_identity_fp,
         };
         // Eager per-origin builds — only for origins in the supplied set

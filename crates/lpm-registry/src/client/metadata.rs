@@ -2055,7 +2055,7 @@ impl RegistryClient {
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         let req = self
             .http
-            .for_url(&npm_url)
+            .for_policy_metadata_url(&npm_url)
             .await?
             .get(&npm_url)
             .header("Accept", "application/json");
@@ -2086,7 +2086,7 @@ impl RegistryClient {
             response = match self
                 .send_package_metadata_request(
                     self.http
-                        .for_url(&npm_url)
+                        .for_policy_metadata_url(&npm_url)
                         .await?
                         .get(&npm_url)
                         .header("Accept", "application/json"),

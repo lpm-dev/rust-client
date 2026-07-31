@@ -186,6 +186,67 @@ fn http_clients_eager_hit_overrides_default() {
     );
 }
 
+#[tokio::test]
+async fn policy_metadata_dispatch_uses_its_dedicated_client() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let regular = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-lpm-pool"),
+            reqwest::header::HeaderValue::from_static("regular"),
+        )]))
+        .build()
+        .expect("regular client");
+    let policy = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-lpm-pool"),
+            reqwest::header::HeaderValue::from_static("policy"),
+        )]))
+        .build()
+        .expect("policy client");
+    let clients = HttpClients::from_default_clients(regular, policy);
+    let url = format!("{}/metadata", server.uri());
+
+    clients
+        .for_url(&url)
+        .await
+        .expect("regular dispatch")
+        .get(&url)
+        .send()
+        .await
+        .expect("regular response");
+    clients
+        .for_policy_metadata_url(&url)
+        .await
+        .expect("policy dispatch")
+        .get(&url)
+        .send()
+        .await
+        .expect("policy response");
+
+    let requests = server.received_requests().await.expect("request recording");
+    let pools: Vec<&str> = requests
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("x-lpm-pool")
+                .and_then(|value| value.to_str().ok())
+                .expect("pool header")
+        })
+        .collect();
+    assert_eq!(pools, vec!["regular", "policy"]);
+}
+
 #[test]
 fn http_clients_eager_port_none_matches_any_port() {
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
