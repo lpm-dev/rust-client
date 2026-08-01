@@ -9363,6 +9363,641 @@ async fn install_tarball_url_with_declared_sri_writes_non_registry_lockfile_entr
     );
 }
 
+#[tokio::test]
+async fn install_github_dependency_at_commit_writes_replayable_lockfile_entry() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let github = MockServer::start().await;
+    let archive = make_tarball_with_files(
+        "wa-sqlite",
+        "1.0.9",
+        &[("index.js", b"module.exports = 'github-ok';\n")],
+    );
+    let archive_integrity = compute_integrity(&archive);
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-dependency-install",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+    ));
+
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run GitHub dependency install");
+
+    assert!(
+        output.status.success(),
+        "GitHub dependency install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("node_modules/wa-sqlite/index.js"),
+        "module.exports = 'github-ok';\n"
+    );
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(lockfile.contains(&format!(
+        "source = \"git+https://github.com/rhashimoto/wa-sqlite.git#{COMMIT}\""
+    )));
+    assert!(lockfile.contains("integrity = \"sha512-"));
+
+    let object_dir = lpm_store::v2::StoreV2Paths::at(project.store_dir().join("v2"))
+        .object_dir(&archive_integrity)
+        .expect("Git archive integrity should address the v2 object");
+    assert!(object_dir.join(".lpm-security.json").is_file());
+}
+
+#[tokio::test]
+async fn recursive_workspace_install_and_offline_replay_preserve_member_github_dependency() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "git-child",
+                "version": "1.0.0"
+            }),
+            &[],
+        )
+        .await;
+
+    let github = MockServer::start().await;
+    let archive = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "wa-sqlite",
+            "version": "1.0.9",
+            "dependencies": { "git-child": "1.0.0" }
+        }),
+        &[],
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .mount(&github)
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-github-root",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "workspace-editor": "workspace:*" }
+}"#,
+    );
+    project.write_file(".npmrc", &format!("registry={}\n", registry.url()));
+    project.write_file(
+        "packages/editor/package.json",
+        &format!(
+            r#"{{
+  "name": "workspace-editor",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run recursive workspace GitHub dependency install");
+    assert!(
+        output.status.success(),
+        "recursive workspace GitHub dependency install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("workspace root lockfile should parse");
+    let git_package = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "wa-sqlite")
+        .expect("workspace root lockfile should contain the GitHub dependency");
+    assert_eq!(
+        git_package.dependencies,
+        vec!["git-child@1.0.0"],
+        "GitHub package registry dependencies must remain in its locked graph",
+    );
+    let member = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "workspace-editor")
+        .expect("workspace root lockfile should contain the workspace member");
+    assert!(
+        member
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.starts_with("wa-sqlite@g-")),
+        "workspace member must point at the commit-pinned GitHub source: {:?}",
+        member.dependencies,
+    );
+    assert!(
+        !project.path().join("node_modules/wa-sqlite").exists(),
+        "a member-only GitHub dependency must not become a workspace-root dependency",
+    );
+
+    let github_requests_before_replay = github
+        .received_requests()
+        .await
+        .expect("read GitHub requests")
+        .len();
+    for relative in [
+        "node_modules",
+        ".lpm",
+        "packages/editor/node_modules",
+        "packages/editor/.lpm",
+    ] {
+        let path = project.path().join(relative);
+        if path.exists() {
+            std::fs::remove_dir_all(path).expect("remove materialized workspace install state");
+        }
+    }
+
+    let replay = lpm_with_registry(&project, &registry.url())
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--recursive",
+            "--frozen-lockfile",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run frozen offline recursive workspace GitHub replay");
+    assert!(
+        replay.status.success(),
+        "frozen offline recursive workspace GitHub replay must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+    assert_eq!(
+        github
+            .received_requests()
+            .await
+            .expect("read GitHub requests after replay")
+            .len(),
+        github_requests_before_replay,
+        "offline replay must not contact GitHub",
+    );
+}
+
+#[tokio::test]
+async fn install_github_dependency_at_branch_locks_resolved_commit() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/rhashimoto/wa-sqlite/commits/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sha": COMMIT
+        })))
+        .expect(1)
+        .mount(&github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(make_tarball_with_files(
+                "wa-sqlite",
+                "1.0.9",
+                &[("index.js", b"module.exports = 'branch-ok';\n")],
+            )),
+        )
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "github-branch-install",
+  "version": "1.0.0",
+  "dependencies": {
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#main"
+  }
+}"#,
+    );
+    let output = lpm(&project)
+        .env("LPM_GITHUB_API_BASE_URL", github.uri())
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run GitHub branch dependency install");
+
+    assert!(
+        output.status.success(),
+        "GitHub branch dependency install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(lockfile.contains(&format!(
+        "source = \"git+https://github.com/rhashimoto/wa-sqlite.git#{COMMIT}\""
+    )));
+    assert!(lockfile.contains("wa-sqlite = \"github:rhashimoto/wa-sqlite#main\""));
+}
+
+#[test]
+fn install_github_dependency_rejects_credentials_without_disclosure() {
+    const SECRET: &str = "credential-that-must-not-leak";
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-credential-rejection",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "git+https://user:{SECRET}@github.com/rhashimoto/wa-sqlite.git#{COMMIT}"
+  }}
+}}"#,
+    ));
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run credential-bearing GitHub dependency install");
+
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(SECRET));
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn install_github_dependency_refuses_archive_redirect() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let external = MockServer::start().await;
+    let github = MockServer::start().await;
+    let external_url = format!("{}/archive.tgz", external.uri());
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", external_url.as_str()))
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-redirect-rejection",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+    ));
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run redirected GitHub dependency install");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected redirect"));
+    assert!(
+        external
+            .received_requests()
+            .await
+            .expect("read external request log")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn install_github_dependency_rejects_oversized_archive_before_reading_body() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind raw GitHub server");
+    let address = listener.local_addr().expect("read raw GitHub address");
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        let (mut stream, _) = listener.accept().expect("accept GitHub archive request");
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request);
+        let declared = lpm_registry::MAX_COMPRESSED_TARBALL_SIZE + 1;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write oversized GitHub response headers");
+    });
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-oversized-archive",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+    ));
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", format!("http://{address}"))
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run oversized GitHub dependency install");
+    server.join().expect("join raw GitHub server");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("response size limit"),
+        "oversized archive rejection must identify the size limit; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn install_github_dependency_replays_frozen_lockfile_offline() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(make_tarball_with_files(
+                "wa-sqlite",
+                "1.0.9",
+                &[("index.js", b"module.exports = 'offline-ok';\n")],
+            )),
+        )
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-offline-replay",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+    ));
+    let first = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run initial GitHub dependency install");
+    assert!(first.status.success());
+    let first_lockfile = project.read_file("lpm.lock");
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before offline replay");
+
+    let replay = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run frozen offline GitHub replay");
+
+    assert!(
+        replay.status.success(),
+        "frozen offline replay must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+    assert_eq!(project.read_file("lpm.lock"), first_lockfile);
+    assert_eq!(
+        project.read_file("node_modules/wa-sqlite/index.js"),
+        "module.exports = 'offline-ok';\n"
+    );
+}
+
+#[tokio::test]
+async fn install_github_dependency_fails_offline_when_store_is_missing() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(make_tarball("wa-sqlite", "1.0.9")))
+        .expect(1)
+        .mount(&github)
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-offline-missing-store",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+    ));
+    let first = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run initial GitHub dependency install");
+    assert!(first.status.success());
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before missing-store replay");
+    std::fs::remove_dir_all(project.store_dir().join("v2"))
+        .expect("remove isolated v2 store before missing-store replay");
+
+    let replay = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run frozen offline GitHub replay without store");
+
+    assert!(!replay.status.success());
+    assert!(String::from_utf8_lossy(&replay.stderr).contains("offline"));
+}
+
+#[tokio::test]
+async fn install_github_dependencies_keep_two_commits_of_same_package_distinct() {
+    const FIRST_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const SECOND_COMMIT: &str = "2222222222222222222222222222222222222222";
+
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/owner/shared/tar.gz/{FIRST_COMMIT}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(make_tarball_with_files(
+                "shared-package",
+                "1.0.0",
+                &[("index.js", b"module.exports = 'first';\n")],
+            )),
+        )
+        .expect(1)
+        .mount(&github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/owner/shared/tar.gz/{SECOND_COMMIT}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(make_tarball_with_files(
+                "shared-package",
+                "1.0.0",
+                &[("index.js", b"module.exports = 'second';\n")],
+            )),
+        )
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "github-distinct-commits",
+  "version": "1.0.0",
+  "dependencies": {{
+    "first": "github:owner/shared#{FIRST_COMMIT}",
+    "second": "github:owner/shared#{SECOND_COMMIT}"
+  }}
+}}"#,
+    ));
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install two commits of one GitHub package");
+
+    assert!(
+        output.status.success(),
+        "both commits must install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("node_modules/first/index.js"),
+        "module.exports = 'first';\n"
+    );
+    assert_eq!(
+        project.read_file("node_modules/second/index.js"),
+        "module.exports = 'second';\n"
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(lockfile.contains(&format!("shared.git#{FIRST_COMMIT}")));
+    assert!(lockfile.contains(&format!("shared.git#{SECOND_COMMIT}")));
+}
+
+#[tokio::test]
+async fn install_github_dependency_writes_deterministic_lockfile_bytes() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(make_tarball("wa-sqlite", "1.0.9")))
+        .expect(2)
+        .mount(&github)
+        .await;
+    let manifest = format!(
+        r#"{{
+  "name": "github-deterministic-lockfile",
+  "version": "1.0.0",
+  "dependencies": {{
+    "wa-sqlite": "github:rhashimoto/wa-sqlite#{COMMIT}"
+  }}
+}}"#,
+    );
+    let first = TempProject::empty(&manifest);
+    let second = TempProject::empty(&manifest);
+
+    for project in [&first, &second] {
+        let output = lpm(project)
+            .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .output()
+            .expect("install deterministic GitHub dependency fixture");
+        assert!(
+            output.status.success(),
+            "fixture install must succeed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    assert_eq!(first.read_file("lpm.lock"), second.read_file("lpm.lock"));
+}
+
 // ─── pre-resolver rejection of transitive non-registry / workspace specs ───
 //
 // File: deps from local sources can carry transitive specs that LPM cannot
@@ -9427,7 +10062,7 @@ fn install_rejects_transitive_tarball_url_from_file_source_before_resolver() {
         "stderr must categorize the unsupported shape; got:\n{stderr}"
     );
     assert!(
-        stderr_compact.contains("hoistthedeptoyourproject'spackage.json"),
+        stderr_compact.contains("publishorvendorthenesteddependencyinstead"),
         "stderr must include the workaround hint; got:\n{stderr}"
     );
     assert!(

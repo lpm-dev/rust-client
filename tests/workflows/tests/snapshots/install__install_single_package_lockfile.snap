@@ -3,7 +3,7 @@ source: tests/workflows/tests/install.rs
 expression: lockfile
 ---
 [metadata]
-lockfile-version = 8
+lockfile-version = 9
 resolved-with = "greedy-fusion"
 
 [importers."."]

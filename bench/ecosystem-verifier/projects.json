@@ -8,12 +8,59 @@
         "@types/express-serve-static-core@5.0.6",
         "vue-tsc@2.2.8"
       ]
+    },
+    "correction_verification": {
+      "typosquat_allow": [
+        {
+          "importer": "packages/nodes-base",
+          "package": "mssql",
+          "similar_to": "mysql",
+          "reason": "Intentional upstream dependency in the pinned n8n fixture"
+        },
+        {
+          "importer": "packages/nodes-base",
+          "package": "mysql2",
+          "similar_to": "mysql",
+          "reason": "Intentional upstream dependency in the pinned n8n fixture"
+        },
+        {
+          "importer": "packages/@n8n/nodes-langchain",
+          "package": "mysql2",
+          "similar_to": "mysql",
+          "reason": "Intentional upstream dependency in the pinned n8n fixture"
+        },
+        {
+          "importer": "packages/cli",
+          "package": "bcryptjs",
+          "similar_to": "bcrypt",
+          "reason": "Intentional upstream dependency in the pinned n8n fixture"
+        }
+      ]
     }
   },
   {
     "id": "nextjs",
     "repository": "https://github.com/vercel/next.js.git",
-    "commit": "b4e3fecc7943d75a3f9c407343091520afafeaac"
+    "commit": "b4e3fecc7943d75a3f9c407343091520afafeaac",
+    "reference_compatibility": {
+      "pnpm_compatibility_database": {
+        "package": "@yarnpkg/extensions@2.0.6",
+        "git_commit": "a9edb7777f04ba16f51503ef6775325b353b67cc",
+        "package_extensions": {
+          "got@<11": {
+            "dependencies": {
+              "@types/responselike": "^1.0.0",
+              "@types/keyv": "^3.1.1"
+            }
+          },
+          "unified@<10": {
+            "dependencies": {
+              "@types/unist": "^2.0.0"
+            }
+          }
+        }
+      }
+    }
   },
   {
     "id": "mui",

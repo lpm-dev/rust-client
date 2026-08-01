@@ -33,6 +33,9 @@ enum FetchSource {
     RemoteTarball {
         url: String,
     },
+    GitHub {
+        url: String,
+    },
 }
 
 impl FetchSource {
@@ -40,6 +43,7 @@ impl FetchSource {
         match self {
             Self::Registry { tarball_url, .. } => tarball_url,
             Self::RemoteTarball { url } => url,
+            Self::GitHub { url } => url,
         }
     }
 
@@ -47,6 +51,7 @@ impl FetchSource {
         match self {
             Self::Registry { .. } => "registry",
             Self::RemoteTarball { .. } => "remote_tarball",
+            Self::GitHub { .. } => "git",
         }
     }
 }
@@ -264,9 +269,16 @@ async fn fetch_one(
         .acquire_owned()
         .await
         .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
-    let (data, computed_sri) = client
-        .download_tarball_with_integrity(target.source.url(), Some(&target.integrity))
-        .await?;
+    let (data, computed_sri) = match &target.source {
+        FetchSource::GitHub { url } => {
+            crate::commands::install::download_github_archive(url, Some(&target.integrity)).await?
+        }
+        FetchSource::Registry { .. } | FetchSource::RemoteTarball { .. } => {
+            client
+                .download_tarball_with_integrity(target.source.url(), Some(&target.integrity))
+                .await?
+        }
+    };
     drop(permit);
 
     let source = target.source.clone();
@@ -282,7 +294,7 @@ async fn fetch_one(
             FetchSource::Registry { .. } => {
                 store.store_package(&name, &version, &data)?;
             }
-            FetchSource::RemoteTarball { .. } => {
+            FetchSource::RemoteTarball { .. } | FetchSource::GitHub { .. } => {
                 store.store_tarball_at_cas_path(&computed_sri, &data)?;
             }
         }
@@ -347,9 +359,16 @@ fn classify_package(
         Source::Directory { .. } | Source::Link { .. } => {
             Ok(FetchPlan::Skip("local_source".to_string()))
         }
-        Source::Git { url } => Err(LpmError::Registry(format!(
-            "lpm fetch cannot materialize git source {url} from lpm.lock yet; use `lpm install` while online for this dependency"
-        ))),
+        Source::Git { url } => {
+            let integrity = required_integrity(package)?;
+            let archive_url = crate::commands::install::github_archive_url(&url)?;
+            Ok(FetchPlan::Fetch(FetchTarget {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                integrity,
+                source: FetchSource::GitHub { url: archive_url },
+            }))
+        }
     }
 }
 
@@ -381,7 +400,9 @@ fn is_cached(
 
     match &target.source {
         FetchSource::Registry { .. } => store.has_package(&target.name, &target.version),
-        FetchSource::RemoteTarball { .. } => store.has_tarball(&target.integrity),
+        FetchSource::RemoteTarball { .. } | FetchSource::GitHub { .. } => {
+            store.has_tarball(&target.integrity)
+        }
     }
 }
 

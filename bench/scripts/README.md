@@ -42,7 +42,10 @@ Use `--determinism-runs 3` for the full fresh-state
 auto/concurrency-1/concurrency-3 lockfile-byte gate after the initial pilot has
 no blocking parser or install failure. Every run count also includes a separate
 fresh-project solve over the initial run's warm metadata cache, reported apart
-from scheduling parity. Pass `--materialize-reference` to build pnpm's
+from scheduling parity. The cache-warm solve runs first so its initial store can
+be released before fresh-state scheduling checks; unless `--keep-workspaces` is
+set, each completed fresh workspace and isolated store is then removed before
+the next one starts. Pass `--materialize-reference` to build pnpm's
 `node_modules` and run the same direct-layout gate on the reference side; by
 default pnpm performs a fresh lockfile-only solve to avoid duplicating a large
 reference layout. If a pinned project has version-specific patches that are
@@ -51,14 +54,10 @@ the exact allowed set. The harness enables pnpm's unused-patch allowance only
 for that project, verifies the reported set exactly, and records it in the
 result; every unlisted unused patch remains a hard failure. LPM's unsupported
 pnpm patch entries stay visible in compatibility output, and no LPM patch or
-security policy is relaxed. If an install reaches a direct Git dependency that
-LPM does not support, the harness records the package and specifier as an
-explicit non-passing `capability_gap`; it does not report that pre-resolution
-stop as a graph discrepancy or rewrite the dependency to bypass the product
-boundary. A reference fresh solve stopped by pnpm's trust-downgrade policy is
-similarly recorded as a non-passing `policy_block`, with the exact package and
-version. The harness does not weaken either manager's security policy to force
-a graph comparison.
+security policy is relaxed. A reference fresh solve stopped by pnpm's
+trust-downgrade policy is recorded as a non-passing `policy_block`, with the
+exact package and version. The harness does not weaken either manager's
+security policy to force a graph comparison.
 Artifacts default to a unique directory under `/tmp`; no benchmark
 numbers are written to README or rust-client-docs.
 

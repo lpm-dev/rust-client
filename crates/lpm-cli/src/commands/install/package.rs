@@ -194,6 +194,10 @@ impl InstallPackage {
                 .integrity
                 .as_deref()
                 .is_some_and(|sri| store.has_tarball(sri)),
+            Ok(lpm_lockfile::Source::Git { .. }) => self
+                .integrity
+                .as_deref()
+                .is_some_and(|sri| store.has_tarball(sri)),
             Ok(lpm_lockfile::Source::Directory { path })
             | Ok(lpm_lockfile::Source::Link { path }) => {
                 // () — directory and link deps live
@@ -287,6 +291,9 @@ impl InstallPackage {
                 store.tarball_local_store_path(&hex).ok()
             }
             Ok(lpm_lockfile::Source::Tarball { .. }) => sri_override
+                .or(self.integrity.as_deref())
+                .and_then(|sri| store.tarball_store_path(sri).ok()),
+            Ok(lpm_lockfile::Source::Git { .. }) => sri_override
                 .or(self.integrity.as_deref())
                 .and_then(|sri| store.tarball_store_path(sri).ok()),
             Ok(lpm_lockfile::Source::Directory { path })
@@ -418,6 +425,7 @@ impl InstallPackage {
             Ok(s @ lpm_lockfile::Source::Directory { .. })
             | Ok(s @ lpm_lockfile::Source::Link { .. })
             | Ok(s @ lpm_lockfile::Source::Tarball { .. }) => Some(s.source_id()),
+            Ok(s @ lpm_lockfile::Source::Git { .. }) => Some(s.source_id()),
             _ => None,
         }
     }

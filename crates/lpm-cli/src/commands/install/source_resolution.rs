@@ -36,6 +36,10 @@ pub(super) enum DepKind {
     FileDir,
     /// `link:` dep (always a directory).
     Link,
+    /// GitHub-hosted Git dependency. Immediate declarations use the
+    /// non-registry source pipeline; workspace source graphs promote
+    /// the spec into that same pipeline before registry resolution.
+    Git,
 }
 
 /// a single dep entry from a
@@ -126,6 +130,7 @@ pub(super) struct NonRegistryPreResolveResult {
     /// when the local name aliases the workspace member.
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
     pub(super) optional_registry_roots: HashSet<String>,
+    pub(super) resolved_git_sources: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -134,12 +139,14 @@ pub(super) struct V2WorkspaceRootPreResolveResult {
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
     pub(super) optional_registry_roots: HashSet<String>,
+    pub(super) promoted_git_root_names: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct LocalSourceExpansionResult {
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     pub(super) additional_workspace_links: Vec<WorkspaceMemberLink>,
+    pub(super) promoted_git_root_names: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -316,6 +323,7 @@ pub(super) fn expand_local_source_install_packages(
     let mut node_modules_warned: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
     let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
+    let mut promoted_git_root_names = HashSet::new();
     for (parent_source_string, parent_abs) in immediate_dir_link {
         let Ok(realpath) = parent_abs.canonicalize() else {
             continue;
@@ -335,6 +343,7 @@ pub(super) fn expand_local_source_install_packages(
             &mut node_modules_warned,
             &mut additional_workspace_links,
             workspace_transitives,
+            &mut promoted_git_root_names,
             false,
         )?;
     }
@@ -342,6 +351,7 @@ pub(super) fn expand_local_source_install_packages(
     Ok(LocalSourceExpansionResult {
         source_deps: source_deps_out,
         additional_workspace_links,
+        promoted_git_root_names,
     })
 }
 
@@ -387,6 +397,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
     let LocalSourceExpansionResult {
         source_deps,
         additional_workspace_links,
+        promoted_git_root_names,
     } = expand_local_source_install_packages(
         project_dir,
         deps,
@@ -406,6 +417,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         source_deps,
         additional_workspace_links,
         optional_registry_roots,
+        promoted_git_root_names,
     })
 }
 
@@ -529,13 +541,9 @@ pub(super) fn apply_v2_migration(
 ///    to learn `(name, version)`, build an [`InstallPackage`] with
 ///    `source = "tarball+file:<path>"`.
 ///
-/// In both arms the resulting entry is removed from `deps` so the
-/// resolver only sees registry-style specs.
-///
-/// **Explicit-error arms**:
-/// - [`Specifier::File`] with `is_dir()` target -> directory dep.
-/// - [`Specifier::Link`] -> linked directory dep.
-/// - [`Specifier::Git`] -> git source.
+/// Every supported non-registry entry is removed from `deps` before
+/// registry resolution. Directory, link, and Git sources are also
+/// represented as source-backed graph nodes.
 ///
 /// Surfacing an actionable error at the manifest boundary is
 /// preferable to letting the dep fall through to the resolver and
@@ -569,11 +577,13 @@ pub(super) async fn pre_resolve_non_registry_deps(
     pre_resolve_non_registry_deps_with_optional_registry_roots(
         client,
         store,
+        None,
         project_dir,
         deps,
         json_output,
         strict_integrity,
         workspace_members,
+        &HashSet::new(),
         &HashSet::new(),
     )
     .await
@@ -583,12 +593,14 @@ pub(super) async fn pre_resolve_non_registry_deps(
 pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
+    store_v2: Option<&lpm_store::v2::Store>,
     project_dir: &Path,
     deps: &mut HashMap<String, String>,
     json_output: bool,
     strict_integrity: bool,
     workspace_members: &[WorkspaceMemberLink],
     inherited_optional_registry_roots: &HashSet<String>,
+    promoted_git_root_names: &HashSet<String>,
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Gate the manifest boundary for non-registry specifiers.
     //
@@ -596,8 +608,6 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // - Tarball-URL (`https://...`)
     // - File-tarball (`file:./foo.tgz` is_file())
     // - File-dir (`file:../packages/foo` is_dir())
-    //
-    // Still rejected with explicit, actionable errors:
     // - Link (`link:...`)
     // - Git (`git+...`, `github:...`)
     //
@@ -631,13 +641,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             | Ok(lpm_resolver::Specifier::NpmAlias { .. })
             | Ok(lpm_resolver::Specifier::Workspace(_))
             | Ok(lpm_resolver::Specifier::Tarball { .. }) => {}
-            Ok(lpm_resolver::Specifier::Git { url, .. }) => {
-                return Err(LpmError::Registry(format!(
-                    "dep '{local_name}' uses git specifier '{url}', which is not \
-                     yet supported. Workaround: vendor the package or publish it \
-                     to a registry."
-                )));
-            }
+            Ok(lpm_resolver::Specifier::Git { .. }) => {}
             Ok(lpm_resolver::Specifier::File { path }) => {
                 // Disambiguate file: target via
                 // stat. Result is cached in `file_kinds` for the
@@ -718,13 +722,14 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         }
     }
 
-    // Partition the manifest deps into the four non-registry arms.
+    // Partition the manifest deps into the five non-registry arms.
     // Each arm has its own fetch/materialize site below; the resolver
     // only sees what's left in `deps`.
     let mut tarball_url_specs: Vec<(String, String, Option<String>)> = Vec::new();
     let mut file_tarball_specs: Vec<(String, String)> = Vec::new();
     let mut directory_specs: Vec<(String, String)> = Vec::new();
     let mut link_specs: Vec<(String, String)> = Vec::new();
+    let mut git_specs: Vec<(String, String, String, Option<String>)> = Vec::new();
     deps.retain(
         |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
             Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
@@ -755,6 +760,10 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 link_specs.push((local_name.clone(), path));
                 false
             }
+            Ok(lpm_resolver::Specifier::Git { url, refspec }) => {
+                git_specs.push((local_name.clone(), raw.clone(), url, refspec));
+                false
+            }
             _ => true,
         },
     );
@@ -763,12 +772,14 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         && file_tarball_specs.is_empty()
         && directory_specs.is_empty()
         && link_specs.is_empty()
+        && git_specs.is_empty()
     {
         return Ok(NonRegistryPreResolveResult {
             install_pkgs: Vec::new(),
             source_deps: HashMap::new(),
             additional_workspace_links: Vec::new(),
             optional_registry_roots: inherited_optional_registry_roots.clone(),
+            resolved_git_sources: HashMap::new(),
         });
     }
 
@@ -776,7 +787,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         tarball_url_specs.len()
             + file_tarball_specs.len()
             + directory_specs.len()
-            + link_specs.len(),
+            + link_specs.len()
+            + git_specs.len(),
     );
 
     // workspace members
@@ -787,6 +799,67 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // symlink. Empty for non-workspace projects (the / the invariant
     // checks short-circuit on empty `workspace_members`).
     let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
+    let mut git_source_deps: HashMap<String, Vec<SourceDep>> = HashMap::new();
+    let mut resolved_git_sources = HashMap::with_capacity(git_specs.len());
+
+    for (local_name, raw_spec, url, reference) in git_specs {
+        let resolved = resolve_github_source(&url, reference.as_deref()).await?;
+        let (archive, downloaded_sri) =
+            download_github_archive(&resolved.archive_url, None).await?;
+        let (package_dir, integrity) = if let Some(store_v2) = store_v2 {
+            let (object_dir, integrity, _) =
+                store_v2.extract_object_from_bytes(&archive, Some(&downloaded_sri))?;
+            (object_dir, integrity)
+        } else {
+            (
+                store.store_tarball_at_cas_path(&downloaded_sri, &archive)?,
+                downloaded_sri,
+            )
+        };
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
+            &package_dir,
+            &format!("GitHub dependency {}", resolved.locked_source),
+            MissingVersionPolicy::Require,
+        )?;
+        if local_name != real_name && !json_output {
+            output::warn(&format!(
+                "dep '{}' resolves to package '{}' from GitHub; using the dependency key as the node_modules link name",
+                lpm_common::sanitize_terminal_inline(&local_name),
+                lpm_common::sanitize_terminal_inline(&real_name),
+            ));
+        }
+        collect_git_source_dependencies(
+            &package_dir,
+            &resolved.locked_source,
+            deps,
+            &mut git_source_deps,
+        )?;
+        resolved_git_sources.insert(raw_spec, resolved.locked_source.clone());
+        let promoted = promoted_git_root_names.contains(&local_name);
+        install_pkgs.push(InstallPackage {
+            name: real_name,
+            version: real_version,
+            source: resolved.locked_source,
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(if promoted {
+                Vec::new()
+            } else {
+                vec![local_name]
+            }),
+            is_direct: !promoted,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: Some(integrity),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine,
+            optional: false,
+            tarball_url: Some(resolved.archive_url),
+            metadata_checked_for_tarball: false,
+        });
+    }
 
     // ── Arm 1: — remote tarball URLs ──────────────────────
     for (local_name, url, declared_integrity) in tarball_url_specs {
@@ -1259,8 +1332,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     //
     let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let LocalSourceExpansionResult {
-        source_deps: source_deps_out,
+        source_deps: mut source_deps_out,
         additional_workspace_links,
+        promoted_git_root_names: _,
     } = expand_local_source_install_packages(
         project_dir,
         deps,
@@ -1269,6 +1343,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         json_output,
         WorkspaceTransitiveMode::RootSymlinkOnly,
     )?;
+    source_deps_out.extend(git_source_deps);
     let optional_registry_roots = merge_optional_registry_roots(
         &dependency_names_before_expansion,
         inherited_optional_registry_roots,
@@ -1280,6 +1355,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         source_deps: source_deps_out,
         additional_workspace_links,
         optional_registry_roots,
+        resolved_git_sources,
     })
 }
 
@@ -1448,10 +1524,8 @@ fn project_relative_source_path(project_dir: &Path, source_realpath: &Path) -> S
 /// Walks `dependencies` + `peerDependencies` + `optionalDependencies`.
 /// `devDependencies` belong to the source project itself and are not
 /// transitive dependencies of a consumer. Each entry is classified as:
-/// The resolver only special-cases `npm:` aliases at the root level;
-/// everything else gets fed into [`lpm_resolver::ranges::NpmRange::parse`],
-/// which rejects URL and git specs as invalid semver ranges. Unsupported
-/// transitive shapes must fail here before they reach the resolver.
+/// Registry entries flow to the semver resolver, while source-backed
+/// entries are classified before they can be mistaken for version ranges.
 ///
 /// Allowed shapes:
 /// - `DepKind::Registry` for SemverRange / NpmAlias —
@@ -1460,12 +1534,13 @@ fn project_relative_source_path(project_dir: &Path, source_realpath: &Path) -> S
 /// - `DepKind::FileDir` for `file:` specs whose target is a
 ///   directory.
 /// - `DepKind::Link` for `link:` specs (always a directory).
+/// - `DepKind::Git` for Git sources promoted into the non-registry
+///   source pipeline by the v2 workspace graph.
 ///
 /// Rejected shapes (typed [`LpmError::Registry`] error from
 /// [`classify_source_dep`]):
 /// - `https://` Tarball — would crash the resolver.
 /// - `file:` whose target is a regular file (tarball) — same.
-/// - `git+…` / git host shorthand — same.
 /// - `Specifier::parse` errors (empty path, invalid host
 ///   shorthand, etc.).
 ///
@@ -1590,9 +1665,7 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
                     ))
                 })?;
             let effective_raw = normalized_spec.as_deref().unwrap_or(raw_str);
-            // Invariant invariant: classify_source_dep now
-            // returns a typed error for tarball-URL / file:tarball /
-            // git transitives. Propagate at the manifest-read
+            // Propagate tarball-URL and file:tarball errors at the manifest-read
             // boundary so the user sees a clear actionable message
             // pointing at the offending source dir + dep key,
             // instead of a deep "invalid semver range" error from
@@ -1611,6 +1684,33 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
         }
     }
     Ok(out)
+}
+
+fn collect_git_source_dependencies(
+    package_dir: &Path,
+    parent_source: &str,
+    resolver_dependencies: &mut HashMap<String, String>,
+    source_dependencies: &mut HashMap<String, Vec<SourceDep>>,
+) -> Result<(), LpmError> {
+    let specs = read_source_dep_specs(package_dir)?;
+    for spec in &specs {
+        match spec.kind {
+            DepKind::Registry if spec.auto_install => {
+                resolver_dependencies
+                    .entry(spec.local_name.clone())
+                    .or_insert_with(|| spec.raw_spec.clone());
+            }
+            DepKind::Registry => {}
+            DepKind::Workspace | DepKind::FileDir | DepKind::Link | DepKind::Git => {
+                return Err(LpmError::Registry(format!(
+                    "GitHub dependency {:?} declares unsupported nested non-registry dependency {:?} ({:?}); publish or vendor that nested source",
+                    parent_source, spec.local_name, spec.raw_spec
+                )));
+            }
+        }
+    }
+    source_dependencies.insert(parent_source.to_string(), specs);
+    Ok(())
 }
 
 /// Classify a single transitive dep spec from inside a local-source
@@ -1639,8 +1739,6 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
 ///   support.
 /// - `file:<path>` whose target is a regular file (a tarball) —
 ///   same reason as above.
-/// - `git+…` / git shorthand (`github:user/repo`, etc.) — same
-///   resolver-crash story.
 /// - `Specifier::parse` errors propagate as a typed manifest-
 ///   boundary error.
 ///
@@ -1661,11 +1759,9 @@ pub(super) fn classify_source_dep(
     let unsupported_transitive = |kind: &str| -> LpmError {
         LpmError::Registry(format!(
             "transitive non-registry dep `{dep_name}` (\"{raw}\", a {kind}) declared in \
-             {} is not supported in v1 — only registry, file: directory, and link: \
-             specifiers may appear in a local-source's transitive dependency graph. \
-             Tarball-URL, file:tarball, and git transitives crash the resolver because \
-             they're not valid semver ranges. Workaround: hoist the dep to your \
-             project's package.json (immediate non-registry deps work).",
+             {} is not supported in a local-source dependency graph. Remote and file: \
+             tarballs cannot be represented as resolver ranges; publish or vendor the \
+             nested dependency instead.",
             base_dir.display(),
         ))
     };
@@ -1699,7 +1795,7 @@ pub(super) fn classify_source_dep(
             }
         }
         Ok(lpm_resolver::Specifier::Tarball { .. }) => Err(unsupported_transitive("tarball URL")),
-        Ok(lpm_resolver::Specifier::Git { .. }) => Err(unsupported_transitive("git source")),
+        Ok(lpm_resolver::Specifier::Git { .. }) => Ok(DepKind::Git),
         Err(e) => Err(LpmError::Registry(format!(
             "invalid transitive dep spec for `{dep_name}` (\"{raw}\") declared in {}: {e}",
             base_dir.display(),
@@ -1872,6 +1968,7 @@ fn promote_workspace_member_source_graph(
     node_modules_warned: &mut std::collections::HashSet<PathBuf>,
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
     workspace_transitives: WorkspaceTransitiveMode,
+    promoted_git_root_names: &mut HashSet<String>,
     inherited_optional: bool,
 ) -> Result<(), LpmError> {
     let realpath = match matched_member.resolution_dir().canonicalize() {
@@ -1936,6 +2033,7 @@ fn promote_workspace_member_source_graph(
         node_modules_warned,
         additional_workspace_links,
         workspace_transitives,
+        promoted_git_root_names,
         inherited_optional || spec.optional,
     )
 }
@@ -1989,6 +2087,7 @@ pub(super) fn recurse_local_source_deps(
     // silently dropped the member from the root-symlink set.
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
     workspace_transitives: WorkspaceTransitiveMode,
+    promoted_git_root_names: &mut HashSet<String>,
     inherited_optional: bool,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
@@ -2009,6 +2108,27 @@ pub(super) fn recurse_local_source_deps(
                 consumer_deps_map
                     .entry(spec.local_name.clone())
                     .or_insert_with(|| spec.raw_spec.clone());
+            }
+            DepKind::Git => {
+                if !spec.auto_install {
+                    continue;
+                }
+                if matches!(
+                    workspace_transitives,
+                    WorkspaceTransitiveMode::RootSymlinkOnly
+                ) {
+                    return Err(LpmError::Registry(format!(
+                        "Git dependency {:?} declared in {} requires the v2 source graph",
+                        spec.local_name,
+                        source_dir.display()
+                    )));
+                }
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    consumer_deps_map.entry(spec.local_name.clone())
+                {
+                    entry.insert(spec.raw_spec.clone());
+                    promoted_git_root_names.insert(spec.local_name.clone());
+                }
             }
             DepKind::Workspace => {
                 let matched_member = workspace_members.iter().find(|m| m.name == spec.local_name);
@@ -2072,6 +2192,7 @@ pub(super) fn recurse_local_source_deps(
                     node_modules_warned,
                     additional_workspace_links,
                     workspace_transitives,
+                    promoted_git_root_names,
                     optional_path,
                 )?;
             }
@@ -2155,6 +2276,7 @@ pub(super) fn recurse_local_source_deps(
                                 node_modules_warned,
                                 additional_workspace_links,
                                 workspace_transitives,
+                                promoted_git_root_names,
                                 optional_path,
                             )?;
                         }
@@ -2175,7 +2297,7 @@ pub(super) fn recurse_local_source_deps(
                 let source_string = match spec.kind {
                     DepKind::FileDir => format!("directory+{source_path}"),
                     DepKind::Link => format!("link+{source_path}"),
-                    DepKind::Registry | DepKind::Workspace => unreachable!(),
+                    DepKind::Registry | DepKind::Workspace | DepKind::Git => unreachable!(),
                 };
                 spec.target_source = Some(source_string.clone());
                 visited.insert(realpath.clone(), source_string.clone());
@@ -2221,6 +2343,7 @@ pub(super) fn recurse_local_source_deps(
                     node_modules_warned,
                     additional_workspace_links,
                     workspace_transitives,
+                    promoted_git_root_names,
                     inherited_optional || spec.optional,
                 )?;
             }
@@ -2230,8 +2353,23 @@ pub(super) fn recurse_local_source_deps(
     Ok(())
 }
 
+pub(super) fn bind_resolved_git_source_dependencies(
+    source_deps: &mut HashMap<String, Vec<SourceDep>>,
+    resolved_git_sources: &HashMap<String, String>,
+) {
+    for specs in source_deps.values_mut() {
+        for spec in specs {
+            if matches!(spec.kind, DepKind::Git)
+                && let Some(source) = resolved_git_sources.get(&spec.raw_spec)
+            {
+                spec.target_source = Some(source.clone());
+            }
+        }
+    }
+}
+
 /// post-resolve fix-up that
-/// populates each directory/link `InstallPackage.dependencies`
+/// populates each source-backed `InstallPackage.dependencies`
 /// field.
 ///
 /// **Resolver-agnostic** (per plan): runs after the merged
@@ -2239,7 +2377,7 @@ pub(super) fn recurse_local_source_deps(
 /// AND the non-registry merge), regardless of which resolver
 /// produced the registry portion.
 ///
-/// For each directory/link InstallPackage, looks up its source-deps
+/// For each directory, link, or Git InstallPackage, looks up its source-deps
 /// in `source_deps` and produces `(local_name, target_segment_value)`
 /// pairs for the linker:
 ///
@@ -2247,12 +2385,12 @@ pub(super) fn recurse_local_source_deps(
 ///   version comes from another InstallPackage in `packages` whose
 ///   name matches. The linker uses this to build
 ///   `<safe>@<resolved_version>/...` symlink targets.
-/// - FileDir/Link dep → `(local_name, source_id)` from the exact
+/// - FileDir/Link/Git dep → `(local_name, source_id)` from the exact
 ///   `target_source` recorded by the recursive local-source walker.
 ///
 /// Missing-from-packages registry deps are skipped (the resolver
 /// failed to provide a version, which is a separate bug surfaced
-/// upstream). Missing-from-source_deps directory/link InstallPackages
+/// upstream). Missing-from-source_deps source-backed InstallPackages
 /// (not in the map) are left with empty dependencies — common for
 /// CAS-backed deps the work doesn't touch.
 pub(super) fn apply_post_resolve_directory_link_fixup(
@@ -2268,7 +2406,9 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
     for p in packages.iter() {
         if let Ok(s) = p.source_kind() {
             match s {
-                lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. } => {
+                lpm_lockfile::Source::Directory { .. }
+                | lpm_lockfile::Source::Link { .. }
+                | lpm_lockfile::Source::Git { .. } => {
                     if let Some(sid) = p.wrapper_id_for_source() {
                         source_to_source_id.entry(p.source.clone()).or_insert(sid);
                     }
@@ -2287,11 +2427,13 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
         let Ok(s) = p.source_kind() else {
             continue;
         };
-        let is_local = matches!(
+        let is_source_backed = matches!(
             s,
-            lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. }
+            lpm_lockfile::Source::Directory { .. }
+                | lpm_lockfile::Source::Link { .. }
+                | lpm_lockfile::Source::Git { .. }
         );
-        if !is_local {
+        if !is_source_backed {
             continue;
         }
         let Some(specs) = source_deps.get(&p.source) else {
@@ -2320,11 +2462,18 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                     // create a symlink without a corresponding
                     // wrapper.
                 }
-                DepKind::FileDir | DepKind::Link | DepKind::Workspace => {
+                DepKind::FileDir | DepKind::Link | DepKind::Workspace | DepKind::Git => {
                     if let Some(target_source) = &spec.target_source
                         && let Some(sid) = source_to_source_id.get(target_source)
                     {
                         deps_out.push((spec.local_name.clone(), sid.clone()));
+                    } else if matches!(spec.kind, DepKind::Git)
+                        && let Some((_, locked_target)) = p
+                            .dependencies
+                            .iter()
+                            .find(|(local_name, _)| local_name == &spec.local_name)
+                    {
+                        deps_out.push((spec.local_name.clone(), locked_target.clone()));
                     }
                 }
             }

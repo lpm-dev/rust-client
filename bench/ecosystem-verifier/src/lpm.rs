@@ -15,6 +15,15 @@ use crate::workspace::{
     relative_path,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PackageTarget {
+    version: String,
+    instance: String,
+    source_backed: bool,
+}
+
+type PackageTargets = BTreeMap<(String, String), Vec<PackageTarget>>;
+
 pub fn normalize(workspace: &Path) -> Result<CanonicalGraph> {
     let workspace = canonical_workspace(workspace)?;
     let lockfiles = discover_files(&workspace, lpm_lockfile::LOCKFILE_NAME)?;
@@ -114,19 +123,31 @@ fn normalize_importer(
     workspace_packages: &BTreeMap<String, String>,
 ) -> (ImporterGraph, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
-    let mut package_ids = BTreeMap::<(String, String), Vec<String>>::new();
+    let mut package_ids = PackageTargets::new();
     let mut package_templates = Vec::with_capacity(lockfile.packages.len());
     for package in &lockfile.packages {
         let id = lpm_instance_id(package);
+        let wrapper_id = source_wrapper_id(package);
+        let target = PackageTarget {
+            version: package.version.clone(),
+            instance: id.clone(),
+            source_backed: wrapper_id.is_some(),
+        };
         package_ids
             .entry((package.name.clone(), package.version.clone()))
             .or_default()
-            .push(id.clone());
+            .push(target.clone());
+        if let Some(wrapper_id) = wrapper_id {
+            package_ids
+                .entry((package.name.clone(), wrapper_id))
+                .or_default()
+                .push(target);
+        }
         package_templates.push((id, package));
     }
-    for ids in package_ids.values_mut() {
-        ids.sort();
-        ids.dedup();
+    for targets in package_ids.values_mut() {
+        targets.sort();
+        targets.dedup();
     }
 
     let mut packages = BTreeMap::new();
@@ -273,7 +294,7 @@ fn append_ambient_peer_edges(
     edges: &mut Vec<DependencyEdge>,
     importer_path: &str,
     lockfile: &Lockfile,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     workspace_packages: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -307,6 +328,7 @@ fn append_ambient_peer_edges(
                 lockfile,
                 package_ids,
                 workspace_packages,
+                DiagnosticSeverity::Error,
                 diagnostics,
             ),
         });
@@ -316,7 +338,7 @@ fn append_ambient_peer_edges(
 fn retain_reachable_packages(
     packages: &mut BTreeMap<String, PackageInstance>,
     direct_dependencies: &[DependencyEdge],
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
 ) {
     let mut pending = VecDeque::new();
     for edge in direct_dependencies {
@@ -342,7 +364,7 @@ fn retain_reachable_packages(
 
 fn enqueue_target(
     target: &TargetReference,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     pending: &mut VecDeque<String>,
 ) {
     if let Some(instance) = &target.instance {
@@ -355,8 +377,8 @@ fn enqueue_target(
     let (Some(name), Some(version)) = (&target.name, &target.version) else {
         return;
     };
-    if let Some(ids) = package_ids.get(&(name.clone(), version.clone())) {
-        pending.extend(ids.iter().cloned());
+    if let Some(targets) = package_ids.get(&(name.clone(), version.clone())) {
+        pending.extend(targets.iter().map(|target| target.instance.clone()));
     }
 }
 
@@ -367,7 +389,7 @@ fn append_direct_edges(
     dependencies: &BTreeMap<String, String>,
     kind: DependencyKind,
     lockfile: &Lockfile,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     workspace_packages: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -385,6 +407,11 @@ fn append_direct_edges(
             lockfile,
             package_ids,
             workspace_packages,
+            if kind == DependencyKind::Optional {
+                DiagnosticSeverity::Warning
+            } else {
+                DiagnosticSeverity::Error
+            },
             diagnostics,
         );
         edges.push(DependencyEdge {
@@ -403,19 +430,21 @@ fn direct_target(
     target_name: &str,
     specifier: &str,
     lockfile: &Lockfile,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     workspace_packages: &BTreeMap<String, String>,
+    unresolved_severity: DiagnosticSeverity,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> TargetReference {
     if specifier.starts_with("workspace:") {
         return workspace_packages.get(target_name).map_or_else(
             || {
-                unresolved_edge(
+                unresolved_edge_with_severity(
                     importer_path,
                     local_name,
                     Some(target_name),
                     None,
                     "workspace package name is not present in discovered manifests",
+                    unresolved_severity,
                     diagnostics,
                 )
             },
@@ -445,12 +474,13 @@ fn direct_target(
 
     if let Some(selection) = lockfile.root_resolutions.get(local_name) {
         if selection.package != target_name {
-            return unresolved_edge(
+            return unresolved_edge_with_severity(
                 importer_path,
                 local_name,
                 Some(target_name),
                 Some(&selection.version),
                 "exact root selection disagrees with the importer target",
+                unresolved_severity,
                 diagnostics,
             );
         }
@@ -460,22 +490,24 @@ fn direct_target(
                 && package.source == selection.source
         });
         let Some(package) = matches.next() else {
-            return unresolved_edge(
+            return unresolved_edge_with_severity(
                 importer_path,
                 local_name,
                 Some(target_name),
                 Some(&selection.version),
                 "exact root selection is absent from the lockfile package closure",
+                unresolved_severity,
                 diagnostics,
             );
         };
         if matches.next().is_some() {
-            return unresolved_edge(
+            return unresolved_edge_with_severity(
                 importer_path,
                 local_name,
                 Some(target_name),
                 Some(&selection.version),
                 "exact root selection matches multiple locked package rows",
+                unresolved_severity,
                 diagnostics,
             );
         }
@@ -505,12 +537,13 @@ fn direct_target(
         .or_else(|| select_satisfying_candidate(&candidates, range.as_deref()))
         .or_else(|| (candidates.len() == 1).then(|| candidates[0]));
     let Some(package) = selected else {
-        return unresolved_edge(
+        return unresolved_edge_with_severity(
             importer_path,
             local_name,
             Some(target_name),
             None,
             "no unique locked package satisfies the importer specifier",
+            unresolved_severity,
             diagnostics,
         );
     };
@@ -528,7 +561,7 @@ fn direct_target(
 fn lpm_package_edges(
     importer_path: &str,
     package: &LockedPackage,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     workspace_packages: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<DependencyEdge> {
@@ -585,7 +618,7 @@ fn lpm_package_edges(
 fn parse_peer_bindings(
     importer_path: &str,
     package: &LockedPackage,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     workspace_packages: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeMap<String, TargetReference> {
@@ -622,24 +655,32 @@ fn exact_target(
     local_name: &str,
     target_name: &str,
     version: &str,
-    package_ids: &BTreeMap<(String, String), Vec<String>>,
+    package_ids: &PackageTargets,
     workspace_packages: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> TargetReference {
     let key = (target_name.to_string(), version.to_string());
     match package_ids.get(&key).map(Vec::as_slice) {
-        Some([id]) => TargetReference::package(target_name, version, id.clone()),
-        Some(ids) => unresolved_edge(
-            importer_path,
-            local_name,
-            Some(target_name),
-            Some(version),
-            &format!(
-                "{} package instances share this name and version",
-                ids.len()
-            ),
-            diagnostics,
-        ),
+        Some(targets) => {
+            if let Some(target) = unique_plain_target(targets) {
+                return TargetReference::package(
+                    target_name,
+                    &target.version,
+                    target.instance.clone(),
+                );
+            }
+            unresolved_edge(
+                importer_path,
+                local_name,
+                Some(target_name),
+                Some(version),
+                &format!(
+                    "{} package instances share this name and version",
+                    targets.len()
+                ),
+                diagnostics,
+            )
+        }
         None => workspace_packages.get(target_name).map_or_else(
             || {
                 unresolved_edge(
@@ -656,6 +697,15 @@ fn exact_target(
     }
 }
 
+fn unique_plain_target(targets: &[PackageTarget]) -> Option<&PackageTarget> {
+    if let [target] = targets {
+        return Some(target);
+    }
+    let mut plain = targets.iter().filter(|target| !target.source_backed);
+    let target = plain.next()?;
+    plain.next().is_none().then_some(target)
+}
+
 fn unresolved_edge(
     importer_path: &str,
     local_name: &str,
@@ -664,8 +714,28 @@ fn unresolved_edge(
     reason: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> TargetReference {
+    unresolved_edge_with_severity(
+        importer_path,
+        local_name,
+        target_name,
+        version,
+        reason,
+        DiagnosticSeverity::Error,
+        diagnostics,
+    )
+}
+
+fn unresolved_edge_with_severity(
+    importer_path: &str,
+    local_name: &str,
+    target_name: Option<&str>,
+    version: Option<&str>,
+    reason: &str,
+    severity: DiagnosticSeverity,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TargetReference {
     diagnostics.push(Diagnostic {
-        severity: DiagnosticSeverity::Error,
+        severity,
         code: "lpm_edge_unresolved".into(),
         message: reason.into(),
         importer: Some(importer_path.into()),
@@ -745,6 +815,18 @@ fn lpm_source(package: &LockedPackage) -> PackageSource {
         kind,
         locator,
         integrity: package.integrity.clone(),
+    }
+}
+
+fn source_wrapper_id(package: &LockedPackage) -> Option<String> {
+    match package.source_kind()? {
+        Ok(
+            source @ (Source::Tarball { .. }
+            | Source::Directory { .. }
+            | Source::Link { .. }
+            | Source::Git { .. }),
+        ) => Some(source.source_id()),
+        Ok(Source::Registry { .. }) | Err(_) => None,
     }
 }
 
@@ -1035,6 +1117,102 @@ mod tests {
     }
 
     #[test]
+    fn source_wrapper_dependency_resolves_to_the_package_manifest_version() {
+        let mut git_package = LockedPackage {
+            name: "wa-sqlite".into(),
+            version: "1.0.9".into(),
+            source: Some(
+                "git+https://github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7"
+                    .into(),
+            ),
+            integrity: Some("sha512-YQ==".into()),
+            ..LockedPackage::default()
+        };
+        let source_wrapper = Source::parse(
+            git_package
+                .source
+                .as_deref()
+                .expect("Git package should have a source"),
+        )
+        .expect("Git source should parse")
+        .source_id();
+        let mut parent = registry_package("parent", "1.0.0");
+        parent
+            .dependencies
+            .push(format!("wa-sqlite@{source_wrapper}"));
+        git_package.dependencies.push("child@1.0.0".into());
+        let lockfile = Lockfile {
+            importers: BTreeMap::from([(
+                ".".into(),
+                ImporterSnapshot {
+                    dependencies: BTreeMap::from([("parent".into(), "1.0.0".into())]),
+                    ..ImporterSnapshot::default()
+                },
+            )]),
+            packages: vec![registry_package("child", "1.0.0"), git_package, parent],
+            root_resolutions: BTreeMap::from([(
+                "parent".into(),
+                lpm_lockfile::LockedRootResolution {
+                    package: "parent".into(),
+                    version: "1.0.0".into(),
+                    source: Some("registry+https://registry.npmjs.org".into()),
+                },
+            )]),
+            ..Lockfile::default()
+        };
+
+        let (importer, diagnostics) = normalize_importer(".", &lockfile, &BTreeMap::new());
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let parent = &importer.packages["parent@1.0.0"];
+        let target = &parent.dependencies[0].target;
+        assert_eq!(target.version.as_deref(), Some("1.0.9"));
+        assert!(
+            target
+                .instance
+                .as_deref()
+                .is_some_and(|instance| instance.contains("[source=git+https://github.com/"))
+        );
+    }
+
+    #[test]
+    fn plain_version_dependency_prefers_registry_over_same_version_source_package() {
+        let mut parent = registry_package("parent", "1.0.0");
+        parent.dependencies.push("plugin@1.0.0".into());
+        let source_plugin = LockedPackage {
+            name: "plugin".into(),
+            version: "1.0.0".into(),
+            source: Some("directory+packages/plugin".into()),
+            ..LockedPackage::default()
+        };
+        let lockfile = Lockfile {
+            importers: BTreeMap::from([(
+                ".".into(),
+                ImporterSnapshot {
+                    dependencies: BTreeMap::from([("parent".into(), "1.0.0".into())]),
+                    ..ImporterSnapshot::default()
+                },
+            )]),
+            packages: vec![parent, registry_package("plugin", "1.0.0"), source_plugin],
+            root_resolutions: BTreeMap::from([(
+                "parent".into(),
+                lpm_lockfile::LockedRootResolution {
+                    package: "parent".into(),
+                    version: "1.0.0".into(),
+                    source: Some("registry+https://registry.npmjs.org".into()),
+                },
+            )]),
+            ..Lockfile::default()
+        };
+
+        let (importer, diagnostics) = normalize_importer(".", &lockfile, &BTreeMap::new());
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let target = &importer.packages["parent@1.0.0"].dependencies[0].target;
+        assert_eq!(target.instance.as_deref(), Some("plugin@1.0.0"));
+    }
+
+    #[test]
     fn missing_direct_target_is_reported_as_unresolved_without_panicking() {
         let lockfile = Lockfile {
             metadata: LockfileMetadata {
@@ -1069,6 +1247,31 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "lpm_edge_unresolved")
         );
+    }
+
+    #[test]
+    fn missing_optional_direct_target_is_an_advisory() {
+        let lockfile = Lockfile {
+            importers: BTreeMap::from([(
+                ".".into(),
+                ImporterSnapshot {
+                    optional_dependencies: BTreeMap::from([(
+                        "optional-native".into(),
+                        "^1.0.0".into(),
+                    )]),
+                    ..ImporterSnapshot::default()
+                },
+            )]),
+            ..Lockfile::default()
+        };
+
+        let (importer, diagnostics) = normalize_importer(".", &lockfile, &BTreeMap::new());
+
+        assert_eq!(
+            importer.direct_dependencies[0].target.kind,
+            TargetKind::Unresolved
+        );
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
     }
 
     #[test]
@@ -1169,6 +1372,7 @@ mod tests {
             &lockfile,
             &package_ids,
             &workspace_packages,
+            DiagnosticSeverity::Error,
             &mut diagnostics,
         );
 

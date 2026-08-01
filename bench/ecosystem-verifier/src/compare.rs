@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use lpm_resolver::{NpmRange, NpmVersion};
@@ -16,6 +17,8 @@ pub struct CompatibilityPolicy {
     pub minimum_release_age_exclude: Vec<String>,
     #[serde(default)]
     pub overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    pub reference_peer_overrides: BTreeMap<String, String>,
     #[serde(default)]
     pub patched_dependencies: BTreeMap<String, String>,
     #[serde(default)]
@@ -304,15 +307,19 @@ fn compare_package_variants(
                 .copied()
                 .or_else(|| {
                     reference.iter().copied().find(|expected| {
+                        let expected_dependencies = comparable_dependencies(expected, None);
+                        let actual_dependencies = comparable_dependencies(actual, Some(expected));
                         edge_shapes_match(
-                            &expected.dependencies,
-                            &actual.dependencies,
+                            &expected_dependencies,
+                            &actual_dependencies,
                             compare_kinds,
                         )
                     })
                 })
                 .unwrap_or(expected_contract);
             compare_package_attributes(importer_path, identity, expected, actual, state);
+            let expected_dependencies = comparable_dependencies(expected, None);
+            let actual_dependencies = comparable_dependencies(actual, Some(expected));
             compare_edge_sets(
                 EdgeComparisonScope {
                     importer_path,
@@ -321,8 +328,8 @@ fn compare_package_variants(
                     compare_kinds,
                     conclusive: true,
                 },
-                &expected.dependencies,
-                &actual.dependencies,
+                &expected_dependencies,
+                &actual_dependencies,
                 state,
             );
         }
@@ -335,6 +342,55 @@ fn compare_package_variants(
             validate_required_peers(importer_path, expected_contract, actual, state);
         }
     }
+}
+
+fn comparable_dependencies<'a>(
+    package: &'a PackageInstance,
+    peer_contract: Option<&PackageInstance>,
+) -> Cow<'a, [DependencyEdge]> {
+    if !package.dependencies.iter().any(|edge| {
+        is_exact_package_self_dependency(package, edge)
+            || peer_contract
+                .is_some_and(|expected| dependency_satisfies_declared_peer(expected, edge))
+    }) {
+        return Cow::Borrowed(&package.dependencies);
+    }
+    Cow::Owned(
+        package
+            .dependencies
+            .iter()
+            .filter(|edge| {
+                !is_exact_package_self_dependency(package, edge)
+                    && !peer_contract
+                        .is_some_and(|expected| dependency_satisfies_declared_peer(expected, edge))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+fn is_exact_package_self_dependency(package: &PackageInstance, edge: &DependencyEdge) -> bool {
+    edge.target.kind == TargetKind::Package
+        && edge.local_name == package.name
+        && edge.target.name.as_deref() == Some(package.name.as_str())
+        && edge.target.version.as_deref() == Some(package.version.as_str())
+}
+
+fn dependency_satisfies_declared_peer(expected: &PackageInstance, edge: &DependencyEdge) -> bool {
+    let Some(range) = expected.declared_peers.get(&edge.local_name) else {
+        return false;
+    };
+    if !expected.peer_bindings.contains_key(&edge.local_name)
+        && !expected.optional_peers.contains(&edge.local_name)
+    {
+        return false;
+    }
+    edge.target.kind == TargetKind::Package
+        && edge
+            .target
+            .version
+            .as_deref()
+            .is_some_and(|version| peer_version_satisfies(range, version))
 }
 
 fn edge_shapes_match(
@@ -609,6 +665,7 @@ fn validate_required_peers(
     actual: &PackageInstance,
     state: &mut ComparisonState,
 ) {
+    let actual_identity = format!("{}@{}", actual.name, actual.version);
     for (peer, range) in &expected.declared_peers {
         if expected.optional_peers.contains(peer) {
             continue;
@@ -648,7 +705,19 @@ fn validate_required_peers(
             );
             continue;
         }
-        let Some(binding) = actual.peer_bindings.get(peer) else {
+        let binding = actual.peer_bindings.get(peer).or_else(|| {
+            actual.dependencies.iter().find_map(|edge| {
+                (edge.local_name == *peer
+                    && edge.target.kind == TargetKind::Package
+                    && edge
+                        .target
+                        .version
+                        .as_deref()
+                        .is_some_and(|version| peer_version_satisfies(range, version)))
+                .then_some(&edge.target)
+            })
+        });
+        let Some(binding) = binding else {
             state.summary.required_peer_violations += 1;
             if let Some(reason) = state.compatibility.explain_peer(peer) {
                 state.warning(
@@ -679,14 +748,30 @@ fn validate_required_peers(
         let satisfies = peer_version_satisfies(range, version);
         if !satisfies {
             state.summary.required_peer_violations += 1;
-            state.error(
-                "required_peer_out_of_range",
-                Some(importer_path),
-                Some(&actual.id),
-                format!("resolved peer {peer}@{version} does not satisfy {range}"),
-                Some(serde_json::json!({"name": peer, "range": range})),
-                Some(serde_json::json!({"name": peer, "version": version})),
-            );
+            if let Some(reason) = state
+                .compatibility
+                .explain_reference_peer_override(&actual_identity, peer)
+            {
+                state.warning(
+                    "inconclusive_override_rewritten_peer_range",
+                    Some(importer_path),
+                    Some(&actual.id),
+                    format!(
+                        "resolved peer {peer}@{version} differs from the reference lockfile range {range}, which may have been rewritten by {reason}"
+                    ),
+                    Some(serde_json::json!({"name": peer, "range": range})),
+                    Some(serde_json::json!({"name": peer, "version": version})),
+                );
+            } else {
+                state.error(
+                    "required_peer_out_of_range",
+                    Some(importer_path),
+                    Some(&actual.id),
+                    format!("resolved peer {peer}@{version} does not satisfy {range}"),
+                    Some(serde_json::json!({"name": peer, "range": range})),
+                    Some(serde_json::json!({"name": peer, "version": version})),
+                );
+            }
         }
     }
 }
@@ -938,6 +1023,16 @@ impl CompatibilityPolicy {
             override_applies(selector, None, peer)
                 .then(|| format!("override {selector} => {target}"))
         })
+    }
+
+    fn explain_reference_peer_override(&self, parent: &str, peer: &str) -> Option<String> {
+        self.reference_peer_overrides
+            .iter()
+            .chain(&self.overrides)
+            .find_map(|(selector, target)| {
+                override_applies(selector, Some(parent), peer)
+                    .then(|| format!("override {selector} => {target}"))
+            })
     }
 }
 
@@ -1313,6 +1408,104 @@ mod tests {
     }
 
     #[test]
+    fn package_dependency_satisfies_same_named_peer_contract() {
+        let mut expected_parent = package("parent", "1.0.0");
+        expected_parent
+            .declared_peers
+            .insert("host".into(), "^1.0.0".into());
+        expected_parent.peer_bindings.insert(
+            "host".into(),
+            TargetReference::package("host", "1.2.0", "host@1.2.0".into()),
+        );
+        expected_parent.id = "parent@1.0.0(host@1.2.0)".into();
+        let mut actual_parent = package("parent", "1.0.0");
+        actual_parent.dependencies.push(DependencyEdge {
+            kind: DependencyKind::Production,
+            local_name: "host".into(),
+            specifier: None,
+            target: TargetReference::package("host", "1.2.0", "host@1.2.0".into()),
+        });
+        let expected = graph("pnpm", vec![expected_parent, package("host", "1.2.0")]);
+        let actual = graph("lpm", vec![actual_parent, package("host", "1.2.0")]);
+
+        let report = compare(&expected, &actual);
+
+        assert!(report.passed, "{:#?}", report.discrepancies);
+        assert_eq!(report.summary.dependency_edge_mismatches, 0);
+        assert_eq!(report.summary.required_peer_violations, 0);
+    }
+
+    #[test]
+    fn package_dependency_is_equivalent_to_unbound_optional_peer() {
+        let mut expected_parent = package("parent", "1.0.0");
+        expected_parent
+            .declared_peers
+            .insert("optional-host".into(), "^1.0.0".into());
+        expected_parent
+            .optional_peers
+            .insert("optional-host".into());
+        let mut actual_parent = package("parent", "1.0.0");
+        actual_parent.dependencies.push(DependencyEdge {
+            kind: DependencyKind::Production,
+            local_name: "optional-host".into(),
+            specifier: None,
+            target: TargetReference::package(
+                "optional-host",
+                "1.2.0",
+                "optional-host@1.2.0".into(),
+            ),
+        });
+        let expected = graph("pnpm", vec![expected_parent]);
+        let actual = graph(
+            "lpm",
+            vec![actual_parent, package("optional-host", "1.2.0")],
+        );
+
+        let report = compare(&expected, &actual);
+
+        assert!(report.passed, "{:#?}", report.discrepancies);
+        assert_eq!(report.summary.dependency_edge_mismatches, 0);
+    }
+
+    #[test]
+    fn package_self_dependency_does_not_change_runtime_topology() {
+        let expected_parent = package("parent", "1.0.0");
+        let mut actual_parent = expected_parent.clone();
+        actual_parent.dependencies.push(DependencyEdge {
+            kind: DependencyKind::Production,
+            local_name: "parent".into(),
+            specifier: None,
+            target: TargetReference::package("parent", "1.0.0", "parent@1.0.0".into()),
+        });
+        let expected = graph("pnpm", vec![expected_parent]);
+        let actual = graph("lpm", vec![actual_parent]);
+
+        let report = compare(&expected, &actual);
+
+        assert!(report.passed, "{:#?}", report.discrepancies);
+        assert_eq!(report.summary.dependency_edge_mismatches, 0);
+    }
+
+    #[test]
+    fn package_dependency_to_different_self_version_remains_topological() {
+        let expected_parent = package("parent", "1.0.0");
+        let mut actual_parent = expected_parent.clone();
+        actual_parent.dependencies.push(DependencyEdge {
+            kind: DependencyKind::Production,
+            local_name: "parent".into(),
+            specifier: None,
+            target: TargetReference::package("parent", "2.0.0", "parent@2.0.0".into()),
+        });
+        let expected = graph("pnpm", vec![expected_parent]);
+        let actual = graph("lpm", vec![actual_parent, package("parent", "2.0.0")]);
+
+        let report = compare(&expected, &actual);
+
+        assert!(!report.passed);
+        assert_eq!(report.summary.dependency_edge_mismatches, 1);
+    }
+
+    #[test]
     fn peer_context_difference_does_not_hide_dependency_topology_failure() {
         let mut expected_parent = package("parent", "1.0.0");
         expected_parent.peer_bindings.insert(
@@ -1476,6 +1669,39 @@ mod tests {
         assert!(report.discrepancies.iter().any(|discrepancy| {
             discrepancy.severity == DiagnosticSeverity::Warning
                 && discrepancy.category == "unsupported_policy_required_peer_missing"
+        }));
+    }
+
+    #[test]
+    fn reference_peer_override_makes_rewritten_range_inconclusive() {
+        let mut expected_parent = package("parent", "1.0.0");
+        expected_parent
+            .declared_peers
+            .insert("host".into(), "1.0.0".into());
+        expected_parent.peer_bindings.insert(
+            "host".into(),
+            TargetReference::package("host", "1.0.0", "host@1.0.0".into()),
+        );
+        expected_parent.id = "parent@1.0.0(host@1.0.0)".into();
+        let mut actual_parent = expected_parent.clone();
+        actual_parent.peer_bindings.insert(
+            "host".into(),
+            TargetReference::package("host", "2.0.0", "host@2.0.0".into()),
+        );
+        actual_parent.id = "parent@1.0.0(host@2.0.0)".into();
+        let expected = graph("pnpm", vec![expected_parent, package("host", "1.0.0")]);
+        let actual = graph("lpm", vec![actual_parent, package("host", "2.0.0")]);
+        let policy = CompatibilityPolicy {
+            reference_peer_overrides: BTreeMap::from([("host".into(), "1.0.0".into())]),
+            ..CompatibilityPolicy::default()
+        };
+
+        let report = compare_with_policy(&expected, &actual, &policy);
+
+        assert!(report.passed, "{:#?}", report.discrepancies);
+        assert!(report.discrepancies.iter().any(|discrepancy| {
+            discrepancy.severity == DiagnosticSeverity::Warning
+                && discrepancy.category == "inconclusive_override_rewritten_peer_range"
         }));
     }
 

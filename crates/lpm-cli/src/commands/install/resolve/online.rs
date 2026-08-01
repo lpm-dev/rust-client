@@ -132,17 +132,40 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         source_deps: non_registry_source_deps,
         additional_workspace_links,
         optional_registry_roots,
-    } = pre_resolve_non_registry_deps_with_optional_registry_roots(
-        &arc_client,
-        &store,
-        project_dir,
-        deps,
-        json_output,
-        strict_integrity,
-        all_workspace_members,
-        &v2_workspace_root_pre_resolve.optional_registry_roots,
-    )
-    .await?;
+        resolved_git_sources,
+    } = if lockfile_result.is_some() {
+        NonRegistryPreResolveResult {
+            install_pkgs: Vec::new(),
+            source_deps: HashMap::new(),
+            additional_workspace_links: Vec::new(),
+            optional_registry_roots: v2_workspace_root_pre_resolve
+                .optional_registry_roots
+                .clone(),
+            resolved_git_sources: HashMap::new(),
+        }
+    } else {
+        pre_resolve_non_registry_deps_with_optional_registry_roots(
+            &arc_client,
+            &store,
+            store_v2_handle.as_deref(),
+            project_dir,
+            deps,
+            json_output,
+            strict_integrity,
+            all_workspace_members,
+            &v2_workspace_root_pre_resolve.optional_registry_roots,
+            &v2_workspace_root_pre_resolve.promoted_git_root_names,
+        )
+        .await?
+    };
+    let bound_v2_source_deps = (!resolved_git_sources.is_empty()).then(|| {
+        let mut source_deps = v2_workspace_root_pre_resolve.source_deps.clone();
+        bind_resolved_git_source_dependencies(&mut source_deps, &resolved_git_sources);
+        source_deps
+    });
+    let v2_source_deps = bound_v2_source_deps
+        .as_ref()
+        .unwrap_or(&v2_workspace_root_pre_resolve.source_deps);
     let resolver_root_dependencies =
         lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots);
 
@@ -612,10 +635,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
 
     if requested_v2_mode && !v2_workspace_root_pre_resolve.install_pkgs.is_empty() {
         packages.extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
-        apply_post_resolve_directory_link_fixup(
-            &mut packages,
-            &v2_workspace_root_pre_resolve.source_deps,
-        );
+        apply_post_resolve_directory_link_fixup(&mut packages, v2_source_deps);
     }
     dedupe_install_packages_by_identity(&mut packages);
 

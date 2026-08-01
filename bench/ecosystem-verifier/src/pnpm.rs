@@ -354,6 +354,17 @@ fn importer_closure(
         }
         let default_metadata = PnpmPackage::default();
         let package_metadata = package_metadata.unwrap_or(&default_metadata);
+        for edge in &dependencies {
+            if package_metadata
+                .peer_dependencies
+                .contains_key(&edge.local_name)
+            {
+                parsed
+                    .peer_bindings
+                    .entry(edge.local_name.clone())
+                    .or_insert_with(|| edge.target.clone());
+            }
+        }
         parsed
             .peer_bindings
             .retain(|name, _| package_metadata.peer_dependencies.contains_key(name));
@@ -521,6 +532,9 @@ fn parse_instance<'a>(
             patch_hash = Some(hash.into());
             continue;
         }
+        if is_hashed_peer_context(context) {
+            continue;
+        }
         let peer_base = context.split('(').next().unwrap_or(context);
         let Some((peer_name, peer_version)) = split_name_version(peer_base) else {
             return Err(VerifierError::InvalidPnpmReference {
@@ -590,6 +604,10 @@ fn split_name_version(reference: &str) -> Option<(&str, &str)> {
         .map(|(index, _)| index)?;
     let version = &reference[position + 1..];
     (!version.is_empty()).then_some((&reference[..position], version))
+}
+
+fn is_hashed_peer_context(context: &str) -> bool {
+    context.len() == 32 && context.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn pnpm_source(package: &PnpmPackage) -> PackageSource {
@@ -800,6 +818,53 @@ snapshots:
             parsed.peer_bindings["vitest"].version.as_deref(),
             Some("4.1.10")
         );
+    }
+
+    #[test]
+    fn hashed_peer_context_uses_snapshot_dependencies_for_peer_bindings() {
+        const PEER_HASH: &str = "3b1a25b0995775fe57cda10016bb2bdd";
+        let lockfile = format!(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      react-dom:
+        specifier: ^19.0.0
+        version: 19.1.0({PEER_HASH})
+packages:
+  react@19.1.0:
+    resolution: {{integrity: sha512-react}}
+  react-dom@19.1.0:
+    resolution: {{integrity: sha512-dom}}
+    peerDependencies:
+      react: ^19.0.0
+snapshots:
+  react@19.1.0: {{}}
+  react-dom@19.1.0({PEER_HASH}):
+    dependencies:
+      react: 19.1.0
+"#
+        );
+        let parsed: PnpmLockfile = serde_yaml::from_str(&lockfile).expect("parse fixture");
+
+        let graph = normalize_parsed(
+            Path::new("/fixture"),
+            "9.0".into(),
+            parsed,
+            &BTreeMap::new(),
+        )
+        .expect("normalize hashed peer context");
+
+        let package = &graph.importers["."].packages[&format!("react-dom@19.1.0({PEER_HASH})")];
+        assert_eq!(
+            package
+                .peer_bindings
+                .get("react")
+                .and_then(|target| target.version.as_deref()),
+            Some("19.1.0")
+        );
+        assert!(package.dependencies.is_empty());
     }
 
     #[test]

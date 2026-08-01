@@ -97,6 +97,7 @@ impl PackageKey {
 ///   attestation again.
 /// - **v8**: exact root-link selections. Warm installs replay the resolver's
 ///   chosen direct and ambient root packages instead of inferring versions.
+/// - **v9**: Git dependency sources are pinned to an exact commit.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -107,7 +108,8 @@ impl PackageKey {
 pub const LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES: u32 = 6;
 pub const LOCKFILE_VERSION_WITH_PROVENANCE: u32 = 7;
 pub const LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS: u32 = 8;
-pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS;
+pub const LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS: u32 = 9;
+pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -548,6 +550,22 @@ impl LockedPackage {
         };
         if is_lpm_origin(&url) { None } else { Some(url) }
     }
+
+    pub fn git_metadata_error(&self) -> Option<&'static str> {
+        match self.source_kind() {
+            Some(Ok(Source::Git { url })) => {
+                if !is_safe_github_source(&url) {
+                    return Some("git source is not a pinned public GitHub repository");
+                }
+                if self.integrity.as_deref().is_none_or(str::is_empty) {
+                    return Some("git source is missing archive integrity");
+                }
+                None
+            }
+            Some(Ok(_)) | None => None,
+            Some(Err(_)) => None,
+        }
+    }
 }
 
 /// `https://lpm.dev` (+ subdomains) and `http://localhost` /
@@ -639,6 +657,20 @@ impl Lockfile {
         self.packages.insert(pos, pkg);
     }
 
+    pub(crate) fn git_schema_error(&self) -> Option<String> {
+        if self.metadata.lockfile_version >= LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS {
+            return None;
+        }
+        self.packages.iter().find_map(|package| {
+            matches!(package.source_kind(), Some(Ok(Source::Git { .. }))).then(|| {
+                format!(
+                    "package {:?} uses Git metadata, which requires lockfile version {}",
+                    package.name, LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+                )
+            })
+        })
+    }
+
     /// Package-shape invariants that hold for both the TOML and
     /// binary read sides. Currently: `@lpm.dev/*` scope-pinning.
     pub fn validate_loaded_packages(packages: &[LockedPackage]) -> Result<(), LockfileError> {
@@ -648,6 +680,12 @@ impl Lockfile {
                     package: pkg.name.clone(),
                     url,
                 });
+            }
+            if let Some(reason) = pkg.git_metadata_error() {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} has invalid git metadata: {reason}",
+                    pkg.name
+                )));
             }
         }
         Ok(())
@@ -816,9 +854,9 @@ impl Default for Lockfile {
 
 /// Validate that a package source URL in the lockfile is safe.
 ///
-/// Only HTTPS registries and localhost (for development) are accepted.
-/// Returns `false` for HTTP (non-localhost), file://, ftp://, or other schemes
-/// that could indicate a tampered lockfile redirecting downloads to a malicious server.
+/// Accepts HTTPS registries, localhost registries used for development,
+/// and public GitHub repositories pinned to an exact lowercase commit.
+/// Returns `false` for insecure or credential-bearing network sources.
 pub fn is_safe_source(source: &str) -> bool {
     // Allow HTTPS registries (any host)
     if source.starts_with("registry+https://") {
@@ -830,5 +868,50 @@ pub fn is_safe_source(source: &str) -> bool {
     {
         return true;
     }
-    false
+    is_safe_github_source(source)
+}
+
+fn is_safe_github_source(source: &str) -> bool {
+    let Some(raw_url) = source.strip_prefix("git+") else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    let Some(commit) = url.fragment() else {
+        return false;
+    };
+    if commit.len() != 40
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || commit.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let mut segments = match url.path_segments() {
+        Some(segments) => segments,
+        None => return false,
+    };
+    let owner = segments.next();
+    let repository = segments.next();
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && owner.is_some_and(is_safe_github_component)
+        && repository.is_some_and(|name| {
+            name.strip_suffix(".git")
+                .is_some_and(is_safe_github_component)
+        })
+        && segments.next().is_none()
+}
+
+fn is_safe_github_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }

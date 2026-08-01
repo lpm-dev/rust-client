@@ -25,9 +25,10 @@ pub use io::ensure_gitattributes;
 pub use model::{
     CatalogSnapshotEntry, CatalogSnapshots, DEFAULT_RESOLVED_WITH, ImporterSnapshot,
     ImporterSnapshots, LOCKFILE_NAME, LOCKFILE_VERSION, LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
-    LOCKFILE_VERSION_WITH_PROVENANCE, LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS, LockedPackage,
-    LockedProvenance, LockedRegistrySignature, LockedRootResolution, Lockfile, LockfileMetadata,
-    LockfilePatch, LockfilePatches, PackageKey, RootResolutions, is_safe_source,
+    LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS, LOCKFILE_VERSION_WITH_PROVENANCE,
+    LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS, LockedPackage, LockedProvenance,
+    LockedRegistrySignature, LockedRootResolution, Lockfile, LockfileMetadata, LockfilePatch,
+    LockfilePatches, PackageKey, RootResolutions, is_safe_source,
 };
 pub use source::{Source, SourceParseError};
 

@@ -128,16 +128,16 @@ function runProject(project) {
     const importerInventoryPath = path.join(projectOutput, 'lpm-importers.json');
     const importerPaths = discoverLpmImporterPaths(lpmDir, importerInventoryPath);
     result.policy_normalization = applyEquivalentLpmPolicy(lpmDir, pnpmPolicy, importerPaths);
+    result.policy_normalization.correction_verification =
+      applyPinnedLpmVerificationPolicy(project, lpmDir);
     result.reference_compatibility = applyPinnedReferenceCompatibility(
       project,
       result.policy_normalization,
     );
-    const compatibilityPath = path.join(projectOutput, 'unsupported-pnpm-policy.json');
-    writeJson(compatibilityPath, result.policy_normalization.unsupported);
-    const lpmEnv = lpmCorrectionEnvironment(
-      path.join(projectWork, 'lpm-state'),
-      result.policy_normalization,
-    );
+    const compatibilityPath = path.join(projectOutput, 'comparison-policy.json');
+    writeJson(compatibilityPath, comparisonPolicy(result.policy_normalization));
+    const lpmStateRoot = path.join(projectWork, 'lpm-state');
+    const lpmEnv = lpmCorrectionEnvironment(lpmStateRoot, result.policy_normalization);
 
     const permittedUnusedPatches = expectedUnusedPatches(project);
     const pnpmArgs = pnpmInstallArgs(project, materializeReference);
@@ -197,16 +197,7 @@ function runProject(project) {
     });
     result.stages.lpm_install = stageResult(lpmInstall);
     if (lpmInstall.error || lpmInstall.status !== 0) {
-      const capabilityGap = classifyLpmInstallCapabilityGap(lpmInstall);
-      if (capabilityGap == null) {
-        throw loggedCommandFailure(`${project.id}:lpm-install`, lpmInstall);
-      }
-      result.status = 'capability_gap';
-      result.capability_gap = capabilityGap;
-      console.log(
-        `[${project.id}] capability gap: ${capabilityGap.package} uses unsupported Git source ${capabilityGap.specifier}`,
-      );
-      return finishProject(result, projectOutput, projectWork);
+      throw loggedCommandFailure(`${project.id}:lpm-install`, lpmInstall);
     }
     const lpmReport = parseJsonOutput(lpmInstall.stdout, 'lpm install');
     writeJson(path.join(projectOutput, 'lpm-install.parsed.json'), lpmReport);
@@ -265,6 +256,7 @@ function runProject(project) {
       lpmDir,
       projectWork,
       lpmEnv,
+      lpmStateRoot,
       projectOutput,
       initialLocks,
       result.policy_normalization,
@@ -346,69 +338,12 @@ function runDeterminismGates(
   initialWorkspace,
   projectWork,
   baseEnv,
+  baseStateRoot,
   projectOutput,
   expectedLocks,
   policyNormalization,
 ) {
-  const freshSchedulingRuns = [
-    {
-      run: 1,
-      concurrency: 'auto',
-      cache_state: 'fresh',
-      locks_match_initial: true,
-      lock_count: expectedLocks.size,
-    },
-  ];
-  const concurrencies = ['1', '3'];
-  for (let index = 1; index < determinismRuns; index += 1) {
-    const concurrency = concurrencies[index - 1];
-    const workspace = path.join(projectWork, `lpm-determinism-${concurrency}`);
-    copySource(sourceDir, workspace);
-    applyEquivalentLpmPolicy(
-      workspace,
-      policyNormalization.source,
-      policyNormalization.applied_importers,
-    );
-    removeNamedFiles(workspace, ['lpm.lock', 'lpm.lockb'], workRoot);
-    removeNamedDirectories(workspace, 'node_modules', workRoot);
-    const env = lpmCorrectionEnvironment(
-      path.join(projectWork, `lpm-determinism-${concurrency}-state`),
-      policyNormalization,
-    );
-    const run = runLogged({
-      label: `${project.id}:determinism-${concurrency}`,
-      command: lpmBin,
-      commandArgs: baseLpmArgs(),
-      cwd: workspace,
-      env: { ...env, LPM_WORKSPACE_CONCURRENCY: concurrency },
-      timeoutMs,
-      outputBase: path.join(projectOutput, `lpm-determinism-${concurrency}`),
-    });
-    const locks = hashNamedFiles(workspace, ['lpm.lock', 'lpm.lockb']);
-    const lockDifferences = lockMapDifferences(expectedLocks, locks);
-    if (lockDifferences.length > 0) {
-      preserveNamedFiles(
-        initialWorkspace,
-        ['lpm.lock', 'lpm.lockb'],
-        path.join(projectOutput, 'determinism-lockfiles', 'initial'),
-      );
-      preserveNamedFiles(
-        workspace,
-        ['lpm.lock', 'lpm.lockb'],
-        path.join(projectOutput, 'determinism-lockfiles', `fresh-${index + 1}`),
-      );
-    }
-    freshSchedulingRuns.push({
-      run: index + 1,
-      concurrency,
-      cache_state: 'fresh',
-      ...stageResult(run),
-      locks_match_initial: lockDifferences.length === 0,
-      lock_count: locks.size,
-      lock_differences: lockDifferences,
-    });
-  }
-
+  const executionPlan = determinismExecutionPlan(determinismRuns);
   const cacheWarmWorkspace = path.join(projectWork, 'lpm-determinism-cache-warm');
   copySource(sourceDir, cacheWarmWorkspace);
   applyEquivalentLpmPolicy(
@@ -416,6 +351,7 @@ function runDeterminismGates(
     policyNormalization.source,
     policyNormalization.applied_importers,
   );
+  applyPinnedLpmVerificationPolicy(project, cacheWarmWorkspace);
   removeNamedFiles(cacheWarmWorkspace, ['lpm.lock', 'lpm.lockb'], workRoot);
   removeNamedDirectories(cacheWarmWorkspace, 'node_modules', workRoot);
   const cacheWarmRun = runLogged({
@@ -430,11 +366,6 @@ function runDeterminismGates(
   const cacheWarmLocks = hashNamedFiles(cacheWarmWorkspace, ['lpm.lock', 'lpm.lockb']);
   const cacheWarmLockDifferences = lockMapDifferences(expectedLocks, cacheWarmLocks);
   if (cacheWarmLockDifferences.length > 0) {
-    preserveNamedFiles(
-      initialWorkspace,
-      ['lpm.lock', 'lpm.lockb'],
-      path.join(projectOutput, 'determinism-lockfiles', 'initial'),
-    );
     preserveNamedFiles(
       cacheWarmWorkspace,
       ['lpm.lock', 'lpm.lockb'],
@@ -452,6 +383,76 @@ function runDeterminismGates(
       lock_differences: cacheWarmLockDifferences,
     },
   };
+  cleanupCompletedDeterminismRun(
+    cacheWarmWorkspace,
+    null,
+    workRoot,
+    keepWorkspaces,
+  );
+  cleanupCompletedDeterminismRun(
+    initialWorkspace,
+    baseStateRoot,
+    workRoot,
+    keepWorkspaces,
+  );
+
+  const freshSchedulingRuns = [
+    {
+      run: 1,
+      concurrency: 'auto',
+      cache_state: 'fresh',
+      locks_match_initial: true,
+      lock_count: expectedLocks.size,
+    },
+  ];
+  for (let index = 1; index < executionPlan.length; index += 1) {
+    const concurrency = executionPlan[index].concurrency;
+    const workspace = path.join(projectWork, `lpm-determinism-${concurrency}`);
+    const stateRoot = path.join(projectWork, `lpm-determinism-${concurrency}-state`);
+    copySource(sourceDir, workspace);
+    applyEquivalentLpmPolicy(
+      workspace,
+      policyNormalization.source,
+      policyNormalization.applied_importers,
+    );
+    applyPinnedLpmVerificationPolicy(project, workspace);
+    removeNamedFiles(workspace, ['lpm.lock', 'lpm.lockb'], workRoot);
+    removeNamedDirectories(workspace, 'node_modules', workRoot);
+    const env = lpmCorrectionEnvironment(stateRoot, policyNormalization);
+    const run = runLogged({
+      label: `${project.id}:determinism-${concurrency}`,
+      command: lpmBin,
+      commandArgs: baseLpmArgs(),
+      cwd: workspace,
+      env: { ...env, LPM_WORKSPACE_CONCURRENCY: concurrency },
+      timeoutMs,
+      outputBase: path.join(projectOutput, `lpm-determinism-${concurrency}`),
+    });
+    const locks = hashNamedFiles(workspace, ['lpm.lock', 'lpm.lockb']);
+    const lockDifferences = lockMapDifferences(expectedLocks, locks);
+    if (lockDifferences.length > 0) {
+      preserveNamedFiles(
+        workspace,
+        ['lpm.lock', 'lpm.lockb'],
+        path.join(projectOutput, 'determinism-lockfiles', `fresh-${index + 1}`),
+      );
+    }
+    freshSchedulingRuns.push({
+      run: index + 1,
+      concurrency,
+      cache_state: 'fresh',
+      ...stageResult(run),
+      locks_match_initial: lockDifferences.length === 0,
+      lock_count: locks.size,
+      lock_differences: lockDifferences,
+    });
+    cleanupCompletedDeterminismRun(
+      workspace,
+      stateRoot,
+      workRoot,
+      keepWorkspaces,
+    );
+  }
   const freshScheduling = {
     requested_runs: determinismRuns,
     passed: freshSchedulingRuns.every(
@@ -466,6 +467,16 @@ function runDeterminismGates(
   };
   writeJson(path.join(projectOutput, 'determinism-gates.json'), result);
   return result;
+}
+
+function determinismExecutionPlan(runCount) {
+  return [
+    { kind: 'metadata-cache-warm', concurrency: 'auto' },
+    ...['1', '3'].slice(0, runCount - 1).map((concurrency) => ({
+      kind: 'fresh',
+      concurrency,
+    })),
+  ];
 }
 
 function normalizeGraph(manager, workspace, output) {
@@ -550,7 +561,10 @@ function verifyDirectLayout(workspace, graph) {
           actual: manifest.name ?? null,
         });
       }
-      if (edge.target.version && manifest.version !== edge.target.version) {
+      if (
+        edge.target.version &&
+        !installedVersionMatches(edge.target.version, manifest.version)
+      ) {
         failures.push({
           importer: importer.path,
           dependency: edge.local_name,
@@ -568,6 +582,13 @@ function verifyDirectLayout(workspace, graph) {
     workspace_projections_pending: workspaceProjectionsPending,
     failures,
   };
+}
+
+function installedVersionMatches(expected, actual) {
+  if (actual === expected) return true;
+  if (typeof expected !== 'string' || typeof actual !== 'string') return false;
+  const exactSemver = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  return exactSemver.test(expected) && actual === `v${expected}`;
 }
 
 function pendingWorkspaceProjectionMatches(workspace, packageDir, target) {
@@ -885,7 +906,7 @@ function readEffectivePnpmPolicy(workspace, env) {
     if (output === '' || output === 'undefined') return null;
     return JSON.parse(output);
   };
-  return {
+  const configPolicy = {
     auto_install_peers: read('autoInstallPeers'),
     minimum_release_age_exclude: read('minimumReleaseAgeExclude'),
     overrides: read('overrides'),
@@ -894,6 +915,48 @@ function readEffectivePnpmPolicy(workspace, env) {
     peer_dependency_rules: read('peerDependencyRules'),
     trust_policy: read('trustPolicy'),
   };
+  const manifestPath = path.join(workspace, 'package.json');
+  const manifest = readJson(manifestPath);
+  const manifestPnpm =
+    manifest.pnpm && typeof manifest.pnpm === 'object' && !Array.isArray(manifest.pnpm)
+      ? manifest.pnpm
+      : {};
+  return mergePnpmPolicy(configPolicy, manifestPnpm);
+}
+
+function mergePnpmPolicy(configPolicy, manifestPnpm) {
+  return {
+    auto_install_peers: configPolicy.auto_install_peers ?? manifestPnpm.autoInstallPeers ?? null,
+    minimum_release_age_exclude:
+      configPolicy.minimum_release_age_exclude ?? manifestPnpm.minimumReleaseAgeExclude ?? null,
+    overrides: mergePolicyObjects(manifestPnpm.overrides, configPolicy.overrides),
+    package_extensions: mergePolicyObjects(
+      manifestPnpm.packageExtensions,
+      configPolicy.package_extensions,
+    ),
+    patched_dependencies: mergePolicyObjects(
+      manifestPnpm.patchedDependencies,
+      configPolicy.patched_dependencies,
+    ),
+    peer_dependency_rules: mergePolicyObjects(
+      manifestPnpm.peerDependencyRules,
+      configPolicy.peer_dependency_rules,
+    ),
+    trust_policy: configPolicy.trust_policy ?? manifestPnpm.trustPolicy ?? null,
+  };
+}
+
+function mergePolicyObjects(manifestValue, configValue) {
+  const manifestObject =
+    manifestValue && typeof manifestValue === 'object' && !Array.isArray(manifestValue)
+      ? manifestValue
+      : null;
+  const configObject =
+    configValue && typeof configValue === 'object' && !Array.isArray(configValue)
+      ? configValue
+      : null;
+  if (manifestObject == null && configObject == null) return null;
+  return { ...(manifestObject ?? {}), ...(configObject ?? {}) };
 }
 
 function discoverLpmImporterPaths(workspace, output) {
@@ -910,16 +973,8 @@ function discoverLpmImporterPaths(workspace, output) {
 
 function normalizeImporterPaths(workspace, importerPaths) {
   assert(Array.isArray(importerPaths) && importerPaths.length > 0, 'no recursive importers found');
-  const normalized = sortedUnique(importerPaths.map((entry) => slash(entry)));
+  const normalized = normalizeImporterPathsForValidation(importerPaths);
   for (const importerPath of normalized) {
-    assert(
-      importerPath === '.' ||
-        (!path.isAbsolute(importerPath) &&
-          importerPath !== '..' &&
-          !importerPath.startsWith('../') &&
-          !importerPath.includes('/../')),
-      `invalid recursive importer path: ${importerPath}`,
-    );
     const manifestPath = path.join(workspace, importerPath, 'package.json');
     assertInside(workspace, manifestPath);
     assert(fs.statSync(manifestPath).isFile(), `recursive importer has no package.json: ${importerPath}`);
@@ -994,6 +1049,31 @@ function applyEquivalentLpmPolicy(workspace, pnpmPolicy, importerPaths) {
   };
 }
 
+function applyPinnedLpmVerificationPolicy(project, workspace) {
+  const entries = project.correction_verification?.typosquat_allow ?? [];
+  if (entries.length === 0) return { typosquat_allow: [] };
+
+  const importers = normalizeImporterPaths(
+    workspace,
+    sortedUnique(entries.map((entry) => entry.importer)),
+  );
+  for (const importer of importers) {
+    const policyPath = path.join(workspace, importer, 'lpm.toml');
+    assertInside(workspace, policyPath);
+    const existing = fs.existsSync(policyPath) ? fs.readFileSync(policyPath, 'utf8') : '';
+    const blocks = entries
+      .filter((entry) => entry.importer === importer)
+      .map(
+        (entry) =>
+          `[[policy.typosquat.allow]]\npackage = ${JSON.stringify(entry.package)}\nsimilar-to = ${JSON.stringify(entry.similar_to)}\nreason = ${JSON.stringify(entry.reason)}`,
+      );
+    const separator = existing === '' || existing.endsWith('\n') ? '' : '\n';
+    fs.writeFileSync(policyPath, `${existing}${separator}${blocks.join('\n\n')}\n`);
+  }
+
+  return { typosquat_allow: structuredClone(entries) };
+}
+
 function applyPinnedReferenceCompatibility(project, policyNormalization) {
   const database = project.reference_compatibility?.pnpm_compatibility_database;
   if (database == null) return null;
@@ -1006,6 +1086,15 @@ function applyPinnedReferenceCompatibility(project, policyNormalization) {
       package_extensions: extensions,
     },
   };
+}
+
+function comparisonPolicy(policyNormalization) {
+  const policy = structuredClone(policyNormalization.unsupported);
+  const referencePeerOverrides = stringMap(policyNormalization.source.overrides);
+  if (Object.keys(referencePeerOverrides).length > 0) {
+    policy.reference_peer_overrides = referencePeerOverrides;
+  }
+  return policy;
 }
 
 function applyTranslatedPolicyToImporter(workspace, importerPath, translated) {
@@ -1208,6 +1297,17 @@ function removeTree(target, guardRoot) {
   fs.rmSync(target, { recursive: true, force: true });
 }
 
+function cleanupCompletedDeterminismRun(
+  workspace,
+  stateRoot,
+  guardRoot,
+  preserveWorkspaces,
+) {
+  if (preserveWorkspaces) return;
+  removeTree(workspace, guardRoot);
+  if (stateRoot != null) removeTree(stateRoot, guardRoot);
+}
+
 function assertInside(root, target) {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
@@ -1287,6 +1387,65 @@ function validateProject(project, ids = new Set()) {
     );
     validatePackageExtensions(database.package_extensions, project.id);
   }
+  if (project.correction_verification != null) {
+    assertPlainObject(
+      project.correction_verification,
+      `correction_verification must be an object for ${project.id}`,
+    );
+    assert.deepEqual(
+      Object.keys(project.correction_verification),
+      ['typosquat_allow'],
+      `correction_verification has unsupported fields for ${project.id}`,
+    );
+    const entries = project.correction_verification.typosquat_allow;
+    assert(
+      Array.isArray(entries) && entries.length > 0,
+      `typosquat_allow must be a non-empty array for ${project.id}`,
+    );
+    const identities = new Set();
+    for (const entry of entries) {
+      assertPlainObject(entry, `typosquat_allow entries must be objects for ${project.id}`);
+      assert.deepEqual(
+        Object.keys(entry).sort(),
+        ['importer', 'package', 'reason', 'similar_to'],
+        `typosquat_allow entry has unsupported fields for ${project.id}`,
+      );
+      assert(
+        normalizeImporterPathsForValidation([entry.importer]).length === 1,
+        `invalid typosquat_allow importer for ${project.id}`,
+      );
+      for (const field of ['package', 'similar_to', 'reason']) {
+        assert(
+          typeof entry[field] === 'string' &&
+            entry[field] !== '' &&
+            entry[field].trim() === entry[field] &&
+            !/\p{Cc}/u.test(entry[field]),
+          `invalid typosquat_allow ${field} for ${project.id}`,
+        );
+      }
+      const identity = `${entry.importer}\0${entry.package}\0${entry.similar_to}`;
+      assert(!identities.has(identity), `duplicate typosquat_allow entry for ${project.id}`);
+      identities.add(identity);
+    }
+  }
+}
+
+function normalizeImporterPathsForValidation(importerPaths) {
+  assert(Array.isArray(importerPaths), 'importer paths must be an array');
+  const normalized = sortedUnique(importerPaths.map((entry) => slash(entry)));
+  for (const importerPath of normalized) {
+    assert(
+      importerPath === '.' ||
+        (typeof importerPath === 'string' &&
+          importerPath !== '' &&
+          !path.isAbsolute(importerPath) &&
+          importerPath !== '..' &&
+          !importerPath.startsWith('../') &&
+          !importerPath.includes('/../')),
+      `invalid recursive importer path: ${importerPath}`,
+    );
+  }
+  return normalized;
 }
 
 function assertPlainObject(value, message) {
@@ -1413,30 +1572,6 @@ function parseJsonOutput(output, label) {
   } catch (error) {
     throw new Error(`${label} did not emit valid JSON: ${error.message}`);
   }
-}
-
-function classifyLpmInstallCapabilityGap(run) {
-  if (run.status === 0 || run.error || typeof run.stdout !== 'string') return null;
-  let report;
-  try {
-    report = JSON.parse(run.stdout);
-  } catch {
-    return null;
-  }
-  if (report?.success !== false || report?.error_code !== 'registry') return null;
-  const message = typeof report.error === 'string' ? report.error : '';
-  const match = message.match(
-    /dep '([^']+)' uses git specifier '([^']+)', which is not yet supported\./,
-  );
-  if (match == null) return null;
-  return {
-    code: 'unsupported_git_source',
-    manager: 'lpm',
-    phase: 'install',
-    package: match[1],
-    specifier: match[2],
-    message,
-  };
 }
 
 function classifyPnpmInstallPolicyBlock(run) {
@@ -1568,8 +1703,52 @@ function runSelfTests() {
   ]);
   assert.equal(parsed.projects, 'vite,vue');
   assert.equal(parsed.determinismRuns, '3');
+  assert.deepEqual(
+    mergePnpmPolicy(
+      {
+        auto_install_peers: null,
+        minimum_release_age_exclude: null,
+        overrides: null,
+        package_extensions: null,
+        patched_dependencies: null,
+        peer_dependency_rules: null,
+        trust_policy: null,
+      },
+      {
+        autoInstallPeers: true,
+        overrides: { postcss: '8.5.10' },
+        patchedDependencies: { fixture: 'patches/fixture.patch' },
+      },
+    ),
+    {
+      auto_install_peers: true,
+      minimum_release_age_exclude: null,
+      overrides: { postcss: '8.5.10' },
+      package_extensions: null,
+      patched_dependencies: { fixture: 'patches/fixture.patch' },
+      peer_dependency_rules: null,
+      trust_policy: null,
+    },
+  );
+  assert.deepEqual(
+    comparisonPolicy({
+      source: { overrides: { postcss: '8.5.10', vite: 'catalog:' } },
+      unsupported: { overrides: { vite: 'catalog:' } },
+    }),
+    {
+      overrides: { vite: 'catalog:' },
+      reference_peer_overrides: { postcss: '8.5.10', vite: 'catalog:' },
+    },
+  );
+  assert.equal(installedVersionMatches('1.28.1', 'v1.28.1'), true);
+  assert.equal(installedVersionMatches('1.28.1', 'v1.28.2'), false);
   assert.equal(parsed.keepWorkspaces, true);
   assert.equal(parsed.materializeReference, true);
+  assert.deepEqual(determinismExecutionPlan(3), [
+    { kind: 'metadata-cache-warm', concurrency: 'auto' },
+    { kind: 'fresh', concurrency: '1' },
+    { kind: 'fresh', concurrency: '3' },
+  ]);
 
   const fixtureProjects = [
     {
@@ -1651,31 +1830,6 @@ function runSelfTests() {
   });
   assert.match(failureDetail, /manifest rejected/);
   assert.match(failureDetail, /warning emitted before failure/);
-  assert.deepEqual(
-    classifyLpmInstallCapabilityGap({
-      status: 1,
-      stdout:
-        '{"schema_version":1,"success":false,"error":"registry error: dep \'wa-sqlite\' uses git specifier \'git+https://github.com/rhashimoto/wa-sqlite.git\', which is not yet supported. Workaround: vendor the package or publish it to a registry.","error_code":"registry"}',
-      stderr: '',
-    }),
-    {
-      code: 'unsupported_git_source',
-      manager: 'lpm',
-      phase: 'install',
-      package: 'wa-sqlite',
-      specifier: 'git+https://github.com/rhashimoto/wa-sqlite.git',
-      message:
-        "registry error: dep 'wa-sqlite' uses git specifier 'git+https://github.com/rhashimoto/wa-sqlite.git', which is not yet supported. Workaround: vendor the package or publish it to a registry.",
-    },
-  );
-  assert.equal(
-    classifyLpmInstallCapabilityGap({
-      status: 1,
-      stdout: '{"success":false,"error":"registry unavailable","error_code":"registry"}',
-      stderr: '',
-    }),
-    null,
-  );
   assert.deepEqual(
     classifyPnpmInstallPolicyBlock({
       status: 1,
@@ -1799,6 +1953,27 @@ function runSelfTests() {
     assert.deepEqual(policyNormalization.unsupported.overrides, {
       debug: 'npm:obug@^1.0.2',
     });
+    const correctionProject = {
+      ...fixtureProjects[0],
+      correction_verification: {
+        typosquat_allow: [
+          {
+            importer: 'packages/member',
+            package: 'mysql2',
+            similar_to: 'mysql',
+            reason: 'Pinned self-test dependency',
+          },
+        ],
+      },
+    };
+    validateProject(correctionProject);
+    assert.deepEqual(applyPinnedLpmVerificationPolicy(correctionProject, workspace), {
+      typosquat_allow: correctionProject.correction_verification.typosquat_allow,
+    });
+    assert.match(
+      fs.readFileSync(path.join(workspace, 'packages/member/lpm.toml'), 'utf8'),
+      /package = "mysql2"\nsimilar-to = "mysql"\nreason = "Pinned self-test dependency"/,
+    );
     const referenceCompatibility = applyPinnedReferenceCompatibility(
       compatibilityProject,
       policyNormalization,
@@ -1906,6 +2081,14 @@ function runSelfTests() {
     removeNamedDirectories(workspace, 'node_modules', directory);
     assert.equal(fs.existsSync(path.join(workspace, 'packages/member/node_modules')), false);
     assert.equal(fs.existsSync(path.join(workspace, 'packages/member/package.json')), true);
+
+    const completedWorkspace = path.join(directory, 'completed-determinism-workspace');
+    const completedState = path.join(directory, 'completed-determinism-state');
+    writeJson(path.join(completedWorkspace, 'lpm.lock'), { stable: true });
+    writeJson(path.join(completedState, 'home/state.json'), { cached: true });
+    cleanupCompletedDeterminismRun(completedWorkspace, completedState, directory, false);
+    assert.equal(fs.existsSync(completedWorkspace), false);
+    assert.equal(fs.existsSync(completedState), false);
   } finally {
     removeTree(directory, os.tmpdir());
   }
