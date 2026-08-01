@@ -13,8 +13,8 @@
 //! tarball+<url-or-path>    # remote https tarball OR local file: tarball
 //! directory+<path>         # file: directory dep
 //! link+<path>              # link: directory dep (yarn/pnpm style)
-//! git+<url>                # git source; URL retains the npm-canonical
-//!                          # `git+` prefix (e.g., git+https://, git+ssh://)
+//! git+<url>#<commit>       # git source pinned to an exact commit; URL retains
+//!                          # the npm-canonical `git+` prefix
 //! ```
 //!
 //! Each non-Registry variant carries only "where it came from".
@@ -25,10 +25,10 @@
 //!   would let `lpm update` silently swap a tarball-URL dep for a
 //!   registry package with the same dist URL.
 //!
-//! Git's resolved commit SHA and the user-written refspec live as
-//! sibling fields on the package entry too — not inside the `Git`
-//! variant — so [`Source`] mirrors the wire string 1:1 and the
-//! commit can be updated independently of the source URL.
+//! The user-written ref remains in the importer snapshot. The package
+//! source contains the resolved commit so source identity, root
+//! selection, and binary lockfile replay all use the same immutable
+//! value.
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use std::fmt;
@@ -50,9 +50,8 @@ pub enum Source {
     /// `link:` directory dep. Always wrapper-symlinked (yarn/pnpm
     /// semantics).
     Link { path: String },
-    /// Git source. URL retains the npm-canonical `git+` prefix.
-    /// The resolved commit SHA and refspec live as sibling fields on
-    /// the package entry, not in this variant.
+    /// Git source pinned to a commit. URL retains the npm-canonical
+    /// `git+` prefix and ends in `#<40-character commit>`.
     Git { url: String },
 }
 

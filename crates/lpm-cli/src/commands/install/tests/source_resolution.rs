@@ -430,22 +430,17 @@ async fn pre_resolve_strict_integrity_accepts_declared_sri() {
     assert_eq!(install_pkgs[0].integrity.as_deref(), Some(sri.as_str()));
 }
 
-// ── (reviewed): unsupported Specifier variants ────────────
-// Git/File/Link specifiers parse cleanly but the install pipeline
-// doesn't support them in 59.0. Pre-resolve must surface a clear,
-// actionable error at the manifest boundary instead of letting the
-// dep fall through to the resolver and produce an opaque
-// node_semver parse error.
+// ── unsupported Specifier variants ────────────────────────────────
 
 #[tokio::test]
-async fn pre_resolve_rejects_git_specifier_with_clear_error() {
+async fn pre_resolve_rejects_non_github_git_source() {
     let store_root = tempfile::tempdir().unwrap();
     let store = PackageStore::at(store_root.path());
     let client = Arc::new(RegistryClient::new());
 
     let mut deps = HashMap::from([(
         "my-fork".to_string(),
-        "git+https://github.com/foo/bar.git".to_string(),
+        "git+https://gitlab.com/foo/bar.git#1111111111111111111111111111111111111111".to_string(),
     )]);
     let err = pre_resolve_non_registry_deps(
         &client,
@@ -457,42 +452,9 @@ async fn pre_resolve_rejects_git_specifier_with_clear_error() {
         &[],
     )
     .await
-    .expect_err("git specifier must be rejected at pre-resolve");
+    .expect_err("non-GitHub Git specifier must be rejected at pre-resolve");
     let msg = err.to_string();
-    assert!(
-        msg.contains("my-fork"),
-        "error must name the dep, got: {msg}"
-    );
-    assert!(
-        msg.contains("git") && msg.contains("not yet supported"),
-        "error must explain the limitation, got: {msg}"
-    );
-    assert!(
-        msg.contains("Workaround"),
-        "error must offer a workaround, got: {msg}"
-    );
-}
-
-#[tokio::test]
-async fn pre_resolve_rejects_github_shorthand_via_git_arm() {
-    // `github:user/repo` expands to a Git Specifier — same arm.
-    let store_root = tempfile::tempdir().unwrap();
-    let store = PackageStore::at(store_root.path());
-    let client = Arc::new(RegistryClient::new());
-
-    let mut deps = HashMap::from([("forked".to_string(), "github:foo/bar".to_string())]);
-    let err = pre_resolve_non_registry_deps(
-        &client,
-        &store,
-        store_root.path(),
-        &mut deps,
-        true,
-        false,
-        &[],
-    )
-    .await
-    .expect_err("github: shorthand must be rejected at pre-resolve");
-    assert!(err.to_string().contains("forked"));
+    assert!(msg.contains("github.com"), "got: {msg}");
 }
 
 // ── (): directory-dep happy paths ──────────────────
@@ -888,7 +850,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
 }
 
 /// `classify_source_dep`
-/// rejects tarball-URL, git, and file-tarball transitives at
+/// rejects tarball-URL and file-tarball transitives at
 /// manifest-read time. Unsupported transitives must not be appended to
 /// the consumer's `deps` map, where the resolver's `NpmRange::parse`
 /// rejects them as invalid semver ranges. This test pins the contract:
@@ -911,12 +873,6 @@ fn classify_source_dep_rejects_unsupported_transitive_specs() {
         ("http://example.com/foo.tgz", "tarball URL"),
         // Local file tarball (file: → regular file).
         ("file:./foo.tgz", "file: tarball"),
-        // Git in canonical form.
-        ("git+https://github.com/foo/bar.git", "git source"),
-        ("git+ssh://git@github.com/foo/bar.git", "git source"),
-        // Git host shorthand (Specifier::parse expands to Git).
-        ("github:foo/bar", "git source"),
-        ("gitlab:foo/bar#main", "git source"),
     ];
 
     for (raw, want_substr) in cases {
@@ -943,7 +899,7 @@ fn classify_source_dep_rejects_unsupported_transitive_specs() {
 
 /// the supported
 /// transitive shapes (registry semver / npm-alias / workspace,
-/// file: directory, link:) all classify correctly without error.
+/// file: directory, link:, and Git) all classify correctly without error.
 /// Regression guard against an over-eager reject in the the invariant
 /// fix.
 #[test]
@@ -978,6 +934,14 @@ fn classify_source_dep_accepts_supported_transitive_specs() {
         // file: directory and link: directory.
         ("file:./packages/local-foo", DepKind::FileDir),
         ("link:./packages/local-foo", DepKind::Link),
+        (
+            "github:rhashimoto/wa-sqlite#779219540f66cecaa159da32b3b8936697ba10a7",
+            DepKind::Git,
+        ),
+        (
+            "git+https://github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7",
+            DepKind::Git,
+        ),
     ];
 
     for (raw, want_kind) in cases {

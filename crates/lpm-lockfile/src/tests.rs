@@ -917,6 +917,97 @@ fn unsafe_source_file() {
     assert!(!is_safe_source("file:///etc/passwd"));
 }
 
+#[test]
+fn safe_source_accepts_commit_pinned_public_github_repository() {
+    assert!(is_safe_source(
+        "git+https://github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7"
+    ));
+}
+
+#[test]
+fn safe_source_rejects_github_repository_without_commit() {
+    assert!(!is_safe_source(
+        "git+https://github.com/rhashimoto/wa-sqlite.git"
+    ));
+}
+
+#[test]
+fn safe_source_rejects_github_repository_with_credentials() {
+    assert!(!is_safe_source(
+        "git+https://user:secret@github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7"
+    ));
+}
+
+#[test]
+fn to_toml_rejects_git_source_without_archive_integrity() {
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        name: "wa-sqlite".to_string(),
+        version: "1.0.9".to_string(),
+        source: Some(
+            "git+https://github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7"
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("Git source without integrity must not serialize");
+    assert!(error.to_string().contains("missing archive integrity"));
+}
+
+#[test]
+fn from_toml_rejects_git_source_with_symbolic_ref() {
+    let toml = r#"
+[metadata]
+lockfile-version = 9
+
+[[packages]]
+name = "wa-sqlite"
+version = "1.0.9"
+source = "git+https://github.com/rhashimoto/wa-sqlite.git#main"
+integrity = "sha512-YQ=="
+"#;
+
+    let error =
+        Lockfile::from_toml(toml).expect_err("Git lockfile source must contain an exact commit");
+    assert!(error.to_string().contains("pinned public GitHub"));
+}
+
+#[test]
+fn from_toml_rejects_git_source_before_git_schema_version() {
+    let toml = r#"
+[metadata]
+lockfile-version = 8
+
+[[packages]]
+name = "wa-sqlite"
+version = "1.0.9"
+source = "git+https://github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7"
+integrity = "sha512-YQ=="
+"#;
+
+    let error = Lockfile::from_toml(toml)
+        .expect_err("Git lockfile source must require the Git-aware schema version");
+    assert!(error.to_string().contains("lockfile version 9"));
+}
+
+#[test]
+fn package_key_distinguishes_two_commits_of_same_github_package() {
+    let package_at = |commit: &str| LockedPackage {
+        name: "example".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(format!("git+https://github.com/owner/example.git#{commit}")),
+        integrity: Some("sha512-YQ==".to_string()),
+        ..Default::default()
+    };
+
+    let first = package_at("1111111111111111111111111111111111111111").package_key();
+    let second = package_at("2222222222222222222222222222222222222222").package_key();
+    assert_ne!(first, second);
+}
+
 /// npm-alias metadata round-trips through the TOML serializer.
 /// Both `root-aliases` (top-level) and per-package
 /// `alias-dependencies` must survive `to_toml` → `from_toml` with
@@ -1756,7 +1847,7 @@ fn from_toml_rejects_link_source_with_tarball_hint() {
 fn lockfile_with_bad_pair(name: &str, source: &str, tarball: &str) -> String {
     format!(
         "[metadata]\n\
-             lockfile-version = 1\n\
+             lockfile-version = 9\n\
              resolved-with = \"pubgrub\"\n\
              \n\
              [[packages]]\n\

@@ -1878,8 +1878,10 @@ pub(super) async fn run_online_fetch_phase(
                 // bypass the registry-routed legacy/streaming paths
                 // entirely. The URL is the source identity; the
                 // store path is content-addressable by integrity.
-                let is_tarball_source =
-                    matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
+                let is_tarball_source = matches!(
+                    p.source_kind(),
+                    Ok(lpm_lockfile::Source::Tarball { .. }) | Ok(lpm_lockfile::Source::Git { .. })
+                );
                 let store_v2_arg = store_v2_ref.as_deref();
                 let (computed_sri, task_timings, final_url, fresh_object) = if is_tarball_source {
                     fetch_and_store_tarball_url(
@@ -3376,9 +3378,13 @@ pub(super) async fn fetch_and_store_tarball_url(
     })?;
 
     let download_start = std::time::Instant::now();
-    let (data, computed_sri) = client
-        .download_tarball_with_integrity(url, p.integrity.as_deref())
-        .await?;
+    let (data, computed_sri) = if matches!(p.source_kind(), Ok(lpm_lockfile::Source::Git { .. })) {
+        download_github_archive(url, p.integrity.as_deref()).await?
+    } else {
+        client
+            .download_tarball_with_integrity(url, p.integrity.as_deref())
+            .await?
+    };
     let download_ms = download_start.elapsed().as_millis();
 
     // download_tarball_with_integrity already verified the SRI when

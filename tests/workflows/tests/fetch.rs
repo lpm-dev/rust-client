@@ -2,8 +2,12 @@
 
 mod support;
 
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_with_files,
+};
+use support::{TempProject, lpm, lpm_with_registry, write_npm_firewall_global_config};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const PACKAGE_JSON: &str = r#"{
   "name": "fetch-app",
@@ -179,6 +183,115 @@ async fn fetch_reads_lockfile_without_manifest_and_enables_offline_frozen_instal
         String::from_utf8_lossy(&offline.stdout),
         String::from_utf8_lossy(&offline.stderr)
     );
+}
+
+#[tokio::test]
+async fn fetch_materializes_commit_pinned_github_source_with_security_analysis() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let archive = make_tarball_with_files(
+        "wa-sqlite",
+        "1.0.9",
+        &[("index.js", b"module.exports = 'fetch-ok';\n")],
+    );
+    let integrity = compute_integrity(&archive);
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion");
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "wa-sqlite".to_string(),
+        version: "1.0.9".to_string(),
+        source: Some(format!(
+            "git+https://github.com/rhashimoto/wa-sqlite.git#{COMMIT}"
+        )),
+        integrity: Some(integrity.clone()),
+        ..Default::default()
+    });
+    let project = TempProject::empty(r#"{"name":"fetch-github-fixture","version":"1.0.0"}"#);
+    std::fs::remove_file(project.path().join("package.json")).expect("remove package manifest");
+    project.write_file(
+        "lpm.lock",
+        &lockfile
+            .to_toml()
+            .expect("serialize GitHub lockfile fixture"),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args(["fetch"])
+        .output()
+        .expect("run lpm fetch for GitHub source");
+
+    assert!(
+        output.status.success(),
+        "GitHub fetch must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let object_dir = lpm_store::v2::StoreV2Paths::at(project.store_dir().join("v2"))
+        .object_dir(&integrity)
+        .expect("GitHub archive integrity should address the v2 object");
+    assert!(object_dir.join("package.json").is_file());
+    assert!(object_dir.join(".lpm-security.json").is_file());
+}
+
+#[tokio::test]
+async fn fetch_rejects_github_archive_that_does_not_match_lockfile_integrity() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let archive = make_tarball("wa-sqlite", "1.0.9");
+    let archive_integrity = compute_integrity(&archive);
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+        .expect(1)
+        .mount(&github)
+        .await;
+
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion");
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "wa-sqlite".to_string(),
+        version: "1.0.9".to_string(),
+        source: Some(format!(
+            "git+https://github.com/rhashimoto/wa-sqlite.git#{COMMIT}"
+        )),
+        integrity: Some(compute_integrity(b"different archive bytes")),
+        ..Default::default()
+    });
+    let project = TempProject::empty(r#"{"name":"fetch-github-mismatch","version":"1.0.0"}"#);
+    std::fs::remove_file(project.path().join("package.json")).expect("remove package manifest");
+    project.write_file(
+        "lpm.lock",
+        &lockfile
+            .to_toml()
+            .expect("serialize mismatched GitHub lockfile fixture"),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args(["fetch"])
+        .output()
+        .expect("run lpm fetch with mismatched GitHub integrity");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("integrity"),
+        "GitHub integrity rejection must identify the mismatch; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let object_dir = lpm_store::v2::StoreV2Paths::at(project.store_dir().join("v2"))
+        .object_dir(&archive_integrity)
+        .expect("actual GitHub archive integrity should address a potential v2 object");
+    assert!(!object_dir.exists());
 }
 
 #[tokio::test]

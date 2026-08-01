@@ -375,7 +375,11 @@ fn patch_fresh_tarball_urls(
     fresh_urls: &HashMap<String, String>,
 ) {
     for package in &mut lockfile.packages {
-        if let Some(url) = fresh_urls.get(&locked_package_key(package)) {
+        if matches!(
+            package.source_kind(),
+            Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+        ) && let Some(url) = fresh_urls.get(&locked_package_key(package))
+        {
             package.tarball = Some(url.clone());
         }
     }
@@ -1984,16 +1988,20 @@ pub(super) fn try_lockfile_fast_path(
     // taught about non-Registry sources, the
     // PackageKey-based lookups in this loop are already correct.
     //
-    // Key is "name\x00version" (compound string) to avoid allocating a
-    // PackageKey (SHA-256 source_id + 2 String clones) on every build
-    // AND every lookup — the root symlink slot is unambiguous for
-    // (name, version) since the lockfile rejects same-name-same-version
-    // cross-source collisions during resolution.
-    let root_link_key = |name: &str, version: &str| -> String {
-        let mut k = String::with_capacity(name.len() + 1 + version.len());
-        k.push_str(name);
+    // Keep the raw source in this short-lived key to distinguish
+    // same-version packages from different registries, tarballs, or
+    // Git commits without allocating a hashed PackageKey per lookup.
+    let root_link_key = |package: &lpm_lockfile::LockedPackage| -> String {
+        let source_len = package.source.as_deref().map_or(0, str::len);
+        let mut k =
+            String::with_capacity(package.name.len() + 1 + package.version.len() + 1 + source_len);
+        k.push_str(&package.name);
         k.push('\x00');
-        k.push_str(version);
+        k.push_str(&package.version);
+        k.push('\x00');
+        if let Some(source) = &package.source {
+            k.push_str(source);
+        }
         k
     };
     let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -2010,7 +2018,7 @@ pub(super) fn try_lockfile_fast_path(
             source: lp.source.clone(),
         };
         root_link_map
-            .entry(root_link_key(&lp.name, &lp.version))
+            .entry(root_link_key(lp))
             .or_default()
             .push(local.clone());
         lockfile
@@ -2041,9 +2049,7 @@ pub(super) fn try_lockfile_fast_path(
             version: lp.version.clone(),
             source: lp.source.clone(),
         };
-        let entry = root_link_map
-            .entry(root_link_key(&lp.name, &lp.version))
-            .or_default();
+        let entry = root_link_map.entry(root_link_key(lp)).or_default();
         if !entry.iter().any(|l| l == ambient) {
             entry.push(ambient.clone());
         }
@@ -2112,9 +2118,7 @@ pub(super) fn try_lockfile_fast_path(
                 })
                 .collect();
 
-            let root_link_names = root_link_map
-                .get(&root_link_key(&lp.name, &lp.version))
-                .cloned();
+            let root_link_names = root_link_map.get(&root_link_key(lp)).cloned();
             let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
 
             InstallPackage {
@@ -2144,53 +2148,56 @@ pub(super) fn try_lockfile_fast_path(
                 // origin before reusing it. Any rejection downgrades
                 // to `None`, which forces on-demand lookup against
                 // the current registry.
-                tarball_url: lp.tarball.as_deref().and_then(|url| {
-                    match evaluate_cached_url(url, client) {
-                        GateDecision::Accepted => Some(url.to_string()),
-                        GateDecision::RejectedScheme => {
-                            // Writer never emits scheme-unsafe URLs,
-                            // so this path signals a corrupt lockfile.
-                            // Counter-bumped for telemetry symmetry
-                            // with shape/origin — makes corrupt-
-                            // lockfile signals observable instead of
-                            // trace-log-only.
-                            gate_stats
-                                .scheme_mismatch
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                "cached tarball URL for {}@{} has unsafe scheme; \
+                tarball_url: match lp.source_kind() {
+                    Some(Ok(lpm_lockfile::Source::Git { url })) => github_archive_url(&url).ok(),
+                    _ => lp.tarball.as_deref().and_then(|url| {
+                        match evaluate_cached_url(url, client) {
+                            GateDecision::Accepted => Some(url.to_string()),
+                            GateDecision::RejectedScheme => {
+                                // Writer never emits scheme-unsafe URLs,
+                                // so this path signals a corrupt lockfile.
+                                // Counter-bumped for telemetry symmetry
+                                // with shape/origin — makes corrupt-
+                                // lockfile signals observable instead of
+                                // trace-log-only.
+                                gate_stats
+                                    .scheme_mismatch
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(
+                                    "cached tarball URL for {}@{} has unsafe scheme; \
                                  falling back to on-demand lookup",
-                                lp.name,
-                                lp.version,
-                            );
-                            None
-                        }
-                        GateDecision::RejectedShape => {
-                            gate_stats
-                                .shape_mismatch
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                "cached tarball URL for {}@{} failed shape check; \
+                                    lp.name,
+                                    lp.version,
+                                );
+                                None
+                            }
+                            GateDecision::RejectedShape => {
+                                gate_stats
+                                    .shape_mismatch
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(
+                                    "cached tarball URL for {}@{} failed shape check; \
                                  falling back to on-demand lookup",
-                                lp.name,
-                                lp.version,
-                            );
-                            None
+                                    lp.name,
+                                    lp.version,
+                                );
+                                None
+                            }
+                            GateDecision::RejectedOrigin => {
+                                // Expected after `LPM_REGISTRY_URL` switch:
+                                // stored `@lpm.dev/*` URLs mismatch the new
+                                // origin and fall through to on-demand
+                                // lookup against the mirror. The writeback
+                                // trigger ( Change 3) will persist the
+                                // rebased URLs on the next install.
+                                gate_stats
+                                    .origin_mismatch
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                None
+                            }
                         }
-                        GateDecision::RejectedOrigin => {
-                            // Expected after `LPM_REGISTRY_URL` switch:
-                            // stored `@lpm.dev/*` URLs mismatch the new
-                            // origin and fall through to on-demand
-                            // lookup against the mirror. The writeback
-                            // trigger ( Change 3) will persist the
-                            // rebased URLs on the next install.
-                            gate_stats
-                                .origin_mismatch
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            None
-                        }
-                    }
-                }),
+                    }),
+                },
                 metadata_checked_for_tarball: false,
             }
         })

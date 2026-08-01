@@ -31,6 +31,7 @@ mod diff_util;
 mod fetch;
 mod fetch_overlap;
 mod firewall;
+mod github_source;
 mod gitignore;
 mod lifecycle;
 mod linking;
@@ -74,6 +75,8 @@ pub(crate) use firewall::{
     registry_materialization_route_is_public_npm,
     run_prepared_npm_firewall_materialization_preflight,
 };
+use github_source::resolve_github_source;
+pub(crate) use github_source::{download_github_archive, github_archive_url};
 pub use gitignore::ensure_skills_gitignore;
 use gitignore::*;
 use lifecycle::*;
@@ -1043,15 +1046,18 @@ async fn run_with_options_under_store_lock(
             source_deps: mut spike_pre_resolved_source_deps,
             additional_workspace_links,
             optional_registry_roots,
+            resolved_git_sources,
         } = pre_resolve_non_registry_deps_with_optional_registry_roots(
             &arc_client,
             &store,
+            store_v2_handle.as_deref(),
             project_dir,
             &mut deps,
             json_output,
             strict_integrity,
             &all_workspace_members,
             &v2_workspace_root_pre_resolve.optional_registry_roots,
+            &v2_workspace_root_pre_resolve.promoted_git_root_names,
         )
         .await?;
 
@@ -1081,6 +1087,10 @@ async fn run_with_options_under_store_lock(
                 .entry(source.clone())
                 .or_insert_with(|| deps.clone());
         }
+        bind_resolved_git_source_dependencies(
+            &mut spike_pre_resolved_source_deps,
+            &resolved_git_sources,
+        );
 
         workspace_resolution::wait_for_commit().await;
         if defer_project_linker_layout_maintenance {
