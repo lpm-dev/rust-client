@@ -29,6 +29,7 @@ pub use compat::{
 };
 pub use discovery::{
     Workspace, WorkspaceMember, collect_all_dependencies, discover_workspace, find_project_root,
+    read_workspace_root_package,
 };
 pub use error::WorkspaceError;
 pub use package_json::{

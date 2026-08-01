@@ -76,6 +76,7 @@ const POPULAR_PACKAGES: &[&str] = &[
     "string_decoder",
     "buffer",
     "events",
+    "fsevents",
     "util",
     "process",
     "punycode",
@@ -206,8 +207,8 @@ pub fn extract_package_name(name: &str) -> &str {
 /// name is extracted before comparison so typosquats in scoped names are caught.
 ///
 /// Threshold logic:
-/// - Short names (<=5 chars): distance must be exactly 1 (very strict to avoid
-///   false positives on common short words like "glob", "cors")
+/// - If either name is short (<=5 chars): distance must be exactly 1 (very
+///   strict to avoid false positives on common short words like "glob", "cors")
 /// - Longer names (>5 chars): distance up to 2 allowed
 ///
 /// Exact matches return `None` (user wants the real package).
@@ -253,7 +254,11 @@ pub fn analyze_typosquatting(name: &str) -> Option<TyposquatFinding> {
             continue;
         }
         let distance = levenshtein(bare_name, popular);
-        let threshold = if popular.len() <= 5 { 1 } else { 2 };
+        let threshold = if bare_name.len() <= 5 || popular.len() <= 5 {
+            1
+        } else {
+            2
+        };
         if distance > 0 && distance <= threshold {
             return Some(TyposquatFinding {
                 similar: popular,
@@ -368,6 +373,11 @@ mod tests {
     #[test]
     fn no_warn_exact_react() {
         assert_eq!(check_typosquatting("react"), None);
+    }
+
+    #[test]
+    fn no_warn_exact_fsevents() {
+        assert_eq!(check_typosquatting("fsevents"), None);
     }
 
     #[test]
@@ -493,6 +503,11 @@ mod tests {
     #[test]
     fn no_warn_legitimate_tiny_package_name() {
         assert_eq!(check_typosquatting("ms"), None);
+    }
+
+    #[test]
+    fn no_warn_legitimate_short_serve_package() {
+        assert_eq!(check_typosquatting("serve"), None);
     }
 
     #[test]

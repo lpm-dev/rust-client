@@ -119,6 +119,8 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        workspace_versions: HashSet::new(),
+        platform_metadata_complete: true,
         latest_version: None,
         versions: parsed,
         deps: deps_map,
@@ -168,10 +170,7 @@ fn partial_worker_cache_refetches_for_uncovered_overlapping_range() {
     info.versions_complete = false;
     info.covered_ranges.insert("^4.0.0".to_string());
 
-    assert!(partial_worker_cache_needs_full_metadata(
-        &info,
-        &edge_for_range("shared", "*")
-    ));
+    assert!(info.needs_metadata_for_range(&edge_for_range("shared", "*").range));
 }
 
 #[test]
@@ -180,10 +179,27 @@ fn partial_worker_cache_serves_worker_covered_range() {
     info.versions_complete = false;
     info.covered_ranges.insert("^4.0.0".to_string());
 
-    assert!(!partial_worker_cache_needs_full_metadata(
-        &info,
-        &edge_for_range("shared", "^4.0.0")
-    ));
+    assert!(!info.needs_metadata_for_range(&edge_for_range("shared", "^4.0.0").range));
+}
+
+#[test]
+fn workspace_cache_serves_a_satisfying_local_version_without_registry_metadata() {
+    let mut info = mk_info(&["2.0.0"], &[]);
+    info.versions_complete = false;
+    info.workspace_versions
+        .insert(NpmVersion::parse("2.0.0").expect("valid workspace version"));
+
+    assert!(!info.needs_metadata_for_range(&NpmRange::parse("^2.0.0").expect("valid range")));
+}
+
+#[test]
+fn workspace_cache_requests_registry_metadata_for_a_nonmatching_range() {
+    let mut info = mk_info(&["2.0.0"], &[]);
+    info.versions_complete = false;
+    info.workspace_versions
+        .insert(NpmVersion::parse("2.0.0").expect("valid workspace version"));
+
+    assert!(info.needs_metadata_for_range(&NpmRange::parse("^1.0.0").expect("valid range")));
 }
 
 #[test]
@@ -215,6 +231,45 @@ fn merging_partial_versions_drops_package_level_completeness() {
             .iter()
             .any(|version| version.to_string() == "3.0.0")
     );
+}
+
+#[test]
+fn merging_cached_metadata_regular_dependency_shadows_same_named_peer_requirement() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("dual-role-dependency");
+    let regular = mk_info(&["1.0.0"], &[("zod", "^4.3.6")]);
+    insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), Arc::new(regular));
+
+    let mut peer_fragment = mk_info(&["1.0.0"], &[]);
+    peer_fragment.versions_complete = false;
+    peer_fragment.deps.remove("1.0.0");
+    peer_fragment.peer_deps.insert(
+        "1.0.0".to_string(),
+        HashMap::from([("zod".to_string(), "^4.0.0".to_string())]),
+    );
+    let merged =
+        insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(peer_fragment));
+
+    assert!(
+        !merged
+            .peer_deps
+            .get("1.0.0")
+            .is_some_and(|peers| peers.contains_key("zod")),
+        "a partial metadata merge must preserve regular-dependency precedence"
+    );
+}
+
+#[test]
+fn reinserting_identical_cached_metadata_reuses_the_existing_arc() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("same-metadata");
+    let info = Arc::new(mk_info(&["1.0.0"], &[]));
+    shared_cache.insert(canonical.clone(), Arc::clone(&info));
+
+    let reinserted =
+        insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::clone(&info));
+
+    assert!(Arc::ptr_eq(&reinserted, &info));
 }
 
 #[test]
@@ -269,6 +324,18 @@ fn find_best_version_picks_newest_match() {
     assert_eq!(
         picked(find_best_version(&info, &range)).to_string(),
         "4.17.21"
+    );
+}
+
+#[test]
+fn find_best_version_prefers_satisfying_latest_dist_tag() {
+    let mut info = mk_info(&["1.0.0-next.28", "1.0.0-next.25"], &[]);
+    info.latest_version = Some(NpmVersion::parse("1.0.0-next.25").unwrap());
+    let range = NpmRange::parse("^1.0.0-next.25").unwrap();
+
+    assert_eq!(
+        picked(find_best_version(&info, &range)).to_string(),
+        "1.0.0-next.25"
     );
 }
 
@@ -1106,12 +1173,9 @@ fn seed_root_edges_seeds_root_node() {
 }
 
 #[test]
-fn process_edge_reuses_node_when_existing_version_satisfies_new_range() {
-    // Two parents both wanting `lodash` with COMPATIBLE ranges
-    // (^4.0.0 and ^4.10.0 both satisfied by 4.17.21) should produce
-    // ONE resolved node, two parent→child edges. The first edge
-    // picks 4.17.21; the second sees an existing node whose version
-    // satisfies its tighter range and reuses it.
+fn process_edge_reuses_node_when_edges_select_the_same_version() {
+    // Both compatible ranges naturally select 4.17.21, so their exact
+    // selected package identity is shared by both parent edges.
     let info = mk_info(&["4.17.21"], &[]);
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), "^4.0.0".to_string());
@@ -1166,6 +1230,58 @@ fn process_edge_reuses_node_when_existing_version_satisfies_new_range() {
     );
 }
 
+fn overlapping_range_targets(broad_first: bool) -> (String, String) {
+    let info = mk_info(&["2.0.3", "1.0.1"], &[]);
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let narrow_parent = push_node(&mut state, CanonicalKey::npm("narrow-parent"), "1.0.0");
+    let broad_parent = push_node(&mut state, CanonicalKey::npm("broad-parent"), "1.0.0");
+    let narrow = Edge {
+        parent: narrow_parent,
+        local_name: "shared".to_string(),
+        canonical: CanonicalKey::npm("shared"),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let broad = Edge {
+        parent: broad_parent,
+        local_name: "shared".to_string(),
+        canonical: CanonicalKey::npm("shared"),
+        range: NpmRange::parse("1 - 2").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let edges = if broad_first {
+        [broad, narrow]
+    } else {
+        [narrow, broad]
+    };
+    for edge in edges {
+        process_edge(&edge, &info, &mut state).unwrap();
+    }
+    let selected = |parent: NodeId| {
+        let child = state.nodes[parent as usize].children[0].1;
+        state.nodes[child as usize].version.to_string()
+    };
+    (selected(narrow_parent), selected(broad_parent))
+}
+
+#[test]
+fn process_edge_overlapping_range_targets_are_independent_of_edge_order() {
+    let narrow_first = overlapping_range_targets(false);
+    let broad_first = overlapping_range_targets(true);
+
+    assert_eq!(narrow_first, broad_first);
+    assert_eq!(narrow_first, ("1.0.1".to_string(), "2.0.3".to_string()));
+}
+
 #[test]
 fn process_edge_records_work_stats_for_allocation_and_reuse() {
     let info = mk_info(&["4.17.21"], &[]);
@@ -1203,8 +1319,8 @@ fn process_edge_records_work_stats_for_allocation_and_reuse() {
     assert_eq!(state.work_stats.edge_process_count, 2);
     assert_eq!(state.work_stats.node_allocated_count, 1);
     assert_eq!(state.work_stats.edge_reuse_count, 1);
-    assert_eq!(state.work_stats.edge_reuse_range_count, 1);
-    assert_eq!(state.work_stats.edge_reuse_exact_count, 0);
+    assert_eq!(state.work_stats.edge_reuse_range_count, 0);
+    assert_eq!(state.work_stats.edge_reuse_exact_count, 1);
 }
 
 #[test]
@@ -2045,6 +2161,19 @@ fn peer_collection_does_not_push_to_task_queue() {
 }
 
 #[test]
+fn peer_collection_regular_dependency_shadows_same_named_peer_requirement() {
+    let info = mk_info_with_peers(&["1.0.0"], &[("zod", "^4.3.6")], &[("zod", "^4.0.0")], &[]);
+    let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+    assert_eq!(state.task_queue.len(), 1);
+    assert_eq!(state.task_queue[0].local_name, "zod");
+    assert!(
+        state.peer_requirements.is_empty(),
+        "a regular dependency must not also create peer context for the same local name"
+    );
+}
+
+#[test]
 fn peer_collection_does_not_mutate_consumer_children() {
     // **Contract assertion.** The consumer node's `children` list
     // must not gain a peer entry. If a future change accidentally
@@ -2312,7 +2441,7 @@ fn push_node(state: &mut ResolveState, canonical: CanonicalKey, version: &str) -
 }
 
 #[test]
-fn process_edge_reuses_newest_existing_version_when_multiple_satisfy_range() {
+fn process_edge_reuses_existing_node_for_the_natural_target_version() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     push_node(&mut state, CanonicalKey::Root, "0.0.0");
     let shared = CanonicalKey::npm("shared");
@@ -2345,7 +2474,7 @@ fn process_edge_reuses_newest_existing_version_when_multiple_satisfy_range() {
     assert_eq!(
         state.nodes[0].children,
         vec![("shared".to_string(), newer)],
-        "reuse must be independent of the order compatible nodes were allocated"
+        "reuse must target the edge's natural selection"
     );
 }
 
@@ -2413,7 +2542,7 @@ fn into_resolved_packages_binds_peer_by_consumer_range() {
         mk_info_arc(&["18.2.0", "17.0.2"], &[]),
     );
 
-    let resolved = state.into_resolved_packages(&cache);
+    let resolved = state.into_resolved_packages(&cache, &HashMap::new());
     let plugin = resolved
         .iter()
         .find(|pkg| pkg.package.canonical_name() == "plugin")
@@ -2423,6 +2552,46 @@ fn into_resolved_packages_binds_peer_by_consumer_range() {
         vec![("react".to_string(), "17.0.2".to_string())],
         "greedy finalization should bind the peer version satisfying the consumer range"
     );
+}
+
+#[test]
+fn into_resolved_packages_recomputes_required_reachability_from_the_final_graph() {
+    let mut state = ResolveState::new(
+        HashMap::from([("required-parent".to_string(), "1.0.0".to_string())]),
+        OverrideSet::empty(),
+    );
+    state.seed_root_edges().expect("seed required root");
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("required-parent"),
+        version: NpmVersion::parse("1.0.0").expect("valid parent version"),
+        optional: false,
+        children: vec![("required-child".to_string(), 2)],
+    });
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("required-child"),
+        version: NpmVersion::parse("1.0.0").expect("valid child version"),
+        optional: true,
+        children: Vec::new(),
+    });
+    state.nodes[0].children = vec![("required-parent".to_string(), 1)];
+    let cache = HashMap::from([
+        (
+            CanonicalKey::npm("required-parent"),
+            Arc::new(mk_info(&["1.0.0"], &[("required-child", "1.0.0")])),
+        ),
+        (
+            CanonicalKey::npm("required-child"),
+            Arc::new(mk_info(&["1.0.0"], &[])),
+        ),
+    ]);
+
+    let packages = state.into_resolved_packages(&cache, &HashMap::new());
+    let child = packages
+        .iter()
+        .find(|package| package.package.canonical_name() == "required-child")
+        .expect("required child should be resolved");
+
+    assert!(!child.optional);
 }
 
 #[tokio::test]
@@ -3392,12 +3561,7 @@ fn peer_prefetch_picker_empty_when_peer_requirements_empty() {
 }
 
 #[test]
-fn process_edge_zero_overrides_takes_hot_path_unchanged() {
-    // Sanity check: with no overrides, the slow-path branch is
-    // never entered — the existing (range.satisfies → reuse,
-    // else find_best_version → allocate) semantic is byte-
-    // identical. Guards against an accidental regression where
-    // the slow path becomes the default.
+fn process_edge_without_overrides_selects_natural_version() {
     let info = mk_info(&["4.17.21", "4.0.0"], &[]);
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), "^4.0.0".to_string());
@@ -3571,6 +3735,555 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
         (PACKAGE_COUNT - FANOUT) as u64
     );
     assert!(result.stage_timing.dispatcher_semaphore_wait_ns > 0);
+}
+
+async fn resolve_overlapping_range_with_parent_delay(
+    exact_parent_delay_ms: u64,
+    range_parent_delay_ms: u64,
+) -> String {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for (name, dependency_range, delay_ms) in [
+        ("exact-parent", "1.0.0", exact_parent_delay_ms),
+        ("range-parent", "^1.0.0", range_parent_delay_ms),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(delay_ms))
+                    .set_body_json(metadata_json(name, &[("shared-child", dependency_range)])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/shared-child"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "shared-child",
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "shared-child",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.invalid/shared-child-1.0.0.tgz",
+                        "integrity": "sha512-shared-100"
+                    }
+                },
+                "1.1.0": {
+                    "name": "shared-child",
+                    "version": "1.1.0",
+                    "dist": {
+                        "tarball": "https://example.invalid/shared-child-1.1.0.tgz",
+                        "integrity": "sha512-shared-110"
+                    }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-02T00:00:00.000Z"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let dependencies = HashMap::from([
+        ("exact-parent".to_string(), "^1.0.0".to_string()),
+        ("range-parent".to_string(), "^1.0.0".to_string()),
+    ]);
+    let result = resolve_greedy_fused(
+        client,
+        dependencies,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("overlapping range fixture should resolve");
+
+    result
+        .packages
+        .iter()
+        .find(|package| package.package.canonical_name() == "range-parent")
+        .and_then(|package| {
+            package
+                .dependencies
+                .iter()
+                .find(|(name, _)| name == "shared-child")
+        })
+        .map(|(_, version)| version.clone())
+        .expect("range parent should retain its shared-child edge")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_overlapping_range_selection_is_independent_of_metadata_arrival_order() {
+    let exact_first = resolve_overlapping_range_with_parent_delay(0, 100).await;
+    let range_first = resolve_overlapping_range_with_parent_delay(100, 0).await;
+
+    assert_eq!(exact_first, "1.1.0");
+    assert_eq!(
+        exact_first, range_first,
+        "metadata response order must not change the selected dependency graph"
+    );
+}
+
+async fn resolve_direct_and_transitive_overlap_with_seeded_cache(
+    seed_parent: bool,
+    seed_shared: bool,
+) -> String {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let parent_metadata = metadata_json("range-parent", &[("shared-child", "*")]);
+    let shared_metadata = serde_json::json!({
+        "name": "shared-child",
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "shared-child",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/shared-child-1.0.0.tgz",
+                    "integrity": "sha512-shared-100"
+                }
+            },
+            "1.1.0": {
+                "name": "shared-child",
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": "https://example.invalid/shared-child-1.1.0.tgz",
+                    "integrity": "sha512-shared-110"
+                }
+            }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/range-parent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(parent_metadata.clone()))
+        .expect(u64::from(!seed_parent))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared-child"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
+        .expect(u64::from(!seed_shared))
+        .mount(&server)
+        .await;
+
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    if seed_parent {
+        let metadata = serde_json::from_value(parent_metadata).expect("parent metadata fixture");
+        shared_cache.insert(
+            CanonicalKey::npm("range-parent"),
+            Arc::new(parse_metadata_to_cache_info(&metadata)),
+        );
+    }
+    if seed_shared {
+        let metadata = serde_json::from_value(shared_metadata).expect("shared metadata fixture");
+        shared_cache.insert(
+            CanonicalKey::npm("shared-child"),
+            Arc::new(parse_metadata_to_cache_info(&metadata)),
+        );
+    }
+
+    let result = resolve_greedy_fused_with_cache_options(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("range-parent".to_string(), "*".to_string()),
+            ("shared-child".to_string(), "1.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        shared_cache,
+        true,
+        true,
+    )
+    .await
+    .expect("direct and transitive overlap fixture should resolve");
+
+    result
+        .packages
+        .iter()
+        .find(|package| package.package.canonical_name() == "range-parent")
+        .and_then(|package| {
+            package
+                .dependencies
+                .iter()
+                .find(|(name, _)| name == "shared-child")
+        })
+        .map(|(_, version)| version.clone())
+        .expect("range parent should retain its shared-child edge")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_overlapping_range_selection_is_independent_of_shared_cache_warmth() {
+    let cold = resolve_direct_and_transitive_overlap_with_seeded_cache(false, false).await;
+    let parent_warm = resolve_direct_and_transitive_overlap_with_seeded_cache(true, false).await;
+    let shared_warm = resolve_direct_and_transitive_overlap_with_seeded_cache(false, true).await;
+    let fully_warm = resolve_direct_and_transitive_overlap_with_seeded_cache(true, true).await;
+
+    assert_eq!(cold, "1.1.0");
+    assert_eq!(
+        [parent_warm, shared_warm, fully_warm],
+        [cold.clone(), cold.clone(), cold],
+        "shared-cache warmth must not change the selected dependency graph"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CacheWarmOverlapResult {
+    required_parent_child: String,
+    optional_parent_child: String,
+    shared_versions: Vec<(String, bool)>,
+}
+
+#[derive(Clone, Copy)]
+enum CacheWarmFixtureSeed {
+    Cold,
+    RequiredChain,
+    Complete,
+}
+
+async fn resolve_deep_required_and_shallow_optional_overlap(
+    seed: CacheWarmFixtureSeed,
+) -> CacheWarmOverlapResult {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let required_parent = metadata_json("a-required-parent", &[("middle", "*")]);
+    let optional_parent = metadata_json("b-optional-parent", &[("shared-child", "^1.1.1")]);
+    let middle = metadata_json("middle", &[("shared-child", "~1.1.1")]);
+    let shared_child = serde_json::json!({
+        "name": "shared-child",
+        "dist-tags": { "latest": "1.3.0" },
+        "versions": {
+            "1.1.1": {
+                "name": "shared-child",
+                "version": "1.1.1",
+                "dist": {
+                    "tarball": "https://example.invalid/shared-child-1.1.1.tgz",
+                    "integrity": "sha512-shared-111"
+                }
+            },
+            "1.3.0": {
+                "name": "shared-child",
+                "version": "1.3.0",
+                "dist": {
+                    "tarball": "https://example.invalid/shared-child-1.3.0.tgz",
+                    "integrity": "sha512-shared-130"
+                }
+            }
+        }
+    });
+    let required_chain_seeded = matches!(
+        seed,
+        CacheWarmFixtureSeed::RequiredChain | CacheWarmFixtureSeed::Complete
+    );
+    let fully_seeded = matches!(seed, CacheWarmFixtureSeed::Complete);
+    for (name, metadata, seeded) in [
+        (
+            "a-required-parent",
+            required_parent.clone(),
+            required_chain_seeded,
+        ),
+        ("b-optional-parent", optional_parent.clone(), fully_seeded),
+        ("middle", middle.clone(), required_chain_seeded),
+        ("shared-child", shared_child.clone(), fully_seeded),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .expect(u64::from(!seeded))
+            .mount(&server)
+            .await;
+    }
+
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    if required_chain_seeded {
+        for (name, metadata) in [("a-required-parent", required_parent), ("middle", middle)] {
+            let metadata = serde_json::from_value(metadata).expect("seeded metadata fixture");
+            shared_cache.insert(
+                CanonicalKey::npm(name),
+                Arc::new(parse_metadata_to_cache_info(&metadata)),
+            );
+        }
+    }
+    if fully_seeded {
+        for (name, metadata) in [
+            ("b-optional-parent", optional_parent),
+            ("shared-child", shared_child),
+        ] {
+            let metadata = serde_json::from_value(metadata).expect("seeded metadata fixture");
+            shared_cache.insert(
+                CanonicalKey::npm(name),
+                Arc::new(parse_metadata_to_cache_info(&metadata)),
+            );
+        }
+    }
+
+    let roots = crate::resolve::RootDependencies::with_optional_names(
+        HashMap::from([
+            ("a-required-parent".to_string(), "*".to_string()),
+            ("b-optional-parent".to_string(), "*".to_string()),
+        ]),
+        HashSet::from(["b-optional-parent".to_string()]),
+    );
+    let result = resolve_greedy_fused_with_cache_options_and_policy_roots(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        roots,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        shared_cache,
+        true,
+        true,
+        ResolverPolicy::default(),
+    )
+    .await
+    .expect("deep required and shallow optional overlap should resolve");
+
+    let dependency_version = |parent: &str, child: &str| {
+        result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == parent)
+            .and_then(|package| package.dependencies.iter().find(|(name, _)| name == child))
+            .map_or_else(
+                || panic!("{parent} should retain its {child} edge"),
+                |(_, version)| version.clone(),
+            )
+    };
+    let mut shared_versions: Vec<_> = result
+        .packages
+        .iter()
+        .filter(|package| package.package.canonical_name() == "shared-child")
+        .map(|package| (package.version.to_string(), package.optional))
+        .collect();
+    shared_versions.sort_unstable();
+
+    CacheWarmOverlapResult {
+        required_parent_child: dependency_version("middle", "shared-child"),
+        optional_parent_child: dependency_version("b-optional-parent", "shared-child"),
+        shared_versions,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_deep_overlap_selection_is_independent_of_shared_cache_warmth() {
+    let cold = resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Cold).await;
+    let partially_seeded =
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::RequiredChain)
+            .await;
+    let fully_seeded =
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Complete).await;
+
+    assert_eq!(
+        [
+            (
+                partially_seeded.required_parent_child,
+                partially_seeded.optional_parent_child,
+            ),
+            (
+                fully_seeded.required_parent_child,
+                fully_seeded.optional_parent_child,
+            ),
+        ],
+        [
+            (
+                cold.required_parent_child.clone(),
+                cold.optional_parent_child.clone(),
+            ),
+            (cold.required_parent_child, cold.optional_parent_child),
+        ],
+        "shared-cache warmth must not change overlapping transitive selections"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_required_reachability_is_independent_of_shared_cache_warmth() {
+    let cold = resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Cold).await;
+    let partially_seeded =
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::RequiredChain)
+            .await;
+    let fully_seeded =
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Complete).await;
+
+    assert_eq!(
+        [
+            partially_seeded.shared_versions,
+            fully_seeded.shared_versions
+        ],
+        [cold.shared_versions.clone(), cold.shared_versions],
+        "shared-cache warmth must not change required versus optional reachability"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_strict_release_age_selection_is_independent_of_persistent_cache_warmth() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut parent_abbreviated = metadata_json("range-parent", &[("shared-child", "*")]);
+    let parent_object = parent_abbreviated
+        .as_object_mut()
+        .expect("parent metadata object");
+    parent_object.remove("time");
+    parent_object.insert(
+        "modified".to_string(),
+        serde_json::Value::String("2026-07-31T12:00:00.000Z".to_string()),
+    );
+    let shared_abbreviated = serde_json::json!({
+        "name": "shared-child",
+        "modified": "2026-07-31T12:00:00.000Z",
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "shared-child",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/shared-child-1.0.0.tgz",
+                    "integrity": "sha512-shared-100"
+                }
+            },
+            "1.1.0": {
+                "name": "shared-child",
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": "https://example.invalid/shared-child-1.1.0.tgz",
+                    "integrity": "sha512-shared-110"
+                }
+            }
+        }
+    });
+    for (name, abbreviated, release_times) in [
+        (
+            "range-parent",
+            parent_abbreviated,
+            serde_json::json!({
+                "name": "range-parent",
+                "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+            }),
+        ),
+        (
+            "shared-child",
+            shared_abbreviated,
+            serde_json::json!({
+                "name": "shared-child",
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-02-01T00:00:00.000Z"
+                }
+            }),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .and(header("Accept", "application/vnd.npm.install-v1+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .and(header("Accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_times))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let cache_dir = tempfile::tempdir().expect("metadata cache temp dir");
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(Some(cache_dir.path().to_path_buf())),
+    );
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_775_001_600, Default::default());
+    let resolve = |dependencies| {
+        resolve_greedy_fused_with_cache_options_and_policy(
+            Arc::clone(&client),
+            dependencies,
+            OverrideSet::empty(),
+            route_table.clone(),
+            8,
+            None,
+            Arc::new(dashmap::DashMap::new()),
+            true,
+            true,
+            policy.clone(),
+        )
+    };
+
+    resolve(HashMap::from([(
+        "shared-child".to_string(),
+        "*".to_string(),
+    )]))
+    .await
+    .expect("member pre-resolution should warm shared metadata");
+    client.flush_pending_cache_writes().await;
+
+    let partially_warm = resolve(HashMap::from([
+        ("range-parent".to_string(), "*".to_string()),
+        ("shared-child".to_string(), "1.0.0".to_string()),
+    ]))
+    .await
+    .expect("partially warm root should resolve");
+    client.flush_pending_cache_writes().await;
+    let fully_warm = resolve(HashMap::from([
+        ("range-parent".to_string(), "*".to_string()),
+        ("shared-child".to_string(), "1.0.0".to_string()),
+    ]))
+    .await
+    .expect("fully warm root should resolve");
+
+    let selected_child = |result: &ResolveResult| {
+        result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == "range-parent")
+            .and_then(|package| {
+                package
+                    .dependencies
+                    .iter()
+                    .find(|(name, _)| name == "shared-child")
+            })
+            .map(|(_, version)| version.clone())
+            .expect("range parent should retain its shared-child edge")
+    };
+    let partially_warm_child = selected_child(&partially_warm);
+    let fully_warm_child = selected_child(&fully_warm);
+    assert_eq!(partially_warm_child, "1.1.0");
+    assert_eq!(
+        partially_warm_child, fully_warm_child,
+        "persistent metadata cache warmth must not change strict-policy selection"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4062,7 +4775,10 @@ async fn fusion_streaming_worker_batch_refetches_full_metadata_for_late_peer_ran
     ]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let mut root_meta = metadata_json("proxy-peer-root", &[("shared-peer", "^5.0.0")]);
+    let mut root_meta = metadata_json(
+        "proxy-peer-root",
+        &[("shared-peer-v5", "npm:shared-peer@^5.0.0")],
+    );
     root_meta["versions"]["1.0.0"]["peerDependencies"] =
         serde_json::json!({ "shared-peer": "^4.0.0" });
     let streamed_shared = metadata_json_version("shared-peer", "5.0.0", &[]);

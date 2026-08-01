@@ -1,9 +1,8 @@
 use super::ExperimentalMetadataFetchTimings;
 use super::metrics::{metrics_incr_cache_wait, metrics_incr_escape_hatch, metrics_incr_timeout};
 use super::prelude::*;
-use super::state::{MetadataEdgeMissLatest, ResolveState};
+use super::state::{MetadataEdgeMissLatest, PendingRootConstraints, ResolveState};
 use super::types::Edge;
-use crate::provider::CachedDistInfo;
 
 /// Fast cache hit, then short-lived per-canonical wait, then escape-hatch
 /// direct fetch. Mirrors `LpmDependencyProvider::ensure_cached` but yields an
@@ -159,6 +158,9 @@ pub(super) async fn fetch_metadata_for_resolver(
     if info.needs_release_time_metadata(canonical, policy) {
         fetch_release_times_for_policy(client, route_table, canonical, &mut info, false).await?;
     }
+    if info.needs_platform_metadata() {
+        fetch_platform_metadata(client, route_table, canonical, &mut info, false).await?;
+    }
     Ok(fetched_metadata_from_info(
         None,
         dist_tags,
@@ -228,6 +230,9 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
         }
         timings.policy_release_time_ms = policy_start.elapsed().as_millis();
     }
+    if info.needs_platform_metadata() {
+        fetch_platform_metadata(client, route_table, canonical, &mut info, true).await?;
+    }
     let fetched = fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
     timings.total_ms = total_start.elapsed().as_millis();
     Ok((fetched, timings))
@@ -294,9 +299,10 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     timings.body_bytes = raw.timings.body_bytes;
 
     let parse_start = Instant::now();
-    let info = parse_partial_metadata_to_cache_info(&raw.metadata);
+    let mut info = parse_partial_metadata_to_cache_info(&raw.metadata);
+    info.platform_metadata_complete = true;
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
-    if info.needs_policy_metadata(canonical, policy) {
+    if info.needs_supplemental_metadata(canonical, policy) {
         let policy_start = Instant::now();
         let fetched = fetch_metadata_for_resolver(
             client,
@@ -507,31 +513,51 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     policy: &ResolverPolicy,
     trace_metadata_fetches: bool,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
-    if !info.needs_policy_metadata(canonical, policy) {
+    if !info.needs_supplemental_metadata(canonical, policy) {
         return Ok(info);
     }
     if !matches!(canonical, CanonicalKey::Npm { .. }) {
         return Ok(info);
     }
-    if !info.needs_trust_metadata(policy) && info.needs_release_time_metadata(canonical, policy) {
+    if !info.needs_trust_metadata(policy) {
         let mut merged = (*info).clone();
-        let policy_start = trace_metadata_fetches.then(Instant::now);
-        let detail = fetch_release_times_for_policy(
-            client,
-            route_table,
-            canonical,
-            &mut merged,
-            trace_metadata_fetches,
-        )
-        .await?;
-        if let Some(start) = policy_start {
+        let supplemental_start = trace_metadata_fetches.then(Instant::now);
+        let (detail, policy_release_time_ms) =
+            if merged.needs_release_time_metadata(canonical, policy) {
+                let release_time_start = trace_metadata_fetches.then(Instant::now);
+                let detail = fetch_release_times_for_policy(
+                    client,
+                    route_table,
+                    canonical,
+                    &mut merged,
+                    trace_metadata_fetches,
+                )
+                .await?;
+                (
+                    detail,
+                    release_time_start.map_or(0, |start| start.elapsed().as_millis()),
+                )
+            } else {
+                (None, 0)
+            };
+        if merged.needs_platform_metadata() {
+            fetch_platform_metadata(
+                client,
+                route_table,
+                canonical,
+                &mut merged,
+                trace_metadata_fetches,
+            )
+            .await?;
+        }
+        if let Some(start) = supplemental_start {
             let elapsed = start.elapsed().as_millis();
             lpm_registry::timing::record_metadata_fetch_detail(
                 cached_policy_metadata_fetch_detail_record(
                     canonical,
                     route_table,
                     elapsed,
-                    elapsed,
+                    policy_release_time_ms,
                     0,
                     merged.versions.len() as u64,
                     detail,
@@ -662,6 +688,101 @@ async fn fetch_release_times_for_policy(
     Ok(None)
 }
 
+async fn fetch_platform_metadata(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    info: &mut CachedPackageInfo,
+    capture_timings: bool,
+) -> Result<Option<ReleaseTimeFetchDetail>, ResolveError> {
+    let CanonicalKey::Npm { name } = canonical else {
+        return Ok(None);
+    };
+    let route = route_table.route_for_package(name);
+    let detail = fetch_platform_metadata_from_route(
+        client,
+        canonical,
+        name,
+        route.clone(),
+        info,
+        capture_timings,
+    )
+    .await?;
+    if !info.needs_platform_metadata() {
+        return Ok(detail);
+    }
+    if matches!(route, UpstreamRoute::LpmWorker) {
+        let direct_detail = fetch_platform_metadata_from_route(
+            client,
+            canonical,
+            name,
+            UpstreamRoute::NpmDirect,
+            info,
+            capture_timings,
+        )
+        .await?;
+        if !info.needs_platform_metadata() {
+            return Ok(direct_detail.or(detail));
+        }
+    }
+    Err(ResolveError::DependencyFetch {
+        package: canonical.to_string(),
+        version: "*".to_string(),
+        detail: "full registry metadata omitted the versions map required to recover platform restrictions"
+            .to_string(),
+    })
+}
+
+async fn fetch_platform_metadata_from_route(
+    client: &RegistryClient,
+    canonical: &CanonicalKey,
+    name: &str,
+    route: UpstreamRoute,
+    info: &mut CachedPackageInfo,
+    capture_timings: bool,
+) -> Result<Option<ReleaseTimeFetchDetail>, ResolveError> {
+    let fetch = async {
+        if capture_timings {
+            let start = Instant::now();
+            let timed = client
+                .get_npm_platform_metadata_routed_full_with_timings(name, route)
+                .await
+                .map_err(|error| ResolveError::DependencyFetch {
+                    package: canonical.to_string(),
+                    version: "*".to_string(),
+                    detail: error.to_string(),
+                })?;
+            let detail = ReleaseTimeFetchDetail {
+                total_ms: start.elapsed().as_millis(),
+                timings: timed.timings,
+                version_count: timed
+                    .metadata
+                    .versions
+                    .as_ref()
+                    .map_or(0, |versions| versions.len() as u64),
+            };
+            merge_release_times_into_cache_info(info, &timed.metadata);
+            Ok(Some(detail))
+        } else {
+            let metadata = client
+                .get_npm_platform_metadata_routed_full(name, route)
+                .await
+                .map_err(|error| ResolveError::DependencyFetch {
+                    package: canonical.to_string(),
+                    version: "*".to_string(),
+                    detail: error.to_string(),
+                })?;
+            merge_release_times_into_cache_info(info, &metadata);
+            Ok(None)
+        }
+    };
+    lpm_registry::timing::with_metadata_purpose(
+        lpm_registry::timing::MetadataPurpose::PlatformHydration,
+        fetch,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 struct ReleaseTimeFetchDetail {
     total_ms: u128,
@@ -679,7 +800,7 @@ async fn fetch_full_metadata_for_policy(
 ) -> Result<FetchedMetadata, ResolveError> {
     let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
     let fetched = parse_full_fetched_metadata(full, include_speculation, include_latest_version);
-    if !fetched.info.needs_policy_metadata(canonical, policy) {
+    if !fetched.info.needs_supplemental_metadata(canonical, policy) {
         return Ok(fetched);
     }
 
@@ -720,123 +841,7 @@ pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) tarball_dispatched_count: &'a mut u64,
     pub(super) parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
     pub(super) state: &'a mut ResolveState,
-}
-
-pub(super) fn insert_or_merge_cached_package_info(
-    shared_cache: &SharedCache,
-    canonical: CanonicalKey,
-    incoming: Arc<CachedPackageInfo>,
-) -> Arc<CachedPackageInfo> {
-    if incoming.versions_complete {
-        shared_cache.insert(canonical, incoming.clone());
-        return incoming;
-    }
-
-    let Some(existing) = shared_cache
-        .get(&canonical)
-        .map(|entry| Arc::clone(entry.value()))
-    else {
-        shared_cache.insert(canonical, incoming.clone());
-        return incoming;
-    };
-
-    let merged = Arc::new(merge_cached_package_info(&existing, &incoming));
-    shared_cache.insert(canonical, merged.clone());
-    merged
-}
-
-fn merge_cached_package_info(
-    existing: &CachedPackageInfo,
-    incoming: &CachedPackageInfo,
-) -> CachedPackageInfo {
-    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
-    versions.extend(existing.versions.iter().cloned());
-    versions.extend(incoming.versions.iter().cloned());
-    versions.sort_by(|a, b| b.cmp(a));
-    versions.dedup();
-
-    let mut dist = existing.dist.clone();
-    for (version, incoming_dist) in &incoming.dist {
-        dist.entry(version.clone())
-            .and_modify(|existing_dist| {
-                *existing_dist = merge_cached_dist_info(existing_dist, incoming_dist);
-            })
-            .or_insert_with(|| incoming_dist.clone());
-    }
-
-    let mut deps = existing.deps.clone();
-    deps.extend(incoming.deps.clone());
-    let mut peer_deps = existing.peer_deps.clone();
-    peer_deps.extend(incoming.peer_deps.clone());
-    let mut optional_dep_names = existing.optional_dep_names.clone();
-    optional_dep_names.extend(incoming.optional_dep_names.clone());
-    let mut optional_peer_names = existing.optional_peer_names.clone();
-    optional_peer_names.extend(incoming.optional_peer_names.clone());
-    let mut node_engines = existing.node_engines.clone();
-    node_engines.extend(incoming.node_engines.clone());
-    let mut bundled_dep_names = existing.bundled_dep_names.clone();
-    bundled_dep_names.extend(incoming.bundled_dep_names.clone());
-    let mut platform = existing.platform.clone();
-    platform.extend(incoming.platform.clone());
-    let mut aliases = existing.aliases.clone();
-    aliases.extend(incoming.aliases.clone());
-    let mut covered_ranges = existing.covered_ranges.clone();
-    covered_ranges.extend(incoming.covered_ranges.iter().cloned());
-    let incoming_adds_versions = incoming
-        .versions
-        .iter()
-        .any(|version| !existing.versions.contains(version));
-    let versions_complete = existing.versions_complete && !incoming_adds_versions;
-
-    CachedPackageInfo {
-        modified: incoming
-            .modified
-            .clone()
-            .or_else(|| existing.modified.clone()),
-        modified_unix: incoming.modified_unix.or(existing.modified_unix),
-        trust_metadata_complete: versions_complete
-            && (existing.trust_metadata_complete || incoming.trust_metadata_complete),
-        versions_complete,
-        covered_ranges,
-        latest_version: incoming
-            .latest_version
-            .clone()
-            .or_else(|| existing.latest_version.clone()),
-        versions,
-        deps,
-        peer_deps,
-        optional_dep_names,
-        optional_peer_names,
-        node_engines,
-        bundled_dep_names,
-        platform,
-        dist,
-        aliases,
-    }
-}
-
-fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
-    CachedDistInfo {
-        tarball_url: incoming
-            .tarball_url
-            .clone()
-            .or_else(|| existing.tarball_url.clone()),
-        integrity: incoming
-            .integrity
-            .clone()
-            .or_else(|| existing.integrity.clone()),
-        signatures: if incoming.signatures.is_empty() {
-            existing.signatures.clone()
-        } else {
-            incoming.signatures.clone()
-        },
-        published_at: incoming
-            .published_at
-            .clone()
-            .or_else(|| existing.published_at.clone()),
-        published_at_unix: incoming.published_at_unix.or(existing.published_at_unix),
-        trust_evidence: incoming.trust_evidence.or(existing.trust_evidence),
-    }
+    pub(super) pending_root_constraints: &'a mut PendingRootConstraints,
 }
 
 pub(super) fn complete_metadata_fetch(
@@ -892,6 +897,9 @@ pub(super) fn complete_metadata_fetch(
             if let Some(edges) = completion.parked.remove(&canonical) {
                 for edge in edges {
                     propagate_fetch_error(&edge, &e, completion.state)?;
+                    completion
+                        .pending_root_constraints
+                        .complete_root_edge(&edge, &mut completion.state.task_queue);
                 }
             }
         }

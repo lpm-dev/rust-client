@@ -14,7 +14,7 @@ use support::{
     TempProject, configure_fake_node, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry,
     project_bin_path, write_repeated_file, write_signed_unlock,
 };
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── No package.json ─────────────────────────────────────────────
@@ -828,6 +828,100 @@ async fn install_add_with_dist_tag_resolves_tagged_prerelease_and_saves_exact() 
         serde_json::Value::String(beta_version.to_string()),
         "node_modules must contain the dist-tag target version"
     );
+}
+
+async fn assert_install_range_prefers_satisfying_latest_dist_tag(resolver: Option<&str>) {
+    let mock = MockRegistry::start().await;
+    let package_name = "dist-tag-range-preference";
+    let latest_version = "1.0.0-next.25";
+    let higher_version = "1.0.0-next.28";
+    let latest_tarball = make_tarball(package_name, latest_version);
+    let higher_tarball = make_tarball(package_name, higher_version);
+    let metadata = serde_json::json!({
+        "name": package_name,
+        "dist-tags": {
+            "latest": latest_version,
+            "next": higher_version,
+        },
+        "modified": "2025-01-02T00:00:00.000Z",
+        "versions": {
+            latest_version: {
+                "name": package_name,
+                "version": latest_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package_name, latest_version),
+                    "integrity": compute_integrity(&latest_tarball),
+                },
+                "dependencies": {},
+            },
+            higher_version: {
+                "name": package_name,
+                "version": higher_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package_name, higher_version),
+                    "integrity": compute_integrity(&higher_tarball),
+                },
+                "dependencies": {},
+            },
+        },
+        "time": {
+            latest_version: "2025-01-01T00:00:00.000Z",
+            higher_version: "2025-01-02T00:00:00.000Z",
+        },
+    });
+    mock.with_package_metadata_and_tarballs(
+        package_name,
+        metadata.clone(),
+        &[
+            (latest_version, latest_tarball),
+            (higher_version, higher_tarball),
+        ],
+    )
+    .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name": "dist-tag-range-project",
+            "version": "1.0.0",
+            "dependencies": {{ "{package_name}": "^1.0.0-next.25" }}
+        }}"#,
+    ));
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.args([
+        "install",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]);
+    if let Some(resolver) = resolver {
+        command.env("LPM_RESOLVER", resolver);
+    }
+
+    let output = command.output().expect("run range install");
+
+    assert!(
+        output.status.success(),
+        "range install must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let installed: serde_json::Value = serde_json::from_str(
+        &project.read_file(&format!("node_modules/{package_name}/package.json")),
+    )
+    .expect("installed package.json must parse");
+    assert_eq!(installed["version"], serde_json::json!(latest_version));
+}
+
+#[tokio::test]
+async fn install_range_prefers_satisfying_latest_dist_tag_over_higher_prerelease() {
+    assert_install_range_prefers_satisfying_latest_dist_tag(None).await;
+}
+
+#[tokio::test]
+async fn install_pubgrub_range_prefers_satisfying_latest_dist_tag_over_higher_prerelease() {
+    assert_install_range_prefers_satisfying_latest_dist_tag(Some("pubgrub")).await;
 }
 
 #[tokio::test]
@@ -8046,6 +8140,105 @@ fn strict_install_skips_incompatible_optional_file_dependency_from_local_source(
     assert!(project.path().join("node_modules/local-host").exists());
 }
 
+#[test]
+fn install_accepts_versionless_transitive_link_dependency() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"versionless-link-consumer",
+            "version":"1.0.0",
+            "dependencies":{"local-parent":"file:./packages/local-parent"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-parent/package.json",
+        r#"{
+            "name":"local-parent",
+            "version":"1.0.0",
+            "dependencies":{"local-child":"link:../local-child"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-child/package.json",
+        r#"{"name":"local-child","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/local-child/index.js",
+        "module.exports = 'linked';\n",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install versionless transitive link dependency");
+
+    assert!(
+        output.status.success(),
+        "a local link package may omit version\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lockfile after versionless link install");
+    assert!(
+        lockfile
+            .packages
+            .iter()
+            .any(|package| package.name == "local-child" && package.version == "0.0.0"),
+        "versionless local links must use the same 0.0.0 identity as versionless workspace members",
+    );
+}
+
+#[test]
+fn install_does_not_auto_install_optional_peer_from_local_dependency() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"optional-local-peer-consumer",
+            "version":"1.0.0",
+            "dependencies":{"local-peer-host":"file:./packages/local-peer-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-peer-host/package.json",
+        r#"{
+            "name":"local-peer-host",
+            "version":"1.0.0",
+            "peerDependencies":{"foobar":"0.0.0"},
+            "peerDependenciesMeta":{"foobar":{"optional":true}}
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install local dependency with an absent optional peer");
+
+    assert!(
+        output.status.success(),
+        "an absent optional peer must not trigger registry resolution\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lockfile after optional peer install");
+    assert!(
+        lockfile
+            .packages
+            .iter()
+            .all(|package| package.name != "foobar"),
+        "optional peer must remain absent when the consumer does not provide it",
+    );
+}
+
 #[tokio::test]
 async fn optional_local_engine_skip_preserves_required_registry_package_with_same_identity() {
     let mock = MockRegistry::start().await;
@@ -9352,6 +9545,39 @@ fn install_workspace_transitive_resolves_against_full_membership_set() {
     );
 }
 
+#[test]
+fn install_workspace_accepts_utf8_bom_prefixed_member_manifest() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "bom-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/bom-member/package.json",
+        "\u{feff}{\"name\":\"bom-member\",\"version\":\"1.0.0\"}",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run recursive workspace install");
+
+    assert!(
+        output.status.success(),
+        "recursive install must accept a BOM-prefixed member manifest\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 // ─── workspace member root-symlink discovery paths ───
 //
 // Three discovery paths plant `node_modules/<member>` symlinks: the
@@ -9496,7 +9722,7 @@ fn store_v1_rollback_workspace_transitives_link_member_sources_at_root() {
 }
 
 #[tokio::test]
-async fn install_registry_transitive_dep_reenters_workspace_member() {
+async fn install_registry_transitive_keeps_registry_and_workspace_instances_separate() {
     let project = TempProject::empty(
         r#"{
   "name": "workspace-external-reentry-root",
@@ -9525,12 +9751,20 @@ async fn install_registry_transitive_dep_reenters_workspace_member() {
 }"#,
     );
     project.write_file(
+        "packages/cycle-a/index.js",
+        "module.exports = require('@smoke/cycle-b').name;\n",
+    );
+    project.write_file(
         "packages/cycle-b/package.json",
         r#"{
   "name": "@smoke/cycle-b",
   "version": "1.0.0",
   "dependencies": { "@smoke/cycle-a": "workspace:*" }
 }"#,
+    );
+    project.write_file(
+        "packages/cycle-b/index.js",
+        "exports.name = 'workspace-cycle-b';\n",
     );
 
     let mock = MockRegistry::start().await;
@@ -9548,6 +9782,15 @@ async fn install_registry_transitive_dep_reenters_workspace_member() {
         )],
     )
     .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "@smoke/cycle-b",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"exports.name = 'registry-cycle-b';\n")],
+    )
+    .await;
 
     let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.current_dir(project.path().join("apps/app"));
@@ -9563,7 +9806,7 @@ async fn install_registry_transitive_dep_reenters_workspace_member() {
 
     assert!(
         output.status.success(),
-        "install should resolve registry package transitive @smoke/cycle-b to the local workspace member\nstdout:\n{}\nstderr:\n{}",
+        "install should keep registry and workspace instances separate\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -9579,7 +9822,26 @@ async fn install_registry_transitive_dep_reenters_workspace_member() {
         .expect("resolve workspace cycle-b package");
     assert_eq!(
         cycle_b_resolved, cycle_b_expected,
-        "registry transitive @smoke/cycle-b dependency must re-enter the local workspace member",
+        "the explicit workspace dependency must still link the local member",
+    );
+
+    let runtime = std::process::Command::new("node")
+        .args([
+            "-e",
+            "process.stdout.write(`${require('@smoke/cycle-a')}:${require('external-reentry')}`)",
+        ])
+        .current_dir(&app_dir)
+        .output()
+        .expect("run mixed registry and workspace source graph");
+    assert!(
+        runtime.status.success(),
+        "mixed source graph must load\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "workspace-cycle-b:registry-cycle-b",
     );
 
     let requests = mock
@@ -9587,21 +9849,204 @@ async fn install_registry_transitive_dep_reenters_workspace_member() {
         .received_requests()
         .await
         .expect("wiremock request log must be available");
-    let leaked_cycle_b_requests: Vec<_> = requests
+    let cycle_b_requested = requests
         .iter()
-        .filter(|request| request.url.path().contains("cycle-b"))
-        .map(|request| request.url.path().to_string())
-        .collect();
+        .any(|request| request.url.path().contains("cycle-b"));
     assert!(
-        leaked_cycle_b_requests.is_empty(),
-        "install must not ask the registry for workspace member @smoke/cycle-b; leaked requests: {leaked_cycle_b_requests:?}\nstdout:\n{}\nstderr:\n{}",
+        cycle_b_requested,
+        "the registry package's dependency must be fetched from the registry\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
+async fn assert_registry_transitive_uses_registry_when_workspace_version_does_not_match(
+    pubgrub: bool,
+) {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-version-mismatch-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}"#,
+    );
+    project.write_file(
+        "apps/app/package.json",
+        r#"{
+  "name": "@smoke/app",
+  "version": "1.0.0",
+  "dependencies": { "external-consumer": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/shared/package.json",
+        r#"{
+  "name": "@smoke/shared",
+  "version": "2.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file(
+        "packages/shared/index.js",
+        "module.exports = 'workspace-v2';\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "external-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "dependencies": { "@smoke/shared": "^1.0.0" }
+        }),
+        &[("index.js", b"module.exports = require('@smoke/shared');\n")],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "@smoke/shared",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'registry-v1';\n")],
+    )
+    .await;
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.current_dir(project.path().join("apps/app"));
+    if pubgrub {
+        cmd.env("LPM_RESOLVER", "pubgrub");
+        cmd.env("LPM_GREEDY_FUSION", "0");
+    }
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run install with a nonmatching workspace package version");
+
+    assert!(
+        output.status.success(),
+        "registry transitive must resolve a published version when the local workspace member does not satisfy its range\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .args(["-e", "process.stdout.write(require('external-consumer'))"])
+        .current_dir(project.path().join("apps/app"))
+        .output()
+        .expect("run installed registry consumer");
+    assert!(
+        runtime.status.success(),
+        "installed registry consumer must load\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "registry-v1");
+}
+
 #[tokio::test]
-async fn install_registry_transitive_dep_reenters_workspace_member_under_v2_store() {
+async fn install_registry_transitive_uses_registry_when_workspace_version_does_not_match() {
+    assert_registry_transitive_uses_registry_when_workspace_version_does_not_match(false).await;
+}
+
+#[tokio::test]
+async fn install_pubgrub_registry_transitive_uses_registry_when_workspace_version_does_not_match() {
+    assert_registry_transitive_uses_registry_when_workspace_version_does_not_match(true).await;
+}
+
+#[tokio::test]
+async fn install_registry_transitive_uses_registry_when_workspace_version_matches() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-source-boundary-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}"#,
+    );
+    project.write_file(
+        "apps/app/package.json",
+        r#"{
+  "name": "@smoke/app",
+  "version": "1.0.0",
+  "dependencies": { "external-consumer": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/shared/package.json",
+        r#"{
+  "name": "@smoke/shared",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file(
+        "packages/shared/index.js",
+        "module.exports = 'workspace-v1';\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "external-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "dependencies": { "@smoke/shared": "1.0.0" }
+        }),
+        &[("index.js", b"module.exports = require('@smoke/shared');\n")],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "@smoke/shared",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'registry-v1';\n")],
+    )
+    .await;
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.current_dir(project.path().join("apps/app"));
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install registry consumer beside same-version workspace member");
+
+    assert!(
+        output.status.success(),
+        "registry transitive install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let runtime = std::process::Command::new("node")
+        .args(["-e", "process.stdout.write(require('external-consumer'))"])
+        .current_dir(project.path().join("apps/app"))
+        .output()
+        .expect("run installed registry consumer");
+    assert!(
+        runtime.status.success(),
+        "installed registry consumer must load\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "registry-v1");
+}
+
+#[tokio::test]
+async fn install_registry_transitive_keeps_registry_and_workspace_instances_separate_under_v2_store()
+ {
     let project = TempProject::empty(
         r#"{
   "name": "workspace-external-reentry-root",
@@ -9630,12 +10075,20 @@ async fn install_registry_transitive_dep_reenters_workspace_member_under_v2_stor
 }"#,
     );
     project.write_file(
+        "packages/cycle-a/index.js",
+        "module.exports = require('@smoke/cycle-b').name;\n",
+    );
+    project.write_file(
         "packages/cycle-b/package.json",
         r#"{
   "name": "@smoke/cycle-b",
   "version": "1.0.0",
   "dependencies": { "@smoke/cycle-a": "workspace:*" }
 }"#,
+    );
+    project.write_file(
+        "packages/cycle-b/index.js",
+        "exports.name = 'workspace-cycle-b';\n",
     );
 
     let mock = MockRegistry::start().await;
@@ -9651,6 +10104,15 @@ async fn install_registry_transitive_dep_reenters_workspace_member_under_v2_stor
             "index.js",
             b"module.exports = require('@smoke/cycle-b').name;\n",
         )],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "@smoke/cycle-b",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"exports.name = 'registry-cycle-b';\n")],
     )
     .await;
 
@@ -9669,7 +10131,7 @@ async fn install_registry_transitive_dep_reenters_workspace_member_under_v2_stor
 
     assert!(
         output.status.success(),
-        "v2 install should resolve registry package transitive @smoke/cycle-b to the local workspace member without leaking to the registry\nstdout:\n{}\nstderr:\n{}",
+        "v2 install should keep registry and workspace instances separate\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -9689,19 +10151,36 @@ async fn install_registry_transitive_dep_reenters_workspace_member_under_v2_stor
         "v2 install must still root-link the workspace member for direct workspace consumers",
     );
 
+    let runtime = std::process::Command::new("node")
+        .args([
+            "-e",
+            "process.stdout.write(`${require('@smoke/cycle-a')}:${require('external-reentry')}`)",
+        ])
+        .current_dir(&app_dir)
+        .output()
+        .expect("run mixed registry and workspace source graph under v2");
+    assert!(
+        runtime.status.success(),
+        "mixed v2 source graph must load\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "workspace-cycle-b:registry-cycle-b",
+    );
+
     let requests = mock
         .server()
         .received_requests()
         .await
         .expect("wiremock request log must be available");
-    let leaked_cycle_b_requests: Vec<_> = requests
+    let cycle_b_requested = requests
         .iter()
-        .filter(|request| request.url.path().contains("cycle-b"))
-        .map(|request| request.url.path().to_string())
-        .collect();
+        .any(|request| request.url.path().contains("cycle-b"));
     assert!(
-        leaked_cycle_b_requests.is_empty(),
-        "v2 install must not ask the registry for workspace member @smoke/cycle-b; leaked requests: {leaked_cycle_b_requests:?}\nstdout:\n{}\nstderr:\n{}",
+        cycle_b_requested,
+        "the registry package's v2 dependency must be fetched from the registry\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -9759,6 +10238,54 @@ fn install_workspace_self_dependency_fails_without_writing_artifacts() {
     assert!(
         !member_dir.join("lpm.lock").exists() && !member_dir.join("lpm.lockb").exists(),
         "self-dependency failure must happen before lockfiles are written",
+    );
+}
+
+#[test]
+fn install_workspace_dev_self_dependency_succeeds_without_creating_a_self_link() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-dev-self-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/dev-self/package.json",
+        r#"{
+  "name": "@smoke/dev-self",
+  "version": "1.0.0",
+  "devDependencies": {
+    "@smoke/dev-self": "workspace:*"
+  }
+}"#,
+    );
+
+    let mut cmd = lpm(&project);
+    cmd.current_dir(project.path().join("packages/dev-self"));
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run workspace dev self-dependency install");
+
+    assert!(
+        output.status.success(),
+        "a development-only self reference must not make the workspace uninstallable\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !project
+            .path()
+            .join("packages/dev-self/node_modules/@smoke/dev-self")
+            .exists(),
+        "development-only self reference must not create a recursive node_modules link",
     );
 }
 
@@ -9864,6 +10391,1098 @@ fn workspace_repeat_project() -> TempProject {
         r#"{ "name": "foo", "version": "1.0.0" }"#,
     );
     project
+}
+
+#[test]
+fn recursive_frozen_replay_accepts_dependency_free_workspace_member_lockfile() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "recursive-empty-member",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "linked-member": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/linked-member/package.json",
+        r#"{ "name": "linked-member", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/empty-member/package.json",
+        "\u{feff}{\"name\":\"empty-member\",\"version\":\"1.0.0\"}",
+    );
+    project.write_file("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+
+    let first = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "--json",
+            "install",
+            "--recursive",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-audit-after-install",
+        ])
+        .output()
+        .expect("spawn initial recursive install");
+    assert!(
+        first.status.success(),
+        "initial recursive install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let empty_lockfile_path = project.path().join("packages/empty-member/lpm.lock");
+    let mut empty_lockfile = lpm_lockfile::Lockfile::read_from_file(&empty_lockfile_path)
+        .expect("dependency-free member lockfile should parse");
+    assert!(
+        empty_lockfile.importers.contains_key("."),
+        "new dependency-free lockfiles must record their importer snapshot",
+    );
+    empty_lockfile.importers.clear();
+    empty_lockfile
+        .write_all(&empty_lockfile_path)
+        .expect("write legacy dependency-free lockfile shape");
+
+    let replay = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "--json",
+            "install",
+            "--recursive",
+            "--frozen-lockfile",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-audit-after-install",
+        ])
+        .output()
+        .expect("spawn frozen recursive replay");
+    assert!(
+        replay.status.success(),
+        "frozen recursive replay rejected a dependency-free member lockfile:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+}
+
+#[tokio::test]
+async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "peerDependencies": { "workspace-lib": "^1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "recursive-frozen-local-sources",
+  "private": true,
+  "workspaces": ["docs", "packages/*"],
+  "dependencies": { "workspace-lib": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "docs/package.json",
+        r#"{
+  "name": "docs",
+  "version": "1.0.0",
+  "dependencies": { "peer-consumer": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/workspace-lib/package.json",
+        r#"{
+  "name": "workspace-lib",
+  "version": "1.0.0",
+  "dependencies": { "peer-consumer": "1.0.0" }
+}"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn initial recursive install");
+    assert!(
+        first.status.success(),
+        "initial recursive install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let docs_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("docs/lpm.lock"))
+            .expect("docs lockfile should parse");
+    assert!(
+        docs_lockfile.packages.iter().any(|package| {
+            package.name == "workspace-lib"
+                && package.source.as_deref() == Some("directory+../packages/workspace-lib")
+        }),
+        "docs lockfile should capture the workspace package selected for the peer",
+    );
+    let member_lockfile = lpm_lockfile::Lockfile::read_from_file(
+        &project.path().join("packages/workspace-lib/lpm.lock"),
+    )
+    .expect("workspace member lockfile should parse");
+    assert!(
+        member_lockfile.packages.iter().any(|package| {
+            package.name == "workspace-lib" && package.source.as_deref() == Some("directory+.")
+        }),
+        "a workspace package selected for its own peer must use a non-empty local source",
+    );
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn frozen recursive replay");
+    assert!(
+        replay.status.success(),
+        "frozen recursive replay rejected a workspace source:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&replay.stderr).contains("unsafe source URL"),
+        "validated workspace sources must not emit an unsafe-source warning:\n{}",
+        String::from_utf8_lossy(&replay.stderr),
+    );
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-provider",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": { "peer-provider": "^1.0.0" }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('peer-provider/package.json').version;\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-peer-provider",
+  "private": true,
+  "workspaces": ["app"],
+  "dependencies": { "peer-provider": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-peer-consumer",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install");
+    assert!(
+        install.status.success(),
+        "recursive install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let member_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
+            .expect("member lockfile should parse");
+    let consumer = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-consumer")
+        .expect("member lockfile should contain peer-consumer");
+    assert_eq!(
+        consumer.peers,
+        vec!["peer-provider@1.0.0"],
+        "the workspace root dependency must be recorded as the member consumer's peer context",
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path().join("app"))
+        .arg("-e")
+        .arg("process.stdout.write(require('peer-consumer'))")
+        .output()
+        .expect("run member peer consumer");
+    assert!(
+        runtime.status.success(),
+        "member consumer should resolve the workspace root peer\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "1.0.0");
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_local_dependency_satisfies_member_transitive_peer() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "provider-child",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": { "workspace-provider": "^1.0.0" }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('workspace-provider/package.json').version;\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-local-peer-provider",
+  "private": true,
+  "workspaces": ["app", "packages/*"],
+  "dependencies": { "workspace-provider": "workspace:*" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-local-peer-consumer",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "packages/workspace-provider/package.json",
+        r#"{
+  "name": "workspace-provider",
+  "version": "1.0.0",
+  "dependencies": { "provider-child": "1.0.0" }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install");
+    assert!(
+        install.status.success(),
+        "recursive install should rebase the root's workspace peer provider\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let member_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
+            .expect("member lockfile should parse");
+    let provider = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "workspace-provider")
+        .expect("member lockfile should contain the root workspace peer provider");
+    assert_eq!(
+        provider.source.as_deref(),
+        Some("directory+../packages/workspace-provider"),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path().join("app"))
+        .arg("-e")
+        .arg("process.stdout.write(require('peer-consumer'))")
+        .output()
+        .expect("run member peer consumer");
+    assert!(
+        runtime.status.success(),
+        "member consumer should resolve the root workspace peer\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "1.0.0");
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn frozen recursive replay");
+    assert!(
+        replay.status.success(),
+        "frozen replay should reconstruct the root workspace provider fingerprint\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_local_dependency_closure_satisfies_member_transitive_peer() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "provider-child",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": { "provider-child": "^1.0.0" }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('provider-child/package.json').version;\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-local-peer-provider-closure",
+  "private": true,
+  "workspaces": ["app", "packages/*"],
+  "dependencies": { "workspace-provider": "workspace:*" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-local-peer-consumer-closure",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": {
+    "autoInstallPeers": false,
+    "strictPeerDependencies": true
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/workspace-provider/package.json",
+        r#"{
+  "name": "workspace-provider",
+  "version": "1.0.0",
+  "dependencies": { "provider-child": "1.0.0" }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install");
+    assert!(
+        install.status.success(),
+        "recursive install should expose the root local provider's closure as peer context\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let member_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
+            .expect("member lockfile should parse");
+    let consumer = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-consumer")
+        .expect("member lockfile should contain peer-consumer");
+    assert_eq!(consumer.peers, vec!["provider-child@1.0.0"]);
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path().join("app"))
+        .arg("-e")
+        .arg("process.stdout.write(require('peer-consumer'))")
+        .output()
+        .expect("run member peer consumer");
+    assert!(
+        runtime.status.success(),
+        "member consumer should resolve the root provider closure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "1.0.0");
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_peer_context_replays_frozen_and_offline() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({ "name": "peer-provider", "version": "1.0.0" }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": { "peer-provider": "^1.0.0" }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('peer-provider/package.json').version;\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-peer-replay",
+  "private": true,
+  "workspaces": ["app", "empty"],
+  "dependencies": { "peer-provider": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-peer-replay",
+  "private": true,
+  "dependencies": {
+    "local-helper": "file:./local-helper",
+    "peer-consumer": "1.0.0"
+  },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/local-helper/package.json",
+        r#"{
+  "name": "local-helper",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file(
+        "empty/package.json",
+        r#"{
+  "name": "workspace-member-without-root-peer-context",
+  "private": true
+}"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn initial recursive install");
+    assert!(
+        first.status.success(),
+        "initial recursive install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove root materialization");
+    std::fs::remove_dir_all(project.path().join("app/node_modules"))
+        .expect("remove member materialization");
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn frozen offline recursive replay");
+    assert!(
+        replay.status.success(),
+        "frozen offline recursive replay should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path().join("app"))
+        .arg("-e")
+        .arg("process.stdout.write(require('peer-consumer'))")
+        .output()
+        .expect("run replayed member peer consumer");
+    assert!(
+        runtime.status.success(),
+        "replayed member consumer should resolve the root peer\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&runtime.stdout), "1.0.0");
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_provider_change_invalidates_member_peer_context() {
+    let mock = MockRegistry::start().await;
+    let provider_v1 = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "peer-provider", "version": "1.0.0" }),
+        &[],
+    );
+    let provider_v2 = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "peer-provider", "version": "2.0.0" }),
+        &[],
+    );
+    let provider_v1_integrity = compute_integrity(&provider_v1);
+    let provider_v2_integrity = compute_integrity(&provider_v2);
+    mock.with_package_metadata_and_tarballs(
+        "peer-provider",
+        serde_json::json!({
+            "name": "peer-provider",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "peer-provider",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": mock.tarball_url("peer-provider", "1.0.0"),
+                        "integrity": provider_v1_integrity
+                    }
+                },
+                "2.0.0": {
+                    "name": "peer-provider",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": mock.tarball_url("peer-provider", "2.0.0"),
+                        "integrity": provider_v2_integrity
+                    }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "2.0.0": "2025-01-02T00:00:00.000Z"
+            }
+        }),
+        &[("1.0.0", provider_v1), ("2.0.0", provider_v2)],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": { "peer-provider": ">=1.0.0 <3.0.0" }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('peer-provider/package.json').version;\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-peer-change",
+  "private": true,
+  "workspaces": ["app"],
+  "dependencies": { "peer-provider": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-peer-change",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn initial recursive install");
+    assert!(
+        first.status.success(),
+        "initial recursive install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "workspace-root-peer-change",
+  "description": "provider changed",
+  "private": true,
+  "workspaces": ["app"],
+  "dependencies": { "peer-provider": "2.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    let second = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install after root provider change");
+    assert!(
+        second.status.success(),
+        "recursive install should reconcile the changed root provider\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+
+    let root_lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("root lockfile should parse");
+    assert!(
+        root_lockfile
+            .packages
+            .iter()
+            .any(|package| package.name == "peer-provider" && package.version == "2.0.0"),
+        "root lockfile should select the changed provider: {:#?}",
+        root_lockfile
+            .packages
+            .iter()
+            .filter(|package| package.name == "peer-provider")
+            .map(|package| package.version.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let member_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
+            .expect("member lockfile should parse");
+    let consumer = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-consumer")
+        .expect("member lockfile should contain peer-consumer");
+    assert_eq!(consumer.peers, vec!["peer-provider@2.0.0"]);
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_provider_outside_peer_range_remains_strict_error() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({ "name": "peer-provider", "version": "2.0.0" }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "peerDependencies": { "peer-provider": "^1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-peer-out-of-range",
+  "private": true,
+  "workspaces": ["app"],
+  "dependencies": { "peer-provider": "2.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-peer-out-of-range",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": { "autoInstallPeers": false, "strictPeerDependencies": true }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn strict recursive install");
+    assert!(
+        !install.status.success(),
+        "an out-of-range root provider must not satisfy the member peer"
+    );
+    assert!(
+        String::from_utf8_lossy(&install.stderr).contains("strict-peer-dependencies failed"),
+        "strict peer failure should remain visible:\n{}",
+        String::from_utf8_lossy(&install.stderr),
+    );
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_provider_closure_preserves_root_override_context() {
+    let mock = MockRegistry::start().await;
+    let child_v1 = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "provider-child", "version": "1.0.0" }),
+        &[],
+    );
+    let child_v2 = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "provider-child", "version": "2.0.0" }),
+        &[],
+    );
+    let child_v1_integrity = compute_integrity(&child_v1);
+    let child_v2_integrity = compute_integrity(&child_v2);
+    mock.with_package_metadata_and_tarballs(
+        "provider-child",
+        serde_json::json!({
+            "name": "provider-child",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "provider-child",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": mock.tarball_url("provider-child", "1.0.0"),
+                        "integrity": child_v1_integrity
+                    }
+                },
+                "2.0.0": {
+                    "name": "provider-child",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": mock.tarball_url("provider-child", "2.0.0"),
+                        "integrity": child_v2_integrity
+                    }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "2.0.0": "2025-01-02T00:00:00.000Z"
+            }
+        }),
+        &[("1.0.0", child_v1), ("2.0.0", child_v2)],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-provider",
+            "version": "1.0.0",
+            "dependencies": { "provider-child": "*" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "peerDependencies": { "peer-provider": "^1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-peer-override",
+  "private": true,
+  "workspaces": ["app"],
+  "dependencies": { "peer-provider": "1.0.0" },
+  "lpm": {
+    "autoInstallPeers": false,
+    "overrides": { "provider-child": "1.0.0" }
+  }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-peer-override",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": {
+    "autoInstallPeers": false,
+    "overrides": { "provider-child": "2.0.0" }
+  }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install with importer-specific overrides");
+    assert!(
+        install.status.success(),
+        "recursive install should preserve the root provider closure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let member_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
+            .expect("member lockfile should parse");
+    let provider = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-provider")
+        .expect("member lockfile should contain the root peer provider");
+    assert_eq!(provider.dependencies, vec!["provider-child@1.0.0"]);
+    assert!(
+        member_lockfile
+            .packages
+            .iter()
+            .any(|package| { package.name == "provider-child" && package.version == "1.0.0" }),
+        "member graph should import the child selected under the root override",
+    );
+}
+
+#[tokio::test]
+async fn recursive_workspace_root_provider_closure_preserves_registry_route_context() {
+    let root_registry = MockRegistry::start().await;
+    let member_registry = MockRegistry::start().await;
+    root_registry
+        .with_manifest_package(
+            serde_json::json!({ "name": "peer-provider", "version": "1.0.0" }),
+            &[],
+        )
+        .await;
+    member_registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "peer-consumer",
+                "version": "1.0.0",
+                "peerDependencies": { "peer-provider": "^1.0.0" }
+            }),
+            &[],
+        )
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-peer-route",
+  "private": true,
+  "workspaces": ["app"],
+  "dependencies": { "peer-provider": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(".npmrc", &format!("registry={}\n", root_registry.url()));
+    project.write_file(
+        "app/.npmrc",
+        &format!("registry={}\n", member_registry.url()),
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-peer-route",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &root_registry.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install with importer-specific routes");
+    assert!(
+        install.status.success(),
+        "recursive install should preserve importer registry routes\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let member_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
+            .expect("member lockfile should parse");
+    let provider = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-provider")
+        .expect("member lockfile should contain the root peer provider");
+    let consumer = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-consumer")
+        .expect("member lockfile should contain its direct consumer");
+    assert_eq!(
+        provider.source.as_deref(),
+        Some(format!("registry+{}", root_registry.url()).as_str()),
+    );
+    assert_eq!(
+        consumer.source.as_deref(),
+        Some(format!("registry+{}", member_registry.url()).as_str()),
+    );
+}
+
+#[tokio::test]
+async fn recursive_frozen_replay_ignores_registry_roots_injected_by_workspace_source_expansion() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({ "name": "external-dependency", "version": "1.0.0" }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-source-expansion-root",
+  "private": true,
+  "workspaces": ["app", "packages/*"],
+  "dependencies": { "workspace-host": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": {
+    "external-dependency": "1.0.0",
+    "workspace-host": "workspace:*",
+    "workspace-plugin": "workspace:*"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/workspace-host/package.json",
+        r#"{ "name": "workspace-host", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/workspace-plugin/package.json",
+        r#"{
+  "name": "workspace-plugin",
+  "version": "1.0.0",
+  "peerDependencies": { "workspace-host": "^1.0.0" }
+}"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn initial recursive install");
+    assert!(
+        first.status.success(),
+        "initial recursive install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    for node_modules in [
+        project.path().join("node_modules"),
+        project.path().join("app/node_modules"),
+        project.path().join("packages/workspace-host/node_modules"),
+        project
+            .path()
+            .join("packages/workspace-plugin/node_modules"),
+    ] {
+        if node_modules.exists() {
+            std::fs::remove_dir_all(node_modules).expect("remove installed workspace layout");
+        }
+    }
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn frozen recursive replay");
+    assert!(
+        replay.status.success(),
+        "frozen replay treated an expanded workspace peer as a registry root:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
 }
 
 /// Install-hash must fold member manifests into its freshness key. A
@@ -10319,7 +11938,6 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
         String::from_utf8_lossy(&sequential_output.stdout),
         String::from_utf8_lossy(&sequential_output.stderr)
     );
-
     let resolve_ahead = workspace_fixture();
     let resolve_ahead_output = lpm_with_registry(&resolve_ahead, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
@@ -10354,6 +11972,207 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
         lockfile_bytes(&resolve_ahead),
         lockfile_bytes(&sequential),
         "resolve-ahead importer lockfiles must be byte-identical to sequential resolution"
+    );
+}
+
+#[tokio::test]
+async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
+    fn workspace_fixture() -> TempProject {
+        let project = TempProject::empty(
+            r#"{
+  "name": "recursive-overlapping-range-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "importer-a": "workspace:*",
+    "range-parent": "*",
+    "shared-dependency": "1.0.0"
+  }
+}"#,
+        );
+        project.write_file(
+            "packages/a/package.json",
+            r#"{
+  "name": "importer-a",
+  "version": "1.0.0",
+  "dependencies": { "shared-dependency": "*" }
+}"#,
+        );
+        std::fs::create_dir_all(project.home().join(".lpm"))
+            .expect("create isolated LPM config directory");
+        std::fs::write(
+            project.home().join(".lpm/config.toml"),
+            "minimum-release-age-secs = 86400\nrelease-age-policy = \"strict\"\n",
+        )
+        .expect("write strict release-age fixture config");
+        project
+    }
+
+    fn lockfile_bytes(project: &TempProject) -> Vec<Vec<u8>> {
+        ["lpm.lock", "packages/a/lpm.lock"]
+            .into_iter()
+            .map(|path| {
+                std::fs::read(project.path().join(path))
+                    .unwrap_or_else(|error| panic!("read {path}: {error}"))
+            })
+            .collect()
+    }
+
+    let mock = MockRegistry::start().await;
+    let version_1_0_0 = make_tarball("shared-dependency", "1.0.0");
+    let version_1_1_0 = make_tarball("shared-dependency", "1.1.0");
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "range-parent",
+            "version": "1.0.0",
+            "dependencies": { "shared-dependency": "*" }
+        }),
+        &[],
+    )
+    .await;
+    let shared_metadata = serde_json::json!({
+        "name": "shared-dependency",
+        "modified": "2026-07-31T12:00:00.000Z",
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "shared-dependency",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("shared-dependency", "1.0.0"),
+                    "integrity": compute_integrity(&version_1_0_0),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": "shared-dependency",
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url("shared-dependency", "1.1.0"),
+                    "integrity": compute_integrity(&version_1_1_0),
+                },
+                "dependencies": {}
+            }
+        }
+    });
+    let shared_release_times = serde_json::json!({
+        "name": "shared-dependency",
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-02-01T00:00:00.000Z"
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/shared-dependency"))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared-dependency"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(shared_release_times))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    for (version, tarball) in [("1.0.0", &version_1_0_0), ("1.1.0", &version_1_1_0)] {
+        mock.register_tarball_bytes("shared-dependency", version, tarball);
+        Mock::given(method("GET"))
+            .and(path(MockRegistry::tarball_path(
+                "shared-dependency",
+                version,
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball.clone())
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(mock.server())
+            .await;
+    }
+
+    let project = workspace_fixture();
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    let cold_output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_WORKSPACE_CONCURRENCY", "1")
+        .env_remove("LPM_NPM_ROUTE")
+        .args([
+            "--json",
+            "install",
+            "--timing",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run cold recursive install");
+    assert!(
+        cold_output.status.success(),
+        "cold recursive install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cold_output.stdout),
+        String::from_utf8_lossy(&cold_output.stderr)
+    );
+
+    let cold_locks = lockfile_bytes(&project);
+    let cold_root_lock =
+        std::fs::read_to_string(project.path().join("lpm.lock")).expect("read cold root lockfile");
+    assert!(
+        cold_root_lock.contains("dependencies = [\"shared-dependency@1.0.0\"]"),
+        "the explicit root constraint must govern the overlapping transitive edge"
+    );
+    let cold_member_lock = std::fs::read_to_string(project.path().join("packages/a/lpm.lock"))
+        .expect("read cold member lockfile");
+    assert!(
+        cold_member_lock.contains("version = \"1.1.0\""),
+        "the broad member fixture must select the newest shared dependency"
+    );
+
+    for relative in [
+        "lpm.lock",
+        "packages/a/lpm.lock",
+        "node_modules",
+        "packages/a/node_modules",
+    ] {
+        let target = project.path().join(relative);
+        if target.is_dir() {
+            std::fs::remove_dir_all(&target)
+                .unwrap_or_else(|error| panic!("remove {}: {error}", target.display()));
+        } else if target.exists() {
+            std::fs::remove_file(&target)
+                .unwrap_or_else(|error| panic!("remove {}: {error}", target.display()));
+        }
+    }
+
+    let warm_output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_WORKSPACE_CONCURRENCY", "1")
+        .env_remove("LPM_NPM_ROUTE")
+        .args([
+            "install",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run metadata-cache-warm recursive install");
+    assert!(
+        warm_output.status.success(),
+        "metadata-cache-warm recursive install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&warm_output.stdout),
+        String::from_utf8_lossy(&warm_output.stderr)
+    );
+
+    assert_eq!(
+        lockfile_bytes(&project),
+        cold_locks,
+        "metadata cache warmth must not change the resolved graph or lockfile bytes"
     );
 }
 
@@ -11798,6 +13617,157 @@ async fn install_strict_release_age_selects_mature_transitive_path() {
 }
 
 #[tokio::test]
+async fn install_strict_release_age_hydrates_platform_metadata_for_mature_optional_package() {
+    const PARENT: &str = "strict-release-age-platform-parent";
+    const PACKAGE: &str = "strict-release-age-native";
+    const VERSION: &str = "1.0.0";
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"strict-release-age-platform",
+            "version":"1.0.0",
+            "dependencies":{{"{PARENT}":"{VERSION}"}},
+            "lpm":{{"minimumReleaseAge":86400,"minimumReleaseAgePolicy":"strict"}}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+
+    let parent_tarball = make_tarball(PARENT, VERSION);
+    let package_tarball = make_tarball(PACKAGE, VERSION);
+    let parent_abbreviated = serde_json::json!({
+        "name": PARENT,
+        "modified": "2025-01-01T00:00:00.000Z",
+        "dist-tags": { "latest": VERSION },
+        "versions": {
+            VERSION: {
+                "name": PARENT,
+                "version": VERSION,
+                "dist": {
+                    "tarball": mock.tarball_url(PARENT, VERSION),
+                    "integrity": compute_integrity(&parent_tarball),
+                },
+                "optionalDependencies": { PACKAGE: VERSION }
+            }
+        }
+    });
+    let abbreviated = serde_json::json!({
+        "name": PACKAGE,
+        "modified": "2025-01-01T00:00:00.000Z",
+        "dist-tags": { "latest": VERSION },
+        "versions": {
+            VERSION: {
+                "name": PACKAGE,
+                "version": VERSION,
+                "os": ["linux"],
+                "cpu": ["arm64"],
+                "dist": {
+                    "tarball": mock.tarball_url(PACKAGE, VERSION),
+                    "integrity": compute_integrity(&package_tarball),
+                },
+                "dependencies": {}
+            }
+        }
+    });
+    let parent_full = serde_json::json!({
+        "name": PARENT,
+        "time": { VERSION: "2025-01-01T00:00:00.000Z" },
+        "versions": { VERSION: {} }
+    });
+    let package_full = serde_json::json!({
+        "name": PACKAGE,
+        "time": { VERSION: "2025-01-01T00:00:00.000Z" },
+        "versions": {
+            VERSION: {
+                "os": ["linux"],
+                "cpu": ["arm64"],
+                "libc": ["glibc"]
+            }
+        }
+    });
+    for (name, install_metadata, full_metadata, full_request_count) in [
+        (PARENT, parent_abbreviated, parent_full, 0),
+        (PACKAGE, abbreviated, package_full, 1),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .and(header("Accept", "application/vnd.npm.install-v1+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(install_metadata))
+            .expect(1)
+            .mount(mock.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .and(header("Accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(full_metadata))
+            .expect(full_request_count)
+            .mount(mock.server())
+            .await;
+    }
+    for (name, tarball) in [(PARENT, parent_tarball), (PACKAGE, package_tarball)] {
+        mock.register_tarball_bytes(name, VERSION, &tarball);
+        Mock::given(method("GET"))
+            .and(path(MockRegistry::tarball_path(name, VERSION)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball)
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(mock.server())
+            .await;
+    }
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env_remove("LPM_NPM_ROUTE")
+        .env("LPM_TIMING_DETAIL", "basic")
+        .args([
+            "--json",
+            "install",
+            "--timing",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run strict release-age install");
+    assert!(
+        output.status.success(),
+        "strict release-age install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("timed platform hydration install should emit JSON");
+    let platform_hydration = envelope["timing"]["detail"]["metadata"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["purpose"] == "platform_hydration")
+        })
+        .unwrap_or_else(|| {
+            panic!("timing metadata should identify platform hydration work; got {envelope:#}")
+        });
+    assert_eq!(platform_hydration["request_count"], 1);
+    assert_eq!(platform_hydration["unique_package_count"], 1);
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("strict release-age lockfile should parse");
+    let package = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == PACKAGE && package.version == VERSION)
+        .expect("strict release-age package should be locked");
+    assert_eq!(
+        package.libc,
+        ["glibc"],
+        "platform metadata present only in npm's full manifest must survive release-age merging"
+    );
+}
+
+#[tokio::test]
 async fn install_strict_release_age_revalidates_fresh_lockfile_entry() {
     let project = TempProject::empty("");
     write_release_age_manifest_with_deps(
@@ -11915,6 +13885,98 @@ async fn install_package_json_min_release_age_exclude_allows_fresh_direct_depend
     assert!(
         out.status.success(),
         "exact package exclude must allow the fresh direct dependency; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_cooldown_not_blocked(&out);
+}
+
+#[tokio::test]
+async fn install_package_json_version_release_age_exclude_allows_only_the_selected_release() {
+    let project = TempProject::empty("");
+    let version_selector = format!("{RELEASE_AGE_PKG}@{RELEASE_AGE_VERSION}");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        None,
+        &[&version_selector],
+    );
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn version-excluded lpm install");
+
+    assert!(
+        out.status.success(),
+        "an exact package-version exclusion must allow that fresh release; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_cooldown_not_blocked(&out);
+}
+
+#[tokio::test]
+async fn install_package_json_version_release_age_exclude_does_not_allow_another_release() {
+    let project = TempProject::empty("");
+    let other_version_selector = format!("{RELEASE_AGE_PKG}@2.0.0");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        None,
+        &[&other_version_selector],
+    );
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn differently-versioned exclusion install");
+
+    assert_cooldown_blocked(&out);
+}
+
+#[tokio::test]
+async fn install_package_json_scoped_wildcard_release_age_exclude_allows_package_in_scope() {
+    let project = TempProject::empty("");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        None,
+        &["@lpm.dev/*"],
+    );
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn scope-excluded lpm install");
+
+    assert!(
+        out.status.success(),
+        "a scoped wildcard exclusion must allow a fresh package inside that scope; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );

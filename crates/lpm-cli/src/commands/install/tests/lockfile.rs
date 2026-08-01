@@ -94,6 +94,141 @@ fn prepare_override_resolution_state_resolves_catalog_backed_override_maps() {
     assert_eq!(catalog_resolutions.len(), 3);
 }
 
+fn catalog_resolution(
+    package_name: &str,
+    specifier: &str,
+) -> lpm_workspace::CatalogProtocolResolution {
+    lpm_workspace::CatalogProtocolResolution {
+        catalog_name: "default".to_string(),
+        package_name: package_name.to_string(),
+        reference: "catalog:".to_string(),
+        specifier: specifier.to_string(),
+    }
+}
+
+fn add_catalog_snapshot(
+    lockfile: &mut lpm_lockfile::Lockfile,
+    resolution: &lpm_workspace::CatalogProtocolResolution,
+    version: &str,
+) {
+    lockfile
+        .catalogs
+        .entry(resolution.catalog_name.clone())
+        .or_default()
+        .insert(
+            resolution.package_name.clone(),
+            lpm_lockfile::CatalogSnapshotEntry {
+                specifier: resolution.specifier.clone(),
+                version: version.to_string(),
+                reference: resolution.reference.clone(),
+            },
+        );
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: resolution.package_name.clone(),
+        version: version.to_string(),
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        resolution.package_name.clone(),
+        lpm_lockfile::LockedRootResolution {
+            package: resolution.package_name.clone(),
+            version: version.to_string(),
+            source: None,
+        },
+    );
+}
+
+#[test]
+fn lockfile_catalog_replay_allows_configured_override_that_was_not_applied() {
+    let direct = catalog_resolution("direct-package", "^1.0.0");
+    let applied_override = catalog_resolution("applied-override", "^2.0.0");
+    let unused_override = catalog_resolution("unused-override", "^3.0.0");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    add_catalog_snapshot(&mut lockfile, &direct, "1.1.0");
+    add_catalog_snapshot(&mut lockfile, &applied_override, "2.1.0");
+    let deps = HashMap::from([(direct.package_name.clone(), direct.specifier.clone())]);
+
+    assert!(lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[direct, applied_override, unused_override],
+    ));
+}
+
+#[test]
+fn lockfile_catalog_replay_rejects_missing_direct_snapshot() {
+    let direct = catalog_resolution("direct-package", "^1.0.0");
+    let deps = HashMap::from([(direct.package_name.clone(), direct.specifier.clone())]);
+
+    assert!(!lockfile_catalog_snapshots_match_current(
+        &lpm_lockfile::Lockfile::new(),
+        &deps,
+        &[direct],
+    ));
+}
+
+#[test]
+fn lockfile_catalog_replay_rejects_snapshot_for_removed_override() {
+    let direct = catalog_resolution("direct-package", "^1.0.0");
+    let removed_override = catalog_resolution("removed-override", "^2.0.0");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    add_catalog_snapshot(&mut lockfile, &direct, "1.1.0");
+    add_catalog_snapshot(&mut lockfile, &removed_override, "2.1.0");
+    let deps = HashMap::from([(direct.package_name.clone(), direct.specifier.clone())]);
+
+    assert!(!lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[direct],
+    ));
+}
+
+#[test]
+fn lockfile_catalog_replay_rejects_changed_specifier_or_reference() {
+    let locked_resolution = catalog_resolution("direct-package", "^1.0.0");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    add_catalog_snapshot(&mut lockfile, &locked_resolution, "1.1.0");
+    let deps = HashMap::from([(
+        locked_resolution.package_name.clone(),
+        locked_resolution.specifier.clone(),
+    )]);
+    let mut changed_specifier = locked_resolution.clone();
+    changed_specifier.specifier = "^1.1.0".to_string();
+    let mut changed_reference = locked_resolution;
+    changed_reference.reference = "catalog:testing".to_string();
+
+    assert!(!lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[changed_specifier],
+    ));
+    assert!(!lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[changed_reference],
+    ));
+}
+
+#[test]
+fn lockfile_catalog_replay_rejects_snapshot_version_drift() {
+    let direct = catalog_resolution("direct-package", "^1.0.0");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    add_catalog_snapshot(&mut lockfile, &direct, "1.1.0");
+    lockfile
+        .catalogs
+        .get_mut("default")
+        .and_then(|catalog| catalog.get_mut("direct-package"))
+        .expect("catalog snapshot")
+        .version = "1.2.0".to_string();
+    let deps = HashMap::from([(direct.package_name.clone(), direct.specifier.clone())]);
+
+    assert!(!lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[direct],
+    ));
+}
+
 #[test]
 fn resolved_to_install_packages_dedups_p4_split_duplicates() {
     // Four resolver outputs for `cross-spawn@7.0.6`: one un-scoped
@@ -111,10 +246,13 @@ fn resolved_to_install_packages_dedups_p4_split_duplicates() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     assert_eq!(
@@ -211,7 +349,7 @@ fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
 fn fresh_lockfiles_use_current_schema_version() {
     assert_eq!(
         lpm_lockfile::LOCKFILE_VERSION,
-        lpm_lockfile::LOCKFILE_VERSION_WITH_PROVENANCE
+        lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS
     );
     let lf = lpm_lockfile::Lockfile::new();
     assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
@@ -232,10 +370,13 @@ fn resolved_to_install_packages_keeps_distinct_versions() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     assert_eq!(installed.len(), 2, "distinct versions must be preserved");
@@ -262,10 +403,13 @@ fn resolved_to_install_packages_keeps_direct_root_link_when_ambient_peer_has_sam
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &ambient_peer_installs,
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     let direct = installed
@@ -303,10 +447,13 @@ fn resolved_to_install_packages_prefers_unscoped_root_candidate_for_non_semver_d
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[],
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     let direct = installed
@@ -344,14 +491,99 @@ fn resolved_to_install_packages_dedups_preserves_first_order() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     assert_eq!(installed.len(), 1);
     assert_eq!(installed[0].version, "3.3.11");
+}
+
+#[test]
+fn lockfile_alias_dependencies_are_sorted_by_local_name() {
+    let mut resolved = fake_resolved("alias-parent", "1.0.0", None);
+    for index in (0..32).rev() {
+        let local = format!("local-{index:02}");
+        resolved
+            .dependencies
+            .push((local.clone(), "1.0.0".to_string()));
+        resolved.aliases.insert(local, format!("target-{index:02}"));
+    }
+    let dependencies = HashMap::from([("alias-parent".to_string(), "1.0.0".to_string())]);
+    let installed = resolved_to_install_packages(
+        &[resolved],
+        &dependencies,
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &HashMap::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
+    );
+
+    let locked = locked_package_from_install_package(&installed[0]);
+    let local_names: Vec<&str> = locked
+        .alias_dependencies
+        .iter()
+        .map(|alias| alias[0].as_str())
+        .collect();
+    let mut sorted = local_names.clone();
+    sorted.sort_unstable();
+
+    assert_eq!(
+        local_names, sorted,
+        "lockfile alias mappings must not inherit randomized HashMap iteration order"
+    );
+}
+
+#[test]
+fn locked_root_selection_uses_the_persisted_exact_version() {
+    let source = "registry+https://registry.npmjs.org";
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for version in ["1.0.0", "1.1.0"] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "peer-host".to_string(),
+            version: version.to_string(),
+            source: Some(source.to_string()),
+            ..Default::default()
+        });
+    }
+    lockfile.root_resolutions.insert(
+        "peer-host".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            package: "peer-host".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+
+    let selected = select_locked_root_package(&lockfile, "peer-host", "peer-host", "^1.0.0")
+        .expect("persisted exact root selection");
+
+    assert_eq!(selected.version, "1.0.0");
+}
+
+#[test]
+fn locked_root_selection_rejects_ambiguous_inference_when_exact_selection_is_absent() {
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.root_resolutions.clear();
+    for version in ["1.0.0", "1.1.0"] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "peer-host".to_string(),
+            version: version.to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..Default::default()
+        });
+    }
+
+    assert!(select_locked_root_package(&lockfile, "peer-host", "peer-host", "^1.0.0").is_none());
 }
 
 // ── (reviewed): route-table-aware source URL ──────────────
@@ -420,10 +652,13 @@ fn resolved_to_install_packages_uses_lpm_dev_for_lpm_scope() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     assert_eq!(installed.len(), 1);
@@ -441,10 +676,13 @@ fn resolved_to_install_packages_default_npmjs_for_non_lpm_no_npmrc() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     assert_eq!(installed.len(), 1);
@@ -481,6 +719,8 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
             trust_metadata_complete: false,
             versions_complete: true,
             covered_ranges: std::collections::HashSet::new(),
+            workspace_versions: std::collections::HashSet::new(),
+            platform_metadata_complete: true,
             latest_version: None,
             versions: vec![NpmVersion::parse("1.0.0").unwrap()],
             deps: HashMap::new(),
@@ -501,10 +741,13 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[],
         &resolver_cache,
-        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
-        &RegistryClient::new(),
+        RegistrySourceContext::new(
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            &RegistryClient::new(),
+        ),
     );
 
     assert_eq!(installed.len(), 1);
@@ -535,10 +778,10 @@ fn resolved_to_install_packages_uses_npmrc_override_when_present() {
         &resolved,
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[], // tests don't exercise ambient peer installs
         &HashMap::new(),
-        &route_table,
-        &RegistryClient::new(),
+        RegistrySourceContext::new(&route_table, &RegistryClient::new()),
     );
 
     assert_eq!(installed.len(), 1);
@@ -584,10 +827,10 @@ fn tarball_not_found_error_preserves_project_lockfiles_byte_for_byte() {
         &[fake_resolved("some-pkg", "1.0.0", None)],
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[],
         &HashMap::new(),
-        &route_table,
-        &RegistryClient::new(),
+        RegistrySourceContext::new(&route_table, &RegistryClient::new()),
     );
     let client = Arc::new(RegistryClient::new());
     let err = artifact_unavailable_error(
@@ -638,10 +881,10 @@ fn fresh_resolution_artifact_failure_preserves_existing_project_lockfiles() {
         &[fake_resolved("overlap-pkg", "1.0.0", None)],
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[],
         &HashMap::new(),
-        &route_table,
-        &RegistryClient::new(),
+        RegistrySourceContext::new(&route_table, &RegistryClient::new()),
     );
     let client = Arc::new(RegistryClient::new());
     let err = artifact_unavailable_error(
@@ -680,10 +923,10 @@ fn artifact_unavailable_error_redacts_registry_credentials_and_url_components() 
         &[fake_resolved("secret-source", "1.0.0", None)],
         &deps,
         &HashMap::new(),
+        &HashMap::new(),
         &[],
         &HashMap::new(),
-        &route_table,
-        &RegistryClient::new(),
+        RegistrySourceContext::new(&route_table, &RegistryClient::new()),
     );
     packages[0].source = "registry+https://user:password@example.test/private/token-value?auth=query-secret#fragment-secret".to_string();
 
@@ -709,6 +952,82 @@ fn artifact_unavailable_error_redacts_registry_credentials_and_url_components() 
             "artifact error exposed secret-bearing URL component {secret:?}: {rendered}"
         );
     }
+}
+
+fn locked_directory_package(name: &str, version: &str, path: &str) -> lpm_lockfile::LockedPackage {
+    lpm_lockfile::LockedPackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        source: Some(format!("directory+{path}")),
+        integrity: None,
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        os: Vec::new(),
+        cpu: Vec::new(),
+        libc: Vec::new(),
+        node_engine: None,
+        optional: false,
+        dependencies: Vec::new(),
+        alias_dependencies: Vec::new(),
+        peers: Vec::new(),
+        tarball: None,
+    }
+}
+
+#[test]
+fn online_lockfile_replay_rejects_workspace_member_identity_substitution() {
+    let directory = tempfile::tempdir().expect("create workspace root");
+    let expected_path = directory.path().join("packages/expected");
+    let substitute_path = directory.path().join("packages/substitute");
+    std::fs::create_dir_all(&expected_path).expect("create expected workspace member");
+    std::fs::create_dir_all(&substitute_path).expect("create substitute workspace member");
+    let workspace = lpm_workspace::Workspace {
+        root: directory.path().to_path_buf(),
+        root_package: serde_json::from_str(r#"{ "name": "root", "private": true }"#)
+            .expect("parse root manifest"),
+        members: vec![
+            lpm_workspace::WorkspaceMember {
+                path: expected_path,
+                package: serde_json::from_str(r#"{ "name": "expected", "version": "1.0.0" }"#)
+                    .expect("parse expected manifest"),
+            },
+            lpm_workspace::WorkspaceMember {
+                path: substitute_path,
+                package: serde_json::from_str(r#"{ "name": "substitute", "version": "1.0.0" }"#)
+                    .expect("parse substitute manifest"),
+            },
+        ],
+    };
+    let package = locked_directory_package("expected", "1.0.0", "packages/substitute");
+
+    assert!(!online_local_source_is_allowed(
+        &package,
+        directory.path(),
+        &HashMap::new(),
+        Some(&workspace),
+    ));
+}
+
+#[test]
+fn online_lockfile_replay_rejects_undeclared_parent_directory_source() {
+    let directory = tempfile::tempdir().expect("create project parent");
+    let project = directory.path().join("project");
+    let outside = directory.path().join("outside");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::create_dir_all(&outside).expect("create outside package");
+    std::fs::write(
+        outside.join("package.json"),
+        r#"{ "name": "outside", "version": "1.0.0" }"#,
+    )
+    .expect("write outside manifest");
+    let package = locked_directory_package("outside", "1.0.0", "../outside");
+
+    assert!(!online_local_source_is_allowed(
+        &package,
+        &project,
+        &HashMap::new(),
+        None,
+    ));
 }
 
 /// The fast-path writeback trigger fires on v1 → v2 binary migration
@@ -771,8 +1090,16 @@ fn lockfile_fast_path_flags_v1_binary_for_upgrade() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed via TOML fallback");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed via TOML fallback");
 
     assert!(
         result.needs_binary_upgrade,
@@ -816,8 +1143,16 @@ fn lockfile_fast_path_flags_missing_binary_for_upgrade() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed with only TOML");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed with only TOML");
 
     assert!(
         result.needs_binary_upgrade,
@@ -856,8 +1191,16 @@ fn try_lockfile_fast_path_flags_stale_binary_for_writeback() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed via TOML");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed via TOML");
 
     assert!(
         result.needs_binary_upgrade,
@@ -896,8 +1239,16 @@ fn try_lockfile_fast_path_flags_corrupt_binary_for_writeback() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed via TOML");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed via TOML");
 
     assert!(
         result.needs_binary_upgrade,
@@ -938,8 +1289,16 @@ fn lockfile_fast_path_skips_upgrade_when_binary_current() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed with both TOML + v2 binary");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed with both TOML + v2 binary");
 
     assert!(
         !result.needs_binary_upgrade,
@@ -981,8 +1340,16 @@ fn accepted_gate_url_populates_tarball_url() {
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed on valid lockfile");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed on valid lockfile");
 
     assert_eq!(result.packages.len(), 1);
     assert_eq!(
@@ -1030,8 +1397,16 @@ fn try_lockfile_fast_path_restores_registry_signature_metadata() {
     let deps: HashMap<String, String> = [("signed-pkg".to_string(), "^1.0.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed on signed lockfile");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed on signed lockfile");
 
     assert_eq!(result.packages.len(), 1);
     assert_eq!(
@@ -1079,8 +1454,9 @@ fn rejected_gate_urls_downgrade_to_none_with_telemetry() {
 
         let deps: HashMap<String, String> = [("victim".to_string(), "^1.0.0".to_string())].into();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], client, &gate_stats, false)
-            .expect("fast path should succeed even with a gate-rejected URL");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], None, client, &gate_stats, false)
+                .expect("fast path should succeed even with a gate-rejected URL");
         (result, gate_stats, dir)
     };
 
@@ -1145,8 +1521,16 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
     let deps: HashMap<String, String> = [("old-entry".to_string(), "^1.0.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
-        .expect("fast path should succeed on pre-existing lockfile");
+    let result = try_lockfile_fast_path(
+        &lockfile_path,
+        &deps,
+        &[],
+        None,
+        &client,
+        &gate_stats,
+        false,
+    )
+    .expect("fast path should succeed on pre-existing lockfile");
 
     assert_eq!(result.packages[0].tarball_url, None);
 

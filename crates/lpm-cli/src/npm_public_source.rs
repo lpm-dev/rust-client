@@ -106,6 +106,7 @@ mod tests {
                 ..Default::default()
             }],
             root_aliases: Default::default(),
+            root_resolutions: Default::default(),
             ambient_peer_installs: Vec::new(),
         }
     }

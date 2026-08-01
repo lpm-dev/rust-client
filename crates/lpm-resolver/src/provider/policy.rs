@@ -35,7 +35,7 @@ pub(crate) fn release_age_status_for_version_unprofiled(
     {
         return ReleaseTimeStatus::Allowed;
     }
-    policy.release_time_status_unix_for_package(package, published_unix)
+    policy.release_time_status_unix_for_package_version(package, version, published_unix)
 }
 
 pub(crate) fn trust_downgrade_violation(

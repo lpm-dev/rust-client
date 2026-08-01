@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -88,24 +89,27 @@ pub(crate) fn guard_manifest_direct_dependencies(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let mut direct_names = BTreeSet::new();
-    direct_names.extend(pkg.dependencies.keys().cloned());
-    direct_names.extend(pkg.dev_dependencies.keys().cloned());
-    direct_names.extend(pkg.optional_dependencies.keys().cloned());
-    direct_names.extend(pkg.peer_dependencies.keys().cloned());
-
-    let mut findings = Vec::new();
-    for name in &direct_names {
-        validate_package_name(name)?;
+    for dependencies in [
+        &pkg.dependencies,
+        &pkg.dev_dependencies,
+        &pkg.optional_dependencies,
+        &pkg.peer_dependencies,
+    ] {
+        for (local_name, spec) in dependencies {
+            validate_package_name(local_name)?;
+            direct_names.insert(registry_name_for_typosquat_analysis(local_name, spec));
+        }
     }
 
     if typosquat_guard_disabled(project_dir, json_output)? {
         return Ok(());
     }
 
+    let mut findings = Vec::new();
     let policy = TyposquatPolicy::load(project_dir)?;
     let locked_direct = locked_direct_names(project_dir);
     for name in &direct_names {
-        if locked_direct.contains(name) {
+        if locked_direct.contains(name.as_ref()) {
             continue;
         }
         if let Some(finding) = analyze_name(
@@ -131,6 +135,13 @@ pub(crate) fn guard_manifest_direct_dependencies(
     }
 
     Err(error_context(project_dir, findings, None, false))
+}
+
+fn registry_name_for_typosquat_analysis<'a>(local_name: &'a str, spec: &str) -> Cow<'a, str> {
+    lpm_resolver::ranges::parse_npm_alias(spec).map_or_else(
+        || Cow::Borrowed(local_name),
+        |alias| Cow::Owned(alias.target),
+    )
 }
 
 pub(crate) fn validate_package_name(name: &str) -> Result<(), LpmError> {
@@ -476,10 +487,16 @@ fn locked_direct_names(project_dir: &Path) -> BTreeSet<String> {
     };
 
     let mut names = BTreeSet::new();
-    names.extend(importer.dependencies.keys().cloned());
-    names.extend(importer.dev_dependencies.keys().cloned());
-    names.extend(importer.optional_dependencies.keys().cloned());
-    names.extend(importer.peer_dependencies.keys().cloned());
+    for dependencies in [
+        &importer.dependencies,
+        &importer.dev_dependencies,
+        &importer.optional_dependencies,
+        &importer.peer_dependencies,
+    ] {
+        names.extend(dependencies.iter().map(|(local_name, spec)| {
+            registry_name_for_typosquat_analysis(local_name, spec).into_owned()
+        }));
+    }
     names
 }
 

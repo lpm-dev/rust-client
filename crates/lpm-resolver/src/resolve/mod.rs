@@ -23,7 +23,7 @@ pub use dispatch::{
 };
 #[allow(unused_imports)]
 pub use error::ResolveError;
-pub(crate) use format::dedupe_peer_superset_packages;
+pub(crate) use format::{dedupe_peer_superset_packages, mark_optional_reachability};
 pub(crate) use peers::resolve_peer_binding_version;
 #[allow(unused_imports)]
 pub use peers::{
@@ -32,7 +32,8 @@ pub use peers::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent, StageTiming,
+    ResolveResult, ResolvedPackage, RootDependencies, RootResolution, SelectedPackageEvent,
+    StageTiming,
 };
 
 mod prelude {
@@ -52,7 +53,7 @@ mod prelude {
     pub(super) use super::format::{
         aliases_are_superset, dedupe_peer_superset_packages, entries_are_superset, format_solution,
         mark_optional_reachability, resolved_package_can_replace, resolved_package_identity_key,
-        resolved_package_is_strict_superset,
+        resolved_package_is_strict_superset, root_resolutions_from_solution,
     };
     #[allow(unused_imports)]
     pub(super) use super::peers::{
@@ -63,8 +64,8 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::types::{
-        PubGrubResult, ResolveResult, ResolvedPackage, RootDependencies, SelectedPackageEvent,
-        StageTiming,
+        PubGrubResult, ResolveResult, ResolvedPackage, RootDependencies, RootResolution,
+        SelectedPackageEvent, StageTiming,
     };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;

@@ -806,10 +806,9 @@ pub fn link_finalize(
 /// second invocation.
 ///
 /// The symlink target is a relative path computed via [`pathdiff::diff_paths`]
-/// from the link's parent directory to the canonicalized member source
-/// directory. Relative symlinks are resilient to workspace moves and match
-/// the strategy already used elsewhere in this crate (see the bin link path
-/// at the bottom of `link_packages`).
+/// from the link's parent directory to the member source directory. Existing
+/// ancestors are canonicalized, while a missing final target is preserved so
+/// packages can declare a not-yet-built `publishConfig.directory`.
 ///
 /// On Windows, the relative path is resolved into an absolute target before
 /// being passed to [`create_symlink_or_junction`] because NTFS junctions
@@ -817,7 +816,7 @@ pub fn link_finalize(
 ///
 /// Errors:
 /// - I/O failures creating parent directories or the symlink itself
-/// - The member source directory cannot be canonicalized (does not exist)
+/// - An existing ancestor of the member source directory cannot be resolved
 pub fn link_workspace_member(
     node_modules_dir: &Path,
     package_name: &str,
@@ -833,17 +832,35 @@ pub fn link_workspace_member(
         )));
     }
 
-    // Resolve the canonical source dir up front. The relative-symlink
-    // computation needs both endpoints in canonical form to be correct.
-    let source_canonical = member_source_dir.canonicalize().map_err(|e| {
-        LpmError::Io(std::io::Error::new(
-            e.kind(),
-            format!(
-                "workspace member source directory {} does not exist or is unreadable: {e}",
-                member_source_dir.display()
-            ),
-        ))
-    })?;
+    let requested_source = if member_source_dir.is_absolute() {
+        member_source_dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(member_source_dir)
+    };
+    let mut existing_ancestor = requested_source.as_path();
+    let (canonical_ancestor, missing_suffix) = loop {
+        match existing_ancestor.canonicalize() {
+            Ok(canonical) => {
+                let suffix = requested_source
+                    .strip_prefix(existing_ancestor)
+                    .unwrap_or_else(|_| Path::new(""));
+                break (canonical, suffix);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
+                    LpmError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "workspace member source has no existing ancestor: {}",
+                            member_source_dir.display()
+                        ),
+                    ))
+                })?;
+            }
+            Err(error) => return Err(LpmError::Io(error)),
+        }
+    };
+    let source_target = canonical_ancestor.join(missing_suffix);
 
     let link_path = node_modules_dir.join(package_name);
 
@@ -873,8 +890,8 @@ pub fn link_workspace_member(
     let link_parent_canonical = link_parent
         .canonicalize()
         .unwrap_or_else(|_| link_parent.to_path_buf());
-    let relative_target = pathdiff::diff_paths(&source_canonical, &link_parent_canonical)
-        .unwrap_or_else(|| source_canonical.clone());
+    let relative_target = pathdiff::diff_paths(&source_target, &link_parent_canonical)
+        .unwrap_or_else(|| source_target.clone());
 
     create_symlink_or_junction(&relative_target, &link_path).map_err(LpmError::Io)?;
     Ok(())

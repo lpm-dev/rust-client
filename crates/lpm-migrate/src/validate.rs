@@ -273,6 +273,7 @@ mod tests {
             provenance: std::collections::BTreeMap::new(),
             packages,
             root_aliases: std::collections::BTreeMap::new(),
+            root_resolutions: lpm_lockfile::RootResolutions::new(),
             ambient_peer_installs: Vec::new(),
         }
     }

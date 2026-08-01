@@ -167,6 +167,61 @@ pub(super) struct MetadataEdgeMissLatest<'a> {
     pub(super) compare_policy_pick: bool,
 }
 
+pub(super) struct PendingRootConstraints {
+    remaining: AHashMap<CanonicalKey, usize>,
+    deferred: AHashMap<CanonicalKey, Vec<Edge>>,
+}
+
+impl PendingRootConstraints {
+    pub(super) fn from_task_queue(task_queue: &VecDeque<Edge>) -> Self {
+        let mut remaining = AHashMap::with_capacity(task_queue.len());
+        for edge in task_queue.iter().filter(|edge| edge.parent == 0) {
+            *remaining.entry(edge.canonical.clone()).or_insert(0) += 1;
+        }
+        Self {
+            remaining,
+            deferred: AHashMap::new(),
+        }
+    }
+
+    pub(super) fn defer_if_root_pending(&mut self, edge: Edge) -> Option<Edge> {
+        if edge.parent == 0
+            || self.remaining.is_empty()
+            || !self.remaining.contains_key(&edge.canonical)
+        {
+            return Some(edge);
+        }
+        self.deferred
+            .entry(edge.canonical.clone())
+            .or_default()
+            .push(edge);
+        None
+    }
+
+    pub(super) fn complete_root_edge(&mut self, edge: &Edge, task_queue: &mut VecDeque<Edge>) {
+        if edge.parent != 0 {
+            return;
+        }
+        let Some(count) = self.remaining.get_mut(&edge.canonical) else {
+            return;
+        };
+        *count -= 1;
+        if *count != 0 {
+            return;
+        }
+        self.remaining.remove(&edge.canonical);
+        if let Some(edges) = self.deferred.remove(&edge.canonical) {
+            for deferred in edges.into_iter().rev() {
+                task_queue.push_front(deferred);
+            }
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.remaining.is_empty() && self.deferred.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataEdgeMissRangeShape {
     Exact,
@@ -259,6 +314,7 @@ pub(super) struct ResolveState {
     /// installs would share a single link entry and contaminate each other's
     /// `node_modules/`.
     pub(super) peer_requirements: Vec<PeerRequirement>,
+    pub(super) peer_bindings: AHashMap<NodeId, AHashMap<String, NpmVersion>>,
     /// Canonical names of packages the peer-drain pass synthesized as
     /// ambient root-scoped installs. Drained into
     /// `ResolveResult.ambient_peer_installs` at each arm's tail. The install
@@ -357,6 +413,7 @@ impl ResolveState {
             // bench/fixture-large produces ~10s of total peer entries
             // across 250+ packages. Start small; Vec::push amortizes.
             peer_requirements: Vec::new(),
+            peer_bindings: AHashMap::new(),
             // Typically 0 (most installs don't need ambient peer
             // synthesis). Allocated lazily on first push.
             ambient_peer_installs: Vec::new(),
@@ -486,17 +543,47 @@ impl ResolveState {
         Ok(())
     }
 
+    pub(super) fn root_resolutions(&self) -> HashMap<String, RootResolution> {
+        let Some(root) = self.nodes.first() else {
+            return HashMap::new();
+        };
+        let mut resolutions = HashMap::with_capacity(self.root_deps.len());
+        for (local_name, node_id) in &root.children {
+            if !self.root_deps.contains_key(local_name) || resolutions.contains_key(local_name) {
+                continue;
+            }
+            let Some(selected) = self.nodes.get(*node_id as usize) else {
+                continue;
+            };
+            resolutions.insert(
+                local_name.clone(),
+                RootResolution {
+                    package: selected.canonical.to_string(),
+                    version: selected.version.to_string(),
+                },
+            );
+        }
+        resolutions
+    }
+
     /// Convert the in-flight builders into the public
     /// `Vec<ResolvedPackage>`. Mirrors `format_solution`.
     pub(super) fn into_resolved_packages(
         self,
         cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+        root_aliases: &HashMap<String, String>,
     ) -> Vec<ResolvedPackage> {
+        let root_dependencies = crate::resolve::RootDependencies::with_optional_names(
+            self.root_deps,
+            self.optional_root_names,
+        );
+        let peer_bindings = self.peer_bindings;
+        let nodes = self.nodes;
         // Build node-id → version-string lookup so child edges can
         // be resolved to the child's selected version regardless of
         // aliasing (alias rewriting already happened at edge-creation
         // time, so children[i].1 is always the correct node id).
-        let id_to_version: Vec<String> = self.nodes.iter().map(|n| n.version.to_string()).collect();
+        let id_to_version: Vec<String> = nodes.iter().map(|n| n.version.to_string()).collect();
 
         // canonical-name → resolved-version lookup for peer resolution.
         // Mirrors `format_solution`'s peer-candidate lookup. Built from the
@@ -504,8 +591,7 @@ impl ResolveState {
         // intersect the active install set. `CanonicalKey`'s Display impl
         // emits the canonical-name form (`@lpm.dev/owner.name` or `react`),
         // matching how `peerDependencies` keys are spelled in package.json.
-        let resolved_by_canonical: HashMap<String, Vec<(Option<String>, String)>> = self
-            .nodes
+        let resolved_by_canonical: HashMap<String, Vec<(Option<String>, String)>> = nodes
             .iter()
             .filter(|n| !matches!(n.canonical, CanonicalKey::Root))
             .fold(HashMap::new(), |mut acc, n| {
@@ -515,14 +601,14 @@ impl ResolveState {
                 acc
             });
 
-        let mut out: Vec<ResolvedPackage> = self
-            .nodes
+        let mut out: Vec<ResolvedPackage> = nodes
             .into_iter()
             .enumerate()
             .filter(|(_, n)| !matches!(n.canonical, CanonicalKey::Root))
-            .map(|(_, n)| {
+            .map(|(node_index, n)| {
                 let pkg = canonical_to_resolver_package(&n.canonical);
                 let ver_str = n.version.to_string();
+                let selected_peer_bindings = peer_bindings.get(&(node_index as NodeId));
 
                 let cached_aliases: HashMap<String, String> = cache
                     .get(&n.canonical)
@@ -580,6 +666,11 @@ impl ResolveState {
                         let mut out: Vec<(String, String)> = peer_deps
                             .iter()
                             .filter_map(|(peer_name, peer_range)| {
+                                if let Some(version) = selected_peer_bindings
+                                    .and_then(|bindings| bindings.get(peer_name))
+                                {
+                                    return Some((peer_name.clone(), version.to_string()));
+                                }
                                 let parsed_range = NpmRange::parse(peer_range).ok();
                                 resolve_peer_binding_version(
                                     &pkg,
@@ -610,6 +701,12 @@ impl ResolveState {
             })
             .collect();
 
+        crate::resolve::mark_optional_reachability(
+            &mut out,
+            cache,
+            &root_dependencies,
+            root_aliases,
+        );
         crate::resolve::dedupe_peer_superset_packages(&mut out);
 
         // Match `format_solution`'s deterministic order so lockfile
@@ -701,6 +798,8 @@ mod tests {
             trust_metadata_complete: false,
             versions_complete: true,
             covered_ranges: HashSet::new(),
+            workspace_versions: HashSet::new(),
+            platform_metadata_complete: true,
             latest_version: None,
             versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
             deps: HashMap::new(),
@@ -717,6 +816,66 @@ mod tests {
 
     fn shape(raw: &str) -> MetadataEdgeMissRangeShape {
         metadata_edge_miss_range_shape(&NpmRange::parse(raw).expect("valid test range"))
+    }
+
+    fn root_edge(name: &str) -> Edge {
+        Edge {
+            parent: 0,
+            local_name: name.to_string(),
+            canonical: CanonicalKey::npm(name),
+            range: NpmRange::parse("*").expect("valid range"),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_root_constraints_ignore_synthetic_root_edges() {
+        let initial = root_edge("initial-root");
+        let mut queue = VecDeque::from([initial.clone()]);
+        let mut pending = PendingRootConstraints::from_task_queue(&queue);
+
+        pending.complete_root_edge(&root_edge("synthetic-peer"), &mut queue);
+        assert!(
+            !pending.is_empty(),
+            "an unrelated synthetic root must not release the initial barrier"
+        );
+
+        pending.complete_root_edge(&initial, &mut queue);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn root_resolutions_keep_manifest_selection_when_ambient_peer_uses_same_name() {
+        let mut state = ResolveState::new(
+            HashMap::from([("peer-host".to_string(), "^1.0.0".to_string())]),
+            OverrideSet::empty(),
+        );
+        state.seed_root_edges().expect("seed root edge");
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("peer-host"),
+            version: NpmVersion::parse("1.0.0").expect("valid direct version"),
+            optional: false,
+            children: Vec::new(),
+        });
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("peer-host"),
+            version: NpmVersion::parse("1.1.0").expect("valid ambient version"),
+            optional: false,
+            children: Vec::new(),
+        });
+        state.nodes[0].children = vec![("peer-host".to_string(), 1), ("peer-host".to_string(), 2)];
+
+        assert_eq!(
+            state.root_resolutions().get("peer-host"),
+            Some(&RootResolution {
+                package: "peer-host".to_string(),
+                version: "1.0.0".to_string(),
+            })
+        );
     }
 
     #[test]

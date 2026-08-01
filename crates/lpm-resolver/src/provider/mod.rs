@@ -101,3 +101,5 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use version_ranges::Ranges;
 }
+
+pub(crate) use cache::insert_or_merge_cached_package_info;

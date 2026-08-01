@@ -1,5 +1,184 @@
 use super::prelude::*;
 
+pub(crate) fn insert_or_merge_cached_package_info(
+    shared_cache: &SharedCache,
+    canonical: CanonicalKey,
+    incoming: Arc<CachedPackageInfo>,
+) -> Arc<CachedPackageInfo> {
+    let Some(existing) = shared_cache
+        .get(&canonical)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        shared_cache.insert(canonical, incoming.clone());
+        return incoming;
+    };
+
+    if Arc::ptr_eq(&existing, &incoming) {
+        return existing;
+    }
+
+    if incoming.versions_complete && existing.workspace_versions.is_empty() {
+        shared_cache.insert(canonical, incoming.clone());
+        return incoming;
+    }
+
+    let merged = Arc::new(merge_cached_package_info(&existing, &incoming));
+    shared_cache.insert(canonical, merged.clone());
+    merged
+}
+
+fn merge_cached_package_info(
+    existing: &CachedPackageInfo,
+    incoming: &CachedPackageInfo,
+) -> CachedPackageInfo {
+    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
+    versions.extend(existing.versions.iter().cloned());
+    versions.extend(incoming.versions.iter().cloned());
+    versions.sort_by(|a, b| b.cmp(a));
+    versions.dedup();
+
+    let mut dist = existing.dist.clone();
+    for (version, incoming_dist) in &incoming.dist {
+        dist.entry(version.clone())
+            .and_modify(|existing_dist| {
+                *existing_dist = merge_cached_dist_info(existing_dist, incoming_dist);
+            })
+            .or_insert_with(|| incoming_dist.clone());
+    }
+
+    let mut deps = existing.deps.clone();
+    deps.extend(incoming.deps.clone());
+    let mut peer_deps = existing.peer_deps.clone();
+    peer_deps.extend(incoming.peer_deps.clone());
+    let mut optional_dep_names = existing.optional_dep_names.clone();
+    optional_dep_names.extend(incoming.optional_dep_names.clone());
+    let mut optional_peer_names = existing.optional_peer_names.clone();
+    optional_peer_names.extend(incoming.optional_peer_names.clone());
+    let mut node_engines = existing.node_engines.clone();
+    node_engines.extend(incoming.node_engines.clone());
+    let mut bundled_dep_names = existing.bundled_dep_names.clone();
+    bundled_dep_names.extend(incoming.bundled_dep_names.clone());
+    let mut platform = existing.platform.clone();
+    platform.extend(incoming.platform.clone());
+    let mut aliases = existing.aliases.clone();
+    aliases.extend(incoming.aliases.clone());
+    let mut covered_ranges = existing.covered_ranges.clone();
+    covered_ranges.extend(incoming.covered_ranges.iter().cloned());
+    let mut workspace_versions = existing.workspace_versions.clone();
+    workspace_versions.extend(incoming.workspace_versions.iter().cloned());
+
+    for workspace_version in &workspace_versions {
+        let version = workspace_version.to_string();
+        preserve_workspace_entry(&mut deps, &existing.deps, &version);
+        preserve_workspace_entry(&mut peer_deps, &existing.peer_deps, &version);
+        preserve_workspace_entry(
+            &mut optional_dep_names,
+            &existing.optional_dep_names,
+            &version,
+        );
+        preserve_workspace_entry(
+            &mut optional_peer_names,
+            &existing.optional_peer_names,
+            &version,
+        );
+        preserve_workspace_entry(&mut node_engines, &existing.node_engines, &version);
+        preserve_workspace_entry(
+            &mut bundled_dep_names,
+            &existing.bundled_dep_names,
+            &version,
+        );
+        preserve_workspace_entry(&mut platform, &existing.platform, &version);
+        preserve_workspace_entry(&mut dist, &existing.dist, &version);
+        preserve_workspace_entry(&mut aliases, &existing.aliases, &version);
+    }
+
+    let incoming_adds_versions = incoming
+        .versions
+        .iter()
+        .any(|version| !existing.versions.contains(version));
+    let versions_complete =
+        incoming.versions_complete || (existing.versions_complete && !incoming_adds_versions);
+    let trust_metadata_complete = if incoming.versions_complete {
+        incoming.trust_metadata_complete
+    } else if versions_complete {
+        existing.trust_metadata_complete
+    } else {
+        false
+    };
+    let platform_metadata_complete = if incoming.versions_complete {
+        incoming.platform_metadata_complete
+    } else if versions_complete {
+        existing.platform_metadata_complete
+    } else {
+        false
+    };
+
+    let mut merged = CachedPackageInfo {
+        modified: incoming
+            .modified
+            .clone()
+            .or_else(|| existing.modified.clone()),
+        modified_unix: incoming.modified_unix.or(existing.modified_unix),
+        trust_metadata_complete,
+        versions_complete,
+        covered_ranges,
+        workspace_versions,
+        platform_metadata_complete,
+        latest_version: incoming
+            .latest_version
+            .clone()
+            .or_else(|| existing.latest_version.clone()),
+        versions,
+        deps,
+        peer_deps,
+        optional_dep_names,
+        optional_peer_names,
+        node_engines,
+        bundled_dep_names,
+        platform,
+        dist,
+        aliases,
+    };
+    merged.remove_shadowed_peer_requirements();
+    merged
+}
+
+fn preserve_workspace_entry<T: Clone>(
+    merged: &mut HashMap<String, T>,
+    workspace: &HashMap<String, T>,
+    version: &str,
+) {
+    if let Some(value) = workspace.get(version) {
+        merged.insert(version.to_string(), value.clone());
+    } else {
+        merged.remove(version);
+    }
+}
+
+fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
+    CachedDistInfo {
+        tarball_url: incoming
+            .tarball_url
+            .clone()
+            .or_else(|| existing.tarball_url.clone()),
+        integrity: incoming
+            .integrity
+            .clone()
+            .or_else(|| existing.integrity.clone()),
+        signatures: if incoming.signatures.is_empty() {
+            existing.signatures.clone()
+        } else {
+            incoming.signatures.clone()
+        },
+        published_at: incoming
+            .published_at
+            .clone()
+            .or_else(|| existing.published_at.clone()),
+        published_at_unix: incoming.published_at_unix.or(existing.published_at_unix),
+        trust_evidence: incoming.trust_evidence.or(existing.trust_evidence),
+    }
+}
+
 impl StreamingBfsMetrics {
     pub fn new() -> Self {
         Self::default()
@@ -145,6 +324,25 @@ impl LpmDependencyProvider {
         self.direct_fetch_and_cache(package)
     }
 
+    pub(super) fn ensure_cached_for_range(
+        &self,
+        package: &ResolverPackage,
+        range: &NpmRange,
+    ) -> Result<(), ProviderError> {
+        if package.is_root() {
+            return Ok(());
+        }
+        let key = CanonicalKey::from(package);
+        let needs_registry_metadata = self
+            .cache
+            .get(&key)
+            .is_some_and(|info| info.needs_metadata_for_range(range));
+        if needs_registry_metadata {
+            return self.direct_fetch_and_cache(package);
+        }
+        self.ensure_cached(package)
+    }
+
     fn ensure_policy_metadata(
         &self,
         package: &ResolverPackage,
@@ -166,7 +364,7 @@ impl LpmDependencyProvider {
         let needs_upgrade = self
             .cache
             .get(key)
-            .is_some_and(|info| info.needs_policy_metadata(key, &self.policy));
+            .is_some_and(|info| info.needs_supplemental_metadata(key, &self.policy));
         if !needs_upgrade {
             return Ok(());
         }
@@ -175,23 +373,51 @@ impl LpmDependencyProvider {
         };
         let route = self.route_table.route_for_package(name);
         let policy_start = trace_metadata_fetches.then(Instant::now);
-        let info = self.fetch_full_policy_info(name, route.clone(), key)?;
+        let info = self
+            .cache
+            .get(key)
+            .map(|info| (**info).clone())
+            .ok_or_else(|| ProviderError::Registry(format!("npm:{name}: metadata cache miss")))?;
+        let fetched_full_policy_metadata = info.needs_trust_metadata(&self.policy);
+        let mut info = if fetched_full_policy_metadata {
+            self.fetch_full_policy_info(name, route.clone(), key)?
+        } else {
+            info
+        };
+        let mut release_time_detail = None;
+        let release_time_start = trace_metadata_fetches.then(Instant::now);
+        if info.needs_release_time_metadata(key, &self.policy) {
+            release_time_detail =
+                Some(self.fetch_release_time_policy_info(name, route.clone(), key, &mut info)?);
+        }
+        if info.needs_platform_metadata() {
+            self.fetch_platform_info(name, route.clone(), key, &mut info)?;
+        }
         if let Some(start) = policy_start {
             let elapsed = start.elapsed().as_millis();
-            lpm_registry::timing::record_metadata_fetch_detail(
-                lpm_registry::timing::MetadataFetchDetailRecord {
-                    package: key.to_string(),
-                    route: match route {
-                        UpstreamRoute::NpmDirect => "npm_direct",
-                        UpstreamRoute::LpmWorker => "lpm_worker",
-                        UpstreamRoute::Custom { .. } => "custom",
-                    },
-                    total_ms: elapsed,
-                    policy_full_metadata_ms: elapsed,
-                    version_count: info.versions.len() as u64,
-                    ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+            let mut record = lpm_registry::timing::MetadataFetchDetailRecord {
+                package: key.to_string(),
+                route: match route {
+                    UpstreamRoute::NpmDirect => "npm_direct",
+                    UpstreamRoute::LpmWorker => "lpm_worker",
+                    UpstreamRoute::Custom { .. } => "custom",
                 },
-            );
+                total_ms: elapsed,
+                policy_release_time_ms: release_time_start
+                    .filter(|_| release_time_detail.is_some())
+                    .map_or(0, |start| start.elapsed().as_millis()),
+                policy_full_metadata_ms: if fetched_full_policy_metadata {
+                    elapsed
+                } else {
+                    0
+                },
+                version_count: info.versions.len() as u64,
+                ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+            };
+            if let Some(detail) = &release_time_detail {
+                detail.apply_to(&mut record);
+            }
+            lpm_registry::timing::record_metadata_fetch_detail(record);
         }
         self.insert_and_notify(key.clone(), info);
         Ok(())
@@ -202,7 +428,7 @@ impl LpmDependencyProvider {
     /// reorder — notifying before inserting races the provider's re-check
     /// and causes spurious wait-loop iterations.
     pub(super) fn insert_and_notify(&self, key: CanonicalKey, info: CachedPackageInfo) {
-        self.cache.insert(key.clone(), Arc::new(info));
+        insert_or_merge_cached_package_info(&self.cache, key.clone(), Arc::new(info));
         self.available_versions_cache
             .borrow_mut()
             .retain(|package, _| CanonicalKey::from(package) != key);

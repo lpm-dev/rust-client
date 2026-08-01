@@ -294,6 +294,53 @@ async fn ci_auto_frozen_repeat_install_uses_up_to_date_fast_path() {
 }
 
 #[tokio::test]
+async fn frozen_replay_accepts_unchanged_peer_dependency_rules_across_processes() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "frozen-peer-rules",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" },
+            "lpm": {
+                "peerDependencyRules": {
+                    "allowedVersions": {
+                        "consumer-a>peer-a": "^1.0.0",
+                        "consumer-b>peer-b": "^2.0.0",
+                        "consumer-c>peer-c": "^3.0.0",
+                        "consumer-d>peer-d": "^4.0.0",
+                        "consumer-e>peer-e": "^5.0.0",
+                        "consumer-f>peer-f": "^6.0.0",
+                        "consumer-g>peer-g": "^7.0.0",
+                        "consumer-h>peer-h": "^8.0.0"
+                    }
+                }
+            }
+        }"#,
+    );
+    install_once(&project, &mock).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run frozen replay with unchanged peer rules");
+
+    assert!(
+        output.status.success(),
+        "unchanged peer rules must have a process-stable lockfile fingerprint:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn lpm_ci_replays_frozen_lockfile_without_rewriting_lockfiles() {
     let mock = MockRegistry::start().await;
     mount_ms(&mock).await;

@@ -1389,17 +1389,149 @@ where
 
 // ─── Minimal metadata views ─────────────────────────────────────────────────
 
+/// Platform fields retained from a version entry in a full npm packument.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ReleaseTimeVersionMetadata {
+    /// Operating-system restrictions declared by the package version.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub os: Vec<String>,
+    /// CPU restrictions declared by the package version.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cpu: Vec<String>,
+    /// Linux libc restrictions declared by the package version.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub libc: Vec<String>,
+}
+
+impl ReleaseTimeVersionMetadata {
+    fn is_empty(&self) -> bool {
+        self.os.is_empty() && self.cpu.is_empty() && self.libc.is_empty()
+    }
+}
+
+fn deserialize_release_time_platform_versions<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, ReleaseTimeVersionMetadata>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct PlatformVersionsVisitor;
+
+    impl<'de> Visitor<'de> for PlatformVersionsVisitor {
+        type Value = HashMap<String, ReleaseTimeVersionMetadata>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an npm versions map")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut versions = HashMap::new();
+            while let Some((version, metadata)) =
+                map.next_entry::<String, ReleaseTimeVersionMetadata>()?
+            {
+                if !metadata.is_empty() {
+                    versions.insert(version, metadata);
+                }
+            }
+            Ok(versions)
+        }
+    }
+
+    struct OptionalPlatformVersionsVisitor;
+
+    impl<'de> Visitor<'de> for OptionalPlatformVersionsVisitor {
+        type Value = Option<HashMap<String, ReleaseTimeVersionMetadata>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an npm versions map or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer
+                .deserialize_map(PlatformVersionsVisitor)
+                .map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalPlatformVersionsVisitor)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct ReleaseTimeMetadata {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub time: HashMap<String, String>,
+    /// Sparse per-version platform metadata from full npm packuments.
+    /// `Some(empty)` records that a full `versions` map was present but
+    /// contained no platform restrictions; `None` identifies a time-only
+    /// response that cannot prove platform metadata completeness.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_release_time_platform_versions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub versions: Option<HashMap<String, ReleaseTimeVersionMetadata>>,
 }
 
 impl ReleaseTimeMetadata {
     pub fn matches_package(&self, expected: &str) -> bool {
         self.name.as_deref().is_none_or(|name| name == expected)
+    }
+
+    pub(crate) fn from_full_package_metadata(metadata: PackageMetadata) -> Self {
+        let versions = metadata
+            .versions
+            .into_iter()
+            .filter_map(|(version, metadata)| {
+                let platform = ReleaseTimeVersionMetadata {
+                    os: metadata.os,
+                    cpu: metadata.cpu,
+                    libc: metadata.libc,
+                };
+                (!platform.is_empty()).then_some((version, platform))
+            })
+            .collect();
+        Self {
+            name: Some(metadata.name),
+            time: metadata.time,
+            versions: Some(versions),
+        }
     }
 }
 
@@ -1555,6 +1687,57 @@ mod tests {
             version.libc.iter().map(String::as_str).collect::<Vec<_>>(),
             ["glibc"]
         );
+    }
+
+    #[test]
+    fn release_time_metadata_preserves_platform_fields_from_full_packument() {
+        let metadata: ReleaseTimeMetadata = serde_json::from_value(serde_json::json!({
+            "name": "native-linux",
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "os": "linux",
+                    "cpu": ["arm64"],
+                    "libc": "glibc",
+                    "dependencies": { "ignored": "1.0.0" }
+                },
+                "2.0.0": {
+                    "dependencies": { "ignored": "2.0.0" }
+                }
+            }
+        }))
+        .expect("full npm metadata should parse through the compact release-time view");
+
+        let projected = serde_json::to_value(metadata).expect("serialize compact metadata");
+        assert_eq!(
+            projected["versions"],
+            serde_json::json!({
+                "1.0.0": {
+                    "os": ["linux"],
+                    "cpu": ["arm64"],
+                    "libc": ["glibc"]
+                }
+            }),
+            "the compact release-time representation should retain only platform-bearing versions"
+        );
+    }
+
+    #[test]
+    fn release_time_metadata_distinguishes_time_only_from_full_empty_versions() {
+        let time_only: ReleaseTimeMetadata = serde_json::from_value(serde_json::json!({
+            "name": "portable-package",
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }))
+        .expect("time-only metadata should parse");
+        let full: ReleaseTimeMetadata = serde_json::from_value(serde_json::json!({
+            "name": "portable-package",
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" },
+            "versions": { "1.0.0": { "dependencies": { "ignored": "1.0.0" } } }
+        }))
+        .expect("full metadata should parse");
+
+        assert!(time_only.versions.is_none());
+        assert_eq!(full.versions.as_ref().map(HashMap::len), Some(0));
     }
 
     #[test]

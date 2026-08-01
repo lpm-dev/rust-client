@@ -59,6 +59,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) applied_overrides: Vec<OverrideHit>,
     pub(in crate::commands::install) peer_conflicts: Vec<lpm_resolver::PeerConflictReport>,
     pub(in crate::commands::install) peer_warnings: Vec<PeerWarning>,
+    pub(in crate::commands::install) workspace_root_peer_providers_fingerprint: Option<String>,
     pub(in crate::commands::install) ambient_peer_installs_for_lockfile: Vec<String>,
     pub(in crate::commands::install) spec_tracker: SpeculativeKeyTracker,
     pub(in crate::commands::install) speculation_join: Option<SpeculationJoin>,
@@ -251,7 +252,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     );
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
@@ -397,7 +397,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let dep_names: Vec<String> = deps.keys().cloned().collect();
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
                     let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
                     let walker_done: WalkerDone =
                         Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -526,23 +525,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     &resolve_result.cache,
                     &compiled_peer_rules,
                 );
-                if !peer_warnings.is_empty() && !json_output {
-                    for w in &peer_warnings {
-                        output::warn(&format!(
-                            "peer dep: {}",
-                            lpm_common::sanitize_terminal_inline(&w.to_string())
-                        ));
-                    }
-                }
-
                 applied_overrides = resolve_result.applied_overrides.clone();
                 peer_conflicts = resolve_result.peer_conflicts.clone();
-
-                if strict_peer_dependencies
-                    && let Some(err) = strict_peer_dependency_error(&peer_warnings, &peer_conflicts)
-                {
-                    return Err(err);
-                }
 
                 if peer_conflict_auto_isolation_allowed {
                     auto_isolated_peer_conflicts = !peer_conflicts.is_empty();
@@ -564,16 +548,14 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 resolver_stage_timing = resolve_result.stage_timing;
                 ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
 
-                let mut packages = resolved_to_install_packages_with_workspace_members(
+                let mut packages = resolved_to_install_packages(
                     &resolve_result.packages,
                     deps,
                     &resolve_result.root_aliases,
+                    &resolve_result.root_resolutions,
                     &resolve_result.ambient_peer_installs,
                     &resolve_result.cache,
-                    &route_table,
-                    arc_client.as_ref(),
-                    all_workspace_members,
-                    project_dir,
+                    RegistrySourceContext::new(&route_table, arc_client.as_ref()),
                 );
                 let latest_stable = build_latest_stable_versions(&resolve_result.cache);
                 packages.extend(tarball_url_install_pkgs.iter().cloned());
@@ -633,6 +615,28 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     }
     dedupe_install_packages_by_identity(&mut packages);
 
+    let workspace_root_peer_providers_fingerprint =
+        workspace_resolution::reconcile_root_peer_providers(
+            project_dir,
+            &mut packages,
+            &mut peer_warnings,
+            &v2_workspace_root_pre_resolve.install_pkgs,
+        )
+        .await?;
+    if !peer_warnings.is_empty() && !json_output {
+        for warning in &peer_warnings {
+            output::warn(&format!(
+                "peer dep: {}",
+                lpm_common::sanitize_terminal_inline(&warning.to_string())
+            ));
+        }
+    }
+    if strict_peer_dependencies
+        && let Some(error) = strict_peer_dependency_error(&peer_warnings, &peer_conflicts)
+    {
+        return Err(error);
+    }
+
     let packages_for_lockfile = packages.clone();
     if omit_policy.dev {
         filter_dev_packages(&mut packages, production_dependency_names);
@@ -650,6 +654,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         applied_overrides,
         peer_conflicts,
         peer_warnings,
+        workspace_root_peer_providers_fingerprint,
         ambient_peer_installs_for_lockfile,
         spec_tracker,
         speculation_join,

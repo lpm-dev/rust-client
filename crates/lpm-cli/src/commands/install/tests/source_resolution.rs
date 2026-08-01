@@ -1,5 +1,43 @@
 use super::*;
 
+#[test]
+fn read_pkg_json_name_version_defaults_versionless_local_directory_to_zero() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        br#"{"name":"versionless-local"}"#,
+    )
+    .unwrap();
+
+    let (_, version, _) = read_pkg_json_name_version(
+        directory.path(),
+        "versionless local directory",
+        MissingVersionPolicy::DefaultToZero,
+    )
+    .unwrap();
+
+    assert_eq!(version, "0.0.0");
+}
+
+#[test]
+fn read_pkg_json_name_version_rejects_versionless_tarball_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        br#"{"name":"versionless-tarball"}"#,
+    )
+    .unwrap();
+
+    let error = read_pkg_json_name_version(
+        directory.path(),
+        "versionless tarball",
+        MissingVersionPolicy::Require,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("has no `version` field"));
+}
+
 // ── local-tarball path traversal ─────────────
 
 /// The classic exploit shape: a manifest entry like
@@ -1049,6 +1087,88 @@ fn read_source_dep_specs_excludes_dev_dependencies_from_consumed_local_sources()
     assert_eq!(names, vec!["runtime-package"]);
 }
 
+#[test]
+fn read_source_dep_specs_resolves_workspace_default_catalog_dependencies() {
+    let workspace = tempfile::tempdir().unwrap();
+    let member_dir = workspace.path().join("packages/catalog-provider");
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(
+        workspace.path().join("package.json"),
+        br#"{
+          "name": "catalog-workspace",
+          "version": "1.0.0",
+          "private": true,
+          "workspaces": ["packages/*"]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("pnpm-workspace.yaml"),
+        b"packages:\n  - packages/*\ncatalog:\n  is-positive: ^2.0.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        br#"{
+          "name": "catalog-provider",
+          "version": "1.0.0",
+          "dependencies": { "is-positive": "catalog:" }
+        }"#,
+    )
+    .unwrap();
+
+    let specs = read_source_dep_specs(&member_dir).unwrap();
+
+    assert!(
+        matches!(
+            specs.as_slice(),
+            [SourceDep {
+                local_name,
+                raw_spec,
+                kind: DepKind::Registry,
+                optional: false,
+                auto_install: true,
+                ..
+            }] if local_name == "is-positive" && raw_spec == "^2.0.0"
+        ),
+        "workspace catalog references must resolve before source dependency classification: {specs:?}",
+    );
+}
+
+#[tokio::test]
+async fn pre_resolve_does_not_auto_install_optional_peer_from_local_source() {
+    let store_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let project = tempfile::tempdir().unwrap();
+    let local_package = project.path().join("packages/local-package");
+    std::fs::create_dir_all(&local_package).unwrap();
+    std::fs::write(
+        local_package.join("package.json"),
+        br#"{
+          "name": "local-package",
+          "version": "1.0.0",
+          "peerDependencies": { "foobar": "0.0.0" },
+          "peerDependenciesMeta": { "foobar": { "optional": true } }
+        }"#,
+    )
+    .unwrap();
+    let mut deps = HashMap::from([(
+        "local-package".to_string(),
+        "file:./packages/local-package".to_string(),
+    )]);
+
+    let result =
+        pre_resolve_non_registry_deps(&client, &store, project.path(), &mut deps, true, false, &[])
+            .await
+            .unwrap();
+
+    assert!(!deps.contains_key("foobar"));
+    let source = &result.install_pkgs[0].source;
+    let peer = &result.source_deps[source][0];
+    assert!(peer.optional && !peer.auto_install);
+}
+
 #[tokio::test]
 async fn pre_resolve_marks_duplicate_local_dependency_optional_after_override() {
     let store_root = tempfile::tempdir().unwrap();
@@ -1136,6 +1256,7 @@ async fn workspace_transitive_with_matching_member_does_not_pollute_resolver_dep
     let workspace_members = vec![WorkspaceMemberLink {
         name: "bar".to_string(),
         version: "2.5.0".to_string(),
+        package_dir: bar_dir.clone(),
         source_dir: bar_dir,
     }];
 
@@ -1180,11 +1301,13 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
     let foo = WorkspaceMemberLink {
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: foo_dir.clone(),
         source_dir: foo_dir,
     };
     let bar = WorkspaceMemberLink {
         name: "bar".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: bar_dir.clone(),
         source_dir: bar_dir,
     };
     let mut deps = HashMap::new();
@@ -2015,7 +2138,10 @@ async fn pre_resolve_recurses_into_transitive_file_directory_deps() {
     assert_eq!(a_specs.len(), 1);
     assert_eq!(a_specs[0].local_name, "b");
     assert_eq!(a_specs[0].kind, DepKind::FileDir);
-    assert_eq!(a_specs[0].target_source.as_deref(), Some("directory+../b"));
+    assert_eq!(
+        a_specs[0].target_source.as_deref(),
+        Some("directory+packages/b")
+    );
 }
 
 #[tokio::test]
@@ -2345,6 +2471,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 raw_spec: "^4.0.0".to_string(),
                 kind: DepKind::Registry,
                 optional: false,
+                auto_install: true,
                 target_source: None,
             },
             SourceDep {
@@ -2352,6 +2479,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 raw_spec: "file:../b".to_string(),
                 kind: DepKind::FileDir,
                 optional: false,
+                auto_install: true,
                 target_source: Some("directory+./packages/b".to_string()),
             },
         ],
@@ -2431,6 +2559,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             raw_spec: "npm:@jsr/std__path@^1.1.0".to_string(),
             kind: DepKind::Registry,
             optional: false,
+            auto_install: true,
             target_source: None,
         }],
     );
@@ -2523,6 +2652,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             raw_spec: "file:../react-fork".to_string(),
             kind: DepKind::FileDir,
             optional: false,
+            auto_install: true,
             target_source: Some(fork_source),
         }],
     );
@@ -2571,6 +2701,7 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
             raw_spec: "^1.0.0".to_string(),
             kind: DepKind::Registry,
             optional: false,
+            auto_install: true,
             target_source: None,
         }],
     );
@@ -2589,10 +2720,12 @@ fn make_workspace_member(parent: &Path, name: &str, version: &str) -> WorkspaceM
         format!(r#"{{"name":"{name}","version":"{version}"}}"#),
     )
     .unwrap();
+    let dir = dir.canonicalize().unwrap();
     WorkspaceMemberLink {
         name: name.to_string(),
         version: version.to_string(),
-        source_dir: dir.canonicalize().unwrap(),
+        package_dir: dir.clone(),
+        source_dir: dir,
     }
 }
 
@@ -2705,6 +2838,7 @@ async fn pre_resolve_overlap_with_version_mismatch_is_hard_error() {
     let member = WorkspaceMemberLink {
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: pkg_dir.canonicalize().unwrap(),
         source_dir: pkg_dir.canonicalize().unwrap(),
     };
 
@@ -2774,6 +2908,7 @@ fn detect_workspace_overlap_realpath_byte_equal_match() {
     let member = WorkspaceMemberLink {
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: canon.clone(),
         source_dir: canon.clone(),
     };
     match detect_workspace_overlap(
@@ -2800,6 +2935,7 @@ fn detect_workspace_overlap_no_overlap_when_paths_differ() {
     let member = WorkspaceMemberLink {
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: a.canonicalize().unwrap(),
         source_dir: a.canonicalize().unwrap(),
     };
     let result = detect_workspace_overlap(

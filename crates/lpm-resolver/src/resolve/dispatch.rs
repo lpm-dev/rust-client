@@ -335,6 +335,8 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                     root_aliases,
                     root_dependencies,
                 ) = provider.into_parts();
+                let root_resolutions =
+                    root_resolutions_from_solution(&solution, &root_dependencies, &root_aliases);
                 let (packages, platform_skipped) = match format_solution(
                     solution,
                     &cache,
@@ -377,6 +379,7 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                     applied_overrides,
                     platform_skipped,
                     root_aliases,
+                    root_resolutions,
                     // The PubGrub/walker arm doesn't implement eager
                     // peer auto-install (legacy correctness opt-out via
                     // `LPM_RESOLVER=pubgrub`). Users who pin to pubgrub

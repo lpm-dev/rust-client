@@ -215,6 +215,7 @@ fn importer_snapshots_round_trip_dependency_sections() {
         dev_dependencies: BTreeMap::from([("vitest".to_string(), "^4.0.0".to_string())]),
         optional_dependencies: BTreeMap::from([("fsevents".to_string(), "^2.3.3".to_string())]),
         peer_dependencies: BTreeMap::from([("typescript".to_string(), ">=5".to_string())]),
+        workspace_root_peer_providers_fingerprint: Some("sha256-workspace-root".to_string()),
         ..ImporterSnapshot::default()
     };
     lf.importers.insert(".".to_string(), importer.clone());
@@ -224,7 +225,8 @@ fn importer_snapshots_round_trip_dependency_sections() {
         toml.contains("[importers.\".\".dependencies]")
             && toml.contains("[importers.\".\".dev-dependencies]")
             && toml.contains("[importers.\".\".optional-dependencies]")
-            && toml.contains("[importers.\".\".peer-dependencies]"),
+            && toml.contains("[importers.\".\".peer-dependencies]")
+            && toml.contains("workspace-root-peer-providers-fingerprint"),
         "lockfile must serialize importer dependency sections, got:\n{toml}"
     );
 
@@ -977,6 +979,24 @@ fn toml_roundtrips_npm_alias_metadata() {
         parsed, lf,
         "round-trip must preserve every alias field byte-for-byte"
     );
+}
+
+#[test]
+fn toml_roundtrips_exact_root_resolutions() {
+    let mut lockfile = Lockfile::new();
+    lockfile.root_resolutions.insert(
+        "peer-host".to_string(),
+        LockedRootResolution {
+            package: "peer-host".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+
+    let toml = lockfile.to_toml().expect("serialize exact root selection");
+    let parsed = Lockfile::from_toml(&toml).expect("parse exact root selection");
+
+    assert_eq!(parsed.root_resolutions, lockfile.root_resolutions);
 }
 
 /// The binary format cannot express alias metadata;

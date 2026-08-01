@@ -427,6 +427,70 @@ catalog:
 }
 
 #[tokio::test]
+async fn recursive_workspace_member_resolves_pnpm_default_catalog_dependency() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+                "is-positive": "catalog:"
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": {
+                "catalog-provider": "workspace:*"
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/catalog-provider/package.json",
+        r#"{
+            "name": "catalog-provider",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run recursive lpm install");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "recursive install must resolve member catalog: from pnpm-workspace.yaml\n{text}"
+    );
+    assert_eq!(
+        resolved_version_at(&project, "packages/app", "is-positive"),
+        "2.0.0",
+        "workspace-member provider closures should inherit the root pnpm default catalog"
+    );
+}
+
+#[tokio::test]
 async fn pnpm_workspace_named_catalog_resolves_catalog_dependency() {
     let mock = MockRegistry::start().await;
     mount_is_positive_versions(&mock).await;
@@ -868,6 +932,101 @@ async fn lockfile_catalog_snapshot_records_named_catalog_resolution() {
 }
 
 #[tokio::test]
+async fn frozen_catalog_install_replays_override_selected_direct_version() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "needs-positive-two",
+            "version": "1.0.0",
+            "peerDependencies": {
+                "is-positive": "^2.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:",
+                "needs-positive-two": "^1.0.0"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": ">=1.0.0"
+                }
+            },
+            "lpm": {
+                "overrides": {
+                    "is-positive": "1.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let first = run_install(&project, &mock, &[]);
+    let first_text = output_text(&first);
+    assert!(
+        first.status.success(),
+        "initial catalog install with an override must succeed\n{first_text}"
+    );
+
+    let frozen = run_install(&project, &mock, &["--frozen-lockfile"]);
+    let frozen_text = output_text(&frozen);
+    assert!(
+        frozen.status.success(),
+        "frozen replay must accept the override-selected direct catalog version\n{frozen_text}"
+    );
+}
+
+#[tokio::test]
+async fn frozen_catalog_replay_allows_unused_catalog_backed_resolution() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "resolutions": {
+                "is-negative": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0",
+                    "is-negative": "^1.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let first = run_install(&project, &mock, &[]);
+    let first_text = output_text(&first);
+    assert!(
+        first.status.success(),
+        "initial catalog install with an unused resolution must succeed\n{first_text}"
+    );
+    assert!(
+        catalog_snapshot_entry_optional(&project, "default", "is-negative").is_none(),
+        "an unused catalog-backed resolution must not be persisted as applied"
+    );
+
+    let frozen = run_install(&project, &mock, &["--frozen-lockfile"]);
+    let frozen_text = output_text(&frozen);
+    assert!(
+        frozen.status.success(),
+        "frozen replay must accept a configured catalog-backed resolution that was not applied\n{frozen_text}"
+    );
+}
+
+#[tokio::test]
 async fn warm_install_updates_catalog_snapshot_when_catalog_specifier_drifts() {
     let mock = MockRegistry::start().await;
     mount_is_positive_versions(&mock).await;
@@ -1275,7 +1434,7 @@ fn catalog_show_resolved_rejects_lockfile_missing_referenced_catalog_snapshot() 
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
-        "1.0.0",
+        "2.0.0",
         &[
             (
                 "1.0.0",
@@ -1497,19 +1656,26 @@ fn catalog_snapshot_entry(
     catalog: &str,
     package: &str,
 ) -> lpm_lockfile::CatalogSnapshotEntry {
+    catalog_snapshot_entry_optional(project, catalog, package).unwrap_or_else(|| {
+        panic!(
+            "expected lockfile catalog snapshot `{catalog}` entry for `{package}`\n{}",
+            project.read_file("lpm.lock")
+        )
+    })
+}
+
+fn catalog_snapshot_entry_optional(
+    project: &TempProject,
+    catalog: &str,
+    package: &str,
+) -> Option<lpm_lockfile::CatalogSnapshotEntry> {
     let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
         .expect("lpm.lock parses");
     lockfile
         .catalogs
         .get(catalog)
         .and_then(|entries| entries.get(package))
-        .unwrap_or_else(|| {
-            panic!(
-                "expected lockfile catalog snapshot `{catalog}` entry for `{package}`\n{}",
-                project.read_file("lpm.lock")
-            )
-        })
-        .clone()
+        .cloned()
 }
 
 fn catalog_snapshot_entry_at(

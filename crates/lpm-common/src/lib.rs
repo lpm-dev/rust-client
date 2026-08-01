@@ -18,6 +18,7 @@ pub mod platform;
 pub mod provenance;
 pub mod symlink;
 pub mod terminal;
+mod utf8_bom;
 
 #[cfg(unix)]
 pub use atomic_write::replace_symlink_atomic;
@@ -46,6 +47,7 @@ pub use symlink::{
     create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,
 };
 pub use terminal::{sanitize_for_terminal, sanitize_terminal_inline, sanitize_terminal_multiline};
+pub use utf8_bom::{strip_utf8_bom_bytes, strip_utf8_bom_str};
 
 /// The LPM scope prefix. All LPM packages live under this scope.
 pub const LPM_SCOPE: &str = "@lpm.dev";

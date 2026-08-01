@@ -44,13 +44,15 @@ pub use overrides::{
     OverrideSource, OverrideTarget, override_selector_target_name,
 };
 pub use package::{CanonicalKey, ResolverPackage};
-pub use policy::{ReleaseTimeStatus, ResolverPolicy, TrustEvidence, TrustPolicyMode};
+pub use policy::{
+    ReleaseAgeExclusion, ReleaseTimeStatus, ResolverPolicy, TrustEvidence, TrustPolicyMode,
+};
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta, is_platform_compatible};
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{
     CompiledPeerRules, PeerWarning, ResolveError, ResolveResult, ResolvedPackage, RootDependencies,
-    SelectedPackageEvent, StageTiming, check_unmet_peers, resolve_dependencies,
+    RootResolution, SelectedPackageEvent, StageTiming, check_unmet_peers, resolve_dependencies,
     resolve_dependencies_routed, resolve_dependencies_with_overrides, resolve_with_shared_cache,
     resolve_with_shared_cache_options, resolve_with_shared_cache_options_and_policy,
     resolve_with_shared_cache_options_and_policy_roots, validate_allowed_versions_range,

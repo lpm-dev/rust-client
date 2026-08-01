@@ -18,11 +18,6 @@ const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 /// stops a hostile / compromised mirror from OOM-ing the CLI on a
 /// path that never needed metadata-sized buffers.
 pub(super) const MAX_API_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-pub(super) const UTF8_BOM_BYTES: &[u8] = b"\xEF\xBB\xBF";
-
-pub(super) fn strip_json_bom_bytes(content: &[u8]) -> &[u8] {
-    content.strip_prefix(UTF8_BOM_BYTES).unwrap_or(content)
-}
 
 /// Drain a response body with a two-stage size cap.
 ///
@@ -136,7 +131,7 @@ fn parse_metadata_buffer<T: serde::de::DeserializeOwned>(
     buf: &[u8],
     context: &str,
 ) -> Result<T, LpmError> {
-    serde_json::from_slice(strip_json_bom_bytes(buf))
+    serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(buf))
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
 }
 
@@ -150,7 +145,7 @@ pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
     context: &str,
 ) -> Result<T, LpmError> {
     let buf = read_capped_body(response, MAX_API_RESPONSE_BYTES, context).await?;
-    serde_json::from_slice(strip_json_bom_bytes(&buf))
+    serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&buf))
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
 }
 
@@ -163,7 +158,7 @@ pub(super) async fn parse_capped_api_json_with_timing<T: serde::de::DeserializeO
     let body_read_ms = elapsed_millis(body_start);
 
     let parse_start = std::time::Instant::now();
-    let parsed = serde_json::from_slice(strip_json_bom_bytes(&buf))
+    let parsed = serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&buf))
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))?;
     let json_parse_ms = elapsed_millis(parse_start);
 

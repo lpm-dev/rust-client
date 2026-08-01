@@ -334,7 +334,8 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     // `applied_overrides` ordering on `--json` output.
     let applied_overrides = state.overrides.take_hits();
     let work_stats = state.work_stats;
-    let packages = state.into_resolved_packages(&cache);
+    let root_resolutions = state.root_resolutions();
+    let packages = state.into_resolved_packages(&cache, &root_aliases);
     let (
         selected_package_count,
         selected_unique_canonical_count,
@@ -351,6 +352,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
         // Root aliases: populated during seed_root_edges when a root dep
         // declares `npm:target@range`. Empty when no root dep uses alias syntax.
         root_aliases,
+        root_resolutions,
         ambient_peer_installs,
         peer_conflicts,
         stage_timing: StageTiming {

@@ -3304,8 +3304,8 @@ mod tests {
             "line 8 must reserve Node runtime fingerprint metadata"
         );
         assert_eq!(
-            lines[8], "b:required",
-            "line 9 must record the binary lockfile expectation"
+            lines[8], "b:not-required",
+            "line 9 must record that importer state is TOML-only"
         );
 
         // Round-trip: needs_install reads the complete shape as up-to-date.

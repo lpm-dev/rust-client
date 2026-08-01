@@ -1633,6 +1633,22 @@ fn isolated_linker_skips_dependency_local_name_with_traversal() {
 
 #[cfg(unix)]
 #[test]
+fn workspace_member_link_allows_a_missing_publish_directory_target() {
+    let root = tempfile::tempdir().unwrap();
+    let node_modules = root.path().join("project/node_modules");
+    let publish_directory = root.path().join("packages/library/build");
+    std::fs::create_dir_all(&node_modules).unwrap();
+    std::fs::create_dir_all(publish_directory.parent().unwrap()).unwrap();
+
+    link_workspace_member(&node_modules, "@fixture/library", &publish_directory).unwrap();
+
+    let link = node_modules.join("@fixture/library");
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(std::fs::metadata(link).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn workspace_member_link_rejects_symlinked_node_modules_root() {
     let root = tempfile::tempdir().unwrap();
     let project_dir = root.path().join("project");

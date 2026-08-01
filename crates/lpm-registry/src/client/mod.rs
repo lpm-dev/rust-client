@@ -64,7 +64,7 @@ use self::state::{CacheContent, CacheValidator, CachedClient};
 use self::url_gate::validate_pem_root;
 
 #[cfg(test)]
-use self::body::{MAX_API_RESPONSE_BYTES, UTF8_BOM_BYTES};
+use self::body::MAX_API_RESPONSE_BYTES;
 #[cfg(test)]
 use self::cache::{METADATA_CACHE_FILE_CAP, METADATA_CACHE_MAGIC};
 #[cfg(test)]

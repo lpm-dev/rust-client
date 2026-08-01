@@ -109,10 +109,10 @@ pub(super) fn enqueue_child_deps(
         }
     }
 
-    // Capture every `peerDependencies` entry on this (canonical, version)
-    // as a `PeerRequirement`. Peers are NOT pushed onto `state.task_queue`
-    // because they must NOT become `n.children` edges — see the
-    // [`PeerRequirement`] doc + the v2 graph-key rationale on
+    // Capture `peerDependencies` entries that are not shadowed by a regular
+    // dependency on the same local name. Peers are NOT pushed onto
+    // `state.task_queue` because they must NOT become `n.children` edges —
+    // see the [`PeerRequirement`] doc + the v2 graph-key rationale on
     // `state.peer_requirements`.
     //
     // Same alias / workspace / range-parse defenses as the regular-deps
@@ -125,6 +125,14 @@ pub(super) fn enqueue_child_deps(
         peer_entries.sort_by_key(|(name, _)| *name);
 
         for (peer_name, peer_range_str) in peer_entries {
+            if info
+                .deps
+                .get(&ver_str)
+                .is_some_and(|deps| deps.contains_key(peer_name))
+            {
+                continue;
+            }
+
             // `workspace:` peers from a registry-published package
             // shouldn't exist (npm rejects them at publish time).
             // Skip with a specific log rather than letting

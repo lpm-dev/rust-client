@@ -4,7 +4,8 @@ use std::path::Path;
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_text_file_capped};
 
 use crate::error::WorkspaceError;
-use crate::package_json::{PackageJson, strip_json_bom_str};
+use crate::package_json::PackageJson;
+use lpm_common::strip_utf8_bom_str;
 
 pub type CatalogReferences = BTreeMap<String, BTreeSet<String>>;
 
@@ -85,7 +86,7 @@ pub fn prune_unused_package_json_catalogs(
     let content = read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES)
         .map_err(|error| WorkspaceError::Io(error.to_string()))?;
     let mut doc: serde_json::Value =
-        serde_json::from_str(strip_json_bom_str(&content)).map_err(|e| {
+        serde_json::from_str(strip_utf8_bom_str(&content)).map_err(|e| {
             WorkspaceError::Parse(format!(
                 "failed to parse package manifest {}: {e}",
                 path.display()

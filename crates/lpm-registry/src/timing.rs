@@ -56,6 +56,7 @@ pub enum MetadataPurpose {
     Resolve,
     BlockedSet,
     SignatureHydration,
+    PlatformHydration,
     ProvenanceDrift,
     TarballUrlLookup,
 }
@@ -66,16 +67,18 @@ impl MetadataPurpose {
             Self::Resolve => "resolve",
             Self::BlockedSet => "blocked_set",
             Self::SignatureHydration => "signature_hydration",
+            Self::PlatformHydration => "platform_hydration",
             Self::ProvenanceDrift => "provenance_drift",
             Self::TarballUrlLookup => "tarball_url_lookup",
         }
     }
 }
 
-const METADATA_PURPOSES: [MetadataPurpose; 5] = [
+const METADATA_PURPOSES: [MetadataPurpose; 6] = [
     MetadataPurpose::Resolve,
     MetadataPurpose::BlockedSet,
     MetadataPurpose::SignatureHydration,
+    MetadataPurpose::PlatformHydration,
     MetadataPurpose::ProvenanceDrift,
     MetadataPurpose::TarballUrlLookup,
 ];
@@ -92,6 +95,7 @@ struct PurposeCounters {
 static RESOLVE_COUNTERS: PurposeCounters = PurposeCounters::new();
 static BLOCKED_SET_COUNTERS: PurposeCounters = PurposeCounters::new();
 static SIGNATURE_HYDRATION_COUNTERS: PurposeCounters = PurposeCounters::new();
+static PLATFORM_HYDRATION_COUNTERS: PurposeCounters = PurposeCounters::new();
 static PROVENANCE_DRIFT_COUNTERS: PurposeCounters = PurposeCounters::new();
 static TARBALL_URL_LOOKUP_COUNTERS: PurposeCounters = PurposeCounters::new();
 
@@ -120,6 +124,7 @@ fn purpose_counters(purpose: MetadataPurpose) -> &'static PurposeCounters {
         MetadataPurpose::Resolve => &RESOLVE_COUNTERS,
         MetadataPurpose::BlockedSet => &BLOCKED_SET_COUNTERS,
         MetadataPurpose::SignatureHydration => &SIGNATURE_HYDRATION_COUNTERS,
+        MetadataPurpose::PlatformHydration => &PLATFORM_HYDRATION_COUNTERS,
         MetadataPurpose::ProvenanceDrift => &PROVENANCE_DRIFT_COUNTERS,
         MetadataPurpose::TarballUrlLookup => &TARBALL_URL_LOOKUP_COUNTERS,
     }

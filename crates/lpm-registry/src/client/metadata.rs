@@ -1883,6 +1883,73 @@ impl RegistryClient {
         }
     }
 
+    pub async fn get_npm_platform_metadata_routed_full(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::NpmDirect => Ok(self
+                .get_npm_platform_metadata_direct_full_with_timings(name)
+                .await?
+                .metadata),
+            crate::UpstreamRoute::LpmWorker => self.get_npm_package_release_times_full(name).await,
+            crate::UpstreamRoute::Custom { target, auth } => {
+                let compact = self
+                    .get_npm_release_times_from_full(&target.base_url, name, auth.as_ref())
+                    .await?;
+                if compact.versions.is_some() {
+                    return Ok(compact);
+                }
+                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_ref())
+                    .await
+                    .map(ReleaseTimeMetadata::from_full_package_metadata)
+            }
+        }
+    }
+
+    pub async fn get_npm_platform_metadata_routed_full_with_timings(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<TimedReleaseTimeMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::NpmDirect => {
+                self.get_npm_platform_metadata_direct_full_with_timings(name)
+                    .await
+            }
+            route => {
+                let metadata = self
+                    .get_npm_platform_metadata_routed_full(name, route)
+                    .await?;
+                Ok(TimedReleaseTimeMetadata {
+                    metadata,
+                    timings: PackageMetadataFetchTimings::default(),
+                })
+            }
+        }
+    }
+
+    async fn get_npm_platform_metadata_direct_full_with_timings(
+        &self,
+        name: &str,
+    ) -> Result<TimedReleaseTimeMetadata, LpmError> {
+        let cached = self
+            .get_npm_release_times_direct_full_inner_with_timings(name, true)
+            .await?;
+        if cached.metadata.versions.is_some() {
+            return Ok(cached);
+        }
+        let mut fetched = self
+            .get_npm_release_times_direct_full_inner_with_timings(name, false)
+            .await?;
+        fetched.timings.cache_read_ms = fetched
+            .timings
+            .cache_read_ms
+            .saturating_add(cached.timings.cache_read_ms);
+        Ok(fetched)
+    }
+
     async fn get_npm_package_release_times_full(
         &self,
         name: &str,

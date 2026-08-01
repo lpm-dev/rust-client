@@ -6,17 +6,8 @@ use crate::error::WorkspaceError;
 use crate::trust::TrustedDependencies;
 use lpm_common::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_file_capped, read_text_file_capped,
+    strip_utf8_bom_bytes, strip_utf8_bom_str,
 };
-
-const UTF8_BOM_BYTES: &[u8] = b"\xEF\xBB\xBF";
-
-pub(crate) fn strip_json_bom_str(content: &str) -> &str {
-    content.strip_prefix('\u{feff}').unwrap_or(content)
-}
-
-pub(crate) fn strip_json_bom_bytes(content: &[u8]) -> &[u8] {
-    content.strip_prefix(UTF8_BOM_BYTES).unwrap_or(content)
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct PackageJson {
@@ -80,6 +71,10 @@ pub struct PackageJson {
     pub resolutions: HashMap<String, String>,
 
     pub workspaces: Option<WorkspacesConfig>,
+
+    /// Publish-time package projection. Workspace consumers link to
+    /// `directory` when it is declared, matching pnpm's local-package view.
+    pub publish_config: PublishConfig,
 
     /// LPM-specific config section (decided: config goes in package.json "lpm" key).
     pub lpm: Option<LpmConfig>,
@@ -145,6 +140,7 @@ fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, Str
         overrides: lossy_string_map_from_value(obj.get("overrides")),
         resolutions: lossy_string_map_from_value(obj.get("resolutions")),
         workspaces: optional_typed_field(obj, "workspaces")?,
+        publish_config: publish_config_from_value(obj.get("publishConfig")),
         lpm: optional_typed_field(obj, "lpm")?,
         engines: lossy_string_map_from_value(obj.get("engines")),
         scripts: lossy_string_map_from_value(obj.get("scripts")),
@@ -236,6 +232,23 @@ fn bin_config_from_value(value: &serde_json::Value) -> Option<BinConfig> {
     value
         .as_object()
         .map(|_| BinConfig::Map(lossy_string_map_from_value(Some(value))))
+}
+
+fn publish_config_from_value(value: Option<&serde_json::Value>) -> PublishConfig {
+    PublishConfig {
+        directory: value
+            .and_then(serde_json::Value::as_object)
+            .and_then(|config| config.get("directory"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+/// The package directory exposed to registry consumers and local workspace links.
+#[derive(Debug, Clone, Default)]
+pub struct PublishConfig {
+    /// Path relative to the package root that contains the publishable package tree.
+    pub directory: Option<String>,
 }
 
 /// Per-peer metadata from `peerDependenciesMeta`.
@@ -335,7 +348,10 @@ pub enum WorkspacesConfig {
     /// Simple array of glob patterns: `["packages/*", "apps/*"]`
     Globs(Vec<String>),
     /// Object form: `{ "packages": ["packages/*"] }`
-    Object { packages: Vec<String> },
+    Object {
+        #[serde(default)]
+        packages: Vec<String>,
+    },
 }
 
 /// LPM-specific config in package.json `"lpm"` key.
@@ -632,7 +648,7 @@ pub fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
     let content =
         read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES).map_err(map_manifest_read_error)?;
 
-    serde_json::from_str(strip_json_bom_str(&content))
+    serde_json::from_str(strip_utf8_bom_str(&content))
         .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
 }
 
@@ -665,7 +681,7 @@ fn map_manifest_read_error(error: BoundedReadError) -> WorkspaceError {
 /// deps — the common case for the majority of packages in any install set.
 /// See `ensure_peer_context` in `lpm-linker` for the canonical call site.
 pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, WorkspaceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(strip_json_bom_bytes(content))
+    let parsed: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(content))
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
     let Some(obj) = parsed.as_object() else {
         return Ok((HashMap::new(), HashMap::new()));
@@ -685,7 +701,7 @@ pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, Workspa
 ///
 /// See `create_bin_links_v2` in `lpm-linker` for the canonical call site.
 pub fn parse_bin_field(content: &[u8]) -> Result<Option<BinConfig>, WorkspaceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(strip_json_bom_bytes(content))
+    let parsed: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(content))
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
     Ok(parsed.get("bin").and_then(bin_config_from_value))
 }
@@ -710,6 +726,19 @@ mod tests {
         let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
 
         assert_eq!(pkg.name.as_deref(), Some("bom-prefixed"));
+    }
+
+    #[test]
+    fn read_package_json_captures_publish_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"published-projection","publishConfig":{"directory":"build"}}"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+
+        assert_eq!(pkg.publish_config.directory.as_deref(), Some("build"));
     }
 
     /// Regression test for the rollup plugins fixture. rollup's

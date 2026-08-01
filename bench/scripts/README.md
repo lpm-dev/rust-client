@@ -1,5 +1,67 @@
 # Install benchmark scripts
 
+## Ecosystem correction verification
+
+`run-ecosystem-correction.mjs` checks importer-scoped lock graphs and LPM's
+direct installed layout across pinned popular pnpm workspaces. It compares exact
+package identities, dependency edges, resolved peer contexts, sources,
+integrities, platform constraints, optional reachability, and workspace links.
+It also runs LPM frozen, up-to-date, and offline-rebuild replay gates. Generated
+JSON contains every discrepancy; Markdown limits the table to the first 100.
+
+The graph-parity cell uses a strict one-day minimum release age for both managers,
+including transitive packages.
+Before making either temporary manager copy, the harness removes install-time
+lifecycle phases from valid workspace `package.json` files and records every
+removed phase in the project result. This prevents package-manager guards and
+build hooks from changing a graph-only run. pnpm receives
+`minimumReleaseAge=1440`; LPM keeps its production 24-hour duration and receives
+`release-age-policy = "strict"` through its isolated benchmark config.
+Repository-specific exclusion syntax is reported rather than bypassing LPM's
+cooldown-approval gate.
+Known pnpm compatibility-database mutations are accepted only when the pinned
+project record names the exact selector, injected fields, database package
+version, and source commit. They remain visible as compatibility advisories;
+all other dependency-edge differences remain correction errors. Generated
+reference and initial LPM lockfiles are retained with the report. Unless
+`--keep-workspaces` is set, materialized layouts and project copies are removed
+as soon as their evidence has been normalized so large workspaces do not make a
+multi-project run consume unbounded temporary disk space.
+
+```bash
+cargo build --release --locked -p lpm-cli --bin lpm-rs
+cargo build --release --locked -p lpm-ecosystem-verifier \
+  --bin lpm-ecosystem-verifier
+node bench/scripts/run-ecosystem-correction.mjs --self-test
+node bench/scripts/run-ecosystem-correction.mjs \
+  --projects vite,vue,n8n \
+  --determinism-runs 1
+```
+
+Use `--determinism-runs 3` for the full fresh-state
+auto/concurrency-1/concurrency-3 lockfile-byte gate after the initial pilot has
+no blocking parser or install failure. Every run count also includes a separate
+fresh-project solve over the initial run's warm metadata cache, reported apart
+from scheduling parity. Pass `--materialize-reference` to build pnpm's
+`node_modules` and run the same direct-layout gate on the reference side; by
+default pnpm performs a fresh lockfile-only solve to avoid duplicating a large
+reference layout. If a pinned project has version-specific patches that are
+expected to become inactive during that fresh solve, its project record pins
+the exact allowed set. The harness enables pnpm's unused-patch allowance only
+for that project, verifies the reported set exactly, and records it in the
+result; every unlisted unused patch remains a hard failure. LPM's unsupported
+pnpm patch entries stay visible in compatibility output, and no LPM patch or
+security policy is relaxed. If an install reaches a direct Git dependency that
+LPM does not support, the harness records the package and specifier as an
+explicit non-passing `capability_gap`; it does not report that pre-resolution
+stop as a graph discrepancy or rewrite the dependency to bypass the product
+boundary. A reference fresh solve stopped by pnpm's trust-downgrade policy is
+similarly recorded as a non-passing `policy_block`, with the exact package and
+version. The harness does not weaken either manager's security policy to force
+a graph comparison.
+Artifacts default to a unique directory under `/tmp`; no benchmark
+numbers are written to README or rust-client-docs.
+
 ## Recursive workspace install
 
 `recursive-workspace-install-benchmark.mjs` compares one up-to-date root

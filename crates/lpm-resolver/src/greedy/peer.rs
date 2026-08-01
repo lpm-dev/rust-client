@@ -1,6 +1,8 @@
+use super::policy::apply_peer_override_target_greedy;
 use super::prelude::*;
 use super::state::ResolveState;
 use super::types::{DepBehavior, Edge, PeerConflictReport, PeerRequirement};
+use super::version::{VersionPick, find_best_version_with_policy};
 
 // ── Eager peer auto-install drain ─────────────────────────────────
 //
@@ -9,18 +11,17 @@ use super::types::{DepBehavior, Edge, PeerConflictReport, PeerRequirement};
 //     onto `state.peer_requirements`, NEVER as `task_queue` edges.
 //   - After the main task_queue drains, a peer-drain pass runs:
 //     1. Group requirements by `canonical`.
-//     2. For each group, check if any node in `state.resolved` for
-//        that canonical satisfies EVERY consumer's range. Yes → skip
-//        (the existing `into_resolved_packages` peer derivation will
-//        record the consumer→peer edge from cache).
-//     3. If unsatisfied AND `auto_install_peers` is on AND at least
+//     2. Bind each consumer to the newest matching version already
+//        present in `state.resolved`.
+//     3. If requirements remain AND `auto_install_peers` is on AND at least
 //        one consumer is non-optional, look up the canonical's
 //        manifest (arm-specific fetch closure), find the newest
 //        version satisfying every consumer's range, and synthesize a
 //        ROOT-SCOPED ambient `Edge` pinning that exact version.
-//     4. If no version satisfies every required consumer's range →
-//        `ResolveError::PeerConflict` (the user must fix the manifest
-//        or pin via `lpm.overrides`).
+//     4. If no version satisfies every remaining required range, pick
+//        the version satisfying the most consumers and report the rest.
+//        Hard-fail only when no published version satisfies any required
+//        consumer.
 //   - Caller pushes synthesized edges to `task_queue`, re-drains the
 //     main loop, and re-runs the drain pass. Repeat until both
 //     queues are empty (transitive peers from ambient installs may
@@ -66,11 +67,6 @@ impl CachedPeerResolution {
 /// Classification outcome for a single peer-canonical group during
 /// the drain pass.
 enum PeerDrainOutcome {
-    /// Some node already in `state.resolved` for this canonical
-    /// satisfies every requirement in the group. No work to do —
-    /// `into_resolved_packages` will record the per-consumer peer
-    /// edges from the metadata cache.
-    SatisfiedByExisting,
     /// All consumers in the group declared the peer as optional, OR
     /// `auto_install_peers` is off. Skip without synthesis;
     /// `check_unmet_peers` handles user-visible output.
@@ -201,22 +197,92 @@ fn find_version_satisfying_most<'a>(
     best.map(|(v, _, misses)| (v, misses))
 }
 
-/// True iff at least one node currently in `state.resolved[canonical]`
-/// is at a version that satisfies EVERY requirement in the group. The
-/// existing `into_resolved_packages` peer-derivation pass picks up the
-/// resolved version from `resolved_by_canonical`, so a satisfied group
-/// needs no further work.
-fn group_satisfied_by_existing(
+fn newest_existing_version_for_requirement(
     state: &ResolveState,
     canonical: &CanonicalKey,
-    reqs: &[&PeerRequirement],
-) -> bool {
-    let Some(nodes) = state.resolved.get(canonical) else {
-        return false;
-    };
+    requirement: &PeerRequirement,
+) -> Option<NpmVersion> {
+    let nodes = state.resolved.get(canonical)?;
     nodes
         .iter()
-        .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+        .filter(|(version, _)| requirement.range.satisfies(version))
+        .map(|(version, _)| version)
+        .max()
+        .cloned()
+}
+
+async fn apply_peer_overrides<F, Fut>(
+    state: &mut ResolveState,
+    canonical: &CanonicalKey,
+    requirements: &mut [PeerRequirement],
+    fetch_manifest: &mut F,
+) -> Result<(), ResolveError>
+where
+    F: FnMut(CanonicalKey) -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>,
+{
+    if state.overrides.is_empty() {
+        return Ok(());
+    }
+
+    let info = fetch_manifest(canonical.clone()).await?;
+    let canonical_name = canonical.to_string();
+    for requirement in requirements {
+        let VersionPick::Picked(natural) =
+            find_best_version_with_policy(canonical, &info, &requirement.range, &state.policy)
+        else {
+            continue;
+        };
+        let parent = state
+            .nodes
+            .get(requirement.consumer as usize)
+            .map(|node| node.canonical.to_string());
+        let Some(entry) = state
+            .overrides
+            .find_match(&canonical_name, &natural, parent.as_deref())
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(forced) =
+            apply_peer_override_target_greedy(canonical, &info, &entry.target, &state.policy)
+        else {
+            tracing::warn!(
+                "override {} could not select an eligible peer version for {}",
+                entry.raw_key,
+                canonical_name
+            );
+            continue;
+        };
+        requirement.range = NpmRange::parse(&forced.to_string()).map_err(|error| {
+            ResolveError::Internal(format!(
+                "override produced invalid peer version range '{forced}' for {canonical_name}: {error}"
+            ))
+        })?;
+        state.overrides.record_hit(OverrideHit {
+            raw_key: entry.raw_key,
+            source: entry.source,
+            package: canonical_name.clone(),
+            from_version: natural.to_string(),
+            to_version: forced.to_string(),
+            via_parent: parent,
+        });
+    }
+    Ok(())
+}
+
+fn record_peer_bindings(
+    state: &mut ResolveState,
+    requirements: &[&PeerRequirement],
+    chosen: &NpmVersion,
+) {
+    for requirement in requirements {
+        state
+            .peer_bindings
+            .entry(requirement.consumer)
+            .or_default()
+            .insert(requirement.peer_name.clone(), chosen.clone());
+    }
 }
 
 pub(super) fn peer_resolution_cache_key(
@@ -298,8 +364,8 @@ fn peer_conflict_consumer_entry(state: &ResolveState, req: &PeerRequirement) -> 
 ///   - at least one consumer in the group is non-optional
 ///     (optional-only groups never auto-install, so prefetching
 ///     would be wasted bandwidth);
-///   - no node in `state.resolved` for the canonical satisfies any
-///     consumer's range (i.e., not already met by an ancestor);
+///   - at least one required consumer has no matching version in
+///     `state.resolved`;
 ///   - the canonical is not in `cached_canonicals` (manifest already
 ///     in the shared cache — the eventual drain pass will hit the
 ///     fast path);
@@ -341,12 +407,9 @@ pub(super) fn pick_peer_prefetch_candidates(
         if reqs.iter().all(|r| r.optional) {
             continue;
         }
-        // Already satisfied by an existing node in the resolved tree.
-        if let Some(nodes) = state.resolved.get(canonical)
-            && nodes
-                .iter()
-                .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
-        {
+        if reqs.iter().filter(|req| !req.optional).all(|requirement| {
+            newest_existing_version_for_requirement(state, canonical, requirement).is_some()
+        }) {
             continue;
         }
         // Manifest already in cache — drain pass will hit the fast
@@ -406,8 +469,21 @@ where
 
     let mut synthesized: Vec<Edge> = Vec::new();
     for canonical in canonicals {
-        let reqs_owned = grouped.remove(&canonical).expect("just collected key");
-        let reqs: Vec<&PeerRequirement> = reqs_owned.iter().collect();
+        let mut reqs_owned = grouped.remove(&canonical).expect("just collected key");
+        apply_peer_overrides(state, &canonical, &mut reqs_owned, &mut fetch_manifest).await?;
+        let mut reqs = Vec::with_capacity(reqs_owned.len());
+        for requirement in &reqs_owned {
+            if let Some(chosen) =
+                newest_existing_version_for_requirement(state, &canonical, requirement)
+            {
+                record_peer_bindings(state, &[requirement], &chosen);
+            } else {
+                reqs.push(requirement);
+            }
+        }
+        if reqs.is_empty() {
+            continue;
+        }
 
         let outcome = classify_peer_group(
             state,
@@ -419,9 +495,9 @@ where
         .await?;
 
         match outcome {
-            PeerDrainOutcome::SatisfiedByExisting => continue,
             PeerDrainOutcome::SkippedOptOut => continue,
             PeerDrainOutcome::Synthesize { chosen } => {
+                record_peer_bindings(state, &reqs, &chosen);
                 synthesize_ambient_edge(
                     state,
                     &canonical,
@@ -434,6 +510,7 @@ where
                 chosen,
                 unsatisfied,
             } => {
+                record_peer_bindings(state, &reqs, &chosen);
                 synthesize_ambient_edge(
                     state,
                     &canonical,
@@ -526,12 +603,7 @@ where
     F: FnMut(CanonicalKey) -> Fut,
     Fut: std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>,
 {
-    // Step 1 — already satisfied?
-    if group_satisfied_by_existing(state, canonical, reqs) {
-        return Ok(PeerDrainOutcome::SatisfiedByExisting);
-    }
-
-    // Step 2 — opt-out gates. If every requirement is optional, the
+    // Opt-out gates. If every requirement is optional, the
     // manifest author asked us not to fail; same skip path as
     // `auto_install_peers = false`.
     let any_required = reqs.iter().any(|r| !r.optional);
@@ -544,7 +616,7 @@ where
         return Ok(cached.value().to_outcome(state, reqs));
     }
 
-    // Step 3 — synthesis path. Fetch the manifest, find the version
+    // Synthesis path. Fetch the manifest, find the version
     // satisfying every consumer's range. Raising `PeerConflict` when no
     // version threads every range breaks real-world installs whose
     // TRANSITIVE tree declares incompatible peer ranges (e.g. nestjs's

@@ -1227,7 +1227,7 @@ mod tests {
             vec!["react".to_string(), "@scope/pkg".to_string()]
         );
 
-        let err = build_install_global_overrides_with_excludes(
+        let o = build_install_global_overrides_with_excludes(
             false,
             false,
             None,
@@ -1240,11 +1240,8 @@ mod tests {
             vec![],
             false,
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("exact package names"),
-            "glob exclude must surface a parser error: {err}"
-        );
+        .unwrap();
+        assert_eq!(o.min_release_age_exclude, vec!["@scope/*".to_string()]);
     }
 
     #[test]

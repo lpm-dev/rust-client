@@ -22,9 +22,26 @@ pub(super) struct WorkspaceMemberLink {
     /// Concrete version from the member's own package.json `version` field.
     /// Used only for diagnostics — there is no resolver constraint to satisfy.
     pub(super) version: String,
-    /// Absolute path to the member's source directory (the parent of its
-    /// `package.json`). The post-link symlink target.
+    /// Absolute path to the workspace package directory containing its
+    /// `package.json`. Resolution reads dependency and engine metadata here.
+    pub(super) package_dir: PathBuf,
+    /// Absolute post-link target. This may be a not-yet-created
+    /// `publishConfig.directory` below `package_dir`.
     pub(super) source_dir: PathBuf,
+}
+
+impl WorkspaceMemberLink {
+    pub(super) fn resolution_dir(&self) -> &Path {
+        if self.source_dir.join("package.json").is_file() {
+            &self.source_dir
+        } else {
+            &self.package_dir
+        }
+    }
+
+    pub(super) fn needs_publish_projection_link(&self) -> bool {
+        self.source_dir != self.package_dir && self.resolution_dir() == self.package_dir
+    }
 }
 
 pub(super) struct WorkspaceInstallContext {
@@ -67,7 +84,7 @@ pub(super) fn prepare_workspace_install_context(
         (Vec::new(), catalog_resolutions)
     };
 
-    let all_workspace_members = all_workspace_members(workspace.as_deref());
+    let all_workspace_members = all_workspace_members(workspace.as_deref())?;
 
     pre_extract_file_link_workspace_members(
         deps,
@@ -110,22 +127,25 @@ fn resolve_install_catalogs(
     Ok(resolved)
 }
 
-fn all_workspace_members(workspace: Option<&lpm_workspace::Workspace>) -> Vec<WorkspaceMemberLink> {
-    workspace
-        .map(|ws| {
-            linkable_workspace_packages(ws)
-                .filter_map(|(package, source_dir)| {
-                    let name = package.name.as_deref()?.to_string();
-                    let version = package.version.as_deref().unwrap_or("0.0.0").to_string();
-                    Some(WorkspaceMemberLink {
-                        name,
-                        version,
-                        source_dir: source_dir.to_path_buf(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn all_workspace_members(
+    workspace: Option<&lpm_workspace::Workspace>,
+) -> Result<Vec<WorkspaceMemberLink>, LpmError> {
+    let Some(workspace) = workspace else {
+        return Ok(Vec::new());
+    };
+    let mut links = Vec::with_capacity(workspace.members.len() + 1);
+    for (package, package_dir) in linkable_workspace_packages(workspace) {
+        let Some(name) = package.name.as_deref() else {
+            continue;
+        };
+        links.push(WorkspaceMemberLink {
+            name: name.to_string(),
+            version: package.version.as_deref().unwrap_or("0.0.0").to_string(),
+            package_dir: package_dir.to_path_buf(),
+            source_dir: workspace_package_link_source(package, package_dir)?,
+        });
+    }
+    Ok(links)
 }
 
 fn linkable_workspace_packages(
@@ -137,6 +157,71 @@ fn linkable_workspace_packages(
             .iter()
             .map(|member| (&member.package, member.path.as_path())),
     )
+}
+
+fn workspace_package_link_source(
+    package: &lpm_workspace::PackageJson,
+    package_dir: &Path,
+) -> Result<PathBuf, LpmError> {
+    let Some(raw_directory) = package.publish_config.directory.as_deref() else {
+        return Ok(package_dir.to_path_buf());
+    };
+    let relative = Path::new(raw_directory);
+    if raw_directory.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(LpmError::Workspace(format!(
+            "package {} has invalid publishConfig.directory `{raw_directory}`; expected a non-empty path inside the package directory",
+            package.name.as_deref().unwrap_or("<unnamed>"),
+        )));
+    }
+
+    let source_dir = package_dir.join(relative);
+    let package_root = package_dir.canonicalize().map_err(|error| {
+        LpmError::Workspace(format!(
+            "failed to resolve workspace package directory {}: {error}",
+            package_dir.display()
+        ))
+    })?;
+    let mut existing_ancestor = source_dir.as_path();
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
+            LpmError::Workspace(format!(
+                "failed to resolve publishConfig.directory {} inside {}",
+                source_dir.display(),
+                package_dir.display()
+            ))
+        })?;
+    }
+    let canonical_ancestor = existing_ancestor.canonicalize().map_err(|error| {
+        LpmError::Workspace(format!(
+            "failed to resolve publishConfig.directory ancestor {}: {error}",
+            existing_ancestor.display()
+        ))
+    })?;
+    if !canonical_ancestor.starts_with(&package_root) {
+        return Err(LpmError::Workspace(format!(
+            "package {} publishConfig.directory `{raw_directory}` resolves outside its package directory",
+            package.name.as_deref().unwrap_or("<unnamed>"),
+        )));
+    }
+    if source_dir.exists() {
+        return source_dir.canonicalize().map_err(|error| {
+            LpmError::Workspace(format!(
+                "failed to resolve publishConfig.directory {}: {error}",
+                source_dir.display()
+            ))
+        });
+    }
+    Ok(source_dir)
 }
 
 pub(super) fn is_declared_workspace_package_source(
@@ -153,7 +238,17 @@ pub(super) fn is_declared_workspace_package_source(
     linkable_workspace_packages(&workspace).any(|(package, path)| {
         package.name.as_deref() == Some(package_name)
             && package.version.as_deref().unwrap_or("0.0.0") == package_version
-            && path.canonicalize().is_ok_and(|path| path == source_dir)
+            && (path.canonicalize().is_ok_and(|path| path == source_dir)
+                || workspace_package_link_source(package, path)
+                    .and_then(|path| {
+                        path.canonicalize().map_err(|error| {
+                            LpmError::Workspace(format!(
+                                "failed to resolve workspace package source {}: {error}",
+                                path.display()
+                            ))
+                        })
+                    })
+                    .is_ok_and(|path| path == source_dir))
     })
 }
 
@@ -288,7 +383,7 @@ pub(super) fn extract_workspace_protocol_deps(
 
     let mut extracted = Vec::with_capacity(workspace_names.len());
     for (name, range) in &workspace_names {
-        let (package, source_dir) = linkable_workspace_packages(workspace)
+        let (package, package_dir) = linkable_workspace_packages(workspace)
             .find(|(package, _)| package.name.as_deref() == Some(name.as_str()))
             .ok_or_else(|| {
                 let mut available: Vec<&str> = linkable_workspace_packages(workspace)
@@ -307,11 +402,13 @@ pub(super) fn extract_workspace_protocol_deps(
             })?;
 
         let version = package.version.as_deref().unwrap_or("0.0.0").to_string();
+        let source_dir = workspace_package_link_source(package, package_dir)?;
 
         extracted.push(WorkspaceMemberLink {
             name: name.clone(),
             version,
-            source_dir: source_dir.to_path_buf(),
+            package_dir: package_dir.to_path_buf(),
+            source_dir,
         });
     }
 
@@ -323,8 +420,9 @@ pub(super) fn extract_workspace_protocol_deps(
     Ok(extracted)
 }
 
-pub(super) fn reject_workspace_self_dependency(
+pub(super) fn validate_workspace_self_dependencies(
     pkg: &lpm_workspace::PackageJson,
+    install_deps: &mut HashMap<String, String>,
 ) -> Result<(), LpmError> {
     let Some(package_name) = pkg.name.as_deref() else {
         return Ok(());
@@ -332,7 +430,6 @@ pub(super) fn reject_workspace_self_dependency(
 
     for (section, deps) in [
         ("dependencies", &pkg.dependencies),
-        ("devDependencies", &pkg.dev_dependencies),
         ("peerDependencies", &pkg.peer_dependencies),
         ("optionalDependencies", &pkg.optional_dependencies),
     ] {
@@ -346,161 +443,26 @@ pub(super) fn reject_workspace_self_dependency(
         }
     }
 
-    Ok(())
-}
-
-pub(super) fn workspace_member_cache_info(
-    member: &WorkspaceMemberLink,
-) -> Result<Option<lpm_resolver::CachedPackageInfo>, LpmError> {
-    let Some(version) = lpm_resolver::NpmVersion::parse(&member.version).ok() else {
-        return Ok(None);
-    };
-    let pkg_json_path = member.source_dir.join("package.json");
-    let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path) else {
-        return Ok(None);
-    };
-    let version_str = version.to_string();
-
-    let mut deps = HashMap::with_capacity(pkg.dependencies.len() + pkg.optional_dependencies.len());
-    let mut aliases = HashMap::new();
-    let mut optional_names = HashSet::with_capacity(pkg.optional_dependencies.len());
+    if !pkg.dependencies.contains_key(package_name)
+        && pkg
+            .dev_dependencies
+            .get(package_name)
+            .is_some_and(|spec| spec.starts_with("workspace:"))
     {
-        let mut insert_dep = |local_name: String, raw_spec: String| -> Result<(), LpmError> {
-            let effective_spec = lpm_resolver::normalize_jsr_dependency(&local_name, &raw_spec)
-                .map_err(|err| {
-                    LpmError::Workspace(format!(
-                        "workspace member `{}` dependency `{local_name}` has invalid spec \
-                         `{raw_spec}` in {}: {err}",
-                        member.name,
-                        pkg_json_path.display(),
-                    ))
-                })?
-                .unwrap_or(raw_spec);
-
-            match lpm_resolver::ranges::parse_npm_alias(&effective_spec) {
-                Some(alias) => {
-                    aliases.insert(local_name.clone(), alias.target);
-                    deps.insert(local_name, alias.range);
-                }
-                None => {
-                    deps.insert(local_name, effective_spec);
-                }
-            }
-            Ok(())
-        };
-        for (name, spec) in pkg.dependencies {
-            insert_dep(name, spec)?;
-        }
-        for (name, spec) in pkg.optional_dependencies {
-            optional_names.insert(name.clone());
-            insert_dep(name, spec)?;
-        }
+        install_deps.remove(package_name);
     }
 
-    let mut deps_by_version = HashMap::with_capacity(1);
-    deps_by_version.insert(version_str.clone(), deps);
-
-    let mut peer_deps = HashMap::new();
-    if !pkg.peer_dependencies.is_empty() {
-        peer_deps.insert(version_str.clone(), pkg.peer_dependencies);
-    }
-
-    let mut optional_dep_names = HashMap::new();
-    if !optional_names.is_empty() {
-        optional_dep_names.insert(version_str.clone(), optional_names);
-    }
-
-    let mut optional_peer_names = HashMap::new();
-    let optional_peers: HashSet<String> = pkg
-        .peer_dependencies_meta
-        .into_iter()
-        .filter_map(|(name, meta)| meta.optional.then_some(name))
-        .collect();
-    if !optional_peers.is_empty() {
-        optional_peer_names.insert(version_str.clone(), optional_peers);
-    }
-
-    let mut aliases_by_version = HashMap::new();
-    if !aliases.is_empty() {
-        aliases_by_version.insert(version_str.clone(), aliases);
-    }
-
-    let mut node_engines = HashMap::new();
-    if let Some(required) = pkg.engines.get("node") {
-        node_engines.insert(version_str.clone(), required.clone());
-    }
-
-    let mut dist = HashMap::with_capacity(1);
-    dist.insert(version_str, lpm_resolver::CachedDistInfo::default());
-
-    Ok(Some(lpm_resolver::CachedPackageInfo {
-        // Local workspace metadata is authoritative; avoid registry upgrade probes under policy checks.
-        modified: Some("1970-01-01T00:00:00.000Z".to_string()),
-        modified_unix: Some(0),
-        trust_metadata_complete: true,
-        versions_complete: true,
-        covered_ranges: std::collections::HashSet::new(),
-        latest_version: None,
-        versions: vec![version],
-        deps: deps_by_version,
-        peer_deps,
-        optional_dep_names,
-        optional_peer_names,
-        node_engines,
-        bundled_dep_names: HashMap::new(),
-        platform: HashMap::new(),
-        dist,
-        aliases: aliases_by_version,
-    }))
-}
-
-pub(super) fn seed_workspace_resolver_cache(
-    shared_cache: &lpm_resolver::SharedCache,
-    members: &[WorkspaceMemberLink],
-) -> Result<(), LpmError> {
-    for member in members {
-        let Some(info) = workspace_member_cache_info(member)? else {
-            continue;
-        };
-        let key = lpm_resolver::CanonicalKey::from_dep_name(&member.name);
-        shared_cache.insert(key, Arc::new(info));
-    }
     Ok(())
 }
 
 pub(super) fn workspace_member_source(project_dir: &Path, source_dir: &Path) -> String {
     let source_path =
         pathdiff::diff_paths(source_dir, project_dir).unwrap_or_else(|| source_dir.to_path_buf());
-    let source = source_path.to_string_lossy().replace('\\', "/");
+    let mut source = source_path.to_string_lossy().replace('\\', "/");
+    if source.is_empty() {
+        source.push('.');
+    }
     format!("directory+{source}")
-}
-
-pub(super) fn rewrite_workspace_resolved_sources(
-    packages: &mut [InstallPackage],
-    workspace_members: &[WorkspaceMemberLink],
-    project_dir: &Path,
-) {
-    if workspace_members.is_empty() {
-        return;
-    }
-    let members_by_name: HashMap<&str, &WorkspaceMemberLink> = workspace_members
-        .iter()
-        .map(|member| (member.name.as_str(), member))
-        .collect();
-
-    for package in packages {
-        let Some(member) = members_by_name.get(package.name.as_str()) else {
-            continue;
-        };
-        if package.version != member.version {
-            continue;
-        }
-        package.source = workspace_member_source(project_dir, &member.source_dir);
-        package.is_lpm = false;
-        package.integrity = None;
-        package.tarball_url = None;
-        package.metadata_checked_for_tarball = false;
-    }
 }
 
 pub(super) fn append_workspace_links_from_local_packages(
@@ -537,7 +499,8 @@ pub(super) fn append_workspace_links_from_local_packages(
         let Some(member) = all_workspace_members.iter().find(|member| {
             member.name == package.name
                 && member.version == package.version
-                && canonicalize_path(&member.source_dir) == canonical_source
+                && (canonicalize_path(&member.package_dir) == canonical_source
+                    || canonicalize_path(&member.source_dir) == canonical_source)
         }) else {
             continue;
         };
@@ -626,7 +589,7 @@ pub(super) fn pre_extract_file_link_workspace_members(
     // ≤100 syscalls regardless of the number of root deps.
     let canonical_members: Vec<(PathBuf, &WorkspaceMemberLink)> = all_workspace_members
         .iter()
-        .map(|m| (canonicalize_path(&m.source_dir), m))
+        .map(|m| (canonicalize_path(&m.package_dir), m))
         .collect();
 
     let mut to_remove: Vec<(String, WorkspaceMemberLink, String)> = Vec::new();
@@ -661,6 +624,7 @@ pub(super) fn pre_extract_file_link_workspace_members(
             WorkspaceMemberLink {
                 name: local_name.clone(),
                 version: matched.version.clone(),
+                package_dir: matched.package_dir.clone(),
                 source_dir: matched.source_dir.clone(),
             },
             raw.clone(),
@@ -755,12 +719,12 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
     // the dedupe shape in `pre_extract_file_link_workspace_members`.
     let mut visited: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
-        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .map(|m| (m.name.clone(), canonicalize_path(m.resolution_dir())))
         .collect();
     let mut queue: std::collections::VecDeque<WorkspaceMemberLink> =
         workspace_member_deps.iter().cloned().collect();
     while let Some(member) = queue.pop_front() {
-        let pkg_json_path = member.source_dir.join("package.json");
+        let pkg_json_path = member.resolution_dir().join("package.json");
         let content = match lpm_common::read_text_file_capped(
             &pkg_json_path,
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
@@ -814,7 +778,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
                         available_str,
                     )));
                 };
-                let canonical = canonicalize_path(&target_member.source_dir);
+                let canonical = canonicalize_path(target_member.resolution_dir());
                 let key = (local_name.clone(), canonical);
                 if !visited.insert(key) {
                     continue;
@@ -822,6 +786,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
                 let entry = WorkspaceMemberLink {
                     name: local_name.clone(),
                     version: target_member.version.clone(),
+                    package_dir: target_member.package_dir.clone(),
                     source_dir: target_member.source_dir.clone(),
                 };
                 workspace_member_deps.push(entry.clone());
@@ -838,12 +803,12 @@ pub(super) fn enforce_required_workspace_member_engines(
 ) -> Result<(), LpmError> {
     let mut checked_sources = HashSet::with_capacity(workspace_member_deps.len());
     for member in workspace_member_deps {
-        if !checked_sources.insert(member.source_dir.as_path()) {
+        if !checked_sources.insert(member.resolution_dir()) {
             continue;
         }
         let Some(required) = read_pkg_json_node_engine(
-            &member.source_dir,
-            &format!("workspace member at {}", member.source_dir.display()),
+            member.resolution_dir(),
+            &format!("workspace member at {}", member.resolution_dir().display()),
         )?
         else {
             continue;

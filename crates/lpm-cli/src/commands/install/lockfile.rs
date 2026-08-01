@@ -53,12 +53,15 @@ pub(super) struct LockfileSelectionInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
     pub(super) client: &'a RegistryClient,
     pub(super) gate_stats: &'a GateStats,
     pub(super) frozen_lockfile_active: bool,
     pub(super) force: bool,
     pub(super) overrides_changed: bool,
     pub(super) patches_changed: bool,
+    pub(super) workspace_root_provider_state_changed: bool,
+    pub(super) importer_snapshot_changed: bool,
     pub(super) is_add_invocation: bool,
     pub(super) auto_install_peers: bool,
     pub(super) json_output: bool,
@@ -72,6 +75,7 @@ pub(super) fn select_lockfile_install_plan(
             input.lockfile_path,
             input.deps,
             input.catalog_resolutions,
+            input.workspace,
             input.client,
             input.gate_stats,
             false,
@@ -99,7 +103,13 @@ pub(super) fn select_lockfile_install_plan(
         return Ok(Some(candidate));
     }
 
-    if input.force || input.overrides_changed || input.patches_changed || input.is_add_invocation {
+    if input.force
+        || input.overrides_changed
+        || input.patches_changed
+        || input.workspace_root_provider_state_changed
+        || input.importer_snapshot_changed
+        || input.is_add_invocation
+    {
         return Ok(None);
     }
 
@@ -107,6 +117,7 @@ pub(super) fn select_lockfile_install_plan(
         input.lockfile_path,
         input.deps,
         input.catalog_resolutions,
+        input.workspace,
         input.client,
         input.gate_stats,
         false,
@@ -231,6 +242,7 @@ fn fresh_resolved_lockfile(
     }
 
     lockfile.root_aliases = root_aliases_for_lockfile(&persisted_packages, input.deps);
+    lockfile.root_resolutions = root_resolutions_for_lockfile(&persisted_packages);
     lockfile.ambient_peer_installs = input.ambient_peer_installs_for_lockfile.to_vec();
     let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
         &input.catalog_resolutions[..input.dependency_catalog_resolution_count],
@@ -248,17 +260,22 @@ fn fresh_resolved_lockfile(
     Ok(lockfile)
 }
 
-fn locked_package_from_install_package(package: &InstallPackage) -> lpm_lockfile::LockedPackage {
+pub(super) fn locked_package_from_install_package(
+    package: &InstallPackage,
+) -> lpm_lockfile::LockedPackage {
     let dependencies = package
         .dependencies
         .iter()
         .map(|(dep_name, dep_version)| format!("{dep_name}@{dep_version}"))
         .collect();
-    let alias_dependencies = package
+    let mut alias_dependencies: Vec<_> = package
         .aliases
         .iter()
         .map(|(local, target)| [local.clone(), target.clone()])
         .collect();
+    alias_dependencies.sort_unstable_by(|left, right| {
+        left[0].cmp(&right[0]).then_with(|| left[1].cmp(&right[1]))
+    });
     let peers = package
         .peers
         .iter()
@@ -446,6 +463,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
 }
 
 pub(super) async fn run_empty_dependency_install_phase(
@@ -469,6 +487,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         object_integrity_policy,
         security_analysis_policy,
         dependency_engine_policy,
+        current_importer_snapshot,
     } = input;
 
     if cleanup_catalogs_in_pipeline {
@@ -541,7 +560,7 @@ pub(super) async fn run_empty_dependency_install_phase(
     {
         tracing::warn!("failed to delete stale overrides-state.json: {e}");
     }
-    materialize_empty_install_artifacts(project_dir)?;
+    materialize_empty_install_artifacts(project_dir, current_importer_snapshot)?;
     write_post_install_hash(
         project_dir,
         linker_mode,
@@ -627,6 +646,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) client: &'a RegistryClient,
     pub(super) project_dir: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
+    pub(super) lockfile_deps: &'a HashMap<String, String>,
     pub(super) pkg: &'a lpm_workspace::PackageJson,
     pub(super) lockfile_path: &'a Path,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
@@ -671,6 +691,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) emit_install_report: bool,
+    pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
 }
 
 pub(super) async fn run_offline_install_phase(
@@ -680,6 +701,7 @@ pub(super) async fn run_offline_install_phase(
         client,
         project_dir,
         deps,
+        lockfile_deps,
         pkg,
         lockfile_path,
         catalog_resolutions,
@@ -723,6 +745,7 @@ pub(super) async fn run_offline_install_phase(
         compatibility_bin_names,
         dependency_engine_policy,
         emit_install_report,
+        current_importer_snapshot,
     } = input;
 
     if overrides_changed {
@@ -768,8 +791,9 @@ pub(super) async fn run_offline_install_phase(
     // Offline replay cannot fresh-resolve, so it trusts lockfile-local source entries.
     let fast = try_lockfile_fast_path(
         lockfile_path,
-        deps,
+        lockfile_deps,
         catalog_resolutions,
+        None,
         client,
         gate_stats,
         true,
@@ -803,6 +827,26 @@ pub(super) async fn run_offline_install_phase(
             fast.lockfile.metadata.lockfile_version,
             lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
         )));
+    }
+    let current_root_providers = current_importer_snapshot
+        .workspace_root_peer_providers_fingerprint
+        .as_deref();
+    let locked_root_providers = fast.lockfile.importers.get(".").and_then(|importer| {
+        importer
+            .workspace_root_peer_providers_fingerprint
+            .as_deref()
+    });
+    if current_root_providers != locked_root_providers {
+        return Err(LpmError::Registry(
+            "--offline: workspace root peer-provider state differs from this importer's lockfile. Run `lpm install --recursive` online to reconcile the workspace, then retry --offline."
+                .to_string(),
+        ));
+    }
+    if fast.lockfile.importers.get(".") != Some(current_importer_snapshot) {
+        return Err(LpmError::Registry(
+            "--offline: package.json differs from this importer's lockfile. Run `lpm install` online to reconcile the manifest, then retry --offline."
+                .to_string(),
+        ));
     }
 
     let mut locked = fast.packages;
@@ -1128,6 +1172,7 @@ pub(super) fn resolved_catalog_version_from_install_packages(
     packages: &[InstallPackage],
 ) -> Option<String> {
     let requested_range = lpm_resolver::NpmRange::parse(&resolution.specifier).ok();
+    let mut direct_match: Option<&InstallPackage> = None;
     let mut first_match: Option<&InstallPackage> = None;
     let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &InstallPackage)> = None;
     let mut best_any: Option<(lpm_resolver::NpmVersion, &InstallPackage)> = None;
@@ -1136,6 +1181,13 @@ pub(super) fn resolved_catalog_version_from_install_packages(
         .iter()
         .filter(|package| package_matches_catalog_resolution(package, &resolution.package_name))
     {
+        if package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| name == &resolution.package_name))
+        {
+            direct_match = Some(package);
+        }
         if first_match.is_none() {
             first_match = Some(package);
         }
@@ -1161,8 +1213,9 @@ pub(super) fn resolved_catalog_version_from_install_packages(
         }
     }
 
-    best_satisfying
-        .map(|(_, package)| package.version.clone())
+    direct_match
+        .map(|package| package.version.clone())
+        .or_else(|| best_satisfying.map(|(_, package)| package.version.clone()))
         .or_else(|| best_any.map(|(_, package)| package.version.clone()))
         .or_else(|| first_match.map(|package| package.version.clone()))
 }
@@ -1178,44 +1231,59 @@ pub(super) fn package_matches_catalog_resolution(
             .is_some_and(|names| names.iter().any(|name| name == package_name))
 }
 
-pub(super) fn catalog_snapshot_entry_count(snapshots: &lpm_lockfile::CatalogSnapshots) -> usize {
-    snapshots.values().map(BTreeMap::len).sum()
-}
-
 pub(super) fn lockfile_catalog_snapshots_match_current(
     lockfile: &lpm_lockfile::Lockfile,
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
 ) -> bool {
-    if catalog_snapshot_entry_count(&lockfile.catalogs) != catalog_resolutions.len() {
-        return false;
+    let mut current_resolutions = HashMap::with_capacity(catalog_resolutions.len());
+    for resolution in catalog_resolutions {
+        let key = (
+            resolution.catalog_name.as_str(),
+            resolution.package_name.as_str(),
+        );
+        if current_resolutions.insert(key, resolution).is_some() {
+            return false;
+        }
+    }
+
+    for (catalog_name, entries) in &lockfile.catalogs {
+        for (package_name, entry) in entries {
+            let Some(resolution) = current_resolutions
+                .get(&(catalog_name.as_str(), package_name.as_str()))
+                .copied()
+            else {
+                return false;
+            };
+            if entry.specifier != resolution.specifier || entry.reference != resolution.reference {
+                return false;
+            }
+
+            let target = lockfile
+                .root_aliases
+                .get(package_name)
+                .map_or(package_name.as_str(), String::as_str);
+            let requested_spec = deps
+                .get(package_name)
+                .map_or(resolution.specifier.as_str(), String::as_str);
+            let Some(locked_package) =
+                select_locked_root_package(lockfile, package_name, target, requested_spec)
+            else {
+                return false;
+            };
+            if locked_package.version != entry.version {
+                return false;
+            }
+        }
     }
 
     for resolution in catalog_resolutions {
-        let Some(entry) = lockfile
-            .catalogs
-            .get(&resolution.catalog_name)
-            .and_then(|catalog| catalog.get(&resolution.package_name))
-        else {
-            return false;
-        };
-        if entry.specifier != resolution.specifier || entry.reference != resolution.reference {
-            return false;
-        }
-
-        let target = lockfile
-            .root_aliases
-            .get(&resolution.package_name)
-            .map_or(resolution.package_name.as_str(), String::as_str);
-        let requested_spec = deps
-            .get(&resolution.package_name)
-            .map_or(resolution.specifier.as_str(), String::as_str);
-        let Some(locked_package) =
-            select_locked_package_for_requested_spec(lockfile, target, requested_spec)
-        else {
-            return false;
-        };
-        if locked_package.version != entry.version {
+        if deps.contains_key(&resolution.package_name)
+            && !lockfile
+                .catalogs
+                .get(&resolution.catalog_name)
+                .is_some_and(|catalog| catalog.contains_key(&resolution.package_name))
+        {
             return false;
         }
     }
@@ -1278,6 +1346,47 @@ pub(crate) fn select_locked_package_for_requested_spec<'a>(
         .map(|(_, candidate)| candidate)
         .or_else(|| best_any.map(|(_, candidate)| candidate))
         .or(first_match)
+}
+
+pub(crate) fn select_locked_root_package<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    local_name: &str,
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    if let Some(selection) = lockfile.root_resolutions.get(local_name) {
+        if selection.package != target {
+            return None;
+        }
+        return lockfile.packages.iter().find(|package| {
+            package.name == selection.package
+                && package.version == selection.version
+                && package.source == selection.source
+        });
+    }
+
+    let requested_range = requested_range_for_locked_lookup(requested_spec)
+        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+    let mut candidate = None;
+    for package in lockfile
+        .packages
+        .iter()
+        .filter(|package| package.name == target)
+    {
+        if let Some(range) = requested_range.as_ref() {
+            let Ok(version) = lpm_resolver::NpmVersion::parse(&package.version) else {
+                continue;
+            };
+            if !range.satisfies(&version) {
+                continue;
+            }
+        }
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some(package);
+    }
+    candidate
 }
 
 fn select_resolved_package_for_requested_spec<'a>(
@@ -1661,8 +1770,10 @@ pub(super) fn filter_dependency_engine_packages(
 
 pub(super) fn lockfile_satisfies_fast_path(
     lockfile: &lpm_lockfile::Lockfile,
+    lockfile_dir: &Path,
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    workspace: Option<&lpm_workspace::Workspace>,
     accept_unsafe_sources: bool,
     emit_warnings: bool,
 ) -> bool {
@@ -1691,10 +1802,12 @@ pub(super) fn lockfile_satisfies_fast_path(
         if let Some(source) = package.source.as_deref()
             && !lpm_lockfile::is_safe_source(source)
         {
-            if accept_unsafe_sources {
+            if accept_unsafe_sources
+                || online_local_source_is_allowed(package, lockfile_dir, deps, workspace)
+            {
                 if emit_warnings {
                     tracing::debug!(
-                        "package {}@{} non-registry source {} accepted in offline mode",
+                        "package {}@{} validated non-registry source {} for lockfile replay",
                         package.name,
                         package.version,
                         source
@@ -1726,7 +1839,7 @@ pub(super) fn lockfile_satisfies_fast_path(
             .root_aliases
             .get(local)
             .map_or(local.as_str(), String::as_str);
-        if select_locked_package_for_requested_spec(lockfile, target, requested_spec).is_none() {
+        if select_locked_root_package(lockfile, local, target, requested_spec).is_none() {
             if emit_warnings {
                 tracing::debug!(
                     "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
@@ -1739,10 +1852,82 @@ pub(super) fn lockfile_satisfies_fast_path(
     true
 }
 
+pub(super) fn online_local_source_is_allowed(
+    package: &lpm_lockfile::LockedPackage,
+    lockfile_dir: &Path,
+    deps: &HashMap<String, String>,
+    workspace: Option<&lpm_workspace::Workspace>,
+) -> bool {
+    let source_path = match package
+        .source
+        .as_deref()
+        .and_then(|source| lpm_lockfile::Source::parse(source).ok())
+    {
+        Some(lpm_lockfile::Source::Directory { path })
+        | Some(lpm_lockfile::Source::Link { path }) => path,
+        _ => return false,
+    };
+    let Ok(canonical_source) = lockfile_dir.join(source_path).canonicalize() else {
+        return false;
+    };
+    if !canonical_source.is_dir() {
+        return false;
+    }
+
+    if workspace.is_some_and(|workspace| {
+        workspace_package_at_source(workspace, &canonical_source)
+            .is_some_and(|manifest| manifest_matches_locked_package(manifest, package))
+    }) {
+        return true;
+    }
+
+    let declared_directly = deps.values().any(|specifier| {
+        let Some(path) = specifier
+            .strip_prefix("file:")
+            .or_else(|| specifier.strip_prefix("link:"))
+        else {
+            return false;
+        };
+        lockfile_dir
+            .join(path)
+            .canonicalize()
+            .is_ok_and(|declared| declared == canonical_source)
+    });
+    if !declared_directly {
+        return false;
+    }
+
+    lpm_workspace::read_package_json(&canonical_source.join("package.json"))
+        .is_ok_and(|manifest| manifest_matches_locked_package(&manifest, package))
+}
+
+fn workspace_package_at_source<'a>(
+    workspace: &'a lpm_workspace::Workspace,
+    canonical_source: &Path,
+) -> Option<&'a lpm_workspace::PackageJson> {
+    let canonical_root = workspace.root.canonicalize().ok()?;
+    if canonical_source == canonical_root {
+        return Some(&workspace.root_package);
+    }
+    workspace.members.iter().find_map(|member| {
+        let relative = member.path.strip_prefix(&workspace.root).ok()?;
+        (canonical_root.join(relative) == canonical_source).then_some(&member.package)
+    })
+}
+
+fn manifest_matches_locked_package(
+    manifest: &lpm_workspace::PackageJson,
+    package: &lpm_lockfile::LockedPackage,
+) -> bool {
+    manifest.name.as_deref() == Some(package.name.as_str())
+        && manifest.version.as_deref().unwrap_or("0.0.0") == package.version
+}
+
 pub(super) fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    workspace: Option<&lpm_workspace::Workspace>,
     // — the URL-reuse gate needs the client to check
     // origin (`is_configured_origin`) and the shared `GateStats`
     // to bump mismatch counters. Both passed by ref; the fast
@@ -1767,14 +1952,16 @@ pub(super) fn try_lockfile_fast_path(
         return None;
     }
 
-    let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+    let mut lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
     let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
 
     if !lockfile_satisfies_fast_path(
         &lockfile,
+        lockfile_path.parent()?,
         deps,
         catalog_resolutions,
+        workspace,
         accept_unsafe_sources,
         true,
     ) {
@@ -1816,14 +2003,20 @@ pub(super) fn try_lockfile_fast_path(
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some(lp) =
-            select_locked_package_for_requested_spec(&lockfile, &target, requested_spec)
-        {
-            root_link_map
-                .entry(root_link_key(&lp.name, &lp.version))
-                .or_default()
-                .push(local.clone());
-        }
+        let lp = select_locked_root_package(&lockfile, local, &target, requested_spec)?;
+        let selected = lpm_lockfile::LockedRootResolution {
+            package: lp.name.clone(),
+            version: lp.version.clone(),
+            source: lp.source.clone(),
+        };
+        root_link_map
+            .entry(root_link_key(&lp.name, &lp.version))
+            .or_default()
+            .push(local.clone());
+        lockfile
+            .root_resolutions
+            .entry(local.clone())
+            .or_insert(selected);
     }
     // surface lockfile-recorded ambient peer installs
     // (auto-installed peers from the cold resolve) at the project's
@@ -1839,14 +2032,25 @@ pub(super) fn try_lockfile_fast_path(
     // if the user later moves the auto-installed peer into their
     // `dependencies`, we don't want a double-link entry.
     for ambient in &lockfile.ambient_peer_installs {
-        if let Some(lp) = lockfile.find_package(ambient) {
-            let entry = root_link_map
-                .entry(root_link_key(&lp.name, &lp.version))
-                .or_default();
-            if !entry.iter().any(|l| l == ambient) {
-                entry.push(ambient.clone());
-            }
+        if deps.contains_key(ambient) {
+            continue;
         }
+        let lp = select_locked_root_package(&lockfile, ambient, ambient, "*")?;
+        let selected = lpm_lockfile::LockedRootResolution {
+            package: lp.name.clone(),
+            version: lp.version.clone(),
+            source: lp.source.clone(),
+        };
+        let entry = root_link_map
+            .entry(root_link_key(&lp.name, &lp.version))
+            .or_default();
+        if !entry.iter().any(|l| l == ambient) {
+            entry.push(ambient.clone());
+        }
+        lockfile
+            .root_resolutions
+            .entry(ambient.clone())
+            .or_insert(selected);
     }
     for locals in root_link_map.values_mut() {
         locals.sort();
@@ -2022,6 +2226,28 @@ pub(super) fn root_aliases_for_lockfile(
     aliases
 }
 
+pub(super) fn root_resolutions_for_lockfile(
+    packages: &[InstallPackage],
+) -> lpm_lockfile::RootResolutions {
+    let mut resolutions = lpm_lockfile::RootResolutions::new();
+    for package in packages {
+        let Some(link_names) = &package.root_link_names else {
+            continue;
+        };
+        for local_name in link_names {
+            resolutions.insert(
+                local_name.clone(),
+                lpm_lockfile::LockedRootResolution {
+                    package: package.name.clone(),
+                    version: package.version.clone(),
+                    source: Some(package.source.clone()),
+                },
+            );
+        }
+    }
+    resolutions
+}
+
 /// Convert resolver output to InstallPackage list.
 ///
 /// — the `root_aliases` map (from the resolver's
@@ -2074,10 +2300,25 @@ pub(super) fn build_latest_stable_versions(
     out
 }
 
+pub(super) struct RegistrySourceContext<'a> {
+    route_table: &'a RouteTable,
+    registry_client: &'a RegistryClient,
+}
+
+impl<'a> RegistrySourceContext<'a> {
+    pub(super) fn new(route_table: &'a RouteTable, registry_client: &'a RegistryClient) -> Self {
+        Self {
+            route_table,
+            registry_client,
+        }
+    }
+}
+
 pub(super) fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
+    root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
     // (see function doc)
     ambient_peer_installs: &[String],
     resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
@@ -2087,9 +2328,12 @@ pub(super) fn resolved_to_install_packages(
     // hardcoded npmjs.org. motivated source_id by URL for
     // exactly this reason; without route-awareness here, the type
     // system's granularity wasn't reaching the install pipeline.
-    route_table: &RouteTable,
-    registry_client: &RegistryClient,
+    registry_source: RegistrySourceContext<'_>,
 ) -> Vec<InstallPackage> {
+    let RegistrySourceContext {
+        route_table,
+        registry_client,
+    } = registry_source;
     // Targets the root either declares directly OR reaches via an
     // npm-alias: each such target's (any version's) resolved package
     // is considered a direct dep for scripts/display.
@@ -2119,9 +2363,15 @@ pub(super) fn resolved_to_install_packages(
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some(package) =
+        let exact = root_resolutions.get(local).and_then(|selection| {
+            resolved.iter().find(|package| {
+                package.package.canonical_name() == selection.package
+                    && package.version.to_string() == selection.version
+            })
+        });
+        if let Some(package) = exact.or_else(|| {
             select_resolved_package_for_requested_spec(resolved, &target, requested_spec)
-        {
+        }) {
             root_link_map
                 .entry(rlk(&target, &package.version.to_string()))
                 .or_default()
@@ -2227,31 +2477,6 @@ pub(super) fn resolved_to_install_packages(
             })
         })
         .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn resolved_to_install_packages_with_workspace_members(
-    resolved: &[ResolvedPackage],
-    deps: &HashMap<String, String>,
-    root_aliases: &HashMap<String, String>,
-    ambient_peer_installs: &[String],
-    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
-    route_table: &RouteTable,
-    registry_client: &RegistryClient,
-    all_workspace_members: &[WorkspaceMemberLink],
-    project_dir: &Path,
-) -> Vec<InstallPackage> {
-    let mut packages = resolved_to_install_packages(
-        resolved,
-        deps,
-        root_aliases,
-        ambient_peer_installs,
-        resolver_cache,
-        route_table,
-        registry_client,
-    );
-    rewrite_workspace_resolved_sources(&mut packages, all_workspace_members, project_dir);
-    packages
 }
 
 #[cfg(test)]

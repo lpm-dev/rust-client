@@ -31,6 +31,7 @@ members = [
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
     "crates/lpm-triage-advisor",
+    "bench/ecosystem-verifier",
     "tests/integration",
     "tests/workflows",
 ]
@@ -86,6 +87,7 @@ axum = { version = "0.8", features = ["json"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
 schemars = { version = "1", default-features = false, features = ["std", "derive"] }
 proptest = "1"
 

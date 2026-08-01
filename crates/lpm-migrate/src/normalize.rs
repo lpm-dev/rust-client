@@ -131,6 +131,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
         provenance: std::collections::BTreeMap::new(),
         packages: locked_packages,
         root_aliases: std::collections::BTreeMap::new(),
+        root_resolutions: lpm_lockfile::RootResolutions::new(),
         // `lpm migrate` translates yarn/pnpm/npm lockfiles into the
         // lpm shape; the source formats don't track synthesized ambient
         // peers (those are an lpm-resolver semantic, not a generic
