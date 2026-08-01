@@ -10062,7 +10062,7 @@ fn install_rejects_transitive_tarball_url_from_file_source_before_resolver() {
         "stderr must categorize the unsupported shape; got:\n{stderr}"
     );
     assert!(
-        stderr_compact.contains("hoistthedeptoyourproject'spackage.json"),
+        stderr_compact.contains("publishorvendorthenesteddependencyinstead"),
         "stderr must include the workaround hint; got:\n{stderr}"
     );
     assert!(
