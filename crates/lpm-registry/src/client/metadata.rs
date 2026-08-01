@@ -2061,7 +2061,18 @@ impl RegistryClient {
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
         let cache_key = format!("npm-release-times:{name}");
+        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
         let mut timings = PackageMetadataFetchTimings::default();
+        let memory_read_start = std::time::Instant::now();
+        if use_cache && let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
+            timings.cache_read_ms = memory_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
+            crate::timing::record_metadata_cache_hit();
+            return Ok(TimedReleaseTimeMetadata {
+                metadata: cached,
+                timings,
+            });
+        }
         if use_cache {
             let cache_read_start = std::time::Instant::now();
             if let Some((cached, _etag)) = self
@@ -2072,6 +2083,7 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
+                self.remember_release_times_for_command(&memory_cache_key, &cached);
                 return Ok(TimedReleaseTimeMetadata {
                     metadata: cached,
                     timings,
@@ -2087,6 +2099,7 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
+                self.remember_release_times_for_command(&memory_cache_key, &cached);
                 return Ok(TimedReleaseTimeMetadata {
                     metadata: cached,
                     timings,
@@ -2096,6 +2109,7 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
+                self.remember_release_times_for_command(&memory_cache_key, &cached);
                 return Ok(TimedReleaseTimeMetadata {
                     metadata: cached,
                     timings,
@@ -2104,6 +2118,36 @@ impl RegistryClient {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         }
         crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
+        if use_cache && let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
+            timings.cache_hit = true;
+            return Ok(TimedReleaseTimeMetadata {
+                metadata: cached,
+                timings,
+            });
+        }
+        if use_cache {
+            let coalesced_read_start = std::time::Instant::now();
+            if let Some((cached, _etag)) = self
+                .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+                .await
+                && cached.matches_package(name)
+            {
+                timings.cache_read_ms = timings
+                    .cache_read_ms
+                    .saturating_add(coalesced_read_start.elapsed().as_millis());
+                timings.cache_hit = true;
+                self.remember_release_times_for_command(&memory_cache_key, &cached);
+                return Ok(TimedReleaseTimeMetadata {
+                    metadata: cached,
+                    timings,
+                });
+            }
+            timings.cache_read_ms = timings
+                .cache_read_ms
+                .saturating_add(coalesced_read_start.elapsed().as_millis());
+        }
 
         let validator_start = std::time::Instant::now();
         let cache_validator = use_cache
@@ -2146,6 +2190,7 @@ impl RegistryClient {
                 && metadata.matches_package(name)
             {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                self.remember_release_times_for_command(&memory_cache_key, &metadata);
                 return finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
@@ -2190,6 +2235,7 @@ impl RegistryClient {
         let cache_write_start = std::time::Instant::now();
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+        self.remember_release_times_for_command(&memory_cache_key, &metadata);
         finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }))
     }
 
@@ -2211,6 +2257,12 @@ impl RegistryClient {
             "npm-release-times:{}:{url}",
             principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
         );
+        let memory_cache_key = format!("custom:{cache_key}");
+
+        if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
+            crate::timing::record_metadata_cache_hit();
+            return Ok(cached);
+        }
 
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
@@ -2218,6 +2270,7 @@ impl RegistryClient {
             && cached.matches_package(name)
         {
             crate::timing::record_metadata_cache_hit();
+            self.remember_release_times_for_command(&memory_cache_key, &cached);
             return Ok(cached);
         }
         let full_cache_key = format!(
@@ -2231,9 +2284,23 @@ impl RegistryClient {
             && !cached.time.is_empty()
         {
             crate::timing::record_metadata_cache_hit();
+            self.remember_release_times_for_command(&memory_cache_key, &cached);
             return Ok(cached);
         }
         crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
+        if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
+            return Ok(cached);
+        }
+        if let Some((cached, _etag)) = self
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+            .await
+            && cached.matches_package(name)
+        {
+            self.remember_release_times_for_command(&memory_cache_key, &cached);
+            return Ok(cached);
+        }
 
         let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();
@@ -2263,6 +2330,7 @@ impl RegistryClient {
                 .await
                 && metadata.matches_package(name)
             {
+                self.remember_release_times_for_command(&memory_cache_key, &metadata);
                 return finish!(Ok(metadata));
             }
             let req = self
@@ -2292,6 +2360,7 @@ impl RegistryClient {
             Err(err) => return finish!(Err(err)),
         };
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.remember_release_times_for_command(&memory_cache_key, &metadata);
         finish!(Ok(metadata))
     }
 
@@ -2444,14 +2513,32 @@ impl RegistryClient {
             "npm:{}:{url}",
             principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
         );
+        let memory_cache_key = format!("custom:{cache_key}");
+
+        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
+            crate::timing::record_metadata_cache_hit();
+            return Ok(cached);
+        }
 
         // Tier 1: TTL+magic cache hit.
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (custom)");
+            self.remember_metadata_for_command(&memory_cache_key, &cached);
             return Ok(cached);
         }
         crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
+        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
+            tracing::debug!("metadata memory cache hit (custom, coalesced)");
+            return Ok(cached);
+        }
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (custom, coalesced)");
+            self.remember_metadata_for_command(&memory_cache_key, &cached);
+            return Ok(cached);
+        }
 
         let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();
@@ -2482,6 +2569,7 @@ impl RegistryClient {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
                 tracing::debug!("metadata cache revalidated (custom 304)");
+                self.remember_metadata_for_command(&memory_cache_key, &metadata);
                 return finish!(Ok(metadata));
             }
             let req = self
@@ -2507,6 +2595,7 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.remember_metadata_for_command(&memory_cache_key, &metadata);
         finish!(Ok(metadata))
     }
 

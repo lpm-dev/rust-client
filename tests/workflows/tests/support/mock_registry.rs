@@ -742,6 +742,16 @@ impl MockRegistry {
     }
 
     pub async fn with_npm_firewall_allow(&self, name: &str, version: &str) -> &Self {
+        self.with_npm_firewall_allow_expected(name, version, 1..=1)
+            .await
+    }
+
+    pub async fn with_npm_firewall_allow_expected(
+        &self,
+        name: &str,
+        version: &str,
+        expected_calls: std::ops::RangeInclusive<u64>,
+    ) -> &Self {
         Mock::given(method("POST"))
             .and(path("/api/registry/-/npm-firewall/verdicts"))
             .and(body_string_contains(format!("\"name\":\"{name}\"")))
@@ -774,7 +784,7 @@ impl MockRegistry {
                     "confidence": 1.0
                 }]
             })))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&self.server)
             .await;
         self

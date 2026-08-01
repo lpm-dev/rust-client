@@ -41,6 +41,8 @@ pub use types::{
 
 mod prelude {
     #[allow(unused_imports)]
+    pub(super) use super::cache::activate_workspace_fallback;
+    #[allow(unused_imports)]
     pub(super) use super::error::{ProviderError, classify_registry_error};
     #[allow(unused_imports)]
     pub(super) use super::parse::{
@@ -102,4 +104,4 @@ mod prelude {
     pub(super) use version_ranges::Ranges;
 }
 
-pub(crate) use cache::insert_or_merge_cached_package_info;
+pub(crate) use cache::{activate_workspace_fallback, insert_or_merge_cached_package_info};

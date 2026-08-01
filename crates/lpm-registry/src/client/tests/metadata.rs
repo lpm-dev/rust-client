@@ -1434,6 +1434,121 @@ async fn command_scoped_metadata_cache_single_flights_independent_resolvers_with
 }
 
 #[tokio::test]
+async fn command_scoped_metadata_cache_single_flights_custom_registry_resolvers() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let registry = MockServer::start().await;
+    let package = "shared-custom-importer-package";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(50))
+                .set_body_string(test_metadata_json(package)),
+        )
+        .expect(1)
+        .mount(&registry)
+        .await;
+
+    let mut client = RegistryClient::new().clone_with_metadata_memory_cache();
+    client.cache_dir = None;
+    let first = client.clone_with_config();
+    let second = client.clone_with_config();
+    let base_url = registry.uri();
+
+    let (first_result, second_result) = tokio::join!(
+        first.get_npm_metadata_from(&base_url, package, None),
+        second.get_npm_metadata_from(&base_url, package, None),
+    );
+
+    assert_eq!(first_result.unwrap().name, package);
+    assert_eq!(second_result.unwrap().name, package);
+}
+
+#[tokio::test]
+async fn command_scoped_release_time_cache_single_flights_independent_resolvers() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let package = "shared-release-time-package";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .and(header("Accept", "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(50))
+                .set_body_json(serde_json::json!({
+                    "name": package,
+                    "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+                })),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .clone_with_metadata_memory_cache();
+    client.cache_dir = None;
+    let first = client.clone_with_config();
+    let second = client.clone_with_config();
+
+    let (first_result, second_result) = tokio::join!(
+        first.get_npm_release_times_routed_full(package, crate::UpstreamRoute::NpmDirect),
+        second.get_npm_release_times_routed_full(package, crate::UpstreamRoute::NpmDirect),
+    );
+
+    assert_eq!(
+        first_result.unwrap().time,
+        second_result.unwrap().time,
+        "independent resolvers must observe the same cached publication times",
+    );
+}
+
+#[tokio::test]
+async fn command_scoped_release_time_cache_single_flights_custom_registry_resolvers() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let registry = MockServer::start().await;
+    let package = "shared-custom-release-time-package";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .and(header("Accept", "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(50))
+                .set_body_json(serde_json::json!({
+                    "name": package,
+                    "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+                })),
+        )
+        .expect(1)
+        .mount(&registry)
+        .await;
+
+    let mut client = RegistryClient::new().clone_with_metadata_memory_cache();
+    client.cache_dir = None;
+    let first = client.clone_with_config();
+    let second = client.clone_with_config();
+    let base_url = registry.uri();
+
+    let (first_result, second_result) = tokio::join!(
+        first.get_npm_release_times_from_full(&base_url, package, None),
+        second.get_npm_release_times_from_full(&base_url, package, None),
+    );
+
+    assert_eq!(
+        first_result.unwrap().time,
+        second_result.unwrap().time,
+        "equivalent custom-registry resolvers must reuse one immutable response",
+    );
+}
+
+#[tokio::test]
 async fn command_scoped_metadata_cache_keeps_direct_registry_origins_isolated() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

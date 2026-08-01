@@ -252,6 +252,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     );
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
+                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
@@ -397,6 +398,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let dep_names: Vec<String> = deps.keys().cloned().collect();
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+                    seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
                     let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
                     let walker_done: WalkerDone =
                         Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -548,7 +550,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 resolver_stage_timing = resolve_result.stage_timing;
                 ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
 
-                let mut packages = resolved_to_install_packages(
+                let mut packages = resolved_to_install_packages_with_workspace_members(
                     &resolve_result.packages,
                     deps,
                     &resolve_result.root_aliases,
@@ -556,6 +558,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     &resolve_result.ambient_peer_installs,
                     &resolve_result.cache,
                     RegistrySourceContext::new(&route_table, arc_client.as_ref()),
+                    all_workspace_members,
+                    project_dir,
                 );
                 let latest_stable = build_latest_stable_versions(&resolve_result.cache);
                 packages.extend(tarball_url_install_pkgs.iter().cloned());

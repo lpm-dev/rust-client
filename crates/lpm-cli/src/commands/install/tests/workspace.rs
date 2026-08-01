@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn matching_semver_workspace_dependency_is_extracted_for_local_linking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let member_dir = dir.path().join("packages/app");
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let workspace = lpm_workspace::discover_workspace(dir.path())
+        .unwrap()
+        .unwrap();
+    let members = all_workspace_members(Some(&workspace)).unwrap();
+    let mut deps = HashMap::from([("app".to_string(), "^1.0.0".to_string())]);
+
+    let extracted = extract_matching_workspace_semver_deps(&mut deps, &members);
+
+    assert!(deps.is_empty());
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, "app");
+    assert_eq!(extracted[0].version, "1.0.0");
+}
+
+#[test]
+fn incompatible_semver_workspace_dependency_remains_a_registry_dependency() {
+    let member = WorkspaceMemberLink {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        package_dir: PathBuf::from("packages/app"),
+        source_dir: PathBuf::from("packages/app"),
+    };
+    let mut deps = HashMap::from([("app".to_string(), "^2.0.0".to_string())]);
+
+    let extracted = extract_matching_workspace_semver_deps(&mut deps, &[member]);
+
+    assert!(extracted.is_empty());
+    assert_eq!(deps.get("app").map(String::as_str), Some("^2.0.0"));
+}
+
+#[test]
 fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
     let dir = tempfile::tempdir().unwrap();
     let runtime_dir = dir.path().join("packages/runtime");

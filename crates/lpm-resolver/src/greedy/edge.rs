@@ -164,19 +164,42 @@ fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
     }
 }
 
+fn newest_satisfying_root_node(
+    state: &ResolveState,
+    edge: &Edge,
+    latest_version: Option<&NpmVersion>,
+) -> Option<NodeId> {
+    state
+        .nodes
+        .first()?
+        .children
+        .iter()
+        .filter(|(local_name, _)| state.root_deps.contains_key(local_name))
+        .filter_map(|(_, id)| {
+            let node = state.nodes.get(*id as usize)?;
+            (node.canonical == edge.canonical
+                && edge
+                    .range
+                    .satisfies_with_latest_bound(&node.version, latest_version))
+            .then_some((&node.version, *id))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, id)| id)
+}
+
 /// Core reuse-or-allocate logic. The `forced` parameter, when present,
 /// carries (natural_version, optional_override) computed by the override
-/// branch in [`process_edge`]. Every edge selects its natural or forced
-/// target before exact-identity deduplication so metadata timing and cache
-/// warmth cannot change a broad range by exposing another compatible node
-/// first.
+/// branch in [`process_edge`]. Compatible transitive edges prefer a version
+/// already selected by a manifest root. Other edges retain exact selected
+/// identity, including path-targeted overrides.
 fn process_edge_inner(
     edge: &Edge,
     info: &CachedPackageInfo,
     forced: Option<(NpmVersion, Option<(NpmVersion, OverrideHit)>)>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
-    // Determine the target version for this edge before deduplication.
+    let is_root_edge = edge.parent == 0;
+
     let (target_version, override_hit): (NpmVersion, Option<OverrideHit>) = match forced {
         Some((natural, Some((forced_v, hit)))) => {
             let _ = natural;
@@ -259,11 +282,24 @@ fn process_edge_inner(
         );
     }
 
-    let existing_id: Option<NodeId> = state.resolved.get(&edge.canonical).and_then(|nodes| {
-        nodes
-            .iter()
-            .find(|(version, _)| version == &target_version)
-            .map(|(_, id)| *id)
+    let split_gate = !state.overrides.split_targets().is_empty()
+        && state
+            .overrides
+            .split_targets()
+            .contains(&edge.canonical.to_string());
+    let must_exact_match = is_root_edge || override_hit.is_some() || split_gate;
+    let root_id = if must_exact_match {
+        None
+    } else {
+        newest_satisfying_root_node(state, edge, info.latest_version.as_ref())
+    };
+    let existing_id = root_id.or_else(|| {
+        state.resolved.get(&edge.canonical).and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(version, _)| version == &target_version)
+                .map(|(_, id)| *id)
+        })
     });
 
     let child_id = match existing_id {
@@ -272,8 +308,13 @@ fn process_edge_inner(
                 mark_node_required_closure(state, id);
             }
             state.work_stats.edge_reuse_count = state.work_stats.edge_reuse_count.saturating_add(1);
-            state.work_stats.edge_reuse_exact_count =
-                state.work_stats.edge_reuse_exact_count.saturating_add(1);
+            if state.nodes[id as usize].version == target_version {
+                state.work_stats.edge_reuse_exact_count =
+                    state.work_stats.edge_reuse_exact_count.saturating_add(1);
+            } else {
+                state.work_stats.edge_reuse_range_count =
+                    state.work_stats.edge_reuse_range_count.saturating_add(1);
+            }
             id
         }
         None => {

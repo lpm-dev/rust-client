@@ -200,9 +200,8 @@ pub(crate) async fn run_recursive_workspace_install(
             ),
         })
     });
-    let workspace_client = resolution_coordinator
-        .as_ref()
-        .map(|_| client.clone_with_metadata_memory_cache());
+    let workspace_client =
+        (!options.offline && targets.len() > 1).then(|| client.clone_with_metadata_memory_cache());
     let client = workspace_client.as_ref().unwrap_or(client);
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);

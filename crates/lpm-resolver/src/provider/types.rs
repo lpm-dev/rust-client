@@ -260,8 +260,11 @@ impl CachedPackageInfo {
     }
 
     pub fn needs_metadata_for_range(&self, range: &NpmRange) -> bool {
-        if self.versions_complete || self.workspace_version_satisfies(range) {
+        if self.versions_complete {
             return false;
+        }
+        if !self.workspace_versions.is_empty() {
+            return true;
         }
         if let Some(exact) = range.exact_version() {
             return !self.versions.contains(&exact);

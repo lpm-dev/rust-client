@@ -84,23 +84,21 @@ impl LpmDependencyProvider {
                 let total_start = trace_metadata_fetches.then(Instant::now);
                 let raw_start = trace_metadata_fetches.then(Instant::now);
                 let mut detail: Option<lpm_registry::timing::MetadataFetchDetailRecord> = None;
-                let metadata = match &route {
-                    UpstreamRoute::LpmWorker => {
-                        self.rt
-                            .block_on(self.client.get_npm_package_metadata(name))
-                            .inspect(|metadata| {
-                                if let Some(start) = raw_start {
-                                    detail =
-                                        Some(lpm_registry::timing::MetadataFetchDetailRecord {
-                                            package: key.to_string(),
-                                            route: "lpm_worker",
-                                            raw_fetch_ms: start.elapsed().as_millis(),
-                                            version_count: metadata.versions.len() as u64,
-                                            ..lpm_registry::timing::MetadataFetchDetailRecord::default()
-                                        });
-                                }
-                            })
-                    }
+                let metadata_result = match &route {
+                    UpstreamRoute::LpmWorker => self
+                        .rt
+                        .block_on(self.client.get_npm_package_metadata(name))
+                        .inspect(|metadata| {
+                            if let Some(start) = raw_start {
+                                detail = Some(lpm_registry::timing::MetadataFetchDetailRecord {
+                                    package: key.to_string(),
+                                    route: "lpm_worker",
+                                    raw_fetch_ms: start.elapsed().as_millis(),
+                                    version_count: metadata.versions.len() as u64,
+                                    ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                                });
+                            }
+                        }),
                     UpstreamRoute::NpmDirect => {
                         if trace_metadata_fetches {
                             self.rt
@@ -155,8 +153,21 @@ impl LpmDependencyProvider {
                                 }
                             })
                     }
-                }
-                .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+                };
+                let metadata = match metadata_result {
+                    Ok(metadata) => metadata,
+                    Err(lpm_common::LpmError::NotFound(_))
+                        if activate_workspace_fallback(&self.cache, &key).is_some() =>
+                    {
+                        self.available_versions_cache
+                            .borrow_mut()
+                            .retain(|package, _| CanonicalKey::from(package) != key);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(ProviderError::Registry(format!("npm:{name}: {error}")));
+                    }
+                };
 
                 let parse_start = trace_metadata_fetches.then(Instant::now);
                 let mut info = parse_metadata_to_cache_info(&metadata);

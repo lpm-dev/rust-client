@@ -258,11 +258,11 @@ mod prelude {
     pub(super) use crate::policy::{ReleaseTimeStatus, ResolverPolicy};
     pub(super) use crate::provider::{
         CachedPackageInfo, NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone,
-        insert_or_merge_cached_package_info, merge_release_times_into_cache_info,
-        parse_full_metadata_to_cache_info, parse_metadata_to_cache_info,
-        parse_partial_metadata_to_cache_info, release_age_status_for_version,
-        release_age_status_for_version_unprofiled, trust_downgrade_violation,
-        trust_downgrade_violation_unprofiled,
+        activate_workspace_fallback, insert_or_merge_cached_package_info,
+        merge_release_times_into_cache_info, parse_full_metadata_to_cache_info,
+        parse_metadata_to_cache_info, parse_partial_metadata_to_cache_info,
+        release_age_status_for_version, release_age_status_for_version_unprofiled,
+        trust_downgrade_violation, trust_downgrade_violation_unprofiled,
     };
     pub(super) use crate::ranges::NpmRange;
     pub(super) use crate::resolve::{

@@ -17,6 +17,11 @@ pub(crate) fn insert_or_merge_cached_package_info(
         return existing;
     }
 
+    if incoming.workspace_versions.is_empty() && !existing.workspace_versions.is_empty() {
+        shared_cache.insert(canonical, incoming.clone());
+        return incoming;
+    }
+
     if incoming.versions_complete && existing.workspace_versions.is_empty() {
         shared_cache.insert(canonical, incoming.clone());
         return incoming;
@@ -25,6 +30,24 @@ pub(crate) fn insert_or_merge_cached_package_info(
     let merged = Arc::new(merge_cached_package_info(&existing, &incoming));
     shared_cache.insert(canonical, merged.clone());
     merged
+}
+
+pub(crate) fn activate_workspace_fallback(
+    shared_cache: &SharedCache,
+    canonical: &CanonicalKey,
+) -> Option<Arc<CachedPackageInfo>> {
+    let existing = shared_cache
+        .get(canonical)
+        .map(|entry| Arc::clone(entry.value()))?;
+    if existing.workspace_versions.is_empty() {
+        return None;
+    }
+
+    let mut fallback = (*existing).clone();
+    fallback.versions_complete = true;
+    let fallback = Arc::new(fallback);
+    shared_cache.insert(canonical.clone(), fallback.clone());
+    Some(fallback)
 }
 
 fn merge_cached_package_info(

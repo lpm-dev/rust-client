@@ -848,7 +848,7 @@ pub(super) fn complete_metadata_fetch(
     canonical: CanonicalKey,
     result: FetchResult,
     completion: &mut MetadataFetchCompletion<'_>,
-) -> Result<(), ResolveError> {
+) -> Result<bool, ResolveError> {
     let count_latest_for_miss = match completion.counted_metadata_edge_misses.as_mut() {
         Some(misses) => misses.remove(&canonical),
         None => false,
@@ -892,19 +892,35 @@ pub(super) fn complete_metadata_fetch(
                     completion.state.task_queue.push_back(e);
                 }
             }
+            Ok(true)
         }
-        Err(e) => {
+        Err(error)
+            if matches!(error, ResolveError::PackageNotFound { .. })
+                && activate_workspace_fallback(completion.shared_cache, &canonical).is_some() =>
+        {
+            if let Some(mut edges) = completion.parked.remove(&canonical) {
+                edges.sort_by(|left, right| {
+                    (left.parent, left.local_name.as_str())
+                        .cmp(&(right.parent, right.local_name.as_str()))
+                });
+                for edge in edges {
+                    completion.state.task_queue.push_back(edge);
+                }
+            }
+            Ok(true)
+        }
+        Err(error) => {
             if let Some(edges) = completion.parked.remove(&canonical) {
                 for edge in edges {
-                    propagate_fetch_error(&edge, &e, completion.state)?;
+                    propagate_fetch_error(&edge, &error, completion.state)?;
                     completion
                         .pending_root_constraints
                         .complete_root_edge(&edge, &mut completion.state.task_queue);
                 }
             }
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Raw-metadata fetch, factored out so the fused resolver can cache the
@@ -925,13 +941,10 @@ async fn fetch_metadata_raw(
         CanonicalKey::Lpm { owner, name } => {
             let pkg_name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))
                 .map_err(|e| ResolveError::Internal(e.to_string()))?;
-            client.get_package_metadata(&pkg_name).await.map_err(|e| {
-                ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: e.to_string(),
-                }
-            })
+            client
+                .get_package_metadata(&pkg_name)
+                .await
+                .map_err(|error| metadata_fetch_error(canonical, error))
         }
         CanonicalKey::Npm { name } => {
             let route = route_table.route_for_package(name);
@@ -948,12 +961,22 @@ async fn fetch_metadata_raw(
                         .await
                 }
             }
-            .map_err(|e| ResolveError::DependencyFetch {
-                package: canonical.to_string(),
-                version: "*".to_string(),
-                detail: e.to_string(),
-            })
+            .map_err(|error| metadata_fetch_error(canonical, error))
         }
+    }
+}
+
+fn metadata_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -> ResolveError {
+    match error {
+        lpm_common::LpmError::NotFound(detail) => ResolveError::PackageNotFound {
+            package: canonical.to_string(),
+            detail,
+        },
+        other => ResolveError::DependencyFetch {
+            package: canonical.to_string(),
+            version: "*".to_string(),
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -983,11 +1006,7 @@ async fn fetch_metadata_raw_with_timings(
                     route: "lpm",
                     registry_timings: None,
                 })
-                .map_err(|e| ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: e.to_string(),
-                })
+                .map_err(|error| metadata_fetch_error(canonical, error))
         }
         CanonicalKey::Npm { name } => {
             let route = route_table.route_for_package(name);
@@ -1018,11 +1037,7 @@ async fn fetch_metadata_raw_with_timings(
                         registry_timings: None,
                     }),
             }
-            .map_err(|e| ResolveError::DependencyFetch {
-                package: canonical.to_string(),
-                version: "*".to_string(),
-                detail: e.to_string(),
-            })
+            .map_err(|error| metadata_fetch_error(canonical, error))
         }
     }
 }
@@ -1039,24 +1054,17 @@ async fn fetch_full_metadata_raw(
         CanonicalKey::Lpm { owner, name } => {
             let pkg_name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))
                 .map_err(|e| ResolveError::Internal(e.to_string()))?;
-            client.get_package_metadata(&pkg_name).await.map_err(|e| {
-                ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: e.to_string(),
-                }
-            })
+            client
+                .get_package_metadata(&pkg_name)
+                .await
+                .map_err(|error| metadata_fetch_error(canonical, error))
         }
         CanonicalKey::Npm { name } => {
             let route = route_table.route_for_package(name);
             client
                 .get_npm_metadata_routed_full(name, route)
                 .await
-                .map_err(|e| ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: e.to_string(),
-                })
+                .map_err(|error| metadata_fetch_error(canonical, error))
         }
     }
 }
@@ -1092,7 +1100,8 @@ pub(super) fn propagate_fetch_error(
         return Ok(());
     }
     let detail = match err {
-        ResolveError::DependencyFetch { detail, .. } => detail.clone(),
+        ResolveError::DependencyFetch { detail, .. }
+        | ResolveError::PackageNotFound { detail, .. } => detail.clone(),
         ResolveError::Resolution(context) => context.reason.clone(),
         other => other.to_string(),
     };

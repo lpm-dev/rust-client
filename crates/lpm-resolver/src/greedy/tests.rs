@@ -183,13 +183,13 @@ fn partial_worker_cache_serves_worker_covered_range() {
 }
 
 #[test]
-fn workspace_cache_serves_a_satisfying_local_version_without_registry_metadata() {
+fn workspace_cache_probes_the_registry_before_using_a_satisfying_local_version() {
     let mut info = mk_info(&["2.0.0"], &[]);
     info.versions_complete = false;
     info.workspace_versions
         .insert(NpmVersion::parse("2.0.0").expect("valid workspace version"));
 
-    assert!(!info.needs_metadata_for_range(&NpmRange::parse("^2.0.0").expect("valid range")));
+    assert!(info.needs_metadata_for_range(&NpmRange::parse("^2.0.0").expect("valid range")));
 }
 
 #[test]
@@ -200,6 +200,45 @@ fn workspace_cache_requests_registry_metadata_for_a_nonmatching_range() {
         .insert(NpmVersion::parse("2.0.0").expect("valid workspace version"));
 
     assert!(info.needs_metadata_for_range(&NpmRange::parse("^1.0.0").expect("valid range")));
+}
+
+#[test]
+fn registry_not_found_activates_the_workspace_cache_as_authoritative() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("workspace-fallback");
+    let mut workspace = mk_info(&["2.0.0"], &[]);
+    workspace.versions_complete = false;
+    workspace
+        .workspace_versions
+        .insert(NpmVersion::parse("2.0.0").expect("valid workspace version"));
+    shared_cache.insert(canonical.clone(), Arc::new(workspace));
+
+    let fallback = activate_workspace_fallback(&shared_cache, &canonical)
+        .expect("workspace metadata should be available as a fallback");
+
+    assert!(fallback.versions_complete);
+    assert!(!fallback.needs_metadata_for_range(&NpmRange::parse("^2.0.0").unwrap()));
+}
+
+#[test]
+fn successful_registry_metadata_replaces_same_version_workspace_metadata() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("source-boundary");
+    let mut workspace = mk_info(&["1.0.0"], &[("local-child", "1.0.0")]);
+    workspace.versions_complete = false;
+    workspace
+        .workspace_versions
+        .insert(NpmVersion::parse("1.0.0").expect("valid workspace version"));
+    shared_cache.insert(canonical.clone(), Arc::new(workspace));
+
+    let registry = mk_info(&["1.0.0"], &[("registry-child", "1.0.0")]);
+    let selected =
+        insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(registry));
+
+    assert!(selected.workspace_versions.is_empty());
+    let dependencies = &selected.deps["1.0.0"];
+    assert!(dependencies.contains_key("registry-child"));
+    assert!(!dependencies.contains_key("local-child"));
 }
 
 #[test]
@@ -1228,6 +1267,40 @@ fn process_edge_reuses_node_when_edges_select_the_same_version() {
             .iter()
             .any(|(_, id)| *id == lodash_id)
     );
+}
+
+#[test]
+fn transitive_edge_prefers_a_satisfying_root_selection_over_its_newer_natural_target() {
+    let info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    let mut state = ResolveState::new(
+        HashMap::from([("shared".to_string(), "1.0.0".to_string())]),
+        OverrideSet::empty(),
+    );
+    state.seed_root_edges().unwrap();
+    let root_edge = state.task_queue.pop_front().unwrap();
+    process_edge(&root_edge, &info, &mut state).unwrap();
+    let root_shared_id = state.nodes[0].children[0].1;
+    let parent_id = push_node(&mut state, CanonicalKey::npm("range-parent"), "1.0.0");
+    let transitive = Edge {
+        parent: parent_id,
+        local_name: "shared".to_string(),
+        canonical: CanonicalKey::npm("shared"),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+
+    process_edge(&transitive, &info, &mut state).unwrap();
+
+    assert_eq!(
+        state.nodes[parent_id as usize].children[0].1,
+        root_shared_id
+    );
+    assert_eq!(state.resolved[&CanonicalKey::npm("shared")].len(), 1);
+    assert_eq!(state.work_stats.edge_reuse_range_count, 1);
 }
 
 fn overlapping_range_targets(broad_first: bool) -> (String, String) {
@@ -3941,7 +4014,7 @@ async fn fusion_overlapping_range_selection_is_independent_of_shared_cache_warmt
     let shared_warm = resolve_direct_and_transitive_overlap_with_seeded_cache(false, true).await;
     let fully_warm = resolve_direct_and_transitive_overlap_with_seeded_cache(true, true).await;
 
-    assert_eq!(cold, "1.1.0");
+    assert_eq!(cold, "1.0.0");
     assert_eq!(
         [parent_warm, shared_warm, fully_warm],
         [cold.clone(), cold.clone(), cold],
@@ -4279,7 +4352,7 @@ async fn fusion_strict_release_age_selection_is_independent_of_persistent_cache_
     };
     let partially_warm_child = selected_child(&partially_warm);
     let fully_warm_child = selected_child(&fully_warm);
-    assert_eq!(partially_warm_child, "1.1.0");
+    assert_eq!(partially_warm_child, "1.0.0");
     assert_eq!(
         partially_warm_child, fully_warm_child,
         "persistent metadata cache warmth must not change strict-policy selection"

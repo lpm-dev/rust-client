@@ -1678,7 +1678,7 @@ async fn recursive_install_commits_no_importer_when_root_firewall_blocks() {
         &[("member-allowed", "1.0.0"), ("root-blocked", "1.0.0")],
     )
     .await;
-    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+    mock.with_npm_firewall_allow_expected("member-allowed", "1.0.0", 0..=1)
         .await;
     mock.with_npm_firewall_block("root-blocked", "1.0.0").await;
 

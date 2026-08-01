@@ -445,28 +445,19 @@ impl RootProviderSnapshot {
     fn new(
         root_dir: &Path,
         packages: Vec<InstallPackage>,
-        ephemeral_workspace_packages: &[InstallPackage],
+        workspace_packages: &[InstallPackage],
     ) -> Self {
-        let ephemeral_keys = ephemeral_workspace_packages
-            .iter()
-            .map(install_pkg_key)
-            .collect::<HashSet<_>>();
-        let persisted_packages = packages
-            .iter()
-            .filter(|package| !ephemeral_keys.contains(&install_pkg_key(package)))
-            .cloned()
-            .collect::<Vec<_>>();
         let mut lockfile = lpm_lockfile::Lockfile::new();
-        for package in &persisted_packages {
+        for package in &packages {
             lockfile.add_package(super::lockfile::locked_package_from_install_package(
                 package,
             ));
         }
         let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
         let deps = super::manifest_install_deps(&package);
-        lockfile.root_aliases = super::root_aliases_for_lockfile(&persisted_packages, &deps);
-        lockfile.root_resolutions = super::root_resolutions_for_lockfile(&persisted_packages);
-        let direct = direct_provider_identities(&package, &lockfile, ephemeral_workspace_packages);
+        lockfile.root_aliases = super::root_aliases_for_lockfile(&packages, &deps);
+        lockfile.root_resolutions = super::root_resolutions_for_lockfile(&packages);
+        let direct = direct_provider_identities(&package, &lockfile, workspace_packages);
         let mut direct_by_name = BTreeMap::<String, Vec<usize>>::new();
         for (index, package) in packages.iter().enumerate() {
             if package.is_direct {
@@ -489,7 +480,7 @@ impl RootProviderSnapshot {
             .iter()
             .map(FingerprintPackage::from_locked)
             .collect::<Vec<_>>();
-        let local = local_provider_fingerprints(root_dir, ephemeral_workspace_packages);
+        let local = local_provider_fingerprints(root_dir, workspace_packages);
         let manifest = root_manifest_bytes(root_dir);
         let fingerprint = root_provider_fingerprint(&manifest, &direct, &rows, &local);
         Self {

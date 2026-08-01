@@ -49,6 +49,12 @@ pub(super) fn lockfile_needs_peer_state_repair(
         && lockfile.metadata.lockfile_version < MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE
 }
 
+pub(super) fn importer_snapshot_is_authoritative(
+    snapshot: &lpm_lockfile::ImporterSnapshot,
+) -> bool {
+    snapshot.auto_install_peers.is_some()
+}
+
 pub(super) struct LockfileSelectionInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
@@ -152,7 +158,6 @@ pub(super) struct OnlineLockfileWritePhaseInput<'a> {
     pub(super) used_lockfile: bool,
     pub(super) resolved_with: &'a str,
     pub(super) auto_isolated_peer_conflicts: bool,
-    pub(super) workspace_install_packages: &'a [InstallPackage],
     pub(super) packages_for_lockfile: &'a [InstallPackage],
     pub(super) deps: &'a HashMap<String, String>,
     pub(super) ambient_peer_installs_for_lockfile: &'a [String],
@@ -225,17 +230,7 @@ fn fresh_resolved_lockfile(
     let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(input.resolved_with);
     lockfile.metadata.auto_isolated_peer_conflicts = input.auto_isolated_peer_conflicts;
 
-    let ephemeral_workspace_pkg_keys: HashSet<String> = input
-        .workspace_install_packages
-        .iter()
-        .map(install_pkg_key)
-        .collect();
-    let persisted_packages: Vec<InstallPackage> = input
-        .packages_for_lockfile
-        .iter()
-        .filter(|package| !ephemeral_workspace_pkg_keys.contains(&install_pkg_key(package)))
-        .cloned()
-        .collect();
+    let persisted_packages = input.packages_for_lockfile.to_vec();
 
     for package in &persisted_packages {
         lockfile.add_package(locked_package_from_install_package(package));
@@ -828,25 +823,30 @@ pub(super) async fn run_offline_install_phase(
             lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
         )));
     }
-    let current_root_providers = current_importer_snapshot
-        .workspace_root_peer_providers_fingerprint
-        .as_deref();
-    let locked_root_providers = fast.lockfile.importers.get(".").and_then(|importer| {
-        importer
+    if let Some(locked_importer) = fast
+        .lockfile
+        .importers
+        .get(".")
+        .filter(|snapshot| importer_snapshot_is_authoritative(snapshot))
+    {
+        let current_root_providers = current_importer_snapshot
             .workspace_root_peer_providers_fingerprint
-            .as_deref()
-    });
-    if current_root_providers != locked_root_providers {
-        return Err(LpmError::Registry(
-            "--offline: workspace root peer-provider state differs from this importer's lockfile. Run `lpm install --recursive` online to reconcile the workspace, then retry --offline."
-                .to_string(),
-        ));
-    }
-    if fast.lockfile.importers.get(".") != Some(current_importer_snapshot) {
-        return Err(LpmError::Registry(
-            "--offline: package.json differs from this importer's lockfile. Run `lpm install` online to reconcile the manifest, then retry --offline."
-                .to_string(),
-        ));
+            .as_deref();
+        let locked_root_providers = locked_importer
+            .workspace_root_peer_providers_fingerprint
+            .as_deref();
+        if current_root_providers != locked_root_providers {
+            return Err(LpmError::Registry(
+                "--offline: workspace root peer-provider state differs from this importer's lockfile. Run `lpm install --recursive` online to reconcile the workspace, then retry --offline."
+                    .to_string(),
+            ));
+        }
+        if locked_importer != current_importer_snapshot {
+            return Err(LpmError::Registry(
+                "--offline: package.json differs from this importer's lockfile. Run `lpm install` online to reconcile the manifest, then retry --offline."
+                    .to_string(),
+            ));
+        }
     }
 
     let mut locked = fast.packages;
@@ -2477,6 +2477,36 @@ pub(super) fn resolved_to_install_packages(
             })
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolved_to_install_packages_with_workspace_members(
+    resolved: &[ResolvedPackage],
+    deps: &HashMap<String, String>,
+    root_aliases: &HashMap<String, String>,
+    root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
+    ambient_peer_installs: &[String],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    registry_source: RegistrySourceContext<'_>,
+    workspace_members: &[WorkspaceMemberLink],
+    project_dir: &Path,
+) -> Vec<InstallPackage> {
+    let mut packages = resolved_to_install_packages(
+        resolved,
+        deps,
+        root_aliases,
+        root_resolutions,
+        ambient_peer_installs,
+        resolver_cache,
+        registry_source,
+    );
+    rewrite_workspace_resolved_sources(
+        &mut packages,
+        resolver_cache,
+        workspace_members,
+        project_dir,
+    );
+    packages
 }
 
 #[cfg(test)]

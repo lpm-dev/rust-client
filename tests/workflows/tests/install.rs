@@ -1533,7 +1533,7 @@ fn empty_deps_second_install_is_up_to_date() {
 }
 
 #[test]
-fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
+fn bare_install_with_importer_snapshot_stays_fresh_without_binary_lockfile() {
     let project = TempProject::empty(
         r#"{
         "name": "empty-deps-lockb-refresh",
@@ -1553,11 +1553,9 @@ fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
         String::from_utf8_lossy(&first.stderr),
     );
     assert!(
-        project.file_exists("lpm.lockb"),
-        "first install must materialize lpm.lockb"
+        !project.file_exists("lpm.lockb"),
+        "importer state is not representable in the current binary lockfile format"
     );
-
-    std::fs::remove_file(project.path().join("lpm.lockb")).expect("remove lpm.lockb");
 
     let second = lpm(&project)
         .args(["install"])
@@ -1570,8 +1568,17 @@ fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
         String::from_utf8_lossy(&second.stderr),
     );
     assert!(
-        project.file_exists("lpm.lockb"),
-        "bare install must regenerate missing lpm.lockb before reporting fresh"
+        !project.file_exists("lpm.lockb"),
+        "a fresh TOML-only install must not create a lossy binary sidecar"
+    );
+    let second_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        second_output.contains("up to date"),
+        "the missing unsupported sidecar must not invalidate freshness:\n{second_output}"
     );
 
     let doctor = lpm(&project)
@@ -1585,7 +1592,7 @@ fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
     );
     assert!(
         !doctor_output.contains("lpm.lockb missing"),
-        "doctor must not keep warning after bare install regenerated lpm.lockb:\n{doctor_output}"
+        "doctor must not request a sidecar that cannot represent importer state:\n{doctor_output}"
     );
 }
 
@@ -10488,6 +10495,7 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
   "dependencies": { "workspace-lib": "workspace:*" }
 }"#,
     );
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
     project.write_file(
         "docs/package.json",
         r#"{
@@ -12033,7 +12041,7 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
     .await;
     let shared_metadata = serde_json::json!({
         "name": "shared-dependency",
-        "modified": "2026-07-31T12:00:00.000Z",
+        "modified": "2099-01-01T00:00:00.000Z",
         "dist-tags": { "latest": "1.1.0" },
         "versions": {
             "1.0.0": {

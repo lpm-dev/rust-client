@@ -1936,8 +1936,14 @@ async fn install_with_partial_node_modules_re_links_to_full_state() {
 /// panic, never silently produce wrong results.
 #[tokio::test]
 async fn install_with_truncated_lockb_falls_back_to_toml() {
-    let project = TempProject::empty(r#"{"name":"torn-test","version":"1.0.0","dependencies":{}}"#);
-    let first = lpm(&project)
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("binary-cache-package", "1.0.0");
+    mock.with_package("binary-cache-package", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"torn-test","version":"1.0.0","dependencies":{"binary-cache-package":"1.0.0"}}"#,
+    );
+    let first = lpm_with_registry(&project, &mock.url())
         .args(install_args_with(&[]))
         .output()
         .expect("run first install");
@@ -1946,6 +1952,35 @@ async fn install_with_truncated_lockb_falls_back_to_toml() {
         "setup: first install failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read setup lockfile");
+    lockfile.importers.clear();
+    lockfile.patches.clear();
+    lockfile.catalogs.clear();
+    lockfile.root_aliases.clear();
+    lockfile.root_resolutions.clear();
+    lockfile.ambient_peer_installs.clear();
+    lockfile.metadata.auto_isolated_peer_conflicts = false;
+    for package in &mut lockfile.packages {
+        package.alias_dependencies.clear();
+        package.peers.clear();
+        package.os.clear();
+        package.cpu.clear();
+        package.libc.clear();
+        package.node_engine = None;
+        package.optional = false;
+        package.registry_signatures.clear();
+        package.registry_published_at = None;
+    }
+    assert!(
+        lpm_lockfile::binary::binary_format_supports(&lockfile),
+        "fixture must produce a binary lockfile before truncation",
+    );
+    lockfile
+        .write_all(&lockfile_path)
+        .expect("write legacy binary-representable lockfile");
 
     // Truncate lpm.lockb to a few random bytes — not a valid header.
     let lockb_path = project.path().join("lpm.lockb");
@@ -1958,7 +1993,7 @@ async fn install_with_truncated_lockb_falls_back_to_toml() {
     // Run install again. Must NOT panic; must produce a coherent end
     // state (either by re-parsing lpm.lock or by re-resolving from
     // package.json).
-    let second = lpm(&project)
+    let second = lpm_with_registry(&project, &mock.url())
         .args(install_args_with(&[]))
         .output()
         .expect("run second install");

@@ -141,6 +141,9 @@ pub enum ResolveError {
         detail: String,
     },
 
+    #[error("package {package} was not found: {detail}")]
+    PackageNotFound { package: String, detail: String },
+
     #[error("failed to choose version for {package}: {detail}")]
     VersionChoice { package: String, detail: String },
 

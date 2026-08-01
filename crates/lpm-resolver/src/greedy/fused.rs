@@ -195,8 +195,7 @@ impl OrderedMetadataFetches {
                 self.next_commit_sequence.checked_add(1).ok_or_else(|| {
                     ResolveError::Internal("metadata commit sequence overflow".into())
                 })?;
-            let succeeded = result.is_ok();
-            complete_metadata_fetch(canonical.clone(), result, completion)?;
+            let succeeded = complete_metadata_fetch(canonical.clone(), result, completion)?;
             if succeeded {
                 self.committed.insert(canonical);
             }

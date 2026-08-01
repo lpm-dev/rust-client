@@ -1636,7 +1636,6 @@ async fn run_with_options_under_store_lock(
         used_lockfile,
         resolved_with,
         auto_isolated_peer_conflicts,
-        workspace_install_packages: &v2_workspace_root_pre_resolve.install_pkgs,
         packages_for_lockfile: &packages_for_lockfile,
         deps: &deps,
         ambient_peer_installs_for_lockfile: &ambient_peer_installs_for_lockfile,

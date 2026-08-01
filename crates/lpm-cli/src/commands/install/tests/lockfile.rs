@@ -22,6 +22,23 @@ use super::*;
 use lpm_resolver::NpmVersion;
 use lpm_resolver::ResolverPackage;
 
+#[test]
+fn importer_snapshot_with_peer_install_state_is_authoritative() {
+    let snapshot = lpm_lockfile::ImporterSnapshot {
+        auto_install_peers: Some(false),
+        ..Default::default()
+    };
+
+    assert!(importer_snapshot_is_authoritative(&snapshot));
+}
+
+#[test]
+fn importer_snapshot_without_peer_install_state_is_legacy() {
+    assert!(!importer_snapshot_is_authoritative(
+        &lpm_lockfile::ImporterSnapshot::default()
+    ));
+}
+
 fn fake_resolved(name: &str, version: &str, context: Option<&str>) -> ResolvedPackage {
     let pkg = match context {
         Some(ctx) => ResolverPackage::npm(name).with_context(ctx),

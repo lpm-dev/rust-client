@@ -85,6 +85,19 @@ pub(super) fn prepare_workspace_install_context(
     };
 
     let all_workspace_members = all_workspace_members(workspace.as_deref())?;
+    let semver_workspace_members =
+        extract_matching_workspace_semver_deps(deps, &all_workspace_members);
+    if !semver_workspace_members.is_empty() && !json_output {
+        for member in &semver_workspace_members {
+            tracing::debug!(
+                "workspace member (compatible local version): {} @ {} from {}",
+                member.name,
+                member.version,
+                member.source_dir.display()
+            );
+        }
+    }
+    workspace_member_deps.extend(semver_workspace_members);
 
     pre_extract_file_link_workspace_members(
         deps,
@@ -127,7 +140,7 @@ fn resolve_install_catalogs(
     Ok(resolved)
 }
 
-fn all_workspace_members(
+pub(super) fn all_workspace_members(
     workspace: Option<&lpm_workspace::Workspace>,
 ) -> Result<Vec<WorkspaceMemberLink>, LpmError> {
     let Some(workspace) = workspace else {
@@ -420,6 +433,169 @@ pub(super) fn extract_workspace_protocol_deps(
     Ok(extracted)
 }
 
+pub(super) fn extract_matching_workspace_semver_deps(
+    deps: &mut HashMap<String, String>,
+    workspace_members: &[WorkspaceMemberLink],
+) -> Vec<WorkspaceMemberLink> {
+    if deps.is_empty() || workspace_members.is_empty() {
+        return Vec::new();
+    }
+
+    let members_by_name: HashMap<&str, &WorkspaceMemberLink> = workspace_members
+        .iter()
+        .map(|member| (member.name.as_str(), member))
+        .collect();
+    let mut matching_names = Vec::new();
+
+    for (name, raw_specifier) in deps.iter() {
+        let Some(member) = members_by_name.get(name.as_str()) else {
+            continue;
+        };
+        let Ok(lpm_resolver::Specifier::SemverRange(raw_range)) =
+            lpm_resolver::Specifier::parse(raw_specifier)
+        else {
+            continue;
+        };
+        let (Ok(range), Ok(version)) = (
+            lpm_resolver::NpmRange::parse(&raw_range),
+            lpm_resolver::NpmVersion::parse(&member.version),
+        ) else {
+            continue;
+        };
+        if range.satisfies(&version) {
+            matching_names.push(name.clone());
+        }
+    }
+
+    matching_names.sort_unstable();
+    let mut extracted = Vec::with_capacity(matching_names.len());
+    for name in matching_names {
+        deps.remove(&name);
+        extracted.push((*members_by_name[&name.as_str()]).clone());
+    }
+    extracted
+}
+
+pub(super) fn workspace_member_cache_info(
+    member: &WorkspaceMemberLink,
+) -> Result<Option<lpm_resolver::CachedPackageInfo>, LpmError> {
+    let Ok(version) = lpm_resolver::NpmVersion::parse(&member.version) else {
+        return Ok(None);
+    };
+    let pkg_json_path = member.resolution_dir().join("package.json");
+    let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path) else {
+        return Ok(None);
+    };
+    let version_string = version.to_string();
+
+    let mut dependencies =
+        HashMap::with_capacity(pkg.dependencies.len() + pkg.optional_dependencies.len());
+    let mut aliases = HashMap::new();
+    let mut optional_names = HashSet::with_capacity(pkg.optional_dependencies.len());
+    {
+        let mut insert_dependency = |local_name: String,
+                                     raw_specifier: String|
+         -> Result<(), LpmError> {
+            let effective_specifier =
+                    lpm_resolver::normalize_jsr_dependency(&local_name, &raw_specifier)
+                        .map_err(|error| {
+                            LpmError::Workspace(format!(
+                                "workspace member `{}` dependency `{local_name}` has invalid spec `{raw_specifier}` in {}: {error}",
+                                member.name,
+                                pkg_json_path.display(),
+                            ))
+                        })?
+                        .unwrap_or(raw_specifier);
+
+            if let Some(alias) = lpm_resolver::ranges::parse_npm_alias(&effective_specifier) {
+                aliases.insert(local_name.clone(), alias.target);
+                dependencies.insert(local_name, alias.range);
+            } else {
+                dependencies.insert(local_name, effective_specifier);
+            }
+            Ok(())
+        };
+        for (name, specifier) in pkg.dependencies {
+            insert_dependency(name, specifier)?;
+        }
+        for (name, specifier) in pkg.optional_dependencies {
+            optional_names.insert(name.clone());
+            insert_dependency(name, specifier)?;
+        }
+    }
+
+    let mut dependencies_by_version = HashMap::with_capacity(1);
+    dependencies_by_version.insert(version_string.clone(), dependencies);
+
+    let mut peer_dependencies = HashMap::new();
+    if !pkg.peer_dependencies.is_empty() {
+        peer_dependencies.insert(version_string.clone(), pkg.peer_dependencies);
+    }
+
+    let mut optional_dependency_names = HashMap::new();
+    if !optional_names.is_empty() {
+        optional_dependency_names.insert(version_string.clone(), optional_names);
+    }
+
+    let optional_peers: HashSet<String> = pkg
+        .peer_dependencies_meta
+        .into_iter()
+        .filter_map(|(name, metadata)| metadata.optional.then_some(name))
+        .collect();
+    let mut optional_peer_names = HashMap::new();
+    if !optional_peers.is_empty() {
+        optional_peer_names.insert(version_string.clone(), optional_peers);
+    }
+
+    let mut aliases_by_version = HashMap::new();
+    if !aliases.is_empty() {
+        aliases_by_version.insert(version_string.clone(), aliases);
+    }
+
+    let mut node_engines = HashMap::new();
+    if let Some(required) = pkg.engines.get("node") {
+        node_engines.insert(version_string.clone(), required.clone());
+    }
+
+    let mut dist = HashMap::with_capacity(1);
+    dist.insert(version_string, lpm_resolver::CachedDistInfo::default());
+
+    Ok(Some(lpm_resolver::CachedPackageInfo {
+        modified: Some("1970-01-01T00:00:00.000Z".to_string()),
+        modified_unix: Some(0),
+        trust_metadata_complete: true,
+        versions_complete: false,
+        covered_ranges: HashSet::new(),
+        workspace_versions: HashSet::from([version.clone()]),
+        platform_metadata_complete: true,
+        latest_version: None,
+        versions: vec![version],
+        deps: dependencies_by_version,
+        peer_deps: peer_dependencies,
+        optional_dep_names: optional_dependency_names,
+        optional_peer_names,
+        node_engines,
+        bundled_dep_names: HashMap::new(),
+        platform: HashMap::new(),
+        dist,
+        aliases: aliases_by_version,
+    }))
+}
+
+pub(super) fn seed_workspace_resolver_cache(
+    shared_cache: &lpm_resolver::SharedCache,
+    members: &[WorkspaceMemberLink],
+) -> Result<(), LpmError> {
+    for member in members {
+        let Some(info) = workspace_member_cache_info(member)? else {
+            continue;
+        };
+        let key = lpm_resolver::CanonicalKey::from_dep_name(&member.name);
+        shared_cache.insert(key, Arc::new(info));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_workspace_self_dependencies(
     pkg: &lpm_workspace::PackageJson,
     install_deps: &mut HashMap<String, String>,
@@ -463,6 +639,44 @@ pub(super) fn workspace_member_source(project_dir: &Path, source_dir: &Path) -> 
         source.push('.');
     }
     format!("directory+{source}")
+}
+
+pub(super) fn rewrite_workspace_resolved_sources(
+    packages: &mut [InstallPackage],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    workspace_members: &[WorkspaceMemberLink],
+    project_dir: &Path,
+) {
+    if workspace_members.is_empty() {
+        return;
+    }
+    let members_by_name: HashMap<&str, &WorkspaceMemberLink> = workspace_members
+        .iter()
+        .map(|member| (member.name.as_str(), member))
+        .collect();
+
+    for package in packages {
+        let Some(member) = members_by_name.get(package.name.as_str()) else {
+            continue;
+        };
+        let Ok(version) = lpm_resolver::NpmVersion::parse(&package.version) else {
+            continue;
+        };
+        let canonical = CanonicalKey::from_dep_name(&package.name);
+        let selected_from_workspace = resolver_cache
+            .get(&canonical)
+            .is_some_and(|info| info.workspace_versions.contains(&version));
+        if !selected_from_workspace || package.version != member.version {
+            continue;
+        }
+        package.source = workspace_member_source(project_dir, member.resolution_dir());
+        package.is_lpm = false;
+        package.integrity = None;
+        package.registry_signatures.clear();
+        package.registry_published_at = None;
+        package.tarball_url = None;
+        package.metadata_checked_for_tarball = false;
+    }
 }
 
 pub(super) fn append_workspace_links_from_local_packages(
