@@ -50,6 +50,49 @@ fn workspace_project() -> TempProject {
     project
 }
 
+fn publish_directory_workspace(with_build_output: bool) -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+  "name": "publish-directory-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/library/package.json",
+        r#"{
+  "name": "@fixture/library",
+  "version": "1.0.0",
+  "publishConfig": { "directory": "build" }
+}"#,
+    );
+    if with_build_output {
+        project.write_file(
+            "packages/library/build/package.json",
+            r#"{
+  "name": "@fixture/library",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+        );
+        project.write_file(
+            "packages/library/build/index.js",
+            "module.exports = 'published';\n",
+        );
+    }
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fixture/library": "workspace:*" }
+}"#,
+    );
+    project
+}
+
 fn assert_install_succeeded(output: &std::process::Output, context: &str) {
     assert!(
         output.status.success(),
@@ -155,6 +198,219 @@ fn recursive_install_resolves_workspace_protocol_to_named_root_package() {
             linked_manifest["version"].as_str(),
         ),
         (Some("vitepress"), Some("1.5.0")),
+    );
+}
+
+#[test]
+fn workspace_protocol_links_the_declared_publish_directory() {
+    let project = publish_directory_workspace(true);
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install workspace package with publish directory");
+
+    assert_install_succeeded(
+        &output,
+        "workspace dependency with publishConfig.directory should install",
+    );
+    assert_eq!(
+        project.read_file("packages/app/node_modules/@fixture/library/index.js"),
+        "module.exports = 'published';\n",
+        "workspace dependency must expose the declared publish directory",
+    );
+}
+
+#[test]
+fn frozen_offline_replay_preserves_workspace_publish_directory_projection() {
+    let project = publish_directory_workspace(true);
+    let app_dir = project.path().join("packages/app");
+    let initial = lpm(&project)
+        .current_dir(&app_dir)
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install workspace package with publish directory");
+    assert_install_succeeded(&initial, "initial workspace install should succeed");
+
+    std::fs::remove_dir_all(app_dir.join("node_modules"))
+        .expect("remove installed workspace layout before replay");
+    std::fs::remove_dir_all(app_dir.join(".lpm"))
+        .expect("remove materialization state before replay");
+
+    let replay = lpm(&project)
+        .current_dir(&app_dir)
+        .args([
+            "install",
+            "--no-recursive",
+            "--offline",
+            "--frozen-lockfile",
+        ])
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("replay workspace publish directory from the lockfile");
+
+    assert_install_succeeded(
+        &replay,
+        "frozen offline replay should preserve the workspace projection",
+    );
+    let link = app_dir.join("node_modules/@fixture/library");
+    let link_metadata = std::fs::symlink_metadata(&link).unwrap_or_else(|error| {
+        panic!(
+            "frozen offline replay should recreate the workspace link at {}: {error}",
+            link.display()
+        )
+    });
+    assert!(
+        link_metadata.file_type().is_symlink() || link_metadata.is_dir(),
+        "replayed workspace entry should remain a directory link"
+    );
+    let replay_target = std::fs::read_link(&link)
+        .unwrap_or_else(|error| panic!("read replayed workspace link target: {error}"));
+    assert!(
+        std::fs::metadata(&link).is_ok(),
+        "replayed workspace link target should exist: {} -> {}",
+        link.display(),
+        replay_target.display()
+    );
+    assert_eq!(
+        project.read_file("packages/app/node_modules/@fixture/library/index.js"),
+        "module.exports = 'published';\n",
+        "lockfile replay must expose the declared publish directory",
+    );
+}
+
+#[test]
+fn workspace_protocol_allows_a_publish_directory_before_build_output_exists() {
+    let project = publish_directory_workspace(false);
+    let app_dir = project.path().join("packages/app");
+    let output = lpm(&project)
+        .current_dir(&app_dir)
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install workspace package before its publish directory is built");
+
+    assert_install_succeeded(
+        &output,
+        "workspace install should allow a not-yet-built publish directory",
+    );
+
+    #[cfg(unix)]
+    {
+        let link = app_dir.join("node_modules/@fixture/library");
+        let metadata = std::fs::symlink_metadata(&link)
+            .expect("workspace publish directory should have a dangling symlink");
+        assert!(metadata.file_type().is_symlink());
+        let target = std::fs::read_link(&link).expect("read workspace publish directory link");
+        assert!(
+            target.ends_with("library/build"),
+            "workspace link should target the publish directory, got {}",
+            target.display()
+        );
+        assert!(std::fs::metadata(link).is_err());
+    }
+}
+
+#[test]
+fn workspace_protocol_rejects_publish_directory_parent_traversal() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "invalid-publish-directory-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/library/package.json",
+        r#"{
+  "name": "@fixture/library",
+  "version": "1.0.0",
+  "publishConfig": { "directory": "../outside" }
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fixture/library": "workspace:*" }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install workspace package with invalid publish directory");
+
+    assert!(
+        !output.status.success(),
+        "publish directory traversal must fail",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("publishConfig.directory") && stderr.contains("../outside"),
+        "failure should identify the invalid publish directory: {stderr}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_protocol_rejects_missing_publish_directory_through_symlink_escape() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "symlink-escape-publish-directory-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/library/package.json",
+        r#"{
+  "name": "@fixture/library",
+  "version": "1.0.0",
+  "publishConfig": { "directory": "projection/build" }
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fixture/library": "workspace:*" }
+}"#,
+    );
+    let outside = project.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create path outside the workspace package");
+    std::os::unix::fs::symlink(&outside, project.path().join("packages/library/projection"))
+        .expect("create publish-directory symlink escape");
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install workspace package through publish-directory symlink escape");
+
+    assert!(!output.status.success(), "symlink escape must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("publishConfig.directory")
+            && stderr.contains("resolves outside its package directory"),
+        "failure should identify the publish-directory symlink escape: {stderr}",
     );
 }
 
@@ -1422,7 +1678,7 @@ async fn recursive_install_commits_no_importer_when_root_firewall_blocks() {
         &[("member-allowed", "1.0.0"), ("root-blocked", "1.0.0")],
     )
     .await;
-    mock.with_npm_firewall_allow("member-allowed", "1.0.0")
+    mock.with_npm_firewall_allow_expected("member-allowed", "1.0.0", 0..=1)
         .await;
     mock.with_npm_firewall_block("root-blocked", "1.0.0").await;
 

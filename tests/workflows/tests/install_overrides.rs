@@ -51,28 +51,68 @@ fn strip_ansi(s: &str) -> String {
 
 /// Synthetic `lpm.lock` containing the given `(name, version, deps)` entries.
 fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
-    let pkgs: Vec<String> = entries
-        .iter()
-        .map(|(name, version, deps)| {
-            let deps_block = if deps.is_empty() {
-                String::new()
-            } else {
-                let inner = deps
-                    .iter()
-                    .map(|d| format!("\"{d}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("\ndependencies = [{inner}]")
-            };
-            format!("[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n")
-        })
+    let package: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("parse fixture manifest");
+    let string_map = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|specifier| (name.clone(), specifier.to_string()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let root_dependencies = string_map(package.get("dependencies"));
+    let catalogs = package
+        .get("catalogs")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, entries)| (name.clone(), string_map(Some(entries))))
         .collect();
-    let toml = format!(
-        "[metadata]\nlockfile-version = {}\nresolved-with = \"pubgrub\"\n\n{}\n",
-        lpm_lockfile::LOCKFILE_VERSION,
-        pkgs.join("\n")
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("pubgrub");
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: root_dependencies.clone(),
+            dev_dependencies: string_map(package.get("devDependencies")),
+            optional_dependencies: string_map(package.get("optionalDependencies")),
+            peer_dependencies: string_map(package.get("peerDependencies")),
+            lpm_overrides: string_map(package.pointer("/lpm/overrides")),
+            overrides: string_map(package.get("overrides")),
+            resolutions: string_map(package.get("resolutions")),
+            catalogs,
+            auto_install_peers: Some(true),
+            ..Default::default()
+        },
     );
-    project.write_file("lpm.lock", &toml);
+    for (name, version, package_dependencies) in entries {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: (*name).to_string(),
+            version: (*version).to_string(),
+            dependencies: package_dependencies
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            ..Default::default()
+        });
+        if root_dependencies.contains_key(*name) {
+            lockfile.root_resolutions.insert(
+                (*name).to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    package: (*name).to_string(),
+                    version: (*version).to_string(),
+                    source: None,
+                },
+            );
+        }
+    }
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write fixture lockfile");
 }
 
 /// Seed a valid integrity-keyed v2 object and bind the matching lockfile row
@@ -523,4 +563,146 @@ async fn install_does_not_follow_preplanted_overrides_state_temp_hardlink() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), original);
+}
+
+async fn mount_peer_override_packages(mock: &MockRegistry) {
+    mock.with_full_package_metadata(
+        "peer-host",
+        "1.1.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("peer-host", "1.0.0")),
+            ),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("peer-host", "1.1.0")),
+            ),
+        ],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "peerDependencies": { "peer-host": "1.1.0" }
+        }),
+        &[],
+    )
+    .await;
+}
+
+fn peer_override_project() -> TempProject {
+    TempProject::empty(
+        r#"{
+  "name": "override-root-link",
+  "version": "1.0.0",
+  "dependencies": {
+    "peer-consumer": "1.0.0",
+    "peer-host": "^1.0.0"
+  },
+  "lpm": {
+    "overrides": { "peer-host": "1.0.0" }
+  }
+}"#,
+    )
+}
+
+#[tokio::test]
+async fn install_root_link_uses_the_version_selected_by_an_override() {
+    let mock = MockRegistry::start().await;
+    mount_peer_override_packages(&mock).await;
+    let project = peer_override_project();
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install override with a second peer-selected version");
+    assert!(
+        output.status.success(),
+        "override install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let linked_manifest =
+        std::fs::read_to_string(project.path().join("node_modules/peer-host/package.json"))
+            .expect("read root-linked peer-host manifest");
+    let linked: serde_json::Value =
+        serde_json::from_str(&linked_manifest).expect("parse root-linked peer-host manifest");
+    assert_eq!(linked["version"], "1.0.0");
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read exact root selection");
+    assert_eq!(
+        lockfile
+            .root_resolutions
+            .get("peer-host")
+            .map(|selection| selection.version.as_str()),
+        Some("1.0.0")
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove fresh install layout");
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("replay override selection from lockfile");
+    assert!(
+        replay.status.success(),
+        "frozen replay must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+
+    let replayed_manifest =
+        std::fs::read_to_string(project.path().join("node_modules/peer-host/package.json"))
+            .expect("read replayed peer-host manifest");
+    let replayed: serde_json::Value =
+        serde_json::from_str(&replayed_manifest).expect("parse replayed peer-host manifest");
+    assert_eq!(replayed["version"], "1.0.0");
+}
+
+#[tokio::test]
+async fn install_override_applies_to_required_peer_binding() {
+    let mock = MockRegistry::start().await;
+    mount_peer_override_packages(&mock).await;
+    let project = peer_override_project();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install override with a required peer");
+    assert!(
+        output.status.success(),
+        "override install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read peer override lockfile");
+    let peer_consumer = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-consumer")
+        .expect("peer-consumer must be locked");
+    assert_eq!(peer_consumer.peers, ["peer-host@1.0.0"]);
 }

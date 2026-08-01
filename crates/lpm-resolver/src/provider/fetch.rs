@@ -1,5 +1,28 @@
 use super::prelude::*;
 
+pub(super) struct ReleaseTimePolicyFetchDetail {
+    pub(super) total_ms: u128,
+    pub(super) timings: lpm_registry::PackageMetadataFetchTimings,
+    pub(super) version_count: u64,
+}
+
+impl ReleaseTimePolicyFetchDetail {
+    pub(super) fn apply_to(&self, record: &mut lpm_registry::timing::MetadataFetchDetailRecord) {
+        record.policy_release_time_fetch_ms = self.total_ms;
+        record.policy_release_time_cache_read_ms = self.timings.cache_read_ms;
+        record.policy_release_time_validator_read_ms = self.timings.validator_read_ms;
+        record.policy_release_time_http_ms = self.timings.http_ms;
+        record.policy_release_time_body_read_ms = self.timings.body_read_ms;
+        record.policy_release_time_json_decode_ms = self.timings.json_decode_ms;
+        record.policy_release_time_cache_after_304_ms = self.timings.cache_after_304_ms;
+        record.policy_release_time_cache_write_dispatch_ms = self.timings.cache_write_dispatch_ms;
+        record.policy_release_time_body_bytes = self.timings.body_bytes;
+        record.policy_release_time_version_count = self.version_count;
+        record.policy_release_time_cache_hit = self.timings.cache_hit;
+        record.policy_release_time_not_modified = self.timings.not_modified;
+    }
+}
+
 impl LpmDependencyProvider {
     /// Synchronous fetch of a single package, keyed + cached under its
     /// canonical form. LPM → Worker unconditionally; npm → per `RouteMode`.
@@ -61,23 +84,21 @@ impl LpmDependencyProvider {
                 let total_start = trace_metadata_fetches.then(Instant::now);
                 let raw_start = trace_metadata_fetches.then(Instant::now);
                 let mut detail: Option<lpm_registry::timing::MetadataFetchDetailRecord> = None;
-                let metadata = match &route {
-                    UpstreamRoute::LpmWorker => {
-                        self.rt
-                            .block_on(self.client.get_npm_package_metadata(name))
-                            .inspect(|metadata| {
-                                if let Some(start) = raw_start {
-                                    detail =
-                                        Some(lpm_registry::timing::MetadataFetchDetailRecord {
-                                            package: key.to_string(),
-                                            route: "lpm_worker",
-                                            raw_fetch_ms: start.elapsed().as_millis(),
-                                            version_count: metadata.versions.len() as u64,
-                                            ..lpm_registry::timing::MetadataFetchDetailRecord::default()
-                                        });
-                                }
-                            })
-                    }
+                let metadata_result = match &route {
+                    UpstreamRoute::LpmWorker => self
+                        .rt
+                        .block_on(self.client.get_npm_package_metadata(name))
+                        .inspect(|metadata| {
+                            if let Some(start) = raw_start {
+                                detail = Some(lpm_registry::timing::MetadataFetchDetailRecord {
+                                    package: key.to_string(),
+                                    route: "lpm_worker",
+                                    raw_fetch_ms: start.elapsed().as_millis(),
+                                    version_count: metadata.versions.len() as u64,
+                                    ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                                });
+                            }
+                        }),
                     UpstreamRoute::NpmDirect => {
                         if trace_metadata_fetches {
                             self.rt
@@ -132,8 +153,21 @@ impl LpmDependencyProvider {
                                 }
                             })
                     }
-                }
-                .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+                };
+                let metadata = match metadata_result {
+                    Ok(metadata) => metadata,
+                    Err(lpm_common::LpmError::NotFound(_))
+                        if activate_workspace_fallback(&self.cache, &key).is_some() =>
+                    {
+                        self.available_versions_cache
+                            .borrow_mut()
+                            .retain(|package, _| CanonicalKey::from(package) != key);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(ProviderError::Registry(format!("npm:{name}: {error}")));
+                    }
+                };
 
                 let parse_start = trace_metadata_fetches.then(Instant::now);
                 let mut info = parse_metadata_to_cache_info(&metadata);
@@ -150,13 +184,24 @@ impl LpmDependencyProvider {
                     {
                         record.policy_full_metadata_ms = start.elapsed().as_millis();
                     }
-                } else if info.needs_release_time_metadata(&key, &self.policy) {
-                    let policy_start = trace_metadata_fetches.then(Instant::now);
-                    self.fetch_release_time_policy_info(name, route, &key, &mut info)?;
-                    if let Some(record) = &mut detail
-                        && let Some(start) = policy_start
-                    {
-                        record.policy_release_time_ms = start.elapsed().as_millis();
+                } else {
+                    if info.needs_release_time_metadata(&key, &self.policy) {
+                        let policy_start = trace_metadata_fetches.then(Instant::now);
+                        let release_time_detail = self.fetch_release_time_policy_info(
+                            name,
+                            route.clone(),
+                            &key,
+                            &mut info,
+                        )?;
+                        if let Some(record) = &mut detail
+                            && let Some(start) = policy_start
+                        {
+                            record.policy_release_time_ms = start.elapsed().as_millis();
+                            release_time_detail.apply_to(record);
+                        }
+                    }
+                    if info.needs_platform_metadata() {
+                        self.fetch_platform_info(name, route, &key, &mut info)?;
                     }
                 }
                 if let Some(mut record) = detail {
@@ -186,7 +231,7 @@ impl LpmDependencyProvider {
             )
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
         let info = parse_full_metadata_to_cache_info(&full);
-        if !info.needs_policy_metadata(key, &self.policy) {
+        if !info.needs_supplemental_metadata(key, &self.policy) {
             return Ok(info);
         }
         if !matches!(route, UpstreamRoute::LpmWorker) {
@@ -203,36 +248,91 @@ impl LpmDependencyProvider {
         Ok(parse_full_metadata_to_cache_info(&direct_full))
     }
 
-    fn fetch_release_time_policy_info(
+    pub(super) fn fetch_release_time_policy_info(
         &self,
         name: &str,
         route: UpstreamRoute,
         key: &CanonicalKey,
         info: &mut CachedPackageInfo,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<ReleaseTimePolicyFetchDetail, ProviderError> {
+        let fetch_start = Instant::now();
         let release_times = self
             .rt
             .block_on(
                 self.client
-                    .get_npm_release_times_routed_full(name, route.clone()),
+                    .get_npm_release_times_routed_full_with_timings(name, route.clone()),
             )
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
-        merge_release_times_into_cache_info(info, &release_times);
+        let mut timings = release_times.timings;
+        let mut version_count = release_times.metadata.time.len() as u64;
+        merge_release_times_into_cache_info(info, &release_times.metadata);
         if !info.needs_policy_metadata(key, &self.policy) {
-            return Ok(());
+            return Ok(ReleaseTimePolicyFetchDetail {
+                total_ms: fetch_start.elapsed().as_millis(),
+                timings,
+                version_count,
+            });
         }
         if !matches!(route, UpstreamRoute::LpmWorker) {
-            return Ok(());
+            return Ok(ReleaseTimePolicyFetchDetail {
+                total_ms: fetch_start.elapsed().as_millis(),
+                timings,
+                version_count,
+            });
         }
 
         let direct_release_times = self
             .rt
             .block_on(
                 self.client
-                    .get_npm_release_times_routed_full(name, UpstreamRoute::NpmDirect),
+                    .get_npm_release_times_routed_full_with_timings(name, UpstreamRoute::NpmDirect),
             )
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
-        merge_release_times_into_cache_info(info, &direct_release_times);
+        timings = direct_release_times.timings;
+        version_count = direct_release_times.metadata.time.len() as u64;
+        merge_release_times_into_cache_info(info, &direct_release_times.metadata);
+        Ok(ReleaseTimePolicyFetchDetail {
+            total_ms: fetch_start.elapsed().as_millis(),
+            timings,
+            version_count,
+        })
+    }
+
+    pub(super) fn fetch_platform_info(
+        &self,
+        name: &str,
+        route: UpstreamRoute,
+        key: &CanonicalKey,
+        info: &mut CachedPackageInfo,
+    ) -> Result<(), ProviderError> {
+        let platform_metadata = self
+            .rt
+            .block_on(lpm_registry::timing::with_metadata_purpose(
+                lpm_registry::timing::MetadataPurpose::PlatformHydration,
+                self.client
+                    .get_npm_platform_metadata_routed_full(name, route.clone()),
+            ))
+            .map_err(|error| ProviderError::Registry(format!("npm:{name}: {error}")))?;
+        merge_release_times_into_cache_info(info, &platform_metadata);
+        if !info.needs_platform_metadata() {
+            return Ok(());
+        }
+        if matches!(route, UpstreamRoute::LpmWorker) {
+            let direct_platform_metadata = self
+                .rt
+                .block_on(lpm_registry::timing::with_metadata_purpose(
+                    lpm_registry::timing::MetadataPurpose::PlatformHydration,
+                    self.client
+                        .get_npm_platform_metadata_routed_full(name, UpstreamRoute::NpmDirect),
+                ))
+                .map_err(|error| ProviderError::Registry(format!("npm:{name}: {error}")))?;
+            merge_release_times_into_cache_info(info, &direct_platform_metadata);
+        }
+        if info.needs_platform_metadata() {
+            return Err(ProviderError::Registry(format!(
+                "npm:{key}: full registry metadata omitted the versions map required to recover platform restrictions"
+            )));
+        }
         Ok(())
     }
 }

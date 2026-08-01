@@ -28,8 +28,18 @@ impl LpmDependencyProvider {
         let info = self.cache.get(&key)?;
         let info = info.value();
 
+        if let Some(latest) = info.latest_version.as_ref()
+            && range.contains(latest)
+            && version_allowed_by_policy(&key, info, latest, &self.policy)
+        {
+            return Some(latest.clone());
+        }
+
         // Versions are sorted newest-first; first match wins.
         for version in &info.versions {
+            if info.latest_version.as_ref() == Some(version) {
+                continue;
+            }
             if !range.contains(version) {
                 continue;
             }
@@ -344,18 +354,6 @@ impl DependencyProvider for LpmDependencyProvider {
                     None => (dep_name.clone(), dep_range_str.clone()),
                 };
 
-                let pkg = ResolverPackage::from_dep_name(&target_name);
-                if let Err(error) = self.ensure_cached(&pkg) {
-                    if edge_is_optional {
-                        tracing::debug!(
-                            "optional root dep {dep_name} fetch failed; skipping: {error}"
-                        );
-                        continue;
-                    }
-                    return Err(error);
-                }
-                let available = self.available_versions(&pkg);
-
                 // **Defense-in-depth.** `workspace:<rest>` must
                 // be rewritten upstream by `lpm-workspace` before
                 // reaching the resolver. If it slips through (future
@@ -375,6 +373,17 @@ impl DependencyProvider for LpmDependencyProvider {
                 }
 
                 let npm_range = NpmRange::parse(&range_str).map_err(ProviderError::InvalidRange)?;
+                let pkg = ResolverPackage::from_dep_name(&target_name);
+                if let Err(error) = self.ensure_cached_for_range(&pkg, &npm_range) {
+                    if edge_is_optional {
+                        tracing::debug!(
+                            "optional root dep {dep_name} fetch failed; skipping: {error}"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
+                let available = self.available_versions(&pkg);
 
                 let range = if available.is_empty() {
                     npm_range.to_pubgrub_ranges_heuristic()
@@ -590,7 +599,25 @@ impl DependencyProvider for LpmDependencyProvider {
             // Other failure shapes (network blips, npm registry 5xx,
             // platform-incompatible) keep the silent debug behavior —
             // they're expected and noisy.
-            match self.ensure_cached(&pkg) {
+            let npm_range = match NpmRange::parse(dep_range_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    let detail = format!("invalid range for {pkg}@{dep_range_str}: {e}");
+                    tracing::debug!("provisionally skipping dep {dep_name}@{dep_range_str}: {e}");
+                    self.record_skipped_dependency(SkippedDependency::new(
+                        package,
+                        version,
+                        &pkg,
+                        dep_name,
+                        dep_range_str,
+                        edge_is_optional,
+                        SkippedDependencyReason::InvalidRange { detail },
+                    ));
+                    continue;
+                }
+            };
+
+            match self.ensure_cached_for_range(&pkg, &npm_range) {
                 Ok(()) => {}
                 Err(e) => {
                     let warn_auth = pkg.is_lpm() && matches!(&e, ProviderError::AuthRequired(_));
@@ -613,24 +640,6 @@ impl DependencyProvider for LpmDependencyProvider {
             // Ranges without a matching candidate follow the same deferred
             // validation path. Platform metadata on satisfying candidates is
             // preserved for install-time filtering.
-            let npm_range = match NpmRange::parse(dep_range_str) {
-                Ok(r) => r,
-                Err(e) => {
-                    let detail = format!("invalid range for {pkg}@{dep_range_str}: {e}");
-                    tracing::debug!("provisionally skipping dep {dep_name}@{dep_range_str}: {e}");
-                    self.record_skipped_dependency(SkippedDependency::new(
-                        package,
-                        version,
-                        &pkg,
-                        dep_name,
-                        dep_range_str,
-                        edge_is_optional,
-                        SkippedDependencyReason::InvalidRange { detail },
-                    ));
-                    continue;
-                }
-            };
-
             let range = if available.is_empty() {
                 npm_range.to_pubgrub_ranges_heuristic()
             } else {

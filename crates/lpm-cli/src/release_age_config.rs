@@ -24,8 +24,8 @@
 //! TOML is scoped to save-policy keys, while release-age policy lives in
 //! package.json, global config, or per-invocation flags.
 //!
-//! Exact package-name excludes are merged from the CLI
-//! `--min-release-age-exclude <pkg>` list, `package.json > lpm >
+//! Package, exact-version, and scoped-wildcard excludes are merged from the CLI
+//! `--min-release-age-exclude <selector>` list, `package.json > lpm >
 //! minimumReleaseAgeExclude`, and `~/.lpm/config.toml >
 //! minimum-release-age-exclude` when those layers are consulted. Excludes
 //! affect only release-age selection and the install halt; lifecycle
@@ -654,57 +654,34 @@ pub(crate) fn validate_release_age_excludes(
     let mut seen = HashSet::with_capacity(excludes.len());
     let mut normalized = Vec::with_capacity(excludes.len());
     for raw in excludes {
-        let package = validate_release_age_exclude(source, raw)?;
-        if seen.insert(package.clone()) {
-            normalized.push(package);
+        let exclude = parse_release_age_exclude(source, raw)?;
+        let normalized_exclude = exclude.to_string();
+        if seen.insert(normalized_exclude.clone()) {
+            normalized.push(normalized_exclude);
         }
     }
     Ok(normalized)
 }
 
-fn validate_release_age_exclude(source: &str, raw: &str) -> Result<String, LpmError> {
-    if raw.is_empty() {
-        return Err(LpmError::Registry(format!(
-            "{source} entries must be exact package names, got an empty string"
-        )));
-    }
-    if raw.trim() != raw {
-        return Err(LpmError::Registry(format!(
-            "{source} entries must not contain surrounding whitespace: `{raw}`"
-        )));
-    }
-    if raw.chars().any(|c| matches!(c, '*' | '?' | '[' | ']')) {
-        return Err(LpmError::Registry(format!(
-            "{source} supports exact package names only; glob selectors are not supported in v1: `{raw}`"
-        )));
-    }
-    if raw.chars().any(char::is_whitespace) {
-        return Err(LpmError::Registry(format!(
-            "{source} entries must be exact package names without whitespace: `{raw}`"
-        )));
-    }
-    if raw == "<root>" {
-        return Err(LpmError::Registry(format!(
-            "{source} cannot exclude the resolver root package"
-        )));
-    }
-    if raw.contains(':') {
-        return Err(LpmError::Registry(format!(
-            "{source} supports package names only, not package specifiers or protocols: `{raw}`"
-        )));
-    }
-    if !is_exact_package_name(raw) {
-        return Err(LpmError::Registry(format!(
-            "{source} entries must be valid exact package names: `{raw}`"
-        )));
-    }
-    let version_search_start = usize::from(raw.starts_with('@'));
-    if raw[version_search_start..].contains('@') {
-        return Err(LpmError::Registry(format!(
-            "{source} supports package names only, not package versions or ranges: `{raw}`"
-        )));
-    }
-    Ok(lpm_resolver::CanonicalKey::from_dep_name(raw).to_string())
+pub(crate) fn parse_release_age_exclusions(
+    source: &str,
+    excludes: &[String],
+) -> Result<Vec<lpm_resolver::ReleaseAgeExclusion>, LpmError> {
+    excludes
+        .iter()
+        .map(|raw| parse_release_age_exclude(source, raw))
+        .collect()
+}
+
+fn parse_release_age_exclude(
+    source: &str,
+    raw: &str,
+) -> Result<lpm_resolver::ReleaseAgeExclusion, LpmError> {
+    raw.parse().map_err(|detail| {
+        LpmError::Registry(format!(
+            "{source} entry `{raw}` is invalid: {detail}; expected a package name, exact package version, or `@scope/*`"
+        ))
+    })
 }
 
 fn extend_unique_excludes(target: &mut Vec<String>, source: Vec<String>) {
@@ -718,24 +695,6 @@ fn extend_unique_excludes(target: &mut Vec<String>, source: Vec<String>) {
             target.push(package);
         }
     }
-}
-
-fn is_exact_package_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 256 || name.contains('\0') || name.contains("..") {
-        return false;
-    }
-    if name.starts_with('@') {
-        let Some(slash_pos) = name.find('/') else {
-            return false;
-        };
-        let scope = &name[1..slash_pos];
-        let package = &name[slash_pos + 1..];
-        return !scope.is_empty()
-            && !package.is_empty()
-            && !package.contains('/')
-            && !package.contains('\\');
-    }
-    !name.contains('/') && !name.contains('\\')
 }
 
 #[cfg(test)]
@@ -962,27 +921,23 @@ mod tests {
     }
 
     #[test]
-    fn global_file_minimum_release_age_exclude_rejects_glob_selector() {
+    fn global_file_minimum_release_age_exclude_accepts_scoped_wildcard_selector() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         write_file(&path, r#"minimum-release-age-exclude = ["@scope/*"]"#);
-        let err = read_global_release_age_config_from_file(&path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("minimum-release-age-exclude"), "got: {err}");
-        assert!(err.contains("exact package names"), "got: {err}");
+        let result = read_global_release_age_config_from_file(&path).unwrap();
+
+        assert_eq!(result.minimum_release_age_exclude, vec!["@scope/*"]);
     }
 
     #[test]
-    fn global_file_minimum_release_age_exclude_rejects_version_selector() {
+    fn global_file_minimum_release_age_exclude_accepts_exact_version_selector() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         write_file(&path, r#"minimum-release-age-exclude = ["react@19.0.0"]"#);
-        let err = read_global_release_age_config_from_file(&path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("minimum-release-age-exclude"), "got: {err}");
-        assert!(err.contains("versions"), "got: {err}");
+        let result = read_global_release_age_config_from_file(&path).unwrap();
+
+        assert_eq!(result.minimum_release_age_exclude, vec!["react@19.0.0"]);
     }
 
     #[test]
@@ -1028,7 +983,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
 
-        assert!(err.contains("package names only"), "got: {err}");
+        assert!(err.contains("protocol"), "got: {err}");
     }
 
     #[test]
@@ -1038,7 +993,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
 
-        assert!(err.contains("valid exact package names"), "got: {err}");
+        assert!(err.contains("invalid package name"), "got: {err}");
     }
 
     #[test]

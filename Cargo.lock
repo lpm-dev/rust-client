@@ -3375,6 +3375,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lpm-ecosystem-verifier"
+version = "0.71.0"
+dependencies = [
+ "clap",
+ "lpm-common",
+ "lpm-lockfile",
+ "lpm-resolver",
+ "lpm-workspace",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lpm-env"
 version = "0.71.0"
 dependencies = [

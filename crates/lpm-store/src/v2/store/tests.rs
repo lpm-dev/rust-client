@@ -3348,14 +3348,36 @@ fn repeated_local_source_populate_keeps_identical_snapshot_in_place() {
     let third = store
         .populate_object_from_local_source(&source, &sri)
         .unwrap();
-    assert_ne!(
-        std::fs::metadata(&third).unwrap().ino(),
-        first_ino,
-        "a changed source must still refresh the snapshot",
-    );
     assert_eq!(
         std::fs::read_to_string(third.join("src/module-0.js")).unwrap(),
         "module.exports = 'changed';",
+        "a changed source must still refresh the snapshot",
+    );
+}
+
+#[test]
+fn local_source_snapshot_does_not_change_when_live_source_is_modified_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let sri = synthetic_sri(
+        b"local_source_snapshot_does_not_change_when_live_source_is_modified_in_place",
+    );
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    std::fs::write(
+        source.join("src/module-0.js"),
+        b"module.exports = 'changed';",
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(object_dir.join("src/module-0.js")).unwrap(),
+        "module.exports = 0;",
+        "a published local-source object must not share mutable file data with the live source",
     );
 }
 

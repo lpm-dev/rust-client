@@ -99,6 +99,8 @@ fn peer_deps_stored_per_version() {
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        workspace_versions: HashSet::new(),
+        platform_metadata_complete: true,
         latest_version: None,
         versions: vec![
             NpmVersion::parse("2.0.0").unwrap(),
@@ -512,6 +514,8 @@ fn make_info(
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        workspace_versions: HashSet::new(),
+        platform_metadata_complete: true,
         latest_version: None,
         versions: versions
             .iter()
@@ -645,6 +649,205 @@ fn parse_metadata_keeps_peer_dependencies_when_regular_dependency_cache_is_spars
     );
 }
 
+#[test]
+fn parse_metadata_regular_dependency_shadows_same_named_peer_requirement() {
+    let value = serde_json::json!({
+        "name": "dual-role-dependency",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "dual-role-dependency",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/dual-role-dependency-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                },
+                "dependencies": {
+                    "zod": "^4.3.6"
+                },
+                "peerDependencies": {
+                    "zod": "^4.0.0"
+                }
+            }
+        },
+    });
+    let meta: lpm_registry::PackageMetadata =
+        serde_json::from_value(value).expect("valid PackageMetadata");
+    let info = parse_metadata_to_cache_info(&meta);
+
+    assert_eq!(
+        info.deps
+            .get("1.0.0")
+            .and_then(|deps| deps.get("zod"))
+            .map(String::as_str),
+        Some("^4.3.6")
+    );
+    assert!(
+        !info
+            .peer_deps
+            .get("1.0.0")
+            .is_some_and(|peers| peers.contains_key("zod")),
+        "a regular dependency must not also become peer context"
+    );
+}
+
+#[test]
+fn merge_release_times_fills_missing_platform_axes_without_losing_abbreviated_metadata() {
+    let abbreviated: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "native-linux",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "native-linux",
+                "version": "1.0.0",
+                "os": ["linux"],
+                "cpu": ["arm64"],
+                "dependencies": { "runtime-helper": "^2.0.0" },
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/native-linux/-/native-linux-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        }
+    }))
+    .expect("valid abbreviated metadata");
+    let release_times: lpm_registry::ReleaseTimeMetadata =
+        serde_json::from_value(serde_json::json!({
+            "name": "native-linux",
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "os": ["linux"],
+                    "cpu": ["arm64"],
+                    "libc": ["glibc"]
+                }
+            }
+        }))
+        .expect("valid full metadata projected to release-time fields");
+
+    let mut info = parse_partial_metadata_to_cache_info(&abbreviated);
+    merge_release_times_into_cache_info(&mut info, &release_times);
+
+    assert!(info.platform_metadata_complete);
+
+    assert_eq!(
+        (
+            info.platform.get("1.0.0"),
+            info.deps
+                .get("1.0.0")
+                .and_then(|dependencies| dependencies.get("runtime-helper"))
+                .map(String::as_str),
+            info.dist
+                .get("1.0.0")
+                .and_then(|dist| dist.tarball_url.as_deref()),
+            info.dist
+                .get("1.0.0")
+                .and_then(|dist| dist.published_at.as_deref()),
+        ),
+        (
+            Some(&PlatformMeta {
+                os: vec!["linux".to_string()],
+                cpu: vec!["arm64".to_string()],
+                libc: vec!["glibc".to_string()],
+            }),
+            Some("^2.0.0"),
+            Some("https://registry.npmjs.org/native-linux/-/native-linux-1.0.0.tgz"),
+            Some("2025-01-01T00:00:00.000Z"),
+        ),
+        "release-time merging should fill missing platform axes while retaining abbreviated dependency and distribution data"
+    );
+}
+
+#[test]
+fn abbreviated_linux_platform_requires_full_platform_metadata() {
+    let abbreviated: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "native-linux",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "native-linux",
+                "version": "1.0.0",
+                "os": ["linux"],
+                "cpu": ["x64"]
+            }
+        }
+    }))
+    .expect("valid abbreviated metadata");
+
+    let info = parse_metadata_to_cache_info(&abbreviated);
+
+    assert!(info.needs_platform_metadata());
+}
+
+#[test]
+fn abbreviated_darwin_only_platform_does_not_require_libc_hydration() {
+    let abbreviated: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "native-darwin",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "native-darwin",
+                "version": "1.0.0",
+                "os": ["darwin"],
+                "cpu": ["arm64"]
+            }
+        }
+    }))
+    .expect("valid abbreviated metadata");
+
+    let info = parse_metadata_to_cache_info(&abbreviated);
+
+    assert!(!info.needs_platform_metadata());
+}
+
+#[test]
+fn abbreviated_cpu_only_platform_requires_libc_hydration() {
+    let abbreviated: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "native-cpu",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "native-cpu",
+                "version": "1.0.0",
+                "cpu": ["x64"]
+            }
+        }
+    }))
+    .expect("valid abbreviated metadata");
+
+    let info = parse_metadata_to_cache_info(&abbreviated);
+
+    assert!(info.needs_platform_metadata());
+}
+
+#[test]
+fn time_only_release_metadata_does_not_complete_platform_metadata() {
+    let abbreviated: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "native-linux",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "native-linux",
+                "version": "1.0.0",
+                "os": ["linux"],
+                "cpu": ["x64"]
+            }
+        }
+    }))
+    .expect("valid abbreviated metadata");
+    let release_times: lpm_registry::ReleaseTimeMetadata =
+        serde_json::from_value(serde_json::json!({
+            "name": "native-linux",
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        }))
+        .expect("valid time-only metadata");
+    let mut info = parse_metadata_to_cache_info(&abbreviated);
+
+    merge_release_times_into_cache_info(&mut info, &release_times);
+
+    assert!(info.needs_platform_metadata());
+}
+
 /// Regression test for the prerelease-stripping bug found in the
 /// hoisted-mode compatibility audit (vite-react,
 /// nextjs-minimal, babel-presets fixtures all failed with
@@ -715,6 +918,24 @@ fn parse_metadata_non_prerelease_range_skips_prereleases() {
 }
 
 // === choose_version: override warning behavior ===
+
+#[test]
+fn choose_version_prefers_satisfying_latest_dist_tag() {
+    let pkg = ResolverPackage::npm("dist-tag-range-preference");
+    let mut info = make_info(&["1.0.0-next.28", "1.0.0-next.25"], vec![], vec![], vec![]);
+    info.latest_version = Some(NpmVersion::parse("1.0.0-next.25").unwrap());
+    let provider = make_provider_with_cache(HashMap::new(), vec![(pkg.clone(), info)]);
+    let range = NpmRange::parse("^1.0.0-next.25")
+        .unwrap()
+        .to_pubgrub_ranges(&provider.available_versions(&pkg));
+
+    let chosen = provider.choose_version(&pkg, &range).unwrap();
+
+    assert_eq!(
+        chosen.map(|version| version.to_string()),
+        Some("1.0.0-next.25".to_string())
+    );
+}
 
 /// Build an OverrideSet from a single `lpm.overrides` entry. Test
 /// helper that mirrors the `OverrideSet::parse` call site in
@@ -1366,7 +1587,7 @@ fn direct_fetch_uses_direct_full_when_worker_full_omits_release_time() {
 }
 
 #[test]
-fn ensure_policy_metadata_trace_records_cached_full_policy_hydration() {
+fn ensure_policy_metadata_trace_records_cached_release_time_hydration() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1430,11 +1651,14 @@ fn ensure_policy_metadata_trace_records_cached_full_policy_hydration() {
     let mut cached = make_info(&["1.0.0"], vec![], vec![], vec![]);
     cached.modified = Some("2025-01-03T00:00:00.000Z".to_string());
     cached.modified_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
+    cached
+        .dist
+        .insert("1.0.0".to_string(), CachedDistInfo::default());
     provider.cache.insert(key.clone(), Arc::new(cached));
 
     provider
         .ensure_policy_metadata_with_trace(&pkg, &key, true)
-        .expect("cached abbreviated metadata should hydrate full policy metadata");
+        .expect("cached abbreviated metadata should hydrate release-time metadata");
 
     let snapshot = lpm_registry::timing::snapshot_metadata_fetch_detail();
     lpm_registry::timing::reset_metadata_detail();
@@ -1442,15 +1666,16 @@ fn ensure_policy_metadata_trace_records_cached_full_policy_hydration() {
 
     assert_eq!(snapshot.calls, 1);
     assert_eq!(snapshot.route_npm_direct_count, 1);
-    assert!(snapshot.attribution.policy_full_metadata_sum_ms > 0);
+    assert!(snapshot.attribution.policy_release_time_sum_ms > 0);
+    assert!(snapshot.attribution.policy_release_time_fetch_sum_ms > 0);
     assert!(
         snapshot
             .top_slow_packages
-            .by_policy_full_metadata
+            .by_policy_release_time_fetch
             .iter()
             .any(|row| row.package == key.to_string()
                 && row.route == "npm_direct"
-                && row.policy_full_metadata_ms > 0)
+                && row.policy_release_time_fetch_ms > 0)
     );
     let hydrated = provider.cache.get(&key).expect("hydrated cache entry");
     assert_eq!(

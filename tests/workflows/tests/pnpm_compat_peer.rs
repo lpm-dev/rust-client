@@ -441,6 +441,49 @@ async fn install_json_reports_peer_conflict_issue() {
 }
 
 #[tokio::test]
+async fn incompatible_peer_consumers_bind_to_matching_existing_versions() {
+    let mock = MockRegistry::start().await;
+    mount_conflicting_peer_graph(&mock).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "legacy-peer-carrier",
+            "version": "1.0.0",
+            "dependencies": {
+                "shared-peer": "1.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "legacy-peer-carrier": "1.0.0",
+                "peer-consumer-a": "1.0.0",
+                "peer-consumer-b": "1.0.0",
+                "shared-peer": "2.0.0"
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .output()
+        .expect("failed to install peer consumers with both peer versions available");
+    assert!(
+        output.status.success(),
+        "peer-isolated install must succeed\n{}",
+        output_text(&output)
+    );
+
+    assert_lockfile_has_peer_binding(&project, "peer-consumer-a", "1.0.0", "shared-peer@1.0.0");
+    assert_lockfile_has_peer_binding(&project, "peer-consumer-b", "1.0.0", "shared-peer@2.0.0");
+}
+
+#[tokio::test]
 async fn strict_peer_dependencies_cli_fails_when_required_peer_is_missing() {
     let mock = MockRegistry::start().await;
     mount_required_peer_host(&mock).await;

@@ -100,7 +100,7 @@ async fn parse_capped_metadata_accepts_utf8_bom_prefixed_response() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let mut body = Vec::from(UTF8_BOM_BYTES);
+    let mut body = Vec::from(b"\xEF\xBB\xBF".as_slice());
     body.extend_from_slice(br#"{"name":"bom-prefixed","versions":{}}"#);
     Mock::given(method("GET"))
         .and(match_path("/p"))

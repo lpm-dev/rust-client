@@ -121,16 +121,25 @@ pub(crate) async fn run_recursive_workspace_install(
         return Ok(());
     }
 
+    let root_target_index = targets.iter().position(|target| target.kind == "root");
+    let root_provider_fingerprint = root_target_index
+        .and_then(|_| {
+            workspace_resolution::root_provider_fingerprint_from_lockfile(&workspace.root)
+        })
+        .map(Arc::<str>::from);
     let targets_need_materialization = workspace_targets_need_materialization(&targets);
-    let lockfile_replay_ready = targets_need_materialization
-        && workspace_targets_are_lockfile_replay_ready(&workspace, &targets, &options);
+    let lockfile_replay_ready = workspace_targets_are_lockfile_replay_ready(
+        &workspace,
+        &targets,
+        &options,
+        root_provider_fingerprint.as_deref(),
+    );
     let share_local_source_populations =
         targets.iter().all(|target| !target.lifecycle.has_scripts());
-    let automatic_parallel_replay =
-        explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
-            && lockfile_replay_ready;
-    let resolve_ahead = targets_need_materialization
-        && !lockfile_replay_ready
+    let automatic_parallel_replay = targets_need_materialization
+        && explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
+        && lockfile_replay_ready;
+    let resolve_ahead = !lockfile_replay_ready
         && !options.offline
         && !options.force
         && explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
@@ -138,6 +147,15 @@ pub(crate) async fn run_recursive_workspace_install(
         && targets
             .iter()
             .all(|target| !target.lifecycle.has_scripts() && target.resolve_ahead_eligible);
+    let root_provider_coordinator = root_target_index
+        .filter(|index| {
+            !resolve_ahead
+                && !lockfile_replay_ready
+                && !options.offline
+                && share_local_source_populations
+                && targets[*index].resolve_ahead_eligible
+        })
+        .map(|_| Arc::new(workspace_resolution::WorkspaceRootProviderCoordinator::new()));
     let concurrency = resolve_workspace_install_concurrency(
         options.workspace_concurrency,
         targets.len(),
@@ -153,6 +171,7 @@ pub(crate) async fn run_recursive_workspace_install(
         concurrency,
         resolution_concurrency,
         resolve_ahead,
+        root_provider_serialized = root_provider_coordinator.is_some(),
         lockfile_replay_ready,
         share_local_source_populations,
         automatic_parallel_replay,
@@ -167,14 +186,22 @@ pub(crate) async fn run_recursive_workspace_install(
         )
     });
     let resolution_coordinator = resolve_ahead.then(|| {
-        Arc::new(workspace_resolution::WorkspaceResolutionCoordinator::new(
-            targets.len(),
-            resolution_concurrency,
-        ))
+        Arc::new(match root_target_index {
+            Some(root_index) => {
+                workspace_resolution::WorkspaceResolutionCoordinator::new_with_root(
+                    targets.len(),
+                    resolution_concurrency,
+                    root_index,
+                )
+            }
+            None => workspace_resolution::WorkspaceResolutionCoordinator::new(
+                targets.len(),
+                resolution_concurrency,
+            ),
+        })
     });
-    let workspace_client = resolution_coordinator
-        .as_ref()
-        .map(|_| client.clone_with_metadata_memory_cache());
+    let workspace_client =
+        (!options.offline && targets.len() > 1).then(|| client.clone_with_metadata_memory_cache());
     let client = workspace_client.as_ref().unwrap_or(client);
     let workspace_root = workspace.root.clone();
     let workspace_lock = lpm_common::project_install_lock(&workspace_root);
@@ -191,8 +218,10 @@ pub(crate) async fn run_recursive_workspace_install(
     let scheduler = local_tasks.run_until(async {
         let mut active_workspace = Arc::new(workspace);
         let target_count = targets.len();
-        let scheduling_order =
-            workspace_target_scheduling_order(&targets, resolution_coordinator.is_some());
+        let scheduling_order = workspace_target_scheduling_order(
+            &targets,
+            resolution_coordinator.is_some() || root_provider_coordinator.is_some(),
+        );
         let mut plans: Vec<Option<WorkspaceInstallTarget>> = targets.drain(..).map(Some).collect();
         let mut done = vec![false; target_count];
         let mut started_at = vec![None::<Instant>; target_count];
@@ -204,7 +233,11 @@ pub(crate) async fn run_recursive_workspace_install(
         loop {
             if first_error.is_none() {
                 for &index in &scheduling_order {
-                    let scheduler_limit = if resolution_coordinator.is_some() {
+                    let root_provider_pending = root_provider_coordinator.is_some()
+                        && root_target_index.is_some_and(|root_index| !done[root_index]);
+                    let scheduler_limit = if root_provider_pending {
+                        1
+                    } else if resolution_coordinator.is_some() {
                         target_count
                     } else {
                         concurrency
@@ -213,8 +246,12 @@ pub(crate) async fn run_recursive_workspace_install(
                         break;
                     }
                     let ready = plans[index].as_ref().is_some_and(|plan| {
-                        resolution_coordinator.is_some()
-                            || plan.schedule_after.iter().all(|dep| done[*dep])
+                        if root_provider_pending {
+                            root_target_index == Some(index)
+                        } else {
+                            resolution_coordinator.is_some()
+                                || plan.schedule_after.iter().all(|dep| done[*dep])
+                        }
                     });
                     if !ready {
                         continue;
@@ -231,6 +268,8 @@ pub(crate) async fn run_recursive_workspace_install(
                         Arc::clone(&options),
                         materialization_coordinator.as_ref().map(Arc::clone),
                         resolution_coordinator.as_ref().map(Arc::clone),
+                        root_provider_coordinator.as_ref().map(Arc::clone),
+                        root_provider_fingerprint.as_ref().map(Arc::clone),
                         &mut outcomes,
                     );
                 }
@@ -303,6 +342,8 @@ fn spawn_workspace_target_install(
         Arc<workspace_materialization::WorkspaceMaterializationCoordinator>,
     >,
     resolution_coordinator: Option<Arc<workspace_resolution::WorkspaceResolutionCoordinator>>,
+    root_provider_coordinator: Option<Arc<workspace_resolution::WorkspaceRootProviderCoordinator>>,
+    root_provider_fingerprint: Option<Arc<str>>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
@@ -315,7 +356,23 @@ fn spawn_workspace_target_install(
     let client = client.clone_with_config();
     let lpm_root = lpm_root.clone();
     in_flight.spawn_local(async move {
-        let install = run_workspace_target_install(plan, client, lpm_root, base_workspace, options);
+        let is_root = plan.kind == "root";
+        let install = run_workspace_target_install(
+            plan,
+            client,
+            lpm_root,
+            base_workspace,
+            options,
+            root_provider_fingerprint,
+        );
+        let install = async {
+            match root_provider_coordinator {
+                Some(coordinator) => {
+                    workspace_resolution::root_provider_scope(coordinator, is_root, install).await
+                }
+                None => install.await,
+            }
+        };
         let install = async {
             match materialization_coordinator {
                 Some(coordinator) => workspace_materialization::scope(coordinator, install).await,
@@ -336,6 +393,7 @@ async fn run_workspace_target_install(
     lpm_root: lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
+    root_provider_fingerprint: Option<Arc<str>>,
 ) -> Result<TargetTaskResult, LpmError> {
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
@@ -401,12 +459,18 @@ async fn run_workspace_target_install(
         Some(capture) => {
             crate::workspace_discovery_cache::scope(
                 Arc::clone(&scoped_workspace),
+                root_provider_fingerprint.as_ref().map(Arc::clone),
                 report_capture::scope(Arc::clone(capture), install),
             )
             .await?;
         }
         None => {
-            crate::workspace_discovery_cache::scope(Arc::clone(&scoped_workspace), install).await?;
+            crate::workspace_discovery_cache::scope(
+                Arc::clone(&scoped_workspace),
+                root_provider_fingerprint,
+                install,
+            )
+            .await?;
         }
     }
 
@@ -515,6 +579,7 @@ fn workspace_targets_are_lockfile_replay_ready(
     workspace: &lpm_workspace::Workspace,
     targets: &[WorkspaceInstallTarget],
     options: &RecursiveInstallOptions,
+    root_provider_fingerprint: Option<&str>,
 ) -> bool {
     if options.force
         || options.offline
@@ -540,7 +605,13 @@ fn workspace_targets_are_lockfile_replay_ready(
         let Some(package) = packages_by_path.get(target.path.as_path()).copied() else {
             return false;
         };
-        target_lockfile_is_replay_ready(workspace, &target.path, package, global_auto_install_peers)
+        target_lockfile_is_replay_ready(
+            workspace,
+            &target.path,
+            package,
+            global_auto_install_peers,
+            root_provider_fingerprint,
+        )
     })
 }
 
@@ -549,6 +620,7 @@ fn target_lockfile_is_replay_ready(
     project_dir: &Path,
     package: &lpm_workspace::PackageJson,
     global_auto_install_peers: Option<bool>,
+    root_provider_fingerprint: Option<&str>,
 ) -> bool {
     if package
         .lpm
@@ -595,7 +667,7 @@ fn target_lockfile_is_replay_ready(
     }) else {
         return false;
     };
-    let current_importer = validation::importer_snapshot_for_current_manifest(
+    let mut current_importer = validation::importer_snapshot_for_current_manifest(
         package,
         &overrides.lpm_overrides,
         overrides.overrides.as_ref(),
@@ -604,11 +676,32 @@ fn target_lockfile_is_replay_ready(
         None,
         auto_install_peers,
     );
+    let locked_uses_root_providers = lockfile
+        .importers
+        .get(".")
+        .and_then(|importer| {
+            importer
+                .workspace_root_peer_providers_fingerprint
+                .as_deref()
+        })
+        .is_some();
+    if project_dir != workspace.root && locked_uses_root_providers {
+        current_importer.workspace_root_peer_providers_fingerprint =
+            root_provider_fingerprint.map(str::to_string);
+    }
     if lockfile.importers.get(".") != Some(&current_importer) {
         return false;
     }
 
-    lockfile_satisfies_fast_path(&lockfile, &deps, &catalog_resolutions, false, false)
+    lockfile_satisfies_fast_path(
+        &lockfile,
+        project_dir,
+        &deps,
+        &catalog_resolutions,
+        Some(workspace),
+        false,
+        false,
+    )
 }
 
 fn select_workspace_install_targets(
@@ -1193,6 +1286,7 @@ mod tests {
             directory.path(),
             &package,
             None,
+            None,
         ));
     }
 
@@ -1212,6 +1306,7 @@ mod tests {
             directory.path(),
             &package,
             None,
+            None,
         ));
     }
 
@@ -1227,6 +1322,7 @@ mod tests {
             directory.path(),
             &package,
             None,
+            None,
         ));
     }
 
@@ -1241,6 +1337,7 @@ mod tests {
             &workspace,
             directory.path(),
             &package,
+            None,
             None,
         ));
     }

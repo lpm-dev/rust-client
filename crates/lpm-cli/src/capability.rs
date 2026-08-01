@@ -541,8 +541,8 @@ impl CapabilitySet {
                 });
             }
         };
-        let json: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| CapabilityParseError::Json {
+        let json: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&raw))
+            .map_err(|e| CapabilityParseError::Json {
                 path: package_json.display().to_string(),
                 source: e.to_string(),
             })?;
@@ -1470,6 +1470,16 @@ mod tests {
         let (_tmp, path) = pkg_json_fixture(r#"{"name":"x","version":"1.0.0"}"#);
         let s = CapabilitySet::from_package_json(&path).unwrap();
         assert!(s.is_at_baseline());
+    }
+
+    #[test]
+    fn parse_utf8_bom_prefixed_package_json_returns_capabilities() {
+        let (_tmp, path) =
+            pkg_json_fixture("\u{feff}{\"lpm\":{\"scripts\":{\"readProject\":\"full\"}}}");
+
+        let capabilities = CapabilitySet::from_package_json(&path).unwrap();
+
+        assert_eq!(capabilities.read_project, ReadProjectMode::Full);
     }
 
     #[test]

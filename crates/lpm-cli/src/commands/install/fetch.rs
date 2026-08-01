@@ -169,7 +169,7 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) allow_new: bool,
     pub(super) effective_min_age_secs: u64,
     pub(super) release_age_policy: crate::release_age_config::ReleaseAgePolicy,
-    pub(super) minimum_release_age_exclude: &'a HashSet<String>,
+    pub(super) minimum_release_age_exclude: &'a HashSet<lpm_resolver::ReleaseAgeExclusion>,
     pub(super) drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     pub(super) verify_policy: crate::provenance_fetch::VerifyPolicy,
     pub(super) global_config: &'a crate::commands::config::GlobalConfig,
@@ -1008,7 +1008,12 @@ pub(super) async fn run_online_fetch_phase(
             if !release_age_policy_applies_to_install_package(release_age_policy, p) {
                 continue;
             }
-            if minimum_release_age_exclude.contains(&p.name) {
+            let canonical = lpm_resolver::CanonicalKey::from_dep_name(&p.name);
+            let parsed_version = lpm_resolver::NpmVersion::parse(&p.version).ok();
+            if minimum_release_age_exclude
+                .iter()
+                .any(|exclude| exclude.matches(&canonical, parsed_version.as_ref()))
+            {
                 continue;
             }
             let key = (p.name.clone(), p.version.clone());
@@ -1177,7 +1182,7 @@ pub(super) async fn run_online_fetch_phase(
             for p in &packages {
                 let prior_verified = prior_verified_names.contains(p.name.as_str());
                 if !install_package_is_registry_source(p) {
-                    if trust_no_downgrade && prior_verified {
+                    if trust_no_downgrade && prior_verified && !used_lockfile {
                         return Err(provenance_downgrade_error(
                             &p.name,
                             &p.version,
@@ -1226,13 +1231,9 @@ pub(super) async fn run_online_fetch_phase(
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if used_lockfile {
                     let provenance_key = provenance_lockfile_id(p)?;
                     let Some(evidence) = lockfile_provenance.get(&provenance_key) else {
-                        if trust_no_downgrade && prior_verified {
-                            return Err(provenance_downgrade_error(
-                                &p.name,
-                                &p.version,
-                                "this version has no matching lockfile evidence",
-                            ));
-                        }
+                        // Name-level provenance history cannot distinguish an upgrade from
+                        // versions and sources that already coexisted in this lockfile. Only a
+                        // fresh resolution may classify missing evidence as a downgrade.
                         if availability_mode.is_strict() {
                             return Err(LpmError::ProvenanceVerification(format!(
                                 "strict provenance availability requires lockfile evidence for {}@{}",

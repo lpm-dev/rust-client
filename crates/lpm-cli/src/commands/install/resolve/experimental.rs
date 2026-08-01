@@ -221,7 +221,6 @@ pub(in crate::commands::install) async fn run(
     pre_resolved_install_pkgs: &[InstallPackage],
     pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
     workspace_member_deps: &[WorkspaceMemberLink],
-    all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     current_patches: &HashMap<String, PatchedDependencyEntry>,
     prior_patch_state: &Option<patch_state::PatchState>,
@@ -510,7 +509,6 @@ pub(in crate::commands::install) async fn run(
         auto_install_peers,
         include_optional_dependencies,
         optional_registry_roots,
-        all_workspace_members,
         catalog_resolutions,
         pre_resolved_install_pkgs,
         pre_resolved_source_deps,
@@ -877,7 +875,6 @@ async fn compute_parity_if_requested(
     auto_install_peers: bool,
     include_optional_dependencies: bool,
     optional_registry_roots: &HashSet<String>,
-    all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     pre_resolved_install_pkgs: &[InstallPackage],
     pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
@@ -895,7 +892,6 @@ async fn compute_parity_if_requested(
         ExperimentalResolverParityMode::Disabled => unreachable!(),
         ExperimentalResolverParityMode::FreshResolve { .. } => {
             let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-            seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
             let npm_fanout = positive_usize_env_or_default(
                 "LPM_NPM_FANOUT",
                 default_fusion_npm_fanout(false, 0),
@@ -920,16 +916,14 @@ async fn compute_parity_if_requested(
                 .await
                 .map_err(crate::resolver_error::resolver_error_to_lpm)?;
 
-            let mut packages = resolved_to_install_packages_with_workspace_members(
+            let mut packages = resolved_to_install_packages(
                 &resolve_result.packages,
                 deps,
                 &resolve_result.root_aliases,
+                &resolve_result.root_resolutions,
                 &resolve_result.ambient_peer_installs,
                 &resolve_result.cache,
-                &route_table,
-                client.as_ref(),
-                all_workspace_members,
-                project_dir,
+                RegistrySourceContext::new(&route_table, client.as_ref()),
             );
             let optional_dependency_names =
                 optional_dependency_names_from_resolver_cache(&packages, &resolve_result.cache);
@@ -951,6 +945,7 @@ async fn compute_parity_if_requested(
                 &lockfile_path,
                 deps,
                 catalog_resolutions,
+                None,
                 client.as_ref(),
                 &gate_stats,
                 true,

@@ -95,6 +95,8 @@ impl PackageKey {
 /// - **v7**: artifact-bound Sigstore provenance evidence. Frozen installs can
 ///   replay a previously verified publisher identity without fetching the
 ///   attestation again.
+/// - **v8**: exact root-link selections. Warm installs replay the resolver's
+///   chosen direct and ambient root packages instead of inferring versions.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -104,7 +106,8 @@ impl PackageKey {
 /// fast-path eligibility on subsequent installs).
 pub const LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES: u32 = 6;
 pub const LOCKFILE_VERSION_WITH_PROVENANCE: u32 = 7;
-pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_PROVENANCE;
+pub const LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS: u32 = 8;
+pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -117,6 +120,21 @@ pub type ImporterSnapshots = BTreeMap<String, ImporterSnapshot>;
 
 /// Lockfile-recorded patch evidence keyed by `<package-name>@<version>`.
 pub type LockfilePatches = BTreeMap<String, LockfilePatch>;
+
+/// Exact root-link selections keyed by the project-side link name.
+pub type RootResolutions = BTreeMap<String, LockedRootResolution>;
+
+/// One exact package identity selected for a project root link.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LockedRootResolution {
+    /// Canonical package name after npm-alias resolution.
+    pub package: String,
+    /// Exact selected package version.
+    pub version: String,
+    /// Package source identity used to disambiguate cross-source collisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
 
 /// One patch file bound to the package bytes it is allowed to modify.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -194,6 +212,14 @@ pub struct ImporterSnapshot {
         skip_serializing_if = "Option::is_none"
     )]
     pub auto_install_peers: Option<bool>,
+    /// Fingerprint of the workspace root's exact provider graph used to
+    /// satisfy peers for this importer during a recursive install.
+    #[serde(
+        default,
+        rename = "workspace-root-peer-providers-fingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workspace_root_peer_providers_fingerprint: Option<String>,
 }
 
 /// One lockfile-recorded catalog resolution.
@@ -268,6 +294,13 @@ pub struct Lockfile {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub root_aliases: std::collections::BTreeMap<String, String>,
+    /// Exact root-link selections captured from resolver output.
+    #[serde(
+        default,
+        rename = "root-resolutions",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub root_resolutions: RootResolutions,
     /// Canonical names of packages the resolver auto-installed at root
     /// scope to satisfy unmet `peerDependencies` (eager peer
     /// auto-install).
@@ -576,6 +609,7 @@ impl Lockfile {
             provenance: BTreeMap::new(),
             packages: Vec::new(),
             root_aliases: BTreeMap::new(),
+            root_resolutions: RootResolutions::new(),
             // Populated by `install.rs` from
             // `ResolveResult.ambient_peer_installs` on cold-resolve
             // lockfile writes; empty on warm/lockfile-fast-path

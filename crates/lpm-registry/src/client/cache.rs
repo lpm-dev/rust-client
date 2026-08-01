@@ -71,6 +71,33 @@ impl RegistryClient {
             .or_insert(metadata);
     }
 
+    pub(super) fn read_release_time_memory_cache(&self, key: &str) -> Option<ReleaseTimeMetadata> {
+        let cached = self
+            .release_time_memory_cache
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned();
+        cached.map(|metadata| metadata.as_ref().clone())
+    }
+
+    pub(super) fn remember_release_times_for_command(
+        &self,
+        key: &str,
+        metadata: &ReleaseTimeMetadata,
+    ) {
+        let Some(cache) = &self.release_time_memory_cache else {
+            return;
+        };
+        let metadata = Arc::new(metadata.clone());
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key.to_owned())
+            .or_insert(metadata);
+    }
+
     fn invalidate_metadata_memory_cache(&self, key: &str) {
         if let Some(cache) = &self.metadata_memory_cache {
             cache

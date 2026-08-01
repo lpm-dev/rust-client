@@ -63,10 +63,7 @@ fn find_best_version_with_policy_impl(
     record_policy_profile: bool,
 ) -> VersionPick {
     let mut first_policy_block: Option<VersionPick> = None;
-    for v in &info.versions {
-        if !range.satisfies_with_latest_bound(v, info.latest_version.as_ref()) {
-            continue;
-        }
+    for v in versions_by_npm_preference(info, range) {
         let release_age_status = if record_policy_profile {
             release_age_status_for_version(canonical, info, v, policy)
         } else {
@@ -110,4 +107,20 @@ fn find_best_version_with_policy_impl(
         return VersionPick::Picked(v.clone());
     }
     first_policy_block.unwrap_or(VersionPick::NoSatisfying)
+}
+
+pub(super) fn versions_by_npm_preference<'a>(
+    info: &'a CachedPackageInfo,
+    range: &'a NpmRange,
+) -> impl Iterator<Item = &'a NpmVersion> {
+    let preferred_latest = info
+        .latest_version
+        .as_ref()
+        .filter(|latest| range.satisfies_with_latest_bound(latest, info.latest_version.as_ref()));
+    preferred_latest
+        .into_iter()
+        .chain(info.versions.iter().filter(move |version| {
+            preferred_latest != Some(*version)
+                && range.satisfies_with_latest_bound(version, info.latest_version.as_ref())
+        }))
 }

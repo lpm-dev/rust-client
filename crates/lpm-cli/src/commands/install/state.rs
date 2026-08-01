@@ -268,6 +268,7 @@ pub(super) async fn run_install_freshness_phase(
         && compatibility_bins_ready;
     let fast_path_packages = if fast_path_base_eligible {
         let gate_stats = GateStats::default();
+        let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);
         let fast = validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
             .and_then(|(lockfile_deps, workspace_deps_filtered)| {
                 if workspace_deps_filtered
@@ -280,11 +281,25 @@ pub(super) async fn run_install_freshness_phase(
                     input.lockfile_path,
                     &lockfile_deps,
                     &[],
+                    workspace.as_deref(),
                     input.client,
                     &gate_stats,
                     false,
                 )
-                .map(|fast| fast.packages)
+                .and_then(|fast| {
+                    let locked = fast.lockfile.importers.get(".").and_then(|importer| {
+                        importer
+                            .workspace_root_peer_providers_fingerprint
+                            .as_deref()
+                    });
+                    let expected = crate::workspace_discovery_cache::
+                        root_provider_fingerprint_for_locked_member(input.project_dir, locked);
+                    if expected.as_deref().map(AsRef::as_ref) == locked {
+                        Some(fast.packages)
+                    } else {
+                        None
+                    }
+                })
             });
         if let Some(mut packages) = fast {
             if input.omit_policy.dev {
@@ -675,9 +690,16 @@ fn decide_dependency_engine_freshness(
 /// succeed once but never become warm-cache fresh, so every later
 /// `lpm install`, `lpm dev`, and sync fast-lane probe would fall back
 /// to the slow path despite the manifest already being fully applied.
-pub(super) fn materialize_empty_install_artifacts(project_dir: &Path) -> Result<(), LpmError> {
+pub(super) fn materialize_empty_install_artifacts(
+    project_dir: &Path,
+    current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
+) -> Result<(), LpmError> {
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    lpm_lockfile::Lockfile::default()
+    let mut lockfile = lpm_lockfile::Lockfile::default();
+    lockfile
+        .importers
+        .insert(".".to_string(), current_importer_snapshot.clone());
+    lockfile
         .write_all(&lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
 

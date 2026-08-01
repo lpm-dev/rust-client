@@ -1,5 +1,33 @@
 use super::prelude::*;
 
+pub(super) fn root_resolutions_from_solution(
+    solution: &pubgrub::SelectedDependencies<LpmDependencyProvider>,
+    root_dependencies: &RootDependencies,
+    root_aliases: &HashMap<String, String>,
+) -> HashMap<String, RootResolution> {
+    let mut resolutions = HashMap::with_capacity(root_dependencies.dependencies.len());
+    for local_name in root_dependencies.dependencies.keys() {
+        let target = root_aliases
+            .get(local_name)
+            .map_or(local_name.as_str(), String::as_str);
+        let root_package = ResolverPackage::from_dep_name(target);
+        let Some((package, version)) = solution
+            .iter()
+            .find(|(package, _)| package == &&root_package)
+        else {
+            continue;
+        };
+        resolutions.insert(
+            local_name.clone(),
+            RootResolution {
+                package: package.canonical_name(),
+                version: version.to_string(),
+            },
+        );
+    }
+    resolutions
+}
+
 /// Convert PubGrub solution + cached metadata into `ResolvedPackage` list
 /// with dependency edges populated.
 pub(super) fn format_solution(
@@ -190,7 +218,7 @@ fn validate_selected_dependency_skips(
     Ok(platform_skipped)
 }
 
-pub(super) fn mark_optional_reachability(
+pub(crate) fn mark_optional_reachability(
     packages: &mut [ResolvedPackage],
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     root_dependencies: &RootDependencies,
@@ -399,6 +427,41 @@ mod skipped_dependency_tests {
         assert_eq!(
             validate_selected_dependency_skips(&packages, &HashMap::new(), vec![skipped]).unwrap(),
             0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod root_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn pubgrub_root_resolution_uses_unscoped_selection_when_split_version_also_exists() {
+        let package = ResolverPackage::npm("peer-host");
+        let mut solution: pubgrub::SelectedDependencies<LpmDependencyProvider> =
+            pubgrub::Map::default();
+        solution.insert(
+            package.with_context("peer-consumer"),
+            NpmVersion::parse("1.1.0").expect("valid split version"),
+        );
+        solution.insert(
+            package,
+            NpmVersion::parse("1.0.0").expect("valid root version"),
+        );
+        let root_dependencies = RootDependencies::required(HashMap::from([(
+            "peer-host".to_string(),
+            "^1.0.0".to_string(),
+        )]));
+
+        let resolutions =
+            root_resolutions_from_solution(&solution, &root_dependencies, &HashMap::new());
+
+        assert_eq!(
+            resolutions.get("peer-host"),
+            Some(&RootResolution {
+                package: "peer-host".to_string(),
+                version: "1.0.0".to_string(),
+            })
         );
     }
 }

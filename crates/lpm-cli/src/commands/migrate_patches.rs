@@ -486,6 +486,7 @@ mod tests {
                 })
                 .collect(),
             root_aliases: std::collections::BTreeMap::new(),
+            root_resolutions: lpm_lockfile::RootResolutions::new(),
             ambient_peer_installs: Vec::new(),
         }
     }

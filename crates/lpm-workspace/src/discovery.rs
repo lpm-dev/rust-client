@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::WorkspaceError;
@@ -29,35 +29,10 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     let mut current = start_dir.to_path_buf();
 
     loop {
-        let pkg_json_path = current.join("package.json");
-        match read_package_json(&pkg_json_path) {
-            Ok(mut root_package) => {
-                // Check for workspace globs in package.json
-                let workspace_globs = match &root_package.workspaces {
-                    Some(WorkspacesConfig::Globs(globs)) => Some(globs.clone()),
-                    Some(WorkspacesConfig::Object { packages }) => Some(packages.clone()),
-                    None => None,
-                };
-
-                // Also check for pnpm-workspace.yaml
-                let pnpm_workspace_path = current.join("pnpm-workspace.yaml");
-                let pnpm_workspace = read_pnpm_workspace(&pnpm_workspace_path)?;
-
-                if let Some(config) = pnpm_workspace.as_ref() {
-                    merge_pnpm_workspace_config(&mut root_package, config);
-                }
-
-                let globs = workspace_globs.or_else(|| {
-                    pnpm_workspace.as_ref().and_then(|config| {
-                        if config.packages.is_empty() {
-                            None
-                        } else {
-                            Some(config.packages.clone())
-                        }
-                    })
-                });
-
-                if let Some(globs) = globs {
+        match read_workspace_root(&current) {
+            Ok((root_package, pnpm_workspace)) => {
+                let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+                if !globs.is_empty() {
                     let members = discover_members(&current, &globs)?;
                     warn_on_member_catalogs(&members);
                     let workspace = Workspace {
@@ -98,6 +73,43 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     }
 
     Ok(None)
+}
+
+fn workspace_member_globs(
+    root_package: &PackageJson,
+    pnpm_workspace: Option<&PnpmWorkspaceConfig>,
+) -> Vec<String> {
+    let package_json_globs: &[String] = match &root_package.workspaces {
+        Some(WorkspacesConfig::Globs(globs)) => globs,
+        Some(WorkspacesConfig::Object { packages }) => packages,
+        None => &[],
+    };
+    let pnpm_globs = pnpm_workspace.map_or(&[][..], |config| config.packages.as_slice());
+    let mut globs = Vec::with_capacity(package_json_globs.len() + pnpm_globs.len());
+    let mut seen = HashSet::with_capacity(globs.capacity());
+    for glob in package_json_globs.iter().chain(pnpm_globs) {
+        if seen.insert(glob.as_str()) {
+            globs.push(glob.clone());
+        }
+    }
+    globs
+}
+
+/// Read a workspace root manifest and merge root configuration from
+/// `pnpm-workspace.yaml` without discovering member packages.
+pub fn read_workspace_root_package(root: &Path) -> Result<PackageJson, WorkspaceError> {
+    read_workspace_root(root).map(|(package, _)| package)
+}
+
+fn read_workspace_root(
+    root: &Path,
+) -> Result<(PackageJson, Option<PnpmWorkspaceConfig>), WorkspaceError> {
+    let mut root_package = read_package_json(&root.join("package.json"))?;
+    let pnpm_workspace = read_pnpm_workspace(&root.join("pnpm-workspace.yaml"))?;
+    if let Some(config) = pnpm_workspace.as_ref() {
+        merge_pnpm_workspace_config(&mut root_package, config);
+    }
+    Ok((root_package, pnpm_workspace))
 }
 
 /// Walk up from `start_dir` to find the nearest ancestor directory
@@ -221,8 +233,7 @@ fn merge_pnpm_workspace_config(root_package: &mut PackageJson, config: &PnpmWork
 /// `package.json` files are read and folded into the install-hash;
 /// sibling-project deps would otherwise materialize into the
 /// current project's `node_modules`. The pattern boundary is the
-/// only place to refuse this — the glob library happily walks
-/// anywhere the OS lets it.
+/// only place to refuse this before workspace traversal begins.
 fn validate_workspace_glob(pattern: &str) -> Result<(), WorkspaceError> {
     if pattern.is_empty() {
         return Err(WorkspaceError::Parse("empty workspace glob pattern".into()));
@@ -282,57 +293,181 @@ fn warn_on_member_catalogs(members: &[WorkspaceMember]) {
 
 /// Discover workspace member packages matching the given glob patterns.
 fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
-    let mut members = Vec::new();
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-
+    let mut manifest_paths = Vec::new();
+    let mut exclusions = Vec::new();
     for pattern in globs {
-        // refuse path-escape shapes at the manifest boundary.
-        validate_workspace_glob(pattern)?;
+        let Some(excluded) = pattern.strip_prefix('!') else {
+            let workspace_glob = WorkspaceGlob::compile(root, pattern)?;
+            workspace_glob.collect_manifest_paths(root, &mut manifest_paths)?;
+            continue;
+        };
+        exclusions.push(WorkspaceGlob::compile(root, excluded)?);
+    }
+    manifest_paths.retain(|manifest| {
+        let directory = manifest.parent().expect("workspace manifest has a parent");
+        let relative = directory.strip_prefix(root).unwrap_or(directory);
+        !exclusions
+            .iter()
+            .any(|exclusion| exclusion.matches_relative_directory(relative))
+    });
+    manifest_paths.sort();
+    manifest_paths.dedup();
 
-        // Resolve glob pattern relative to workspace root
-        let full_pattern = root.join(pattern).join("package.json");
-        let pattern_str = full_pattern.to_string_lossy().to_string();
-
-        let paths = glob::glob(&pattern_str)
-            .map_err(|e| WorkspaceError::Parse(format!("invalid glob pattern '{pattern}': {e}")))?;
-
-        for entry in paths {
-            let pkg_json_path =
-                entry.map_err(|e| WorkspaceError::Io(format!("glob error: {e}")))?;
-
-            // Defence-in-depth: even with the pattern validated
-            // above, refuse any match whose canonical resolution
-            // doesn't sit under the canonical project root. Catches
-            // a glob match that traverses an existing symlink out
-            // of the tree.
-            let canonical_match = pkg_json_path
-                .canonicalize()
-                .unwrap_or_else(|_| pkg_json_path.clone());
-            if !canonical_match.starts_with(&canonical_root) {
-                tracing::warn!(
-                    pattern = %pattern,
-                    matched = %pkg_json_path.display(),
-                    canonical = %canonical_match.display(),
-                    canonical_root = %canonical_root.display(),
-                    "skipping workspace member outside project root"
-                );
-                continue;
-            }
-
-            let member_dir = pkg_json_path.parent().unwrap().to_path_buf();
-            let package = read_package_json(&pkg_json_path)?;
-
-            members.push(WorkspaceMember {
-                path: member_dir,
-                package,
-            });
+    let mut members = Vec::with_capacity(manifest_paths.len());
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    for pkg_json_path in manifest_paths {
+        let canonical_match = pkg_json_path
+            .canonicalize()
+            .unwrap_or_else(|_| pkg_json_path.clone());
+        if !canonical_match.starts_with(&canonical_root) {
+            tracing::warn!(
+                matched = %pkg_json_path.display(),
+                canonical = %canonical_match.display(),
+                canonical_root = %canonical_root.display(),
+                "skipping workspace member outside project root"
+            );
+            continue;
         }
+
+        let member_dir = pkg_json_path
+            .parent()
+            .expect("workspace manifest has a parent")
+            .to_path_buf();
+        let package = read_package_json(&pkg_json_path)?;
+        members.push(WorkspaceMember {
+            path: member_dir,
+            package,
+        });
     }
 
-    // Sort by path for deterministic ordering
-    members.sort_by(|a, b| a.path.cmp(&b.path));
-
     Ok(members)
+}
+
+struct WorkspaceGlob {
+    pattern: glob::Pattern,
+    scan_root: PathBuf,
+    scan_root_depth: usize,
+    max_depth: Option<usize>,
+}
+
+impl WorkspaceGlob {
+    fn compile(root: &Path, raw: &str) -> Result<Self, WorkspaceError> {
+        validate_workspace_glob(raw)?;
+        let mut normalized = PathBuf::new();
+        for component in Path::new(raw).components() {
+            if let std::path::Component::Normal(value) = component {
+                normalized.push(value);
+            }
+        }
+        if normalized.as_os_str().is_empty() {
+            normalized.push(".");
+        }
+        let pattern = glob::Pattern::new(&normalized.to_string_lossy()).map_err(|error| {
+            WorkspaceError::Parse(format!("invalid glob pattern '{raw}': {error}"))
+        })?;
+        let components: Vec<_> = normalized.components().collect();
+        let literal_components = components
+            .iter()
+            .take_while(|component| !contains_glob_metacharacters(component.as_os_str()))
+            .count();
+        let mut scan_root = root.to_path_buf();
+        for component in components.iter().take(literal_components) {
+            scan_root.push(component.as_os_str());
+        }
+        let max_depth = components
+            .iter()
+            .all(|component| !component.as_os_str().to_string_lossy().contains("**"))
+            .then_some(components.len());
+        Ok(Self {
+            pattern,
+            scan_root,
+            scan_root_depth: literal_components,
+            max_depth,
+        })
+    }
+
+    fn collect_manifest_paths(
+        &self,
+        root: &Path,
+        manifests: &mut Vec<PathBuf>,
+    ) -> Result<(), WorkspaceError> {
+        match std::fs::symlink_metadata(&self.scan_root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(WorkspaceError::Io(format!(
+                    "failed to inspect {}: {error}",
+                    self.scan_root.display()
+                )));
+            }
+        }
+        let match_options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        let mut pending = vec![(self.scan_root.clone(), self.scan_root_depth)];
+        while let Some((directory, depth)) = pending.pop() {
+            let relative = directory.strip_prefix(root).unwrap_or(&directory);
+            if self.matches_directory(relative, match_options) {
+                let manifest = directory.join("package.json");
+                if manifest.is_file() {
+                    manifests.push(manifest);
+                }
+            }
+            if self.max_depth.is_some_and(|max_depth| depth >= max_depth) {
+                continue;
+            }
+            let entries = std::fs::read_dir(&directory).map_err(|error| {
+                WorkspaceError::Io(format!("failed to read {}: {error}", directory.display()))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    WorkspaceError::Io(format!("failed to read {}: {error}", directory.display()))
+                })?;
+                let file_type = entry.file_type().map_err(|error| {
+                    WorkspaceError::Io(format!(
+                        "failed to inspect {}: {error}",
+                        entry.path().display()
+                    ))
+                })?;
+                if file_type.is_dir() && entry.file_name() != "node_modules" {
+                    pending.push((entry.path(), depth + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn matches_directory(&self, relative: &Path, options: glob::MatchOptions) -> bool {
+        if self.pattern.matches_path_with(relative, options) {
+            return true;
+        }
+        let relative = relative.to_string_lossy();
+        let mut with_separator = String::with_capacity(relative.len() + 1);
+        with_separator.push_str(&relative);
+        with_separator.push(std::path::MAIN_SEPARATOR);
+        self.pattern.matches_with(&with_separator, options)
+    }
+
+    fn matches_relative_directory(&self, relative: &Path) -> bool {
+        self.matches_directory(
+            relative,
+            glob::MatchOptions {
+                case_sensitive: true,
+                require_literal_separator: true,
+                require_literal_leading_dot: false,
+            },
+        )
+    }
+}
+
+fn contains_glob_metacharacters(component: &std::ffi::OsStr) -> bool {
+    component
+        .to_string_lossy()
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
 }
 
 fn has_intermediate_non_member_package_json(
@@ -463,6 +598,159 @@ mod tests {
 
         let ws = discover_workspace(dir.path()).unwrap().unwrap();
         assert_eq!(ws.members.len(), 1);
+    }
+
+    #[test]
+    fn discover_workspace_combines_package_json_and_pnpm_workspace_members() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - 'turbopack/packages/*'\n",
+        )
+        .unwrap();
+
+        let package_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&package_dir).unwrap();
+        create_package_json(&package_dir, r#"{"name":"app"}"#);
+        let turbopack_dir = dir.path().join("turbopack/packages/devlow-bench");
+        fs::create_dir_all(&turbopack_dir).unwrap();
+        create_package_json(&turbopack_dir, r#"{"name":"devlow-bench"}"#);
+
+        let workspace = discover_workspace(dir.path()).unwrap().unwrap();
+        let member_names: Vec<_> = workspace
+            .members
+            .iter()
+            .filter_map(|member| member.package.name.as_deref())
+            .collect();
+
+        assert_eq!(member_names, ["app", "devlow-bench"]);
+    }
+
+    #[test]
+    fn discover_pnpm_workspace_excludes_members_matching_negated_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(dir.path(), r#"{"name":"monorepo"}"#);
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/**'\n  - '!**/dist-*'\n",
+        )
+        .unwrap();
+
+        let member_dir = dir.path().join("packages/member");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(&member_dir, r#"{"name":"member"}"#);
+        let excluded_dir = dir.path().join("packages/dist-generated");
+        fs::create_dir_all(&excluded_dir).unwrap();
+        create_package_json(&excluded_dir, r#"{"name":"dist-generated"}"#);
+
+        let workspace = discover_workspace(dir.path()).unwrap().unwrap();
+        let names: Vec<_> = workspace
+            .members
+            .iter()
+            .filter_map(|member| member.package.name.as_deref())
+            .collect();
+
+        assert_eq!(names, ["member"]);
+    }
+
+    #[test]
+    fn discover_workspace_ignores_member_nohoist_object_without_package_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"monorepo","workspaces":{"packages":["apps/*"]}}"#,
+        );
+        let member_dir = dir.path().join("apps/webhook");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{"name":"@fixture/webhook","workspaces":{"nohoist":["socket.io"]}}"#,
+        );
+
+        let workspace = discover_workspace(&member_dir).unwrap().unwrap();
+
+        assert_eq!(workspace.root, dir.path());
+        assert_eq!(workspace.members.len(), 1);
+        assert_eq!(
+            workspace.members[0].package.name.as_deref(),
+            Some("@fixture/webhook")
+        );
+    }
+
+    #[test]
+    fn read_workspace_root_package_merges_pnpm_configuration_without_discovering_members() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(dir.path(), r#"{"name":"monorepo"}"#);
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/**'\ncatalog:\n  react: ^19.0.0\n",
+        )
+        .unwrap();
+
+        let package = read_workspace_root_package(dir.path()).unwrap();
+
+        assert_eq!(package.catalogs["default"]["react"], "^19.0.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_workspace_ignores_node_modules_symlink_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        create_package_json(directory.path(), r#"{"name":"root","private":true}"#);
+        fs::write(
+            directory.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'playground/**'\n",
+        )
+        .unwrap();
+        let member = directory.path().join("playground/alias");
+        fs::create_dir_all(member.join("node_modules/@vitejs")).unwrap();
+        create_package_json(
+            &member,
+            r#"{"name":"@vitejs/test-alias","version":"0.0.0"}"#,
+        );
+        std::os::unix::fs::symlink(
+            member.canonicalize().unwrap(),
+            member.join("node_modules/@vitejs/test-alias"),
+        )
+        .unwrap();
+
+        let workspace = discover_workspace(directory.path()).unwrap().unwrap();
+
+        assert_eq!(workspace.members.len(), 1);
+    }
+
+    #[test]
+    fn discover_workspace_recursive_globs_include_their_zero_depth_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        create_package_json(directory.path(), r#"{"name":"root","private":true}"#);
+        fs::write(
+            directory.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'playground/**'\n  - 'packages/**/__tests__/**'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("playground")).unwrap();
+        create_package_json(
+            &directory.path().join("playground"),
+            r#"{"name":"playground"}"#,
+        );
+        fs::create_dir_all(directory.path().join("packages/vite/src/node/__tests__")).unwrap();
+        create_package_json(
+            &directory.path().join("packages/vite/src/node/__tests__"),
+            r#"{"name":"vite-tests"}"#,
+        );
+
+        let workspace = discover_workspace(directory.path()).unwrap().unwrap();
+        let names: Vec<_> = workspace
+            .members
+            .iter()
+            .filter_map(|member| member.package.name.as_deref())
+            .collect();
+
+        assert_eq!(names, ["vite-tests", "playground"]);
     }
 
     #[test]

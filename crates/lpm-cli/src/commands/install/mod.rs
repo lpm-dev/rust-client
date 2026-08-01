@@ -665,7 +665,7 @@ async fn run_with_options_under_store_lock(
     let gate_stats = Arc::new(GateStats::default());
 
     let mut deps = manifest_deps.clone();
-    reject_workspace_self_dependency(&pkg)?;
+    validate_workspace_self_dependencies(&pkg, &mut deps)?;
 
     let declared_deps = deps.clone();
 
@@ -684,12 +684,14 @@ async fn run_with_options_under_store_lock(
     )?;
     reject_remote_tarball_url_deps_with_policy_extensions(&policy_extension_configs, &deps)?;
 
-    // Snapshot for release-age direct canonicals: the policy's direct
-    // set is defined by the manifest-declared roots, not by whatever
-    // the workspace pre-resolve later injects into `deps`.
-    let release_age_direct_snapshot = deps.clone();
-    let minimum_release_age_exclude: std::collections::HashSet<String> =
-        minimum_release_age_exclude.into_iter().collect();
+    let direct_dependency_snapshot = deps.clone();
+    let minimum_release_age_exclude: std::collections::HashSet<_> =
+        crate::release_age_config::parse_release_age_exclusions(
+            "resolved minimum-release-age exclusions",
+            &minimum_release_age_exclude,
+        )?
+        .into_iter()
+        .collect();
 
     let OverrideResolutionState {
         lpm_overrides,
@@ -737,8 +739,10 @@ async fn run_with_options_under_store_lock(
         current_patches,
         current_patch_fingerprint,
         current_lockfile_patches,
-        current_importer_snapshot,
+        mut current_importer_snapshot,
         prior_verified_provenance,
+        workspace_root_provider_state_changed,
+        importer_snapshot_changed,
     } = validate_install_lockfile_state(LockfileValidationInput {
         project_dir,
         lockfile_path: &lockfile_path,
@@ -753,6 +757,7 @@ async fn run_with_options_under_store_lock(
     })?;
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
+        workspace_resolution::publish_root_peer_providers_for_empty_install(project_dir);
         workspace_resolution::wait_for_commit().await;
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
@@ -775,6 +780,7 @@ async fn run_with_options_under_store_lock(
             object_integrity_policy,
             security_analysis_policy,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
+            current_importer_snapshot: &current_importer_snapshot,
         })
         .await?;
         return Ok(());
@@ -813,12 +819,10 @@ async fn run_with_options_under_store_lock(
         V2WorkspaceRootPreResolveResult::default()
     };
     if requested_v2_mode {
-        workspace_member_deps.clear();
+        workspace_member_deps.retain(WorkspaceMemberLink::needs_publish_projection_link);
     }
 
-    let resolver_excludes = minimum_release_age_exclude
-        .iter()
-        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
+    let resolver_excludes = minimum_release_age_exclude.iter().cloned();
     let resolver_policy = if release_age_policy.is_strict() {
         lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
             resolver_min_age_secs,
@@ -826,7 +830,7 @@ async fn run_with_options_under_store_lock(
             resolver_excludes,
         )
     } else {
-        let direct_canonicals = direct_release_age_canonicals(&release_age_direct_snapshot);
+        let direct_canonicals = direct_release_age_canonicals(&direct_dependency_snapshot);
         lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
             resolver_min_age_secs,
             resolver_trust_policy,
@@ -840,6 +844,7 @@ async fn run_with_options_under_store_lock(
             client,
             project_dir,
             deps: &deps,
+            lockfile_deps: &direct_dependency_snapshot,
             pkg: &pkg,
             lockfile_path: &lockfile_path,
             catalog_resolutions: &catalog_resolutions,
@@ -883,20 +888,24 @@ async fn run_with_options_under_store_lock(
             compatibility_bin_names,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
             emit_install_report,
+            current_importer_snapshot: &current_importer_snapshot,
         })
         .await;
     }
 
     let lockfile_result = select_lockfile_install_plan(LockfileSelectionInput {
         lockfile_path: &lockfile_path,
-        deps: &deps,
+        deps: &direct_dependency_snapshot,
         catalog_resolutions: &catalog_resolutions,
+        workspace: workspace.as_deref(),
         client,
         gate_stats: &gate_stats,
         frozen_lockfile_active,
         force,
         overrides_changed,
         patches_changed,
+        workspace_root_provider_state_changed,
+        importer_snapshot_changed,
         is_add_invocation,
         auto_install_peers,
         json_output,
@@ -975,50 +984,60 @@ async fn run_with_options_under_store_lock(
         true
     };
 
-    if experimental_resolver::should_run(experimental_resolver::ExperimentalResolverAdmission {
-        json_output,
-        frozen_lockfile_active,
-        omit_policy,
-        has_workspace_member_deps: !workspace_member_deps.is_empty()
-            || !direct_workspace_member_deps.is_empty(),
-        has_v2_workspace_member_deps: !v2_workspace_root_pre_resolve.install_pkgs.is_empty()
-            || !v2_workspace_root_pre_resolve
-                .additional_workspace_links
-                .is_empty(),
-        has_tarball_source_deps: experimental_resolver::has_tarball_source_deps(project_dir, &deps),
-        verify_registry_signatures,
-        strict_integrity,
-        force_security_floor,
-        npm_firewall_enabled: npm_firewall_mode.is_enabled(),
-        policy_extensions_enabled: !policy_extension_configs.is_empty(),
-        auto_build,
-        script_policy_override,
-        script_policy_is_default: experimental_resolver_script_policy_is_default,
-        has_trusted_dependencies: pkg
-            .lpm
-            .as_ref()
-            .is_some_and(|lpm| !lpm.trusted_dependencies.is_empty()),
-        strict_release_age_replay: release_age_policy.is_strict() && effective_min_age_secs > 0,
-        allow_new,
-        is_add_invocation,
-        has_direct_versions_out: direct_versions_out.is_some(),
-        has_target_set: target_set.is_some(),
-        audit_after_install,
-        no_skills,
-        no_security_summary,
-        verbose,
-        drift_ignore_policy_is_default: matches!(
-            &drift_ignore_policy,
-            crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
-        ),
-        verify_policy_is_default: matches!(
-            verify_policy.enforce,
-            crate::provenance_fetch::EnforceMode::Deny
-        ) && matches!(
-            &verify_policy.skip,
-            crate::provenance_fetch::SkipPolicy::None
-        ),
-    })? {
+    if !workspace_resolution::active()
+        && experimental_resolver::should_run(
+            experimental_resolver::ExperimentalResolverAdmission {
+                json_output,
+                frozen_lockfile_active,
+                omit_policy,
+                has_workspace_member_deps: !workspace_member_deps.is_empty()
+                    || !direct_workspace_member_deps.is_empty(),
+                has_v2_workspace_member_deps: !v2_workspace_root_pre_resolve
+                    .install_pkgs
+                    .is_empty()
+                    || !v2_workspace_root_pre_resolve
+                        .additional_workspace_links
+                        .is_empty(),
+                has_tarball_source_deps: experimental_resolver::has_tarball_source_deps(
+                    project_dir,
+                    &deps,
+                ),
+                verify_registry_signatures,
+                strict_integrity,
+                force_security_floor,
+                npm_firewall_enabled: npm_firewall_mode.is_enabled(),
+                policy_extensions_enabled: !policy_extension_configs.is_empty(),
+                auto_build,
+                script_policy_override,
+                script_policy_is_default: experimental_resolver_script_policy_is_default,
+                has_trusted_dependencies: pkg
+                    .lpm
+                    .as_ref()
+                    .is_some_and(|lpm| !lpm.trusted_dependencies.is_empty()),
+                strict_release_age_replay: release_age_policy.is_strict()
+                    && effective_min_age_secs > 0,
+                allow_new,
+                is_add_invocation,
+                has_direct_versions_out: direct_versions_out.is_some(),
+                has_target_set: target_set.is_some(),
+                audit_after_install,
+                no_skills,
+                no_security_summary,
+                verbose,
+                drift_ignore_policy_is_default: matches!(
+                    &drift_ignore_policy,
+                    crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+                ),
+                verify_policy_is_default: matches!(
+                    verify_policy.enforce,
+                    crate::provenance_fetch::EnforceMode::Deny
+                ) && matches!(
+                    &verify_policy.skip,
+                    crate::provenance_fetch::SkipPolicy::None
+                ),
+            },
+        )?
+    {
         let NonRegistryPreResolveResult {
             install_pkgs: mut spike_pre_resolved_install_pkgs,
             source_deps: mut spike_pre_resolved_source_deps,
@@ -1089,7 +1108,6 @@ async fn run_with_options_under_store_lock(
             &spike_pre_resolved_install_pkgs,
             &spike_pre_resolved_source_deps,
             &workspace_member_deps,
-            &all_workspace_members,
             &catalog_resolutions,
             &current_patches,
             &prior_patch_state,
@@ -1159,6 +1177,7 @@ async fn run_with_options_under_store_lock(
         applied_overrides,
         peer_conflicts,
         peer_warnings,
+        workspace_root_peer_providers_fingerprint,
         ambient_peer_installs_for_lockfile,
         spec_tracker,
         speculation_join,
@@ -1177,6 +1196,9 @@ async fn run_with_options_under_store_lock(
         auto_isolated_peer_conflicts,
         linker_mode,
     } = online_resolution?;
+    if let Some(fingerprint) = workspace_root_peer_providers_fingerprint {
+        current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
+    }
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
@@ -1614,7 +1636,6 @@ async fn run_with_options_under_store_lock(
         used_lockfile,
         resolved_with,
         auto_isolated_peer_conflicts,
-        workspace_install_packages: &v2_workspace_root_pre_resolve.install_pkgs,
         packages_for_lockfile: &packages_for_lockfile,
         deps: &deps,
         ambient_peer_installs_for_lockfile: &ambient_peer_installs_for_lockfile,

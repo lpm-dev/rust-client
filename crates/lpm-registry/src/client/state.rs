@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) type MetadataMemoryCache = Arc<std::sync::Mutex<HashMap<String, Arc<PackageMetadata>>>>;
+pub(super) type ReleaseTimeMemoryCache =
+    Arc<std::sync::Mutex<HashMap<String, Arc<ReleaseTimeMetadata>>>>;
 
 /// Result of a verified tarball download. The tarball is spooled to a temp file
 /// on disk — only the SRI hash and byte count are kept in memory.
@@ -97,6 +99,7 @@ pub struct RegistryClient {
     /// importer resolvers can reuse one parsed registry response without
     /// sharing resolver state.
     pub(super) metadata_memory_cache: Option<MetadataMemoryCache>,
+    pub(super) release_time_memory_cache: Option<ReleaseTimeMemoryCache>,
     /// When set, `write_metadata_cache` runs the file write inline on the
     /// calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. Used by mock-server tests where

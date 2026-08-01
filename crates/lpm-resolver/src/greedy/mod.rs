@@ -5,14 +5,12 @@
 //!
 //! ## Scope
 //!
-//! - **Multi-version-per-canonical via reuse-on-compatible / allocate-on-
-//!   incompatible.** When edge A picks `lodash@4.17.21` and edge B
-//!   wants `lodash@^4`, edge B reuses A's node — first-version-wins
-//!   inside any single satisfying range bucket. When edge B's range is
-//!   `^3` and 4.17.21 doesn't satisfy
-//!   it, the resolver allocates a new node for `lodash@3.10.1` (or
-//!   whatever the best match is); both versions live independently in
-//!   the resolved tree, keyed by `(canonical, version)`.
+//! - **Multi-version-per-canonical via exact selected-identity reuse.** Each
+//!   edge chooses its natural or overridden target before deduplication. Two
+//!   edges selecting `lodash@4.17.21` reuse one node; an edge selecting
+//!   `lodash@3.10.1` allocates another. Both versions live independently in
+//!   the resolved tree, keyed by `(canonical, version)`, and selection does
+//!   not depend on which compatible range happened to arrive first.
 //! - **Required + optional deps.** Peer deps are recorded but not
 //!   eagerly installed; the existing post-resolve [`crate::check_unmet_peers`]
 //!   pass continues to surface peer warnings.
@@ -44,9 +42,8 @@
 //!    through to a direct registry fetch.
 //! 3. Pick a version with [`find_best_version`] (reverse-iterate sorted
 //!    versions; first satisfying match wins).
-//! 4. Either reuse an existing node for `canonical` when the selected
-//!    version is compatible, or allocate a new one and enqueue its deps as fresh
-//!    edges.
+//! 4. Either reuse an existing node for the exact selected package identity,
+//!    or allocate a new one and enqueue its deps as fresh edges.
 //! 5. Repeat until `task_queue` is empty.
 //!
 //! No backtracking. No split-retry. The cost model is O(edges × log
@@ -261,6 +258,7 @@ mod prelude {
     pub(super) use crate::policy::{ReleaseTimeStatus, ResolverPolicy};
     pub(super) use crate::provider::{
         CachedPackageInfo, NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone,
+        activate_workspace_fallback, insert_or_merge_cached_package_info,
         merge_release_times_into_cache_info, parse_full_metadata_to_cache_info,
         parse_metadata_to_cache_info, parse_partial_metadata_to_cache_info,
         release_age_status_for_version, release_age_status_for_version_unprofiled,
@@ -268,7 +266,8 @@ mod prelude {
     };
     pub(super) use crate::ranges::NpmRange;
     pub(super) use crate::resolve::{
-        ResolveError, ResolveResult, ResolvedPackage, StageTiming, resolve_peer_binding_version,
+        ResolveError, ResolveResult, ResolvedPackage, RootResolution, StageTiming,
+        resolve_peer_binding_version,
     };
     pub(super) use crate::speculation::SpeculativePackageMetadata;
     pub(super) use ahash::{AHashMap, AHashSet};

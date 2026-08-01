@@ -529,21 +529,13 @@ fn materialize_local_source_file(src: &Path, dst: &Path) -> Result<(), LpmError>
             ))
         })?;
     }
-    if let Err(e) = std::fs::hard_link(src, dst) {
-        tracing::trace!(
-            src = %src.display(),
-            dst = %dst.display(),
-            error = %e,
-            "v2 local-source object: hardlink failed, falling back to copy"
-        );
-        std::fs::copy(src, dst).map_err(|copy_err| {
-            LpmError::Store(format!(
-                "failed to copy v2 local-source file {} → {}: {copy_err}",
-                src.display(),
-                dst.display()
-            ))
-        })?;
-    }
+    std::fs::copy(src, dst).map_err(|copy_err| {
+        LpmError::Store(format!(
+            "failed to copy v2 local-source file {} → {}: {copy_err}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
     Ok(())
 }
 

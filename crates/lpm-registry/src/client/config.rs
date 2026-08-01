@@ -275,6 +275,7 @@ impl RegistryClient {
             cache_dir,
             pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
             metadata_memory_cache: None,
+            release_time_memory_cache: None,
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
@@ -683,6 +684,7 @@ impl RegistryClient {
             // queued by ANY clone of this client.
             pending_cache_writes: Arc::clone(&self.pending_cache_writes),
             metadata_memory_cache: self.metadata_memory_cache.as_ref().map(Arc::clone),
+            release_time_memory_cache: self.release_time_memory_cache.as_ref().map(Arc::clone),
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
@@ -702,6 +704,7 @@ impl RegistryClient {
     pub fn clone_with_metadata_memory_cache(&self) -> Self {
         let mut client = self.clone_with_config();
         client.metadata_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+        client.release_time_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
         client
     }
 
@@ -709,6 +712,7 @@ impl RegistryClient {
     /// configuration and persistent cache behavior.
     pub fn without_metadata_memory_cache(mut self) -> Self {
         self.metadata_memory_cache = None;
+        self.release_time_memory_cache = None;
         self
     }
 

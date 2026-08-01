@@ -117,6 +117,15 @@ pub struct CachedPackageInfo {
     /// Range strings for which an incomplete `versions` set is known to be
     /// Worker-selected. Empty for normal complete packuments.
     pub covered_ranges: HashSet<String>,
+    /// Versions sourced from local workspace manifests rather than registry
+    /// packuments. A satisfying local version is preferred, while a range
+    /// that matches none of these versions must be allowed to fetch registry
+    /// metadata for the same package name.
+    pub workspace_versions: HashSet<NpmVersion>,
+    /// True when the registry response included full per-version platform
+    /// fields. npm abbreviated packuments retain `os` and `cpu` but omit
+    /// `libc`, so a non-empty platform map is not necessarily complete.
+    pub platform_metadata_complete: bool,
     /// Parsed target of the registry's authoritative `latest` dist-tag.
     pub latest_version: Option<NpmVersion>,
     /// Available versions, sorted descending (newest first).
@@ -124,6 +133,7 @@ pub struct CachedPackageInfo {
     /// Regular dependencies for each version: version_string → { dep_name → range_string }.
     pub deps: HashMap<String, HashMap<String, String>>,
     /// Peer dependencies for each version: version_string → { dep_name → range_string }.
+    /// A same-named regular or optional dependency takes precedence and is omitted here.
     /// Checked post-resolution against the actual resolved tree (not during resolution).
     pub peer_deps: HashMap<String, HashMap<String, String>>,
     /// Optional dependency names (per version). Included in deps but resolution failure
@@ -152,7 +162,7 @@ pub struct CachedPackageInfo {
     /// shadow over the bundled copy depending on hoisting precedence.
     pub bundled_dep_names: HashMap<String, HashSet<String>>,
     /// Platform restrictions per version: version_string → PlatformMeta.
-    /// Only populated for versions that declare os/cpu restrictions.
+    /// Only populated for versions that declare os/cpu/libc restrictions.
     pub platform: HashMap<String, PlatformMeta>,
     /// Distribution info per version: tarball URL and integrity hash.
     /// Carried through to the download phase to avoid re-fetching metadata.
@@ -233,6 +243,44 @@ impl SkippedDependency {
 }
 
 impl CachedPackageInfo {
+    pub(super) fn remove_shadowed_peer_requirements(&mut self) {
+        let deps = &self.deps;
+        self.peer_deps.retain(|version, peers| {
+            if let Some(regular) = deps.get(version) {
+                peers.retain(|name, _| !regular.contains_key(name));
+            }
+            !peers.is_empty()
+        });
+        self.optional_peer_names.retain(|version, peers| {
+            if let Some(regular) = deps.get(version) {
+                peers.retain(|name| !regular.contains_key(name));
+            }
+            !peers.is_empty()
+        });
+    }
+
+    pub fn needs_metadata_for_range(&self, range: &NpmRange) -> bool {
+        if self.versions_complete {
+            return false;
+        }
+        if !self.workspace_versions.is_empty() {
+            return true;
+        }
+        if let Some(exact) = range.exact_version() {
+            return !self.versions.contains(&exact);
+        }
+        !self.covered_ranges.contains(range.raw())
+            || !self.versions.iter().any(|version| {
+                range.satisfies_with_latest_bound(version, self.latest_version.as_ref())
+            })
+    }
+
+    pub fn workspace_version_satisfies(&self, range: &NpmRange) -> bool {
+        self.workspace_versions
+            .iter()
+            .any(|version| range.satisfies_with_latest_bound(version, self.latest_version.as_ref()))
+    }
+
     pub fn needs_trust_metadata(&self, policy: &ResolverPolicy) -> bool {
         policy.requires_trust_history() && !self.trust_metadata_complete
     }
@@ -262,6 +310,33 @@ impl CachedPackageInfo {
     pub fn needs_policy_metadata(&self, package: &CanonicalKey, policy: &ResolverPolicy) -> bool {
         self.needs_trust_metadata(policy) || self.needs_release_time_metadata(package, policy)
     }
+
+    pub fn needs_platform_metadata(&self) -> bool {
+        !self.platform_metadata_complete
+            && self.platform.values().any(|platform| {
+                platform.libc.is_empty()
+                    && (!platform.os.is_empty() || !platform.cpu.is_empty())
+                    && platform_may_target_linux(&platform.os)
+            })
+    }
+
+    pub fn needs_supplemental_metadata(
+        &self,
+        package: &CanonicalKey,
+        policy: &ResolverPolicy,
+    ) -> bool {
+        self.needs_policy_metadata(package, policy) || self.needs_platform_metadata()
+    }
+}
+
+fn platform_may_target_linux(os: &[String]) -> bool {
+    if os.is_empty() {
+        return true;
+    }
+    if os.iter().any(|entry| entry.starts_with('!')) {
+        return !os.iter().any(|entry| entry == "!linux");
+    }
+    os.iter().any(|entry| entry == "linux")
 }
 
 /// Platform restriction metadata for a specific package version.

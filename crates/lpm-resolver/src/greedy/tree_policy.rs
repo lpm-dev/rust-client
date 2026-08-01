@@ -115,10 +115,7 @@ where
 {
     Box::pin(async move {
         let mut saw_candidate = false;
-        for version in &info.versions {
-            if !range.satisfies_with_latest_bound(version, info.latest_version.as_ref()) {
-                continue;
-            }
+        for version in super::version::versions_by_npm_preference(info, range) {
             saw_candidate = true;
             if !candidate_allowed(canonical, info, version, policy) {
                 continue;

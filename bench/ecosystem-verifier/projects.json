@@ -1,0 +1,71 @@
+[
+  {
+    "id": "n8n",
+    "repository": "https://github.com/n8n-io/n8n.git",
+    "commit": "f3b052a1923cbd36abc10b3e5fcff8e7b505c59d",
+    "fresh_solve": {
+      "expected_unused_patches": [
+        "@types/express-serve-static-core@5.0.6",
+        "vue-tsc@2.2.8"
+      ]
+    }
+  },
+  {
+    "id": "nextjs",
+    "repository": "https://github.com/vercel/next.js.git",
+    "commit": "b4e3fecc7943d75a3f9c407343091520afafeaac"
+  },
+  {
+    "id": "mui",
+    "repository": "https://github.com/mui/material-ui.git",
+    "commit": "6cca37e953d70fa314e67d897a98d4d52f3b8999",
+    "reference_compatibility": {
+      "pnpm_compatibility_database": {
+        "package": "@yarnpkg/extensions@2.0.6",
+        "git_commit": "a9edb7777f04ba16f51503ef6775325b353b67cc",
+        "package_extensions": {
+          "notistack@^3.0.0": {
+            "dependencies": {
+              "csstype": "^3.0.10"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "vite",
+    "repository": "https://github.com/vitejs/vite.git",
+    "commit": "e6b6b167afa0a80548829d1f24a0712f9194389a"
+  },
+  {
+    "id": "astro",
+    "repository": "https://github.com/withastro/astro.git",
+    "commit": "9f4c1dae5cfea782dab56fe962810da97f75033b"
+  },
+  {
+    "id": "nuxt",
+    "repository": "https://github.com/nuxt/nuxt.git",
+    "commit": "3f29ffe6b9515fcb346142447c80101e431d0a90"
+  },
+  {
+    "id": "vue",
+    "repository": "https://github.com/vuejs/core.git",
+    "commit": "b5f8518379b77c3b62a7a9d2b52f6c76cda09bd5"
+  },
+  {
+    "id": "slidev",
+    "repository": "https://github.com/slidevjs/slidev.git",
+    "commit": "f970a444338b6c45f5d181a44c493fc3e7a57450"
+  },
+  {
+    "id": "prisma",
+    "repository": "https://github.com/prisma/prisma.git",
+    "commit": "202819d12433a73b8d52b15783cbb9fa5718486e"
+  },
+  {
+    "id": "novu",
+    "repository": "https://github.com/novuhq/novu.git",
+    "commit": "9c16ae2fe3b6c71bbf8c1e64097185c58ffe77ad"
+  }
+]

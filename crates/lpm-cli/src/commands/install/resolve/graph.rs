@@ -60,6 +60,7 @@ pub(super) fn load_lockfile_graph_packages(
         &lockfile_path,
         deps,
         catalog_resolutions,
+        None,
         client,
         gate_stats,
         false,

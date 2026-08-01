@@ -37,10 +37,10 @@ pub(crate) fn resolver_policy_for_project_with_excludes(
     } else {
         config.minimum_release_age_secs
     };
-    let excludes = config
-        .minimum_release_age_exclude
-        .iter()
-        .map(|name| CanonicalKey::from_dep_name(name));
+    let excludes = crate::release_age_config::parse_release_age_exclusions(
+        "resolved minimum-release-age exclusions",
+        &config.minimum_release_age_exclude,
+    )?;
     Ok(ResolverPolicy::new_with_release_age_excludes(
         minimum_release_age_secs,
         TrustPolicyMode::Off,
@@ -179,9 +179,13 @@ fn version_allowed_by_policy(
     version: &str,
     policy: &ResolverPolicy,
 ) -> bool {
+    let Ok(parsed_version) = lpm_resolver::NpmVersion::parse(version) else {
+        return false;
+    };
     matches!(
-        policy.release_time_status_for_package(
+        policy.release_time_status_for_package_version(
             canonical,
+            &parsed_version,
             metadata.time.get(version).map(String::as_str)
         ),
         ReleaseTimeStatus::Allowed
@@ -194,9 +198,22 @@ fn policy_blocked_error(
     version: &str,
     policy: &ResolverPolicy,
 ) -> LpmError {
-    let detail = match policy
-        .release_time_status_for_package(canonical, metadata.time.get(version).map(String::as_str))
-    {
+    let status = lpm_resolver::NpmVersion::parse(version).map_or_else(
+        |_| {
+            policy.release_time_status_for_package(
+                canonical,
+                metadata.time.get(version).map(String::as_str),
+            )
+        },
+        |parsed_version| {
+            policy.release_time_status_for_package_version(
+                canonical,
+                &parsed_version,
+                metadata.time.get(version).map(String::as_str),
+            )
+        },
+    );
+    let detail = match status {
         ReleaseTimeStatus::Allowed => "allowed by policy".to_string(),
         ReleaseTimeStatus::Missing => format!(
             "missing publish time for minimumReleaseAge={}s",

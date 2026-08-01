@@ -56,6 +56,11 @@ pub(super) struct SourceDep {
     pub(super) kind: DepKind,
     /// Whether this edge was declared in `optionalDependencies`.
     pub(super) optional: bool,
+    /// Whether a missing registry target should be promoted into the
+    /// workspace-wide resolver input. Optional peers remain observable
+    /// for linking when the consumer already provides them, but must not
+    /// cause an install on their own.
+    pub(super) auto_install: bool,
     /// Exact `InstallPackage::source` string for a resolved
     /// directory/link target. Registry-style dependencies leave this
     /// empty and resolve through the registry package index.
@@ -355,13 +360,13 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
     let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
     for member in direct_workspace_member_deps {
         let node_engine = read_pkg_json_node_engine(
-            &member.source_dir,
-            &format!("workspace member at {}", member.source_dir.display()),
+            member.resolution_dir(),
+            &format!("workspace member at {}", member.resolution_dir().display()),
         )?;
         install_pkgs.push(InstallPackage {
             name: member.name.clone(),
             version: member.version.clone(),
-            source: workspace_member_source(project_dir, &member.source_dir),
+            source: workspace_member_source(project_dir, member.resolution_dir()),
             dependencies: Vec::new(),
             aliases: HashMap::new(),
             root_link_names: Some(vec![member.name.clone()]),
@@ -834,8 +839,11 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             .await?;
         let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
 
-        let (real_name, real_version, node_engine) =
-            read_pkg_json_name_version(&cas_path, &format!("tarball at {url}"))?;
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
+            &cas_path,
+            &format!("tarball at {url}"),
+            MissingVersionPolicy::Require,
+        )?;
 
         // Dep-key vs fetched-name policy: warn rather than reject. The manifest dep key
         // controls node_modules layout (via `root_link_names`); the
@@ -925,6 +933,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &cas_path,
             &format!("local tarball at {}", abs_path.display()),
+            MissingVersionPolicy::Require,
         )?;
 
         if local_name != real_name && !json_output {
@@ -1023,6 +1032,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &realpath,
             &format!("file: directory at {}", realpath.display()),
+            MissingVersionPolicy::DefaultToZero,
         )?;
 
         // : workspace overlap detection. Realpath of source
@@ -1061,6 +1071,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 additional_workspace_links.push(WorkspaceMemberLink {
                     name: local_name.clone(),
                     version: member.version.clone(),
+                    package_dir: member.package_dir.clone(),
                     source_dir: member.source_dir.clone(),
                 });
                 continue;
@@ -1142,8 +1153,11 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             ))
         })?;
 
-        let (real_name, real_version, node_engine) =
-            read_pkg_json_name_version(&realpath, &format!("link: dep at {}", realpath.display()))?;
+        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
+            &realpath,
+            &format!("link: dep at {}", realpath.display()),
+            MissingVersionPolicy::DefaultToZero,
+        )?;
 
         // : workspace overlap detection — same logic as the
         // directory arm.
@@ -1172,6 +1186,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 additional_workspace_links.push(WorkspaceMemberLink {
                     name: local_name.clone(),
                     version: member.version.clone(),
+                    package_dir: member.package_dir.clone(),
                     source_dir: member.source_dir.clone(),
                 });
                 continue;
@@ -1352,9 +1367,16 @@ pub(super) async fn read_local_tarball_bounded(
 /// inline this logic with identical error shapes. `source_label` is
 /// embedded in error messages so the user knows which arm produced
 /// them (`"tarball at https://..."` vs `"local tarball at ..."`).
+#[derive(Clone, Copy)]
+pub(super) enum MissingVersionPolicy {
+    Require,
+    DefaultToZero,
+}
+
 pub(super) fn read_pkg_json_name_version(
     cas_path: &Path,
     source_label: &str,
+    missing_version: MissingVersionPolicy,
 ) -> Result<(String, String, Option<String>), LpmError> {
     let pkg_json = read_pkg_json(cas_path, source_label)?;
     let name = pkg_json
@@ -1366,15 +1388,17 @@ pub(super) fn read_pkg_json_name_version(
             ))
         })?
         .to_string();
-    let version = pkg_json
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
+    let version = match pkg_json.get("version").and_then(|value| value.as_str()) {
+        Some(version) => version.to_string(),
+        None if matches!(missing_version, MissingVersionPolicy::DefaultToZero) => {
+            "0.0.0".to_string()
+        }
+        None => {
+            return Err(LpmError::Registry(format!(
                 "{source_label} has no `version` field in package.json"
-            ))
-        })?
-        .to_string();
+            )));
+        }
+    };
     let node_engine = package_json_node_engine(&pkg_json);
     Ok((name, version, node_engine))
 }
@@ -1396,7 +1420,7 @@ fn read_pkg_json(cas_path: &Path, source_label: &str) -> Result<serde_json::Valu
                 "failed to read package.json from {source_label}: {e}"
             ))
         })?;
-    serde_json::from_str(&pkg_json_str)
+    serde_json::from_str(lpm_common::strip_utf8_bom_str(&pkg_json_str))
         .map_err(|e| LpmError::Registry(format!("invalid package.json in {source_label}: {e}")))
 }
 
@@ -1406,6 +1430,15 @@ fn package_json_node_engine(pkg_json: &serde_json::Value) -> Option<String> {
         .and_then(|engines| engines.get("node"))
         .and_then(|value| value.as_str())
         .map(str::to_string)
+}
+
+fn project_relative_source_path(project_dir: &Path, source_realpath: &Path) -> String {
+    let project_realpath = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let path = pathdiff::diff_paths(source_realpath, project_realpath)
+        .unwrap_or_else(|| source_realpath.to_path_buf());
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// read a local source's
@@ -1452,30 +1485,103 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
                 source_dir.display()
             ))
         })?;
-    let pkg_json: serde_json::Value = serde_json::from_str(&pkg_json_str).map_err(|e| {
-        LpmError::Registry(format!(
-            "invalid package.json in local source at {}: {e}",
-            source_dir.display()
-        ))
-    })?;
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&pkg_json_str)).map_err(|e| {
+            LpmError::Registry(format!(
+                "invalid package.json in local source at {}: {e}",
+                source_dir.display()
+            ))
+        })?;
+
+    let dependency_fields = ["dependencies", "peerDependencies", "optionalDependencies"];
+    let has_catalog_references = dependency_fields.iter().any(|field| {
+        pkg_json
+            .get(field)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|dependencies| {
+                dependencies.values().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|specifier| specifier.starts_with("catalog:"))
+                })
+            })
+    });
+    let local_catalogs = if has_catalog_references {
+        pkg_json
+            .get("catalogs")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "invalid catalogs in local source at {}: {error}",
+                    source_dir.display()
+                ))
+            })?
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let workspace = if has_catalog_references {
+        crate::workspace_discovery_cache::discover_workspace(source_dir).map_err(|error| {
+            LpmError::Workspace(format!(
+                "workspace discovery failed for local source {}: {error}",
+                source_dir.display()
+            ))
+        })?
+    } else {
+        None
+    };
+    let catalogs = workspace.as_deref().map_or(&local_catalogs, |workspace| {
+        &workspace.root_package.catalogs
+    });
 
     let optional_names = pkg_json
         .get("optionalDependencies")
         .and_then(|value| value.as_object())
         .map(|deps| deps.keys().map(String::as_str).collect::<HashSet<_>>())
         .unwrap_or_default();
+    let optional_peer_names = pkg_json
+        .get("peerDependenciesMeta")
+        .and_then(|value| value.as_object())
+        .map(|metadata| {
+            metadata
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .get("optional")
+                        .and_then(|optional| optional.as_bool())
+                        .is_some_and(|optional| optional)
+                        .then_some(name.as_str())
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     let mut out = Vec::new();
-    for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
+    for field in dependency_fields {
         let Some(deps) = pkg_json.get(field).and_then(|v| v.as_object()) else {
             continue;
         };
+        let mut resolved_specs = deps
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|specifier| (name.clone(), specifier.to_string()))
+            })
+            .collect::<HashMap<_, _>>();
+        lpm_workspace::resolve_catalog_protocol(&mut resolved_specs, catalogs)
+            .map_err(catalog_protocol_error_to_lpm)?;
         for (local_name, raw) in deps {
             if field == "dependencies" && optional_names.contains(local_name.as_str()) {
                 continue;
             }
-            let Some(raw_str) = raw.as_str() else {
+            let Some(original_raw) = raw.as_str() else {
                 continue;
             };
+            let raw_str = resolved_specs
+                .get(local_name)
+                .map_or(original_raw, String::as_str);
             let normalized_spec = lpm_resolver::normalize_jsr_dependency(local_name, raw_str)
                 .map_err(|e| {
                     LpmError::Registry(format!(
@@ -1492,11 +1598,14 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
             // instead of a deep "invalid semver range" error from
             // inside the resolver.
             let kind = classify_source_dep(source_dir, effective_raw, local_name)?;
+            let optional_peer =
+                field == "peerDependencies" && optional_peer_names.contains(local_name.as_str());
             out.push(SourceDep {
                 local_name: local_name.clone(),
                 raw_spec: normalized_spec.unwrap_or_else(|| raw_str.to_string()),
                 kind,
-                optional: field == "optionalDependencies",
+                optional: field == "optionalDependencies" || optional_peer,
+                auto_install: !optional_peer,
                 target_source: None,
             });
         }
@@ -1653,11 +1762,11 @@ pub(super) fn detect_workspace_overlap<'a>(
         return Ok(WorkspaceOverlap::NoOverlap);
     }
     for member in workspace_members {
-        // Canonicalize the member's source_dir for the comparison.
+        // Canonicalize the member's effective resolution directory.
         // The dir was discovered by lpm-workspace; re-canonicalizing
         // here costs one stat per member but avoids storing
         // realpaths upstream just for this comparison.
-        let Ok(member_realpath) = member.source_dir.canonicalize() else {
+        let Ok(member_realpath) = member.resolution_dir().canonicalize() else {
             // Member's source_dir is missing/unreadable —
             // workspace discovery should have caught this, so we
             // fall through to "no overlap" rather than masking the
@@ -1765,11 +1874,11 @@ fn promote_workspace_member_source_graph(
     workspace_transitives: WorkspaceTransitiveMode,
     inherited_optional: bool,
 ) -> Result<(), LpmError> {
-    let realpath = match matched_member.source_dir.canonicalize() {
+    let realpath = match matched_member.resolution_dir().canonicalize() {
         Ok(path) => path,
         Err(_) => return Ok(()),
     };
-    let source_string = workspace_member_source(project_dir, &matched_member.source_dir);
+    let source_string = workspace_member_source(project_dir, matched_member.resolution_dir());
     if let Some(existing_source) = visited.get(&realpath) {
         spec.target_source = Some(existing_source.clone());
         if let Some(root_link_name) = root_link_name
@@ -1787,10 +1896,10 @@ fn promote_workspace_member_source_graph(
     visited.insert(realpath.clone(), source_string.clone());
     spec.target_source = Some(source_string.clone());
     let node_engine = read_pkg_json_node_engine(
-        &matched_member.source_dir,
+        matched_member.resolution_dir(),
         &format!(
             "workspace member at {}",
-            matched_member.source_dir.display()
+            matched_member.resolution_dir().display()
         ),
     )?;
     install_pkgs_out.push(InstallPackage {
@@ -1890,6 +1999,9 @@ pub(super) fn recurse_local_source_deps(
     for spec in specs.iter_mut() {
         match spec.kind {
             DepKind::Registry => {
+                if !spec.auto_install {
+                    continue;
+                }
                 // First-come-first-serve: consumer's own decl wins,
                 // and the FIRST transitive dep encountered for a
                 // given local_name wins over later ones. Acceptable
@@ -1931,6 +2043,7 @@ pub(super) fn recurse_local_source_deps(
                     additional_workspace_links.push(WorkspaceMemberLink {
                         name: spec.local_name.clone(),
                         version: matched_member.version.clone(),
+                        package_dir: matched_member.package_dir.clone(),
                         source_dir: matched_member.source_dir.clone(),
                     });
                 }
@@ -1983,6 +2096,7 @@ pub(super) fn recurse_local_source_deps(
                 let (real_name, real_version, node_engine) = read_pkg_json_name_version(
                     &realpath,
                     &format!("transitive local source at {}", realpath.display()),
+                    MissingVersionPolicy::DefaultToZero,
                 )?;
                 // (): workspace overlap on
                 // transitive deps too. Same dedupe-or-error logic
@@ -2016,6 +2130,7 @@ pub(super) fn recurse_local_source_deps(
                             additional_workspace_links.push(WorkspaceMemberLink {
                                 name: spec.local_name.clone(),
                                 version: member.version.clone(),
+                                package_dir: member.package_dir.clone(),
                                 source_dir: member.source_dir.clone(),
                             });
                         }
@@ -2056,9 +2171,10 @@ pub(super) fn recurse_local_source_deps(
                     json_output,
                     node_modules_warned,
                 );
+                let source_path = project_relative_source_path(project_dir, &realpath);
                 let source_string = match spec.kind {
-                    DepKind::FileDir => format!("directory+{path_str}"),
-                    DepKind::Link => format!("link+{path_str}"),
+                    DepKind::FileDir => format!("directory+{source_path}"),
+                    DepKind::Link => format!("link+{source_path}"),
                     DepKind::Registry | DepKind::Workspace => unreachable!(),
                 };
                 spec.target_source = Some(source_string.clone());

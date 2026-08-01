@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn matching_semver_workspace_dependency_is_extracted_for_local_linking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let member_dir = dir.path().join("packages/app");
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let workspace = lpm_workspace::discover_workspace(dir.path())
+        .unwrap()
+        .unwrap();
+    let members = all_workspace_members(Some(&workspace)).unwrap();
+    let mut deps = HashMap::from([("app".to_string(), "^1.0.0".to_string())]);
+
+    let extracted = extract_matching_workspace_semver_deps(&mut deps, &members);
+
+    assert!(deps.is_empty());
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, "app");
+    assert_eq!(extracted[0].version, "1.0.0");
+}
+
+#[test]
+fn incompatible_semver_workspace_dependency_remains_a_registry_dependency() {
+    let member = WorkspaceMemberLink {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        package_dir: PathBuf::from("packages/app"),
+        source_dir: PathBuf::from("packages/app"),
+    };
+    let mut deps = HashMap::from([("app".to_string(), "^2.0.0".to_string())]);
+
+    let extracted = extract_matching_workspace_semver_deps(&mut deps, &[member]);
+
+    assert!(extracted.is_empty());
+    assert_eq!(deps.get("app").map(String::as_str), Some("^2.0.0"));
+}
+
+#[test]
 fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
     let dir = tempfile::tempdir().unwrap();
     let runtime_dir = dir.path().join("packages/runtime");
@@ -27,11 +72,13 @@ fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
     let runtime = WorkspaceMemberLink {
         name: "@test/runtime".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: runtime_dir.clone(),
         source_dir: runtime_dir,
     };
     let build_tool = WorkspaceMemberLink {
         name: "@test/build-tool".to_string(),
         version: "1.0.0".to_string(),
+        package_dir: build_tool_dir.clone(),
         source_dir: build_tool_dir,
     };
     let mut expanded = vec![runtime.clone()];
@@ -229,52 +276,6 @@ fn workspace_protocol_dep_is_extracted_before_resolver_sees_it() {
     assert_eq!(
         extracted[0].source_dir.canonicalize().unwrap(),
         core_dir.canonicalize().unwrap(),
-    );
-}
-
-#[test]
-fn workspace_member_cache_info_normalizes_jsr_dependency_aliases() {
-    let dir = tempfile::tempdir().unwrap();
-    let member_dir = dir.path().join("packages/app");
-    std::fs::create_dir_all(&member_dir).unwrap();
-    std::fs::write(
-        member_dir.join("package.json"),
-        r#"{
-  "name": "app",
-  "version": "1.0.0",
-  "dependencies": {
-    "@std/path": "jsr:@std/path@1.1.6"
-  }
-}"#,
-    )
-    .unwrap();
-
-    let info = workspace_member_cache_info(&WorkspaceMemberLink {
-        name: "app".to_string(),
-        version: "1.0.0".to_string(),
-        source_dir: member_dir,
-    })
-    .expect("valid jsr dependency should normalize")
-    .expect("valid workspace member should produce cache info");
-
-    let deps = info
-        .deps
-        .get("1.0.0")
-        .expect("workspace member version should have dependency metadata");
-    assert_eq!(
-        deps.get("@std/path").map(String::as_str),
-        Some("1.1.6"),
-        "JSR dependency must be cached as the npm-alias target range"
-    );
-
-    let aliases = info
-        .aliases
-        .get("1.0.0")
-        .expect("workspace member version should have alias metadata");
-    assert_eq!(
-        aliases.get("@std/path").map(String::as_str),
-        Some("@jsr/std__path"),
-        "JSR dependency must map the local package name to the npm.jsr.io package"
     );
 }
 
@@ -514,6 +515,7 @@ fn link_workspace_members_creates_node_modules_symlink_to_member_source_dir() {
     let members = vec![WorkspaceMemberLink {
         name: "@test/core".to_string(),
         version: "2.0.0".to_string(),
+        package_dir: core_dir.clone(),
         source_dir: core_dir.clone(),
     }];
 
@@ -557,6 +559,7 @@ fn link_workspace_members_is_idempotent_across_repeated_calls() {
     let members = vec![WorkspaceMemberLink {
         name: "@test/core".to_string(),
         version: "0.0.0".to_string(),
+        package_dir: core_dir.clone(),
         source_dir: core_dir.clone(),
     }];
 
@@ -590,11 +593,13 @@ fn link_workspace_members_from_member_also_populates_workspace_root() {
         WorkspaceMemberLink {
             name: "@test/core".to_string(),
             version: "0.0.0".to_string(),
+            package_dir: core_dir.clone(),
             source_dir: core_dir.clone(),
         },
         WorkspaceMemberLink {
             name: "@test/tokens".to_string(),
             version: "0.0.0".to_string(),
+            package_dir: tokens_dir.clone(),
             source_dir: tokens_dir.clone(),
         },
     ];

@@ -145,6 +145,9 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.root_aliases.is_empty() {
         return false;
     }
+    if !lockfile.root_resolutions.is_empty() {
+        return false;
+    }
     // Extend the same "skip binary fast path when the lockfile carries
     // metadata the binary schema can't encode" gate to peer fields.
     // Both `Lockfile.ambient_peer_installs` and per-package
@@ -902,6 +905,7 @@ impl BinaryLockfileReader {
             // correspond to an alias-free lockfile and this field is
             // always empty.
             root_aliases: std::collections::BTreeMap::new(),
+            root_resolutions: crate::RootResolutions::new(),
             // Same reasoning as `root_aliases`: projects with ambient
             // peer installs skip the binary write entirely, so any
             // `to_lockfile()` we'd reach is for a binary-representable

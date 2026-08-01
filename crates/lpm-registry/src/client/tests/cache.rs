@@ -614,6 +614,7 @@ async fn direct_npm_release_times_full_accepts_time_only_metadata_and_caches_it(
         fetched.time.get("1.0.0").map(String::as_str),
         Some("2025-01-01T00:00:00.000Z")
     );
+    assert!(fetched.versions.is_none());
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -630,6 +631,136 @@ async fn direct_npm_release_times_full_accepts_time_only_metadata_and_caches_it(
     assert_eq!(
         cached.time.get("1.0.0").map(String::as_str),
         Some("2025-01-01T00:00:00.000Z")
+    );
+    assert!(cached.versions.is_none());
+}
+
+#[tokio::test]
+async fn direct_platform_metadata_refetches_incomplete_release_time_cache() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "native-linux";
+    Mock::given(method("GET"))
+        .and(path("/native-linux"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let release_times = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect("time-only release metadata should populate the cache");
+    assert!(release_times.versions.is_none());
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/native-linux"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "os": ["linux"],
+                    "cpu": ["x64"],
+                    "libc": ["glibc"]
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let platform = client
+        .get_npm_platform_metadata_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect("platform hydration should bypass a time-only cache entry");
+    assert_eq!(
+        platform
+            .versions
+            .as_ref()
+            .and_then(|versions| versions.get("1.0.0"))
+            .map(|metadata| metadata.libc.as_slice()),
+        Some(["glibc".to_string()].as_slice())
+    );
+}
+
+#[tokio::test]
+async fn direct_npm_release_time_cache_preserves_compact_platform_metadata() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "native-linux";
+    let release_times = serde_json::json!({
+        "name": npm_name,
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "os": ["linux"],
+                "cpu": "arm64",
+                "libc": ["glibc"]
+            }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/native-linux"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect("full npm response should project platform metadata");
+    assert_eq!(
+        serde_json::to_value(&fetched).unwrap()["versions"]["1.0.0"],
+        serde_json::json!({
+            "os": ["linux"],
+            "cpu": ["arm64"],
+            "libc": ["glibc"]
+        })
+    );
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/native-linux"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let cached = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect("fresh release-time cache should avoid the network");
+    assert_eq!(
+        serde_json::to_value(&cached).unwrap()["versions"]["1.0.0"],
+        serde_json::json!({
+            "os": ["linux"],
+            "cpu": ["arm64"],
+            "libc": ["glibc"]
+        })
     );
 }
 

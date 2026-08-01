@@ -95,6 +95,69 @@ fn install_json_rejects_manifest_direct_typosquat_before_lockfile_write() {
 }
 
 #[tokio::test]
+async fn install_json_allows_manifest_alias_whose_local_name_resembles_target() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("vite", "1.0.0");
+    mock.with_package("vite", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-alias",
+            "version":"1.0.0",
+            "dependencies":{"vite7":"npm:vite@1.0.0"}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "an npm alias must analyze its canonical target rather than its local key\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[test]
+fn install_json_rejects_manifest_alias_with_suspicious_registry_target() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-alias-target",
+            "version":"1.0.0",
+            "dependencies":{"http-client":"npm:axois@1.0.0"}
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["install", "--json"])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        !output.status.success(),
+        "a suspicious npm alias target must fail before resolver/network\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], "typosquat_suspected");
+    assert_eq!(json["error"]["findings"][0]["package"], "axois");
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
 async fn install_json_env_can_disable_manifest_typosquat_analysis() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("axois", "1.0.0");
@@ -398,6 +461,90 @@ async fn install_json_allows_popular_clean_chat_package() {
         Some(&serde_json::json!("typosquat_suspected"))
     );
     assert!(project.read_file("package.json").contains("chat"));
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn install_json_allows_legitimate_fsevents_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("fsevents", "2.3.3");
+    mock.with_package("fsevents", "2.3.3", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-fsevents-legitimate",
+            "version":"1.0.0",
+            "dependencies":{}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "fsevents@2.3.3",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install fsevents");
+
+    assert!(
+        output.status.success(),
+        "legitimate fsevents install should pass typosquat guard\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_ne!(
+        json.get("error_code"),
+        Some(&serde_json::json!("typosquat_suspected"))
+    );
+    assert!(project.read_file("package.json").contains("fsevents"));
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn install_json_allows_legitimate_short_serve_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("serve", "14.2.4");
+    mock.with_package("serve", "14.2.4", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-serve-legitimate",
+            "version":"1.0.0",
+            "dependencies":{}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "serve@14.2.4",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install serve");
+
+    assert!(
+        output.status.success(),
+        "legitimate short serve install should pass typosquat guard\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_ne!(
+        json.get("error_code"),
+        Some(&serde_json::json!("typosquat_suspected"))
+    );
+    assert!(project.read_file("package.json").contains("serve"));
     assert!(project.file_exists("lpm.lock"));
 }
 

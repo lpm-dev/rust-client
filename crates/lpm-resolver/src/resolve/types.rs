@@ -92,6 +92,12 @@ pub struct ResolvedPackage {
     pub optional: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootResolution {
+    pub package: String,
+    pub version: String,
+}
+
 /// Concrete package selected by the greedy-fusion resolver before the final
 /// resolved graph is materialized.
 #[derive(Debug, Clone)]
@@ -157,6 +163,10 @@ pub struct ResolveResult {
     /// this to (a) drive root `node_modules/<local>/` symlinks and (b)
     /// persist aliases in the lockfile for deterministic re-install.
     pub root_aliases: HashMap<String, String>,
+    /// Exact package identities selected for root dependency slots.
+    /// Keyed by the local manifest name so npm aliases retain their
+    /// project-side link name.
+    pub root_resolutions: HashMap<String, RootResolution>,
     /// Ambient installs synthesized by the eager peer-drain pass.
     /// Shape: each entry is the canonical name of a package the
     /// resolver auto-installed because some consumer declared it as a
@@ -328,11 +338,11 @@ pub struct StageTiming {
     /// Edges that reused an existing selected node rather than allocating
     /// a new `(canonical, version)` node.
     pub work_edge_reuse_count: u64,
-    /// Reuse count where the existing node only needed to satisfy the
-    /// requested range.
+    /// Legacy range-compatible reuse count. Exact selected-identity
+    /// resolution leaves this at zero.
     pub work_edge_reuse_range_count: u64,
-    /// Reuse count where root deps, overrides, or split-targeted packages
-    /// required an exact-version match.
+    /// Reuse count where the edge's selected package identity matched an
+    /// existing node exactly.
     pub work_edge_reuse_exact_count: u64,
     /// Number of selected nodes allocated by the greedy resolver.
     pub work_node_allocated_count: u64,

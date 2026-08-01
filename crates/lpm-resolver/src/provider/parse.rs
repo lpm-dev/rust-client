@@ -20,19 +20,19 @@ use super::prelude::*;
 pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
-    parse_metadata_to_cache_info_inner(metadata, false, true)
+    parse_metadata_to_cache_info_inner(metadata, false, true, false)
 }
 
 pub(crate) fn parse_partial_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
-    parse_metadata_to_cache_info_inner(metadata, false, false)
+    parse_metadata_to_cache_info_inner(metadata, false, false, false)
 }
 
 pub(crate) fn parse_full_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
-    parse_metadata_to_cache_info_inner(metadata, true, true)
+    parse_metadata_to_cache_info_inner(metadata, true, true, true)
 }
 
 pub(crate) fn merge_release_times_into_cache_info(
@@ -47,12 +47,32 @@ pub(crate) fn merge_release_times_into_cache_info(
             dist.published_at_unix = parse_npm_time_unix(published_at);
         }
     }
+
+    if let Some(release_platforms) = &release_times.versions {
+        for (version, release_platform) in release_platforms {
+            if !info.dist.contains_key(version) {
+                continue;
+            }
+            let platform = info.platform.entry(version.clone()).or_default();
+            if platform.os.is_empty() {
+                platform.os.clone_from(&release_platform.os);
+            }
+            if platform.cpu.is_empty() {
+                platform.cpu.clone_from(&release_platform.cpu);
+            }
+            if platform.libc.is_empty() {
+                platform.libc.clone_from(&release_platform.libc);
+            }
+        }
+        info.platform_metadata_complete = true;
+    }
 }
 
 fn parse_metadata_to_cache_info_inner(
     metadata: &lpm_registry::PackageMetadata,
     trust_metadata_complete: bool,
     versions_complete: bool,
+    platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
     let mut dependency_entry_count = 0usize;
@@ -244,12 +264,14 @@ fn parse_metadata_to_cache_info_inner(
     versions.sort();
     versions.reverse(); // Newest first
 
-    CachedPackageInfo {
+    let mut info = CachedPackageInfo {
         modified: metadata.modified.clone(),
         modified_unix: metadata.modified.as_deref().and_then(parse_npm_time_unix),
         trust_metadata_complete,
         versions_complete,
         covered_ranges: HashSet::new(),
+        workspace_versions: HashSet::new(),
+        platform_metadata_complete,
         latest_version: metadata
             .latest_version_tag()
             .and_then(|version| NpmVersion::parse(version).ok()),
@@ -263,7 +285,9 @@ fn parse_metadata_to_cache_info_inner(
         platform,
         dist: dist_info,
         aliases,
-    }
+    };
+    info.remove_shadowed_peer_requirements();
+    info
 }
 
 fn detect_trust_evidence(ver_meta: &lpm_registry::VersionMetadata) -> Option<TrustEvidence> {

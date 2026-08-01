@@ -70,7 +70,7 @@ async fn resolve_with_prefetch(
     if let Some(batch) = prefetched {
         for (name, metadata) in batch {
             let key = CanonicalKey::from_dep_name(&name);
-            let info = crate::provider::parse_metadata_to_cache_info(&metadata);
+            let info = crate::provider::parse_full_metadata_to_cache_info(&metadata);
             shared_cache.insert(key, Arc::new(info));
         }
     }
@@ -336,6 +336,8 @@ fn make_cached_info(
         trust_metadata_complete: false,
         versions_complete: true,
         covered_ranges: HashSet::new(),
+        workspace_versions: HashSet::new(),
+        platform_metadata_complete: true,
         latest_version: None,
         versions: versions
             .iter()

@@ -203,14 +203,19 @@ async fn lockfile_records_configured_lpm_registry_as_the_package_source() {
 }
 
 fn seed_verified_lockfile_evidence(project: &TempProject, version: &str) -> String {
-    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    seed_verified_lockfile_evidence_at(&project.path().join(lpm_lockfile::LOCKFILE_NAME), version)
+}
+
+fn seed_verified_lockfile_evidence_at(lockfile_path: &std::path::Path, version: &str) -> String {
     let mut lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read installed lockfile");
+        lpm_lockfile::Lockfile::read_from_file(lockfile_path).expect("read installed lockfile");
     let package = lockfile
         .packages
         .iter()
-        .find(|package| package.name == PACKAGE && package.version == version)
-        .expect("locked package")
+        .find(|package| {
+            package.name == PACKAGE && package.version == version && package.integrity.is_some()
+        })
+        .expect("locked registry package")
         .clone();
     let integrity = lpm_common::Integrity::parse(
         package
@@ -241,7 +246,7 @@ fn seed_verified_lockfile_evidence(project: &TempProject, version: &str) -> Stri
         },
     );
     lockfile
-        .write_all(&lockfile_path)
+        .write_all(lockfile_path)
         .expect("write lockfile with verified provenance");
     subject_sha512
 }
@@ -388,6 +393,96 @@ async fn frozen_strict_install_replays_artifact_bound_lockfile_evidence() {
         "frozen strict replay must accept matching verified evidence:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn lockfile_replay_accepts_a_coexisting_unattested_version_under_no_downgrade() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name": "coexisting-provenance-history",
+            "version": "1.0.0",
+            "dependencies": {{
+                "verified-copy": "npm:{PACKAGE}@{VERSION_1}",
+                "unattested-copy": "npm:{PACKAGE}@{VERSION_2}"
+            }}
+        }}"#,
+    ));
+    let mock = MockRegistry::start().await;
+    configure_custom_registry(&project, &mock);
+    mount_package_versions(
+        &mock,
+        &[
+            (VERSION_1, Attestation::Absent),
+            (VERSION_2, Attestation::Absent),
+        ],
+    )
+    .await;
+
+    let initial = install(&project, &mock, &[]);
+    assert!(
+        initial.status.success(),
+        "initial install with coexisting versions must succeed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    seed_verified_lockfile_evidence(&project, VERSION_1);
+    write_sigstore_config(&project, None, None, Some("no-downgrade"), None);
+
+    let replay = install(&project, &mock, &[]);
+
+    assert!(
+        replay.status.success(),
+        "a verified version must not make a coexisting locked version fail on replay:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+}
+
+#[tokio::test]
+async fn lockfile_replay_accepts_coexisting_registry_and_local_sources_under_no_downgrade() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name": "coexisting-provenance-sources",
+            "version": "1.0.0",
+            "dependencies": {{
+                "registry-copy": "npm:{PACKAGE}@{VERSION_1}",
+                "local-copy": "file:./local-copy"
+            }}
+        }}"#,
+    ));
+    project.write_file(
+        "local-copy/package.json",
+        &format!(
+            r#"{{
+                "name": "{PACKAGE}",
+                "version": "{VERSION_1}",
+                "main": "index.js"
+            }}"#,
+        ),
+    );
+    project.write_file("local-copy/index.js", "module.exports = 'local';\n");
+    let mock = MockRegistry::start().await;
+    configure_custom_registry(&project, &mock);
+    mount_package_versions(&mock, &[(VERSION_1, Attestation::Absent)]).await;
+
+    let initial = install(&project, &mock, &[]);
+    assert!(
+        initial.status.success(),
+        "initial install with coexisting sources must succeed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    seed_verified_lockfile_evidence(&project, VERSION_1);
+    write_sigstore_config(&project, None, None, Some("no-downgrade"), None);
+
+    let replay = install(&project, &mock, &[]);
+
+    assert!(
+        replay.status.success(),
+        "verified registry evidence must not relabel a coexisting locked local source as a substitution:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
     );
 }
 
