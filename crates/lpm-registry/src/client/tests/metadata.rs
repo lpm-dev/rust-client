@@ -1434,6 +1434,36 @@ async fn command_scoped_metadata_cache_single_flights_independent_resolvers_with
 }
 
 #[tokio::test]
+async fn command_scoped_metadata_cache_returns_the_same_arc_for_direct_registry_hits() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let package = "shared-arc-package";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(package)))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .clone_with_metadata_memory_cache();
+    client.cache_dir = None;
+    client.get_npm_metadata_direct(package).await.unwrap();
+
+    let first = client
+        .npm_metadata_direct_memory_cache(package)
+        .expect("first memory-cache hit");
+    let second = client
+        .npm_metadata_direct_memory_cache(package)
+        .expect("second memory-cache hit");
+
+    assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test]
 async fn command_scoped_metadata_cache_single_flights_custom_registry_resolvers() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

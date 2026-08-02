@@ -49,14 +49,30 @@ impl RegistryClient {
     }
 
     pub(super) fn read_metadata_memory_cache(&self, key: &str) -> Option<PackageMetadata> {
-        let cached = self
-            .metadata_memory_cache
+        self.read_metadata_memory_cache_arc(key)
+            .map(|metadata| metadata.as_ref().clone())
+    }
+
+    fn read_metadata_memory_cache_arc(&self, key: &str) -> Option<Arc<PackageMetadata>> {
+        self.metadata_memory_cache
             .as_ref()?
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
-            .cloned();
-        cached.map(|metadata| metadata.as_ref().clone())
+            .cloned()
+    }
+
+    /// Returns immutable command-scoped direct-registry metadata without
+    /// cloning the packument.
+    pub fn npm_metadata_direct_memory_cache(&self, name: &str) -> Option<Arc<PackageMetadata>> {
+        let cache_key = format!("npm:{name}");
+        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
+        let cached = self.read_metadata_memory_cache_arc(&memory_cache_key);
+        if cached.is_some() {
+            crate::timing::record_metadata_request(name);
+            crate::timing::record_metadata_cache_hit();
+        }
+        cached
     }
 
     pub(super) fn remember_metadata_for_command(&self, key: &str, metadata: &PackageMetadata) {

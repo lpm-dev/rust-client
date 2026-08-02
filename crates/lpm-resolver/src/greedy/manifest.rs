@@ -135,6 +135,26 @@ pub(super) struct FetchedMetadata {
 
 pub(super) type FetchResult = Result<FetchedMetadata, ResolveError>;
 
+pub(super) fn parse_cached_metadata_for_resolver(
+    metadata: &lpm_registry::PackageMetadata,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+) -> Option<FetchedMetadata> {
+    let base_fact = Arc::new(parse_metadata_to_cache_info(metadata));
+    if base_fact.needs_supplemental_metadata(canonical, policy) {
+        return None;
+    }
+    let mut fetched = fetched_metadata_from_arc(
+        None,
+        metadata.dist_tags.clone(),
+        Arc::clone(&base_fact),
+        include_speculation,
+    );
+    fetched.shared_fact = Some(base_fact);
+    Some(fetched)
+}
+
 pub(super) async fn fetch_metadata_for_resolver(
     client: &RegistryClient,
     route_table: &RouteTable,

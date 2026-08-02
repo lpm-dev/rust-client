@@ -108,6 +108,12 @@ fn platform_default_fetch_extract_permits(
 }
 
 pub(super) fn configured_fetch_extract_limiter(v2_store_active: bool) -> FetchExtractLimiter {
+    configured_fetch_extract_permits_from_env(v2_store_active)
+        .map(tokio::sync::Semaphore::new)
+        .map(Arc::new)
+}
+
+pub(super) fn configured_fetch_extract_permits_from_env(v2_store_active: bool) -> Option<usize> {
     let explicit_permits = std::env::var(ENV_FETCH_EXTRACT_PERMITS).ok();
     let experimental_resolver = std::env::var(ENV_EXPERIMENTAL_RESOLVER).ok();
     configured_fetch_extract_permits(
@@ -115,8 +121,6 @@ pub(super) fn configured_fetch_extract_limiter(v2_store_active: bool) -> FetchEx
         experimental_resolver.as_deref(),
         v2_store_active,
     )
-    .map(tokio::sync::Semaphore::new)
-    .map(Arc::new)
 }
 
 async fn acquire_fetch_extract_permit(
@@ -557,9 +561,14 @@ pub(super) async fn run_online_fetch_phase(
     // Per-package v2 link handles populated by both the cache-hit
     // short-circuits below and the fetch tasks further down. Drained
     // at the link stage and folded into the LinkResult.
-    let v2_link_task_semaphore = Arc::new(Semaphore::new(v2_link_task_concurrency(
-        v2_target_by_key.len(),
-    )));
+    let v2_link_task_semaphore = workspace_materialization::current().map_or_else(
+        || {
+            Arc::new(Semaphore::new(v2_link_task_concurrency(
+                v2_target_by_key.len(),
+            )))
+        },
+        |coordinator| coordinator.v2_link_task_semaphore(),
+    );
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
     fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
     let v2_prevalidate_start = Instant::now();

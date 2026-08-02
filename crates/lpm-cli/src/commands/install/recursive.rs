@@ -9,11 +9,12 @@ const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
 const WORKSPACE_INSTALL_DEFAULT_CONCURRENCY: usize = 1;
 const WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY: usize = 3;
 const WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY: usize = 6;
-const WORKSPACE_INSTALL_FRESH_PARALLEL_TARGET_THRESHOLD: usize = 64;
+const WORKSPACE_INSTALL_FRESH_WORK_UNITS_PER_LANE: usize = 256;
 
 #[derive(Clone, Copy)]
 struct AutomaticWorkspaceInstallPolicy {
     target_count: usize,
+    dependency_count: usize,
     targets_need_materialization: bool,
     lockfile_replay_ready: bool,
     offline: bool,
@@ -31,14 +32,29 @@ impl AutomaticWorkspaceInstallPolicy {
     }
 
     fn parallel_fresh(self) -> bool {
-        self.target_count >= WORKSPACE_INSTALL_FRESH_PARALLEL_TARGET_THRESHOLD
-            && self.targets_need_materialization
+        self.fresh_concurrency() > WORKSPACE_INSTALL_DEFAULT_CONCURRENCY
+    }
+
+    fn fresh_concurrency(self) -> usize {
+        let eligible = self.targets_need_materialization
             && !self.lockfile_replay_ready
             && !self.offline
             && !self.force
             && !self.explicit_concurrency
             && self.share_local_source_populations
-            && self.root_resolve_ahead_eligible
+            && self.root_resolve_ahead_eligible;
+        if !eligible {
+            return WORKSPACE_INSTALL_DEFAULT_CONCURRENCY;
+        }
+
+        self.target_count
+            .saturating_add(self.dependency_count)
+            .div_ceil(WORKSPACE_INSTALL_FRESH_WORK_UNITS_PER_LANE)
+            .clamp(
+                WORKSPACE_INSTALL_DEFAULT_CONCURRENCY,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            )
+            .min(self.target_count.max(1))
     }
 }
 
@@ -76,6 +92,7 @@ struct WorkspaceInstallTarget {
     path: PathBuf,
     kind: &'static str,
     lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle,
+    dependency_count: usize,
     resolve_ahead_eligible: bool,
     // Indices of targets that must complete before this one starts:
     // workspace dependency edges, the sequential chain between
@@ -167,12 +184,14 @@ pub(crate) async fn run_recursive_workspace_install(
         &options,
         root_provider_fingerprint.as_deref(),
     );
-    let share_local_source_populations =
-        targets.iter().all(|target| !target.lifecycle.has_scripts());
+    let share_local_source_populations = workspace_allows_shared_local_source_populations(&targets);
     let explicit_concurrency =
         explicit_workspace_install_concurrency(options.workspace_concurrency).is_some();
     let automatic_policy = AutomaticWorkspaceInstallPolicy {
         target_count: targets.len(),
+        dependency_count: targets.iter().fold(0usize, |total, target| {
+            total.saturating_add(target.dependency_count)
+        }),
         targets_need_materialization,
         lockfile_replay_ready,
         offline: options.offline,
@@ -184,6 +203,7 @@ pub(crate) async fn run_recursive_workspace_install(
     };
     let automatic_parallel_replay = automatic_policy.parallel_replay();
     let automatic_parallel_fresh = automatic_policy.parallel_fresh();
+    let automatic_fresh_concurrency = automatic_policy.fresh_concurrency();
     let resolve_ahead = !lockfile_replay_ready
         && !options.offline
         && !options.force
@@ -200,6 +220,7 @@ pub(crate) async fn run_recursive_workspace_install(
                 && !lockfile_replay_ready
                 && !options.offline
                 && share_local_source_populations
+                && !targets[*index].lifecycle.has_scripts()
                 && targets[*index].resolve_ahead_eligible
         })
         .map(|_| {
@@ -214,7 +235,7 @@ pub(crate) async fn run_recursive_workspace_install(
         targets.len(),
         automatic_parallel_replay || automatic_parallel_fresh,
         if automatic_parallel_fresh {
-            WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY
+            automatic_fresh_concurrency
         } else {
             WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY
         },
@@ -227,23 +248,26 @@ pub(crate) async fn run_recursive_workspace_install(
     );
     tracing::debug!(
         concurrency,
-        resolution_concurrency,
+        effective_resolution_concurrency = if resolve_ahead {
+            resolution_concurrency
+        } else {
+            0
+        },
         resolve_ahead,
         root_provider_serialized = root_provider_coordinator.is_some(),
         lockfile_replay_ready,
+        share_object_validations = targets_need_materialization,
         share_local_source_populations,
+        workspace_resource_pools = true,
         automatic_parallel_replay,
         automatic_parallel_fresh,
         "selected recursive workspace install concurrency"
     );
-    let materialization_coordinator = targets_need_materialization.then(|| {
-        Arc::new(
-            workspace_materialization::WorkspaceMaterializationCoordinator::new(
-                lockfile_replay_ready,
-                share_local_source_populations,
-            ),
-        )
-    });
+    let materialization_coordinator = Arc::new(
+        workspace_materialization::WorkspaceMaterializationCoordinator::new(
+            share_local_source_populations,
+        ),
+    );
     let resolution_coordinator = resolve_ahead.then(|| {
         Arc::new(match root_target_index {
             Some(root_index) => {
@@ -269,6 +293,8 @@ pub(crate) async fn run_recursive_workspace_install(
     let started = Instant::now();
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     let options = Arc::new(options);
+    let workspace_freshness_cache =
+        Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
     // The install pipeline future is !Send (the fused resolver keeps
     // single-threaded caches), so concurrent targets run on a LocalSet.
     // Downloads, extraction, and link tasks are spawned onto the
@@ -327,9 +353,10 @@ pub(crate) async fn run_recursive_workspace_install(
                         &lpm_root,
                         Arc::clone(&active_workspace),
                         Arc::clone(&options),
-                        materialization_coordinator.as_ref().map(Arc::clone),
+                        Arc::clone(&materialization_coordinator),
                         resolution_coordinator.as_ref().map(Arc::clone),
                         root_provider_coordinator.as_ref().map(Arc::clone),
+                        Arc::clone(&workspace_freshness_cache),
                         root_provider_fingerprint.as_ref().map(Arc::clone),
                         &mut outcomes,
                     );
@@ -399,11 +426,12 @@ fn spawn_workspace_target_install(
     lpm_root: &lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
-    materialization_coordinator: Option<
-        Arc<workspace_materialization::WorkspaceMaterializationCoordinator>,
+    materialization_coordinator: Arc<
+        workspace_materialization::WorkspaceMaterializationCoordinator,
     >,
     resolution_coordinator: Option<Arc<workspace_resolution::WorkspaceResolutionCoordinator>>,
     root_provider_coordinator: Option<Arc<workspace_resolution::WorkspaceRootProviderCoordinator>>,
+    workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
@@ -424,6 +452,7 @@ fn spawn_workspace_target_install(
             lpm_root,
             base_workspace,
             options,
+            workspace_freshness_cache,
             root_provider_fingerprint,
         );
         let install = async {
@@ -434,12 +463,7 @@ fn spawn_workspace_target_install(
                 None => install.await,
             }
         };
-        let install = async {
-            match materialization_coordinator {
-                Some(coordinator) => workspace_materialization::scope(coordinator, install).await,
-                None => install.await,
-            }
-        };
+        let install = workspace_materialization::scope(materialization_coordinator, install);
         let result = match resolution_coordinator {
             Some(coordinator) => workspace_resolution::scope(coordinator, index, install).await,
             None => install.await,
@@ -454,10 +478,14 @@ async fn run_workspace_target_install(
     lpm_root: lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
+    workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
 ) -> Result<TargetTaskResult, LpmError> {
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
+    if plan.lifecycle.has_dev_preinstall() {
+        workspace_freshness_cache.invalidate();
+    }
 
     // `pnpm:devPreinstall` may edit the target manifest, and the root
     // install must see current root configuration; both re-read from
@@ -521,6 +549,7 @@ async fn run_workspace_target_install(
             crate::workspace_discovery_cache::scope(
                 Arc::clone(&scoped_workspace),
                 root_provider_fingerprint.as_ref().map(Arc::clone),
+                Arc::clone(&workspace_freshness_cache),
                 report_capture::scope(Arc::clone(capture), install),
             )
             .await?;
@@ -529,6 +558,7 @@ async fn run_workspace_target_install(
             crate::workspace_discovery_cache::scope(
                 Arc::clone(&scoped_workspace),
                 root_provider_fingerprint,
+                Arc::clone(&workspace_freshness_cache),
                 install,
             )
             .await?;
@@ -537,6 +567,9 @@ async fn run_workspace_target_install(
 
     plan.lifecycle
         .run_after_successful_install(&plan.path, options.json_output)?;
+    if plan.lifecycle.has_scripts() {
+        workspace_freshness_cache.invalidate();
+    }
 
     Ok(TargetTaskResult {
         report: capture.as_ref().and_then(report_capture::take),
@@ -623,20 +656,45 @@ fn dependency_specifier_allows_resolution_ahead(raw: &str) -> bool {
     )
 }
 
-fn package_allows_resolution_ahead(package: &lpm_workspace::PackageJson) -> bool {
-    package
-        .dependencies
-        .values()
-        .chain(package.dev_dependencies.values())
-        .chain(package.optional_dependencies.values())
-        .chain(package.peer_dependencies.values())
-        .all(|specifier| dependency_specifier_allows_resolution_ahead(specifier))
+fn package_allows_resolution_ahead(
+    package: &lpm_workspace::PackageJson,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+) -> bool {
+    [
+        &package.dependencies,
+        &package.dev_dependencies,
+        &package.optional_dependencies,
+        &package.peer_dependencies,
+    ]
+    .into_iter()
+    .all(|dependencies| {
+        let mut resolved = dependencies.clone();
+        lpm_workspace::resolve_catalog_protocol(&mut resolved, catalogs).is_ok()
+            && resolved
+                .values()
+                .all(|specifier| dependency_specifier_allows_resolution_ahead(specifier))
+    })
 }
 
 fn workspace_targets_need_materialization(targets: &[WorkspaceInstallTarget]) -> bool {
     targets
         .iter()
         .any(|target| !target.path.join("node_modules").is_dir())
+}
+
+fn workspace_allows_shared_local_source_populations(targets: &[WorkspaceInstallTarget]) -> bool {
+    targets
+        .iter()
+        .all(|target| target.kind == "root" || !target.lifecycle.has_scripts())
+}
+
+fn package_install_dependency_count(package: &lpm_workspace::PackageJson) -> usize {
+    package
+        .dependencies
+        .len()
+        .saturating_add(package.dev_dependencies.len())
+        .saturating_add(package.optional_dependencies.len())
+        .saturating_add(package.peer_dependencies.len())
 }
 
 fn workspace_targets_are_lockfile_replay_ready(
@@ -861,7 +919,11 @@ fn select_workspace_install_targets(
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
                 &member.package,
             ),
-            resolve_ahead_eligible: package_allows_resolution_ahead(&member.package),
+            dependency_count: package_install_dependency_count(&member.package),
+            resolve_ahead_eligible: package_allows_resolution_ahead(
+                &member.package,
+                &workspace.root_package.catalogs,
+            ),
             schedule_after: if workspace_edges_usable {
                 graph.edges[id]
                     .iter()
@@ -905,7 +967,11 @@ fn select_workspace_install_targets(
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
                 &workspace.root_package,
             ),
-            resolve_ahead_eligible: package_allows_resolution_ahead(&workspace.root_package),
+            dependency_count: package_install_dependency_count(&workspace.root_package),
+            resolve_ahead_eligible: package_allows_resolution_ahead(
+                &workspace.root_package,
+                &workspace.root_package.catalogs,
+            ),
             schedule_after,
         });
     }
@@ -1318,6 +1384,7 @@ mod tests {
     fn recursive_workspace_install_keeps_small_fresh_workspaces_sequential() {
         let policy = AutomaticWorkspaceInstallPolicy {
             target_count: 4,
+            dependency_count: 0,
             ..large_fresh_workspace_policy()
         };
 
@@ -1331,6 +1398,30 @@ mod tests {
             ),
             1,
         );
+    }
+
+    #[test]
+    fn recursive_workspace_install_parallelizes_smaller_dependency_heavy_workspaces() {
+        let policy = AutomaticWorkspaceInstallPolicy {
+            target_count: 30,
+            dependency_count: 500,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(policy.parallel_fresh());
+        assert_eq!(policy.fresh_concurrency(), 3);
+    }
+
+    #[test]
+    fn recursive_workspace_install_keeps_large_dependency_free_workspaces_sequential() {
+        let policy = AutomaticWorkspaceInstallPolicy {
+            target_count: 240,
+            dependency_count: 0,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(!policy.parallel_fresh());
+        assert_eq!(policy.fresh_concurrency(), 1);
     }
 
     #[test]
@@ -1351,6 +1442,30 @@ mod tests {
         };
 
         assert!(!policy.parallel_fresh());
+    }
+
+    #[test]
+    fn recursive_workspace_install_allows_parallel_members_before_scripted_root() {
+        let package = replay_ready_package();
+        let mut scripted_root_package = package.clone();
+        scripted_root_package
+            .scripts
+            .insert("prepare".to_string(), "node prepare.js".to_string());
+        let member = workspace_target("member", "member", &package);
+        let root = workspace_target("root", "root", &scripted_root_package);
+        let targets = [member, root];
+        let policy = AutomaticWorkspaceInstallPolicy {
+            share_local_source_populations: workspace_allows_shared_local_source_populations(
+                &targets,
+            ),
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(policy.parallel_fresh());
+        assert_eq!(
+            workspace_target_scheduling_order(&targets, false),
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -1419,6 +1534,26 @@ mod tests {
                 "{specifier} must stay on the dependency-ordered path"
             );
         }
+    }
+
+    #[test]
+    fn recursive_workspace_resolution_rejects_catalog_entry_resolving_to_local_source() {
+        let mut package = lpm_workspace::PackageJson::default();
+        package
+            .dependencies
+            .insert("local-package".to_string(), "catalog:".to_string());
+        package.catalogs.insert(
+            "default".to_string(),
+            HashMap::from([(
+                "local-package".to_string(),
+                "file:../local-package".to_string(),
+            )]),
+        );
+
+        assert!(!package_allows_resolution_ahead(
+            &package,
+            &package.catalogs,
+        ));
     }
 
     #[test]
@@ -1573,6 +1708,7 @@ mod tests {
     fn large_fresh_workspace_policy() -> AutomaticWorkspaceInstallPolicy {
         AutomaticWorkspaceInstallPolicy {
             target_count: 78,
+            dependency_count: 2_022,
             targets_need_materialization: true,
             lockfile_replay_ready: false,
             offline: false,
@@ -1592,7 +1728,8 @@ mod tests {
             path: path.to_path_buf(),
             kind: "root",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
-            resolve_ahead_eligible: package_allows_resolution_ahead(package),
+            dependency_count: package_install_dependency_count(package),
+            resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
             schedule_after: Vec::new(),
         }
     }
@@ -1607,7 +1744,8 @@ mod tests {
             path: PathBuf::from(path),
             kind,
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
-            resolve_ahead_eligible: package_allows_resolution_ahead(package),
+            dependency_count: package_install_dependency_count(package),
+            resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
             schedule_after: Vec::new(),
         }
     }

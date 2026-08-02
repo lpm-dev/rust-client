@@ -2,8 +2,8 @@ use super::edge::process_edge_with_preferred;
 use super::manifest::{
     FetchResult, FetchedMetadata, MetadataFetchCompletion, cached_manifest_from_importer_or_facts,
     complete_metadata_fetch, ensure_policy_metadata_for_cached_manifest,
-    fetch_metadata_for_resolver_with_trace_detail, parse_fetched_metadata,
-    parse_partial_fetched_metadata, publish_direct_base_fact,
+    fetch_metadata_for_resolver_with_trace_detail, parse_cached_metadata_for_resolver,
+    parse_fetched_metadata, parse_partial_fetched_metadata, publish_direct_base_fact,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -51,7 +51,7 @@ impl SharedMetadataConcurrency {
 
 #[cfg(test)]
 mod shared_metadata_concurrency_tests {
-    use super::SharedMetadataConcurrency;
+    use super::*;
 
     #[tokio::test(flavor = "current_thread")]
     async fn cloned_handles_enforce_one_global_permit_limit() {
@@ -67,6 +67,69 @@ mod shared_metadata_concurrency_tests {
             Err(tokio::sync::TryAcquireError::NoPermits)
         ));
         drop((first, second));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_memory_cache_hit_completes_without_metadata_permit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let package = "shared-memory-cache";
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": package,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/shared-memory-cache.tgz",
+                            "integrity": "sha512-shared-memory-cache"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None)
+                .clone_with_metadata_memory_cache(),
+        );
+        client.get_npm_metadata_direct(package).await.unwrap();
+        let metadata_sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            metadata_sem: &metadata_sem,
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut jobs = tokio::task::JoinSet::new();
+
+        spawn_metadata_fetch_job(&mut jobs, &dispatch, CanonicalKey::npm(package), false);
+        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            jobs.join_next()
+                .await
+                .expect("metadata job")
+                .expect("metadata task")
+        })
+        .await
+        .expect("memory-cache hit should not wait for a permit");
+
+        assert!(result.is_ok());
+        assert_eq!(telemetry.semaphore_wait_count.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -463,7 +526,29 @@ fn spawn_metadata_fetch_job(
     let policy_c = dispatch.policy.clone();
     let trace_metadata_fetches = dispatch.trace_metadata_fetches;
     let telemetry = Arc::clone(dispatch.telemetry);
+    let memory_cached = if trace_metadata_fetches {
+        None
+    } else if let CanonicalKey::Npm { name } = &canonical
+        && matches!(
+            route_table_c.route_for_package(name),
+            UpstreamRoute::NpmDirect
+        )
+    {
+        client_c.npm_metadata_direct_memory_cache(name)
+    } else {
+        None
+    };
     metadata_jobs.spawn(async move {
+        if let Some(metadata) = memory_cached
+            && let Some(fetched) = parse_cached_metadata_for_resolver(
+                &metadata,
+                &canonical,
+                &policy_c,
+                include_speculation,
+            )
+        {
+            return (canonical, Ok(fetched));
+        }
         let _permit = match Arc::clone(&permit).try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
