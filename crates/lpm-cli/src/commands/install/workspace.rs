@@ -19,6 +19,8 @@ use super::*;
 pub(super) struct WorkspaceMemberLink {
     /// Package name as declared in the member's package.json (e.g., `@test/core`).
     pub(super) name: String,
+    /// Dependency key used for the project-level `node_modules` link.
+    pub(super) link_name: String,
     /// Concrete version from the member's own package.json `version` field.
     /// Used only for diagnostics — there is no resolver constraint to satisfy.
     pub(super) version: String,
@@ -153,6 +155,7 @@ pub(super) fn all_workspace_members(
         };
         links.push(WorkspaceMemberLink {
             name: name.to_string(),
+            link_name: name.to_string(),
             version: package.version.as_deref().unwrap_or("0.0.0").to_string(),
             package_dir: package_dir.to_path_buf(),
             source_dir: workspace_package_link_source(package, package_dir)?,
@@ -419,6 +422,7 @@ pub(super) fn extract_workspace_protocol_deps(
 
         extracted.push(WorkspaceMemberLink {
             name: name.clone(),
+            link_name: name.clone(),
             version,
             package_dir: package_dir.to_path_buf(),
             source_dir,
@@ -692,11 +696,11 @@ pub(super) fn append_workspace_links_from_local_packages(
     let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let skipped: HashSet<(String, PathBuf)> = skip_workspace_members
         .iter()
-        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .map(|m| (m.link_name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
     let mut seen: HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
-        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .map(|m| (m.link_name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
 
     for package in packages {
@@ -718,10 +722,10 @@ pub(super) fn append_workspace_links_from_local_packages(
         }) else {
             continue;
         };
-        if skipped.contains(&(member.name.clone(), canonical_source.clone())) {
+        if skipped.contains(&(member.link_name.clone(), canonical_source.clone())) {
             continue;
         }
-        if seen.insert((member.name.clone(), canonical_source)) {
+        if seen.insert((member.link_name.clone(), canonical_source)) {
             workspace_member_deps.push(member.clone());
         }
     }
@@ -734,11 +738,14 @@ pub(super) fn merge_workspace_member_links(
     let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let mut seen: HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
-        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .map(|m| (m.link_name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
 
     for entry in links {
-        let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
+        let key = (
+            entry.link_name.clone(),
+            canonicalize_path(&entry.source_dir),
+        );
         if seen.insert(key) {
             workspace_member_deps.push(entry);
         }
@@ -836,7 +843,8 @@ pub(super) fn pre_extract_file_link_workspace_members(
         to_remove.push((
             local_name.clone(),
             WorkspaceMemberLink {
-                name: local_name.clone(),
+                name: matched.name.clone(),
+                link_name: local_name.clone(),
                 version: matched.version.clone(),
                 package_dir: matched.package_dir.clone(),
                 source_dir: matched.source_dir.clone(),
@@ -849,13 +857,13 @@ pub(super) fn pre_extract_file_link_workspace_members(
     // (deduped against existing workspace_member_deps).
     let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
-        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .map(|m| (m.link_name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
     let mut seen = existing;
     for (dep_name, member_link, raw_spec) in to_remove {
         deps.remove(&dep_name);
         let key = (
-            member_link.name.clone(),
+            member_link.link_name.clone(),
             canonicalize_path(&member_link.source_dir),
         );
         if seen.insert(key) {
@@ -933,7 +941,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
     // the dedupe shape in `pre_extract_file_link_workspace_members`.
     let mut visited: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
-        .map(|m| (m.name.clone(), canonicalize_path(m.resolution_dir())))
+        .map(|m| (m.link_name.clone(), canonicalize_path(m.resolution_dir())))
         .collect();
     let mut queue: std::collections::VecDeque<WorkspaceMemberLink> =
         workspace_member_deps.iter().cloned().collect();
@@ -998,7 +1006,8 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
                     continue;
                 }
                 let entry = WorkspaceMemberLink {
-                    name: local_name.clone(),
+                    name: target_member.name.clone(),
+                    link_name: local_name.clone(),
                     version: target_member.version.clone(),
                     package_dir: target_member.package_dir.clone(),
                     source_dir: target_member.source_dir.clone(),
@@ -1072,11 +1081,11 @@ pub(super) fn link_workspace_members(
     let mut linked = 0usize;
     for member in members {
         for node_modules in &node_modules_roots {
-            lpm_linker::link_workspace_member(node_modules, &member.name, &member.source_dir)
+            lpm_linker::link_workspace_member(node_modules, &member.link_name, &member.source_dir)
                 .map_err(|e| {
                     LpmError::Workspace(format!(
                         "failed to link workspace member {}: {e}",
-                        member.name
+                        member.link_name
                     ))
                 })?;
         }

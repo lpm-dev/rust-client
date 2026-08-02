@@ -11210,6 +11210,144 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
     );
 }
 
+#[test]
+fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "recursive-aliased-file-member",
+  "private": true,
+  "workspaces": ["playground/**"]
+}"#,
+    );
+    project.write_file(
+        "playground/minify/package.json",
+        r#"{
+  "name": "@test/minify",
+  "version": "0.0.0",
+  "dependencies": { "minified-module": "file:./dir/module" }
+}"#,
+    );
+    project.write_file(
+        "playground/minify/dir/module/package.json",
+        r#"{ "name": "@test/minify", "version": "0.0.0" }"#,
+    );
+
+    let initial = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn initial recursive install");
+    assert!(
+        initial.status.success(),
+        "initial recursive install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr),
+    );
+
+    let replay = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--recursive",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn frozen recursive replay");
+    assert!(
+        replay.status.success(),
+        "frozen recursive replay rejected its aliased local workspace source:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&replay.stderr).contains("unsafe source URL"),
+        "validated aliased workspace sources must not emit an unsafe-source warning:\n{}",
+        String::from_utf8_lossy(&replay.stderr),
+    );
+
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("playground/minify/lpm.lock"))
+            .expect("aliased workspace member lockfile should parse");
+    assert!(
+        lockfile.packages.iter().any(|package| {
+            package.name == "@test/minify"
+                && package.source.as_deref() == Some("directory+dir/module")
+        }),
+        "the local alias must not replace the package's canonical identity",
+    );
+}
+
+#[test]
+fn recursive_lockfile_records_canonical_alias_for_transitive_file_workspace_member() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "recursive-transitive-file-alias",
+  "private": true,
+  "workspaces": ["packages/**"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": { "host": "file:./host" }
+}"#,
+    );
+    project.write_file(
+        "packages/app/host/package.json",
+        r#"{
+  "name": "host",
+  "version": "1.0.0",
+  "dependencies": { "leaf-alias": "file:../leaf" }
+}"#,
+    );
+    project.write_file(
+        "packages/app/leaf/package.json",
+        r#"{ "name": "@test/leaf", "version": "1.0.0" }"#,
+    );
+
+    let install = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install");
+    assert!(
+        install.status.success(),
+        "recursive local-source install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join("packages/app/lpm.lock"))
+            .expect("app lockfile should parse");
+    let host = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "host")
+        .expect("app lockfile should contain the local host package");
+    assert!(
+        host.alias_dependencies
+            .iter()
+            .any(|alias| { alias[0] == "leaf-alias" && alias[1] == "@test/leaf" }),
+        "the transitive local edge must preserve its local and canonical names: {:?}",
+        host.alias_dependencies,
+    );
+}
+
 #[tokio::test]
 async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() {
     let mock = MockRegistry::start().await;

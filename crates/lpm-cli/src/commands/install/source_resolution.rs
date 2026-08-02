@@ -123,7 +123,7 @@ pub(super) struct NonRegistryPreResolveResult {
     /// each directory/link InstallPackage's `dependencies` field.
     pub(super) source_deps: HashMap<String, Vec<SourceDep>>,
     /// Workspace members discovered through dedupe or the the invariant
-    /// transitive `workspace:` arm. Each entry's `name` is the LOCAL
+    /// transitive `workspace:` arm. Each entry's `link_name` is the LOCAL
     /// name (the parent's dep key) so `link_workspace_members`
     /// creates `node_modules/<local>` rather than
     /// `node_modules/<canonical>` — matches consumer expectation
@@ -367,19 +367,31 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
     }
 
     let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
-    let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
+    let mut install_pkgs: Vec<InstallPackage> =
+        Vec::with_capacity(direct_workspace_member_deps.len());
+    let mut package_by_source: HashMap<String, usize> =
+        HashMap::with_capacity(direct_workspace_member_deps.len());
     for member in direct_workspace_member_deps {
+        let source = workspace_member_source(project_dir, member.resolution_dir());
+        if let Some(&index) = package_by_source.get(&source) {
+            let root_link_names = install_pkgs[index].root_link_names.get_or_insert_default();
+            if !root_link_names.contains(&member.link_name) {
+                root_link_names.push(member.link_name.clone());
+            }
+            continue;
+        }
         let node_engine = read_pkg_json_node_engine(
             member.resolution_dir(),
             &format!("workspace member at {}", member.resolution_dir().display()),
         )?;
+        package_by_source.insert(source.clone(), install_pkgs.len());
         install_pkgs.push(InstallPackage {
             name: member.name.clone(),
             version: member.version.clone(),
-            source: workspace_member_source(project_dir, member.resolution_dir()),
+            source,
             dependencies: Vec::new(),
             aliases: HashMap::new(),
-            root_link_names: Some(vec![member.name.clone()]),
+            root_link_names: Some(vec![member.link_name.clone()]),
             is_direct: true,
             is_lpm: false,
             peers: Vec::new(),
@@ -1142,7 +1154,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 // under the consumer's local_name so the caller can
                 // merge it into the slice that drives root linking.
                 additional_workspace_links.push(WorkspaceMemberLink {
-                    name: local_name.clone(),
+                    name: member.name.clone(),
+                    link_name: local_name.clone(),
                     version: member.version.clone(),
                     package_dir: member.package_dir.clone(),
                     source_dir: member.source_dir.clone(),
@@ -1257,7 +1270,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 // under the consumer's local_name so the caller
                 // creates `node_modules/<local>` at the project root.
                 additional_workspace_links.push(WorkspaceMemberLink {
-                    name: local_name.clone(),
+                    name: member.name.clone(),
+                    link_name: local_name.clone(),
                     version: member.version.clone(),
                     package_dir: member.package_dir.clone(),
                     source_dir: member.source_dir.clone(),
@@ -2161,7 +2175,8 @@ pub(super) fn recurse_local_source_deps(
                 ) && optional_path;
                 if !graph_backed_root_link {
                     additional_workspace_links.push(WorkspaceMemberLink {
-                        name: spec.local_name.clone(),
+                        name: matched_member.name.clone(),
+                        link_name: spec.local_name.clone(),
                         version: matched_member.version.clone(),
                         package_dir: matched_member.package_dir.clone(),
                         source_dir: matched_member.source_dir.clone(),
@@ -2249,7 +2264,8 @@ pub(super) fn recurse_local_source_deps(
                         ) && optional_path;
                         if !graph_backed_root_link {
                             additional_workspace_links.push(WorkspaceMemberLink {
-                                name: spec.local_name.clone(),
+                                name: member.name.clone(),
+                                link_name: spec.local_name.clone(),
                                 version: member.version.clone(),
                                 package_dir: member.package_dir.clone(),
                                 source_dir: member.source_dir.clone(),
@@ -2402,7 +2418,7 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
     // resolve by exact source string so same-name local forks do not
     // collapse onto the first package encountered.
     let mut name_to_version: HashMap<String, String> = HashMap::new();
-    let mut source_to_source_id: HashMap<String, String> = HashMap::new();
+    let mut source_to_package: HashMap<String, (String, String)> = HashMap::new();
     for p in packages.iter() {
         if let Ok(s) = p.source_kind() {
             match s {
@@ -2410,7 +2426,9 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                 | lpm_lockfile::Source::Link { .. }
                 | lpm_lockfile::Source::Git { .. } => {
                     if let Some(sid) = p.wrapper_id_for_source() {
-                        source_to_source_id.entry(p.source.clone()).or_insert(sid);
+                        source_to_package
+                            .entry(p.source.clone())
+                            .or_insert_with(|| (sid, p.name.clone()));
                     }
                 }
                 _ => {
@@ -2464,9 +2482,12 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                 }
                 DepKind::FileDir | DepKind::Link | DepKind::Workspace | DepKind::Git => {
                     if let Some(target_source) = &spec.target_source
-                        && let Some(sid) = source_to_source_id.get(target_source)
+                        && let Some((sid, canonical_name)) = source_to_package.get(target_source)
                     {
                         deps_out.push((spec.local_name.clone(), sid.clone()));
+                        if spec.local_name != *canonical_name {
+                            aliases_out.insert(spec.local_name.clone(), canonical_name.clone());
+                        }
                     } else if matches!(spec.kind, DepKind::Git)
                         && let Some((_, locked_target)) = p
                             .dependencies

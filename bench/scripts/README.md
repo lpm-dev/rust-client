@@ -10,7 +10,10 @@ It also runs LPM frozen, up-to-date, and offline-rebuild replay gates. Generated
 JSON contains every discrepancy; Markdown limits the table to the first 100.
 
 The graph-parity cell uses a strict one-day minimum release age for both managers,
-including transitive packages.
+including transitive packages. LPM's first solve records a fixed cutoff for that
+project, and every replay and fresh-concurrency solve increases the duration to
+preserve the same cutoff. This prevents a package maturing during a long matrix
+from being misreported as scheduler nondeterminism without weakening the policy.
 Before making either temporary manager copy, the harness removes install-time
 lifecycle phases from valid workspace `package.json` files and records every
 removed phase in the project result. This prevents package-manager guards and

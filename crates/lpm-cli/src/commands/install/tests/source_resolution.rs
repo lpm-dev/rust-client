@@ -1219,6 +1219,7 @@ async fn workspace_transitive_with_matching_member_does_not_pollute_resolver_dep
     std::fs::create_dir_all(&bar_dir).unwrap();
     let workspace_members = vec![WorkspaceMemberLink {
         name: "bar".to_string(),
+        link_name: "bar".to_string(),
         version: "2.5.0".to_string(),
         package_dir: bar_dir.clone(),
         source_dir: bar_dir,
@@ -1264,12 +1265,14 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
 
     let foo = WorkspaceMemberLink {
         name: "foo".to_string(),
+        link_name: "foo".to_string(),
         version: "1.0.0".to_string(),
         package_dir: foo_dir.clone(),
         source_dir: foo_dir,
     };
     let bar = WorkspaceMemberLink {
         name: "bar".to_string(),
+        link_name: "bar".to_string(),
         version: "1.0.0".to_string(),
         package_dir: bar_dir.clone(),
         source_dir: bar_dir,
@@ -2687,6 +2690,7 @@ fn make_workspace_member(parent: &Path, name: &str, version: &str) -> WorkspaceM
     let dir = dir.canonicalize().unwrap();
     WorkspaceMemberLink {
         name: name.to_string(),
+        link_name: name.to_string(),
         version: version.to_string(),
         package_dir: dir.clone(),
         source_dir: dir,
@@ -2801,6 +2805,7 @@ async fn pre_resolve_overlap_with_version_mismatch_is_hard_error() {
     // or stale workspace cache).
     let member = WorkspaceMemberLink {
         name: "foo".to_string(),
+        link_name: "foo".to_string(),
         version: "1.0.0".to_string(),
         package_dir: pkg_dir.canonicalize().unwrap(),
         source_dir: pkg_dir.canonicalize().unwrap(),
@@ -2871,6 +2876,7 @@ fn detect_workspace_overlap_realpath_byte_equal_match() {
     let canon = pkg.canonicalize().unwrap();
     let member = WorkspaceMemberLink {
         name: "foo".to_string(),
+        link_name: "foo".to_string(),
         version: "1.0.0".to_string(),
         package_dir: canon.clone(),
         source_dir: canon.clone(),
@@ -2898,6 +2904,7 @@ fn detect_workspace_overlap_no_overlap_when_paths_differ() {
     std::fs::create_dir_all(&b).unwrap();
     let member = WorkspaceMemberLink {
         name: "foo".to_string(),
+        link_name: "foo".to_string(),
         version: "1.0.0".to_string(),
         package_dir: a.canonicalize().unwrap(),
         source_dir: a.canonicalize().unwrap(),

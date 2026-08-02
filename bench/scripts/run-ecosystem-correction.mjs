@@ -21,6 +21,7 @@ const workspaceLifecyclePhases = new Set([
   'prepare',
   'postprepare',
 ]);
+const correctionMinimumReleaseAgeSecs = 86_400;
 const args = parseArgs(process.argv.slice(2));
 
 if (args.help) {
@@ -52,7 +53,7 @@ writeJson(path.join(outputDir, 'plan.json'), {
     release_age: 'one_day_strict_for_both_managers',
     lifecycle_scripts: 'removed_from_temporary_workspace_manifests_for_both_managers',
     engine_constraints: 'warning_only_for_both_managers',
-    note: 'pnpm receives minimumReleaseAge=1440. LPM keeps its production 24-hour duration and uses strict transitive scope from its isolated config. Both managers retain their warning-only engine behavior for graph comparison; LPM receives --no-engine-strict because its production default is stricter than pnpm. Repository-specific exclusion syntax is reported, not bypassed. Removed lifecycle phases are recorded per project. Patch-bearing projects may permit only their pinned expected_unused_patches during the fresh pnpm solve; the observed set must match exactly and is recorded per project.',
+    note: 'pnpm receives minimumReleaseAge=1440. LPM uses strict transitive scope and pins one release-age cutoff per project across its initial, replay, cache-warm, and fresh-concurrency solves; the effective duration remains at least 24 hours. Both managers retain their warning-only engine behavior for graph comparison; LPM receives --no-engine-strict because its production default is stricter than pnpm. Repository-specific exclusion syntax is reported, not bypassed. Removed lifecycle phases are recorded per project. Patch-bearing projects may permit only their pinned expected_unused_patches during the fresh pnpm solve; the observed set must match exactly and is recorded per project.',
   },
   projects,
   determinism_runs: determinismRuns,
@@ -184,7 +185,13 @@ function runProject(project) {
       path.join(projectOutput, 'reference-lockfiles'),
     );
 
-    const lpmArgs = baseLpmArgs();
+    const releaseAgeCutoffUnixSecs = currentUnixSecs() - correctionMinimumReleaseAgeSecs;
+    result.release_age_snapshot = {
+      mode: 'fixed_cutoff',
+      cutoff_unix_secs: releaseAgeCutoffUnixSecs,
+      minimum_age_secs: correctionMinimumReleaseAgeSecs,
+    };
+    const lpmArgs = lpmArgsForReleaseAgeCutoff(releaseAgeCutoffUnixSecs);
     const lpmInstall = runLogged({
       label: `${project.id}:lpm-install`,
       command: lpmBin,
@@ -246,7 +253,14 @@ function runProject(project) {
     }
     if (!keepWorkspaces) removeTree(pnpmDir, workRoot);
 
-    const replay = runReplayGates(project, lpmDir, lpmEnv, projectOutput, initialLocks);
+    const replay = runReplayGates(
+      project,
+      lpmDir,
+      lpmEnv,
+      projectOutput,
+      initialLocks,
+      releaseAgeCutoffUnixSecs,
+    );
     result.replay = replay;
     if (!keepWorkspaces) removeNamedDirectories(lpmDir, 'node_modules', workRoot);
 
@@ -260,6 +274,7 @@ function runProject(project) {
       projectOutput,
       initialLocks,
       result.policy_normalization,
+      releaseAgeCutoffUnixSecs,
     );
     result.determinism = determinism;
 
@@ -282,16 +297,26 @@ function finishProject(result, projectOutput, projectWork) {
   return result;
 }
 
-function runReplayGates(project, workspace, env, projectOutput, expectedLocks) {
+function runReplayGates(
+  project,
+  workspace,
+  env,
+  projectOutput,
+  expectedLocks,
+  releaseAgeCutoffUnixSecs,
+) {
   const gates = [];
   for (const gate of [
-    { name: 'up-to-date', args: baseLpmArgs() },
-    { name: 'frozen', args: [...baseLpmArgs(), '--frozen-lockfile'] },
+    { name: 'up-to-date', extraArgs: [] },
+    { name: 'frozen', extraArgs: ['--frozen-lockfile'] },
   ]) {
     const run = runLogged({
       label: `${project.id}:lpm-${gate.name}`,
       command: lpmBin,
-      commandArgs: gate.args,
+      commandArgs: [
+        ...lpmArgsForReleaseAgeCutoff(releaseAgeCutoffUnixSecs),
+        ...gate.extraArgs,
+      ],
       cwd: workspace,
       env,
       timeoutMs,
@@ -305,7 +330,11 @@ function runReplayGates(project, workspace, env, projectOutput, expectedLocks) {
   const offline = runLogged({
     label: `${project.id}:lpm-offline-rebuild`,
     command: lpmBin,
-    commandArgs: [...baseLpmArgs(), '--offline', '--frozen-lockfile'],
+    commandArgs: [
+      ...lpmArgsForReleaseAgeCutoff(releaseAgeCutoffUnixSecs),
+      '--offline',
+      '--frozen-lockfile',
+    ],
     cwd: workspace,
     env,
     timeoutMs,
@@ -342,6 +371,7 @@ function runDeterminismGates(
   projectOutput,
   expectedLocks,
   policyNormalization,
+  releaseAgeCutoffUnixSecs,
 ) {
   const executionPlan = determinismExecutionPlan(determinismRuns);
   const cacheWarmWorkspace = path.join(projectWork, 'lpm-determinism-cache-warm');
@@ -357,7 +387,7 @@ function runDeterminismGates(
   const cacheWarmRun = runLogged({
     label: `${project.id}:determinism-cache-warm`,
     command: lpmBin,
-    commandArgs: baseLpmArgs(),
+    commandArgs: lpmArgsForReleaseAgeCutoff(releaseAgeCutoffUnixSecs),
     cwd: cacheWarmWorkspace,
     env: baseEnv,
     timeoutMs,
@@ -422,7 +452,7 @@ function runDeterminismGates(
     const run = runLogged({
       label: `${project.id}:determinism-${concurrency}`,
       command: lpmBin,
-      commandArgs: baseLpmArgs(),
+      commandArgs: lpmArgsForReleaseAgeCutoff(releaseAgeCutoffUnixSecs),
       cwd: workspace,
       env: { ...env, LPM_WORKSPACE_CONCURRENCY: concurrency },
       timeoutMs,
@@ -615,6 +645,21 @@ function baseLpmArgs() {
     '--no-audit-after-install',
     '--no-engine-strict',
   ];
+}
+
+function currentUnixSecs() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function lpmArgsForReleaseAgeCutoff(cutoffUnixSecs, nowUnixSecs = currentUnixSecs()) {
+  if (!Number.isSafeInteger(cutoffUnixSecs) || !Number.isSafeInteger(nowUnixSecs)) {
+    throw new Error('release-age cutoff and current time must be integer Unix seconds');
+  }
+  const minimumAgeSecs = nowUnixSecs - cutoffUnixSecs;
+  if (minimumAgeSecs < correctionMinimumReleaseAgeSecs) {
+    throw new Error('correction release-age cutoff must remain at least 24 hours old');
+  }
+  return [...baseLpmArgs(), `--min-release-age=${minimumAgeSecs}`];
 }
 
 function clonePinned(project, destination, outputDirForProject) {
@@ -1748,6 +1793,14 @@ function runSelfTests() {
     { kind: 'metadata-cache-warm', concurrency: 'auto' },
     { kind: 'fresh', concurrency: '1' },
     { kind: 'fresh', concurrency: '3' },
+  ]);
+  assert.deepEqual(lpmArgsForReleaseAgeCutoff(1_799_913_600, 1_800_000_000), [
+    ...baseLpmArgs(),
+    '--min-release-age=86400',
+  ]);
+  assert.deepEqual(lpmArgsForReleaseAgeCutoff(1_799_913_600, 1_800_000_600), [
+    ...baseLpmArgs(),
+    '--min-release-age=87000',
   ]);
 
   const fixtureProjects = [
