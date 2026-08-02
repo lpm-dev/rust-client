@@ -145,6 +145,44 @@ pub(crate) enum FetchBundleError {
 
 pub(crate) type VerifiedNpmProvenance = lpm_lockfile::LockedProvenance;
 
+fn hash_provenance_field(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_optional_provenance_field(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_provenance_field(hasher, value);
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn verified_provenance_digest(
+    snapshot: &ProvenanceSnapshot,
+    subject_name: &str,
+    subject_sha512: &str,
+    integrated_time_secs: u64,
+    log_id: &str,
+    log_index: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-verified-provenance-v1\0");
+    hasher.update([u8::from(snapshot.present)]);
+    hash_optional_provenance_field(&mut hasher, snapshot.publisher.as_deref());
+    hash_optional_provenance_field(&mut hasher, snapshot.workflow_path.as_deref());
+    hash_optional_provenance_field(&mut hasher, snapshot.workflow_ref.as_deref());
+    hash_optional_provenance_field(&mut hasher, snapshot.attestation_cert_sha256.as_deref());
+    hash_provenance_field(&mut hasher, subject_name);
+    hash_provenance_field(&mut hasher, subject_sha512);
+    hasher.update(integrated_time_secs.to_be_bytes());
+    hash_provenance_field(&mut hasher, log_id);
+    hasher.update(log_index.to_be_bytes());
+    format!("sha256-{}", hex::encode(hasher.finalize()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NpmArtifactExpectation {
     subject_name: String,
@@ -538,6 +576,14 @@ pub(crate) fn verify_bundle_or_err(
                     ))
                 })?
                 .as_secs();
+            let bundle_sha256 = verified_provenance_digest(
+                &verified.snapshot,
+                &subject_name,
+                &subject_sha512,
+                integrated_time_secs,
+                &verified.log_id,
+                verified.log_index,
+            );
             Ok(VerifiedNpmProvenance {
                 snapshot: verified.snapshot,
                 subject_name,
@@ -545,7 +591,7 @@ pub(crate) fn verify_bundle_or_err(
                 integrated_time_secs,
                 log_id: verified.log_id,
                 log_index: verified.log_index,
-                bundle_sha256: format!("sha256-{}", hex::encode(Sha256::digest(body))),
+                bundle_sha256,
             })
         }
         Err(verify_err) => {
@@ -1299,6 +1345,22 @@ mod tests {
 
     fn axios_expectation() -> NpmArtifactExpectation {
         NpmArtifactExpectation::from_package("axios", "1.14.0", Some(AXIOS_INTEGRITY)).unwrap()
+    }
+
+    #[test]
+    fn verified_provenance_digest_is_independent_of_json_serialization() {
+        let compact = axios_bundle();
+        let parsed: serde_json::Value = serde_json::from_slice(compact).unwrap();
+        let pretty = serde_json::to_vec_pretty(&parsed).unwrap();
+        assert_ne!(compact, pretty.as_slice());
+
+        let expectation = axios_expectation();
+        let compact_evidence =
+            verify_bundle_or_err(compact, "compact fixture", &expectation).unwrap();
+        let pretty_evidence =
+            verify_bundle_or_err(&pretty, "pretty fixture", &expectation).unwrap();
+
+        assert_eq!(compact_evidence, pretty_evidence);
     }
 
     fn pkg_expectation() -> NpmArtifactExpectation {

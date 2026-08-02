@@ -261,6 +261,8 @@ pub struct LockedProvenance {
     pub log_id: String,
     #[serde(rename = "log-index")]
     pub log_index: i64,
+    /// Deterministic digest of the verified, artifact-bound bundle evidence.
+    /// The serialized key retains its original name for lockfile compatibility.
     #[serde(rename = "bundle-sha256")]
     pub bundle_sha256: String,
 }

@@ -33,6 +33,7 @@ fn matching_semver_workspace_dependency_is_extracted_for_local_linking() {
 fn incompatible_semver_workspace_dependency_remains_a_registry_dependency() {
     let member = WorkspaceMemberLink {
         name: "app".to_string(),
+        link_name: "app".to_string(),
         version: "1.0.0".to_string(),
         package_dir: PathBuf::from("packages/app"),
         source_dir: PathBuf::from("packages/app"),
@@ -71,12 +72,14 @@ fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
 
     let runtime = WorkspaceMemberLink {
         name: "@test/runtime".to_string(),
+        link_name: "@test/runtime".to_string(),
         version: "1.0.0".to_string(),
         package_dir: runtime_dir.clone(),
         source_dir: runtime_dir,
     };
     let build_tool = WorkspaceMemberLink {
         name: "@test/build-tool".to_string(),
+        link_name: "@test/build-tool".to_string(),
         version: "1.0.0".to_string(),
         package_dir: build_tool_dir.clone(),
         source_dir: build_tool_dir,
@@ -514,6 +517,7 @@ fn link_workspace_members_creates_node_modules_symlink_to_member_source_dir() {
 
     let members = vec![WorkspaceMemberLink {
         name: "@test/core".to_string(),
+        link_name: "@test/core".to_string(),
         version: "2.0.0".to_string(),
         package_dir: core_dir.clone(),
         source_dir: core_dir.clone(),
@@ -558,6 +562,7 @@ fn link_workspace_members_is_idempotent_across_repeated_calls() {
 
     let members = vec![WorkspaceMemberLink {
         name: "@test/core".to_string(),
+        link_name: "@test/core".to_string(),
         version: "0.0.0".to_string(),
         package_dir: core_dir.clone(),
         source_dir: core_dir.clone(),
@@ -592,12 +597,14 @@ fn link_workspace_members_from_member_also_populates_workspace_root() {
     let members = vec![
         WorkspaceMemberLink {
             name: "@test/core".to_string(),
+            link_name: "@test/core".to_string(),
             version: "0.0.0".to_string(),
             package_dir: core_dir.clone(),
             source_dir: core_dir.clone(),
         },
         WorkspaceMemberLink {
             name: "@test/tokens".to_string(),
+            link_name: "@test/tokens".to_string(),
             version: "0.0.0".to_string(),
             package_dir: tokens_dir.clone(),
             source_dir: tokens_dir.clone(),
