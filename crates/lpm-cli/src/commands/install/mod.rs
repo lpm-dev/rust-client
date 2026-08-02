@@ -826,20 +826,40 @@ async fn run_with_options_under_store_lock(
     }
 
     let resolver_excludes = minimum_release_age_exclude.iter().cloned();
+    let release_age_reference_unix = workspace_resolution::release_age_reference_unix();
     let resolver_policy = if release_age_policy.is_strict() {
-        lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
-            resolver_min_age_secs,
-            resolver_trust_policy,
-            resolver_excludes,
-        )
+        match release_age_reference_unix {
+            Some(now_unix) => lpm_resolver::ResolverPolicy::new_with_release_age_excludes_at_unix(
+                resolver_min_age_secs,
+                resolver_trust_policy,
+                resolver_excludes,
+                now_unix,
+            ),
+            None => lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
+                resolver_min_age_secs,
+                resolver_trust_policy,
+                resolver_excludes,
+            ),
+        }
     } else {
         let direct_canonicals = direct_release_age_canonicals(&direct_dependency_snapshot);
-        lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
-            resolver_min_age_secs,
-            resolver_trust_policy,
-            resolver_excludes,
-            direct_canonicals,
-        )
+        match release_age_reference_unix {
+            Some(now_unix) => {
+                lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages_at_unix(
+                    resolver_min_age_secs,
+                    resolver_trust_policy,
+                    resolver_excludes,
+                    direct_canonicals,
+                    now_unix,
+                )
+            }
+            None => lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
+                resolver_min_age_secs,
+                resolver_trust_policy,
+                resolver_excludes,
+                direct_canonicals,
+            ),
+        }
     };
 
     if offline {

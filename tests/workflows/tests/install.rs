@@ -2342,6 +2342,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         );
         assert_eq!(dispatcher["scope"], "resolver_pass");
         assert_eq!(dispatcher["kind"], "metadata");
+        assert_eq!(dispatcher["concurrency_scope"], "resolver_pass");
         assert_eq!(dispatcher["tarball_downloads_included"], false);
     }
     insta::assert_json_snapshot!("install_json_timing_dispatcher_concurrency", dispatcher_contract, {
@@ -3568,6 +3569,16 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
             );
         }
     }
+    let resolver_substages = &envelope["timing"]["detail"]["resolve"]["substages"];
+    assert_eq!(resolver_substages["scope"], "resolver_pass");
+    assert_eq!(resolver_substages["work_is_cumulative"], true);
+    insta::assert_json_snapshot!("install_json_timing_resolver_substages", resolver_substages, {
+        ".tree_policy_ms" => "[DURATION]",
+        ".policy_hydration_ms" => "[DURATION]",
+        ".manifest_wait_ms" => "[DURATION]",
+        ".edge_expansion_ms" => "[DURATION]",
+        ".graph_finalization_ms" => "[DURATION]",
+    });
 }
 
 // ─── Lockfile Content Snapshot ───────────────────────────────────
@@ -12509,6 +12520,11 @@ fn recursive_install_timing_distinguishes_command_work_from_target_observations(
         );
     }
 
+    assert_eq!(
+        envelope["timing"]["work"]["resolver_substage_sums"]["aggregation"],
+        "sum_of_resolver_pass_work"
+    );
+
     let contract = serde_json::json!({
         "timing": {
             "scope": envelope["timing"]["scope"],
@@ -12540,6 +12556,11 @@ fn recursive_install_timing_distinguishes_command_work_from_target_observations(
         ".timing.work.target_post_resolve_sum_ms" => "[DURATION]",
         ".timing.work.target_fetch_sum_ms" => "[DURATION]",
         ".timing.work.target_link_sum_ms" => "[DURATION]",
+        ".timing.work.resolver_substage_sums.tree_policy_ms" => "[DURATION]",
+        ".timing.work.resolver_substage_sums.policy_hydration_ms" => "[DURATION]",
+        ".timing.work.resolver_substage_sums.manifest_wait_ms" => "[DURATION]",
+        ".timing.work.resolver_substage_sums.edge_expansion_ms" => "[DURATION]",
+        ".timing.work.resolver_substage_sums.graph_finalization_ms" => "[DURATION]",
         ".timing.wait.target_materialization_sum_ms" => "[DURATION]",
         ".timing.wait.target_commit_sum_ms" => "[DURATION]",
         ".target.waterfall.materialization_wait_ms" => "[DURATION]",
@@ -12882,7 +12903,7 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
         .and(path("/shared-dependency"))
         .and(header("Accept", "application/json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(shared_release_times))
-        .expect(1)
+        .expect(1..)
         .mount(mock.server())
         .await;
     for (version, tarball) in [("1.0.0", &version_1_0_0), ("1.1.0", &version_1_1_0)] {

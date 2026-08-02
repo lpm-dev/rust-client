@@ -10,20 +10,36 @@ use super::{InstallPackage, LpmError, PeerWarning, install_pkg_key};
 
 pub(super) struct WorkspaceResolutionCoordinator {
     resolution_permits: Arc<Semaphore>,
+    release_age_reference_unix: i64,
     materialized: Box<[TargetCompletion]>,
     completed: Box<[TargetCompletion]>,
     prepared_count: std::sync::atomic::AtomicUsize,
     all_prepared: Notify,
     fetch_overlap_hub: OnceLock<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>>,
     resolver_fact_cache: lpm_resolver::SharedCache,
+    resolver_metadata_concurrency: OnceLock<lpm_resolver::SharedMetadataConcurrency>,
     root_index: Option<usize>,
     root_provider_state: RootProviderState,
 }
 
 impl WorkspaceResolutionCoordinator {
+    #[cfg(test)]
     pub(super) fn new(target_count: usize, resolution_concurrency: usize) -> Self {
+        Self::new_at_unix(
+            target_count,
+            resolution_concurrency,
+            current_unix_timestamp(),
+        )
+    }
+
+    pub(super) fn new_at_unix(
+        target_count: usize,
+        resolution_concurrency: usize,
+        release_age_reference_unix: i64,
+    ) -> Self {
         Self {
             resolution_permits: Arc::new(Semaphore::new(resolution_concurrency.max(1))),
+            release_age_reference_unix,
             materialized: (0..target_count)
                 .map(|_| TargetCompletion::default())
                 .collect(),
@@ -34,17 +50,23 @@ impl WorkspaceResolutionCoordinator {
             all_prepared: Notify::new(),
             fetch_overlap_hub: OnceLock::new(),
             resolver_fact_cache: Arc::new(dashmap::DashMap::new()),
+            resolver_metadata_concurrency: OnceLock::new(),
             root_index: None,
             root_provider_state: RootProviderState::new(),
         }
     }
 
-    pub(super) fn new_with_root(
+    pub(super) fn new_with_root_at_unix(
         target_count: usize,
         resolution_concurrency: usize,
         root_index: usize,
+        release_age_reference_unix: i64,
     ) -> Self {
-        let mut coordinator = Self::new(target_count, resolution_concurrency);
+        let mut coordinator = Self::new_at_unix(
+            target_count,
+            resolution_concurrency,
+            release_age_reference_unix,
+        );
         coordinator.root_index = Some(root_index);
         coordinator
     }
@@ -150,13 +172,22 @@ impl RootProviderState {
 pub(super) struct WorkspaceRootProviderCoordinator {
     state: RootProviderState,
     resolver_fact_cache: lpm_resolver::SharedCache,
+    resolver_metadata_concurrency: OnceLock<lpm_resolver::SharedMetadataConcurrency>,
+    release_age_reference_unix: i64,
 }
 
 impl WorkspaceRootProviderCoordinator {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::new_at_unix(current_unix_timestamp())
+    }
+
+    pub(super) fn new_at_unix(release_age_reference_unix: i64) -> Self {
         Self {
             state: RootProviderState::new(),
             resolver_fact_cache: Arc::new(dashmap::DashMap::new()),
+            resolver_metadata_concurrency: OnceLock::new(),
+            release_age_reference_unix,
         }
     }
 
@@ -339,6 +370,23 @@ pub(super) fn active() -> bool {
     ACTIVE_TASK.try_with(|_| ()).is_ok() || ACTIVE_ROOT_PROVIDER_TASK.try_with(|_| ()).is_ok()
 }
 
+pub(super) fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+pub(super) fn release_age_reference_unix() -> Option<i64> {
+    ACTIVE_TASK
+        .try_with(|task| task.coordinator.release_age_reference_unix)
+        .or_else(|_| {
+            ACTIVE_ROOT_PROVIDER_TASK.try_with(|task| task.coordinator.release_age_reference_unix)
+        })
+        .ok()
+}
+
 pub(super) fn fetch_overlap_hub() -> Option<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>> {
     ACTIVE_TASK
         .try_with(|task| task.coordinator.fetch_overlap_hub())
@@ -361,6 +409,45 @@ pub(super) fn resolver_fact_cache_for_importer(
                 .try_with(|task| Arc::clone(&task.coordinator.resolver_fact_cache))
         })
         .ok()
+}
+
+fn metadata_concurrency_with_limit(
+    shared: &OnceLock<lpm_resolver::SharedMetadataConcurrency>,
+    requested_fanout: usize,
+) -> Option<lpm_resolver::SharedMetadataConcurrency> {
+    let requested_fanout = requested_fanout.max(1);
+    let concurrency =
+        shared.get_or_init(|| lpm_resolver::SharedMetadataConcurrency::new(requested_fanout));
+    (concurrency.limit() == requested_fanout).then(|| concurrency.clone())
+}
+
+pub(super) fn resolver_metadata_concurrency_for_importer(
+    route_table: &lpm_registry::RouteTable,
+    requested_fanout: usize,
+) -> Option<lpm_resolver::SharedMetadataConcurrency> {
+    if !matches!(route_table.mode(), lpm_registry::RouteMode::Direct)
+        || !route_table.supports_workspace_fetch_sharing()
+    {
+        return None;
+    }
+
+    ACTIVE_TASK
+        .try_with(|task| {
+            metadata_concurrency_with_limit(
+                &task.coordinator.resolver_metadata_concurrency,
+                requested_fanout,
+            )
+        })
+        .or_else(|_| {
+            ACTIVE_ROOT_PROVIDER_TASK.try_with(|task| {
+                metadata_concurrency_with_limit(
+                    &task.coordinator.resolver_metadata_concurrency,
+                    requested_fanout,
+                )
+            })
+        })
+        .ok()
+        .flatten()
 }
 
 pub(super) fn finish_resolution() {
@@ -948,6 +1035,49 @@ mod tests {
         (first.unwrap().unwrap(), second.unwrap().unwrap())
     }
 
+    async fn metadata_concurrency_for_resolution_importers(
+        route_table: lpm_registry::RouteTable,
+        requested_fanout: usize,
+    ) -> (
+        Option<lpm_resolver::SharedMetadataConcurrency>,
+        Option<lpm_resolver::SharedMetadataConcurrency>,
+    ) {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 2));
+        let local = tokio::task::LocalSet::new();
+        let (first, second) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        let route_table = route_table.clone();
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 0, async {
+                                Ok::<_, ()>(resolver_metadata_concurrency_for_importer(
+                                    &route_table,
+                                    requested_fanout,
+                                ))
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 1, async {
+                                Ok::<_, ()>(resolver_metadata_concurrency_for_importer(
+                                    &route_table,
+                                    requested_fanout,
+                                ))
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+        (first.unwrap().unwrap(), second.unwrap().unwrap())
+    }
+
     #[test]
     fn missing_root_lockfile_has_no_peer_provider_fingerprint() {
         let directory = tempfile::tempdir().unwrap();
@@ -1026,6 +1156,152 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn direct_workspace_importers_share_one_metadata_permit_pool() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let (first, second) = metadata_concurrency_for_resolution_importers(route_table, 16).await;
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert!(first.shares_pool_with(&second));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_provider_workspace_importers_share_one_metadata_permit_pool() {
+        let coordinator = Arc::new(WorkspaceRootProviderCoordinator::new());
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let local = tokio::task::LocalSet::new();
+        let (root, member) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        let route_table = route_table.clone();
+                        tokio::task::spawn_local(async move {
+                            root_provider_scope(coordinator, true, async {
+                                Ok::<_, ()>(resolver_metadata_concurrency_for_importer(
+                                    &route_table,
+                                    16,
+                                ))
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            root_provider_scope(coordinator, false, async {
+                                Ok::<_, ()>(resolver_metadata_concurrency_for_importer(
+                                    &route_table,
+                                    16,
+                                ))
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+        let root = root.unwrap().unwrap().unwrap();
+        let member = member.unwrap().unwrap().unwrap();
+
+        assert!(root.shares_pool_with(&member));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn importer_with_a_different_fanout_keeps_its_own_permit_pool() {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(1, 1));
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let (first, second) = scope(coordinator, 0, async {
+            let first = resolver_metadata_concurrency_for_importer(&route_table, 16);
+            let second = resolver_metadata_concurrency_for_importer(&route_table, 32);
+            Ok::<_, ()>((first, second))
+        })
+        .await
+        .unwrap();
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolution_importers_share_the_command_release_age_reference() {
+        const REFERENCE_UNIX: i64 = 1_800_000_000;
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new_at_unix(
+            2,
+            2,
+            REFERENCE_UNIX,
+        ));
+        let local = tokio::task::LocalSet::new();
+        let (first, second) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 0, async {
+                                Ok::<_, ()>(release_age_reference_unix())
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 1, async {
+                                Ok::<_, ()>(release_age_reference_unix())
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+
+        assert_eq!(
+            (first.unwrap().unwrap(), second.unwrap().unwrap()),
+            (Some(REFERENCE_UNIX), Some(REFERENCE_UNIX))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_provider_importers_share_the_command_release_age_reference() {
+        const REFERENCE_UNIX: i64 = 1_800_000_000;
+        let coordinator = Arc::new(WorkspaceRootProviderCoordinator::new_at_unix(
+            REFERENCE_UNIX,
+        ));
+        let local = tokio::task::LocalSet::new();
+        let (root, member) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            root_provider_scope(coordinator, true, async {
+                                Ok::<_, ()>(release_age_reference_unix())
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            root_provider_scope(coordinator, false, async {
+                                Ok::<_, ()>(release_age_reference_unix())
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+
+        assert_eq!(
+            (root.unwrap().unwrap(), member.unwrap().unwrap()),
+            (Some(REFERENCE_UNIX), Some(REFERENCE_UNIX))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn custom_route_workspace_importers_have_no_shared_base_fact_cache() {
         fn no_env(_name: &str) -> Option<String> {
             None
@@ -1048,6 +1324,34 @@ mod tests {
     async fn proxy_workspace_importers_have_no_shared_base_fact_cache() {
         let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
         let (first, second) = fact_caches_for_resolution_importers(route_table).await;
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_route_workspace_importers_have_no_shared_metadata_permit_pool() {
+        fn no_env(_name: &str) -> Option<String> {
+            None
+        }
+
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            "registry=https://registry.example.test\n",
+            "test",
+            &no_env,
+        );
+        let route_table =
+            lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+        let (first, second) = metadata_concurrency_for_resolution_importers(route_table, 16).await;
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_workspace_importers_have_no_shared_metadata_permit_pool() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+        let (first, second) = metadata_concurrency_for_resolution_importers(route_table, 16).await;
 
         assert!(first.is_none());
         assert!(second.is_none());

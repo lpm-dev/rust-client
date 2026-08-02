@@ -15,6 +15,61 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Command-scoped permit pool shared by importer-local resolver passes.
+#[derive(Clone)]
+pub struct SharedMetadataConcurrency {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+}
+
+impl SharedMetadataConcurrency {
+    /// Creates a metadata permit pool with at least one permit.
+    pub fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    /// Returns the maximum number of concurrent metadata requests.
+    #[inline]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Returns whether two handles control the same permit pool.
+    #[inline]
+    pub fn shares_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.semaphore, &other.semaphore)
+    }
+
+    fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.semaphore)
+    }
+}
+
+#[cfg(test)]
+mod shared_metadata_concurrency_tests {
+    use super::SharedMetadataConcurrency;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cloned_handles_enforce_one_global_permit_limit() {
+        let concurrency = SharedMetadataConcurrency::new(2);
+        let other_importer = concurrency.clone();
+        let first = concurrency.semaphore().acquire_owned().await.unwrap();
+        let second = other_importer.semaphore().acquire_owned().await.unwrap();
+
+        let third = concurrency.semaphore().try_acquire_owned();
+
+        assert!(matches!(
+            third,
+            Err(tokio::sync::TryAcquireError::NoPermits)
+        ));
+        drop((first, second));
+    }
+}
+
 struct FusedTreeProvider<'a> {
     client: &'a Arc<RegistryClient>,
     route_table: &'a RouteTable,
@@ -78,6 +133,22 @@ impl Drop for ActiveMetadataFetch {
 
 fn record_pending_high_water(high_water: &mut u64, pending: usize) {
     *high_water = (*high_water).max(u64::try_from(pending).unwrap_or(u64::MAX));
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+async fn record_manifest_wait<F, T>(enabled: bool, total_ns: &mut u64, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let started = enabled.then(Instant::now);
+    let output = future.await;
+    if let Some(started) = started {
+        *total_ns = total_ns.saturating_add(duration_ns(started.elapsed()));
+    }
+    output
 }
 
 struct OrderedMetadataFetches {
@@ -805,6 +876,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy_roots(
         policy,
         None,
         None,
+        None,
     )
     .await
 }
@@ -836,6 +908,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
         policy,
         selected_package_tx,
         None,
+        None,
     )
     .await
 }
@@ -854,6 +927,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     policy: ResolverPolicy,
     selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
     shared_fact_cache: Option<SharedCache>,
+    shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
@@ -908,7 +982,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // around `inflight` / `parked` because they never cross task
     // boundaries — only the spawn closures own clones of the
     // canonicals they're fetching.
-    let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
+    let dispatcher_concurrency_shared = shared_metadata_concurrency.is_some();
+    let metadata_concurrency =
+        shared_metadata_concurrency.unwrap_or_else(|| SharedMetadataConcurrency::new(npm_fanout));
+    let metadata_sem = metadata_concurrency.semaphore();
     let metadata_fetch_telemetry = Arc::new(MetadataFetchTelemetry::default());
     let metadata_dispatch = MetadataFetchDispatch {
         metadata_sem: &metadata_sem,
@@ -929,6 +1006,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // regular dep dispatch. Bumped by the peer-prefetch step; surfaces on
     // `StageTiming.peer_prefetch_count`.
     let mut peer_prefetch_count: u64 = 0;
+    let mut tree_policy_ns = 0u64;
+    let mut policy_hydration_ns = 0u64;
+    let mut manifest_wait_ns = 0u64;
+    let mut edge_drain_ns = 0u64;
 
     // Pre-size both maps to the expected steady-state cardinality.
     // For bench/fixture-large (266 transitive packages) the default-
@@ -1103,6 +1184,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     }
     loop {
         let mut worker_batch_candidates: Vec<(CanonicalKey, String)> = Vec::new();
+        let edge_drain_started = trace_metadata_fetches.then(Instant::now);
 
         // ── Drain `task_queue` synchronously ─────────────────────
         while let Some(edge) = state.task_queue.pop_front() {
@@ -1164,7 +1246,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     continue;
                 }
                 if !ordered_metadata.has_committed(&edge.canonical) {
-                    let info_arc = ensure_policy_metadata_for_cached_manifest(
+                    let policy_hydration_started = trace_metadata_fetches.then(Instant::now);
+                    let info_result = ensure_policy_metadata_for_cached_manifest(
                         &edge.canonical,
                         info_arc,
                         &client,
@@ -1173,7 +1256,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         &policy,
                         trace_metadata_fetches,
                     )
-                    .await?;
+                    .await;
+                    if let Some(started) = policy_hydration_started {
+                        policy_hydration_ns =
+                            policy_hydration_ns.saturating_add(duration_ns(started.elapsed()));
+                    }
+                    let info_arc = info_result?;
                     let canonical = edge.canonical.clone();
                     let new_completion = ordered_metadata.start(&canonical)?;
                     parked.entry(canonical.clone()).or_default().push(edge);
@@ -1203,7 +1291,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     continue;
                 }
-                let info_arc = ensure_policy_metadata_for_cached_manifest(
+                let policy_hydration_started = trace_metadata_fetches.then(Instant::now);
+                let info_result = ensure_policy_metadata_for_cached_manifest(
                     &edge.canonical,
                     info_arc,
                     &client,
@@ -1212,7 +1301,13 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     &policy,
                     trace_metadata_fetches,
                 )
-                .await?;
+                .await;
+                if let Some(started) = policy_hydration_started {
+                    policy_hydration_ns =
+                        policy_hydration_ns.saturating_add(duration_ns(started.elapsed()));
+                }
+                let info_arc = info_result?;
+                let tree_policy_started = trace_metadata_fetches.then(Instant::now);
                 let preferred = preferred_tree_compatible_version(
                     &edge,
                     &info_arc,
@@ -1221,6 +1316,9 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     &tree_status_cache,
                 )
                 .await;
+                if let Some(started) = tree_policy_started {
+                    tree_policy_ns = tree_policy_ns.saturating_add(duration_ns(started.elapsed()));
+                }
                 process_edge_with_preferred(&edge, &info_arc, preferred, &mut state)?;
                 pending_root_constraints.complete_root_edge(&edge, &mut state.task_queue);
                 continue;
@@ -1270,6 +1368,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     dispatcher_rpc_count += 1;
                 }
             }
+        }
+
+        if let Some(started) = edge_drain_started {
+            edge_drain_ns = edge_drain_ns.saturating_add(duration_ns(started.elapsed()));
         }
 
         if !worker_batch_candidates.is_empty() {
@@ -1771,7 +1873,13 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         // metadata_jobs is non-empty here (the termination guard handles the empty case).
         // Fetches finish concurrently, while graph mutations commit in
         // deterministic dispatch order.
-        if let Some(joined) = metadata_jobs.join_next().await {
+        if let Some(joined) = record_manifest_wait(
+            trace_metadata_fetches,
+            &mut manifest_wait_ns,
+            metadata_jobs.join_next(),
+        )
+        .await
+        {
             let (canonical, result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
             ordered_metadata.queue_tracked(canonical, result)?;
@@ -1793,6 +1901,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
 
     let resolver_ms = pass_start.elapsed().as_millis() as u64;
 
+    let graph_finalization_started = trace_metadata_fetches.then(Instant::now);
     // Same shape as `resolve_greedy`'s tail — `cache` materializes
     // the SharedCache as `HashMap<_, Arc<_>>` for the install-side
     // tarball-url lookup; `into_resolved_packages` consumes state
@@ -1825,6 +1934,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         selected_unique_canonical_count,
         selected_duplicate_canonical_count,
     ) = selected_package_cardinality(&packages);
+    let graph_finalization_ns =
+        graph_finalization_started.map_or(0, |started| duration_ns(started.elapsed()));
+    let edge_expansion_ns = edge_drain_ns
+        .saturating_sub(policy_hydration_ns)
+        .saturating_sub(tree_policy_ns);
 
     let snap = lpm_registry::timing::snapshot();
     let policy_snap = crate::profile::policy_summary();
@@ -1852,6 +1966,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             escape_hatch_rpc_count: 0,
             dispatcher_rpc_count: dispatcher_rpc_count + tree_provider.dispatcher_rpc_count.get(),
             dispatcher_configured_fanout: u64::try_from(npm_fanout).unwrap_or(u64::MAX),
+            dispatcher_concurrency_shared,
             dispatcher_inflight_high_water: metadata_fetch_telemetry
                 .active_high_water
                 .load(Ordering::Relaxed),
@@ -1874,6 +1989,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
             work_peer_requirement_count: work_stats.peer_requirement_count,
             peer: peer_timing,
+            tree_policy_ns,
+            policy_hydration_ns,
+            manifest_wait_ns,
+            edge_expansion_ns,
+            graph_finalization_ns,
             work_metadata_edge_miss_count: work_stats.metadata_edge_miss_count,
             work_metadata_edge_miss_direct_count: work_stats.metadata_edge_miss_direct_count,
             work_metadata_edge_miss_latest_known_count: work_stats

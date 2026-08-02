@@ -3975,6 +3975,47 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fusion_trace_attributes_edge_expansion_and_graph_finalization() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _timing_guard = crate::metadata_fetch_detail_test_lock().lock().await;
+    let _env = ScopedEnvVars::set(&[("LPM_TIMING_DETAIL", "trace")]);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/timed-root"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(5))
+                .set_body_json(metadata_json("timed-root", &[])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let result = resolve_greedy_fused(
+        client,
+        HashMap::from_iter([("timed-root".to_string(), "^1.0.0".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("trace timing fixture should resolve");
+
+    assert!(result.stage_timing.edge_expansion_ns > 0);
+    assert!(result.stage_timing.graph_finalization_ns > 0);
+    assert!(result.stage_timing.manifest_wait_ns >= 1_000_000);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_reuses_direct_base_facts_across_importer_local_caches() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4014,6 +4055,7 @@ async fn fusion_reuses_direct_base_facts_across_importer_local_caches() {
             ResolverPolicy::default(),
             None,
             Some(Arc::clone(&shared_facts)),
+            None,
         )
     };
 

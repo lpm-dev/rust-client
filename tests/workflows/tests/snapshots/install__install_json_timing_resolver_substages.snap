@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/install.rs
+expression: resolver_substages
+---
+{
+  "scope": "resolver_pass",
+  "work_is_cumulative": true,
+  "edge_expansion_excludes_policy_hydration_and_tree_policy": true,
+  "tree_policy_includes_nested_manifest_wait": true,
+  "manifest_wait_excludes_tree_policy_peer_policy_hydration_and_worker_batches": true,
+  "tree_policy_ms": "[DURATION]",
+  "policy_hydration_ms": "[DURATION]",
+  "manifest_wait_ms": "[DURATION]",
+  "edge_expansion_ms": "[DURATION]",
+  "graph_finalization_ms": "[DURATION]"
+}
