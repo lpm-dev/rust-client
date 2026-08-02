@@ -129,6 +129,7 @@ async fn direct_fetch(
 pub(super) struct FetchedMetadata {
     pub(super) speculation: Option<SpeculativePackageMetadata>,
     pub(super) info: Arc<CachedPackageInfo>,
+    pub(super) shared_fact: Option<Arc<CachedPackageInfo>>,
     pub(super) latest_version: Option<NpmVersion>,
 }
 
@@ -143,9 +144,9 @@ pub(super) async fn fetch_metadata_for_resolver(
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
     let dist_tags = metadata.dist_tags.clone();
-    let mut info = parse_metadata_to_cache_info(&metadata);
-    if info.needs_trust_metadata(policy) {
-        return fetch_full_metadata_for_policy(
+    let base_fact = Arc::new(parse_metadata_to_cache_info(&metadata));
+    if base_fact.needs_trust_metadata(policy) {
+        let mut fetched = fetch_full_metadata_for_policy(
             client,
             route_table,
             canonical,
@@ -153,20 +154,28 @@ pub(super) async fn fetch_metadata_for_resolver(
             include_speculation,
             false,
         )
-        .await;
+        .await?;
+        fetched.shared_fact = Some(base_fact);
+        return Ok(fetched);
     }
-    if info.needs_release_time_metadata(canonical, policy) {
+    let needs_release_time = base_fact.needs_release_time_metadata(canonical, policy);
+    let needs_platform = base_fact.needs_platform_metadata();
+    if !needs_release_time && !needs_platform {
+        let mut fetched =
+            fetched_metadata_from_arc(None, dist_tags, Arc::clone(&base_fact), include_speculation);
+        fetched.shared_fact = Some(base_fact);
+        return Ok(fetched);
+    }
+    let mut info = (*base_fact).clone();
+    if needs_release_time {
         fetch_release_times_for_policy(client, route_table, canonical, &mut info, false).await?;
     }
-    if info.needs_platform_metadata() {
+    if needs_platform {
         fetch_platform_metadata(client, route_table, canonical, &mut info, false).await?;
     }
-    Ok(fetched_metadata_from_info(
-        None,
-        dist_tags,
-        info,
-        include_speculation,
-    ))
+    let mut fetched = fetched_metadata_from_info(None, dist_tags, info, include_speculation);
+    fetched.shared_fact = Some(base_fact);
+    Ok(fetched)
 }
 
 pub(super) async fn fetch_metadata_for_resolver_with_timings(
@@ -202,11 +211,11 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
 
     let dist_tags = raw.metadata.dist_tags.clone();
     let parse_start = Instant::now();
-    let mut info = parse_metadata_to_cache_info(&raw.metadata);
+    let base_fact = Arc::new(parse_metadata_to_cache_info(&raw.metadata));
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
-    if info.needs_trust_metadata(policy) {
+    if base_fact.needs_trust_metadata(policy) {
         let policy_start = Instant::now();
-        let fetched = fetch_full_metadata_for_policy(
+        let mut fetched = fetch_full_metadata_for_policy(
             client,
             route_table,
             canonical,
@@ -215,11 +224,26 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
             true,
         )
         .await?;
+        fetched.shared_fact = Some(base_fact);
         timings.policy_full_metadata_ms = policy_start.elapsed().as_millis();
         timings.total_ms = total_start.elapsed().as_millis();
         return Ok((fetched, timings));
     }
-    if info.needs_release_time_metadata(canonical, policy) {
+    let needs_release_time = base_fact.needs_release_time_metadata(canonical, policy);
+    let needs_platform = base_fact.needs_platform_metadata();
+    if !needs_release_time && !needs_platform {
+        let mut fetched = fetched_metadata_from_arc(
+            latest_version,
+            dist_tags,
+            Arc::clone(&base_fact),
+            include_speculation,
+        );
+        fetched.shared_fact = Some(base_fact);
+        timings.total_ms = total_start.elapsed().as_millis();
+        return Ok((fetched, timings));
+    }
+    let mut info = (*base_fact).clone();
+    if needs_release_time {
         let policy_start = Instant::now();
         if let Some(detail) =
             fetch_release_times_for_policy(client, route_table, canonical, &mut info, true).await?
@@ -230,10 +254,12 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
         }
         timings.policy_release_time_ms = policy_start.elapsed().as_millis();
     }
-    if info.needs_platform_metadata() {
+    if needs_platform {
         fetch_platform_metadata(client, route_table, canonical, &mut info, true).await?;
     }
-    let fetched = fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
+    let mut fetched =
+        fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
+    fetched.shared_fact = Some(base_fact);
     timings.total_ms = total_start.elapsed().as_millis();
     Ok((fetched, timings))
 }
@@ -462,6 +488,7 @@ fn parse_fetched_metadata_with_cache_completeness(
     });
     FetchedMetadata {
         speculation,
+        shared_fact: Some(Arc::clone(&info)),
         info,
         latest_version,
     }
@@ -489,11 +516,21 @@ fn fetched_metadata_from_info(
     include_speculation: bool,
 ) -> FetchedMetadata {
     let info = Arc::new(info);
+    fetched_metadata_from_arc(latest_version, dist_tags, info, include_speculation)
+}
+
+fn fetched_metadata_from_arc(
+    latest_version: Option<NpmVersion>,
+    dist_tags: HashMap<String, String>,
+    info: Arc<CachedPackageInfo>,
+    include_speculation: bool,
+) -> FetchedMetadata {
     let speculation = include_speculation
         .then(|| SpeculativePackageMetadata::from_dist_tags_and_info(dist_tags, info.clone()));
     FetchedMetadata {
         speculation,
         info,
+        shared_fact: None,
         latest_version,
     }
 }
@@ -834,6 +871,7 @@ async fn fetch_full_metadata_for_policy(
 
 pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) shared_cache: &'a SharedCache,
+    pub(super) shared_fact_cache: Option<&'a SharedCache>,
     pub(super) route_table: &'a RouteTable,
     pub(super) counted_metadata_edge_misses: Option<&'a mut AHashSet<CanonicalKey>>,
     pub(super) trace_metadata_fetches: bool,
@@ -842,6 +880,48 @@ pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
     pub(super) state: &'a mut ResolveState,
     pub(super) pending_root_constraints: &'a mut PendingRootConstraints,
+}
+
+pub(super) fn cached_manifest_from_importer_or_facts(
+    importer_cache: &SharedCache,
+    shared_fact_cache: Option<&SharedCache>,
+    canonical: &CanonicalKey,
+) -> Option<Arc<CachedPackageInfo>> {
+    if let Some(info) = importer_cache
+        .get(canonical)
+        .map(|entry| Arc::clone(entry.value()))
+    {
+        return Some(info);
+    }
+
+    let fact = shared_fact_cache?
+        .get(canonical)
+        .map(|entry| Arc::clone(entry.value()))?;
+    Some(insert_or_merge_cached_package_info(
+        importer_cache,
+        canonical.clone(),
+        fact,
+    ))
+}
+
+pub(super) fn publish_direct_base_fact(
+    shared_fact_cache: Option<&SharedCache>,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    fact: Option<Arc<CachedPackageInfo>>,
+) {
+    let (Some(shared_fact_cache), Some(fact), CanonicalKey::Npm { name }) =
+        (shared_fact_cache, fact, canonical)
+    else {
+        return;
+    };
+    if !matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::NpmDirect
+    ) {
+        return;
+    }
+    insert_or_merge_cached_package_info(shared_fact_cache, canonical.clone(), fact);
 }
 
 pub(super) fn complete_metadata_fetch(
@@ -858,8 +938,15 @@ pub(super) fn complete_metadata_fetch(
             let FetchedMetadata {
                 speculation,
                 info,
+                shared_fact,
                 latest_version,
             } = fetched;
+            publish_direct_base_fact(
+                completion.shared_fact_cache,
+                completion.route_table,
+                &canonical,
+                shared_fact,
+            );
             if let (Some(tx), Some(speculation)) = (completion.spec_tx, speculation)
                 && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {

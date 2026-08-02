@@ -273,6 +273,29 @@ fn merging_partial_versions_drops_package_level_completeness() {
 }
 
 #[test]
+fn complete_base_metadata_does_not_discard_existing_policy_hydration() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("policy-hydrated");
+    let mut hydrated = mk_info(&["1.0.0"], &[]);
+    hydrated.trust_metadata_complete = true;
+    hydrated.dist.get_mut("1.0.0").unwrap().published_at =
+        Some("2026-07-20T17:38:38.286Z".to_string());
+    insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), Arc::new(hydrated));
+
+    let base = mk_info(&["1.0.0"], &[]);
+    let merged = insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(base));
+
+    assert_eq!(
+        merged
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2026-07-20T17:38:38.286Z")
+    );
+    assert!(merged.trust_metadata_complete);
+}
+
+#[test]
 fn merging_cached_metadata_regular_dependency_shadows_same_named_peer_requirement() {
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let canonical = CanonicalKey::npm("dual-role-dependency");
@@ -320,6 +343,54 @@ fn parse_fetched_metadata_omits_speculation_when_disabled() {
 
     assert!(fetched.speculation.is_none());
     assert_eq!(fetched.info.versions.len(), 1);
+    assert!(
+        fetched
+            .shared_fact
+            .as_ref()
+            .is_some_and(|fact| Arc::ptr_eq(fact, &fetched.info))
+    );
+}
+
+#[test]
+fn full_policy_metadata_is_not_published_as_a_shared_base_fact() {
+    let metadata = serde_json::from_value(metadata_json("policy-full", &[]))
+        .expect("fixture metadata should parse");
+
+    let fetched = parse_full_fetched_metadata(metadata, false, false);
+
+    assert!(fetched.shared_fact.is_none());
+}
+
+#[test]
+fn importer_policy_hydration_does_not_mutate_the_shared_base_fact() {
+    let importer_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let shared_facts: SharedCache = Arc::new(dashmap::DashMap::new());
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let canonical = CanonicalKey::npm("policy-isolated");
+    let base = Arc::new(mk_info(&["1.0.0"], &[]));
+    publish_direct_base_fact(
+        Some(&shared_facts),
+        &route_table,
+        &canonical,
+        Some(Arc::clone(&base)),
+    );
+
+    let importer =
+        cached_manifest_from_importer_or_facts(&importer_cache, Some(&shared_facts), &canonical)
+            .expect("the importer should read the shared base fact");
+    assert!(Arc::ptr_eq(&importer, &base));
+
+    let mut hydrated = (*importer).clone();
+    hydrated.dist.get_mut("1.0.0").unwrap().published_at =
+        Some("2025-01-01T00:00:00.000Z".to_string());
+    importer_cache.insert(canonical.clone(), Arc::new(hydrated));
+
+    assert!(
+        shared_facts
+            .get(&canonical)
+            .and_then(|fact| fact.dist.get("1.0.0").cloned())
+            .is_some_and(|dist| dist.published_at.is_none())
+    );
 }
 
 #[test]
@@ -3901,6 +3972,69 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
         (PACKAGE_COUNT - FANOUT) as u64
     );
     assert!(result.stage_timing.dispatcher_semaphore_wait_ns > 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_reuses_direct_base_facts_across_importer_local_caches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/shared-package"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json("shared-package", &[])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let shared_facts: SharedCache = Arc::new(dashmap::DashMap::new());
+    let dependencies = crate::RootDependencies::required(HashMap::from([(
+        "shared-package".to_string(),
+        "^1.0.0".to_string(),
+    )]));
+    let resolve = || {
+        resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+            Arc::clone(&client),
+            dependencies.clone(),
+            OverrideSet::empty(),
+            route_table.clone(),
+            8,
+            None,
+            Arc::new(dashmap::DashMap::new()),
+            true,
+            true,
+            ResolverPolicy::default(),
+            None,
+            Some(Arc::clone(&shared_facts)),
+        )
+    };
+
+    let first = resolve().await.expect("first importer should resolve");
+    let second = resolve().await.expect("second importer should resolve");
+
+    let identities = |result: &ResolveResult| {
+        result
+            .packages
+            .iter()
+            .map(|package| {
+                (
+                    package.package.canonical_name(),
+                    package.version.to_string(),
+                    package.dependencies.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(identities(&first), identities(&second));
+    assert!(shared_facts.contains_key(&CanonicalKey::npm("shared-package")));
 }
 
 async fn resolve_overlapping_range_with_parent_delay(
