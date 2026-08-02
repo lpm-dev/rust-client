@@ -1783,6 +1783,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // `into_resolved_packages`. Same shape + order contract as the walker arm.
     let applied_overrides = state.overrides.take_hits();
     let work_stats = state.work_stats;
+    let peer_timing = state.peer_work_stats.snapshot();
     let root_resolutions = state.root_resolutions();
     let packages = state.into_resolved_packages(&cache, &root_aliases);
     let (
@@ -1838,6 +1839,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             work_node_allocated_count: work_stats.node_allocated_count,
             work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
             work_peer_requirement_count: work_stats.peer_requirement_count,
+            peer: peer_timing,
             work_metadata_edge_miss_count: work_stats.metadata_edge_miss_count,
             work_metadata_edge_miss_direct_count: work_stats.metadata_edge_miss_direct_count,
             work_metadata_edge_miss_latest_known_count: work_stats

@@ -225,8 +225,12 @@ where
         return Ok(());
     }
 
-    let info = fetch_manifest(canonical.clone()).await?;
     let canonical_name = canonical.to_string();
+    if !state.overrides.may_match_package(&canonical_name) {
+        return Ok(());
+    }
+
+    let info = fetch_peer_manifest(state, canonical.clone(), fetch_manifest).await?;
     for requirement in requirements {
         let VersionPick::Picked(natural) =
             find_best_version_with_policy(canonical, &info, &requirement.range, &state.policy)
@@ -456,6 +460,7 @@ where
     if pending.is_empty() {
         return Ok(Vec::new());
     }
+    let pass_measurement = state.peer_work_stats.begin_pass(&pending);
 
     // Group by canonical, deterministically. The HashMap walk would
     // produce non-reproducible synthesis order; collect-then-sort
@@ -469,6 +474,7 @@ where
 
     let mut synthesized: Vec<Edge> = Vec::new();
     for canonical in canonicals {
+        state.peer_work_stats.record_group();
         let mut reqs_owned = grouped.remove(&canonical).expect("just collected key");
         apply_peer_overrides(state, &canonical, &mut reqs_owned, &mut fetch_manifest).await?;
         let mut reqs = Vec::with_capacity(reqs_owned.len());
@@ -482,6 +488,7 @@ where
             }
         }
         if reqs.is_empty() {
+            state.peer_work_stats.record_already_satisfied_group();
             continue;
         }
 
@@ -495,7 +502,10 @@ where
         .await?;
 
         match outcome {
-            PeerDrainOutcome::SkippedOptOut => continue,
+            PeerDrainOutcome::SkippedOptOut => {
+                state.peer_work_stats.record_skipped_opt_out_group();
+                continue;
+            }
             PeerDrainOutcome::Synthesize { chosen } => {
                 record_peer_bindings(state, &reqs, &chosen);
                 synthesize_ambient_edge(
@@ -505,6 +515,7 @@ where
                     reqs_owned.len(),
                     &mut synthesized,
                 )?;
+                state.peer_work_stats.record_synthesized_edge();
             }
             PeerDrainOutcome::BestEffortSynthesize {
                 chosen,
@@ -518,6 +529,7 @@ where
                     reqs_owned.len(),
                     &mut synthesized,
                 )?;
+                state.peer_work_stats.record_synthesized_edge();
                 // Best-effort synthesis still installs the canonical
                 // at top level — but at most one consumer range. Store
                 // the conflict so install.rs can warn the user about
@@ -547,6 +559,7 @@ where
         }
     }
 
+    state.peer_work_stats.finish_pass(pass_measurement);
     Ok(synthesized)
 }
 
@@ -593,7 +606,7 @@ fn synthesize_ambient_edge(
 /// from the synthesis path so callers can short-circuit the manifest
 /// fetch when it's not needed.
 async fn classify_peer_group<F, Fut>(
-    state: &ResolveState,
+    state: &mut ResolveState,
     canonical: &CanonicalKey,
     reqs: &[&PeerRequirement],
     auto_install_peers: bool,
@@ -603,6 +616,7 @@ where
     F: FnMut(CanonicalKey) -> Fut,
     Fut: std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>,
 {
+    state.peer_work_stats.record_classified_group();
     // Opt-out gates. If every requirement is optional, the
     // manifest author asked us not to fail; same skip path as
     // `auto_install_peers = false`.
@@ -612,9 +626,15 @@ where
     }
 
     let cache_key = peer_resolution_cache_key(canonical, reqs);
-    if let Some(cached) = state.peer_resolution_cache.get(&cache_key) {
-        return Ok(cached.value().to_outcome(state, reqs));
+    let cached_outcome = state
+        .peer_resolution_cache
+        .get(&cache_key)
+        .map(|cached| cached.value().to_outcome(state, reqs));
+    if let Some(outcome) = cached_outcome {
+        state.peer_work_stats.record_resolution_cache_hit();
+        return Ok(outcome);
     }
+    state.peer_work_stats.record_resolution_cache_miss();
 
     // Synthesis path. Fetch the manifest, find the version
     // satisfying every consumer's range. Raising `PeerConflict` when no
@@ -623,7 +643,7 @@ where
     // chain pulling both `ajv-keywords@5` peer'ing ajv@^6 and
     // `ajv-keywords@8` peer'ing ajv@^8). npm v7+ + pnpm hoist a single top-level peer
     // and warn about the stuck consumers; lpm now matches.
-    let info = fetch_manifest(canonical.clone()).await?;
+    let info = fetch_peer_manifest(state, canonical.clone(), fetch_manifest).await?;
     if let Some(chosen) = find_version_satisfying_all(&info, reqs) {
         let outcome = PeerDrainOutcome::Synthesize {
             chosen: chosen.clone(),
@@ -662,4 +682,21 @@ where
             })
             .collect(),
     })
+}
+
+async fn fetch_peer_manifest<F, Fut>(
+    state: &mut ResolveState,
+    canonical: CanonicalKey,
+    fetch_manifest: &mut F,
+) -> Result<Arc<CachedPackageInfo>, ResolveError>
+where
+    F: FnMut(CanonicalKey) -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>,
+{
+    let started = std::time::Instant::now();
+    let result = fetch_manifest(canonical).await;
+    state
+        .peer_work_stats
+        .record_manifest_wait(started.elapsed());
+    result
 }

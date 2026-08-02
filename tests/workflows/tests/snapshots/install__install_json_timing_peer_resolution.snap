@@ -1,0 +1,24 @@
+---
+source: tests/workflows/tests/install.rs
+expression: peer
+---
+{
+  "scope": "resolver_pass",
+  "work_is_cumulative": true,
+  "processing_excludes_manifest_wait": true,
+  "non_empty_pass_count": 0,
+  "requirement_count": 0,
+  "unique_requirement_count": 0,
+  "repeated_requirement_count": 0,
+  "group_count": 0,
+  "already_satisfied_group_count": 0,
+  "classified_group_count": 0,
+  "skipped_opt_out_group_count": 0,
+  "resolution_cache_hit_count": 0,
+  "resolution_cache_miss_count": 0,
+  "manifest_lookup_count": 0,
+  "manifest_wait_ms": 0.0,
+  "processing_ms": 0.0,
+  "synthesized_edge_count": 0,
+  "edge_visits_per_allocated_node": 1.0
+}

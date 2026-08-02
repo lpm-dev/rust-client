@@ -2815,6 +2815,76 @@ async fn peer_drain_reuses_resolution_for_same_parent_peer_context_regardless_or
 }
 
 #[tokio::test]
+async fn peer_drain_telemetry_distinguishes_repeated_cached_and_satisfied_work() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let _react = push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+    let react_consumer = push_node(&mut state, CanonicalKey::npm("react-user"), "1.0.0");
+    let vue_consumer = push_node(&mut state, CanonicalKey::npm("vue-user"), "1.0.0");
+    let optional_consumer = push_node(&mut state, CanonicalKey::npm("optional-user"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        react_consumer,
+        "react",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    ));
+    let vue_requirement = mk_peer_req(
+        vue_consumer,
+        "vue",
+        CanonicalKey::npm("vue"),
+        "^3.0.0",
+        false,
+    );
+    state.peer_requirements.push(vue_requirement.clone());
+    state.peer_requirements.push(mk_peer_req(
+        optional_consumer,
+        "optional-peer",
+        CanonicalKey::npm("optional-peer"),
+        "^1.0.0",
+        true,
+    ));
+
+    let vue_info = mk_info_arc(&["3.5.0"], &[]);
+    let first = drain_peer_requirements_one_pass(&mut state, true, |canonical| {
+        let vue_info = vue_info.clone();
+        async move {
+            assert_eq!(canonical, CanonicalKey::npm("vue"));
+            Ok(vue_info)
+        }
+    })
+    .await
+    .expect("first peer drain should resolve the missing required peer");
+    assert_eq!(first.len(), 1);
+
+    state.peer_requirements.push(vue_requirement);
+    let second = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("cached peer decision should not refetch {canonical}")
+    })
+    .await
+    .expect("second peer drain should reuse the cached decision");
+    assert_eq!(second.len(), 1);
+
+    let snapshot = state.peer_work_stats.snapshot();
+    assert_eq!(
+        (
+            snapshot.non_empty_pass_count,
+            snapshot.requirement_count,
+            snapshot.unique_requirement_count,
+            snapshot.group_count,
+            snapshot.already_satisfied_group_count,
+            snapshot.classified_group_count,
+            snapshot.skipped_opt_out_group_count,
+            snapshot.resolution_cache_hit_count,
+            snapshot.resolution_cache_miss_count,
+            snapshot.manifest_lookup_count,
+            snapshot.synthesized_edge_count,
+        ),
+        (2, 4, 3, 4, 1, 3, 1, 1, 1, 1, 2)
+    );
+}
+
+#[tokio::test]
 async fn peer_drain_cached_best_effort_reports_current_unsatisfied_consumers() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
@@ -3203,6 +3273,29 @@ async fn peer_drain_respects_auto_install_peers_false_opt_out() {
     .await
     .unwrap();
     assert!(synth.is_empty(), "no synthesis under opt-out");
+}
+
+#[tokio::test]
+async fn peer_drain_unrelated_override_does_not_lookup_opted_out_peer_manifest() {
+    let mut state = ResolveState::new(HashMap::new(), override_set("unrelated-package", "2.0.0"));
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "react",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    ));
+
+    let synthesized =
+        drain_peer_requirements_one_pass(&mut state, false, |canonical: CanonicalKey| async move {
+            panic!("unrelated override must not trigger a manifest lookup for {canonical}")
+        })
+        .await
+        .expect("peer auto-install opt-out should finish without synthesis");
+
+    assert!(synthesized.is_empty());
 }
 
 #[tokio::test]
