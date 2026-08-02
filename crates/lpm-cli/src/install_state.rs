@@ -427,74 +427,78 @@ pub fn collect_file_link_manifest_bytes(
     let mut visited: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     let mut buf: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
-    let mut freshness_files: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-
-    if let Some(path) = nearest_pnpm_workspace_yaml(project_dir) {
-        push_freshness_file(path, &mut freshness_files, &mut buf);
-    }
 
     walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
+    let workspace_entries =
+        crate::workspace_discovery_cache::workspace_freshness_entries(project_dir, || {
+            collect_workspace_freshness_entries(project_dir)
+        });
+    let mut entries = Vec::with_capacity(buf.len() + workspace_entries.len());
+    entries.extend(
+        buf.iter()
+            .map(|(path, content)| (path.as_path(), content.as_slice())),
+    );
+    entries.extend(
+        workspace_entries
+            .iter()
+            .map(|(path, content)| (path.as_path(), content.as_slice())),
+    );
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    entries.dedup_by(|left, right| left.0 == right.0);
 
-    // **audit response (round 6) — workspace member
-    // manifests fold into the install-hash.** Round-5's workspace-
-    // member BFS expands the root-symlink set based on each linked
-    // member's `workspace:` transitives, but pre-round-6 the install-
-    // hash didn't fold in member manifests at all. Adding `bar:
-    // workspace:*` to a member's manifest left the install-hash
-    // unchanged, so the next install hit the "up to date" fast-exit
-    // and never planted `node_modules/bar`. This block discovers the
-    // workspace from `project_dir` and folds every member's
-    // package.json into the buffer (deduped against any member that
-    // was ALREADY visited as a file:/link: dep). It also walks each
-    // member's file:/link: transitives so file: deps DECLARED inside
-    // member manifests participate in the freshness signal too.
-    //
-    // Errors silently degrade (no workspaces field / unparseable
-    // package.json / canonicalize failure) — same posture as the
-    // outer walker.
-    if let Ok(Some(ws)) = crate::workspace_discovery_cache::discover_workspace(project_dir) {
-        push_freshness_file(
-            ws.root.join("pnpm-workspace.yaml"),
-            &mut freshness_files,
-            &mut buf,
-        );
-
-        for member in &ws.members {
-            let Ok(realpath) = member.path.canonicalize() else {
-                continue;
-            };
-            if !visited.insert(realpath.clone()) {
-                continue; // already covered via file:/link:
-            }
-            let pkg_json_path = realpath.join("package.json");
-            let Ok(member_content) = lpm_common::read_text_file_capped(
-                &pkg_json_path,
-                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-            ) else {
-                continue;
-            };
-            buf.push((realpath.clone(), member_content.as_bytes().to_vec()));
-            // Walk file:/link: transitives declared inside the member's
-            // manifest — those manifests' contents must also affect
-            // the freshness signal so a `file:` external dep edited
-            // in place invalidates the cache.
-            walk_file_link_deps(&realpath, &member_content, 0, 3, &mut visited, &mut buf);
-        }
-    }
-
-    // Sort by realpath byte order for deterministic output across
-    // platforms / hash-map iteration orders.
-    buf.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut out = Vec::new();
-    for (path, content) in buf {
+    let output_capacity = entries.iter().fold(0usize, |total, (path, content)| {
+        total
+            .saturating_add(path.as_os_str().as_encoded_bytes().len())
+            .saturating_add(content.len())
+            .saturating_add(2)
+    });
+    let mut out = Vec::with_capacity(output_capacity);
+    for (path, content) in entries {
         out.extend_from_slice(path.to_string_lossy().as_bytes());
         out.push(0);
-        out.extend_from_slice(&content);
+        out.extend_from_slice(content);
         out.push(0);
     }
     out
+}
+
+fn collect_workspace_freshness_entries(
+    project_dir: &std::path::Path,
+) -> crate::workspace_discovery_cache::WorkspaceFreshnessEntries {
+    let mut freshness_files = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+
+    if let Some(path) = nearest_pnpm_workspace_yaml(project_dir) {
+        push_freshness_file(path, &mut freshness_files, &mut entries);
+    }
+
+    let Ok(Some(workspace)) = crate::workspace_discovery_cache::discover_workspace(project_dir)
+    else {
+        return entries;
+    };
+    push_freshness_file(
+        workspace.root.join("pnpm-workspace.yaml"),
+        &mut freshness_files,
+        &mut entries,
+    );
+    for member in &workspace.members {
+        let Ok(realpath) = member.path.canonicalize() else {
+            continue;
+        };
+        if !visited.insert(realpath.clone()) {
+            continue;
+        }
+        let Ok(member_content) = lpm_common::read_text_file_capped(
+            &realpath.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) else {
+            continue;
+        };
+        entries.push((realpath.clone(), member_content.as_bytes().to_vec()));
+        walk_file_link_deps(&realpath, &member_content, 0, 3, &mut visited, &mut entries);
+    }
+    entries
 }
 
 fn nearest_pnpm_workspace_yaml(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lpm_common::LpmError;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, Semaphore};
 
 #[derive(Debug)]
 pub(super) struct Coordinated<T> {
@@ -29,7 +29,7 @@ impl<K, T, E> Default for SingleFlight<K, T, E> {
 
 impl<K, T, E> SingleFlight<K, T, E>
 where
-    K: Eq + Hash,
+    K: Clone + Eq + Hash,
     T: Clone,
     E: Clone,
 {
@@ -38,6 +38,21 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
+        self.run_retaining(key, operation, |_| true).await
+    }
+
+    pub(super) async fn run_retaining<F, Fut, Retain>(
+        &self,
+        key: K,
+        operation: F,
+        retain: Retain,
+    ) -> Result<Coordinated<T>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        Retain: FnOnce(&Result<T, E>) -> bool,
+    {
+        let lookup_key = key.clone();
         let cell = {
             let mut entries = self.entries.lock().await;
             Arc::clone(
@@ -55,10 +70,27 @@ where
             })
             .await
             .clone();
+        if !retain(&result) {
+            self.remove_if_same(&lookup_key, &cell).await;
+        }
         result.map(|value| Coordinated {
             value,
             performed: performed.load(Ordering::Relaxed),
         })
+    }
+
+    pub(super) async fn invalidate(&self, key: &K) {
+        self.entries.lock().await.remove(key);
+    }
+
+    async fn remove_if_same(&self, key: &K, cell: &SharedOperation<T, E>) {
+        let mut entries = self.entries.lock().await;
+        if entries
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(entry, cell))
+        {
+            entries.remove(key);
+        }
     }
 }
 
@@ -134,8 +166,12 @@ struct LocalSourcePopulationKey {
 }
 
 pub(super) struct WorkspaceMaterializationCoordinator {
-    share_object_validations: bool,
     share_local_source_populations: bool,
+    fetch_semaphore: Arc<Semaphore>,
+    fetch_extract_limiter: super::FetchExtractLimiter,
+    limit_v1_extraction: bool,
+    v2_link_task_semaphore: Arc<Semaphore>,
+    object_validation_permits: Arc<Semaphore>,
     object_validations: SingleFlight<String, ObjectValidation, SharedMaterializationError>,
     local_source_populations:
         SingleFlight<LocalSourcePopulationKey, std::path::PathBuf, SharedMaterializationError>,
@@ -145,22 +181,50 @@ pub(super) struct WorkspaceMaterializationCoordinator {
 
 impl Default for WorkspaceMaterializationCoordinator {
     fn default() -> Self {
-        Self::new(true, true)
+        Self::new(true)
     }
 }
 
 impl WorkspaceMaterializationCoordinator {
-    pub(super) fn new(
-        share_object_validations: bool,
-        share_local_source_populations: bool,
-    ) -> Self {
+    pub(super) fn new(share_local_source_populations: bool) -> Self {
+        let limit_v1_extraction = super::configured_fetch_extract_permits_from_env(false).is_some();
+        let fetch_extract_limiter = super::configured_fetch_extract_permits_from_env(true)
+            .map(Semaphore::new)
+            .map(Arc::new);
         Self {
-            share_object_validations,
             share_local_source_populations,
+            fetch_semaphore: Arc::new(Semaphore::new(super::max_concurrent_downloads())),
+            fetch_extract_limiter,
+            limit_v1_extraction,
+            v2_link_task_semaphore: Arc::new(Semaphore::new(super::v2_link_task_concurrency(
+                Semaphore::MAX_PERMITS,
+            ))),
+            object_validation_permits: Arc::new(Semaphore::new(
+                super::concurrency::V2_CACHE_CHECK_MAX_CONCURRENCY,
+            )),
             object_validations: SingleFlight::default(),
             local_source_populations: SingleFlight::default(),
             link_materializations: SingleFlight::default(),
         }
+    }
+
+    pub(super) fn fetch_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.fetch_semaphore)
+    }
+
+    pub(super) fn fetch_extract_limiter(
+        &self,
+        v2_store_active: bool,
+    ) -> super::FetchExtractLimiter {
+        if v2_store_active || self.limit_v1_extraction {
+            self.fetch_extract_limiter.clone()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn v2_link_task_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.v2_link_task_semaphore)
     }
 
     pub(super) async fn populate_local_source(
@@ -170,6 +234,7 @@ impl WorkspaceMaterializationCoordinator {
         store: Arc<lpm_store::v2::Store>,
     ) -> Result<Coordinated<std::path::PathBuf>, LpmError> {
         if !self.share_local_source_populations {
+            let validation_sri = source_sri.clone();
             let object_dir = tokio::task::spawn_blocking(move || {
                 store.populate_object_from_local_source(&source_dir, &source_sri)
             })
@@ -177,6 +242,7 @@ impl WorkspaceMaterializationCoordinator {
             .map_err(|error| {
                 LpmError::Registry(format!("v2 local-source task panicked: {error}"))
             })??;
+            self.object_validations.invalidate(&validation_sri).await;
             return Ok(Coordinated {
                 value: object_dir,
                 performed: true,
@@ -187,8 +253,10 @@ impl WorkspaceMaterializationCoordinator {
             source_dir,
             source_sri,
         };
+        let validation_sri = key.source_sri.clone();
         let operation_key = key.clone();
-        self.local_source_populations
+        let result = self
+            .local_source_populations
             .run(key, || async move {
                 tokio::task::spawn_blocking(move || {
                     store.populate_object_from_local_source(
@@ -205,7 +273,11 @@ impl WorkspaceMaterializationCoordinator {
                 .map_err(SharedMaterializationError::from)
             })
             .await
-            .map_err(LpmError::from)
+            .map_err(LpmError::from);
+        if result.is_ok() {
+            self.object_validations.invalidate(&validation_sri).await;
+        }
+        result
     }
 
     pub(super) async fn validate_object(
@@ -213,40 +285,46 @@ impl WorkspaceMaterializationCoordinator {
         source_sri: String,
         store: Arc<lpm_store::v2::Store>,
     ) -> Result<Coordinated<ObjectValidation>, LpmError> {
-        if !self.share_object_validations {
-            let validation = tokio::task::spawn_blocking(move || {
-                store
-                    .reusable_object_with_timings(&source_sri)
-                    .map(|(reusable, timings)| ObjectValidation { reusable, timings })
-            })
-            .await
-            .map_err(|error| {
-                LpmError::Registry(format!("v2 cache check task panicked: {error}"))
-            })??;
-            return Ok(Coordinated {
-                value: validation,
-                performed: true,
-            });
-        }
-
+        let validation_permits = Arc::clone(&self.object_validation_permits);
         let operation_sri = source_sri.clone();
         self.object_validations
-            .run(source_sri, || async move {
-                tokio::task::spawn_blocking(move || {
-                    store
-                        .reusable_object_with_timings(&operation_sri)
-                        .map(|(reusable, timings)| ObjectValidation { reusable, timings })
-                })
-                .await
-                .map_err(|error| {
-                    SharedMaterializationError::Registry(Arc::from(format!(
-                        "v2 cache check task panicked: {error}"
-                    )))
-                })?
-                .map_err(SharedMaterializationError::from)
-            })
+            .run_retaining(
+                source_sri,
+                || async move {
+                    let _permit = validation_permits.acquire_owned().await.map_err(|_| {
+                        SharedMaterializationError::Registry(Arc::from(
+                            "v2 object validation semaphore closed",
+                        ))
+                    })?;
+                    tokio::task::spawn_blocking(move || {
+                        store
+                            .reusable_object_with_timings(&operation_sri)
+                            .map(|(reusable, timings)| ObjectValidation { reusable, timings })
+                    })
+                    .await
+                    .map_err(|error| {
+                        SharedMaterializationError::Registry(Arc::from(format!(
+                            "v2 cache check task panicked: {error}"
+                        )))
+                    })?
+                    .map_err(SharedMaterializationError::from)
+                },
+                |result| {
+                    matches!(
+                        result,
+                        Ok(ObjectValidation {
+                            reusable: Some(_),
+                            ..
+                        })
+                    )
+                },
+            )
             .await
             .map_err(LpmError::from)
+    }
+
+    pub(super) fn object_validation_concurrency(&self, candidate_count: usize) -> usize {
+        super::concurrency::V2_CACHE_CHECK_MAX_CONCURRENCY.min(candidate_count.max(1))
     }
 
     pub(super) async fn materialize_link(
@@ -307,6 +385,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn workspace_materialization_coordinator_reuses_resource_pools() {
+        let _env = crate::test_env::ScopedEnv::update([
+            ("LPM_CONCURRENT_DOWNLOADS", Some("7".into())),
+            ("LPM_FETCH_EXTRACT_PERMITS", Some("3".into())),
+            ("LPM_V2_LINK_TASKS", Some("5".into())),
+        ]);
+        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+
+        assert_eq!(coordinator.fetch_semaphore.available_permits(), 7);
+        assert_eq!(
+            coordinator
+                .fetch_extract_limiter(true)
+                .expect("v2 extraction limiter")
+                .available_permits(),
+            3,
+        );
+        assert_eq!(coordinator.v2_link_task_semaphore.available_permits(), 5);
+    }
+
+    #[test]
+    fn workspace_materialization_coordinator_caps_link_pool_at_tokio_limit() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            "LPM_V2_LINK_TASKS",
+            Some(usize::MAX.to_string().into()),
+        )]);
+        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+
+        assert_eq!(
+            coordinator.v2_link_task_semaphore.available_permits(),
+            Semaphore::MAX_PERMITS,
+        );
+    }
 
     #[tokio::test]
     async fn single_flight_runs_one_operation_for_concurrent_same_key_requests() {
@@ -390,25 +502,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_workspace_validation_does_not_cache_a_missing_object() {
+    async fn fresh_workspace_validation_rechecks_object_after_population() {
         let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("workspace-package");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"workspace-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
         let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
         let source_sri = lpm_store::compute_sri_hash(b"missing-object");
-        let coordinator = WorkspaceMaterializationCoordinator::new(false, true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(true);
 
         let first = coordinator
             .validate_object(source_sri.clone(), Arc::clone(&store))
             .await
             .unwrap();
-        let second = coordinator
+        coordinator
+            .populate_local_source(source, source_sri.clone(), Arc::clone(&store))
+            .await
+            .unwrap();
+        let after_population = coordinator
             .validate_object(source_sri, store)
             .await
             .unwrap();
 
         assert!(first.performed);
-        assert!(second.performed);
         assert!(first.value.reusable.is_none());
-        assert!(second.value.reusable.is_none());
+        assert!(after_population.performed);
+        assert!(after_population.value.reusable.is_some());
     }
 
     #[tokio::test]
@@ -424,7 +547,7 @@ mod tests {
         std::fs::write(source.join("index.js"), b"module.exports = 1;\n").unwrap();
         let source_sri = lpm_store::compute_sri_hash(b"shared-local-source");
         let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
-        let coordinator = WorkspaceMaterializationCoordinator::new(true, true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(true);
 
         let (first, second) = tokio::join!(
             coordinator.populate_local_source(
@@ -443,6 +566,40 @@ mod tests {
         );
         assert_eq!(first.value, second.value);
         assert!(first.value.join("package.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn fresh_workspace_validation_reuses_positive_result_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("workspace-package");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"workspace-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let source_sri = lpm_store::compute_sri_hash(b"shared-positive-object");
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        store
+            .populate_object_from_local_source(&source, &source_sri)
+            .unwrap();
+        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+
+        let (first, second) = tokio::join!(
+            coordinator.validate_object(source_sri.clone(), Arc::clone(&store)),
+            coordinator.validate_object(source_sri, store),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(
+            (
+                first.value.reusable.is_some(),
+                second.value.reusable.is_some(),
+                usize::from(first.performed) + usize::from(second.performed),
+            ),
+            (true, true, 1),
+        );
     }
 
     #[test]

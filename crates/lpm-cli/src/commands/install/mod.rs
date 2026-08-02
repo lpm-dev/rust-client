@@ -939,8 +939,15 @@ async fn run_with_options_under_store_lock(
     // spec dispatcher racing alongside the later real loop would
     // saturate the network for no wall-clock win. One pool,
     // used first by speculation, then drained by real fetch.
-    let fetch_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
-    let fetch_extract_limiter = configured_fetch_extract_limiter(requested_v2_mode);
+    let workspace_materialization = workspace_materialization::current();
+    let fetch_semaphore = workspace_materialization.as_ref().map_or_else(
+        || Arc::new(Semaphore::new(max_concurrent_downloads())),
+        |coordinator| coordinator.fetch_semaphore(),
+    );
+    let fetch_extract_limiter = workspace_materialization.as_ref().map_or_else(
+        || configured_fetch_extract_limiter(requested_v2_mode),
+        |coordinator| coordinator.fetch_extract_limiter(requested_v2_mode),
+    );
     // `LPM_STREAM_FETCH=0` falls back to the temp-file spool path for both
     // early overlap fetches and the post-resolve fetch loop.
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");

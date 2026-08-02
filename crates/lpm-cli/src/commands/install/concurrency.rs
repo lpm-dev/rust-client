@@ -124,8 +124,11 @@ pub(super) async fn prevalidate_v2_reusable_objects(
     }
 
     let candidate_count = candidates.len();
-    let concurrency = v2_cache_check_concurrency(candidate_count);
     let workspace_coordinator = workspace_materialization::current();
+    let concurrency = workspace_coordinator.as_ref().map_or_else(
+        || v2_cache_check_concurrency(candidate_count),
+        |coordinator| coordinator.object_validation_concurrency(candidate_count),
+    );
     let mut checks = futures::stream::iter(candidates.into_iter().map(|(key, sri)| {
         let store_v2 = Arc::clone(&store_v2);
         let workspace_coordinator = workspace_coordinator.as_ref().map(Arc::clone);

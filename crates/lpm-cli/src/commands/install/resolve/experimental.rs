@@ -563,9 +563,14 @@ pub(in crate::commands::install) async fn run(
     let mut downloaded = 0usize;
     let mut cached = 0usize;
     let mut fetch_join_set: FuturesUnordered<FetchHandle> = fetch_handles.into_values().collect();
-    let v2_link_task_semaphore = Arc::new(Semaphore::new(v2_link_task_concurrency(
-        install_packages.len(),
-    )));
+    let v2_link_task_semaphore = workspace_materialization::current().map_or_else(
+        || {
+            Arc::new(Semaphore::new(v2_link_task_concurrency(
+                install_packages.len(),
+            )))
+        },
+        |coordinator| coordinator.v2_link_task_semaphore(),
+    );
     let mut v2_link_handles: Vec<V2LinkHandle> = Vec::new();
     while let Some(handle_result) = fetch_join_set.next().await {
         let outcome = handle_result

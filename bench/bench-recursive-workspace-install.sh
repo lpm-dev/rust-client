@@ -38,7 +38,7 @@ install_flags=(
 )
 hyperfine_args=()
 
-for count in 15 30 60 120 240; do
+for count in 15 30 60 64 78 120 240; do
   workspace="$fixture_root/$count"
   mkdir -p "$workspace/packages"
   printf '{"name":"workspace-%d","private":true,"workspaces":["packages/*"]}\n' \
