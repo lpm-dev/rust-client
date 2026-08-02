@@ -273,6 +273,29 @@ fn merging_partial_versions_drops_package_level_completeness() {
 }
 
 #[test]
+fn complete_base_metadata_does_not_discard_existing_policy_hydration() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("policy-hydrated");
+    let mut hydrated = mk_info(&["1.0.0"], &[]);
+    hydrated.trust_metadata_complete = true;
+    hydrated.dist.get_mut("1.0.0").unwrap().published_at =
+        Some("2026-07-20T17:38:38.286Z".to_string());
+    insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), Arc::new(hydrated));
+
+    let base = mk_info(&["1.0.0"], &[]);
+    let merged = insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(base));
+
+    assert_eq!(
+        merged
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2026-07-20T17:38:38.286Z")
+    );
+    assert!(merged.trust_metadata_complete);
+}
+
+#[test]
 fn merging_cached_metadata_regular_dependency_shadows_same_named_peer_requirement() {
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let canonical = CanonicalKey::npm("dual-role-dependency");
@@ -320,6 +343,54 @@ fn parse_fetched_metadata_omits_speculation_when_disabled() {
 
     assert!(fetched.speculation.is_none());
     assert_eq!(fetched.info.versions.len(), 1);
+    assert!(
+        fetched
+            .shared_fact
+            .as_ref()
+            .is_some_and(|fact| Arc::ptr_eq(fact, &fetched.info))
+    );
+}
+
+#[test]
+fn full_policy_metadata_is_not_published_as_a_shared_base_fact() {
+    let metadata = serde_json::from_value(metadata_json("policy-full", &[]))
+        .expect("fixture metadata should parse");
+
+    let fetched = parse_full_fetched_metadata(metadata, false, false);
+
+    assert!(fetched.shared_fact.is_none());
+}
+
+#[test]
+fn importer_policy_hydration_does_not_mutate_the_shared_base_fact() {
+    let importer_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let shared_facts: SharedCache = Arc::new(dashmap::DashMap::new());
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let canonical = CanonicalKey::npm("policy-isolated");
+    let base = Arc::new(mk_info(&["1.0.0"], &[]));
+    publish_direct_base_fact(
+        Some(&shared_facts),
+        &route_table,
+        &canonical,
+        Some(Arc::clone(&base)),
+    );
+
+    let importer =
+        cached_manifest_from_importer_or_facts(&importer_cache, Some(&shared_facts), &canonical)
+            .expect("the importer should read the shared base fact");
+    assert!(Arc::ptr_eq(&importer, &base));
+
+    let mut hydrated = (*importer).clone();
+    hydrated.dist.get_mut("1.0.0").unwrap().published_at =
+        Some("2025-01-01T00:00:00.000Z".to_string());
+    importer_cache.insert(canonical.clone(), Arc::new(hydrated));
+
+    assert!(
+        shared_facts
+            .get(&canonical)
+            .and_then(|fact| fact.dist.get("1.0.0").cloned())
+            .is_some_and(|dist| dist.published_at.is_none())
+    );
 }
 
 #[test]
@@ -2815,6 +2886,76 @@ async fn peer_drain_reuses_resolution_for_same_parent_peer_context_regardless_or
 }
 
 #[tokio::test]
+async fn peer_drain_telemetry_distinguishes_repeated_cached_and_satisfied_work() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let _react = push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+    let react_consumer = push_node(&mut state, CanonicalKey::npm("react-user"), "1.0.0");
+    let vue_consumer = push_node(&mut state, CanonicalKey::npm("vue-user"), "1.0.0");
+    let optional_consumer = push_node(&mut state, CanonicalKey::npm("optional-user"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        react_consumer,
+        "react",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    ));
+    let vue_requirement = mk_peer_req(
+        vue_consumer,
+        "vue",
+        CanonicalKey::npm("vue"),
+        "^3.0.0",
+        false,
+    );
+    state.peer_requirements.push(vue_requirement.clone());
+    state.peer_requirements.push(mk_peer_req(
+        optional_consumer,
+        "optional-peer",
+        CanonicalKey::npm("optional-peer"),
+        "^1.0.0",
+        true,
+    ));
+
+    let vue_info = mk_info_arc(&["3.5.0"], &[]);
+    let first = drain_peer_requirements_one_pass(&mut state, true, |canonical| {
+        let vue_info = vue_info.clone();
+        async move {
+            assert_eq!(canonical, CanonicalKey::npm("vue"));
+            Ok(vue_info)
+        }
+    })
+    .await
+    .expect("first peer drain should resolve the missing required peer");
+    assert_eq!(first.len(), 1);
+
+    state.peer_requirements.push(vue_requirement);
+    let second = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("cached peer decision should not refetch {canonical}")
+    })
+    .await
+    .expect("second peer drain should reuse the cached decision");
+    assert_eq!(second.len(), 1);
+
+    let snapshot = state.peer_work_stats.snapshot();
+    assert_eq!(
+        (
+            snapshot.non_empty_pass_count,
+            snapshot.requirement_count,
+            snapshot.unique_requirement_count,
+            snapshot.group_count,
+            snapshot.already_satisfied_group_count,
+            snapshot.classified_group_count,
+            snapshot.skipped_opt_out_group_count,
+            snapshot.resolution_cache_hit_count,
+            snapshot.resolution_cache_miss_count,
+            snapshot.manifest_lookup_count,
+            snapshot.synthesized_edge_count,
+        ),
+        (2, 4, 3, 4, 1, 3, 1, 1, 1, 1, 2)
+    );
+}
+
+#[tokio::test]
 async fn peer_drain_cached_best_effort_reports_current_unsatisfied_consumers() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
@@ -3203,6 +3344,29 @@ async fn peer_drain_respects_auto_install_peers_false_opt_out() {
     .await
     .unwrap();
     assert!(synth.is_empty(), "no synthesis under opt-out");
+}
+
+#[tokio::test]
+async fn peer_drain_unrelated_override_does_not_lookup_opted_out_peer_manifest() {
+    let mut state = ResolveState::new(HashMap::new(), override_set("unrelated-package", "2.0.0"));
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "react",
+        CanonicalKey::npm("react"),
+        "^18.0.0",
+        false,
+    ));
+
+    let synthesized =
+        drain_peer_requirements_one_pass(&mut state, false, |canonical: CanonicalKey| async move {
+            panic!("unrelated override must not trigger a manifest lookup for {canonical}")
+        })
+        .await
+        .expect("peer auto-install opt-out should finish without synthesis");
+
+    assert!(synthesized.is_empty());
 }
 
 #[tokio::test]
@@ -3808,6 +3972,69 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
         (PACKAGE_COUNT - FANOUT) as u64
     );
     assert!(result.stage_timing.dispatcher_semaphore_wait_ns > 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_reuses_direct_base_facts_across_importer_local_caches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/shared-package"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json("shared-package", &[])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let shared_facts: SharedCache = Arc::new(dashmap::DashMap::new());
+    let dependencies = crate::RootDependencies::required(HashMap::from([(
+        "shared-package".to_string(),
+        "^1.0.0".to_string(),
+    )]));
+    let resolve = || {
+        resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+            Arc::clone(&client),
+            dependencies.clone(),
+            OverrideSet::empty(),
+            route_table.clone(),
+            8,
+            None,
+            Arc::new(dashmap::DashMap::new()),
+            true,
+            true,
+            ResolverPolicy::default(),
+            None,
+            Some(Arc::clone(&shared_facts)),
+        )
+    };
+
+    let first = resolve().await.expect("first importer should resolve");
+    let second = resolve().await.expect("second importer should resolve");
+
+    let identities = |result: &ResolveResult| {
+        result
+            .packages
+            .iter()
+            .map(|package| {
+                (
+                    package.package.canonical_name(),
+                    package.version.to_string(),
+                    package.dependencies.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(identities(&first), identities(&second));
+    assert!(shared_facts.contains_key(&CanonicalKey::npm("shared-package")));
 }
 
 async fn resolve_overlapping_range_with_parent_delay(

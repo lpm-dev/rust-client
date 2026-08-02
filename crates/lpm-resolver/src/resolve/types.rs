@@ -204,6 +204,39 @@ pub struct ResolveResult {
     pub stage_timing: StageTiming,
 }
 
+/// Peer fixed-point amplification and timing for one resolver pass.
+#[derive(Debug, Clone, Default, Copy)]
+pub struct PeerStageTiming {
+    /// Non-empty peer worklist passes executed by the fixed-point resolver.
+    pub non_empty_pass_count: u64,
+    /// Peer requirements visited across all non-empty passes.
+    pub requirement_count: u64,
+    /// Distinct `(consumer node, peer local name)` requirements visited.
+    pub unique_requirement_count: u64,
+    /// Canonical peer groups considered across all passes.
+    pub group_count: u64,
+    /// Groups satisfied entirely by versions already selected in the graph.
+    pub already_satisfied_group_count: u64,
+    /// Groups that reached peer policy and version classification.
+    pub classified_group_count: u64,
+    /// Classified groups skipped because they were optional-only or peer
+    /// auto-install was disabled.
+    pub skipped_opt_out_group_count: u64,
+    /// Reused peer decisions for an identical canonical and consumer context.
+    pub resolution_cache_hit_count: u64,
+    /// Peer decisions computed for a new canonical and consumer context.
+    pub resolution_cache_miss_count: u64,
+    /// Manifest lookups awaited by peer processing, including cache-backed
+    /// policy hydration.
+    pub manifest_lookup_count: u64,
+    /// Wall-clock nanoseconds spent awaiting peer manifest lookups.
+    pub manifest_wait_ns: u64,
+    /// Peer-drain wall-clock nanoseconds excluding measured manifest waits.
+    pub processing_ns: u64,
+    /// Ambient root-scoped edges synthesized by peer processing.
+    pub synthesized_edge_count: u64,
+}
+
 /// Per-substage wall-clock breakdown emitted by
 /// [`resolve_with_shared_cache`].
 ///
@@ -224,7 +257,7 @@ pub struct ResolveResult {
 ///   only. The initial batch's parse time is folded into
 ///   install.rs's `initial_batch_ms` wall-clock.
 /// - `pubgrub_ms` covers every pass of the `spawn_blocking` that
-///   runs `pubgrub::resolve()` — sum across split-retries. Includes
+///   runs `pubgrub::resolve()` — sum across split-retry passes. Includes
 ///   any provider callback time, so `pubgrub_ms - followup_rpc_ms`
 ///   approximates pubgrub-core work (backtracking, selection).
 #[derive(Debug, Clone, Default, Copy)]
@@ -350,6 +383,8 @@ pub struct StageTiming {
     pub work_child_edge_enqueued_count: u64,
     /// Peer requirements collected from selected package manifests.
     pub work_peer_requirement_count: u64,
+    /// Peer fixed-point amplification and processing breakdown.
+    pub peer: PeerStageTiming,
     /// Distinct canonical metadata misses from dependency edges in the greedy
     /// task queue. Populated only when metadata trace detail is enabled.
     /// Tree-policy lookahead and peer-prefetch fetches are tracked by

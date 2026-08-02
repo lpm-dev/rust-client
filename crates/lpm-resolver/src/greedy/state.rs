@@ -5,6 +5,111 @@ use super::version::is_workspace_specifier;
 use super::version::{VersionPick, find_best_version_with_policy_unprofiled};
 use crate::resolve::SelectedPackageEvent;
 
+#[derive(Debug, Default)]
+pub(super) struct PeerWorkStats {
+    non_empty_pass_count: u64,
+    requirement_count: u64,
+    seen_requirements: AHashSet<(NodeId, String)>,
+    group_count: u64,
+    already_satisfied_group_count: u64,
+    classified_group_count: u64,
+    skipped_opt_out_group_count: u64,
+    resolution_cache_hit_count: u64,
+    resolution_cache_miss_count: u64,
+    manifest_lookup_count: u64,
+    manifest_wait_ns: u64,
+    processing_ns: u64,
+    synthesized_edge_count: u64,
+}
+
+pub(super) struct PeerPassMeasurement {
+    started: std::time::Instant,
+    manifest_wait_ns_before: u64,
+}
+
+impl PeerWorkStats {
+    pub(super) fn begin_pass(&mut self, pending: &[PeerRequirement]) -> PeerPassMeasurement {
+        self.non_empty_pass_count = self.non_empty_pass_count.saturating_add(1);
+        self.requirement_count = self
+            .requirement_count
+            .saturating_add(u64::try_from(pending.len()).unwrap_or(u64::MAX));
+        for requirement in pending {
+            self.seen_requirements
+                .insert((requirement.consumer, requirement.peer_name.clone()));
+        }
+        PeerPassMeasurement {
+            started: std::time::Instant::now(),
+            manifest_wait_ns_before: self.manifest_wait_ns,
+        }
+    }
+
+    pub(super) fn finish_pass(&mut self, measurement: PeerPassMeasurement) {
+        let total_ns = duration_ns(measurement.started.elapsed());
+        let manifest_wait_ns = self
+            .manifest_wait_ns
+            .saturating_sub(measurement.manifest_wait_ns_before);
+        self.processing_ns = self
+            .processing_ns
+            .saturating_add(total_ns.saturating_sub(manifest_wait_ns));
+    }
+
+    pub(super) fn record_group(&mut self) {
+        self.group_count = self.group_count.saturating_add(1);
+    }
+
+    pub(super) fn record_already_satisfied_group(&mut self) {
+        self.already_satisfied_group_count = self.already_satisfied_group_count.saturating_add(1);
+    }
+
+    pub(super) fn record_classified_group(&mut self) {
+        self.classified_group_count = self.classified_group_count.saturating_add(1);
+    }
+
+    pub(super) fn record_skipped_opt_out_group(&mut self) {
+        self.skipped_opt_out_group_count = self.skipped_opt_out_group_count.saturating_add(1);
+    }
+
+    pub(super) fn record_resolution_cache_hit(&mut self) {
+        self.resolution_cache_hit_count = self.resolution_cache_hit_count.saturating_add(1);
+    }
+
+    pub(super) fn record_resolution_cache_miss(&mut self) {
+        self.resolution_cache_miss_count = self.resolution_cache_miss_count.saturating_add(1);
+    }
+
+    pub(super) fn record_manifest_wait(&mut self, elapsed: std::time::Duration) {
+        self.manifest_lookup_count = self.manifest_lookup_count.saturating_add(1);
+        self.manifest_wait_ns = self.manifest_wait_ns.saturating_add(duration_ns(elapsed));
+    }
+
+    pub(super) fn record_synthesized_edge(&mut self) {
+        self.synthesized_edge_count = self.synthesized_edge_count.saturating_add(1);
+    }
+
+    pub(super) fn snapshot(&self) -> crate::resolve::PeerStageTiming {
+        crate::resolve::PeerStageTiming {
+            non_empty_pass_count: self.non_empty_pass_count,
+            requirement_count: self.requirement_count,
+            unique_requirement_count: u64::try_from(self.seen_requirements.len())
+                .unwrap_or(u64::MAX),
+            group_count: self.group_count,
+            already_satisfied_group_count: self.already_satisfied_group_count,
+            classified_group_count: self.classified_group_count,
+            skipped_opt_out_group_count: self.skipped_opt_out_group_count,
+            resolution_cache_hit_count: self.resolution_cache_hit_count,
+            resolution_cache_miss_count: self.resolution_cache_miss_count,
+            manifest_lookup_count: self.manifest_lookup_count,
+            manifest_wait_ns: self.manifest_wait_ns,
+            processing_ns: self.processing_ns,
+            synthesized_edge_count: self.synthesized_edge_count,
+        }
+    }
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ResolveWorkStats {
     pub(super) edge_process_count: u64,
@@ -340,6 +445,7 @@ pub(super) struct ResolveState {
     pub(super) include_optional_dependencies: bool,
     pub(super) policy: ResolverPolicy,
     pub(super) work_stats: ResolveWorkStats,
+    pub(super) peer_work_stats: PeerWorkStats,
     selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
 }
 
@@ -424,6 +530,7 @@ impl ResolveState {
             include_optional_dependencies,
             policy,
             work_stats: ResolveWorkStats::default(),
+            peer_work_stats: PeerWorkStats::default(),
             selected_package_tx: None,
         }
     }

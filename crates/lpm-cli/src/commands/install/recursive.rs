@@ -8,6 +8,38 @@ use tokio::task::JoinSet;
 const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
 const WORKSPACE_INSTALL_DEFAULT_CONCURRENCY: usize = 1;
 const WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY: usize = 3;
+const WORKSPACE_INSTALL_FRESH_PARALLEL_TARGET_THRESHOLD: usize = 64;
+
+#[derive(Clone, Copy)]
+struct AutomaticWorkspaceInstallPolicy {
+    target_count: usize,
+    targets_need_materialization: bool,
+    lockfile_replay_ready: bool,
+    offline: bool,
+    force: bool,
+    explicit_concurrency: bool,
+    share_local_source_populations: bool,
+    root_resolve_ahead_eligible: bool,
+}
+
+impl AutomaticWorkspaceInstallPolicy {
+    fn parallel_replay(self) -> bool {
+        self.targets_need_materialization
+            && !self.explicit_concurrency
+            && self.lockfile_replay_ready
+    }
+
+    fn parallel_fresh(self) -> bool {
+        self.target_count >= WORKSPACE_INSTALL_FRESH_PARALLEL_TARGET_THRESHOLD
+            && self.targets_need_materialization
+            && !self.lockfile_replay_ready
+            && !self.offline
+            && !self.force
+            && !self.explicit_concurrency
+            && self.share_local_source_populations
+            && self.root_resolve_ahead_eligible
+    }
+}
 
 pub(crate) struct RecursiveInstallOptions {
     pub(crate) json_output: bool,
@@ -136,13 +168,26 @@ pub(crate) async fn run_recursive_workspace_install(
     );
     let share_local_source_populations =
         targets.iter().all(|target| !target.lifecycle.has_scripts());
-    let automatic_parallel_replay = targets_need_materialization
-        && explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
-        && lockfile_replay_ready;
+    let explicit_concurrency =
+        explicit_workspace_install_concurrency(options.workspace_concurrency).is_some();
+    let automatic_policy = AutomaticWorkspaceInstallPolicy {
+        target_count: targets.len(),
+        targets_need_materialization,
+        lockfile_replay_ready,
+        offline: options.offline,
+        force: options.force,
+        explicit_concurrency,
+        share_local_source_populations,
+        root_resolve_ahead_eligible: root_target_index
+            .is_some_and(|index| targets[index].resolve_ahead_eligible),
+    };
+    let automatic_parallel_replay = automatic_policy.parallel_replay();
+    let automatic_parallel_fresh = automatic_policy.parallel_fresh();
     let resolve_ahead = !lockfile_replay_ready
         && !options.offline
         && !options.force
-        && explicit_workspace_install_concurrency(options.workspace_concurrency).is_none()
+        && !explicit_concurrency
+        && !automatic_parallel_fresh
         && targets.len() > 1
         && targets
             .iter()
@@ -159,7 +204,7 @@ pub(crate) async fn run_recursive_workspace_install(
     let concurrency = resolve_workspace_install_concurrency(
         options.workspace_concurrency,
         targets.len(),
-        automatic_parallel_replay,
+        automatic_parallel_replay || automatic_parallel_fresh,
     );
     let resolution_concurrency = automatic_workspace_resolution_concurrency(
         targets.len(),
@@ -175,6 +220,7 @@ pub(crate) async fn run_recursive_workspace_install(
         lockfile_replay_ready,
         share_local_source_populations,
         automatic_parallel_replay,
+        automatic_parallel_fresh,
         "selected recursive workspace install concurrency"
     );
     let materialization_coordinator = targets_need_materialization.then(|| {
@@ -489,7 +535,7 @@ async fn run_workspace_target_install(
 fn resolve_workspace_install_concurrency(
     cli_override: Option<NonZeroUsize>,
     target_count: usize,
-    lockfile_replay_ready: bool,
+    automatic_parallel: bool,
 ) -> usize {
     let configured = explicit_workspace_install_concurrency(cli_override);
     let limit = configured.unwrap_or_else(|| {
@@ -498,7 +544,7 @@ fn resolve_workspace_install_concurrency(
             .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY);
         automatic_workspace_install_concurrency(
             target_count,
-            lockfile_replay_ready,
+            automatic_parallel,
             available_parallelism,
         )
     });
@@ -516,10 +562,10 @@ fn explicit_workspace_install_concurrency(cli_override: Option<NonZeroUsize>) ->
 
 fn automatic_workspace_install_concurrency(
     target_count: usize,
-    lockfile_replay_ready: bool,
+    automatic_parallel: bool,
     available_parallelism: usize,
 ) -> usize {
-    if !lockfile_replay_ready {
+    if !automatic_parallel {
         return WORKSPACE_INSTALL_DEFAULT_CONCURRENCY;
     }
     available_parallelism
@@ -1190,6 +1236,60 @@ mod tests {
     }
 
     #[test]
+    fn recursive_workspace_install_parallelizes_large_safe_fresh_workspaces() {
+        let policy = large_fresh_workspace_policy();
+
+        assert!(policy.parallel_fresh());
+        assert_eq!(automatic_workspace_install_concurrency(78, true, 8), 3);
+    }
+
+    #[test]
+    fn recursive_workspace_install_keeps_small_fresh_workspaces_sequential() {
+        let policy = AutomaticWorkspaceInstallPolicy {
+            target_count: 4,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(!policy.parallel_fresh());
+        assert_eq!(automatic_workspace_install_concurrency(4, false, 8), 1);
+    }
+
+    #[test]
+    fn recursive_workspace_install_keeps_uncoordinated_fresh_workspaces_sequential() {
+        let policy = AutomaticWorkspaceInstallPolicy {
+            root_resolve_ahead_eligible: false,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(!policy.parallel_fresh());
+    }
+
+    #[test]
+    fn recursive_workspace_install_keeps_script_bearing_fresh_workspaces_sequential() {
+        let policy = AutomaticWorkspaceInstallPolicy {
+            share_local_source_populations: false,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(!policy.parallel_fresh());
+    }
+
+    #[test]
+    fn recursive_workspace_install_keeps_offline_and_forced_fresh_workspaces_sequential() {
+        let offline = AutomaticWorkspaceInstallPolicy {
+            offline: true,
+            ..large_fresh_workspace_policy()
+        };
+        let forced = AutomaticWorkspaceInstallPolicy {
+            force: true,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(!offline.parallel_fresh());
+        assert!(!forced.parallel_fresh());
+    }
+
+    #[test]
     fn recursive_workspace_install_bounds_fresh_resolution_parallelism() {
         assert_eq!(automatic_workspace_resolution_concurrency(8, 8), 3);
         assert_eq!(automatic_workspace_resolution_concurrency(2, 8), 2);
@@ -1360,6 +1460,19 @@ mod tests {
         let targets = vec![replay_ready_target(directory.path(), &package)];
 
         assert!(workspace_targets_need_materialization(&targets));
+    }
+
+    fn large_fresh_workspace_policy() -> AutomaticWorkspaceInstallPolicy {
+        AutomaticWorkspaceInstallPolicy {
+            target_count: 78,
+            targets_need_materialization: true,
+            lockfile_replay_ready: false,
+            offline: false,
+            force: false,
+            explicit_concurrency: false,
+            share_local_source_populations: true,
+            root_resolve_ahead_eligible: true,
+        }
     }
 
     fn replay_ready_target(

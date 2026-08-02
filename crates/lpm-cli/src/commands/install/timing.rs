@@ -1284,6 +1284,11 @@ pub(super) fn resolve_detail_json(
         .find(|snapshot| snapshot.purpose == "resolve")
         .unwrap_or(&default_metadata);
     let pubgrub_core_estimate_ms = stage.pubgrub_ms.saturating_sub(stage.followup_rpc_ms);
+    let edge_visits_per_allocated_node = if stage.work_node_allocated_count == 0 {
+        0.0
+    } else {
+        stage.work_edge_process_count as f64 / stage.work_node_allocated_count as f64
+    };
     let metadata_dispatcher = metadata_dispatcher_json(stage);
     let mut json = serde_json::json!({
         "wall_ms": resolve_wall_ms,
@@ -1309,6 +1314,27 @@ pub(super) fn resolve_detail_json(
             "parse_ndjson_ms": stage.parse_ndjson_ms,
             "pubgrub_ms": stage.pubgrub_ms,
             "pubgrub_core_estimate_ms": pubgrub_core_estimate_ms,
+        },
+        "peer": {
+            "scope": "resolver_pass",
+            "work_is_cumulative": true,
+            "processing_excludes_manifest_wait": true,
+            "non_empty_pass_count": stage.peer.non_empty_pass_count,
+            "requirement_count": stage.peer.requirement_count,
+            "unique_requirement_count": stage.peer.unique_requirement_count,
+            "repeated_requirement_count": stage.peer.requirement_count
+                .saturating_sub(stage.peer.unique_requirement_count),
+            "group_count": stage.peer.group_count,
+            "already_satisfied_group_count": stage.peer.already_satisfied_group_count,
+            "classified_group_count": stage.peer.classified_group_count,
+            "skipped_opt_out_group_count": stage.peer.skipped_opt_out_group_count,
+            "resolution_cache_hit_count": stage.peer.resolution_cache_hit_count,
+            "resolution_cache_miss_count": stage.peer.resolution_cache_miss_count,
+            "manifest_lookup_count": stage.peer.manifest_lookup_count,
+            "manifest_wait_ms": stage.peer.manifest_wait_ns as f64 / 1_000_000.0,
+            "processing_ms": stage.peer.processing_ns as f64 / 1_000_000.0,
+            "synthesized_edge_count": stage.peer.synthesized_edge_count,
+            "edge_visits_per_allocated_node": edge_visits_per_allocated_node,
         },
         "work": {
             "edge_process_count": stage.work_edge_process_count,
@@ -1874,6 +1900,56 @@ mod tests {
         assert_eq!(json["work"]["selected_package_count"], 6);
         assert_eq!(json["work"]["selected_unique_canonical_count"], 5);
         assert_eq!(json["work"]["selected_duplicate_canonical_count"], 1);
+    }
+
+    #[test]
+    fn resolve_detail_reports_peer_amplification_counters() {
+        let stage = lpm_resolver::StageTiming {
+            work_edge_process_count: 15,
+            work_node_allocated_count: 6,
+            peer: lpm_resolver::PeerStageTiming {
+                non_empty_pass_count: 3,
+                requirement_count: 12,
+                unique_requirement_count: 9,
+                group_count: 7,
+                already_satisfied_group_count: 2,
+                classified_group_count: 5,
+                skipped_opt_out_group_count: 1,
+                resolution_cache_hit_count: 3,
+                resolution_cache_miss_count: 1,
+                manifest_lookup_count: 2,
+                manifest_wait_ns: 2_500_000,
+                processing_ns: 750_000,
+                synthesized_edge_count: 4,
+            },
+            ..lpm_resolver::StageTiming::default()
+        };
+
+        let json = resolve_detail_json(10, 1, &stage, &[], TimingDetailMode::Detail);
+
+        assert_eq!(
+            json["peer"],
+            serde_json::json!({
+                "scope": "resolver_pass",
+                "work_is_cumulative": true,
+                "processing_excludes_manifest_wait": true,
+                "non_empty_pass_count": 3,
+                "requirement_count": 12,
+                "unique_requirement_count": 9,
+                "repeated_requirement_count": 3,
+                "group_count": 7,
+                "already_satisfied_group_count": 2,
+                "classified_group_count": 5,
+                "skipped_opt_out_group_count": 1,
+                "resolution_cache_hit_count": 3,
+                "resolution_cache_miss_count": 1,
+                "manifest_lookup_count": 2,
+                "manifest_wait_ms": 2.5,
+                "processing_ms": 0.75,
+                "synthesized_edge_count": 4,
+                "edge_visits_per_allocated_node": 2.5,
+            })
+        );
     }
 
     #[test]

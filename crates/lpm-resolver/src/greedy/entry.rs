@@ -334,6 +334,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     // `applied_overrides` ordering on `--json` output.
     let applied_overrides = state.overrides.take_hits();
     let work_stats = state.work_stats;
+    let peer_timing = state.peer_work_stats.snapshot();
     let root_resolutions = state.root_resolutions();
     let packages = state.into_resolved_packages(&cache, &root_aliases);
     let (
@@ -369,6 +370,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
             work_node_allocated_count: work_stats.node_allocated_count,
             work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
             work_peer_requirement_count: work_stats.peer_requirement_count,
+            peer: peer_timing,
             work_metadata_edge_miss_count: work_stats.metadata_edge_miss_count,
             work_metadata_edge_miss_direct_count: work_stats.metadata_edge_miss_direct_count,
             work_metadata_edge_miss_latest_known_count: work_stats

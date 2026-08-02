@@ -302,6 +302,8 @@ impl OverrideHit {
 pub struct OverrideSet {
     /// All parsed entries, in deterministic order.
     entries: Vec<OverrideEntry>,
+    /// Canonical package names targeted by at least one selector.
+    target_names: HashSet<String>,
     /// Canonical names that need split identity in the resolver because
     /// they appear as the target of at least one path selector.
     split_targets: HashSet<String>,
@@ -319,6 +321,7 @@ impl OverrideSet {
     pub fn empty() -> Self {
         OverrideSet {
             entries: Vec::new(),
+            target_names: HashSet::new(),
             split_targets: HashSet::new(),
             hits: RefCell::new(Vec::new()),
             fingerprint: empty_fingerprint(),
@@ -402,8 +405,10 @@ impl OverrideSet {
                 .then_with(|| a.selector.target_name().cmp(b.selector.target_name()))
         });
 
+        let mut target_names = HashSet::with_capacity(entries.len());
         let mut split_targets = HashSet::new();
         for e in &entries {
+            target_names.insert(e.selector.target_name().to_string());
             if e.selector.is_path() {
                 split_targets.insert(e.selector.target_name().to_string());
             }
@@ -413,6 +418,7 @@ impl OverrideSet {
 
         Ok(OverrideSet {
             entries,
+            target_names,
             split_targets,
             hits: RefCell::new(Vec::new()),
             fingerprint,
@@ -427,6 +433,11 @@ impl OverrideSet {
     /// True if the set has no entries (i.e., no overrides declared).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether any selector targets this canonical package name.
+    pub(crate) fn may_match_package(&self, canonical_name: &str) -> bool {
+        self.target_names.contains(canonical_name)
     }
 
     /// Iterate every parsed entry in deterministic order.
@@ -527,6 +538,7 @@ impl Clone for OverrideSet {
     fn clone(&self) -> Self {
         OverrideSet {
             entries: self.entries.clone(),
+            target_names: self.target_names.clone(),
             split_targets: self.split_targets.clone(),
             hits: RefCell::new(self.hits.borrow().clone()),
             fingerprint: self.fingerprint.clone(),
@@ -1041,6 +1053,30 @@ mod tests {
         let set = OverrideSet::parse(&map(&[("foo", "^2.0.0")]), &map(&[]), &map(&[])).unwrap();
         let m = set.find_match("foo", &v("1.5.3"), None).unwrap();
         assert_eq!(m.target.raw(), "^2.0.0");
+    }
+
+    #[test]
+    fn may_match_package_indexes_every_selector_kind() {
+        let set = OverrideSet::parse(
+            &map(&[
+                ("plain", "2.0.0"),
+                ("ranged@<2", "2.0.0"),
+                ("parent>nested", "2.0.0"),
+            ]),
+            &map(&[]),
+            &map(&[]),
+        )
+        .unwrap();
+        let indexed = ["plain", "ranged", "nested"].map(|name| set.may_match_package(name));
+
+        assert_eq!(indexed, [true, true, true]);
+    }
+
+    #[test]
+    fn may_match_package_rejects_unrelated_name() {
+        let set = OverrideSet::parse(&map(&[("foo", "2.0.0")]), &map(&[]), &map(&[])).unwrap();
+
+        assert!(!set.may_match_package("bar"));
     }
 
     #[test]

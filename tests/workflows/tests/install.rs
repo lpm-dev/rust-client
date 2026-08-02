@@ -2277,6 +2277,33 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         detail["resolve"]["scheduler"].is_object(),
         "detail.resolve.scheduler must expose resolver wait/fanout counters; got {detail:#?}"
     );
+    let peer = &detail["resolve"]["peer"];
+    for field in [
+        "non_empty_pass_count",
+        "requirement_count",
+        "unique_requirement_count",
+        "repeated_requirement_count",
+        "group_count",
+        "already_satisfied_group_count",
+        "classified_group_count",
+        "skipped_opt_out_group_count",
+        "resolution_cache_hit_count",
+        "resolution_cache_miss_count",
+        "manifest_lookup_count",
+        "manifest_wait_ms",
+        "processing_ms",
+        "synthesized_edge_count",
+        "edge_visits_per_allocated_node",
+    ] {
+        assert!(
+            peer[field].is_number(),
+            "detail.resolve.peer.{field} must be numeric; got {peer:#?}"
+        );
+    }
+    assert_eq!(peer["scope"], "resolver_pass");
+    assert_eq!(peer["work_is_cumulative"], true);
+    assert_eq!(peer["processing_excludes_manifest_wait"], true);
+    insta::assert_json_snapshot!("install_json_timing_peer_resolution", peer);
     let dispatcher_contract = serde_json::json!({
         "summary": envelope["timing"]["resolve"]["dispatcher"],
         "detail": detail["resolve"]["scheduler"]["dispatcher"],

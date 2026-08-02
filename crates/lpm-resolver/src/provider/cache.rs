@@ -5,31 +5,35 @@ pub(crate) fn insert_or_merge_cached_package_info(
     canonical: CanonicalKey,
     incoming: Arc<CachedPackageInfo>,
 ) -> Arc<CachedPackageInfo> {
-    let Some(existing) = shared_cache
-        .get(&canonical)
-        .map(|entry| Arc::clone(entry.value()))
-    else {
-        shared_cache.insert(canonical, incoming.clone());
-        return incoming;
-    };
+    match shared_cache.entry(canonical) {
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(&incoming));
+            incoming
+        }
+        dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            let existing = Arc::clone(entry.get());
+            if Arc::ptr_eq(&existing, &incoming) {
+                return existing;
+            }
 
-    if Arc::ptr_eq(&existing, &incoming) {
-        return existing;
+            if incoming.workspace_versions.is_empty() && !existing.workspace_versions.is_empty() {
+                entry.insert(Arc::clone(&incoming));
+                return incoming;
+            }
+
+            if incoming.versions_complete
+                && !existing.versions_complete
+                && existing.workspace_versions.is_empty()
+            {
+                entry.insert(Arc::clone(&incoming));
+                return incoming;
+            }
+
+            let merged = Arc::new(merge_cached_package_info(&existing, &incoming));
+            entry.insert(Arc::clone(&merged));
+            merged
+        }
     }
-
-    if incoming.workspace_versions.is_empty() && !existing.workspace_versions.is_empty() {
-        shared_cache.insert(canonical, incoming.clone());
-        return incoming;
-    }
-
-    if incoming.versions_complete && existing.workspace_versions.is_empty() {
-        shared_cache.insert(canonical, incoming.clone());
-        return incoming;
-    }
-
-    let merged = Arc::new(merge_cached_package_info(&existing, &incoming));
-    shared_cache.insert(canonical, merged.clone());
-    merged
 }
 
 pub(crate) fn activate_workspace_fallback(
@@ -119,22 +123,18 @@ fn merge_cached_package_info(
         .versions
         .iter()
         .any(|version| !existing.versions.contains(version));
+    let existing_adds_versions = existing
+        .versions
+        .iter()
+        .any(|version| !incoming.versions.contains(version));
     let versions_complete =
         incoming.versions_complete || (existing.versions_complete && !incoming_adds_versions);
-    let trust_metadata_complete = if incoming.versions_complete {
-        incoming.trust_metadata_complete
-    } else if versions_complete {
-        existing.trust_metadata_complete
-    } else {
-        false
-    };
-    let platform_metadata_complete = if incoming.versions_complete {
-        incoming.platform_metadata_complete
-    } else if versions_complete {
-        existing.platform_metadata_complete
-    } else {
-        false
-    };
+    let trust_metadata_complete = (existing.trust_metadata_complete
+        && (incoming.trust_metadata_complete || !incoming_adds_versions))
+        || (incoming.trust_metadata_complete && !existing_adds_versions);
+    let platform_metadata_complete = (existing.platform_metadata_complete
+        && (incoming.platform_metadata_complete || !incoming_adds_versions))
+        || (incoming.platform_metadata_complete && !existing_adds_versions);
 
     let mut merged = CachedPackageInfo {
         modified: incoming

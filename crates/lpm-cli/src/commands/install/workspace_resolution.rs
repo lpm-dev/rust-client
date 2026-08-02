@@ -15,6 +15,7 @@ pub(super) struct WorkspaceResolutionCoordinator {
     prepared_count: std::sync::atomic::AtomicUsize,
     all_prepared: Notify,
     fetch_overlap_hub: OnceLock<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>>,
+    resolver_fact_cache: lpm_resolver::SharedCache,
     root_index: Option<usize>,
     root_provider_state: RootProviderState,
 }
@@ -32,6 +33,7 @@ impl WorkspaceResolutionCoordinator {
             prepared_count: std::sync::atomic::AtomicUsize::new(0),
             all_prepared: Notify::new(),
             fetch_overlap_hub: OnceLock::new(),
+            resolver_fact_cache: Arc::new(dashmap::DashMap::new()),
             root_index: None,
             root_provider_state: RootProviderState::new(),
         }
@@ -147,12 +149,14 @@ impl RootProviderState {
 
 pub(super) struct WorkspaceRootProviderCoordinator {
     state: RootProviderState,
+    resolver_fact_cache: lpm_resolver::SharedCache,
 }
 
 impl WorkspaceRootProviderCoordinator {
     pub(super) fn new() -> Self {
         Self {
             state: RootProviderState::new(),
+            resolver_fact_cache: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -338,6 +342,24 @@ pub(super) fn active() -> bool {
 pub(super) fn fetch_overlap_hub() -> Option<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>> {
     ACTIVE_TASK
         .try_with(|task| task.coordinator.fetch_overlap_hub())
+        .ok()
+}
+
+pub(super) fn resolver_fact_cache_for_importer(
+    route_table: &lpm_registry::RouteTable,
+) -> Option<lpm_resolver::SharedCache> {
+    if !matches!(route_table.mode(), lpm_registry::RouteMode::Direct)
+        || !route_table.supports_workspace_fetch_sharing()
+    {
+        return None;
+    }
+
+    ACTIVE_TASK
+        .try_with(|task| Arc::clone(&task.coordinator.resolver_fact_cache))
+        .or_else(|_| {
+            ACTIVE_ROOT_PROVIDER_TASK
+                .try_with(|task| Arc::clone(&task.coordinator.resolver_fact_cache))
+        })
         .ok()
 }
 
@@ -890,6 +912,42 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    async fn fact_caches_for_resolution_importers(
+        route_table: lpm_registry::RouteTable,
+    ) -> (
+        Option<lpm_resolver::SharedCache>,
+        Option<lpm_resolver::SharedCache>,
+    ) {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 2));
+        let local = tokio::task::LocalSet::new();
+        let (first, second) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        let route_table = route_table.clone();
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 0, async {
+                                Ok::<_, ()>(resolver_fact_cache_for_importer(&route_table))
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 1, async {
+                                Ok::<_, ()>(resolver_fact_cache_for_importer(&route_table))
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+        (first.unwrap().unwrap(), second.unwrap().unwrap())
+    }
+
     #[test]
     fn missing_root_lockfile_has_no_peer_provider_fingerprint() {
         let directory = tempfile::tempdir().unwrap();
@@ -919,6 +977,80 @@ mod tests {
         let _hub = coordinator.fetch_overlap_hub();
 
         assert!(coordinator.fetch_overlap_hub_initialized());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_workspace_importers_share_only_the_base_fact_cache() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let (first, second) = fact_caches_for_resolution_importers(route_table).await;
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_provider_workspace_importers_share_only_the_base_fact_cache() {
+        let coordinator = Arc::new(WorkspaceRootProviderCoordinator::new());
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let local = tokio::task::LocalSet::new();
+        let (root, member) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        let route_table = route_table.clone();
+                        tokio::task::spawn_local(async move {
+                            root_provider_scope(coordinator, true, async {
+                                Ok::<_, ()>(resolver_fact_cache_for_importer(&route_table))
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            root_provider_scope(coordinator, false, async {
+                                Ok::<_, ()>(resolver_fact_cache_for_importer(&route_table))
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+        let root = root.unwrap().unwrap().unwrap();
+        let member = member.unwrap().unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&root, &member));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_route_workspace_importers_have_no_shared_base_fact_cache() {
+        fn no_env(_name: &str) -> Option<String> {
+            None
+        }
+
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            "registry=https://registry.example.test\n",
+            "test",
+            &no_env,
+        );
+        let route_table =
+            lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+        let (first, second) = fact_caches_for_resolution_importers(route_table).await;
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_workspace_importers_have_no_shared_base_fact_cache() {
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+        let (first, second) = fact_caches_for_resolution_importers(route_table).await;
+
+        assert!(first.is_none());
+        assert!(second.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

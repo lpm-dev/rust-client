@@ -1,8 +1,9 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
-    FetchResult, FetchedMetadata, MetadataFetchCompletion, complete_metadata_fetch,
-    ensure_policy_metadata_for_cached_manifest, fetch_metadata_for_resolver_with_trace_detail,
-    parse_fetched_metadata, parse_partial_fetched_metadata,
+    FetchResult, FetchedMetadata, MetadataFetchCompletion, cached_manifest_from_importer_or_facts,
+    complete_metadata_fetch, ensure_policy_metadata_for_cached_manifest,
+    fetch_metadata_for_resolver_with_trace_detail, parse_fetched_metadata,
+    parse_partial_fetched_metadata, publish_direct_base_fact,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -18,6 +19,7 @@ struct FusedTreeProvider<'a> {
     client: &'a Arc<RegistryClient>,
     route_table: &'a RouteTable,
     shared_cache: &'a SharedCache,
+    shared_fact_cache: Option<&'a SharedCache>,
     policy: &'a ResolverPolicy,
     spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     dispatcher_rpc_count: Cell<u64>,
@@ -234,11 +236,11 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
         Box<dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>,
     > {
         Box::pin(async move {
-            if let Some(info_arc) = self
-                .shared_cache
-                .get(canonical)
-                .map(|entry| entry.value().clone())
-            {
+            if let Some(info_arc) = cached_manifest_from_importer_or_facts(
+                self.shared_cache,
+                self.shared_fact_cache,
+                canonical,
+            ) {
                 return ensure_policy_metadata_for_cached_manifest(
                     canonical,
                     info_arc,
@@ -263,8 +265,15 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
             let FetchedMetadata {
                 speculation,
                 info: info_arc,
+                shared_fact,
                 ..
             } = fetched;
+            publish_direct_base_fact(
+                self.shared_fact_cache,
+                self.route_table,
+                canonical,
+                shared_fact,
+            );
             insert_or_merge_cached_package_info(
                 self.shared_cache,
                 canonical.clone(),
@@ -795,6 +804,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy_roots(
         include_optional_dependencies,
         policy,
         None,
+        None,
     )
     .await
 }
@@ -825,6 +835,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
         include_optional_dependencies,
         policy,
         selected_package_tx,
+        None,
     )
     .await
 }
@@ -842,6 +853,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
     selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+    shared_fact_cache: Option<SharedCache>,
 ) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
@@ -880,6 +892,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         client: &client,
         route_table: &route_table,
         shared_cache: &shared_cache,
+        shared_fact_cache: shared_fact_cache.as_ref(),
         policy: &policy,
         spec_tx: spec_tx.as_ref(),
         dispatcher_rpc_count: Cell::new(0),
@@ -1099,7 +1112,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             // Cache hit fast-path. Hot path; one DashMap lookup +
             // refcount bump on the Arc<CachedPackageInfo>. The shard
             // lock is released before `process_edge` mutates state.
-            if let Some(info_arc) = shared_cache.get(&edge.canonical).map(|e| e.value().clone()) {
+            if let Some(info_arc) = cached_manifest_from_importer_or_facts(
+                &shared_cache,
+                shared_fact_cache.as_ref(),
+                &edge.canonical,
+            ) {
                 if info_arc.needs_metadata_for_range(&edge.range) {
                     let canonical = edge.canonical.clone();
                     let new_fetch = ordered_metadata.start(&canonical)?;
@@ -1167,10 +1184,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                 speculation: None,
                                 latest_version: info_arc.latest_version.clone(),
                                 info: info_arc,
+                                shared_fact: None,
                             }),
                         )?;
                         let mut completion = MetadataFetchCompletion {
                             shared_cache: &shared_cache,
+                            shared_fact_cache: shared_fact_cache.as_ref(),
                             route_table: &route_table,
                             counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                             trace_metadata_fetches,
@@ -1366,6 +1385,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             {
                                 let mut completion = MetadataFetchCompletion {
                                     shared_cache: &shared_cache,
+                                    shared_fact_cache: shared_fact_cache.as_ref(),
                                     route_table: &route_table,
                                     counted_metadata_edge_misses: counted_metadata_edge_misses
                                         .as_mut(),
@@ -1394,6 +1414,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         }
                         let mut completion = MetadataFetchCompletion {
                             shared_cache: &shared_cache,
+                            shared_fact_cache: shared_fact_cache.as_ref(),
                             route_table: &route_table,
                             counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                             trace_metadata_fetches,
@@ -1521,6 +1542,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             {
                                 let mut completion = MetadataFetchCompletion {
                                     shared_cache: &shared_cache,
+                                    shared_fact_cache: shared_fact_cache.as_ref(),
                                     route_table: &route_table,
                                     counted_metadata_edge_misses: counted_metadata_edge_misses
                                         .as_mut(),
@@ -1535,6 +1557,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             }
                             let mut completion = MetadataFetchCompletion {
                                 shared_cache: &shared_cache,
+                                shared_fact_cache: shared_fact_cache.as_ref(),
                                 route_table: &route_table,
                                 counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                                 trace_metadata_fetches,
@@ -1667,6 +1690,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             let client_drain = client.clone();
             let route_table_drain = route_table.clone();
             let shared_cache_drain = shared_cache.clone();
+            let shared_fact_cache_drain = shared_fact_cache.clone();
             let policy_drain = policy.clone();
             let synthesized = drain_peer_requirements_one_pass(
                 &mut state,
@@ -1675,12 +1699,15 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     let client = client_drain.clone();
                     let route_table = route_table_drain.clone();
                     let shared_cache = shared_cache_drain.clone();
+                    let shared_fact_cache = shared_fact_cache_drain.clone();
                     let policy = policy_drain.clone();
                     async move {
                         // Cache hit: refcount bump, return immediately.
-                        if let Some(info_arc) =
-                            shared_cache.get(&canonical).map(|e| e.value().clone())
-                        {
+                        if let Some(info_arc) = cached_manifest_from_importer_or_facts(
+                            &shared_cache,
+                            shared_fact_cache.as_ref(),
+                            &canonical,
+                        ) {
                             return ensure_policy_metadata_for_cached_manifest(
                                 &canonical,
                                 info_arc,
@@ -1707,6 +1734,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             trace_metadata_fetches,
                         )
                         .await?;
+                        publish_direct_base_fact(
+                            shared_fact_cache.as_ref(),
+                            &route_table,
+                            &canonical,
+                            fetched.shared_fact,
+                        );
                         let info_arc = fetched.info;
                         Ok(insert_or_merge_cached_package_info(
                             &shared_cache,
@@ -1744,6 +1777,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             ordered_metadata.queue_tracked(canonical, result)?;
             let mut completion = MetadataFetchCompletion {
                 shared_cache: &shared_cache,
+                shared_fact_cache: shared_fact_cache.as_ref(),
                 route_table: &route_table,
                 counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                 trace_metadata_fetches,
@@ -1783,6 +1817,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // `into_resolved_packages`. Same shape + order contract as the walker arm.
     let applied_overrides = state.overrides.take_hits();
     let work_stats = state.work_stats;
+    let peer_timing = state.peer_work_stats.snapshot();
     let root_resolutions = state.root_resolutions();
     let packages = state.into_resolved_packages(&cache, &root_aliases);
     let (
@@ -1838,6 +1873,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             work_node_allocated_count: work_stats.node_allocated_count,
             work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
             work_peer_requirement_count: work_stats.peer_requirement_count,
+            peer: peer_timing,
             work_metadata_edge_miss_count: work_stats.metadata_edge_miss_count,
             work_metadata_edge_miss_direct_count: work_stats.metadata_edge_miss_direct_count,
             work_metadata_edge_miss_latest_known_count: work_stats

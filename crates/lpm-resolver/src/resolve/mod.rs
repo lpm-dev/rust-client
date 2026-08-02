@@ -32,8 +32,8 @@ pub use peers::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    ResolveResult, ResolvedPackage, RootDependencies, RootResolution, SelectedPackageEvent,
-    StageTiming,
+    PeerStageTiming, ResolveResult, ResolvedPackage, RootDependencies, RootResolution,
+    SelectedPackageEvent, StageTiming,
 };
 
 mod prelude {
