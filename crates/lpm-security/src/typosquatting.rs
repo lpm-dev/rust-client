@@ -132,6 +132,7 @@ const POPULAR_PACKAGES: &[&str] = &[
 ];
 
 const KNOWN_LEGITIMATE_COLLISIONS: &[&str] = &[
+    "bcryptjs",
     "canvafy",
     "canvg",
     "chat",
@@ -143,6 +144,8 @@ const KNOWN_LEGITIMATE_COLLISIONS: &[&str] = &[
     "evnty",
     "globo",
     "json-web-token",
+    "mssql",
+    "mysql2",
     "negotiate",
     "never",
     "ngreact",
@@ -398,6 +401,7 @@ mod tests {
     #[test]
     fn no_warn_popular_clean_packages_that_resemble_other_popular_packages() {
         for package in [
+            "bcryptjs",
             "chat",
             "enquirer",
             "canvg",
@@ -412,6 +416,8 @@ mod tests {
             "esplint",
             "globo",
             "json-web-token",
+            "mssql",
+            "mysql2",
             "negotiate",
             "never",
             "ngreact",
