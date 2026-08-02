@@ -183,7 +183,24 @@ impl ResolverPolicy {
         trust_policy: TrustPolicyMode,
         excludes: impl IntoIterator<Item = ReleaseAgeExclusion>,
     ) -> Self {
-        Self::new_inner(minimum_release_age_secs, trust_policy, excludes, None)
+        Self::new_inner(minimum_release_age_secs, trust_policy, excludes, None, None)
+    }
+
+    /// Builds a release-age policy evaluated against an explicit command
+    /// timestamp so multiple importer resolutions share one cutoff.
+    pub fn new_with_release_age_excludes_at_unix(
+        minimum_release_age_secs: u64,
+        trust_policy: TrustPolicyMode,
+        excludes: impl IntoIterator<Item = ReleaseAgeExclusion>,
+        now_unix: i64,
+    ) -> Self {
+        Self::new_inner(
+            minimum_release_age_secs,
+            trust_policy,
+            excludes,
+            None,
+            Some(now_unix),
+        )
     }
 
     pub fn new_with_release_age_excludes_and_packages(
@@ -197,6 +214,25 @@ impl ResolverPolicy {
             trust_policy,
             excludes,
             Some(packages.into_iter().collect()),
+            None,
+        )
+    }
+
+    /// Builds a direct-scope release-age policy evaluated against one explicit
+    /// command timestamp.
+    pub fn new_with_release_age_excludes_and_packages_at_unix(
+        minimum_release_age_secs: u64,
+        trust_policy: TrustPolicyMode,
+        excludes: impl IntoIterator<Item = ReleaseAgeExclusion>,
+        packages: impl IntoIterator<Item = CanonicalKey>,
+        now_unix: i64,
+    ) -> Self {
+        Self::new_inner(
+            minimum_release_age_secs,
+            trust_policy,
+            excludes,
+            Some(packages.into_iter().collect()),
+            Some(now_unix),
         )
     }
 
@@ -205,11 +241,12 @@ impl ResolverPolicy {
         trust_policy: TrustPolicyMode,
         excludes: impl IntoIterator<Item = ReleaseAgeExclusion>,
         packages: Option<HashSet<CanonicalKey>>,
+        now_unix: Option<i64>,
     ) -> Self {
         let cutoff_unix = if minimum_release_age_secs == 0 {
             None
         } else {
-            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let now = now_unix.unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp());
             let min_age_secs = i64::try_from(minimum_release_age_secs).unwrap_or(i64::MAX);
             Some(now.saturating_sub(min_age_secs))
         };
@@ -498,6 +535,33 @@ pub(crate) fn parse_npm_time_unix(input: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_release_age_reference_produces_a_stable_cutoff() {
+        let policy = ResolverPolicy::new_with_release_age_excludes_at_unix(
+            600,
+            TrustPolicyMode::Off,
+            [],
+            2_000,
+        );
+
+        assert_eq!(policy.release_age_cutoff_unix(), Some(1_400));
+    }
+
+    #[test]
+    fn explicit_direct_scope_reference_keeps_package_selection_importer_local() {
+        let included = CanonicalKey::npm("included");
+        let policy = ResolverPolicy::new_with_release_age_excludes_and_packages_at_unix(
+            600,
+            TrustPolicyMode::Off,
+            [],
+            [included.clone()],
+            2_000,
+        );
+
+        assert!(policy.release_age_applies_to_package(&included));
+        assert!(!policy.release_age_applies_to_package(&CanonicalKey::npm("transitive")));
+    }
 
     #[test]
     fn exact_version_exclusion_matches_only_its_package_release() {

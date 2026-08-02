@@ -399,6 +399,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         resolver_policy.clone(),
                         selected_package_tx,
                         workspace_resolution::resolver_fact_cache_for_importer(&route_table),
+                        workspace_resolution::resolver_metadata_concurrency_for_importer(
+                            &route_table,
+                            npm_fanout,
+                        ),
                     )
                     .await
                     .map_err(crate::resolver_error::resolver_error_to_lpm);

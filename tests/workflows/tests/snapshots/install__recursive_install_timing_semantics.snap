@@ -11,7 +11,17 @@ expression: contract
       "target_resolve_sum_ms": "[DURATION]",
       "target_post_resolve_sum_ms": "[DURATION]",
       "target_fetch_sum_ms": "[DURATION]",
-      "target_link_sum_ms": "[DURATION]"
+      "target_link_sum_ms": "[DURATION]",
+      "resolver_substage_sums": {
+        "scope": "recursive_command",
+        "aggregation": "sum_of_resolver_pass_work",
+        "work_is_cumulative": true,
+        "tree_policy_ms": "[DURATION]",
+        "policy_hydration_ms": "[DURATION]",
+        "manifest_wait_ms": "[DURATION]",
+        "edge_expansion_ms": "[DURATION]",
+        "graph_finalization_ms": "[DURATION]"
+      }
     },
     "wait": {
       "aggregation": "sum_of_target_wall_clock",

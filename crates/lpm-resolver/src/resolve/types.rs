@@ -317,6 +317,9 @@ pub struct StageTiming {
     /// Configured permit count for direct metadata fetches in the fused
     /// dispatcher. Zero on resolver arms that do not use this semaphore.
     pub dispatcher_configured_fanout: u64,
+    /// Whether the dispatcher permits are shared by importer-local resolver
+    /// states in one recursive command.
+    pub dispatcher_concurrency_shared: bool,
     /// Peak number of direct metadata fetches holding semaphore permits.
     /// This value cannot exceed [`Self::dispatcher_configured_fanout`].
     pub dispatcher_inflight_high_water: u64,
@@ -385,6 +388,22 @@ pub struct StageTiming {
     pub work_peer_requirement_count: u64,
     /// Peer fixed-point amplification and processing breakdown.
     pub peer: PeerStageTiming,
+    /// Cumulative time in root tree-policy lookahead. This includes any
+    /// manifest waits performed recursively by the lookahead provider.
+    pub tree_policy_ns: u64,
+    /// Cumulative time ensuring cached manifests contain importer-scoped
+    /// release-age, platform, and trust-policy facts.
+    pub policy_hydration_ns: u64,
+    /// Cumulative resolver-orchestration time awaiting dispatcher jobs.
+    /// Tree-policy, peer, policy-hydration, and Worker batch waits are reported
+    /// separately or excluded here.
+    pub manifest_wait_ns: u64,
+    /// Cumulative task-queue expansion time excluding the separately measured
+    /// tree-policy and policy-hydration waits.
+    pub edge_expansion_ns: u64,
+    /// Time spent projecting the resolved graph into deterministic package
+    /// rows and final resolver outputs.
+    pub graph_finalization_ns: u64,
     /// Distinct canonical metadata misses from dependency edges in the greedy
     /// task queue. Populated only when metadata trace detail is enabled.
     /// Tree-policy lookahead and peer-prefetch fetches are tracked by

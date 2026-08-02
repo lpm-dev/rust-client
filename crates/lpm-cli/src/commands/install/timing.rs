@@ -1258,6 +1258,11 @@ pub(super) fn metadata_dispatcher_json(stage: &lpm_resolver::StageTiming) -> ser
         "kind": "metadata",
         "rpc_count": stage.dispatcher_rpc_count,
         "configured_fanout": stage.dispatcher_configured_fanout,
+        "concurrency_scope": if stage.dispatcher_concurrency_shared {
+            "workspace_command"
+        } else {
+            "resolver_pass"
+        },
         "inflight_high_water": stage.dispatcher_inflight_high_water,
         "active_fetch_high_water": stage.dispatcher_inflight_high_water,
         "pending_high_water": stage.dispatcher_pending_high_water,
@@ -1398,6 +1403,18 @@ pub(super) fn resolve_detail_json(
             .saturating_sub(stage.pubgrub_ms as u128),
     });
     if mode.trace() {
+        json["substages"] = serde_json::json!({
+            "scope": "resolver_pass",
+            "work_is_cumulative": true,
+            "edge_expansion_excludes_policy_hydration_and_tree_policy": true,
+            "tree_policy_includes_nested_manifest_wait": true,
+            "manifest_wait_excludes_tree_policy_peer_policy_hydration_and_worker_batches": true,
+            "tree_policy_ms": stage.tree_policy_ns as f64 / 1_000_000.0,
+            "policy_hydration_ms": stage.policy_hydration_ns as f64 / 1_000_000.0,
+            "manifest_wait_ms": stage.manifest_wait_ns as f64 / 1_000_000.0,
+            "edge_expansion_ms": stage.edge_expansion_ns as f64 / 1_000_000.0,
+            "graph_finalization_ms": stage.graph_finalization_ns as f64 / 1_000_000.0,
+        });
         let metadata_fetch_detail = lpm_registry::timing::snapshot_metadata_fetch_detail();
         json["metadata_fetch"] =
             metadata_fetch_detail_json_from_snapshot(&metadata_fetch_detail, mode);
@@ -1900,6 +1917,61 @@ mod tests {
         assert_eq!(json["work"]["selected_package_count"], 6);
         assert_eq!(json["work"]["selected_unique_canonical_count"], 5);
         assert_eq!(json["work"]["selected_duplicate_canonical_count"], 1);
+    }
+
+    #[test]
+    fn resolve_trace_reports_resolver_substage_work() {
+        let stage = lpm_resolver::StageTiming {
+            tree_policy_ns: 1_250_000,
+            policy_hydration_ns: 2_500_000,
+            manifest_wait_ns: 6_500_000,
+            edge_expansion_ns: 3_750_000,
+            graph_finalization_ns: 4_000_000,
+            ..lpm_resolver::StageTiming::default()
+        };
+
+        let json = resolve_detail_json(20, 1, &stage, &[], TimingDetailMode::Trace);
+
+        assert_eq!(
+            json["substages"],
+            serde_json::json!({
+                "scope": "resolver_pass",
+                "work_is_cumulative": true,
+                "edge_expansion_excludes_policy_hydration_and_tree_policy": true,
+                "tree_policy_includes_nested_manifest_wait": true,
+                "manifest_wait_excludes_tree_policy_peer_policy_hydration_and_worker_batches": true,
+                "tree_policy_ms": 1.25,
+                "policy_hydration_ms": 2.5,
+                "manifest_wait_ms": 6.5,
+                "edge_expansion_ms": 3.75,
+                "graph_finalization_ms": 4.0,
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_dispatcher_reports_workspace_command_concurrency_scope() {
+        let stage = lpm_resolver::StageTiming {
+            dispatcher_concurrency_shared: true,
+            ..lpm_resolver::StageTiming::default()
+        };
+
+        let json = metadata_dispatcher_json(&stage);
+
+        assert_eq!(json["concurrency_scope"], "workspace_command");
+    }
+
+    #[test]
+    fn resolve_detail_omits_trace_only_resolver_substages() {
+        let json = resolve_detail_json(
+            20,
+            1,
+            &lpm_resolver::StageTiming::default(),
+            &[],
+            TimingDetailMode::Detail,
+        );
+
+        assert!(json.get("substages").is_none());
     }
 
     #[test]

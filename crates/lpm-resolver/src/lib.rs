@@ -27,7 +27,7 @@ pub(crate) fn metadata_fetch_detail_test_lock() -> &'static tokio::sync::Mutex<(
 
 pub use greedy::PeerConflictReport;
 pub use greedy::{
-    ExperimentalMetadataFetchTimings, ExperimentalVersionSelection,
+    ExperimentalMetadataFetchTimings, ExperimentalVersionSelection, SharedMetadataConcurrency,
     experimental_fetch_cached_package_info_with_policy,
     experimental_fetch_cached_package_info_with_policy_and_timings,
     experimental_fetch_exact_cached_package_info_with_policy_and_timings,

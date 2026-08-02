@@ -8,6 +8,7 @@ use tokio::task::JoinSet;
 const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
 const WORKSPACE_INSTALL_DEFAULT_CONCURRENCY: usize = 1;
 const WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY: usize = 3;
+const WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY: usize = 6;
 const WORKSPACE_INSTALL_FRESH_PARALLEL_TARGET_THRESHOLD: usize = 64;
 
 #[derive(Clone, Copy)]
@@ -192,6 +193,7 @@ pub(crate) async fn run_recursive_workspace_install(
         && targets
             .iter()
             .all(|target| !target.lifecycle.has_scripts() && target.resolve_ahead_eligible);
+    let release_age_reference_unix = workspace_resolution::current_unix_timestamp();
     let root_provider_coordinator = root_target_index
         .filter(|index| {
             !resolve_ahead
@@ -200,11 +202,22 @@ pub(crate) async fn run_recursive_workspace_install(
                 && share_local_source_populations
                 && targets[*index].resolve_ahead_eligible
         })
-        .map(|_| Arc::new(workspace_resolution::WorkspaceRootProviderCoordinator::new()));
+        .map(|_| {
+            Arc::new(
+                workspace_resolution::WorkspaceRootProviderCoordinator::new_at_unix(
+                    release_age_reference_unix,
+                ),
+            )
+        });
     let concurrency = resolve_workspace_install_concurrency(
         options.workspace_concurrency,
         targets.len(),
         automatic_parallel_replay || automatic_parallel_fresh,
+        if automatic_parallel_fresh {
+            WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY
+        } else {
+            WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY
+        },
     );
     let resolution_concurrency = automatic_workspace_resolution_concurrency(
         targets.len(),
@@ -234,15 +247,17 @@ pub(crate) async fn run_recursive_workspace_install(
     let resolution_coordinator = resolve_ahead.then(|| {
         Arc::new(match root_target_index {
             Some(root_index) => {
-                workspace_resolution::WorkspaceResolutionCoordinator::new_with_root(
+                workspace_resolution::WorkspaceResolutionCoordinator::new_with_root_at_unix(
                     targets.len(),
                     resolution_concurrency,
                     root_index,
+                    release_age_reference_unix,
                 )
             }
-            None => workspace_resolution::WorkspaceResolutionCoordinator::new(
+            None => workspace_resolution::WorkspaceResolutionCoordinator::new_at_unix(
                 targets.len(),
                 resolution_concurrency,
+                release_age_reference_unix,
             ),
         })
     });
@@ -536,6 +551,7 @@ fn resolve_workspace_install_concurrency(
     cli_override: Option<NonZeroUsize>,
     target_count: usize,
     automatic_parallel: bool,
+    automatic_max_concurrency: usize,
 ) -> usize {
     let configured = explicit_workspace_install_concurrency(cli_override);
     let limit = configured.unwrap_or_else(|| {
@@ -546,6 +562,7 @@ fn resolve_workspace_install_concurrency(
             target_count,
             automatic_parallel,
             available_parallelism,
+            automatic_max_concurrency,
         )
     });
     limit.min(target_count.max(1))
@@ -564,12 +581,13 @@ fn automatic_workspace_install_concurrency(
     target_count: usize,
     automatic_parallel: bool,
     available_parallelism: usize,
+    automatic_max_concurrency: usize,
 ) -> usize {
     if !automatic_parallel {
         return WORKSPACE_INSTALL_DEFAULT_CONCURRENCY;
     }
     available_parallelism
-        .clamp(1, WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY)
+        .clamp(1, automatic_max_concurrency.max(1))
         .min(target_count.max(1))
 }
 
@@ -1148,12 +1166,38 @@ fn attach_aggregate_telemetry(
             })
             .fold(0u64, u64::saturating_add)
     };
+    let resolver_substage_sum = |field: &str| -> f64 {
+        targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .get("timing")
+                    .and_then(|timing| timing.get("detail"))
+                    .and_then(|detail| detail.get("resolve"))
+                    .and_then(|resolve| resolve.get("substages"))
+                    .and_then(|substages| substages.get(field))
+                    .and_then(serde_json::Value::as_f64)
+            })
+            .sum()
+    };
     let resolve_ms = timing_sum("resolve_ms");
     let fetch_ms = timing_sum("fetch_ms");
     let link_ms = timing_sum("link_ms");
     let materialization_wait_ms = waterfall_sum("materialization_wait_ms");
     let commit_wait_ms = waterfall_sum("commit_wait_ms");
     let post_resolve_work_ms = waterfall_sum("post_resolve_work_ms");
+    let resolver_substage_sums = timing_detail_mode.trace().then(|| {
+        serde_json::json!({
+            "scope": "recursive_command",
+            "aggregation": "sum_of_resolver_pass_work",
+            "work_is_cumulative": true,
+            "tree_policy_ms": resolver_substage_sum("tree_policy_ms"),
+            "policy_hydration_ms": resolver_substage_sum("policy_hydration_ms"),
+            "manifest_wait_ms": resolver_substage_sum("manifest_wait_ms"),
+            "edge_expansion_ms": resolver_substage_sum("edge_expansion_ms"),
+            "graph_finalization_ms": resolver_substage_sum("graph_finalization_ms"),
+        })
+    });
     let aggregate_counts = serde_json::json!({
         "scope": "recursive_command",
         "aggregation": "sum_of_target_observations",
@@ -1204,6 +1248,9 @@ fn attach_aggregate_telemetry(
             },
             "process": recursive_process_timing(timing_detail_mode),
         });
+        if let Some(resolver_substage_sums) = resolver_substage_sums {
+            report["timing"]["work"]["resolver_substage_sums"] = resolver_substage_sums;
+        }
     }
 }
 
@@ -1222,7 +1269,15 @@ mod tests {
             None::<std::ffi::OsString>,
         )]);
 
-        assert_eq!(resolve_workspace_install_concurrency(None, 4, false), 1);
+        assert_eq!(
+            resolve_workspace_install_concurrency(
+                None,
+                4,
+                false,
+                WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY,
+            ),
+            1,
+        );
     }
 
     #[test]
@@ -1232,7 +1287,15 @@ mod tests {
             None::<std::ffi::OsString>,
         )]);
 
-        assert_eq!(automatic_workspace_install_concurrency(8, true, 8), 3);
+        assert_eq!(
+            automatic_workspace_install_concurrency(
+                8,
+                true,
+                8,
+                WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY,
+            ),
+            3,
+        );
     }
 
     #[test]
@@ -1240,7 +1303,15 @@ mod tests {
         let policy = large_fresh_workspace_policy();
 
         assert!(policy.parallel_fresh());
-        assert_eq!(automatic_workspace_install_concurrency(78, true, 8), 3);
+        assert_eq!(
+            automatic_workspace_install_concurrency(
+                78,
+                true,
+                8,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            ),
+            6,
+        );
     }
 
     #[test]
@@ -1251,7 +1322,15 @@ mod tests {
         };
 
         assert!(!policy.parallel_fresh());
-        assert_eq!(automatic_workspace_install_concurrency(4, false, 8), 1);
+        assert_eq!(
+            automatic_workspace_install_concurrency(
+                4,
+                false,
+                8,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            ),
+            1,
+        );
     }
 
     #[test]
@@ -1344,12 +1423,28 @@ mod tests {
 
     #[test]
     fn recursive_workspace_install_caps_automatic_parallelism_by_target_count() {
-        assert_eq!(automatic_workspace_install_concurrency(2, true, 8), 2);
+        assert_eq!(
+            automatic_workspace_install_concurrency(
+                2,
+                true,
+                8,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            ),
+            2,
+        );
     }
 
     #[test]
     fn recursive_workspace_install_keeps_automatic_parallelism_within_available_cpus() {
-        assert_eq!(automatic_workspace_install_concurrency(8, true, 2), 2);
+        assert_eq!(
+            automatic_workspace_install_concurrency(
+                8,
+                true,
+                2,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            ),
+            2,
+        );
     }
 
     #[test]
@@ -1360,7 +1455,12 @@ mod tests {
         )]);
 
         assert_eq!(
-            resolve_workspace_install_concurrency(NonZeroUsize::new(3), 8, false),
+            resolve_workspace_install_concurrency(
+                NonZeroUsize::new(3),
+                8,
+                false,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            ),
             3,
         );
     }
@@ -1372,7 +1472,15 @@ mod tests {
             Some(std::ffi::OsString::from("3")),
         )]);
 
-        assert_eq!(resolve_workspace_install_concurrency(None, 8, false), 3);
+        assert_eq!(
+            resolve_workspace_install_concurrency(
+                None,
+                8,
+                false,
+                WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY,
+            ),
+            3,
+        );
     }
 
     #[test]
