@@ -852,8 +852,8 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
             );
             let lockb_path = lockfile_path.with_extension("lockb");
             let lockb_size = std::fs::metadata(&lockb_path).map_or(0, |m| m.len());
-            let lockfile_pkg_count = workspace_lockfile::read(lockfile_path)
-                .map_or(packages.len(), |lf| lf.packages.len());
+            let lockfile_pkg_count =
+                workspace_lockfile::package_count(lockfile_path).unwrap_or(packages.len());
             eprintln!(
                 "  {}",
                 format!(

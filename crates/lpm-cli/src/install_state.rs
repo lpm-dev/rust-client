@@ -1301,17 +1301,18 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     dependency_engine_key: &str,
     node_runtime_fingerprint: Option<&str>,
 ) -> std::io::Result<()> {
-    let binary_sidecar_expectation = crate::commands::install::workspace_lockfile::read(
-        &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
-    )
-    .ok()
-    .map(|lockfile| {
-        if lpm_lockfile::binary::binary_format_supports(&lockfile) {
-            BinarySidecarExpectation::Required
-        } else {
-            BinarySidecarExpectation::NotRequired
-        }
-    });
+    let binary_sidecar_expectation =
+        crate::commands::install::workspace_lockfile::read_metadata_shared(
+            &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+        )
+        .ok()
+        .map(|lockfile| {
+            if lpm_lockfile::binary::binary_format_supports(&lockfile) {
+                BinarySidecarExpectation::Required
+            } else {
+                BinarySidecarExpectation::NotRequired
+            }
+        });
     write_install_hash_with_metadata(
         project_dir,
         hash,
@@ -1601,7 +1602,7 @@ mod tests {
         ])
     }
 
-    fn write_test_lockfile(project_dir: &Path) -> String {
+    fn write_test_lockfile(project_dir: &Path) -> std::sync::Arc<str> {
         lpm_lockfile::Lockfile::default()
             .write_all(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
             .unwrap();

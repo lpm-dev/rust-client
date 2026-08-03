@@ -1,6 +1,21 @@
 use std::path::{Path, PathBuf};
 
-use crate::{LOCKFILE_VERSION, Lockfile, LockfileError, binary};
+use crate::{LOCKFILE_VERSION, Lockfile, LockfileError, ValidatedLockfile, binary};
+
+impl ValidatedLockfile {
+    /// Deserialize and validate the authoritative TOML lockfile.
+    pub fn from_toml(input: &str) -> Result<Self, LockfileError> {
+        Lockfile::from_toml(input).map(Self)
+    }
+
+    /// Read and validate the authoritative TOML lockfile from disk.
+    pub fn read_fast(toml_path: &Path) -> Result<Self, LockfileError> {
+        let content = std::fs::read_to_string(toml_path).map_err(|error| {
+            LockfileError::Io(format!("failed to read {}: {error}", toml_path.display()))
+        })?;
+        Self::from_toml(&content)
+    }
+}
 
 impl Lockfile {
     /// Read the lockfile view for a project, resolving a workspace member to

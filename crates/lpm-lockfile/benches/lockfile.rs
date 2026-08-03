@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use lpm_lockfile::{LockedPackage, Lockfile, binary};
+use lpm_lockfile::{ImporterSnapshot, LockedPackage, Lockfile, ValidatedLockfile, binary};
 
 fn make_lockfile(n: usize) -> Lockfile {
     let mut lf = Lockfile::new();
@@ -28,6 +28,40 @@ fn make_lockfile(n: usize) -> Lockfile {
         });
     }
     lf
+}
+
+fn make_workspace_union(
+    importer_count: usize,
+    unique_package_count: usize,
+    packages_per_importer: usize,
+) -> (String, Vec<String>) {
+    let packages = make_lockfile(unique_package_count).packages;
+    let mut union = Lockfile::new();
+    let mut importers = Vec::with_capacity(importer_count);
+    for importer_index in 0..importer_count {
+        let importer = format!("packages/member-{importer_index:03}");
+        let mut package_indices = (0..packages_per_importer)
+            .map(|offset| (importer_index * 53 + offset * 11) % unique_package_count)
+            .collect::<Vec<_>>();
+        package_indices.sort_unstable();
+        package_indices.dedup();
+        let mut standalone = Lockfile::new();
+        standalone.importers.insert(
+            ".".to_string(),
+            ImporterSnapshot {
+                dependencies: [(format!("direct-{importer_index:03}"), "^1.0.0".to_string())]
+                    .into(),
+                ..ImporterSnapshot::default()
+            },
+        );
+        standalone.packages = package_indices
+            .into_iter()
+            .map(|index| packages[index].clone())
+            .collect();
+        union.absorb_importer(&importer, standalone).unwrap();
+        importers.push(importer);
+    }
+    (union.to_toml().unwrap(), importers)
 }
 
 fn bench_binary_write(c: &mut Criterion) {
@@ -156,6 +190,31 @@ fn bench_read_fast(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_workspace_union(c: &mut Criterion) {
+    let (encoded, importers) = make_workspace_union(78, 4_570, 400);
+    let validated = ValidatedLockfile::from_toml(&encoded).unwrap();
+    let mut group = c.benchmark_group("workspace_union_78_importers");
+    group.sample_size(10);
+    group.bench_function("parse_and_validate_4570_unique_packages", |b| {
+        b.iter(|| {
+            let lockfile = ValidatedLockfile::from_toml(black_box(&encoded)).unwrap();
+            black_box(lockfile);
+        })
+    });
+    group.bench_function("borrow_31200_importer_package_rows", |b| {
+        b.iter(|| {
+            for importer in &importers {
+                let metadata = validated
+                    .project_importer_metadata(black_box(importer))
+                    .unwrap();
+                let packages = validated.importer_packages(black_box(importer)).unwrap();
+                black_box((metadata, packages));
+            }
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_binary_write,
@@ -163,5 +222,6 @@ criterion_group!(
     bench_toml_read,
     bench_find_package,
     bench_read_fast,
+    bench_workspace_union,
 );
 criterion_main!(benches);

@@ -591,12 +591,13 @@ fn dependency_engine_freshness_key_for_state(
         return decision.key;
     }
 
-    let lockfile = if workspace_lockfile::active() {
-        workspace_lockfile::active_lockfile_content(project_dir)
+    if workspace_lockfile::active() {
+        let lockfile = workspace_lockfile::active_lockfile_content(project_dir);
+        policy.freshness_key(&lockfile)
     } else {
-        std::fs::read_to_string(lockfile_path).unwrap_or_default()
-    };
-    policy.freshness_key(&lockfile)
+        let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
+        policy.freshness_key(&lockfile)
+    }
 }
 
 struct CachedDependencyEngineState<'a> {

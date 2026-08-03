@@ -404,6 +404,25 @@ impl RegistryAuth {
             None => true,
         }
     }
+
+    /// Stable auth identity for security-preserving workspace grouping.
+    /// The digest keeps raw credential material out of grouping keys and logs.
+    pub(crate) fn credential_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        match self {
+            Self::Bearer { token, .. } => {
+                hasher.update(b"bearer:");
+                hasher.update(token.expose_secret().as_bytes());
+            }
+            Self::Basic { credential, .. } => {
+                hasher.update(b"basic:");
+                hasher.update(credential.expose_secret().as_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
 }
 
 impl std::fmt::Debug for RegistryAuth {

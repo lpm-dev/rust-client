@@ -648,6 +648,13 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
         .collect::<Vec<_>>();
     for indices in groups {
         if indices.len() < 2 {
+            if let Some(importer_index) = indices.first().copied() {
+                tracing::debug!(
+                    importer_index,
+                    reason = "singleton-equivalence-group",
+                    "workspace union resolution retained isolated importer"
+                );
+            }
             continue;
         }
         let roots = indices
@@ -1256,20 +1263,121 @@ pub(super) async fn wait_for_commit() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Write};
     use std::sync::Mutex;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::fmt::MakeWriter;
 
-    fn workspace_union_request() -> WorkspaceUnionRequest {
+    #[derive(Clone, Default)]
+    struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for TraceBuffer {
+        type Writer = TraceBuffer;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn workspace_union_request_with_route_table(
+        route_table: lpm_registry::RouteTable,
+    ) -> WorkspaceUnionRequest {
         WorkspaceUnionRequest {
             client: Arc::new(lpm_registry::RegistryClient::new().with_cache_dir(None)),
             root_dependencies: lpm_resolver::RootDependencies::required(HashMap::new()),
             overrides: lpm_resolver::OverrideSet::empty(),
-            route_table: lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            route_table,
             npm_fanout: 8,
             shared_cache: Arc::new(dashmap::DashMap::new()),
             auto_install_peers: true,
             include_optional_dependencies: true,
             policy: lpm_resolver::ResolverPolicy::default(),
         }
+    }
+
+    fn workspace_union_request() -> WorkspaceUnionRequest {
+        workspace_union_request_with_route_table(lpm_registry::RouteTable::from_mode_only(
+            lpm_registry::RouteMode::Direct,
+        ))
+    }
+
+    fn credentialed_route_table(token: &str) -> lpm_registry::RouteTable {
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            &format!(
+                "registry=https://registry.internal/\n//registry.internal/:_authToken={token}\n"
+            ),
+            "test",
+            &|_| None,
+        );
+        lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc)
+            .expect("valid route table")
+    }
+
+    fn default_route_table_with_npm_auth() -> lpm_registry::RouteTable {
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            "//registry.npmjs.org/:_authToken=npm-token\n",
+            "test",
+            &|_| None,
+        );
+        lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc)
+            .expect("valid route table")
+    }
+
+    async fn workspace_union_results_for_routes(
+        first_route: lpm_registry::RouteTable,
+        second_route: lpm_registry::RouteTable,
+    ) -> (
+        Option<lpm_resolver::ResolveResult>,
+        Option<lpm_resolver::ResolveResult>,
+    ) {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new_union_at_unix(
+            2,
+            None,
+            current_unix_timestamp(),
+        ));
+        let local = tokio::task::LocalSet::new();
+        let (first, second) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 0, async {
+                                resolve_workspace_union(workspace_union_request_with_route_table(
+                                    first_route,
+                                ))
+                                .await
+                            })
+                            .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 1, async {
+                                resolve_workspace_union(workspace_union_request_with_route_table(
+                                    second_route,
+                                ))
+                                .await
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+        (first.unwrap().unwrap(), second.unwrap().unwrap())
     }
 
     async fn fact_caches_for_resolution_importers(
@@ -1427,9 +1535,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn workspace_union_projects_importers_with_matching_credentials() {
+        let route_table = credentialed_route_table("shared-token");
+
+        let (first, second) =
+            workspace_union_results_for_routes(route_table.clone(), route_table).await;
+
+        assert!(first.is_some());
+        assert!(second.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_union_logs_when_different_credentials_isolate_importers() {
+        let output = TraceBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(output.clone())
+            .finish();
+        let (first, second) = workspace_union_results_for_routes(
+            credentialed_route_table("first-token"),
+            credentialed_route_table("second-token"),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            rendered
+                .matches("reason=\"singleton-equivalence-group\"")
+                .count(),
+            2,
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn direct_workspace_importers_share_only_the_base_fact_cache() {
         let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let (first, second) = fact_caches_for_resolution_importers(route_table).await;
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn npm_auth_token_does_not_isolate_workspace_fact_caches() {
+        let (first, second) =
+            fact_caches_for_resolution_importers(default_route_table_with_npm_auth()).await;
         let first = first.unwrap();
         let second = second.unwrap();
 
@@ -1476,6 +1635,17 @@ mod tests {
     async fn direct_workspace_importers_share_one_metadata_permit_pool() {
         let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let (first, second) = metadata_concurrency_for_resolution_importers(route_table, 16).await;
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert!(first.shares_pool_with(&second));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn npm_auth_token_does_not_isolate_workspace_metadata_permit_pool() {
+        let (first, second) =
+            metadata_concurrency_for_resolution_importers(default_route_table_with_npm_auth(), 16)
+                .await;
         let first = first.unwrap();
         let second = second.unwrap();
 

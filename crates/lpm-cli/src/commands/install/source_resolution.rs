@@ -2618,12 +2618,12 @@ mod routing_tests {
     use super::*;
 
     #[tokio::test]
-    async fn recursive_metadata_sharing_detaches_for_authenticated_route_contexts() {
+    async fn recursive_metadata_sharing_remains_enabled_for_unused_npm_auth() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let package = "route-isolated-package";
+        let package = "shared-route-package";
         Mock::given(method("GET"))
             .and(path(format!("/{package}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2634,13 +2634,13 @@ mod routing_tests {
                         "name": package,
                         "version": "1.0.0",
                         "dist": {
-                            "tarball": "https://example.invalid/route-isolated-package.tgz",
+                            "tarball": "https://example.invalid/shared-route-package.tgz",
                             "integrity": "sha512-test"
                         }
                     }
                 }
             })))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -2656,7 +2656,7 @@ mod routing_tests {
         );
         let route_table =
             RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).expect("valid route table");
-        assert!(!route_table.supports_workspace_fetch_sharing());
+        assert!(route_table.supports_workspace_fetch_sharing());
 
         let coordinator = Arc::new(workspace_resolution::WorkspaceResolutionCoordinator::new(
             1, 1,
@@ -2671,6 +2671,6 @@ mod routing_tests {
             Ok::<(), LpmError>(())
         })
         .await
-        .expect("route-isolated metadata requests");
+        .expect("shared metadata requests");
     }
 }

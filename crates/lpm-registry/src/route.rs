@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::npmrc::{NpmrcConfig, RegistryAuth, RegistryKind, RegistryTarget};
+use crate::npmrc::{NpmrcConfig, OriginKey, RegistryAuth, RegistryKind, RegistryTarget};
 
 const JSR_NPM_REGISTRY_URL: &str = "https://npm.jsr.io";
 
@@ -39,13 +39,14 @@ pub enum RouteMode {
     Direct,
 }
 
-/// Credential-free route identity used to decide whether workspace importer
+/// Route and credential identity used to decide whether workspace importer
 /// requests may share one resolver traversal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkspaceResolutionKey {
     mode: RouteMode,
     default_registry: Option<String>,
     scope_registries: Vec<(String, String)>,
+    credentialed_origins: Vec<(OriginKey, [u8; 32])>,
 }
 
 /// The concrete upstream selected for a single package.
@@ -281,22 +282,20 @@ impl RouteTable {
     /// Whether immutable registry artifacts may be shared with another
     /// importer using the same command-scoped client.
     ///
-    /// This deliberately accepts only the default routing universe. Any
-    /// configured registry, credential, or TLS override keeps that importer
-    /// on its own fetch dispatcher until those contexts have a
-    /// security-preserving equivalence fingerprint.
+    /// This deliberately accepts only the default routing universe. Auth
+    /// entries do not affect its anonymous metadata routes, while any custom
+    /// registry or TLS override keeps that importer on its own dispatcher.
     pub fn supports_workspace_fetch_sharing(&self) -> bool {
         self.npmrc.default_registry.is_none()
             && self.npmrc.scope_registries.is_empty()
-            && self.npmrc.origin_auth.is_empty()
             && self.npmrc.tls.is_empty()
     }
 
     /// Return an equivalence key for resolver inputs that may safely share a
-    /// workspace union. Credentialed or TLS-customized routes stay isolated;
-    /// unauthenticated registry URLs and scope mappings participate in the key.
+    /// workspace union. Registry mappings and opaque credential fingerprints
+    /// participate in the key; TLS-customized routes stay isolated.
     pub fn workspace_resolution_key(&self) -> Option<WorkspaceResolutionKey> {
-        if !self.npmrc.origin_auth.is_empty() || !self.npmrc.tls.is_empty() {
+        if !self.npmrc.tls.is_empty() {
             return None;
         }
 
@@ -307,6 +306,18 @@ impl RouteTable {
             .map(|(scope, target)| (scope.clone(), target.base_url.to_string()))
             .collect::<Vec<_>>();
         scope_registries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut credentialed_origins = self
+            .npmrc
+            .origin_auth
+            .iter()
+            .map(|(origin, auth)| (origin.clone(), auth.credential_fingerprint()))
+            .collect::<Vec<_>>();
+        credentialed_origins.sort_unstable_by(|left, right| {
+            left.0
+                .host_lower
+                .cmp(&right.0.host_lower)
+                .then_with(|| left.0.port.cmp(&right.0.port))
+        });
         Some(WorkspaceResolutionKey {
             mode: self.mode,
             default_registry: self
@@ -315,6 +326,7 @@ impl RouteTable {
                 .as_ref()
                 .map(|target| target.base_url.to_string()),
             scope_registries,
+            credentialed_origins,
         })
     }
 
@@ -525,11 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_route_table_does_not_support_workspace_fetch_sharing() {
+    fn npm_auth_token_does_not_disable_default_workspace_fetch_sharing() {
         let npmrc = NpmrcConfig::parse("//registry.npmjs.org/:_authToken=secret", "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("valid npmrc");
 
-        assert!(!table.supports_workspace_fetch_sharing());
+        assert!(table.supports_workspace_fetch_sharing());
     }
 
     #[test]
@@ -738,11 +750,47 @@ mod tests {
     }
 
     #[test]
-    fn workspace_resolution_key_rejects_credentialed_routes() {
-        let table = make_table(
-            "registry=https://registry.internal/\n//registry.internal/:_authToken=secret\n",
+    fn workspace_resolution_key_groups_matching_credential_postures() {
+        let first = make_table(
+            "registry=https://registry.internal/\n\
+             //registry.internal/:_authToken=secret\n\
+             //uploads.internal/:_authToken=uploads-secret\n",
             RouteMode::Direct,
         );
+        let second = make_table(
+            "//uploads.internal/:_authToken=uploads-secret\n\
+             //registry.internal/:_authToken=secret\n\
+             registry=https://registry.internal/\n",
+            RouteMode::Direct,
+        );
+
+        assert_eq!(
+            first.workspace_resolution_key(),
+            second.workspace_resolution_key()
+        );
+        assert!(first.workspace_resolution_key().is_some());
+    }
+
+    #[test]
+    fn workspace_resolution_key_separates_different_credentials_for_the_same_origin() {
+        let first = make_table(
+            "registry=https://registry.internal/\n//registry.internal/:_authToken=first\n",
+            RouteMode::Direct,
+        );
+        let second = make_table(
+            "registry=https://registry.internal/\n//registry.internal/:_authToken=second\n",
+            RouteMode::Direct,
+        );
+
+        assert_ne!(
+            first.workspace_resolution_key(),
+            second.workspace_resolution_key()
+        );
+    }
+
+    #[test]
+    fn workspace_resolution_key_rejects_tls_customized_routes() {
+        let table = make_table("strict-ssl=true\n", RouteMode::Direct);
 
         assert_eq!(table.workspace_resolution_key(), None);
     }

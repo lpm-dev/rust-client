@@ -872,6 +872,18 @@ fn workspace_targets_are_lockfile_replay_ready(
     };
     let global_auto_install_peers = global_config.get_bool("auto-install-peers");
 
+    if lockfile_coordinator
+        .preload_existing_projection_metadata(
+            &targets
+                .iter()
+                .map(|target| target.importer.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+
     let mut packages_by_path = HashMap::with_capacity(workspace.members.len() + 1);
     packages_by_path.insert(workspace.root.as_path(), &workspace.root_package);
     for member in &workspace.members {
@@ -882,17 +894,19 @@ fn workspace_targets_are_lockfile_replay_ready(
         let Some(package) = packages_by_path.get(target.path.as_path()).copied() else {
             return false;
         };
-        let Ok(lockfile) = lockfile_coordinator.projection(&target.importer) else {
-            return false;
-        };
-        target_lockfile_is_replay_ready(
-            workspace,
-            &target.path,
-            package,
-            &lockfile,
-            global_auto_install_peers,
-            root_provider_fingerprint,
-        )
+        lockfile_coordinator
+            .with_projection_packages(&target.importer, |lockfile, packages| {
+                target_lockfile_is_replay_ready(
+                    workspace,
+                    &target.path,
+                    package,
+                    &lockfile,
+                    packages,
+                    global_auto_install_peers,
+                    root_provider_fingerprint,
+                )
+            })
+            .unwrap_or(false)
     })
 }
 
@@ -901,6 +915,7 @@ fn target_lockfile_is_replay_ready(
     project_dir: &Path,
     package: &lpm_workspace::PackageJson,
     lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
     global_auto_install_peers: Option<bool>,
     root_provider_fingerprint: Option<&str>,
 ) -> bool {
@@ -971,14 +986,17 @@ fn target_lockfile_is_replay_ready(
         return false;
     }
 
-    lockfile_satisfies_fast_path(
+    super::lockfile::lockfile_satisfies_fast_path_with_packages(
         lockfile,
+        packages,
         project_dir,
         &deps,
         &catalog_resolutions,
         Some(workspace),
-        false,
-        false,
+        super::lockfile::LockfileReplayPolicy {
+            accept_unsafe_sources: false,
+            emit_warnings: false,
+        },
     )
 }
 
@@ -1845,12 +1863,14 @@ mod tests {
         let workspace = replay_ready_workspace(directory.path(), package.clone());
         write_replay_ready_lockfile(directory.path(), &package, "^4.16.0");
         let lockfile = read_replay_ready_lockfile(directory.path());
+        let packages = lockfile.packages.iter().collect::<Vec<_>>();
 
         assert!(!target_lockfile_is_replay_ready(
             &workspace,
             directory.path(),
             &package,
             &lockfile,
+            &packages,
             None,
             None,
         ));
@@ -1863,12 +1883,14 @@ mod tests {
         let workspace = replay_ready_workspace(directory.path(), package.clone());
         write_replay_ready_lockfile(directory.path(), &package, "^4.17.0");
         let lockfile = read_replay_ready_lockfile(directory.path());
+        let packages = lockfile.packages.iter().collect::<Vec<_>>();
 
         assert!(target_lockfile_is_replay_ready(
             &workspace,
             directory.path(),
             &package,
             &lockfile,
+            &packages,
             None,
             None,
         ));
@@ -1888,12 +1910,14 @@ mod tests {
         let preloaded = coordinator
             .projection(".")
             .expect("project preloaded root importer");
+        let packages = preloaded.packages.iter().collect::<Vec<_>>();
 
         assert!(target_lockfile_is_replay_ready(
             &workspace,
             directory.path(),
             &package,
             &preloaded,
+            &packages,
             None,
             None,
         ));

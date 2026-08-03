@@ -28,7 +28,8 @@ pub use model::{
     LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS, LOCKFILE_VERSION_WITH_PROVENANCE,
     LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS, LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
     LockedPackage, LockedProvenance, LockedRegistrySignature, LockedRootResolution, Lockfile,
-    LockfileMetadata, LockfilePatch, LockfilePatches, PackageKey, RootResolutions, is_safe_source,
+    LockfileMetadata, LockfilePatch, LockfilePatches, PackageKey, RootResolutions,
+    ValidatedLockfile, is_safe_source,
 };
 pub use source::{Source, SourceParseError};
 

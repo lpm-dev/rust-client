@@ -147,7 +147,7 @@ pub(super) fn validate_install_lockfile_state(
     let lockfile_for_validation = if workspace_lockfile::exists(input.lockfile_path)
         || input.frozen_lockfile_active
     {
-        match workspace_lockfile::read(input.lockfile_path) {
+        match workspace_lockfile::read_metadata_shared(input.lockfile_path) {
             Ok(lockfile) => Some(lockfile),
             Err(e) if input.frozen_lockfile_active => {
                 return Err(LpmError::Registry(format!(
@@ -221,7 +221,7 @@ pub(super) fn validate_install_lockfile_state(
         .and_then(|lockfile| lockfile.importers.get("."))
         != Some(&current_importer_snapshot);
     let prior_verified_provenance = lockfile_for_validation
-        .map(|lockfile| lockfile.provenance)
+        .map(|lockfile| lockfile.provenance.clone())
         .unwrap_or_default();
 
     Ok(LockfileValidationState {

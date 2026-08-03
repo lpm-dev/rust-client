@@ -70,7 +70,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) streaming_metrics: lpm_resolver::StreamingBfsMetrics,
     pub(in crate::commands::install) initial_batch_ms: u128,
     pub(in crate::commands::install) resolver_stage_timing: lpm_resolver::StageTiming,
-    pub(in crate::commands::install) fast_path_lockfile: Option<lpm_lockfile::Lockfile>,
+    pub(in crate::commands::install) fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
     pub(in crate::commands::install) lockfile_peer_context_authoritative: bool,
     pub(in crate::commands::install) needs_binary_upgrade: bool,
     pub(in crate::commands::install) wf_setup_ms: u128,
@@ -196,7 +196,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let streaming_metrics = lpm_resolver::StreamingBfsMetrics::new();
     let mut initial_batch_ms: u128 = 0;
     let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
-    let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
+    let mut fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>> = None;
     let mut lockfile_peer_context_authoritative = false;
     let mut needs_binary_upgrade = false;
     let wf_setup_ms = start.elapsed().as_millis();
