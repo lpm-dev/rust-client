@@ -152,6 +152,14 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "promotes certificate and key staging files that were themselves installed by the shared secure writer",
     ),
     (
+        "crates/lpm-cli/src/commands/install/workspace_project_state.rs::move_to_backup",
+        "moves project-owned install state into an exclusively created rollback directory before replacement",
+    ),
+    (
+        "crates/lpm-cli/src/commands/install/workspace_project_state.rs::rollback_inner",
+        "restores complete project-owned paths from the transaction's exclusively created rollback directory",
+    ),
+    (
         "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
         "NamedTempFile exclusively creates a randomized sibling before persist",
     ),

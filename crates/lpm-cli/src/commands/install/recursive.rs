@@ -188,6 +188,8 @@ pub(crate) async fn run_recursive_workspace_install(
                 &workspace.root,
                 &legacy_importers,
             )?);
+        let workspace_project_state_coordinator =
+            Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
         let root_target_index = targets.iter().position(|target| target.kind == "root");
         let root_provider_fingerprint = root_target_index
             .and_then(|_| {
@@ -380,14 +382,7 @@ pub(crate) async fn run_recursive_workspace_install(
         let options = Arc::new(options);
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
-        // The install pipeline future is !Send (the fused resolver keeps
-        // single-threaded caches), so concurrent targets run on a LocalSet.
-        // Downloads, extraction, and link tasks are spawned onto the
-        // multi-thread pool from inside each pipeline, so the heavy work
-        // still fans out across cores; only per-target orchestration and
-        // resolver CPU share this thread.
-        let local_tasks = tokio::task::LocalSet::new();
-        let scheduler = local_tasks.run_until(async {
+        let scheduler = async {
             let mut active_workspace = Arc::new(workspace);
             let target_count = targets.len();
             let scheduling_order = workspace_target_scheduling_order(
@@ -449,6 +444,7 @@ pub(crate) async fn run_recursive_workspace_install(
                             Arc::clone(&options),
                             Arc::clone(&materialization_coordinator),
                             Arc::clone(&workspace_lockfile_coordinator),
+                            Arc::clone(&workspace_project_state_coordinator),
                             resolution_task_indices[index].and_then(|task_index| {
                                 resolution_coordinator
                                     .as_ref()
@@ -502,13 +498,31 @@ pub(crate) async fn run_recursive_workspace_install(
                 Some(error) => Err(error),
                 None => Ok(outcomes.into_iter().flatten().collect::<Vec<_>>()),
             }
-        });
-        let outcomes = scheduler.await?;
+        };
+        let outcomes = match scheduler.await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                return Err(rollback_workspace_project_state(
+                    &workspace_project_state_coordinator,
+                    error,
+                ));
+            }
+        };
         let required_importers = outcomes
             .iter()
             .map(|outcome| outcome.importer.clone())
             .collect::<Vec<_>>();
-        if workspace_lockfile_coordinator.commit(&required_importers)? {
+        let lockfile_committed = match workspace_lockfile_coordinator.commit(&required_importers) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return Err(rollback_workspace_project_state(
+                    &workspace_project_state_coordinator,
+                    error,
+                ));
+            }
+        };
+        workspace_project_state_coordinator.commit();
+        if lockfile_committed {
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 
@@ -523,6 +537,21 @@ pub(crate) async fn run_recursive_workspace_install(
         Ok(())
     })
     .await
+}
+
+fn rollback_workspace_project_state(
+    coordinator: &workspace_project_state::WorkspaceProjectStateCoordinator,
+    error: LpmError,
+) -> LpmError {
+    let rollback_errors = coordinator.rollback();
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        LpmError::Script(format!(
+            "{error}; workspace project-state rollback incomplete: {}",
+            rollback_errors.join("; ")
+        ))
+    }
 }
 
 fn discover_recursive_workspace(cwd: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
@@ -550,6 +579,9 @@ fn spawn_workspace_target_install(
         workspace_materialization::WorkspaceMaterializationCoordinator,
     >,
     workspace_lockfile_coordinator: Arc<workspace_lockfile::WorkspaceLockfileCoordinator>,
+    workspace_project_state_coordinator: Arc<
+        workspace_project_state::WorkspaceProjectStateCoordinator,
+    >,
     resolution_task: Option<(
         Arc<workspace_resolution::WorkspaceResolutionCoordinator>,
         usize,
@@ -569,7 +601,7 @@ fn spawn_workspace_target_install(
     });
     let client = client.clone_with_config();
     let lpm_root = lpm_root.clone();
-    in_flight.spawn_local(async move {
+    in_flight.spawn(assert_send(async move {
         let is_root = plan.kind == "root";
         let importer = Arc::<str>::from(plan.importer.as_str());
         let install = run_workspace_target_install(
@@ -591,6 +623,11 @@ fn spawn_workspace_target_install(
         };
         let install = workspace_materialization::scope(materialization_coordinator, install);
         let install = workspace_lockfile::scope(workspace_lockfile_coordinator, importer, install);
+        let install = workspace_project_state::scope(
+            workspace_project_state_coordinator,
+            index,
+            Box::pin(install),
+        );
         let result = match resolution_task {
             Some((coordinator, task_index)) => {
                 workspace_resolution::scope(coordinator, task_index, install).await
@@ -598,7 +635,14 @@ fn spawn_workspace_target_install(
             None => install.await,
         };
         (index, result)
-    });
+    }));
+}
+
+fn assert_send<F>(future: F) -> F
+where
+    F: std::future::Future + Send,
+{
+    future
 }
 
 async fn run_workspace_target_install(
@@ -637,7 +681,7 @@ async fn run_workspace_target_install(
     };
 
     let capture = options.json_output.then(report_capture::new_capture);
-    let install = run_with_options_with_lpm_root(
+    let install = assert_send(run_with_options_with_lpm_root(
         &client,
         &plan.path,
         options.json_output,
@@ -672,7 +716,7 @@ async fn run_workspace_target_install(
         options.json_output,
         false,
         lpm_root,
-    );
+    ));
     match &capture {
         Some(capture) => {
             crate::workspace_discovery_cache::scope(

@@ -1788,6 +1788,16 @@ fn populate_into(
     let materialize_start = std::time::Instant::now();
     materialize_into(object.dir, &pkg_dir)?;
     timings.materialize_ms = materialize_start.elapsed().as_millis();
+
+    // Sibling-dep symlinks. Each lives next to the package (siblings
+    // under the wrapper-level node_modules) — same shape as the
+    // existing isolated linker contract.
+    let symlink_start = std::time::Instant::now();
+    for dep in deps {
+        create_sibling_symlink(&node_modules, dep, graph_key)?;
+    }
+    timings.symlink_ms = symlink_start.elapsed().as_millis();
+
     let snapshot_start = std::time::Instant::now();
     let package_metadata_integrity = compute_tree_metadata_integrity(&pkg_dir)?;
     write_tree_snapshot(
@@ -1799,15 +1809,6 @@ fn populate_into(
         },
     )?;
     timings.snapshot_ms = snapshot_start.elapsed().as_millis();
-
-    // Sibling-dep symlinks. Each lives next to the package (siblings
-    // under the wrapper-level node_modules) — same shape as the
-    // existing isolated linker contract.
-    let symlink_start = std::time::Instant::now();
-    for dep in deps {
-        create_sibling_symlink(&node_modules, dep, graph_key)?;
-    }
-    timings.symlink_ms = symlink_start.elapsed().as_millis();
 
     // Stage the sidecar BEFORE the rename so the published entry is
     // never observable without its metadata.

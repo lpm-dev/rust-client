@@ -180,12 +180,11 @@ pub(super) async fn prevalidate_v2_reusable_objects(
         });
     }
 
-    let unique_candidates: HashSet<&str> = candidates.into_iter().collect();
+    let unique_candidates: HashSet<String> = candidates.into_iter().map(str::to_owned).collect();
     let candidate_count = unique_candidates.len();
     let concurrency = v2_cache_check_concurrency(candidate_count);
     let mut checks = futures::stream::iter(unique_candidates.into_iter().map(|sri| {
         let store_v2 = Arc::clone(&store_v2);
-        let sri = sri.to_string();
         async move {
             tokio::task::spawn_blocking(move || {
                 store_v2

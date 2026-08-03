@@ -12664,6 +12664,78 @@ async fn recursive_install_does_not_commit_any_importer_when_preparation_fails()
 }
 
 #[tokio::test]
+async fn recursive_install_rolls_back_non_union_importer_when_later_importer_fails() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-non-union-rollback-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "valid-dependency": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/union-participant/package.json",
+        r#"{
+  "name": "union-participant",
+  "version": "1.0.0",
+  "dependencies": { "valid-dependency": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/a-stateful/package.json",
+        r#"{
+  "name": "a-stateful",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file(
+        "packages/a-stateful/.lpm/install-hash",
+        "original-install-hash",
+    );
+    project.write_file(
+        "packages/z-failing/package.json",
+        r#"{
+  "name": "z-failing",
+  "version": "1.0.0",
+  "dependencies": {
+    "a-stateful": "workspace:*",
+    "missing-local": "file:./missing.tgz"
+  }
+}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    let valid_tarball = make_tarball("valid-dependency", "1.0.0");
+    mock.with_package("valid-dependency", "1.0.0", &valid_tarball)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install with a later non-union failure");
+
+    assert!(
+        !output.status.success(),
+        "recursive install must fail for the missing local tarball\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("packages/a-stateful/.lpm/install-hash"))
+            .expect("read restored install hash"),
+        "original-install-hash",
+        "a successful non-union importer must roll back when a later importer fails"
+    );
+}
+
+#[tokio::test]
 async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
     fn workspace_fixture() -> TempProject {
         let project = TempProject::empty(

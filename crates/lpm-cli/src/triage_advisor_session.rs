@@ -447,7 +447,8 @@ impl AdvisorSession {
             String,
             PackageAdvisorOutcome,
             bool,
-        )> = futures::stream::iter(candidates.iter().map(|c| {
+        )> = futures::stream::iter((0..candidates.len()).map(|index| {
+            let c = &candidates[index];
             let cache = cache.clone();
             let provider_slug = provider_slug.clone();
             let template_hash = template_hash.clone();

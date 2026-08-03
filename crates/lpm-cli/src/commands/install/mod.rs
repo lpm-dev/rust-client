@@ -58,6 +58,7 @@ mod validation;
 mod workspace;
 pub(crate) mod workspace_lockfile;
 mod workspace_materialization;
+mod workspace_project_state;
 mod workspace_resolution;
 
 use accounting::*;
@@ -429,7 +430,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     let store_lock_path = lpm_root.store_lock();
     let install = lpm_common::with_shared_lock_async(
         store_lock_path,
-        run_with_options_under_store_lock(
+        assert_send_install_future(run_with_options_under_store_lock(
             client,
             project_dir,
             json_output,
@@ -464,9 +465,16 @@ pub(crate) async fn run_with_options_with_lpm_root(
             emit_install_report,
             reserve_stdout,
             &lpm_root,
-        ),
+        )),
     );
     workspace_lockfile::scope_member_install(project_dir, install).await
+}
+
+fn assert_send_install_future<F>(future: F) -> F
+where
+    F: Future + Send,
+{
+    future
 }
 
 /// Body of [`run_with_options`] — the actual install pipeline. Lives
@@ -618,6 +626,12 @@ async fn run_with_options_under_store_lock(
     if freshness_completed {
         return Ok(());
     }
+    workspace_project_state::enter(project_dir).map_err(|error| {
+        LpmError::Io(std::io::Error::other(format!(
+            "failed to begin workspace project-state transaction for {}: {error}",
+            project_dir.display()
+        )))
+    })?;
 
     let pkg_name = pkg.name.as_deref().unwrap_or("(unnamed)");
     // The persistent `› Resolving …` phase line is emitted below after
@@ -762,7 +776,7 @@ async fn run_with_options_under_store_lock(
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
         workspace_resolution::publish_root_peer_providers_for_empty_install(project_dir);
-        workspace_resolution::wait_for_commit().await;
+        workspace_resolution::enter_commit();
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
         }
@@ -1120,7 +1134,7 @@ async fn run_with_options_under_store_lock(
             &resolved_git_sources,
         );
 
-        workspace_resolution::wait_for_commit().await;
+        workspace_resolution::enter_commit();
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
         }
@@ -1395,7 +1409,7 @@ async fn run_with_options_under_store_lock(
     } else {
         None
     };
-    let wf_commit_wait_ms = workspace_resolution::wait_for_commit().await;
+    let wf_commit_wait_ms = workspace_resolution::enter_commit();
     if defer_project_linker_layout_maintenance {
         maintain_project_linker_layout(project_dir, json_output);
     }

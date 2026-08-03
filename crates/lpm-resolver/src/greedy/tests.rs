@@ -13,10 +13,10 @@ use super::types::*;
 use super::version::*;
 use crate::policy::{TrustPolicyMode, parse_npm_time_unix};
 use crate::provider::{CachedDistInfo, CachedPackageInfo};
-use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::fmt::MakeWriter;
@@ -569,14 +569,15 @@ fn find_best_version_release_age_exclude_allows_latest_for_canonical_package() {
 
 struct CountingTreeProvider {
     manifests: AHashMap<CanonicalKey, Arc<CachedPackageInfo>>,
-    cached: RefCell<AHashSet<CanonicalKey>>,
-    ensure_calls: Cell<usize>,
+    cached: Mutex<AHashSet<CanonicalKey>>,
+    ensure_calls: AtomicUsize,
 }
 
 impl TreeManifestProvider for CountingTreeProvider {
     fn cached_manifest(&self, canonical: &CanonicalKey) -> Option<Arc<CachedPackageInfo>> {
         self.cached
-            .borrow()
+            .lock()
+            .expect("cached manifests mutex poisoned")
             .contains(canonical)
             .then(|| self.manifests.get(canonical).cloned())
             .flatten()
@@ -585,8 +586,9 @@ impl TreeManifestProvider for CountingTreeProvider {
     fn ensure_manifest<'a>(
         &'a self,
         canonical: &'a CanonicalKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>> {
-        self.ensure_calls.set(self.ensure_calls.get() + 1);
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + Send + 'a>>
+    {
+        self.ensure_calls.fetch_add(1, Ordering::Relaxed);
         let result = self
             .manifests
             .get(canonical)
@@ -594,7 +596,10 @@ impl TreeManifestProvider for CountingTreeProvider {
             .ok_or_else(|| ResolveError::Internal(format!("missing manifest for {canonical}")));
         Box::pin(async move {
             let info = result?;
-            self.cached.borrow_mut().insert(canonical.clone());
+            self.cached
+                .lock()
+                .expect("cached manifests mutex poisoned")
+                .insert(canonical.clone());
             Ok(info)
         })
     }
@@ -620,19 +625,21 @@ async fn preferred_tree_compatible_version_reuses_cached_subtree_status_for_trus
     let policy = ResolverPolicy::new(0, TrustPolicyMode::NoDowngrade);
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let first =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
     let second =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert_eq!(first, Some(NpmVersion::parse("1.0.0").unwrap()));
     assert_eq!(second, Some(NpmVersion::parse("1.0.0").unwrap()));
-    assert_eq!(provider.ensure_calls.get(), 1);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -660,16 +667,17 @@ async fn preferred_tree_compatible_version_skips_subtree_walk_for_scoped_release
     );
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let preferred =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert!(preferred.is_none());
-    assert_eq!(provider.ensure_calls.get(), 0);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -692,16 +700,17 @@ async fn preferred_tree_compatible_version_skips_subtree_walk_for_transitive_edg
     let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let preferred =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert!(preferred.is_none());
-    assert_eq!(provider.ensure_calls.get(), 0);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -732,16 +741,17 @@ async fn preferred_tree_compatible_version_uses_bounded_release_age_lookahead() 
     let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, TrustPolicyMode::Off);
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, Arc::new(child_info))]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let preferred =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert_eq!(preferred, Some(NpmVersion::parse("1.0.0").unwrap()));
-    assert_eq!(provider.ensure_calls.get(), 1);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 1);
     assert_eq!(cache.release_age_lookahead_fetches(), 1);
 }
 

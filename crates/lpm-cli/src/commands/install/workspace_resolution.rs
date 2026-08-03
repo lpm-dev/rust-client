@@ -11,10 +11,8 @@ use super::{InstallPackage, LpmError, PeerWarning, install_pkg_key};
 pub(super) struct WorkspaceResolutionCoordinator {
     resolution_permits: Arc<Semaphore>,
     release_age_reference_unix: i64,
+    target_count: usize,
     materialized: Box<[TargetCompletion]>,
-    completed: Box<[TargetCompletion]>,
-    prepared_count: std::sync::atomic::AtomicUsize,
-    all_prepared: Notify,
     fetch_overlap_hub: OnceLock<Arc<super::fetch_overlap::WorkspaceFetchOverlapHub>>,
     resolver_fact_cache: lpm_resolver::SharedCache,
     resolver_metadata_concurrency: OnceLock<lpm_resolver::SharedMetadataConcurrency>,
@@ -41,14 +39,10 @@ impl WorkspaceResolutionCoordinator {
         Self {
             resolution_permits: Arc::new(Semaphore::new(resolution_concurrency.max(1))),
             release_age_reference_unix,
+            target_count,
             materialized: (0..target_count)
                 .map(|_| TargetCompletion::default())
                 .collect(),
-            completed: (0..target_count)
-                .map(|_| TargetCompletion::default())
-                .collect(),
-            prepared_count: std::sync::atomic::AtomicUsize::new(0),
-            all_prepared: Notify::new(),
             fetch_overlap_hub: OnceLock::new(),
             resolver_fact_cache: Arc::new(dashmap::DashMap::new()),
             resolver_metadata_concurrency: OnceLock::new(),
@@ -343,32 +337,7 @@ impl WorkspaceResolutionTask {
             .take();
     }
 
-    async fn wait_until_all_prepared(&self) {
-        let notified = self.coordinator.all_prepared.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let prepared = self
-            .coordinator
-            .prepared_count
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .saturating_add(1);
-        if prepared == self.coordinator.completed.len() {
-            self.coordinator.all_prepared.notify_waiters();
-            return;
-        }
-        while self
-            .coordinator
-            .prepared_count
-            .load(std::sync::atomic::Ordering::Acquire)
-            < self.coordinator.completed.len()
-        {
-            notified.as_mut().await;
-            notified.set(self.coordinator.all_prepared.notified());
-            notified.as_mut().enable();
-        }
-    }
-
-    async fn enter_commit(&self) -> u128 {
+    fn enter_commit(&self) -> u128 {
         if self
             .commit_entered
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -378,12 +347,7 @@ impl WorkspaceResolutionTask {
 
         self.finish_resolution();
         self.coordinator.materialized[self.index].finish();
-        let wait_started = std::time::Instant::now();
-        self.wait_until_all_prepared().await;
-        if let Some(previous) = self.index.checked_sub(1) {
-            self.coordinator.completed[previous].wait().await;
-        }
-        wait_started.elapsed().as_millis()
+        0
     }
 
     async fn wait_for_materialization(&self) -> u128 {
@@ -421,10 +385,6 @@ where
     }
     if task.is_root() && !task.coordinator.root_provider_state.has_snapshot() {
         task.coordinator.root_provider_state.fail();
-    }
-    if result.is_ok() {
-        task.enter_commit().await;
-        coordinator.completed[index].finish();
     }
     result
 }
@@ -559,7 +519,7 @@ pub(super) async fn resolve_workspace_union(
         .submitted
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
         .saturating_add(1);
-    if submitted == task.coordinator.completed.len() {
+    if submitted == task.coordinator.target_count {
         resolve_submitted_workspace_unions(&task.coordinator).await;
     } else {
         loop {
@@ -613,7 +573,7 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
         *union
             .results
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = (0..coordinator.completed.len())
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (0..coordinator.target_count)
             .map(|_| Some(WorkspaceUnionResult::Failed(error.clone())))
             .collect();
         union.ready.notify_waiters();
@@ -1261,9 +1221,9 @@ pub(super) async fn wait_for_materialization() -> u128 {
     }
 }
 
-pub(super) async fn wait_for_commit() -> u128 {
+pub(super) fn enter_commit() -> u128 {
     if let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) {
-        task.enter_commit().await
+        task.enter_commit()
     } else {
         0
     }
@@ -1854,9 +1814,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn every_importer_prepares_before_the_first_commit() {
-        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 1));
-        let first_may_finish = Arc::new(Notify::new());
+    async fn importer_enters_commit_without_waiting_for_other_importers() {
+        let projects = tempfile::tempdir().unwrap();
+        let first_project = projects.path().join("first");
+        let second_project = projects.path().join("second");
+        for project in [&first_project, &second_project] {
+            std::fs::create_dir_all(project).unwrap();
+            std::fs::write(project.join("package.json"), b"{}").unwrap();
+        }
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 2));
+        let project_state = Arc::new(
+            super::super::workspace_project_state::WorkspaceProjectStateCoordinator::new(2),
+        );
+        let first_committed = Arc::new(Notify::new());
         let second_may_prepare = Arc::new(Notify::new());
         let second_resolved = Arc::new(Notify::new());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1866,18 +1836,26 @@ mod tests {
             .run_until(async {
                 let first = {
                     let coordinator = Arc::clone(&coordinator);
-                    let first_may_finish = Arc::clone(&first_may_finish);
+                    let first_committed = Arc::clone(&first_committed);
                     let events = Arc::clone(&events);
+                    let first_project = first_project.clone();
+                    let project_state = Arc::clone(&project_state);
                     tokio::task::spawn_local(async move {
-                        scope(coordinator, 0, async {
-                            events.lock().unwrap().push("first-resolved");
-                            finish_resolution();
-                            events.lock().unwrap().push("first-prepared");
-                            wait_for_commit().await;
-                            events.lock().unwrap().push("first-commit");
-                            first_may_finish.notified().await;
-                            Ok::<_, ()>(())
-                        })
+                        super::super::workspace_project_state::scope(
+                            project_state,
+                            0,
+                            scope(coordinator, 0, async {
+                                events.lock().unwrap().push("first-resolved");
+                                finish_resolution();
+                                events.lock().unwrap().push("first-prepared");
+                                super::super::workspace_project_state::enter(&first_project)
+                                    .unwrap();
+                                enter_commit();
+                                events.lock().unwrap().push("first-commit");
+                                first_committed.notify_one();
+                                Ok::<_, ()>(())
+                            }),
+                        )
                         .await
                     })
                 };
@@ -1886,60 +1864,71 @@ mod tests {
                     let second_may_prepare = Arc::clone(&second_may_prepare);
                     let second_resolved = Arc::clone(&second_resolved);
                     let events = Arc::clone(&events);
+                    let second_project = second_project.clone();
+                    let project_state = Arc::clone(&project_state);
                     tokio::task::spawn_local(async move {
-                        scope(coordinator, 1, async {
-                            events.lock().unwrap().push("second-resolved");
-                            second_resolved.notify_one();
-                            second_may_prepare.notified().await;
-                            finish_resolution();
-                            events.lock().unwrap().push("second-prepared");
-                            wait_for_commit().await;
-                            events.lock().unwrap().push("second-commit");
-                            Ok::<_, ()>(())
-                        })
+                        super::super::workspace_project_state::scope(
+                            project_state,
+                            1,
+                            scope(coordinator, 1, async {
+                                events.lock().unwrap().push("second-resolved");
+                                second_resolved.notify_one();
+                                second_may_prepare.notified().await;
+                                finish_resolution();
+                                events.lock().unwrap().push("second-prepared");
+                                super::super::workspace_project_state::enter(&second_project)
+                                    .unwrap();
+                                enter_commit();
+                                events.lock().unwrap().push("second-commit");
+                                Ok::<_, ()>(())
+                            }),
+                        )
                         .await
                     })
                 };
 
                 second_resolved.notified().await;
-                assert_eq!(
-                    *events.lock().unwrap(),
-                    vec!["first-resolved", "first-prepared", "second-resolved"]
-                );
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    first_committed.notified(),
+                )
+                .await
+                .expect("the first importer must enter commit independently");
                 second_may_prepare.notify_one();
-                tokio::task::yield_now().await;
-                assert_eq!(
-                    *events.lock().unwrap(),
-                    vec![
-                        "first-resolved",
-                        "first-prepared",
-                        "second-resolved",
-                        "second-prepared",
-                        "first-commit"
-                    ]
-                );
-                first_may_finish.notify_one();
                 first.await.unwrap().unwrap();
                 second.await.unwrap().unwrap();
             })
             .await;
 
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec![
-                "first-resolved",
-                "first-prepared",
-                "second-resolved",
-                "second-prepared",
-                "first-commit",
-                "second-commit"
-            ]
+        let events = events.lock().unwrap();
+        let first_commit = events
+            .iter()
+            .position(|event| *event == "first-commit")
+            .unwrap();
+        let second_prepare = events
+            .iter()
+            .position(|event| *event == "second-prepared")
+            .unwrap();
+        assert!(
+            first_commit < second_prepare,
+            "the first importer must commit before the second is allowed to prepare: {events:?}"
         );
+        project_state.commit();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn later_importer_materialization_waits_for_its_predecessor() {
+        let projects = tempfile::tempdir().unwrap();
+        let first_project = projects.path().join("first");
+        let second_project = projects.path().join("second");
+        for project in [&first_project, &second_project] {
+            std::fs::create_dir_all(project).unwrap();
+            std::fs::write(project.join("package.json"), b"{}").unwrap();
+        }
         let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 2));
+        let project_state = Arc::new(
+            super::super::workspace_project_state::WorkspaceProjectStateCoordinator::new(2),
+        );
         let first_may_finish_materialization = Arc::new(Notify::new());
         let second_started_waiting = Arc::new(Notify::new());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1952,16 +1941,24 @@ mod tests {
                     let first_may_finish_materialization =
                         Arc::clone(&first_may_finish_materialization);
                     let events = Arc::clone(&events);
+                    let first_project = first_project.clone();
+                    let project_state = Arc::clone(&project_state);
                     tokio::task::spawn_local(async move {
-                        scope(coordinator, 0, async {
-                            finish_resolution();
-                            wait_for_materialization().await;
-                            events.lock().unwrap().push("first-materializing");
-                            first_may_finish_materialization.notified().await;
-                            wait_for_commit().await;
-                            events.lock().unwrap().push("first-commit");
-                            Ok::<_, ()>(())
-                        })
+                        super::super::workspace_project_state::scope(
+                            project_state,
+                            0,
+                            scope(coordinator, 0, async {
+                                finish_resolution();
+                                wait_for_materialization().await;
+                                events.lock().unwrap().push("first-materializing");
+                                first_may_finish_materialization.notified().await;
+                                super::super::workspace_project_state::enter(&first_project)
+                                    .unwrap();
+                                enter_commit();
+                                events.lock().unwrap().push("first-commit");
+                                Ok::<_, ()>(())
+                            }),
+                        )
                         .await
                     })
                 };
@@ -1969,16 +1966,24 @@ mod tests {
                     let coordinator = Arc::clone(&coordinator);
                     let second_started_waiting = Arc::clone(&second_started_waiting);
                     let events = Arc::clone(&events);
+                    let second_project = second_project.clone();
+                    let project_state = Arc::clone(&project_state);
                     tokio::task::spawn_local(async move {
-                        scope(coordinator, 1, async {
-                            finish_resolution();
-                            second_started_waiting.notify_one();
-                            wait_for_materialization().await;
-                            events.lock().unwrap().push("second-materializing");
-                            wait_for_commit().await;
-                            events.lock().unwrap().push("second-commit");
-                            Ok::<_, ()>(())
-                        })
+                        super::super::workspace_project_state::scope(
+                            project_state,
+                            1,
+                            scope(coordinator, 1, async {
+                                finish_resolution();
+                                second_started_waiting.notify_one();
+                                wait_for_materialization().await;
+                                events.lock().unwrap().push("second-materializing");
+                                super::super::workspace_project_state::enter(&second_project)
+                                    .unwrap();
+                                enter_commit();
+                                events.lock().unwrap().push("second-commit");
+                                Ok::<_, ()>(())
+                            }),
+                        )
                         .await
                     })
                 };
@@ -1996,56 +2001,76 @@ mod tests {
             *events.lock().unwrap(),
             vec![
                 "first-materializing",
-                "second-materializing",
                 "first-commit",
+                "second-materializing",
                 "second-commit"
             ]
         );
+        project_state.commit();
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn preparation_failure_returns_without_releasing_a_commit() {
+    async fn preparation_failure_rolls_back_an_importer_that_entered_commit() {
+        let projects = tempfile::tempdir().unwrap();
+        let first_project = projects.path().join("first");
+        std::fs::create_dir_all(first_project.join("node_modules/old-package")).unwrap();
+        std::fs::write(first_project.join("package.json"), b"{}").unwrap();
         let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 2));
+        let project_state = Arc::new(
+            super::super::workspace_project_state::WorkspaceProjectStateCoordinator::new(2),
+        );
         let second_failed = Arc::new(Notify::new());
-        let second_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let first_committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let local = tokio::task::LocalSet::new();
 
         local
             .run_until(async {
                 let first = {
                     let coordinator = Arc::clone(&coordinator);
-                    let first_committed = Arc::clone(&first_committed);
+                    let first_project = first_project.clone();
+                    let project_state = Arc::clone(&project_state);
                     tokio::task::spawn_local(async move {
-                        scope(coordinator, 0, async {
-                            finish_resolution();
-                            wait_for_commit().await;
-                            first_committed.store(true, std::sync::atomic::Ordering::Release);
-                            Ok::<_, &'static str>(())
-                        })
+                        super::super::workspace_project_state::scope(
+                            project_state,
+                            0,
+                            scope(coordinator, 0, async {
+                                finish_resolution();
+                                super::super::workspace_project_state::enter(&first_project)
+                                    .unwrap();
+                                enter_commit();
+                                std::fs::create_dir_all(
+                                    first_project.join("node_modules/new-package"),
+                                )
+                                .unwrap();
+                                Ok::<_, &'static str>(())
+                            }),
+                        )
                         .await
                     })
                 };
                 let second = {
                     let coordinator = Arc::clone(&coordinator);
                     let second_failed = Arc::clone(&second_failed);
-                    let second_returned = Arc::clone(&second_returned);
+                    let project_state = Arc::clone(&project_state);
                     tokio::task::spawn_local(async move {
-                        let result =
-                            scope(coordinator, 1, async { Err::<(), _>("resolve failed") }).await;
-                        second_returned.store(true, std::sync::atomic::Ordering::Release);
+                        let result = super::super::workspace_project_state::scope(
+                            project_state,
+                            1,
+                            scope(coordinator, 1, async { Err::<(), _>("resolve failed") }),
+                        )
+                        .await;
                         second_failed.notify_one();
                         result
                     })
                 };
 
                 second_failed.notified().await;
-                assert!(second_returned.load(std::sync::atomic::Ordering::Acquire));
-                assert!(!first_committed.load(std::sync::atomic::Ordering::Acquire));
                 assert_eq!(second.await.unwrap(), Err("resolve failed"));
-                first.abort();
-                assert!(first.await.unwrap_err().is_cancelled());
+                first.await.unwrap().unwrap();
             })
             .await;
+
+        assert!(project_state.rollback().is_empty());
+        assert!(first_project.join("node_modules/old-package").is_dir());
+        assert!(!first_project.join("node_modules/new-package").exists());
     }
 }

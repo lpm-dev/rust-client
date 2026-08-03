@@ -120,8 +120,15 @@ pub(crate) fn run() -> Result<()> {
     // Paired bench runs on `bench/fixture-large` found no measurable
     // wall-clock effect from capping the pool, so default behavior
     // preserves tokio's unbounded blocking pool.
+    // The install pipeline is one very large future. Recursive installs move
+    // each target pipeline onto a runtime worker, while standalone installs
+    // are polled by the thread driving `block_on`. Give both thread classes
+    // the same explicit budget so debug frames and large workspaces cannot
+    // overflow Tokio's 2 MiB default worker stack.
+    const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
+    runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
     if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -132,16 +139,9 @@ pub(crate) fn run() -> Result<()> {
         .build()
         .expect("failed to create tokio runtime");
 
-    // The install pipeline is one very large future, and a recursive
-    // workspace install polls every target's pipeline on the thread
-    // driving `block_on` (their futures are !Send). Debug-build async
-    // frames are large enough that the platform main-thread stack is
-    // not a safe budget for that, so drive the async entry point on a
-    // dedicated thread with an explicit, generous stack.
-    const ASYNC_MAIN_STACK_BYTES: usize = 64 * 1024 * 1024;
     std::thread::Builder::new()
         .name("lpm-async-main".into())
-        .stack_size(ASYNC_MAIN_STACK_BYTES)
+        .stack_size(ASYNC_STACK_BYTES)
         .spawn(move || runtime.block_on(async_main()))
         .expect("failed to spawn async main thread")
         .join()

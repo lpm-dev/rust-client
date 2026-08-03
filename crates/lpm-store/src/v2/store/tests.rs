@@ -1594,6 +1594,52 @@ fn populate_nests_scoped_same_name_sibling_symlink() {
 }
 
 #[test]
+fn populate_reuses_entry_with_same_name_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+
+    let pkg_sri = synthetic_sri(b"same-name-reuse/pkg");
+    let dep_sri = synthetic_sri(b"same-name-reuse/dep");
+    let pkg_obj = write_object(&store, &pkg_sri, &[("package.json", b"{}")]);
+    write_object(&store, &dep_sri, &[("package.json", b"{}")]);
+    let dep_obj = store.paths().object_dir(&dep_sri).unwrap();
+
+    let pkg_key = arc_key("self-dependent", "2.0.0");
+    let dep_key = arc_key("self-dependent", "1.0.0");
+
+    populate_link_entry_source(
+        &store,
+        LinkEntryRequest {
+            graph_key: dep_key.clone(),
+            source_sri: dep_sri,
+            object_dir: dep_obj,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        },
+    )
+    .unwrap();
+
+    let request = LinkEntryRequest {
+        graph_key: pkg_key,
+        source_sri: pkg_sri,
+        object_dir: pkg_obj,
+        deps: vec![DepLink {
+            local: "self-dependent".into(),
+            target: dep_key,
+        }],
+        platform: Arc::new(sample_meta_platform()),
+    };
+    let first = populate_link_entry_source(&store, request.clone()).unwrap();
+    let second = populate_link_entry_source(&store, request).unwrap();
+
+    assert!(first.freshly_populated);
+    assert!(
+        !second.freshly_populated,
+        "an unchanged same-name dependency layout must reuse its link entry"
+    );
+}
+
+#[test]
 fn extract_object_is_idempotent() {
     // We can't easily invoke the real extractor on a synthetic
     // tarball without pulling in flate2/tar in the test (already

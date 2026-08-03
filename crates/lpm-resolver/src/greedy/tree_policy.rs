@@ -1,6 +1,5 @@
 use super::prelude::*;
 use super::types::Edge;
-use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -14,12 +13,12 @@ pub(super) trait TreeManifestProvider {
     fn ensure_manifest<'a>(
         &'a self,
         canonical: &'a CanonicalKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + Send + 'a>>;
 
     fn prefetch_manifests<'a>(
         &'a self,
         _canonicals: &'a [CanonicalKey],
-    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
 }
@@ -33,31 +32,30 @@ enum TreeStatus {
 
 #[derive(Default)]
 pub(super) struct TreeStatusCache {
-    entries: RefCell<AHashMap<(CanonicalKey, NpmVersion), TreeStatus>>,
-    release_age_lookahead_fetches: Cell<usize>,
+    entries: AHashMap<(CanonicalKey, NpmVersion), TreeStatus>,
+    release_age_lookahead_fetches: usize,
 }
 
 impl TreeStatusCache {
     fn get(&self, key: &(CanonicalKey, NpmVersion)) -> Option<TreeStatus> {
-        self.entries.borrow().get(key).copied()
+        self.entries.get(key).copied()
     }
 
-    fn insert(&self, key: (CanonicalKey, NpmVersion), status: TreeStatus) {
-        self.entries.borrow_mut().insert(key, status);
+    fn insert(&mut self, key: (CanonicalKey, NpmVersion), status: TreeStatus) {
+        self.entries.insert(key, status);
     }
 
-    fn try_spend_release_age_lookahead_fetch(&self) -> bool {
-        let used = self.release_age_lookahead_fetches.get();
-        if used >= RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT {
+    fn try_spend_release_age_lookahead_fetch(&mut self) -> bool {
+        if self.release_age_lookahead_fetches >= RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT {
             return false;
         }
-        self.release_age_lookahead_fetches.set(used + 1);
+        self.release_age_lookahead_fetches += 1;
         true
     }
 
     #[cfg(test)]
     pub(super) fn release_age_lookahead_fetches(&self) -> usize {
-        self.release_age_lookahead_fetches.get()
+        self.release_age_lookahead_fetches
     }
 }
 
@@ -66,10 +64,10 @@ pub(super) async fn preferred_tree_compatible_version<P>(
     info: &CachedPackageInfo,
     policy: &ResolverPolicy,
     provider: &P,
-    cache: &TreeStatusCache,
+    cache: &mut TreeStatusCache,
 ) -> Option<NpmVersion>
 where
-    P: TreeManifestProvider,
+    P: TreeManifestProvider + Sync,
 {
     if edge.parent != 0 {
         return None;
@@ -108,10 +106,10 @@ fn pick_tree_compatible_version<'a, P>(
     policy: &'a ResolverPolicy,
     provider: &'a P,
     visited: &'a mut AHashSet<(CanonicalKey, NpmVersion)>,
-    cache: &'a TreeStatusCache,
-) -> Pin<Box<dyn Future<Output = TreePick> + 'a>>
+    cache: &'a mut TreeStatusCache,
+) -> Pin<Box<dyn Future<Output = TreePick> + Send + 'a>>
 where
-    P: TreeManifestProvider,
+    P: TreeManifestProvider + Sync,
 {
     Box::pin(async move {
         let mut saw_candidate = false;
@@ -146,10 +144,10 @@ fn required_dependency_tree_status<'a, P>(
     policy: &'a ResolverPolicy,
     provider: &'a P,
     visited: &'a mut AHashSet<(CanonicalKey, NpmVersion)>,
-    cache: &'a TreeStatusCache,
-) -> Pin<Box<dyn Future<Output = TreeStatus> + 'a>>
+    cache: &'a mut TreeStatusCache,
+) -> Pin<Box<dyn Future<Output = TreeStatus> + Send + 'a>>
 where
-    P: TreeManifestProvider,
+    P: TreeManifestProvider + Sync,
 {
     Box::pin(async move {
         let visit_key = (canonical.clone(), version.clone());

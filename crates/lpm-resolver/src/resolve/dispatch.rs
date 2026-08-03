@@ -193,6 +193,12 @@ pub async fn resolve_with_shared_cache_options_and_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip_all,
+    name = "resolve",
+    level = "debug",
+    fields(n_deps = root_dependencies.dependencies.len())
+)]
 pub async fn resolve_with_shared_cache_options_and_policy_roots(
     client: Arc<RegistryClient>,
     root_dependencies: RootDependencies,
@@ -235,8 +241,6 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
         .await;
     }
 
-    let _span =
-        tracing::debug_span!("resolve", n_deps = root_dependencies.dependencies.len()).entered();
     let rt = Handle::current();
 
     // Reset profiling accumulators once before resolution starts.

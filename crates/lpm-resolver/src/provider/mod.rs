@@ -85,9 +85,9 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use lpm_registry::{RegistryClient, RouteMode, RouteTable, UpstreamRoute};
     #[allow(unused_imports)]
-    pub(super) use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
+    pub(super) use parking_lot::Mutex;
     #[allow(unused_imports)]
-    pub(super) use std::cell::RefCell;
+    pub(super) use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
     #[allow(unused_imports)]
     pub(super) use std::collections::{HashMap, HashSet};
     #[allow(unused_imports)]
