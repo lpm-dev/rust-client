@@ -156,7 +156,6 @@ pub(super) struct LinkMaterialization {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct LinkMaterializationKey {
     graph_key: Arc<lpm_store::v2::GraphKey>,
-    source_sri: String,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -334,10 +333,7 @@ impl WorkspaceMaterializationCoordinator {
         store: Arc<lpm_store::v2::Store>,
     ) -> Result<Coordinated<LinkMaterialization>, LpmError> {
         let graph_key = plan.graph_key_for(&target)?;
-        let key = LinkMaterializationKey {
-            graph_key,
-            source_sri: target.source_sri.clone(),
-        };
+        let key = LinkMaterializationKey { graph_key };
         self.link_materializations
             .run(key, || async move {
                 tokio::task::spawn_blocking(move || {
@@ -602,25 +598,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn link_materialization_key_separates_source_integrities_for_the_same_graph() {
-        let graph_key = Arc::new(lpm_store::v2::GraphKey::derive(
-            &lpm_store::v2::GraphKeyInputs::new(
-                "shared",
-                "1.0.0",
-                lpm_store::v2::PlatformTuple::current(),
-                lpm_store::v2::LinkerModeTag::Isolated,
-            ),
-        ));
-        let first = LinkMaterializationKey {
-            graph_key: Arc::clone(&graph_key),
-            source_sri: "sha512-first".to_string(),
+    #[tokio::test]
+    async fn link_materialization_coalesces_different_source_integrities_for_one_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"shared","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        let first_sri = lpm_store::compute_sri_hash(b"first-source-identity");
+        let second_sri = lpm_store::compute_sri_hash(b"second-source-identity");
+        store
+            .populate_object_from_local_source(&source, &first_sri)
+            .unwrap();
+        store
+            .populate_object_from_local_source(&source, &second_sri)
+            .unwrap();
+        let first_target = lpm_linker::v2::V2Target {
+            target: lpm_linker::LinkTarget {
+                name: "shared".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: std::path::PathBuf::new(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                is_direct: true,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: lpm_linker::Materialization::CasBacked,
+                peers: Vec::new(),
+                patch_fingerprint: None,
+            },
+            source_sri: first_sri,
+            verified_object_integrity: None,
+            fresh_object: None,
         };
-        let second = LinkMaterializationKey {
-            graph_key,
-            source_sri: "sha512-second".to_string(),
-        };
+        let mut second_target = first_target.clone();
+        second_target.source_sri = second_sri;
+        let plan = Arc::new(
+            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context(
+                &project,
+                vec![first_target.clone()],
+                &store,
+                lpm_linker::LinkerMode::Isolated,
+            )
+            .unwrap(),
+        );
+        let coordinator = WorkspaceMaterializationCoordinator::new(true);
 
-        assert!(first != second);
+        let (first, second) = tokio::join!(
+            coordinator.materialize_link(Arc::clone(&plan), first_target, Arc::clone(&store)),
+            coordinator.materialize_link(plan, second_target, store),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(
+            usize::from(first.performed) + usize::from(second.performed),
+            1
+        );
+        assert_eq!(
+            first.value.materialized.destination,
+            second.value.materialized.destination
+        );
     }
 }

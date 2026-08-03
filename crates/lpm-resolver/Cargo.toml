@@ -29,6 +29,7 @@ bench-internals = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 wiremock = "0.6"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }

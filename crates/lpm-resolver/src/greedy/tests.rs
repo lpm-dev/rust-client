@@ -15,8 +15,33 @@ use crate::policy::{TrustPolicyMode, parse_npm_time_unix};
 use crate::provider::{CachedDistInfo, CachedPackageInfo};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tracing::instrument::WithSubscriber as _;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TraceBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("trace buffer poisoned").extend(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for TraceBuffer {
+    type Writer = TraceBuffer;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 struct ScopedEnvVars {
     originals: Vec<(&'static str, Option<String>)>,
@@ -3186,6 +3211,57 @@ async fn peer_drain_best_effort_synthesizes_for_incompatible_required_ranges() {
     assert_eq!(report.unsatisfied_consumers.len(), 1);
     assert_eq!(report.unsatisfied_consumers[0].0, "legacy-pkg");
     assert_eq!(report.unsatisfied_consumers[0].1, "^17.0.0");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_drain_best_effort_warning_excludes_optional_consumers_from_satisfied_count() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let legacy = push_node(&mut state, CanonicalKey::npm("legacy"), "1.0.0");
+    let modern = push_node(&mut state, CanonicalKey::npm("modern"), "1.0.0");
+    let optional_a = push_node(&mut state, CanonicalKey::npm("optional-a"), "1.0.0");
+    let optional_b = push_node(&mut state, CanonicalKey::npm("optional-b"), "1.0.0");
+
+    for (consumer, range, optional) in [
+        (legacy, "^17.0.0", false),
+        (modern, "^18.0.0", false),
+        (optional_a, "^18.0.0", true),
+        (optional_b, "^99.0.0", true),
+    ] {
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            range,
+            optional,
+        ));
+    }
+
+    let output = TraceBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_level(false)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(output.clone())
+        .finish();
+    let info = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+
+    drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = Arc::clone(&info);
+        async move { Ok(info) }
+    })
+    .with_subscriber(subscriber)
+    .await
+    .expect("best-effort synthesis should succeed");
+
+    let rendered = String::from_utf8(output.0.lock().expect("trace buffer poisoned").clone())
+        .expect("trace output must be UTF-8");
+    assert!(
+        rendered.contains("satisfies 1 of 2 required consumer(s)"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]

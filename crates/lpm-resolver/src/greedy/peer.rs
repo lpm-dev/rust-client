@@ -521,6 +521,11 @@ where
                 chosen,
                 unsatisfied,
             } => {
+                let required_consumer_count = reqs.iter().filter(|req| !req.optional).count();
+                let satisfied_consumer_count = reqs
+                    .iter()
+                    .filter(|req| !req.optional && req.range.satisfies(&chosen))
+                    .count();
                 record_peer_bindings(state, &reqs, &chosen);
                 synthesize_ambient_edge(
                     state,
@@ -542,8 +547,8 @@ where
                      unsatisfied: {}",
                     canonical,
                     chosen,
-                    reqs_owned.len() - unsatisfied.len(),
-                    reqs_owned.iter().filter(|r| !r.optional).count(),
+                    satisfied_consumer_count,
+                    required_consumer_count,
                     unsatisfied
                         .iter()
                         .map(|(c, r)| format!("{c} wants {r}"))
