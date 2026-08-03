@@ -1,9 +1,11 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::SecurityAnalysisPolicy;
 use lpm_common::LpmError;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 
 use super::fs_util::{create_fs_symlink, ensure_store_tier_dir_locked, tmp_sibling};
 use super::integrity::{
@@ -12,6 +14,141 @@ use super::integrity::{
     write_tree_object_integrity,
 };
 use super::tree_hash::is_object_metadata_sidecar_name;
+
+const LOCAL_SOURCE_FINGERPRINT_FILENAME: &str = "local-source-fingerprint-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalSourceFingerprint(String);
+
+pub(crate) fn local_source_fingerprint_path(object_dir: &Path) -> Result<PathBuf, LpmError> {
+    let sentinel = local_source_sentinel_path(object_dir)?;
+    let parent = sentinel.parent().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 local-source sentinel has no parent: {}",
+            sentinel.display()
+        ))
+    })?;
+    Ok(parent.join(LOCAL_SOURCE_FINGERPRINT_FILENAME))
+}
+
+pub(crate) fn stored_local_source_fingerprint_matches(
+    object_dir: &Path,
+    fingerprint: &LocalSourceFingerprint,
+) -> bool {
+    let Ok(path) = local_source_fingerprint_path(object_dir) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|stored| stored.trim() == fingerprint.0)
+}
+
+pub(crate) fn write_local_source_fingerprint(
+    object_dir: &Path,
+    fingerprint: &LocalSourceFingerprint,
+) -> Result<(), LpmError> {
+    let path = local_source_fingerprint_path(object_dir)?;
+    lpm_common::write_file_atomic(&path, format!("{}\n", fingerprint.0)).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to write v2 local-source fingerprint at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn compute_local_source_fingerprint(
+    source_root: &Path,
+) -> Result<Option<LocalSourceFingerprint>, LpmError> {
+    let mut hasher = Sha256::new();
+    hash_local_source_metadata(source_root, &mut hasher, 0)?;
+    Ok(Some(LocalSourceFingerprint(format!(
+        "sha256-{}",
+        hex::encode(hasher.finalize())
+    ))))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn compute_local_source_fingerprint(
+    _source_root: &Path,
+) -> Result<Option<LocalSourceFingerprint>, LpmError> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn hash_local_source_metadata(
+    source_dir: &Path,
+    hasher: &mut Sha256,
+    depth: usize,
+) -> Result<(), LpmError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
+        return Err(LpmError::Store(format!(
+            "v2 local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            source_dir.display()
+        )));
+    }
+
+    let entries =
+        read_snapshot_entries(source_dir, |_, name| is_excluded_local_source_entry(name))?;
+    let mut source_path = source_dir.to_path_buf();
+    for entry in entries {
+        let name = entry.name.as_bytes();
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(name);
+        source_path.push(&entry.name);
+        let file_type = entry.metadata.file_type();
+        if file_type.is_dir() {
+            hasher.update([b'd']);
+            hash_local_source_metadata(&source_path, hasher, depth + 1)?;
+        } else if file_type.is_file() {
+            hasher.update([b'f']);
+            hash_unix_file_metadata(hasher, &entry.metadata);
+        } else if file_type.is_symlink() {
+            hasher.update([b'l']);
+            hash_unix_file_metadata(hasher, &entry.metadata);
+            let resolved = source_path
+                .canonicalize()
+                .unwrap_or_else(|_| source_path.clone());
+            match std::fs::metadata(&resolved) {
+                Ok(metadata) if metadata.is_file() => {
+                    hasher.update([b'f']);
+                    hash_unix_file_metadata(hasher, &metadata);
+                }
+                _ => {
+                    hasher.update([b'l']);
+                    let target = resolved.as_os_str().as_bytes();
+                    hasher.update(
+                        u64::try_from(target.len())
+                            .unwrap_or(u64::MAX)
+                            .to_le_bytes(),
+                    );
+                    hasher.update(target);
+                }
+            }
+        } else {
+            hasher.update([b'o']);
+            hash_unix_file_metadata(hasher, &entry.metadata);
+        }
+        source_path.pop();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hash_unix_file_metadata(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    hasher.update(metadata.dev().to_le_bytes());
+    hasher.update(metadata.ino().to_le_bytes());
+    hasher.update(metadata.size().to_le_bytes());
+    hasher.update(metadata.mode().to_le_bytes());
+    hasher.update(metadata.mtime().to_le_bytes());
+    hasher.update(metadata.mtime_nsec().to_le_bytes());
+    hasher.update(metadata.ctime().to_le_bytes());
+    hasher.update(metadata.ctime_nsec().to_le_bytes());
+}
 
 fn is_complete_local_source_object_dir(dir: &Path) -> bool {
     is_complete_object_dir(dir) && has_local_source_sentinel(dir)

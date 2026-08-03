@@ -20,7 +20,6 @@ struct AutomaticWorkspaceInstallPolicy {
     offline: bool,
     force: bool,
     explicit_concurrency: bool,
-    share_local_source_populations: bool,
     root_resolve_ahead_eligible: bool,
 }
 
@@ -39,7 +38,6 @@ impl AutomaticWorkspaceInstallPolicy {
             && !self.offline
             && !self.force
             && !self.explicit_concurrency
-            && self.share_local_source_populations
             && self.root_resolve_ahead_eligible;
         if !eligible {
             return WORKSPACE_INSTALL_DEFAULT_CONCURRENCY;
@@ -94,6 +92,7 @@ struct WorkspaceInstallTarget {
     dependency_count: usize,
     has_registry_resolution_roots: bool,
     resolve_ahead_eligible: bool,
+    has_workspace_dependents: bool,
     // Indices of targets that must complete before this one starts:
     // workspace dependency edges, the sequential chain between
     // script-bearing targets, and (for the root) every member.
@@ -212,8 +211,7 @@ pub(crate) async fn run_recursive_workspace_install(
             &workspace_lockfile_coordinator,
             root_provider_fingerprint.as_deref(),
         );
-        let share_local_source_populations =
-            workspace_allows_shared_local_source_populations(&targets);
+        let unshared_local_source_roots = scripted_local_source_provider_roots(&targets);
         let explicit_concurrency =
             explicit_workspace_install_concurrency(options.workspace_concurrency).is_some();
         let automatic_policy = AutomaticWorkspaceInstallPolicy {
@@ -226,7 +224,6 @@ pub(crate) async fn run_recursive_workspace_install(
             offline: options.offline,
             force: options.force,
             explicit_concurrency,
-            share_local_source_populations,
             root_resolve_ahead_eligible: root_target_index
                 .is_some_and(|index| targets[index].resolve_ahead_eligible),
         };
@@ -283,7 +280,6 @@ pub(crate) async fn run_recursive_workspace_install(
                     && !resolve_ahead
                     && !lockfile_replay_ready
                     && !options.offline
-                    && share_local_source_populations
                     && !targets[*index].lifecycle.has_scripts()
                     && targets[*index].resolve_ahead_eligible
             })
@@ -324,7 +320,8 @@ pub(crate) async fn run_recursive_workspace_install(
             root_provider_serialized = root_provider_coordinator.is_some(),
             lockfile_replay_ready,
             share_object_validations = targets_need_materialization,
-            share_local_source_populations,
+            share_local_source_populations = true,
+            unshared_local_source_count = unshared_local_source_roots.len(),
             workspace_resource_pools = true,
             automatic_parallel_replay,
             automatic_parallel_fresh,
@@ -332,7 +329,7 @@ pub(crate) async fn run_recursive_workspace_install(
         );
         let materialization_coordinator = Arc::new(
             workspace_materialization::WorkspaceMaterializationCoordinator::new(
-                share_local_source_populations,
+                unshared_local_source_roots,
             ),
         );
         let mut resolution_task_indices = vec![None; targets.len()];
@@ -855,10 +852,23 @@ fn workspace_targets_need_materialization(targets: &[WorkspaceInstallTarget]) ->
         .any(|target| !target.path.join("node_modules").is_dir())
 }
 
-fn workspace_allows_shared_local_source_populations(targets: &[WorkspaceInstallTarget]) -> bool {
-    targets
-        .iter()
-        .all(|target| target.kind == "root" || !target.lifecycle.has_scripts())
+fn scripted_local_source_provider_roots(targets: &[WorkspaceInstallTarget]) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(targets.len());
+    for target in targets {
+        if target.kind == "root"
+            || !target.has_workspace_dependents
+            || !target.lifecycle.has_scripts()
+        {
+            continue;
+        }
+        roots.push(
+            target
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| target.path.clone()),
+        );
+    }
+    roots
 }
 
 fn root_requires_serialized_provider_resolution(
@@ -878,6 +888,13 @@ fn package_install_dependency_count(package: &lpm_workspace::PackageJson) -> usi
         .saturating_add(package.dev_dependencies.len())
         .saturating_add(package.optional_dependencies.len())
         .saturating_add(package.peer_dependencies.len())
+}
+
+fn package_declares_dependency(package: &lpm_workspace::PackageJson, name: &str) -> bool {
+    package.dependencies.contains_key(name)
+        || package.dev_dependencies.contains_key(name)
+        || package.optional_dependencies.contains_key(name)
+        || package.peer_dependencies.contains_key(name)
 }
 
 fn package_has_registry_resolution_roots(
@@ -1147,6 +1164,14 @@ fn select_workspace_install_targets(
                 &member.package,
                 &workspace.root_package.catalogs,
             ),
+            has_workspace_dependents: graph.reverse_edges[id]
+                .iter()
+                .any(|dependent| selected.contains(dependent))
+                || (!filtered
+                    && package_declares_dependency(
+                        &workspace.root_package,
+                        &graph.members[id].name,
+                    )),
             schedule_after: if workspace_edges_usable {
                 graph.edges[id]
                     .iter()
@@ -1200,6 +1225,7 @@ fn select_workspace_install_targets(
                 &workspace.root_package,
                 &workspace.root_package.catalogs,
             ),
+            has_workspace_dependents: false,
             schedule_after,
         });
     }
@@ -1674,13 +1700,37 @@ mod tests {
     }
 
     #[test]
-    fn recursive_workspace_install_keeps_script_bearing_fresh_workspaces_sequential() {
-        let policy = AutomaticWorkspaceInstallPolicy {
-            share_local_source_populations: false,
-            ..large_fresh_workspace_policy()
-        };
+    fn recursive_workspace_install_keeps_non_union_scripted_leaf_parallel() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = workspace_with_scripted_member(directory.path(), false);
+        let targets = select_workspace_install_targets(&workspace, &[], &[], &[], &[]).unwrap();
+        let policy = large_fresh_workspace_policy();
 
-        assert!(!policy.parallel_fresh());
+        assert_eq!(
+            (
+                scripted_local_source_provider_roots(&targets).is_empty(),
+                policy.parallel_fresh(),
+            ),
+            (true, true),
+        );
+    }
+
+    #[test]
+    fn recursive_workspace_scripted_provider_disables_sharing_for_its_source_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = workspace_with_scripted_member(directory.path(), true);
+        let targets = select_workspace_install_targets(&workspace, &[], &[], &[], &[]).unwrap();
+
+        assert_eq!(
+            scripted_local_source_provider_roots(&targets),
+            vec![
+                directory
+                    .path()
+                    .join("packages/provider")
+                    .canonicalize()
+                    .unwrap()
+            ],
+        );
     }
 
     #[test]
@@ -1693,12 +1743,7 @@ mod tests {
         let member = workspace_target("member", "member", &package);
         let root = workspace_target("root", "root", &scripted_root_package);
         let targets = [member, root];
-        let policy = AutomaticWorkspaceInstallPolicy {
-            share_local_source_populations: workspace_allows_shared_local_source_populations(
-                &targets,
-            ),
-            ..large_fresh_workspace_policy()
-        };
+        let policy = large_fresh_workspace_policy();
 
         assert!(policy.parallel_fresh());
         assert_eq!(
@@ -1996,7 +2041,6 @@ mod tests {
             offline: false,
             force: false,
             explicit_concurrency: false,
-            share_local_source_populations: true,
             root_resolve_ahead_eligible: true,
         }
     }
@@ -2014,6 +2058,7 @@ mod tests {
             dependency_count: package_install_dependency_count(package),
             has_registry_resolution_roots: package_install_dependency_count(package) > 0,
             resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
+            has_workspace_dependents: false,
             schedule_after: Vec::new(),
         }
     }
@@ -2032,6 +2077,7 @@ mod tests {
             dependency_count: package_install_dependency_count(package),
             has_registry_resolution_roots: package_install_dependency_count(package) > 0,
             resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
+            has_workspace_dependents: false,
             schedule_after: Vec::new(),
         }
     }
@@ -2056,6 +2102,50 @@ mod tests {
             root: root.to_path_buf(),
             root_package: package,
             members: Vec::new(),
+        }
+    }
+
+    fn workspace_with_scripted_member(
+        root: &Path,
+        provider_has_consumer: bool,
+    ) -> lpm_workspace::Workspace {
+        let provider_path = root.join("packages/provider");
+        let consumer_path = root.join("packages/consumer");
+        std::fs::create_dir_all(&provider_path).unwrap();
+        std::fs::create_dir_all(&consumer_path).unwrap();
+
+        let mut provider = lpm_workspace::PackageJson {
+            name: Some("provider".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..lpm_workspace::PackageJson::default()
+        };
+        provider
+            .scripts
+            .insert("postinstall".to_string(), "node -e 0".to_string());
+        let mut consumer = lpm_workspace::PackageJson {
+            name: Some("consumer".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..lpm_workspace::PackageJson::default()
+        };
+        if provider_has_consumer {
+            consumer
+                .dependencies
+                .insert("provider".to_string(), "workspace:*".to_string());
+        }
+
+        lpm_workspace::Workspace {
+            root: root.to_path_buf(),
+            root_package: lpm_workspace::PackageJson::default(),
+            members: vec![
+                lpm_workspace::WorkspaceMember {
+                    path: provider_path,
+                    package: provider,
+                },
+                lpm_workspace::WorkspaceMember {
+                    path: consumer_path,
+                    package: consumer,
+                },
+            ],
         }
     }
 

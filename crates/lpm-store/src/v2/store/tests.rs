@@ -14,6 +14,7 @@ use crate::v2::integrity::{
     write_tree_snapshot,
 };
 use crate::v2::link_meta::LinkMetaPlatform;
+use crate::v2::local_source::local_source_fingerprint_path;
 use crate::v2::platform::PlatformTuple;
 #[cfg(target_os = "macos")]
 use crate::v2::tree_hash::metadata_hash_implementations_match_for_test;
@@ -3454,6 +3455,36 @@ fn unchanged_local_source_populate_does_not_rewrite_snapshot_metadata() {
         std::fs::metadata(sentinel).unwrap().modified().unwrap(),
         preserved_time,
         "an unchanged local source must reuse its validated snapshot without metadata writes",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_local_source_populate_reuses_recorded_source_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let sri = synthetic_sri(b"unchanged_local_source_populate_reuses_recorded_source_fingerprint");
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    let fingerprint = local_source_fingerprint_path(&object_dir).unwrap();
+    let preserved_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
+    std::fs::File::options()
+        .write(true)
+        .open(&fingerprint)
+        .unwrap()
+        .set_modified(preserved_time)
+        .unwrap();
+
+    store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::metadata(fingerprint).unwrap().modified().unwrap(),
+        preserved_time,
     );
 }
 

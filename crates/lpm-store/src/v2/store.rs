@@ -34,7 +34,9 @@ use super::integrity::{
     write_tree_snapshot, write_tree_snapshot_best_effort,
 };
 use super::local_source::{
-    local_source_snapshot_matches, populate_local_source_object_into, replace_local_source_object,
+    LocalSourceFingerprint, compute_local_source_fingerprint, local_source_snapshot_matches,
+    populate_local_source_object_into, replace_local_source_object,
+    stored_local_source_fingerprint_matches, write_local_source_fingerprint,
 };
 use super::tree_hash::{
     ExtractedObjectStats, ObjectTreeStats, TreeIntegrities, compute_object_tree_integrities,
@@ -1623,7 +1625,14 @@ impl Store {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let snapshot_matches = local_source_snapshot_matches(&canonical_source, &object_dir)?;
+        let source_fingerprint = compute_local_source_fingerprint(&canonical_source)?;
+        let fingerprint_matches = source_fingerprint.as_ref().is_some_and(|fingerprint| {
+            stored_local_source_fingerprint_matches(&object_dir, fingerprint)
+        });
+        let snapshot_matches =
+            fingerprint_matches || local_source_snapshot_matches(&canonical_source, &object_dir)?;
+        // A local-source SRI identifies a mutable path, not its bytes, so source-policy
+        // verification cannot detect corruption of the stored snapshot.
         let verified_object = object_integrity_or_remove(
             &object_dir,
             "before local-source snapshot reuse or refresh",
@@ -1631,8 +1640,15 @@ impl Store {
             ObjectIntegrityPolicy::Tree,
         )?;
         if snapshot_matches && verified_object.is_some() {
-            self.backfill_security_cache_if_enabled(&object_dir, sri);
-            return Ok(object_dir);
+            let stable_source = fingerprint_matches
+                || compute_local_source_fingerprint(&canonical_source)? == source_fingerprint;
+            if stable_source {
+                if !fingerprint_matches {
+                    record_local_source_fingerprint(&object_dir, source_fingerprint.as_ref());
+                }
+                self.backfill_security_cache_if_enabled(&object_dir, sri);
+                return Ok(object_dir);
+            }
         }
 
         if let Some(parent) = object_dir.parent() {
@@ -1641,24 +1657,44 @@ impl Store {
         }
 
         let tmp_dir = tmp_sibling(&object_dir);
-        if tmp_dir.exists() {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        }
-        create_tmp_dir_locked(&tmp_dir)
-            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
+        for attempt in 0..2 {
+            if tmp_dir.exists() {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            }
+            create_tmp_dir_locked(&tmp_dir).map_err(|e| {
+                LpmError::Store(format!("failed to create v2 tmp staging dir: {e}"))
+            })?;
 
-        if let Err(e) = populate_local_source_object_into(
-            &canonical_source,
-            &tmp_dir,
-            sri,
-            self.security_analysis_policy,
-        ) {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e);
-        }
+            let before_population = compute_local_source_fingerprint(&canonical_source)?;
+            if let Err(e) = populate_local_source_object_into(
+                &canonical_source,
+                &tmp_dir,
+                sri,
+                self.security_analysis_policy,
+            ) {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+            let after_population = compute_local_source_fingerprint(&canonical_source)?;
+            if before_population != after_population {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(LpmError::Store(format!(
+                    "v2 local-source object changed while snapshotting {}",
+                    canonical_source.display()
+                )));
+            }
 
-        replace_local_source_object(&tmp_dir, &object_dir, &canonical_source)?;
-        Ok(object_dir)
+            replace_local_source_object(&tmp_dir, &object_dir, &canonical_source)?;
+            record_local_source_fingerprint(&object_dir, after_population.as_ref());
+            return Ok(object_dir);
+        }
+        Err(LpmError::Store(format!(
+            "v2 local-source object changed repeatedly while snapshotting {}",
+            canonical_source.display()
+        )))
     }
 
     /// Iterate every object directory under `objects/` that has a
@@ -2049,6 +2085,21 @@ fn local_source_populate_lock(object_dir: &Path) -> Arc<std::sync::Mutex<()>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(locks.entry(object_dir.to_path_buf()).or_default())
+}
+
+fn record_local_source_fingerprint(
+    object_dir: &Path,
+    fingerprint: Option<&LocalSourceFingerprint>,
+) {
+    let Some(fingerprint) = fingerprint else {
+        return;
+    };
+    if let Err(error) = write_local_source_fingerprint(object_dir, fingerprint) {
+        tracing::warn!(
+            target = %object_dir.display(),
+            "v2 local-source object: failed to record source fingerprint: {error}"
+        );
+    }
 }
 
 #[cfg(test)]

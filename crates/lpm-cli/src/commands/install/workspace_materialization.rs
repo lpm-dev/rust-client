@@ -246,7 +246,7 @@ impl WorkspaceLinkHandle {
 }
 
 pub(super) struct WorkspaceMaterializationCoordinator {
-    share_local_source_populations: bool,
+    unshared_local_source_roots: Box<[std::path::PathBuf]>,
     fetch_semaphore: Arc<Semaphore>,
     fetch_extract_limiter: super::FetchExtractLimiter,
     limit_v1_extraction: bool,
@@ -266,18 +266,18 @@ pub(super) struct WorkspaceMaterializationCoordinator {
 
 impl Default for WorkspaceMaterializationCoordinator {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(Vec::new())
     }
 }
 
 impl WorkspaceMaterializationCoordinator {
-    pub(super) fn new(share_local_source_populations: bool) -> Self {
+    pub(super) fn new(unshared_local_source_roots: Vec<std::path::PathBuf>) -> Self {
         let limit_v1_extraction = super::configured_fetch_extract_permits_from_env(false).is_some();
         let fetch_extract_limiter = super::configured_fetch_extract_permits_from_env(true)
             .map(Semaphore::new)
             .map(Arc::new);
         Self {
-            share_local_source_populations,
+            unshared_local_source_roots: unshared_local_source_roots.into_boxed_slice(),
             fetch_semaphore: Arc::new(Semaphore::new(super::max_concurrent_downloads())),
             fetch_extract_limiter,
             limit_v1_extraction,
@@ -362,7 +362,11 @@ impl WorkspaceMaterializationCoordinator {
         source_sri: String,
         store: Arc<lpm_store::v2::Store>,
     ) -> Result<Coordinated<std::path::PathBuf>, LpmError> {
-        if !self.share_local_source_populations {
+        if self
+            .unshared_local_source_roots
+            .iter()
+            .any(|root| source_dir.starts_with(root))
+        {
             let validation_sri = source_sri.clone();
             let object_dir = tokio::task::spawn_blocking(move || {
                 store.populate_object_from_local_source(&source_dir, &source_sri)
@@ -670,7 +674,7 @@ mod tests {
             ("LPM_FETCH_EXTRACT_PERMITS", Some("3".into())),
             ("LPM_V2_LINK_TASKS", Some("5".into())),
         ]);
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         assert_eq!(coordinator.fetch_semaphore.available_permits(), 7);
         assert_eq!(
@@ -689,7 +693,7 @@ mod tests {
             "LPM_V2_LINK_TASKS",
             Some(usize::MAX.to_string().into()),
         )]);
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         assert_eq!(
             coordinator.v2_link_task_semaphore.available_permits(),
@@ -790,7 +794,7 @@ mod tests {
         .unwrap();
         let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
         let source_sri = lpm_store::compute_sri_hash(b"missing-object");
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         let first = coordinator
             .validate_object(source_sri.clone(), Arc::clone(&store))
@@ -824,7 +828,7 @@ mod tests {
         std::fs::write(source.join("index.js"), b"module.exports = 1;\n").unwrap();
         let source_sri = lpm_store::compute_sri_hash(b"shared-local-source");
         let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         let (first, second) = tokio::join!(
             coordinator.populate_local_source(
@@ -846,6 +850,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripted_provider_source_bypasses_shared_population() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("workspace-package");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"workspace-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let source_sri = lpm_store::compute_sri_hash(b"unshared-local-source");
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        let coordinator = WorkspaceMaterializationCoordinator::new(vec![source.clone()]);
+
+        let (first, second) = tokio::join!(
+            coordinator.populate_local_source(
+                source.clone(),
+                source_sri.clone(),
+                Arc::clone(&store),
+            ),
+            coordinator.populate_local_source(source, source_sri, store),
+        );
+
+        assert_eq!(
+            usize::from(first.unwrap().performed) + usize::from(second.unwrap().performed),
+            2,
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_workspace_validation_reuses_positive_result_concurrently() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("workspace-package");
@@ -860,7 +893,7 @@ mod tests {
         store
             .populate_object_from_local_source(&source, &source_sri)
             .unwrap();
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         let (first, second) = tokio::join!(
             coordinator.validate_object(source_sri.clone(), Arc::clone(&store)),
@@ -898,7 +931,7 @@ mod tests {
         store
             .populate_object_from_local_source(&source, &second_sri)
             .unwrap();
-        let coordinator = Arc::new(WorkspaceMaterializationCoordinator::new(true));
+        let coordinator = Arc::new(WorkspaceMaterializationCoordinator::new(Vec::new()));
         coordinator.publish_union_object_candidates([first_sri.clone(), second_sri.clone()]);
         coordinator.start_union_object_validation(Arc::clone(&store));
         let first_request = [first_sri.as_str()];
@@ -967,7 +1000,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         let (first, second) = tokio::join!(
             coordinator.materialize_link(
@@ -1049,7 +1082,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let coordinator = WorkspaceMaterializationCoordinator::new(true);
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
 
         let (direct, transitive) = tokio::join!(
             coordinator.materialize_link(direct_plan, Arc::new(direct_target), Arc::clone(&store)),
@@ -1116,7 +1149,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let coordinator = Arc::new(WorkspaceMaterializationCoordinator::new(true));
+        let coordinator = Arc::new(WorkspaceMaterializationCoordinator::new(Vec::new()));
         let semaphore = coordinator.v2_link_task_semaphore();
 
         let (first, second) = scope(Arc::clone(&coordinator), async move {
