@@ -538,17 +538,17 @@ pub(in crate::commands::install) async fn run(
             let plan =
                 lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
                     project_dir,
-                    v2_targets.clone(),
+                    v2_targets,
                     store_v2,
                     linker_mode,
                     compatibility_bin_names,
                 )?;
             stage_timings.v2_prepare_ms = v2_prepare_start.elapsed().as_millis();
             let v2_index_start = Instant::now();
-            let target_by_key: HashMap<String, lpm_linker::v2::V2Target> = install_packages
+            let target_by_key: HashMap<String, Arc<lpm_linker::v2::V2Target>> = install_packages
                 .iter()
-                .zip(v2_targets)
-                .map(|(package, target)| (install_pkg_key(package), target))
+                .zip(&plan.augmented_targets)
+                .map(|(package, target)| (install_pkg_key(package), Arc::clone(target)))
                 .collect();
             stage_timings.v2_index_ms = v2_index_start.elapsed().as_millis();
             Some((Arc::new(plan), target_by_key))
@@ -606,7 +606,8 @@ pub(in crate::commands::install) async fn run(
                 target,
                 Arc::clone(store_v2),
                 Arc::clone(&v2_link_task_semaphore),
-            ));
+                workspace_materialization::current(),
+            )?);
         }
     }
     let fetch_ms = fetch_start.elapsed().as_millis();
@@ -1074,9 +1075,7 @@ async fn finish_v2_event_driven_link(
     let mut materialized = Vec::with_capacity(v2_link_handles.len());
     let mut linked = 0usize;
     for handle in v2_link_handles.drain(..) {
-        let task = handle.await.map_err(|e| {
-            LpmError::Registry(format!("experimental v2 link task panicked: {e}"))
-        })??;
+        let task = handle.wait().await?;
         if timing_detail_mode.trace() {
             let package_display =
                 format!("{}@{}", task.materialized.name, task.materialized.version);

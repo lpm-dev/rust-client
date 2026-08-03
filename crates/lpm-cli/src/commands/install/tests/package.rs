@@ -60,15 +60,14 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     let (object_dir, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
 
     let mut pkg = fake_pkg("cache-hit", "1.0.0", true);
-    pkg.integrity = Some(sri);
-    let key = install_pkg_key(&pkg);
+    pkg.integrity = Some(sri.clone());
 
     let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
         .await
         .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
-    assert_eq!(prevalidation.hits.len(), 1);
+    assert_eq!(prevalidation.hit_count, 1);
     assert!(prevalidation.concurrency >= 1);
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.hit_count, 1);
@@ -78,8 +77,7 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     );
     assert_eq!(prevalidation.validation_timings.snapshot_hit_count, 0);
     let hit = prevalidation
-        .hits
-        .get(&key)
+        .reusable(&sri)
         .expect("prevalidation must return the v2 object hit");
     assert_eq!(hit.path, object_dir);
     assert!(hit.object_integrity.as_str().starts_with("sha256-"));
@@ -106,7 +104,7 @@ async fn prevalidate_v2_reusable_objects_source_policy_trusts_tampered_registry_
         .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
-    assert_eq!(prevalidation.hits.len(), 1);
+    assert_eq!(prevalidation.hit_count, 1);
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.hit_count, 1);
     assert_eq!(prevalidation.validation_timings.removed_count, 0);
@@ -137,7 +135,7 @@ async fn prevalidate_v2_reusable_objects_tree_policy_removes_tampered_registry_o
         .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
-    assert!(prevalidation.hits.is_empty());
+    assert_eq!(prevalidation.hit_count, 0);
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.miss_count, 1);
     assert_eq!(prevalidation.validation_timings.removed_count, 1);

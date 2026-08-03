@@ -129,7 +129,7 @@ pub(super) fn build_v2_targets(
             ))
         })?;
         v2_targets.push(lpm_linker::v2::V2Target {
-            target: target.clone(),
+            target: Arc::new(target.clone()),
             source_sri: sri,
             verified_object_integrity: None,
             fresh_object: None,
@@ -232,9 +232,7 @@ pub(super) async fn prepare_v2_link_tasks(
     let mut linked_count = 0usize;
     let started = Instant::now();
     for handle in handles {
-        let task = handle
-            .await
-            .map_err(|error| LpmError::Registry(format!("v2 link task panicked: {error}")))??;
+        let task = handle.wait().await?;
         let package_display = timing_detail_mode
             .trace()
             .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));

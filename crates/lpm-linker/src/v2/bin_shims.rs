@@ -2,6 +2,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lpm_common::LpmError;
 use lpm_store::v2::Store;
@@ -101,7 +102,7 @@ fn reconcile_bin_dir(bin_dir: &Path, desired: &HashSet<String>) -> Result<(), Lp
 /// hoisted-mode v1 only emits direct-dep shims either.
 pub(super) fn create_bin_links_v2(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     compatibility_links: &CompatibilityLinks,

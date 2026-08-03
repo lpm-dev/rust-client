@@ -2095,6 +2095,112 @@ async fn cold_recursive_install_runs_one_union_resolution_for_compatible_importe
     );
 }
 
+async fn assert_recursive_workspace_materialization_processes_shared_registry_rows_once(
+    disable_union_resolution: bool,
+) {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("shared-dep", "1.0.0")]).await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    if disable_union_resolution {
+        std::fs::write(project.home().join(".npmrc"), "strict-ssl=false\n")
+            .expect("write TLS-customized npmrc");
+    }
+    for member in ["first", "second"] {
+        project.write_file(
+            &format!("packages/{member}/package.json"),
+            &format!(
+                r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"shared-dep":"1.0.0"}}}}"#,
+            ),
+        );
+    }
+
+    let seed = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed the workspace store and lockfile");
+    assert_install_succeeded(&seed, "workspace seed install should succeed");
+    let expected_lockfile = project.read_file("lpm.lock");
+
+    for path in [
+        project.path().join("node_modules"),
+        project.path().join("packages/first/node_modules"),
+        project.path().join("packages/second/node_modules"),
+        project.path().join(".lpm"),
+    ] {
+        if path.exists() {
+            std::fs::remove_dir_all(&path)
+                .unwrap_or_else(|error| panic!("remove {}: {error}", path.display()));
+        }
+    }
+    for path in [
+        project.path().join("lpm.lock"),
+        project.path().join("lpm.lockb"),
+    ] {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .unwrap_or_else(|error| panic!("remove {}: {error}", path.display()));
+        }
+    }
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("RUST_LOG", "lpm=debug")
+        .arg("--verbose")
+        .arg("install")
+        .arg("--recursive")
+        .arg("--json")
+        .arg("--timing")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("rerun the union workspace against the warm store");
+    assert_install_succeeded(&output, "warm union workspace install should succeed");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recursive install must emit JSON");
+    let targets = report["targets"]
+        .as_array()
+        .expect("recursive report must contain targets");
+    let sum_fetch_count = |field: &str| {
+        targets
+            .iter()
+            .filter_map(|target| target["timing"]["detail"]["fetch"]["counts"][field].as_u64())
+            .sum::<u64>()
+    };
+
+    assert_eq!(
+        sum_fetch_count("v2_reusable_candidate_count"),
+        1,
+        "the shared store object should be validated once per workspace: {report:#}",
+    );
+    assert_eq!(
+        sum_fetch_count("link_dispatch_count"),
+        1,
+        "the shared graph key should be dispatched once per workspace: {report:#}",
+    );
+    assert_eq!(project.read_file("lpm.lock"), expected_lockfile);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.contains("workspace union resolution completed"),
+        !disable_union_resolution,
+        "the fixture must exercise the intended resolver mode: {stderr}",
+    );
+}
+
+#[tokio::test]
+async fn recursive_workspace_materialization_processes_union_rows_once() {
+    assert_recursive_workspace_materialization_processes_shared_registry_rows_once(false).await;
+}
+
+#[tokio::test]
+async fn recursive_workspace_materialization_processes_independent_rows_once() {
+    assert_recursive_workspace_materialization_processes_shared_registry_rows_once(true).await;
+}
+
 #[tokio::test]
 async fn failed_member_refresh_keeps_the_root_lockfile_byte_identical() {
     let mock = MockRegistry::start().await;

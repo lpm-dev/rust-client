@@ -687,6 +687,15 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
         match resolved {
             Ok(lpm_resolver::WorkspaceResolveOutcome::Projected(projected)) => {
                 let projected_count = projected.iter().filter(|result| result.is_some()).count();
+                if let Some(materialization) = super::workspace_materialization::current() {
+                    materialization.publish_union_object_candidates(
+                        projected
+                            .iter()
+                            .flatten()
+                            .flat_map(|result| result.packages.iter())
+                            .filter_map(|package| package.integrity.clone()),
+                    );
+                }
                 tracing::debug!(
                     importers = projected.len(),
                     projected = projected_count,

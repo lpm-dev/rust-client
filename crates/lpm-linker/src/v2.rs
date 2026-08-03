@@ -78,8 +78,8 @@ mod reconcile;
 use self::bin_shims::create_bin_links_v2;
 pub use self::compat_island::project_compatibility_bins_ready;
 use self::compat_island::{create_project_compatibility_links, normalize_compatibility_bin_names};
-pub use self::keymap::KeyMap;
 use self::keymap::derive_graph_keys;
+pub use self::keymap::{GraphKeyCache, KeyMap};
 #[cfg(all(test, unix))]
 use self::reconcile::symlink_points_to;
 use self::reconcile::{
@@ -94,7 +94,7 @@ use self::reconcile::{
 #[derive(Debug, Clone)]
 pub struct V2Target {
     /// Same identity surface as v1.
-    pub target: LinkTarget,
+    pub target: Arc<LinkTarget>,
     /// SRI of the source tarball. Required to locate the object dir
     /// at `<HOME>/.lpm/store/v2/objects/<sri>/`.
     pub source_sri: String,
@@ -122,7 +122,7 @@ pub struct LinkPlanV2 {
     /// Targets after [`ensure_peer_context`] resolved any missing
     /// peer-context (lockfile fast-path fallback). The same slice
     /// downstream phases iterate.
-    pub augmented_targets: Vec<V2Target>,
+    pub augmented_targets: Vec<Arc<V2Target>>,
     /// `(name, version, wrapper_id) → GraphKey` lookup table populated
     /// by [`derive_graph_keys`]. Read-only for the per-package and
     /// finalize phases.
@@ -402,6 +402,26 @@ pub fn link_v2_prepare_with_compatibility_bin_names(
         linker_mode,
         PeerContextMode::DeriveMissing,
         compatibility_bin_names,
+        None,
+    )
+}
+
+pub fn link_v2_prepare_with_compatibility_bin_names_and_graph_key_cache(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    compatibility_bin_names: &[String],
+    graph_key_cache: &GraphKeyCache,
+) -> Result<LinkPlanV2, LpmError> {
+    link_v2_prepare_inner(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        PeerContextMode::DeriveMissing,
+        compatibility_bin_names,
+        Some(graph_key_cache),
     )
 }
 
@@ -445,6 +465,26 @@ pub fn link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_nam
         linker_mode,
         PeerContextMode::TrustTargets,
         compatibility_bin_names,
+        None,
+    )
+}
+
+pub fn link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names_and_graph_key_cache(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    compatibility_bin_names: &[String],
+    graph_key_cache: &GraphKeyCache,
+) -> Result<LinkPlanV2, LpmError> {
+    link_v2_prepare_inner(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        PeerContextMode::TrustTargets,
+        compatibility_bin_names,
+        Some(graph_key_cache),
     )
 }
 
@@ -460,6 +500,7 @@ fn link_v2_prepare_inner(
     linker_mode: LinkerMode,
     peer_context: PeerContextMode,
     compatibility_bin_names: &[String],
+    graph_key_cache: Option<&GraphKeyCache>,
 ) -> Result<LinkPlanV2, LpmError> {
     // Top-level linker-stage span. Visible in Tracy with
     // `--features tracy`; filtered at INFO level so it's essentially
@@ -474,7 +515,9 @@ fn link_v2_prepare_inner(
         LinkerMode::Isolated => LinkerModeTag::Isolated,
         LinkerMode::Hoisted => LinkerModeTag::Hoisted,
     };
-    let key_map = derive_graph_keys(&augmented_targets[..], &platform, linker_tag)?;
+    let augmented_targets: Vec<Arc<V2Target>> =
+        augmented_targets.into_iter().map(Arc::new).collect();
+    let key_map = derive_graph_keys(&augmented_targets, &platform, linker_tag, graph_key_cache)?;
     let meta_platform = Arc::new(LinkMetaPlatform {
         os: platform.os.clone(),
         cpu: platform.cpu.clone(),
@@ -764,7 +807,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         // Sorted for deterministic GraphKey hashing — must match the
         // sort applied by the resolver-threaded path.
         derived.sort_by(|a, b| a.0.cmp(&b.0));
-        v2t.target.peers = derived;
+        Arc::make_mut(&mut v2t.target).peers = derived;
     }
     Ok(())
 }

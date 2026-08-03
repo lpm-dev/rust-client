@@ -305,6 +305,13 @@ pub(super) async fn run_online_fetch_phase(
     let fetch_plan_start = Instant::now();
     let mut fetch_stage_timings = FetchStageTimings::default();
     let v2_link_task_timings = V2LinkTaskTimings::default();
+    let workspace_coordinator = workspace_materialization::current();
+    if !force
+        && let (Some(coordinator), Some(store_v2)) =
+            (workspace_coordinator.as_ref(), store_v2_handle.as_ref())
+    {
+        coordinator.start_union_object_validation(Arc::clone(store_v2));
+    }
     let preclassification_overlap_drain = if fetch_overlap_join
         .as_ref()
         .is_some_and(FetchOverlapJoin::workspace_shared)
@@ -378,7 +385,6 @@ pub(super) async fn run_online_fetch_phase(
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
     if v2_mode {
-        let workspace_coordinator = workspace_materialization::current();
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_mode implies v2 store handle is available");
@@ -391,7 +397,7 @@ pub(super) async fn run_online_fetch_phase(
             }
             let sri = local_source_sri_for_target(target);
             if let Some(coordinator) = workspace_coordinator.as_ref() {
-                coordinator
+                let population = coordinator
                     .populate_local_source(
                         target.store_path.clone(),
                         sri,
@@ -402,8 +408,10 @@ pub(super) async fn run_online_fetch_phase(
                         ),
                     )
                     .await?;
+                fetch_stage_timings.local_source_count += u64::from(population.performed);
             } else {
                 store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+                fetch_stage_timings.local_source_count += 1;
             }
         }
     }
@@ -451,7 +459,7 @@ pub(super) async fn run_online_fetch_phase(
             match lt.materialization {
                 lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
                     Some(sri) => acc.push(lpm_linker::v2::V2Target {
-                        target: lt.clone(),
+                        target: Arc::new(lt.clone()),
                         source_sri: sri.to_string(),
                         verified_object_integrity: None,
                         fresh_object: None,
@@ -463,7 +471,7 @@ pub(super) async fn run_online_fetch_phase(
                 },
                 lpm_linker::Materialization::DirectorySource => {
                     acc.push(lpm_linker::v2::V2Target {
-                        target: lt.clone(),
+                        target: Arc::new(lt.clone()),
                         source_sri: local_source_sri_for_target(lt),
                         verified_object_integrity: None,
                         fresh_object: None,
@@ -508,60 +516,60 @@ pub(super) async fn run_online_fetch_phase(
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_event_driven implies v2 store");
-        let plan = if used_lockfile && lockfile_peer_context_authoritative {
-            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
-                project_dir,
-                v2_targets_pre,
-                store_v2,
-                linker_mode,
-                compatibility_bin_names,
-            )?
-        } else {
-            lpm_linker::v2::link_v2_prepare_with_compatibility_bin_names(
-                project_dir,
-                v2_targets_pre,
-                store_v2,
-                linker_mode,
-                compatibility_bin_names,
-            )?
+        let plan = match (
+            used_lockfile && lockfile_peer_context_authoritative,
+            workspace_coordinator.as_deref(),
+        ) {
+            (true, Some(coordinator)) => lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names_and_graph_key_cache(
+                    project_dir,
+                    v2_targets_pre,
+                    store_v2,
+                    linker_mode,
+                    compatibility_bin_names,
+                    coordinator.graph_key_cache(),
+                )?,
+            (true, None) => lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
+                    project_dir,
+                    v2_targets_pre,
+                    store_v2,
+                    linker_mode,
+                    compatibility_bin_names,
+                )?,
+            (false, Some(coordinator)) => lpm_linker::v2::link_v2_prepare_with_compatibility_bin_names_and_graph_key_cache(
+                    project_dir,
+                    v2_targets_pre,
+                    store_v2,
+                    linker_mode,
+                    compatibility_bin_names,
+                    coordinator.graph_key_cache(),
+                )?,
+            (false, None) => lpm_linker::v2::link_v2_prepare_with_compatibility_bin_names(
+                    project_dir,
+                    v2_targets_pre,
+                    store_v2,
+                    linker_mode,
+                    compatibility_bin_names,
+                )?,
         };
         Some(std::sync::Arc::new(plan))
     } else {
         None
     };
-    let v2_target_by_key: std::collections::HashMap<String, lpm_linker::v2::V2Target> =
-        if v2_event_driven {
-            packages
-                .iter()
-                .zip(link_targets.iter())
-                .filter_map(|(p, lt)| {
-                    let sri = match lt.materialization {
-                        lpm_linker::Materialization::CasBacked => {
-                            p.integrity.as_deref()?.to_string()
-                        }
-                        lpm_linker::Materialization::DirectorySource => {
-                            local_source_sri_for_target(lt)
-                        }
-                    };
-                    Some((
-                        install_pkg_key(p),
-                        lpm_linker::v2::V2Target {
-                            target: lt.clone(),
-                            source_sri: sri,
-                            verified_object_integrity: None,
-                            fresh_object: None,
-                        },
-                    ))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+    let v2_target_by_key: std::collections::HashMap<String, Arc<lpm_linker::v2::V2Target>> =
+        v2_plan
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, |plan| {
+                packages
+                    .iter()
+                    .zip(&plan.augmented_targets)
+                    .map(|(package, target)| (install_pkg_key(package), Arc::clone(target)))
+                    .collect()
+            });
 
     // Per-package v2 link handles populated by both the cache-hit
     // short-circuits below and the fetch tasks further down. Drained
     // at the link stage and folded into the LinkResult.
-    let v2_link_task_semaphore = workspace_materialization::current().map_or_else(
+    let v2_link_task_semaphore = workspace_coordinator.as_ref().map_or_else(
         || {
             Arc::new(Semaphore::new(v2_link_task_concurrency(
                 v2_target_by_key.len(),
@@ -577,28 +585,17 @@ pub(super) async fn run_online_fetch_phase(
             Some(store_v2) => {
                 prevalidate_v2_reusable_objects(&packages, std::sync::Arc::clone(store_v2)).await?
             }
-            None => V2ReusablePrevalidation {
-                hits: HashMap::new(),
-                candidate_count: 0,
-                concurrency: 0,
-                validation_timings: V2ReusableValidationTimings::default(),
-            },
+            None => V2ReusablePrevalidation::empty(),
         }
     } else {
-        V2ReusablePrevalidation {
-            hits: HashMap::new(),
-            candidate_count: 0,
-            concurrency: 0,
-            validation_timings: V2ReusableValidationTimings::default(),
-        }
+        V2ReusablePrevalidation::empty()
     };
     fetch_stage_timings.v2_reusable_prevalidate_ms = v2_prevalidate_start.elapsed().as_millis();
     fetch_stage_timings.v2_reusable_candidate_count =
         v2_reusable_prevalidation.candidate_count as u64;
     fetch_stage_timings.v2_reusable_concurrency = v2_reusable_prevalidation.concurrency as u64;
-    fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation.hits.len() as u64;
+    fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation.hit_count as u64;
     fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
-    let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
     // The v1 event-driven path mutates project-local wrappers, so recursive
     // resolve-ahead disables it until the deterministic commit turn.
@@ -637,7 +634,7 @@ pub(super) async fn run_online_fetch_phase(
             p.source_kind(),
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
-        if is_local_source {
+        if is_local_source && !v2_mode {
             fetch_stage_timings.local_source_count += 1;
         }
 
@@ -655,13 +652,15 @@ pub(super) async fn run_online_fetch_phase(
                         .as_ref()
                         .expect("v2_event_driven implies v2 store"),
                 );
-                fetch_stage_timings.link_dispatch_count += 1;
-                v2_event_link_handles.push(spawn_v2_link_task(
+                let handle = spawn_v2_link_task(
                     plan_arc,
                     target,
                     store_arc,
                     Arc::clone(&v2_link_task_semaphore),
-                ));
+                    workspace_coordinator.clone(),
+                )?;
+                fetch_stage_timings.link_dispatch_count += u64::from(handle.dispatched());
+                v2_event_link_handles.push(handle);
                 record_timing_detail_ms(
                     &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                     link_dispatch_start,
@@ -690,7 +689,10 @@ pub(super) async fn run_online_fetch_phase(
         if !force
             && v2_mode
             && !is_local_source
-            && let Some(reusable_object) = v2_reusable_objects.get(&package_key)
+            && let Some(reusable_object) = p
+                .integrity
+                .as_deref()
+                .and_then(|source_sri| v2_reusable_prevalidation.reusable(source_sri))
         {
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
@@ -703,7 +705,7 @@ pub(super) async fn run_online_fetch_phase(
                 && let Some(target) = v2_target_by_key.get(&package_key).cloned()
             {
                 let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
-                let mut target = target;
+                let mut target = (*target).clone();
                 target.verified_object_integrity = Some(reusable_object.object_integrity.clone());
                 let plan_arc = std::sync::Arc::clone(plan);
                 let store_arc = std::sync::Arc::clone(
@@ -711,13 +713,15 @@ pub(super) async fn run_online_fetch_phase(
                         .as_ref()
                         .expect("v2_event_driven implies v2 store"),
                 );
-                fetch_stage_timings.link_dispatch_count += 1;
-                v2_event_link_handles.push(spawn_v2_link_task(
+                let handle = spawn_v2_link_task(
                     plan_arc,
-                    target,
+                    Arc::new(target),
                     store_arc,
                     Arc::clone(&v2_link_task_semaphore),
-                ));
+                    workspace_coordinator.clone(),
+                )?;
+                fetch_stage_timings.link_dispatch_count += u64::from(handle.dispatched());
+                v2_event_link_handles.push(handle);
                 record_timing_detail_ms(
                     &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                     link_dispatch_start,
@@ -776,13 +780,15 @@ pub(super) async fn run_online_fetch_phase(
                                 .as_ref()
                                 .expect("v2_event_driven implies v2 store"),
                         );
-                        fetch_stage_timings.link_dispatch_count += 1;
-                        v2_event_link_handles.push(spawn_v2_link_task(
+                        let handle = spawn_v2_link_task(
                             plan_arc,
                             target,
                             store_arc,
                             Arc::clone(&v2_link_task_semaphore),
-                        ));
+                            workspace_coordinator.clone(),
+                        )?;
+                        fetch_stage_timings.link_dispatch_count += u64::from(handle.dispatched());
+                        v2_event_link_handles.push(handle);
                         record_timing_detail_ms(
                             &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                             link_dispatch_start,
@@ -1656,6 +1662,7 @@ pub(super) async fn run_online_fetch_phase(
                 None
             };
             let v2_link_task_semaphore_c = Arc::clone(&v2_link_task_semaphore);
+            let workspace_coordinator_c = workspace_coordinator.clone();
             let spec_tracker_c = spec_tracker.clone();
             // Resolve this package's patch fingerprint outside the move
             // closure so the closure doesn't carry the whole map. `None` for
@@ -1766,16 +1773,17 @@ pub(super) async fn run_online_fetch_phase(
                                 store_v2_ref.as_ref(),
                             ) {
                                 let plan_c = std::sync::Arc::clone(plan);
-                                let mut target_c = target.clone();
+                                let mut target_c = (**target).clone();
                                 target_c.verified_object_integrity =
                                     Some(reusable_object.object_integrity);
                                 let store_c = std::sync::Arc::clone(store_v2);
                                 Some(spawn_v2_link_task(
                                     plan_c,
-                                    target_c,
+                                    Arc::new(target_c),
                                     store_c,
                                     Arc::clone(&v2_link_task_semaphore_c),
-                                ))
+                                    workspace_coordinator_c.clone(),
+                                )?)
                             } else {
                                 None
                             };
@@ -1845,7 +1853,8 @@ pub(super) async fn run_online_fetch_phase(
                                 target_c,
                                 store_c,
                                 Arc::clone(&v2_link_task_semaphore_c),
-                            ))
+                                workspace_coordinator_c.clone(),
+                            )?)
                         } else {
                             None
                         };
@@ -1955,7 +1964,7 @@ pub(super) async fn run_online_fetch_phase(
                         store_v2_ref.as_ref(),
                     ) {
                         let plan_c = std::sync::Arc::clone(plan);
-                        let mut target_c = target.clone();
+                        let mut target_c = (**target).clone();
                         if let Some(object) = fresh_object {
                             target_c.source_sri = computed_sri.clone();
                             target_c.fresh_object = Some(object);
@@ -1963,10 +1972,11 @@ pub(super) async fn run_online_fetch_phase(
                         let store_c = std::sync::Arc::clone(store_v2);
                         Some(spawn_v2_link_task(
                             plan_c,
-                            target_c,
+                            Arc::new(target_c),
                             store_c,
                             Arc::clone(&v2_link_task_semaphore_c),
-                        ))
+                            workspace_coordinator_c,
+                        )?)
                     } else {
                         None
                     };
@@ -2007,6 +2017,7 @@ pub(super) async fn run_online_fetch_phase(
             // Funnel v2 link handles emitted by the fetch tasks into the same
             // drain queue the cache-hit branches above feed.
             if let Some(lh) = v2_link_h {
+                fetch_stage_timings.link_dispatch_count += u64::from(lh.dispatched());
                 v2_event_link_handles.push(lh);
             }
             if let Some(url) = final_url {

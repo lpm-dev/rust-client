@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lpm_common::LpmError;
 use lpm_common::symlink::{
@@ -41,7 +42,7 @@ pub(super) fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
 
 pub(super) fn reconcile_project_node_modules(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     self_package_name: Option<&str>,
     preserve_internal_lpm_dir: bool,
 ) -> Result<(), LpmError> {
@@ -138,7 +139,7 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
 /// into the v2 store's link package dirs.
 pub(super) fn create_root_symlinks(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
 ) -> Result<usize, LpmError> {

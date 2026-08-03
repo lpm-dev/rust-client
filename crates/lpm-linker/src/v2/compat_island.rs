@@ -197,7 +197,7 @@ pub(super) fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
 
 pub(super) fn create_project_compatibility_links(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     compatibility_bin_names: &[String],
@@ -282,7 +282,7 @@ fn build_compat_island_at(
 #[cfg(not(target_os = "macos"))]
 fn create_project_compatibility_links_in_place(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
@@ -313,7 +313,7 @@ fn create_project_compatibility_links_in_place(
 #[cfg(target_os = "macos")]
 fn create_project_compatibility_links_store_cached(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
@@ -541,7 +541,7 @@ pub(super) fn normalize_compatibility_bin_names(bin_names: &[String]) -> Vec<Str
 }
 
 fn collect_compatibility_roots_for_bins<'a>(
-    targets: &'a [V2Target],
+    targets: &'a [Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     requested_bins: &[String],
@@ -603,10 +603,10 @@ fn collect_compatibility_roots_for_bins<'a>(
                     .iter()
                     .any(|(cmd_name, _)| requested.contains(cmd_name.as_str()))
                 {
-                    roots.push(v2t);
+                    roots.push(v2t.as_ref());
                 }
             }
-            None => roots.push(v2t),
+            None => roots.push(v2t.as_ref()),
         }
     }
     roots
@@ -614,13 +614,13 @@ fn collect_compatibility_roots_for_bins<'a>(
 
 fn collect_compatibility_entries<'a>(
     roots: Vec<&'a V2Target>,
-    targets: &'a [V2Target],
+    targets: &'a [Arc<V2Target>],
     key_map: &KeyMap,
 ) -> Result<Vec<CompatibilityEntry<'a>>, LpmError> {
     let mut targets_by_key_dir: HashMap<String, &V2Target> = HashMap::with_capacity(targets.len());
     for v2t in targets {
         if let Some(key) = key_map.get_for(&v2t.target) {
-            targets_by_key_dir.insert(key.dir_name().to_string(), v2t);
+            targets_by_key_dir.insert(key.dir_name().to_string(), v2t.as_ref());
         }
     }
 
@@ -1111,7 +1111,7 @@ fn compatibility_marker(entry: &CompatibilityEntry<'_>) -> String {
 
 fn rewire_project_roots_to_compat(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     key_map: &KeyMap,
     compatibility_links: &CompatibilityLinks,
 ) -> Result<(), LpmError> {
