@@ -201,8 +201,10 @@ pub(super) fn run_online_lockfile_write_phase(
             input.lockfile_path,
             "write",
         )?);
-        lpm_lockfile::ensure_gitattributes(input.project_dir)
-            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+        if !workspace_lockfile::active() {
+            lpm_lockfile::ensure_gitattributes(input.project_dir)
+                .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+        }
         return Ok(result);
     }
 
@@ -403,6 +405,9 @@ fn write_lockfile_and_measure(
     verb: &str,
 ) -> Result<u128, LpmError> {
     let lockfile_write_start = Instant::now();
+    if workspace_lockfile::stage(lockfile) {
+        return Ok(lockfile_write_start.elapsed().as_millis());
+    }
     lockfile
         .write_all(lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to {verb} lockfile: {e}")))?;
@@ -623,8 +628,8 @@ pub(super) fn prepare_lockfile_drift_state(input: LockfileDriftInput<'_>) -> Loc
         );
     }
 
-    let pre_install_direct_versions = if lockfile_path.exists() {
-        lpm_lockfile::Lockfile::read_fast(lockfile_path)
+    let pre_install_direct_versions = if workspace_lockfile::exists(lockfile_path) {
+        workspace_lockfile::read(lockfile_path)
             .ok()
             .map(|lf| collect_locked_direct_versions(pkg, &lf))
             .unwrap_or_default()
@@ -1952,13 +1957,14 @@ pub(super) fn try_lockfile_fast_path(
     // unconditionally rejected the lockfile entry.
     accept_unsafe_sources: bool,
 ) -> Option<LockfileFastPath> {
-    if !lpm_lockfile::Lockfile::exists(lockfile_path) {
+    if !workspace_lockfile::exists(lockfile_path) {
         return None;
     }
 
-    let mut lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+    let mut lockfile = workspace_lockfile::read(lockfile_path).ok()?;
 
-    let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
+    let needs_binary_upgrade =
+        !workspace_lockfile::active() && binary_lockfile_needs_writeback(lockfile_path, &lockfile);
 
     if !lockfile_satisfies_fast_path(
         &lockfile,

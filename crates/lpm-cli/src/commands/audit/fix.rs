@@ -48,14 +48,10 @@ pub async fn run_fix(
     json_output: bool,
     dry_run: bool,
 ) -> Result<(), LpmError> {
-    lpm_common::with_exclusive_lock_async(
-        lpm_common::project_install_lock(project_dir),
-        run_fix_under_project_lock(client, project_dir, json_output, dry_run),
-    )
-    .await
+    run_fix_inner(client, project_dir, json_output, dry_run).await
 }
 
-async fn run_fix_under_project_lock(
+async fn run_fix_inner(
     client: &RegistryClient,
     project_dir: &Path,
     json_output: bool,
@@ -100,9 +96,9 @@ async fn run_fix_under_project_lock(
             "`lpm audit fix` cannot safely choose patched versions because the OSV scan degraded: {reason}"
         )));
     }
-    let lockfile_path = project_dir.join("lpm.lock");
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
+    let project_lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
         .map_err(|e| LpmError::Script(format!("failed to read lpm.lock: {e}")))?;
+    let lockfile = project_lockfile.lockfile;
 
     let mut vulns_by_instance: HashMap<(String, String), Vec<&OsvVulnerability>> = HashMap::new();
     for vuln in &osv_outcome.vulns {
@@ -265,41 +261,73 @@ async fn run_fix_under_project_lock(
         return Ok(());
     }
 
-    let lockfile_binary_path = project_dir.join("lpm.lockb");
-    let install_hash_path = project_dir.join(".lpm").join("install-hash");
-    apply_audit_fixes_to_manifest(&mut doc, &planned)?;
-    let updated_content = serde_json::to_string_pretty(&doc)
-        .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
+    let project_dirs = [project_dir.to_path_buf()];
+    let fix_result =
+        crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
+            project_dir,
+            &project_dirs,
+            async {
+                if !crate::commands::install::workspace_lockfile::project_lockfile_unchanged(
+                    project_dir,
+                    Some(&lockfile),
+                )
+                .map_err(|error| {
+                    LpmError::Script(format!(
+                        "failed to re-read lpm.lock before applying audit fixes: {error}"
+                    ))
+                })? {
+                    return Err(LpmError::Script(
+                        "lpm.lock changed while audit fixes were being planned; no changes were applied"
+                            .into(),
+                    ));
+                }
 
-    let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
-        &[(pkg_json_path.as_path(), original_content.as_slice())],
-        &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
-        &[install_hash_path.as_path()],
-    )
-    .map_err(|error| {
-        LpmError::Script(format!(
-            "package.json changed while audit fix was planning; no changes were applied: {error}"
-        ))
-    })?;
+                let lockfile_path =
+                    crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+                let lockfile_binary_path = lockfile_path.with_extension("lockb");
+                let install_hash_path = project_dir.join(".lpm").join("install-hash");
+                let transaction =
+                    crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
+                        &[(pkg_json_path.as_path(), original_content.as_slice())],
+                        &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
+                        &[install_hash_path.as_path()],
+                    )
+                    .map_err(|error| {
+                        LpmError::Script(format!(
+                            "package.json changed while audit fix was planning; no changes were applied: {error}"
+                        ))
+                    })?;
 
-    lpm_common::write_file_atomic(&pkg_json_path, format!("{updated_content}\n"))
-        .map_err(LpmError::Io)?;
+                apply_audit_fixes_to_manifest(&mut doc, &planned)?;
+                let updated_content = serde_json::to_string_pretty(&doc).map_err(|e| {
+                    LpmError::Script(format!("failed to serialize package.json: {e}"))
+                })?;
+                lpm_common::write_file_atomic(&pkg_json_path, format!("{updated_content}\n"))
+                    .map_err(LpmError::Io)?;
 
-    audit_fix_remove_optional_file(&lockfile_path)?;
-    audit_fix_remove_optional_file(&lockfile_binary_path)?;
+                if !crate::commands::install::workspace_lockfile::mutation_active() {
+                    audit_fix_remove_optional_file(&lockfile_path)?;
+                    audit_fix_remove_optional_file(&lockfile_binary_path)?;
+                }
 
-    let install_result =
-        crate::commands::install::run_silent_for_audit_fix(client, project_dir).await;
+                if let Err(error) =
+                    crate::commands::install::run_silent_for_audit_fix(client, project_dir).await
+                {
+                    if !json_output {
+                        install_ui::warn("install failed — restored original package.json");
+                    }
+                    return Err(error);
+                }
+                verify_audit_fixes(client, project_dir, &planned).await?;
+                crate::commands::install::workspace_lockfile::commit_manifest_transaction(
+                    transaction,
+                );
+                Ok(())
+            },
+        )
+        .await;
 
-    if let Err(err) = install_result {
-        if !json_output {
-            install_ui::warn("install failed — restored original package.json");
-        }
-        return Err(err);
-    }
-
-    verify_audit_fixes(client, project_dir, &planned).await?;
-    tx.commit();
+    fix_result?;
 
     emit_audit_fix_report(
         &planned,
@@ -641,8 +669,7 @@ async fn verify_audit_fixes(
     project_dir: &Path,
     fixes: &[AuditFixPlan],
 ) -> Result<(), LpmError> {
-    let lockfile_path = project_dir.join("lpm.lock");
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
+    let lockfile = crate::commands::install::workspace_lockfile::read_project(project_dir)
         .map_err(|error| LpmError::Script(format!("failed to verify updated lpm.lock: {error}")))?;
 
     for fix in fixes.iter() {

@@ -2729,3 +2729,235 @@ fn legacy_find_package_returns_some_match_under_collision() {
     let found = lf.find_package("react");
     assert!(found.is_some());
 }
+
+fn importer_lockfile(package_name: &str, peer_version: &str) -> Lockfile {
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        name: package_name.to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        peers: vec![format!("runtime@{peer_version}")],
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        package_name.to_string(),
+        LockedRootResolution {
+            package: package_name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+    lockfile
+        .importers
+        .insert(".".to_string(), ImporterSnapshot::default());
+    lockfile
+}
+
+#[test]
+fn workspace_union_round_trips_distinct_importer_peer_contexts() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/one", importer_lockfile("plugin", "1.0.0"))
+        .unwrap();
+    union
+        .absorb_importer("packages/two", importer_lockfile("plugin", "2.0.0"))
+        .unwrap();
+
+    assert_eq!(union.workspace_packages.len(), 2);
+    let encoded = union.to_toml().expect("serialize workspace union");
+    let decoded = Lockfile::from_toml(&encoded).expect("parse workspace union");
+    assert_eq!(decoded, union);
+    assert_eq!(
+        decoded.project_importer("packages/one").unwrap().packages[0].peers,
+        ["runtime@1.0.0"]
+    );
+    assert_eq!(
+        decoded.project_importer("packages/two").unwrap().packages[0].peers,
+        ["runtime@2.0.0"]
+    );
+}
+
+#[test]
+fn workspace_union_serialization_is_independent_of_importer_insertion_order() {
+    let mut forward = Lockfile::new();
+    forward
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    forward
+        .absorb_importer("packages/b", importer_lockfile("b", "2.0.0"))
+        .unwrap();
+
+    let mut reverse = Lockfile::new();
+    reverse
+        .absorb_importer("packages/b", importer_lockfile("b", "2.0.0"))
+        .unwrap();
+    reverse
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+
+    assert_eq!(forward.to_toml().unwrap(), reverse.to_toml().unwrap());
+}
+
+#[test]
+fn workspace_union_rejects_missing_duplicate_and_unreachable_package_ids() {
+    let mut missing = Lockfile::new();
+    missing
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    missing
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages[0] = format!("sha256:{}", "00".repeat(32));
+    assert!(missing.to_toml().is_err(), "missing package id must fail");
+
+    let mut duplicate = Lockfile::new();
+    duplicate
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    let id = duplicate.importers["packages/a"].locked_packages[0].clone();
+    duplicate
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages
+        .push(id);
+    assert!(
+        duplicate.to_toml().is_err(),
+        "duplicate package id must fail"
+    );
+
+    let mut unreachable = Lockfile::new();
+    unreachable
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    unreachable
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages
+        .clear();
+    assert!(
+        unreachable.to_toml().is_err(),
+        "unreachable package row must fail"
+    );
+}
+
+#[test]
+fn workspace_union_rejects_parent_traversal_importer_paths() {
+    let error = Lockfile::new()
+        .absorb_importer("../outside", importer_lockfile("a", "1.0.0"))
+        .expect_err("parent traversal importer must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid workspace importer path")
+    );
+}
+
+#[test]
+fn read_for_project_returns_the_nearest_workspace_importer_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    std::fs::create_dir_all(&member).unwrap();
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let projected = Lockfile::read_for_project(&member).unwrap();
+    assert_eq!(projected.importer, "packages/app");
+    assert_eq!(projected.path, directory.path().join(LOCKFILE_NAME));
+    assert_eq!(projected.lockfile.packages[0].name, "app-dep");
+}
+
+#[test]
+fn read_for_project_anchors_nested_directories_at_the_nearest_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    let nested = member.join("src/components");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let projected = Lockfile::read_for_project(&nested).unwrap();
+    assert_eq!(projected.importer, "packages/app");
+    assert_eq!(projected.lockfile.packages[0].name, "app-dep");
+}
+
+#[test]
+fn read_for_project_prefers_the_authoritative_workspace_projection_over_a_legacy_member_lockfile() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    importer_lockfile("legacy-dep", "1.0.0")
+        .write_to_file(&member.join(LOCKFILE_NAME))
+        .unwrap();
+
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("root-dep", "2.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let projected = Lockfile::read_for_project(&member).unwrap();
+    assert_eq!(projected.path, directory.path().join(LOCKFILE_NAME));
+    assert_eq!(projected.importer, "packages/app");
+    assert_eq!(projected.lockfile.packages[0].name, "root-dep");
+}
+
+#[test]
+fn write_for_project_replaces_only_the_member_projection_and_prunes_old_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("packages/first");
+    let second = directory.path().join("packages/second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/first", importer_lockfile("old", "1.0.0"))
+        .unwrap();
+    union
+        .absorb_importer("packages/second", importer_lockfile("kept", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    Lockfile::write_for_project(&first, importer_lockfile("new", "2.0.0")).unwrap();
+    let owner = Lockfile::read_from_file(&directory.path().join(LOCKFILE_NAME)).unwrap();
+    assert_eq!(
+        owner.project_importer("packages/first").unwrap().packages[0].name,
+        "new"
+    );
+    assert_eq!(
+        owner.project_importer("packages/second").unwrap().packages[0].name,
+        "kept"
+    );
+    assert!(
+        owner
+            .workspace_packages
+            .values()
+            .all(|package| package.name != "old")
+    );
+}

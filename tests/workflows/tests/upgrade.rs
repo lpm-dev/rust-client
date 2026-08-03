@@ -747,6 +747,98 @@ async fn upgrade_writes_new_range_to_manifest_and_lockfile() {
     );
 }
 
+#[tokio::test]
+async fn workspace_member_upgrade_preserves_the_sibling_root_lockfile_projection() {
+    let pkg = "@lpm.dev/owner.workspace-upgrade";
+    let project = TempProject::empty(
+        r#"{
+  "name": "upgrade-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        &format!(
+            "{{\n  \"name\": \"upgrade-app\",\n  \"version\": \"1.0.0\",\n  \
+             \"private\": true,\n  \"dependencies\": {{\n    \"{pkg}\": \"^1.0.0\"\n  }}\n}}\n"
+        ),
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{"name":"upgrade-sibling","version":"1.0.0","private":true}"#,
+    );
+
+    let mut app_projection = lpm_lockfile::Lockfile::new();
+    app_projection.add_package(lpm_lockfile::LockedPackage {
+        name: pkg.into(),
+        version: "1.0.0".into(),
+        source: Some("registry+https://lpm.dev".into()),
+        ..Default::default()
+    });
+    let mut sibling_projection = lpm_lockfile::Lockfile::new();
+    sibling_projection.patches.insert(
+        "sibling@1.0.0".into(),
+        lpm_lockfile::LockfilePatch {
+            path: "patches/sibling.patch".into(),
+            sha256: "sha256-sibling".into(),
+            original_integrity: "sha512-sibling".into(),
+        },
+    );
+    let mut root_lockfile = lpm_lockfile::Lockfile::new();
+    root_lockfile
+        .absorb_importer(".", lpm_lockfile::Lockfile::new())
+        .unwrap();
+    root_lockfile
+        .absorb_importer("packages/app", app_projection)
+        .unwrap();
+    root_lockfile
+        .absorb_importer("packages/sibling", sibling_projection)
+        .unwrap();
+    root_lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+    let sibling_before = root_lockfile.project_importer("packages/sibling").unwrap();
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_pkg(&mock, pkg, "2.0.0").await;
+    let app_dir = project.path().join("packages/app");
+    let output = lpm_with_registry(&project, &mock.url())
+        .current_dir(&app_dir)
+        .args(["upgrade", "-y", "--major"])
+        .output()
+        .expect("upgrade workspace member dependency");
+    assert!(
+        output.status.success(),
+        "workspace member upgrade failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let app_manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/package.json")).unwrap();
+    assert_eq!(
+        app_manifest["dependencies"][pkg],
+        serde_json::json!("^2.0.0")
+    );
+    let updated_root = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert_eq!(
+        updated_root
+            .project_importer("packages/app")
+            .unwrap()
+            .find_package(pkg)
+            .map(|package| package.version.as_str()),
+        Some("2.0.0")
+    );
+    assert_eq!(
+        updated_root.project_importer("packages/sibling").unwrap(),
+        sibling_before
+    );
+    assert!(!app_dir.join("lpm.lock").exists());
+    assert!(!app_dir.join("lpm.lockb").exists());
+}
+
 /// Minified `package.json` input (`"name":"value"` with no space after
 /// the colon) must still be upgraded correctly. The pre-fix
 /// string-replace rewrite only matched `"name": "value"` and silently

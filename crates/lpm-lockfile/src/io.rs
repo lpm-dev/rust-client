@@ -1,8 +1,82 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{LOCKFILE_VERSION, Lockfile, LockfileError, binary};
 
 impl Lockfile {
+    /// Read the lockfile view for a project, resolving a workspace member to
+    /// its importer projection in the nearest ancestor union lockfile.
+    pub fn read_for_project(project_dir: &Path) -> Result<ProjectLockfile, LockfileError> {
+        let project_root = project_dir
+            .ancestors()
+            .find(|ancestor| ancestor.join("package.json").is_file())
+            .unwrap_or(project_dir);
+        let mut local = None;
+        for root in project_root.ancestors() {
+            let path = root.join(crate::LOCKFILE_NAME);
+            if !path.exists() {
+                continue;
+            }
+            if root == project_root {
+                local = Some(Self::read_fast(&path).and_then(|lockfile| {
+                    Ok(ProjectLockfile {
+                        path,
+                        importer: ".".to_string(),
+                        lockfile: lockfile.project_importer(".")?,
+                    })
+                }));
+                continue;
+            }
+            let lockfile = Self::read_fast(&path)?;
+            let relative = project_root.strip_prefix(root).map_err(|error| {
+                LockfileError::Io(format!(
+                    "failed to derive importer path below {}: {error}",
+                    root.display()
+                ))
+            })?;
+            let Some(importer) = importer_path(relative) else {
+                continue;
+            };
+            if !lockfile.importers.contains_key(&importer) {
+                continue;
+            }
+            return Ok(ProjectLockfile {
+                path,
+                lockfile: lockfile.project_importer(&importer)?,
+                importer,
+            });
+        }
+        if let Some(local) = local {
+            return local;
+        }
+        Err(LockfileError::NotFound(format!(
+            "no {} found for {}",
+            crate::LOCKFILE_NAME,
+            project_dir.display()
+        )))
+    }
+
+    /// Atomically write a standalone project view back to its owning
+    /// workspace union, or to the local lockfile for standalone projects.
+    pub fn write_for_project(
+        project_dir: &Path,
+        lockfile: Lockfile,
+    ) -> Result<PathBuf, LockfileError> {
+        match Self::read_for_project(project_dir) {
+            Ok(project) => {
+                let mut owner = Self::read_fast(&project.path)?;
+                owner.replace_importer(&project.importer, lockfile)?;
+                owner.write_all(&project.path)?;
+                Ok(project.path)
+            }
+            Err(LockfileError::NotFound(_)) => {
+                let path = project_dir.join(crate::LOCKFILE_NAME);
+                lockfile.write_all(&path)?;
+                Ok(path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Serialize to TOML string.
     ///
     /// **Writer guard:** refuses to serialize a Lockfile whose package
@@ -13,12 +87,14 @@ impl Lockfile {
     /// [`Lockfile::from_toml`]'s reader gate; together they make a
     /// bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
+        self.validate_workspace_projections()
+            .map_err(|error| LockfileError::Serialize(error.to_string()))?;
         self.validate_provenance()
             .map_err(LockfileError::Serialize)?;
         if let Some(reason) = self.git_schema_error() {
             return Err(LockfileError::Serialize(reason));
         }
-        for pkg in &self.packages {
+        for pkg in self.packages.iter().chain(self.workspace_packages.values()) {
             if !pkg.tarball_field_hint_is_consistent() {
                 return Err(LockfileError::InvalidTarballHint {
                     package: pkg.name.clone(),
@@ -48,6 +124,7 @@ impl Lockfile {
         if let Some(reason) = lockfile.git_schema_error() {
             return Err(LockfileError::Deserialize(reason));
         }
+        lockfile.validate_workspace_projections()?;
 
         // Reject empty-string optional fields at the TOML layer,
         // matching the binary writer's rejection. Without this, a
@@ -56,7 +133,11 @@ impl Lockfile {
         // later in `write_all` when the binary writer's
         // `insert_optional` helper fires. Failing loud at the parse
         // boundary avoids that asymmetric late failure.
-        for pkg in &lockfile.packages {
+        for pkg in lockfile
+            .packages
+            .iter()
+            .chain(lockfile.workspace_packages.values())
+        {
             if let Some(s) = pkg.source.as_deref()
                 && s.is_empty()
             {
@@ -171,6 +252,25 @@ impl Lockfile {
     pub fn exists(path: &Path) -> bool {
         path.exists()
     }
+}
+
+/// A project-local view and the physical lockfile that owns it.
+pub struct ProjectLockfile {
+    pub path: PathBuf,
+    pub importer: String,
+    pub lockfile: Lockfile,
+}
+
+fn importer_path(relative: &Path) -> Option<String> {
+    let mut importer = String::new();
+    for component in relative.components() {
+        let value = component.as_os_str().to_str()?;
+        if !importer.is_empty() {
+            importer.push('/');
+        }
+        importer.push_str(value);
+    }
+    (!importer.is_empty()).then_some(importer)
 }
 
 /// Ensure `.gitattributes` marks `lpm.lockb` as binary.

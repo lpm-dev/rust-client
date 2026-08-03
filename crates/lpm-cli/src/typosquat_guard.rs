@@ -478,8 +478,9 @@ fn locked_in_every_root(name: &str, roots: &[BTreeSet<String>]) -> bool {
 }
 
 fn locked_direct_names(project_dir: &Path) -> BTreeSet<String> {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
+    let Ok(lockfile) =
+        lpm_lockfile::Lockfile::read_for_project(project_dir).map(|project| project.lockfile)
+    else {
         return BTreeSet::new();
     };
     let Some(importer) = lockfile.importers.get(".") else {

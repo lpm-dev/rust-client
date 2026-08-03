@@ -135,6 +135,10 @@ pub(super) fn peer_issues_json_value(
 }
 
 pub(super) fn lockfile_has_auto_isolated_peer_conflicts(lockfile_path: &Path) -> bool {
+    if workspace_lockfile::active() {
+        return workspace_lockfile::read(lockfile_path)
+            .is_ok_and(|lockfile| lockfile.metadata.auto_isolated_peer_conflicts);
+    }
     let Ok(file) = File::open(lockfile_path) else {
         return false;
     };

@@ -366,7 +366,7 @@ fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
 fn fresh_lockfiles_use_current_schema_version() {
     assert_eq!(
         lpm_lockfile::LOCKFILE_VERSION,
-        lpm_lockfile::LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+        lpm_lockfile::LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
     );
     let lf = lpm_lockfile::Lockfile::new();
     assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);

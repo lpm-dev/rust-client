@@ -431,9 +431,28 @@ fn mark_lockfile_package_as_public_npm(project: &TempProject, package: &str) {
     let lockfile_path = project.path().join("lpm.lock");
     let mut lockfile =
         lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read lpm.lock fixture");
-    for locked in &mut lockfile.packages {
-        if locked.name == package {
-            locked.source = Some("registry+https://registry.npmjs.org".to_string());
+    if !lockfile.workspace_packages.is_empty()
+        || lockfile.importers.keys().any(|importer| importer != ".")
+    {
+        let importers = lockfile.importers.keys().cloned().collect::<Vec<_>>();
+        for importer in importers {
+            let mut projection = lockfile.project_importer(&importer).unwrap();
+            let mut changed = false;
+            for locked in &mut projection.packages {
+                if locked.name == package {
+                    locked.source = Some("registry+https://registry.npmjs.org".to_string());
+                    changed = true;
+                }
+            }
+            if changed {
+                lockfile.replace_importer(&importer, projection).unwrap();
+            }
+        }
+    } else {
+        for locked in &mut lockfile.packages {
+            if locked.name == package {
+                locked.source = Some("registry+https://registry.npmjs.org".to_string());
+            }
         }
     }
     lockfile
@@ -997,6 +1016,135 @@ async fn audit_fix_updates_vulnerable_direct_dependency_and_reinstalls_lockfile(
 }
 
 #[tokio::test]
+async fn workspace_member_audit_fix_preserves_the_sibling_root_lockfile_projection() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "audit-fix-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"audit-app","version":"1.0.0","private":true,"dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{"name":"audit-sibling","version":"1.0.0","private":true}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    let vulnerable = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "vuln-pkg",
+            "version": "1.0.0",
+            "license": "MIT",
+            "main": "index.js"
+        }),
+        &[],
+    );
+    let fixed = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "vuln-pkg",
+            "version": "1.0.1",
+            "license": "MIT",
+            "main": "index.js"
+        }),
+        &[],
+    );
+    mock.with_full_package_metadata(
+        "vuln-pkg",
+        "1.0.1",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(vulnerable)),
+            ("1.0.1", serde_json::json!({}), Some(fixed)),
+        ],
+    )
+    .await;
+    let app_dir = project.path().join("packages/app");
+    lpm_with_registry(&project, &mock.url())
+        .current_dir(&app_dir)
+        .args([
+            "install",
+            "--no-recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut root_lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    let mut sibling_projection = lpm_lockfile::Lockfile::new();
+    sibling_projection.patches.insert(
+        "sibling@1.0.0".into(),
+        lpm_lockfile::LockfilePatch {
+            path: "patches/sibling.patch".into(),
+            sha256: "sha256-sibling".into(),
+            original_integrity: "sha512-sibling".into(),
+        },
+    );
+    root_lockfile
+        .absorb_importer("packages/sibling", sibling_projection)
+        .unwrap();
+    root_lockfile.write_all(&lockfile_path).unwrap();
+    let sibling_before = root_lockfile.project_importer("packages/sibling").unwrap();
+
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-workspace-fix",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    let requests_before = mock.server().received_requests().await.unwrap().len();
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.current_dir(&app_dir);
+    command.env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()));
+    let output = command
+        .args(["--json", "audit", "fix"])
+        .output()
+        .expect("apply audit fix from workspace member");
+    assert!(
+        output.status.success(),
+        "workspace audit fix failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests[requests_before..].iter().any(|request| {
+            request.url.path() == "/v1/querybatch"
+                && String::from_utf8_lossy(&request.body).contains("\"version\":\"1.0.1\"")
+        }),
+        "workspace audit-fix verification must scan the staged importer projection"
+    );
+
+    let updated = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    assert_eq!(
+        updated
+            .project_importer("packages/app")
+            .unwrap()
+            .find_package("vuln-pkg")
+            .map(|package| package.version.as_str()),
+        Some("1.0.1")
+    );
+    assert_eq!(
+        updated.project_importer("packages/sibling").unwrap(),
+        sibling_before
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&project.read_file("packages/app/package.json"))
+            .unwrap()["dependencies"]["vuln-pkg"],
+        "1.0.1"
+    );
+    assert!(!app_dir.join("lpm.lock").exists());
+    assert!(!app_dir.join("lpm.lockb").exists());
+}
+
+#[tokio::test]
 async fn audit_fix_apply_installs_the_exact_version_reported_by_dry_run() {
     let project = TempProject::empty(
         r#"{"name":"audit-fix-exact-target","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
@@ -1533,7 +1681,7 @@ async fn audit_fix_rolls_back_when_installed_target_remains_vulnerable() {
 }
 
 #[tokio::test]
-async fn audit_fix_waits_for_the_project_install_transaction_lock() {
+async fn audit_fix_plans_before_waiting_for_the_project_install_transaction_lock() {
     let project = TempProject::empty(
         r#"{"name":"audit-fix-lock","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
     );
@@ -1549,15 +1697,20 @@ async fn audit_fix_waits_for_the_project_install_transaction_lock() {
     command.args(["--json", "audit", "fix"]);
     let mut child = command.spawn().unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if mock.server().received_requests().await.unwrap().len() > requests_before {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit fix did not begin read-only planning while the mutation lock was held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(
         child.try_wait().unwrap().is_none(),
-        "audit fix must wait while another install transaction holds the project lock"
-    );
-    assert_eq!(
-        mock.server().received_requests().await.unwrap().len(),
-        requests_before,
-        "audit fix must acquire the project lock before its audit/planning network calls"
+        "audit fix must wait before mutating while another install transaction holds the project lock"
     );
 
     drop(lock);

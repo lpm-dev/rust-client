@@ -674,14 +674,10 @@ fn load_lockfile_integrity_for_verify(deep: bool) -> (HashMap<String, String>, O
             );
         }
     };
-    let lockfile_path = cwd.join("lpm.lock");
-    if !lockfile_path.exists() {
-        return (HashMap::new(), None);
-    }
-
-    match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
-        Ok(lockfile) => {
-            let integrity = lockfile
+    match lpm_lockfile::Lockfile::read_for_project(&cwd) {
+        Ok(project) => {
+            let integrity = project
+                .lockfile
                 .packages
                 .iter()
                 .filter_map(|package| {
@@ -695,6 +691,7 @@ fn load_lockfile_integrity_for_verify(deep: bool) -> (HashMap<String, String>, O
                 .collect();
             (integrity, None)
         }
+        Err(lpm_lockfile::LockfileError::NotFound(_)) => (HashMap::new(), None),
         Err(e) => (
             HashMap::new(),
             Some(format!(

@@ -13,6 +13,7 @@ mod support;
 
 use support::TempProject;
 use support::lpm;
+use support::workspace_projection_project;
 
 const HOSTILE_GRAPH_FIELD: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
@@ -37,6 +38,26 @@ fn assert_hostile_graph_field_is_inline_safe(context: &str, rendered: &str) {
 /// fixture into a TempProject keeps each test isolated.
 fn graph_fixture() -> TempProject {
     TempProject::from_fixture("graph-project")
+}
+
+#[test]
+fn graph_from_workspace_member_excludes_sibling_lockfile_projection() {
+    let project = workspace_projection_project();
+    let mut command = lpm(&project);
+    command.current_dir(project.path().join("packages/app"));
+    let output = command
+        .args(["graph", "--format", "json"])
+        .output()
+        .expect("run graph from workspace member");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "member graph must succeed:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("app-only"), "member graph: {stdout}");
+    assert!(!stdout.contains("sibling-only"), "member graph: {stdout}");
 }
 
 // ─── bare `lpm graph` (tree default): --json error envelope ──────────

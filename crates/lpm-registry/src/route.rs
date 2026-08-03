@@ -27,7 +27,7 @@ const JSR_NPM_REGISTRY_URL: &str = "https://npm.jsr.io";
 ///
 /// `@lpm.dev/*` packages are unaffected by this setting — they always
 /// route through the LPM Worker for auth + batched cost attribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum RouteMode {
     /// Fetch non-`@lpm.dev/*` packages via the LPM Worker. Internal
     /// debug knob only.
@@ -37,6 +37,15 @@ pub enum RouteMode {
     /// `registry.npmjs.org`. Default — matches `npm`/`yarn`/`pnpm`/`bun`.
     #[default]
     Direct,
+}
+
+/// Credential-free route identity used to decide whether workspace importer
+/// requests may share one resolver traversal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspaceResolutionKey {
+    mode: RouteMode,
+    default_registry: Option<String>,
+    scope_registries: Vec<(String, String)>,
 }
 
 /// The concrete upstream selected for a single package.
@@ -281,6 +290,32 @@ impl RouteTable {
             && self.npmrc.scope_registries.is_empty()
             && self.npmrc.origin_auth.is_empty()
             && self.npmrc.tls.is_empty()
+    }
+
+    /// Return an equivalence key for resolver inputs that may safely share a
+    /// workspace union. Credentialed or TLS-customized routes stay isolated;
+    /// unauthenticated registry URLs and scope mappings participate in the key.
+    pub fn workspace_resolution_key(&self) -> Option<WorkspaceResolutionKey> {
+        if !self.npmrc.origin_auth.is_empty() || !self.npmrc.tls.is_empty() {
+            return None;
+        }
+
+        let mut scope_registries = self
+            .npmrc
+            .scope_registries
+            .iter()
+            .map(|(scope, target)| (scope.clone(), target.base_url.to_string()))
+            .collect::<Vec<_>>();
+        scope_registries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Some(WorkspaceResolutionKey {
+            mode: self.mode,
+            default_registry: self
+                .npmrc
+                .default_registry
+                .as_ref()
+                .map(|target| target.base_url.to_string()),
+            scope_registries,
+        })
     }
 
     /// The **request-aware effective-origin set** for
@@ -683,6 +718,33 @@ mod tests {
     fn make_table(npmrc_content: &str, mode: RouteMode) -> RouteTable {
         let npmrc = NpmrcConfig::parse(npmrc_content, "test", &no_env);
         RouteTable::new(mode, npmrc).expect("npmrc clean")
+    }
+
+    #[test]
+    fn workspace_resolution_key_is_independent_of_scope_declaration_order() {
+        let first = make_table(
+            "@one:registry=https://one.internal/\n@two:registry=https://two.internal/\n",
+            RouteMode::Direct,
+        );
+        let second = make_table(
+            "@two:registry=https://two.internal/\n@one:registry=https://one.internal/\n",
+            RouteMode::Direct,
+        );
+
+        assert_eq!(
+            first.workspace_resolution_key(),
+            second.workspace_resolution_key(),
+        );
+    }
+
+    #[test]
+    fn workspace_resolution_key_rejects_credentialed_routes() {
+        let table = make_table(
+            "registry=https://registry.internal/\n//registry.internal/:_authToken=secret\n",
+            RouteMode::Direct,
+        );
+
+        assert_eq!(table.workspace_resolution_key(), None);
     }
 
     /// Empty top-level → empty effective set, no matter what's in

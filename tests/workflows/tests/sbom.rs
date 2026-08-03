@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, workspace_projection_project};
 
 fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -87,6 +87,36 @@ fn seed_project() -> TempProject {
         }"#,
     );
     project
+}
+
+#[test]
+fn sbom_from_workspace_member_excludes_sibling_lockfile_projection() {
+    let project = workspace_projection_project();
+    let mut command = lpm(&project);
+    command.current_dir(project.path().join("packages/app"));
+    let output = command.args(["sbom"]).output().expect("run member SBOM");
+
+    assert!(
+        output.status.success(),
+        "member SBOM must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("SBOM stdout must be valid JSON");
+    let components = document["components"]
+        .as_array()
+        .expect("CycloneDX components must be an array");
+    assert!(
+        components
+            .iter()
+            .any(|component| component["name"] == "app-only")
+    );
+    assert!(
+        !components
+            .iter()
+            .any(|component| component["name"] == "sibling-only")
+    );
 }
 
 #[test]

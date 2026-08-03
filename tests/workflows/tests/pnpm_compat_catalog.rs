@@ -1385,6 +1385,64 @@ async fn catalog_show_resolved_json_reports_lockfile_catalog_snapshot() {
 }
 
 #[test]
+fn catalog_show_resolved_aggregates_member_projections_from_the_workspace_lockfile() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "catalog-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "catalogs": {
+                "default": { "is-positive": "^2.0.0" }
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "catalog-app",
+            "version": "1.0.0",
+            "dependencies": { "is-positive": "catalog:" }
+        }"#,
+    );
+    let mut app = lpm_lockfile::Lockfile::new();
+    app.catalogs
+        .entry("default".to_string())
+        .or_default()
+        .insert(
+            "is-positive".to_string(),
+            lpm_lockfile::CatalogSnapshotEntry {
+                specifier: "^2.0.0".to_string(),
+                version: "2.0.0".to_string(),
+                reference: "catalog:".to_string(),
+            },
+        );
+    let mut union = lpm_lockfile::Lockfile::new();
+    union
+        .absorb_importer("packages/app", app)
+        .expect("absorb catalog importer");
+    union
+        .write_all(&project.path().join("lpm.lock"))
+        .expect("write workspace lockfile");
+
+    let output = lpm(&project)
+        .args(["--json", "catalog", "show", "--resolved"])
+        .output()
+        .expect("show resolved workspace catalogs");
+    assert!(
+        output.status.success(),
+        "catalog show must aggregate importer snapshots:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("catalog output must be JSON");
+    assert_eq!(envelope["count"], 1);
+    assert_eq!(envelope["entries"][0]["package"], "is-positive");
+    assert_eq!(envelope["entries"][0]["version"], "2.0.0");
+}
+
+#[test]
 fn catalog_show_resolved_rejects_lockfile_missing_referenced_catalog_snapshot() {
     let project = TempProject::empty(
         r#"{
@@ -1596,8 +1654,9 @@ fn run_install_json(project: &TempProject, mock: &MockRegistry, packages: &[&str
 }
 
 fn resolved_version(project: &TempProject, package: &str) -> String {
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
-        .expect("lpm.lock parses");
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project.path())
+        .expect("lpm.lock parses")
+        .lockfile;
     lockfile
         .packages
         .iter()
@@ -1608,9 +1667,9 @@ fn resolved_version(project: &TempProject, package: &str) -> String {
 }
 
 fn resolved_version_at(project: &TempProject, rel_dir: &str, package: &str) -> String {
-    let lockfile =
-        lpm_lockfile::Lockfile::read_fast(&project.path().join(rel_dir).join("lpm.lock"))
-            .expect("lpm.lock parses");
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(&project.path().join(rel_dir))
+        .expect("lpm.lock parses")
+        .lockfile;
     lockfile
         .packages
         .iter()
@@ -1669,8 +1728,9 @@ fn catalog_snapshot_entry_optional(
     catalog: &str,
     package: &str,
 ) -> Option<lpm_lockfile::CatalogSnapshotEntry> {
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
-        .expect("lpm.lock parses");
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project.path())
+        .expect("lpm.lock parses")
+        .lockfile;
     lockfile
         .catalogs
         .get(catalog)
@@ -1684,9 +1744,9 @@ fn catalog_snapshot_entry_at(
     catalog: &str,
     package: &str,
 ) -> lpm_lockfile::CatalogSnapshotEntry {
-    let lockfile =
-        lpm_lockfile::Lockfile::read_fast(&project.path().join(rel_dir).join("lpm.lock"))
-            .expect("lpm.lock parses");
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(&project.path().join(rel_dir))
+        .expect("lpm.lock parses")
+        .lockfile;
     lockfile
         .catalogs
         .get(catalog)

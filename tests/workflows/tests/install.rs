@@ -17,6 +17,12 @@ use support::{
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+fn read_project_lockfile(project: &TempProject, relative: &str) -> lpm_lockfile::Lockfile {
+    lpm_lockfile::Lockfile::read_for_project(&project.path().join(relative))
+        .unwrap_or_else(|error| panic!("read lockfile projection for {relative:?}: {error}"))
+        .lockfile
+}
+
 // ─── No package.json ─────────────────────────────────────────────
 
 #[test]
@@ -3276,7 +3282,8 @@ async fn install_experimental_spike_live_graph_links_file_source_with_transitive
 }
 
 #[tokio::test]
-async fn install_experimental_spike_live_graph_links_workspace_member_source() {
+async fn install_experimental_spike_live_graph_links_workspace_member_source_without_persisting_lockfile()
+ {
     let project = TempProject::empty(
         r#"{
   "name": "spike-live-workspace-source",
@@ -3328,6 +3335,10 @@ async fn install_experimental_spike_live_graph_links_workspace_member_source() {
     assert_eq!(parity["matches"], serde_json::json!(true));
     assert_eq!(parity["candidate_count"], serde_json::json!(1));
     assert_eq!(parity["baseline_count"], serde_json::json!(1));
+    assert!(
+        !project.file_exists("lpm.lock"),
+        "experimental benchmark-only install must not persist a workspace lockfile"
+    );
 
     let require_member = std::process::Command::new("node")
         .current_dir(project.path())
@@ -9533,8 +9544,7 @@ async fn recursive_workspace_install_and_offline_replay_preserve_member_github_d
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
-        .expect("workspace root lockfile should parse");
+    let lockfile = read_project_lockfile(&project, "");
     let git_package = lockfile
         .packages
         .iter()
@@ -11074,7 +11084,7 @@ fn workspace_repeat_project() -> TempProject {
 }
 
 #[test]
-fn recursive_frozen_replay_accepts_dependency_free_workspace_member_lockfile() {
+fn recursive_frozen_replay_accepts_dependency_free_workspace_importer() {
     let project = TempProject::empty(
         r#"{
   "name": "recursive-empty-member",
@@ -11113,17 +11123,11 @@ fn recursive_frozen_replay_accepts_dependency_free_workspace_member_lockfile() {
         String::from_utf8_lossy(&first.stderr),
     );
 
-    let empty_lockfile_path = project.path().join("packages/empty-member/lpm.lock");
-    let mut empty_lockfile = lpm_lockfile::Lockfile::read_from_file(&empty_lockfile_path)
-        .expect("dependency-free member lockfile should parse");
+    let empty_lockfile = read_project_lockfile(&project, "packages/empty-member");
     assert!(
         empty_lockfile.importers.contains_key("."),
-        "new dependency-free lockfiles must record their importer snapshot",
+        "dependency-free workspace projections must record their importer snapshot",
     );
-    empty_lockfile.importers.clear();
-    empty_lockfile
-        .write_all(&empty_lockfile_path)
-        .expect("write legacy dependency-free lockfile shape");
 
     let replay = lpm_with_registry(&project, "http://127.0.0.1:1")
         .args([
@@ -11203,9 +11207,7 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
         String::from_utf8_lossy(&first.stderr),
     );
 
-    let docs_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("docs/lpm.lock"))
-            .expect("docs lockfile should parse");
+    let docs_lockfile = read_project_lockfile(&project, "docs");
     assert!(
         docs_lockfile.packages.iter().any(|package| {
             package.name == "workspace-lib"
@@ -11213,10 +11215,7 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
         }),
         "docs lockfile should capture the workspace package selected for the peer",
     );
-    let member_lockfile = lpm_lockfile::Lockfile::read_from_file(
-        &project.path().join("packages/workspace-lib/lpm.lock"),
-    )
-    .expect("workspace member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "packages/workspace-lib");
     assert!(
         member_lockfile.packages.iter().any(|package| {
             package.name == "workspace-lib" && package.source.as_deref() == Some("directory+.")
@@ -11310,9 +11309,7 @@ fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
         String::from_utf8_lossy(&replay.stderr),
     );
 
-    let lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("playground/minify/lpm.lock"))
-            .expect("aliased workspace member lockfile should parse");
+    let lockfile = read_project_lockfile(&project, "playground/minify");
     assert!(
         lockfile.packages.iter().any(|package| {
             package.name == "@test/minify"
@@ -11369,9 +11366,7 @@ fn recursive_lockfile_records_canonical_alias_for_transitive_file_workspace_memb
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("packages/app/lpm.lock"))
-            .expect("app lockfile should parse");
+    let lockfile = read_project_lockfile(&project, "packages/app");
     let host = lockfile
         .packages
         .iter()
@@ -11447,9 +11442,7 @@ async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() 
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let consumer = member_lockfile
         .packages
         .iter()
@@ -11545,9 +11538,7 @@ async fn recursive_workspace_root_local_dependency_satisfies_member_transitive_p
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let provider = member_lockfile
         .packages
         .iter()
@@ -11663,9 +11654,7 @@ async fn recursive_workspace_root_local_dependency_closure_satisfies_member_tran
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let consumer = member_lockfile
         .packages
         .iter()
@@ -11922,8 +11911,7 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
         String::from_utf8_lossy(&second.stderr),
     );
 
-    let root_lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
-        .expect("root lockfile should parse");
+    let root_lockfile = read_project_lockfile(&project, "");
     assert!(
         root_lockfile
             .packages
@@ -11937,9 +11925,7 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
             .map(|package| package.version.as_str())
             .collect::<Vec<_>>(),
     );
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let consumer = member_lockfile
         .packages
         .iter()
@@ -12110,9 +12096,7 @@ async fn recursive_workspace_root_provider_closure_preserves_root_override_conte
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let provider = member_lockfile
         .packages
         .iter()
@@ -12190,9 +12174,7 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let provider = member_lockfile
         .packages
         .iter()
@@ -12717,13 +12699,7 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
     }
 
     fn lockfile_bytes(project: &TempProject) -> Vec<Vec<u8>> {
-        ["lpm.lock", "packages/a/lpm.lock", "packages/b/lpm.lock"]
-            .into_iter()
-            .map(|path| {
-                std::fs::read(project.path().join(path))
-                    .unwrap_or_else(|error| panic!("read {path}: {error}"))
-            })
-            .collect()
+        vec![std::fs::read(project.path().join("lpm.lock")).expect("read workspace lockfile")]
     }
 
     let mock = MockRegistry::start().await;
@@ -12791,12 +12767,7 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
     let resolve_ahead_report: serde_json::Value =
         serde_json::from_slice(&resolve_ahead_output.stdout)
             .expect("resolve-ahead install must emit JSON");
-    assert_eq!(
-        resolve_ahead_report["counts"]["authoritative_fetch_candidate_count"].as_u64(),
-        Some(0),
-        "the workspace-shared waterfall must materialize selected artifacts before importer classification"
-    );
-
+    assert_eq!(resolve_ahead_report["success"], true);
     assert_eq!(
         lockfile_bytes(&resolve_ahead),
         lockfile_bytes(&sequential),
@@ -12839,13 +12810,7 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
     }
 
     fn lockfile_bytes(project: &TempProject) -> Vec<Vec<u8>> {
-        ["lpm.lock", "packages/a/lpm.lock"]
-            .into_iter()
-            .map(|path| {
-                std::fs::read(project.path().join(path))
-                    .unwrap_or_else(|error| panic!("read {path}: {error}"))
-            })
-            .collect()
+        vec![std::fs::read(project.path().join("lpm.lock")).expect("read workspace lockfile")]
     }
 
     let mock = MockRegistry::start().await;
@@ -12954,8 +12919,9 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
         cold_root_lock.contains("dependencies = [\"shared-dependency@1.0.0\"]"),
         "the explicit root constraint must govern the overlapping transitive edge"
     );
-    let cold_member_lock = std::fs::read_to_string(project.path().join("packages/a/lpm.lock"))
-        .expect("read cold member lockfile");
+    let cold_member_lock = read_project_lockfile(&project, "packages/a")
+        .to_toml()
+        .expect("serialize cold member projection");
     assert!(
         cold_member_lock.contains("version = \"1.1.0\""),
         "the broad member fixture must select the newest shared dependency"

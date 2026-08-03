@@ -630,6 +630,129 @@ fn patch_remove_removes_lockfile_patch_checksum_record() {
 }
 
 #[test]
+fn workspace_member_patch_commit_and_remove_change_only_its_root_projection() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "patch-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"patch-app","version":"1.0.0","private":true}"#,
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{"name":"patch-sibling","version":"1.0.0","private":true}"#,
+    );
+
+    let mut root_lockfile = lpm_lockfile::Lockfile::new();
+    root_lockfile
+        .absorb_importer(".", lpm_lockfile::Lockfile::new())
+        .unwrap();
+    root_lockfile
+        .absorb_importer("packages/app", lpm_lockfile::Lockfile::new())
+        .unwrap();
+    let mut sibling_projection = lpm_lockfile::Lockfile::new();
+    sibling_projection.patches.insert(
+        "sibling@1.0.0".into(),
+        lpm_lockfile::LockfilePatch {
+            path: "patches/sibling.patch".into(),
+            sha256: "sha256-sibling".into(),
+            original_integrity: "sha512-sibling".into(),
+        },
+    );
+    root_lockfile
+        .absorb_importer("packages/sibling", sibling_projection)
+        .unwrap();
+    root_lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+    let sibling_before = root_lockfile.project_importer("packages/sibling").unwrap();
+
+    seed_store_package(
+        &project,
+        "lodash",
+        "4.17.21",
+        &[("index.js", "module.exports = 'orig'\n")],
+    );
+    let app_dir = project.path().join("packages/app");
+    let extract = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .current_dir(&app_dir)
+        .args(["--json", "patch", "lodash@4.17.21"])
+        .output()
+        .expect("extract workspace member patch staging tree");
+    assert!(
+        extract.status.success(),
+        "workspace patch extraction failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&extract.stdout),
+        String::from_utf8_lossy(&extract.stderr),
+    );
+    let extract_json: serde_json::Value =
+        serde_json::from_slice(&extract.stdout).expect("parse patch extraction JSON");
+    let staging = PathBuf::from(extract_json["staging_dir"].as_str().unwrap());
+    std::fs::write(
+        staging.join("node_modules/lodash/index.js"),
+        "module.exports = 'patched'\n",
+    )
+    .unwrap();
+
+    let commit = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .current_dir(&app_dir)
+        .args(["--json", "patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("commit workspace member patch");
+    assert!(
+        commit.status.success(),
+        "workspace patch commit failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&commit.stdout),
+        String::from_utf8_lossy(&commit.stderr),
+    );
+
+    let after_commit = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert!(
+        after_commit
+            .project_importer("packages/app")
+            .unwrap()
+            .patches
+            .contains_key("lodash@4.17.21")
+    );
+    assert_eq!(
+        after_commit.project_importer("packages/sibling").unwrap(),
+        sibling_before
+    );
+    assert!(!app_dir.join("lpm.lock").exists());
+
+    let remove = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .current_dir(&app_dir)
+        .args(["--json", "patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("remove workspace member patch");
+    assert!(
+        remove.status.success(),
+        "workspace patch removal failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr),
+    );
+
+    let after_remove = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert!(
+        !after_remove
+            .project_importer("packages/app")
+            .unwrap()
+            .patches
+            .contains_key("lodash@4.17.21")
+    );
+    assert_eq!(
+        after_remove.project_importer("packages/sibling").unwrap(),
+        sibling_before
+    );
+    assert!(!app_dir.join("lpm.lockb").exists());
+}
+
+#[test]
 fn patch_remove_human_output_uses_slim_status_lines() {
     let project = TempProject::empty(
         r#"{

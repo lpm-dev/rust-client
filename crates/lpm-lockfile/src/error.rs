@@ -12,6 +12,9 @@ pub enum LockfileError {
     #[error("IO error: {0}")]
     Io(String),
 
+    #[error("lockfile not found: {0}")]
+    NotFound(String),
+
     /// A non-Registry source kind is paired with a `tarball`
     /// field-hint. The `tarball` field is a dist-URL cache valid only
     /// for Registry sources; for `Source::Tarball`, `Source::Git`,

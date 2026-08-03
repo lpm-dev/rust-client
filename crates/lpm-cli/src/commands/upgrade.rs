@@ -214,12 +214,9 @@ pub async fn run(
     )?;
 
     // Read lockfile ONCE
-    let lockfile_path = project_dir.join("lpm.lock");
-    let lockfile = if lockfile_path.exists() {
-        lpm_lockfile::Lockfile::read_fast(&lockfile_path).ok()
-    } else {
-        None
-    };
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .ok()
+        .map(|project| project.lockfile);
 
     let mut skipped_private: Vec<String> = Vec::new();
     let all_deps = filter_requested_deps(extract_deps_from_value(&doc), requested_packages)?;
@@ -578,102 +575,108 @@ pub async fn run(
     apply_upgrades_to_manifest(&mut doc, &deduped)?;
     let updated_content = serde_json::to_string_pretty(&doc)
         .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
+    let project_dirs = [project_dir.to_path_buf()];
+    let install_result =
+        crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
+            project_dir,
+            &project_dirs,
+            async {
+                if !crate::commands::install::workspace_lockfile::project_lockfile_unchanged(
+                    project_dir,
+                    lockfile.as_ref(),
+                )
+                .map_err(|error| {
+                    LpmError::Script(format!(
+                        "failed to re-read lpm.lock before applying upgrades: {error}"
+                    ))
+                })? {
+                    return Err(LpmError::Script(
+                        "lpm.lock changed while upgrades were being planned; no changes were applied"
+                            .into(),
+                    ));
+                }
 
-    let lockfile_backup = read_optional_file(&project_dir.join("lpm.lock"))?;
-    let lockfile_binary_backup = read_optional_file(&project_dir.join("lpm.lockb"))?;
+                let lockfile_path =
+                    crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+                let lockfile_binary_path = lockfile_path.with_extension("lockb");
+                let install_hash_path = project_dir.join(".lpm").join("install-hash");
+                let transaction =
+                    crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
+                        &[(pkg_json_path.as_path(), original_content.as_bytes())],
+                        &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
+                        &[install_hash_path.as_path()],
+                    )
+                    .map_err(|error| {
+                        LpmError::Script(format!(
+                            "package.json changed while upgrades were being planned; no changes were applied: {error}"
+                        ))
+                    })?;
 
-    lpm_common::write_file_atomic(&pkg_json_path, format!("{updated_content}\n"))
-        .map_err(|e| LpmError::Script(format!("failed to write package.json: {e}")))?;
+                lpm_common::write_file_atomic(
+                    &pkg_json_path,
+                    format!("{updated_content}\n"),
+                )
+                .map_err(|e| LpmError::Script(format!("failed to write package.json: {e}")))?;
 
-    // ── Run install with backup-and-restore ──────────────────────────
+                if !json_output {
+                    install_ui::phase("Installing upgraded dependencies");
+                }
 
-    if !json_output {
-        install_ui::phase("Installing upgraded dependencies");
-    }
+                if !crate::commands::install::workspace_lockfile::mutation_active() {
+                    remove_optional_file(&lockfile_path)?;
+                    remove_optional_file(&lockfile_binary_path)?;
+                }
 
-    remove_optional_file(&project_dir.join("lpm.lock"))?;
-    remove_optional_file(&project_dir.join("lpm.lockb"))?;
+                let install_result = crate::commands::install::run_with_options(
+                    client,
+                    project_dir,
+                    json_output,
+                    false, // offline
+                    crate::commands::install::FrozenLockfileMode::Never,
+                    false, // force
+                    false, // allow_new
+                    false, // strict_integrity
+                    false, // no_engine_strict
+                    None,  // strict_peer_dependencies_override
+                    None,  // linker_override
+                    crate::lpm_skills_config::LpmSkillsPreference::Config,
+                    false, // no_editor_setup
+                    false, // no_security_summary
+                    false, // auto_build
+                    None,  // target_set
+                    None,  // direct_versions_out
+                    None,  // requested_add_count: upgrade is not an add-path install
+                    None,  // script_policy_override: `lpm upgrade` does not expose policy flags
+                    None,  // advisor_override: `lpm upgrade` does not expose `--advisor`
+                    None,  // min_release_age_override: `lpm upgrade` uses the chain
+                    &[],
+                    crate::provenance_fetch::DriftIgnorePolicy::default(),
+                    crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+                    crate::commands::install::InstallOmitPolicy::default(),
+                    false, // strict_sandbox
+                    false, // no_sandbox
+                    false, // verbose: internal pipeline, no user-facing Done footer
+                    false, // audit_after_install: internal pipeline never runs audit
+                    false, // timing: upgrade does not expose install's --timing flag
+                    &[],
+                )
+                .await;
+                if let Err(error) = install_result {
+                    if !json_output {
+                        install_ui::warn("install failed — restored original package.json");
+                    }
+                    return Err(error);
+                }
 
-    let install_result = crate::commands::install::run_with_options(
-        client,
-        project_dir,
-        json_output,
-        false, // offline
-        crate::commands::install::FrozenLockfileMode::Never,
-        false, // force
-        false, // allow_new
-        false, // strict_integrity
-        false, // no_engine_strict
-        None,  // strict_peer_dependencies_override
-        None,  // linker_override
-        crate::lpm_skills_config::LpmSkillsPreference::Config,
-        false, // no_editor_setup
-        false, // no_security_summary
-        false, // auto_build
-        None,  // target_set
-        None,  // direct_versions_out
-        None,  // requested_add_count: upgrade is not an add-path install
-        None,  // script_policy_override: `lpm upgrade` does not expose policy flags
-        None,  // advisor_override: `lpm upgrade` does not expose `--advisor`
-        None,  // min_release_age_override: `lpm upgrade` uses the chain
-        &[],
-        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm upgrade` enforces drift
-        // `lpm upgrade` does not surface its own
-        // `--unverified-provenance{,-all}` flags; the verifier honors
-        // the operator-persistent posture chain (env + `[sigstore]
-        // verify` config) so an operator who set warn / off via
-        // `lpm install` gets the same posture here.
-        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-        crate::commands::install::InstallOmitPolicy::default(),
-        // `lpm upgrade` does not
-        // surface its own sandbox-mode flags. The chain inside
-        // `rebuild::run` still walks env / config / default, so
-        // users who configured strict persistently still get it.
-        false, // strict_sandbox
-        false, // no_sandbox
-        false, // verbose: internal pipeline, no user-facing Done footer
-        false, // audit_after_install: internal pipeline never runs audit
-        false, // timing: upgrade does not expose install's --timing flag
-        &[],
-    )
-    .await;
+                crate::commands::install::workspace_lockfile::commit_manifest_transaction(
+                    transaction,
+                );
+                Ok(())
+            },
+        )
+        .await;
 
-    if let Err(e) = install_result {
-        if let Err(restore_err) = std::fs::write(&pkg_json_path, &original_content) {
-            tracing::error!(
-                "failed to restore package.json after install failure: {}",
-                restore_err
-            );
-        } else if !json_output {
-            install_ui::warn("install failed — restored original package.json");
-        }
-
-        if let Err(restore_err) =
-            restore_optional_file(&project_dir.join("lpm.lock"), &lockfile_backup)
-        {
-            tracing::error!(
-                "failed to restore lpm.lock after install failure: {}",
-                restore_err
-            );
-        }
-        if let Err(restore_err) =
-            restore_optional_file(&project_dir.join("lpm.lockb"), &lockfile_binary_backup)
-        {
-            tracing::error!(
-                "failed to restore lpm.lockb after install failure: {}",
-                restore_err
-            );
-        }
-        if let Err(invalidate_err) =
-            remove_optional_file(&project_dir.join(".lpm").join("install-hash"))
-        {
-            tracing::error!(
-                "failed to invalidate .lpm/install-hash after install failure: {}",
-                invalidate_err
-            );
-        }
-        return Err(e);
-    }
+    install_result?;
 
     if !json_output {
         install_ui::done("Updated package.json, lpm.lock, node_modules");
@@ -689,17 +692,6 @@ pub async fn run(
     Ok(())
 }
 
-fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, LpmError> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(LpmError::Script(format!(
-            "failed to read {}: {err}",
-            path.display()
-        ))),
-    }
-}
-
 fn remove_optional_file(path: &Path) -> Result<(), LpmError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -708,17 +700,6 @@ fn remove_optional_file(path: &Path) -> Result<(), LpmError> {
             "failed to remove {}: {err}",
             path.display()
         ))),
-    }
-}
-
-fn restore_optional_file(path: &Path, backup: &Option<Vec<u8>>) -> std::io::Result<()> {
-    match backup {
-        Some(bytes) => std::fs::write(path, bytes),
-        None => match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        },
     }
 }
 

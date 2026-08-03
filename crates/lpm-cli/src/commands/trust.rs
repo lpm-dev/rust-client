@@ -383,14 +383,13 @@ fn compute_stale_keys(
 fn installed_names_from_lockfile(
     project_dir: &Path,
 ) -> Result<std::collections::HashSet<String>, LpmError> {
-    let lockfile_path = project_dir.join("lpm.lock");
-    if !lockfile_path.exists() {
-        return Err(LpmError::NotFound(
-            "no lpm.lock found — run `lpm install` before pruning trust entries".into(),
-        ));
-    }
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .map_err(|e| {
+            LpmError::NotFound(format!(
+                "no usable lpm.lock found — run `lpm install` before pruning trust entries: {e}"
+            ))
+        })?
+        .lockfile;
     Ok(lockfile.packages.into_iter().map(|p| p.name).collect())
 }
 
@@ -847,6 +846,7 @@ mod tests {
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            workspace_packages: Default::default(),
             catalogs: Default::default(),
             root_aliases: Default::default(),
             root_resolutions: Default::default(),
@@ -983,6 +983,7 @@ mod tests {
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            workspace_packages: Default::default(),
             catalogs: Default::default(),
             root_aliases: Default::default(),
             root_resolutions: Default::default(),
@@ -1027,6 +1028,7 @@ mod tests {
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            workspace_packages: Default::default(),
             catalogs: Default::default(),
             root_aliases: Default::default(),
             root_resolutions: Default::default(),
@@ -1064,6 +1066,7 @@ mod tests {
             patches: Default::default(),
             provenance: Default::default(),
             packages: vec![],
+            workspace_packages: Default::default(),
             catalogs: Default::default(),
             root_aliases: Default::default(),
             root_resolutions: Default::default(),

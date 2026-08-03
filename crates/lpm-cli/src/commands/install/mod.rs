@@ -56,6 +56,7 @@ mod tests;
 mod timing;
 mod validation;
 mod workspace;
+pub(crate) mod workspace_lockfile;
 mod workspace_materialization;
 mod workspace_resolution;
 
@@ -426,7 +427,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
-    lpm_common::with_shared_lock_async(
+    let install = lpm_common::with_shared_lock_async(
         store_lock_path,
         run_with_options_under_store_lock(
             client,
@@ -464,8 +465,8 @@ pub(crate) async fn run_with_options_with_lpm_root(
             reserve_stdout,
             &lpm_root,
         ),
-    )
-    .await
+    );
+    workspace_lockfile::scope_member_install(project_dir, install).await
 }
 
 /// Body of [`run_with_options`] — the actual install pipeline. Lives
@@ -1124,6 +1125,7 @@ async fn run_with_options_under_store_lock(
             maintain_project_linker_layout(project_dir, json_output);
         }
         apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
+        workspace_lockfile::mark_active_importer_non_persisting();
         return experimental_resolver::run(
             arc_client.clone(),
             project_dir,

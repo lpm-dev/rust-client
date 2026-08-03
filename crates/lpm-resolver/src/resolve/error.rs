@@ -126,7 +126,7 @@ pub(super) fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
 }
 
 /// Errors from the resolution process.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     #[error("{0}")]
     Resolution(Box<ResolutionErrorContext>),

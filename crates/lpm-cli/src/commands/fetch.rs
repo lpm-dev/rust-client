@@ -109,19 +109,17 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let started = Instant::now();
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !lockfile_path.exists() {
-        return Err(LpmError::NotFound(
-            "no lpm.lock found. Run `lpm install` before `lpm fetch`.".into(),
-        ));
-    }
-
     let target_platform = match platform {
         Some(raw) => FetchPlatform::parse(raw)?,
         None => FetchPlatform::current(),
     };
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read lpm.lock: {e}")))?;
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .map_err(|e| {
+            LpmError::NotFound(format!(
+                "no usable lpm.lock found. Run `lpm install` before `lpm fetch`: {e}"
+            ))
+        })?
+        .lockfile;
 
     let mut targets = Vec::with_capacity(lockfile.packages.len());
     let mut results = Vec::new();

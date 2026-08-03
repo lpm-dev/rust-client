@@ -7,11 +7,7 @@ pub(super) fn write_post_install_hash(
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
-    let lock = lpm_common::read_text_file_capped(
-        &project_dir.join("lpm.lock"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    )
-    .unwrap_or_default();
+    let lock = workspace_lockfile::active_lockfile_content(project_dir);
     let dependency_engine_key = dependency_engine_policy.freshness_key(&lock);
     let node_runtime_fingerprint = match dependency_engine_key.as_str() {
         "none" | "legacy" => None,
@@ -45,11 +41,7 @@ fn write_post_install_hash_with_context(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .unwrap_or_default();
-    let lock = lpm_common::read_text_file_capped(
-        &project_dir.join("lpm.lock"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    )
-    .unwrap_or_default();
+    let lock = workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v10(
@@ -273,7 +265,7 @@ pub(super) async fn run_install_freshness_phase(
             .and_then(|(lockfile_deps, workspace_deps_filtered)| {
                 if workspace_deps_filtered
                     && lockfile_deps.is_empty()
-                    && lpm_lockfile::Lockfile::exists(input.lockfile_path)
+                    && workspace_lockfile::exists(input.lockfile_path)
                 {
                     return Some(Vec::new());
                 }
@@ -599,7 +591,11 @@ fn dependency_engine_freshness_key_for_state(
         return decision.key;
     }
 
-    let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
+    let lockfile = if workspace_lockfile::active() {
+        workspace_lockfile::active_lockfile_content(project_dir)
+    } else {
+        std::fs::read_to_string(lockfile_path).unwrap_or_default()
+    };
     policy.freshness_key(&lockfile)
 }
 
@@ -699,12 +695,16 @@ pub(super) fn materialize_empty_install_artifacts(
     lockfile
         .importers
         .insert(".".to_string(), current_importer_snapshot.clone());
-    lockfile
-        .write_all(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
+    if !workspace_lockfile::stage(&lockfile) {
+        lockfile
+            .write_all(&lockfile_path)
+            .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
+    }
 
-    lpm_lockfile::ensure_gitattributes(project_dir)
-        .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+    if !workspace_lockfile::active() {
+        lpm_lockfile::ensure_gitattributes(project_dir)
+            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+    }
 
     std::fs::create_dir_all(project_dir.join("node_modules")).map_err(LpmError::Io)?;
     Ok(())

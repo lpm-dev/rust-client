@@ -43,12 +43,11 @@ pub async fn run_signatures(
 fn registry_signature_inputs_from_discovery(
     discovery: &DiscoveryResult,
 ) -> Result<Vec<crate::registry_signatures::RegistrySignatureInput>, LpmError> {
-    if discovery.manager == ManagerKind::Lpm
-        && let Some(lockfile_path) = discovery.lockfile_path.as_ref()
-    {
-        let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path)
+    if discovery.manager == ManagerKind::Lpm {
+        let lockfile = lpm_lockfile::Lockfile::read_for_project(&discovery.project_root)
             .map_err(|error| LpmError::Registry(format!("failed to read lpm.lock: {error}")))?;
         return Ok(lockfile
+            .lockfile
             .packages
             .iter()
             .map(

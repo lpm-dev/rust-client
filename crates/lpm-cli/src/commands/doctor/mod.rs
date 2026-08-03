@@ -437,7 +437,6 @@ pub async fn run(
     }
 
     // 6. Lockfile? (Fast — load-bearing for install)
-    let lockfile = project_dir.join("lpm.lock");
     checks.extend(check_lockfile_state(project_dir));
 
     // 6b. .gitattributes hygiene (Extended) — git-side correctness for
@@ -447,8 +446,7 @@ pub async fn run(
     }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)
-    if lockfile.exists()
-        && pkg_json_path.exists()
+    if pkg_json_path.exists()
         && let Some(sync_check) = check_deps_in_sync(project_dir)
     {
         checks.push(sync_check);

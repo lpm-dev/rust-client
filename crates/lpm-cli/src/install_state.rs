@@ -735,7 +735,8 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 /// user running `lpm dev`. With a placeholder hash, dev triggers the
 /// install attempt that fails loud — same posture as `lpm install`.
 fn invalid_linker_state(project_dir: &Path, pkg_content: &str) -> InstallState {
-    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let lock_content =
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
     let platform = PlatformTuple::current();
     let placeholder = compute_install_hash_v8(
@@ -757,7 +758,8 @@ fn invalid_integrity_state(
     pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
 ) -> InstallState {
-    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let lock_content =
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
     let platform = PlatformTuple::current();
     let placeholder = compute_install_hash_v8(
@@ -859,14 +861,13 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         return state;
     }
 
-    let lock_path = project_dir.join("lpm.lock");
+    let lock_path = crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
     let hash_file = project_dir.join(".lpm").join("install-hash");
     let nm = project_dir.join("node_modules");
 
     // Read lockfile — empty string if missing (hash will mismatch → needs install)
     let lock_content =
-        lpm_common::read_text_file_capped(&lock_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .unwrap_or_default();
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
     // Local directory source manifests participate in freshness. Empty
     // bytes for projects without local-source deps preserve the common
     // no-local-source path.
@@ -1119,7 +1120,9 @@ fn try_mtime_fast_path(
     let pkg_ns = mtime_ns(&project_dir.join("package.json"))?;
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
-    let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
+    let lock_ns =
+        mtime_ns(&crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir))
+            .unwrap_or(0);
 
     if pkg_ns != stored_pkg_ns || lock_ns != stored_lock_ns {
         return None;
@@ -1189,7 +1192,8 @@ fn binary_lockfile_sidecar_needs_refresh(
     project_dir: &Path,
     expectation: Option<BinarySidecarExpectation>,
 ) -> bool {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lockfile_path =
+        crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
     if !lockfile_path.exists() {
         return false;
     }
@@ -1297,16 +1301,17 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     dependency_engine_key: &str,
     node_runtime_fingerprint: Option<&str>,
 ) -> std::io::Result<()> {
-    let binary_sidecar_expectation =
-        lpm_lockfile::Lockfile::read_from_file(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
-            .ok()
-            .map(|lockfile| {
-                if lpm_lockfile::binary::binary_format_supports(&lockfile) {
-                    BinarySidecarExpectation::Required
-                } else {
-                    BinarySidecarExpectation::NotRequired
-                }
-            });
+    let binary_sidecar_expectation = crate::commands::install::workspace_lockfile::read(
+        &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+    )
+    .ok()
+    .map(|lockfile| {
+        if lpm_lockfile::binary::binary_format_supports(&lockfile) {
+            BinarySidecarExpectation::Required
+        } else {
+            BinarySidecarExpectation::NotRequired
+        }
+    });
     write_install_hash_with_metadata(
         project_dir,
         hash,
@@ -1382,7 +1387,9 @@ fn write_install_hash_with_metadata(
         ));
     }
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
-    let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
+    let lock_ns =
+        mtime_ns(&crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir))
+            .unwrap_or(0);
 
     let hash_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&hash_dir)?;
@@ -1594,17 +1601,22 @@ mod tests {
         ])
     }
 
+    fn write_test_lockfile(project_dir: &Path) -> String {
+        lpm_lockfile::Lockfile::default()
+            .write_all(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir)
+    }
+
     fn setup_up_to_date_project() -> TempDir {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
-        let hash = compute_install_hash(
-            &fs::read_to_string(p.join("package.json")).unwrap(),
-            "lock-content",
-        );
+        let hash =
+            compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
         dir
     }
@@ -1899,12 +1911,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
-        let hash = compute_install_hash(
-            &fs::read_to_string(p.join("package.json")).unwrap(),
-            "lock-content",
-        );
+        let hash =
+            compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
         write_install_hash(p, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
         dir
     }
@@ -2000,13 +2010,11 @@ mod tests {
         let p = dir.path();
         let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
-        let hash = compute_install_hash(
-            &fs::read_to_string(p.join("package.json")).unwrap(),
-            "lock-content",
-        );
+        let hash =
+            compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
         // Bare write — v1 format only.
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
         let state = check_install_state(p);
@@ -2833,13 +2841,13 @@ mod tests {
         let local = make_dir_dep(p, "local", "1.0.0");
         let pkg = r#"{"dependencies":{"local":"file:./local"}}"#;
         fs::write(p.join("package.json"), pkg).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
 
         // Compute and write the v3 hash AS THE INSTALL PIPELINE
         // WOULD (with file/link bytes folded in).
         let bytes = collect_file_link_manifest_bytes(p, pkg);
-        let initial_hash = compute_install_hash_v3(pkg, "lock-content", &bytes);
+        let initial_hash = compute_install_hash_v3(pkg, &lock, &bytes);
         write_install_hash(p, &initial_hash, lpm_linker::LinkerMode::Isolated).unwrap();
         let _home = scoped_home_for(p);
 
@@ -3030,12 +3038,12 @@ mod tests {
         let _home = scoped_home_for(p);
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         // Empty `.lpm/` dir created before hash write.
         fs::create_dir_all(p.join("node_modules/.lpm")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
-        let hash = compute_install_hash(pkg_json, "lock-content");
+        let hash = compute_install_hash(pkg_json, &lock);
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
 
         let state = check_install_state(p);
@@ -3080,10 +3088,10 @@ mod tests {
         let p = dir.path();
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm/hoisted")).unwrap();
-        let hash = compute_install_hash(pkg_json, "lock-content");
+        let hash = compute_install_hash(pkg_json, &lock);
         fs::write(p.join(".lpm/install-hash"), &hash).unwrap();
 
         let v1 = check_install_state_with_linker_integrity_and_dependency_engine(

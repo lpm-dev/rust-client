@@ -140,6 +140,73 @@ impl TempProject {
     }
 }
 
+/// Build a two-member workspace whose root lockfile stores disjoint importer
+/// projections. Both package manifests are also present below the selected
+/// member's node_modules directory so command tests prove isolation comes from
+/// the lockfile projection rather than missing local metadata.
+pub fn workspace_projection_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+            "name": "projection-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "projection-app",
+            "version": "1.0.0",
+            "license": "MIT",
+            "dependencies": { "app-only": "1.0.0" }
+        }"#,
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{
+            "name": "projection-sibling",
+            "version": "1.0.0",
+            "dependencies": { "sibling-only": "1.0.0" }
+        }"#,
+    );
+
+    let package = |name: &str| lpm_lockfile::LockedPackage {
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some(format!("sha512-{name}")),
+        ..Default::default()
+    };
+    let mut app = lpm_lockfile::Lockfile::new();
+    app.add_package(package("app-only"));
+    let mut sibling = lpm_lockfile::Lockfile::new();
+    sibling.add_package(package("sibling-only"));
+
+    let mut root = lpm_lockfile::Lockfile::new();
+    root.absorb_importer("packages/app", app)
+        .expect("absorb app importer");
+    root.absorb_importer("packages/sibling", sibling)
+        .expect("absorb sibling importer");
+    root.write_all(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write root workspace lockfile");
+
+    for (name, license) in [("app-only", "MIT"), ("sibling-only", "Apache-2.0")] {
+        project.write_file(
+            &format!("packages/app/node_modules/{name}/package.json"),
+            &format!(
+                r#"{{
+                    "name": "{name}",
+                    "version": "1.0.0",
+                    "license": "{license}"
+                }}"#
+            ),
+        );
+    }
+
+    project
+}
+
 pub fn project_bin_path(project: &TempProject, name: &str) -> PathBuf {
     let bin_dir = project.path().join("node_modules").join(".bin");
     #[cfg(windows)]

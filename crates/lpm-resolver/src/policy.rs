@@ -170,6 +170,41 @@ impl Default for ResolverPolicy {
 }
 
 impl ResolverPolicy {
+    /// Stable grouping key for workspace importers that may share one
+    /// resolver traversal without changing release-age or trust decisions.
+    pub fn workspace_resolution_key(&self) -> String {
+        let mut excludes = self
+            .minimum_release_age_exclude
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        excludes.sort();
+        let release_age_scope = if self.cutoff_unix.is_none() {
+            "disabled"
+        } else if self.minimum_release_age_packages.is_none() {
+            "all"
+        } else {
+            "direct"
+        };
+        format!(
+            "{}|{:?}|{:?}|{}|{}|{}",
+            self.minimum_release_age_secs,
+            self.cutoff_unix,
+            self.trust_policy,
+            self.ignore_missing_release_time,
+            excludes.join("\0"),
+            release_age_scope,
+        )
+    }
+
+    pub(crate) fn for_workspace_union(&self) -> Self {
+        let mut policy = self.clone();
+        if let Some(packages) = policy.minimum_release_age_packages.as_mut() {
+            packages.clear();
+        }
+        policy
+    }
+
     pub fn new(minimum_release_age_secs: u64, trust_policy: TrustPolicyMode) -> Self {
         Self::new_with_release_age_excludes(
             minimum_release_age_secs,

@@ -20,6 +20,7 @@ pub(super) struct WorkspaceResolutionCoordinator {
     resolver_metadata_concurrency: OnceLock<lpm_resolver::SharedMetadataConcurrency>,
     root_index: Option<usize>,
     root_provider_state: RootProviderState,
+    union: Option<WorkspaceUnionState>,
 }
 
 impl WorkspaceResolutionCoordinator {
@@ -53,6 +54,7 @@ impl WorkspaceResolutionCoordinator {
             resolver_metadata_concurrency: OnceLock::new(),
             root_index: None,
             root_provider_state: RootProviderState::new(),
+            union: None,
         }
     }
 
@@ -68,6 +70,18 @@ impl WorkspaceResolutionCoordinator {
             release_age_reference_unix,
         );
         coordinator.root_index = Some(root_index);
+        coordinator
+    }
+
+    pub(super) fn new_union_at_unix(
+        target_count: usize,
+        root_index: Option<usize>,
+        release_age_reference_unix: i64,
+    ) -> Self {
+        let mut coordinator =
+            Self::new_at_unix(target_count, target_count, release_age_reference_unix);
+        coordinator.root_index = root_index;
+        coordinator.union = Some(WorkspaceUnionState::new(target_count));
         coordinator
     }
 
@@ -96,6 +110,27 @@ impl WorkspaceResolutionCoordinator {
         self.root_provider_state.publish(snapshot);
     }
 
+    fn fail_union(&self) {
+        let Some(union) = self.union.as_ref() else {
+            return;
+        };
+        let mut results = union
+            .results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for result in results.iter_mut() {
+            if result.is_none() {
+                *result = Some(WorkspaceUnionResult::Failed(
+                    lpm_resolver::ResolveError::Cancelled(
+                        "another workspace importer failed before union resolution completed"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+        union.ready.notify_waiters();
+    }
+
     async fn wait_for_root_providers(&self) -> Result<Option<Arc<RootProviderSnapshot>>, LpmError> {
         if self.root_index.is_none() {
             return Ok(None);
@@ -107,6 +142,52 @@ impl WorkspaceResolutionCoordinator {
     fn fetch_overlap_hub_initialized(&self) -> bool {
         self.fetch_overlap_hub.get().is_some()
     }
+}
+
+struct WorkspaceUnionState {
+    requests: std::sync::Mutex<Vec<Option<WorkspaceUnionRequest>>>,
+    results: std::sync::Mutex<Vec<Option<WorkspaceUnionResult>>>,
+    submitted: std::sync::atomic::AtomicUsize,
+    ready: Notify,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct WorkspaceUnionGroupKey {
+    overrides: String,
+    policy: String,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    npm_fanout: usize,
+    route: lpm_registry::WorkspaceResolutionKey,
+}
+
+impl WorkspaceUnionState {
+    fn new(target_count: usize) -> Self {
+        Self {
+            requests: std::sync::Mutex::new((0..target_count).map(|_| None).collect()),
+            results: std::sync::Mutex::new((0..target_count).map(|_| None).collect()),
+            submitted: std::sync::atomic::AtomicUsize::new(0),
+            ready: Notify::new(),
+        }
+    }
+}
+
+pub(super) struct WorkspaceUnionRequest {
+    pub(super) client: Arc<lpm_registry::RegistryClient>,
+    pub(super) root_dependencies: lpm_resolver::RootDependencies,
+    pub(super) overrides: lpm_resolver::OverrideSet,
+    pub(super) route_table: lpm_registry::RouteTable,
+    pub(super) npm_fanout: usize,
+    pub(super) shared_cache: lpm_resolver::SharedCache,
+    pub(super) auto_install_peers: bool,
+    pub(super) include_optional_dependencies: bool,
+    pub(super) policy: lpm_resolver::ResolverPolicy,
+}
+
+enum WorkspaceUnionResult {
+    Projected(Box<lpm_resolver::ResolveResult>),
+    Isolated,
+    Failed(lpm_resolver::ResolveError),
 }
 
 struct RootProviderState {
@@ -335,6 +416,9 @@ where
     let task = coordinator.enter(index).await;
     let result = ACTIVE_TASK.scope(Arc::clone(&task), future).await;
     task.finish_resolution();
+    if result.is_err() {
+        task.coordinator.fail_union();
+    }
     if task.is_root() && !task.coordinator.root_provider_state.has_snapshot() {
         task.coordinator.root_provider_state.fail();
     }
@@ -450,6 +534,180 @@ pub(super) fn resolver_metadata_concurrency_for_importer(
         .flatten()
 }
 
+pub(super) async fn resolve_workspace_union(
+    request: WorkspaceUnionRequest,
+) -> Result<Option<lpm_resolver::ResolveResult>, LpmError> {
+    let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) else {
+        return Ok(None);
+    };
+    let Some(union) = task.coordinator.union.as_ref() else {
+        return Ok(None);
+    };
+
+    {
+        let mut requests = union
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if requests[task.index].replace(request).is_some() {
+            return Err(LpmError::Registry(
+                "workspace importer submitted resolver input more than once".to_string(),
+            ));
+        }
+    }
+    let submitted = union
+        .submitted
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .saturating_add(1);
+    if submitted == task.coordinator.completed.len() {
+        resolve_submitted_workspace_unions(&task.coordinator).await;
+    } else {
+        loop {
+            let notified = union.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if union
+                .results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[task.index]
+                .is_some()
+            {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    let result = union
+        .results
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[task.index]
+        .take()
+        .ok_or_else(|| {
+            LpmError::Registry("workspace union resolver completed without a result".to_string())
+        })?;
+    match result {
+        WorkspaceUnionResult::Projected(result) => Ok(Some(*result)),
+        WorkspaceUnionResult::Isolated => Ok(None),
+        WorkspaceUnionResult::Failed(error) => {
+            Err(crate::resolver_error::resolver_error_to_lpm(error))
+        }
+    }
+}
+
+async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoordinator) {
+    let Some(union) = coordinator.union.as_ref() else {
+        return;
+    };
+    let requests = {
+        let mut requests = union
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *requests)
+    };
+    let Some(mut requests) = requests.into_iter().collect::<Option<Vec<_>>>() else {
+        let error = lpm_resolver::ResolveError::Internal(
+            "workspace union resolver started before every importer submitted input".to_string(),
+        );
+        *union
+            .results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (0..coordinator.completed.len())
+            .map(|_| Some(WorkspaceUnionResult::Failed(error.clone())))
+            .collect();
+        union.ready.notify_waiters();
+        return;
+    };
+    let mut groups = Vec::<Vec<usize>>::new();
+    let mut group_positions =
+        HashMap::<WorkspaceUnionGroupKey, usize>::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        let Some(route_key) = request.route_table.workspace_resolution_key() else {
+            groups.push(vec![index]);
+            continue;
+        };
+        let key = WorkspaceUnionGroupKey {
+            overrides: request.overrides.fingerprint().to_string(),
+            policy: request.policy.workspace_resolution_key(),
+            auto_install_peers: request.auto_install_peers,
+            include_optional_dependencies: request.include_optional_dependencies,
+            npm_fanout: request.npm_fanout,
+            route: route_key,
+        };
+        if let Some(position) = group_positions.get(&key).copied() {
+            groups[position].push(index);
+        } else {
+            group_positions.insert(key, groups.len());
+            groups.push(vec![index]);
+        }
+    }
+
+    let mut results = (0..requests.len())
+        .map(|_| Some(WorkspaceUnionResult::Isolated))
+        .collect::<Vec<_>>();
+    for indices in groups {
+        if indices.len() < 2 {
+            continue;
+        }
+        let roots = indices
+            .iter()
+            .map(|index| requests[*index].root_dependencies.clone())
+            .collect::<Vec<_>>();
+        let policies = indices
+            .iter()
+            .map(|index| requests[*index].policy.clone())
+            .collect::<Vec<_>>();
+        let first = &mut requests[indices[0]];
+        let metadata_concurrency = metadata_concurrency_with_limit(
+            &coordinator.resolver_metadata_concurrency,
+            first.npm_fanout,
+        );
+        let resolved = lpm_resolver::resolve_greedy_fused_workspace_with_cache_options_and_policy(
+            Arc::clone(&first.client),
+            roots,
+            first.overrides.clone(),
+            first.route_table.clone(),
+            first.npm_fanout,
+            Arc::clone(&first.shared_cache),
+            first.auto_install_peers,
+            first.include_optional_dependencies,
+            policies,
+            Some(Arc::clone(&coordinator.resolver_fact_cache)),
+            metadata_concurrency,
+        )
+        .await;
+        match resolved {
+            Ok(lpm_resolver::WorkspaceResolveOutcome::Projected(projected)) => {
+                let projected_count = projected.iter().filter(|result| result.is_some()).count();
+                tracing::debug!(
+                    importers = projected.len(),
+                    projected = projected_count,
+                    "workspace union resolution completed"
+                );
+                for (index, projection) in indices.into_iter().zip(projected) {
+                    if let Some(projection) = projection {
+                        results[index] =
+                            Some(WorkspaceUnionResult::Projected(Box::new(projection)));
+                    }
+                }
+            }
+            Ok(lpm_resolver::WorkspaceResolveOutcome::RequiresIsolatedResolution) => {}
+            Err(error) => {
+                for index in indices {
+                    results[index] = Some(WorkspaceUnionResult::Failed(error.clone()));
+                }
+            }
+        }
+    }
+
+    *union
+        .results
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = results;
+    union.ready.notify_waiters();
+}
+
 pub(super) fn finish_resolution() {
     if let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) {
         task.finish_resolution();
@@ -512,13 +770,14 @@ pub(super) fn publish_root_peer_providers_for_empty_install(project_dir: &Path) 
     }
 }
 
-pub(super) fn root_provider_fingerprint_from_lockfile(root_dir: &Path) -> Option<String> {
+pub(super) fn root_provider_fingerprint_from_projection(
+    root_dir: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> Option<String> {
     let manifest = root_manifest_bytes(root_dir);
-    let lockfile =
-        lpm_lockfile::Lockfile::read_fast(&root_dir.join(lpm_lockfile::LOCKFILE_NAME)).ok()?;
     let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
     let local_packages = root_workspace_install_packages(root_dir, &package)?;
-    let direct = direct_provider_identities(&package, &lockfile, &local_packages);
+    let direct = direct_provider_identities(&package, lockfile, &local_packages);
     let rows = lockfile
         .packages
         .iter()
@@ -999,6 +1258,20 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    fn workspace_union_request() -> WorkspaceUnionRequest {
+        WorkspaceUnionRequest {
+            client: Arc::new(lpm_registry::RegistryClient::new().with_cache_dir(None)),
+            root_dependencies: lpm_resolver::RootDependencies::required(HashMap::new()),
+            overrides: lpm_resolver::OverrideSet::empty(),
+            route_table: lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            npm_fanout: 8,
+            shared_cache: Arc::new(dashmap::DashMap::new()),
+            auto_install_peers: true,
+            include_optional_dependencies: true,
+            policy: lpm_resolver::ResolverPolicy::default(),
+        }
+    }
+
     async fn fact_caches_for_resolution_importers(
         route_table: lpm_registry::RouteTable,
     ) -> (
@@ -1079,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_root_lockfile_has_no_peer_provider_fingerprint() {
+    fn missing_root_projection_has_no_peer_provider_fingerprint() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("package.json"),
@@ -1087,10 +1360,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            root_provider_fingerprint_from_lockfile(directory.path()),
-            None
-        );
+        let coordinator = super::super::workspace_lockfile::WorkspaceLockfileCoordinator::new(
+            directory.path(),
+            &[],
+        )
+        .unwrap();
+        let fingerprint = coordinator.projection(".").ok().and_then(|lockfile| {
+            root_provider_fingerprint_from_projection(directory.path(), &lockfile)
+        });
+
+        assert_eq!(fingerprint, None);
     }
 
     #[test]
@@ -1107,6 +1386,44 @@ mod tests {
         let _hub = coordinator.fetch_overlap_hub();
 
         assert!(coordinator.fetch_overlap_hub_initialized());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_union_waiters_fail_when_a_participant_exits_before_submission() {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new_union_at_unix(
+            2,
+            None,
+            current_unix_timestamp(),
+        ));
+        let local = tokio::task::LocalSet::new();
+        let (failed, waiter) = local
+            .run_until(async {
+                tokio::join!(
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 0, async { Err::<(), _>("pre-submit failure") })
+                                .await
+                        })
+                    },
+                    {
+                        let coordinator = Arc::clone(&coordinator);
+                        tokio::task::spawn_local(async move {
+                            scope(coordinator, 1, async {
+                                resolve_workspace_union(workspace_union_request())
+                                    .await
+                                    .map(|_| ())
+                            })
+                            .await
+                        })
+                    },
+                )
+            })
+            .await;
+
+        assert_eq!(failed.unwrap(), Err("pre-submit failure"));
+        let error = waiter.unwrap().unwrap_err().to_string();
+        assert!(error.contains("another workspace importer failed"));
     }
 
     #[tokio::test(flavor = "current_thread")]

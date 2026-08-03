@@ -177,6 +177,91 @@ console.log(React);
     );
 }
 
+#[tokio::test]
+async fn workspace_member_tidy_fix_preserves_the_sibling_root_lockfile_projection() {
+    let mock = MockRegistry::start().await;
+    mount_basic_packages(&mock).await;
+    mock.with_package(
+        "sibling-pkg",
+        "1.0.0",
+        &make_tarball("sibling-pkg", "1.0.0"),
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "tidy-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "tidy-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "react": "^18.2.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/app/src/index.js",
+        "import React from \"react\";\nconsole.log(React);\n",
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{"name":"tidy-sibling","version":"1.0.0","private":true,"dependencies":{"sibling-pkg":"1.0.0"}}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-audit-after-install",
+        ])
+        .output()
+        .expect("seed recursive workspace install before tidy");
+    assert!(
+        install.status.success(),
+        "workspace seed install failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    let lockfile_path = project.path().join("lpm.lock");
+    let before = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    let sibling_before = before.project_importer("packages/sibling").unwrap();
+    let app_dir = project.path().join("packages/app");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .current_dir(&app_dir)
+        .args(["tidy", "--fix"])
+        .output()
+        .expect("run tidy --fix from workspace member");
+    assert!(
+        output.status.success(),
+        "workspace tidy --fix failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let updated = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    let app_projection = updated.project_importer("packages/app").unwrap();
+    assert!(app_projection.find_package("lodash").is_none());
+    assert!(app_projection.find_package("react").is_some());
+    assert_eq!(
+        updated.project_importer("packages/sibling").unwrap(),
+        sibling_before
+    );
+    assert!(!app_dir.join("lpm.lock").exists());
+    assert!(!app_dir.join("lpm.lockb").exists());
+}
+
 #[test]
 fn tidy_fix_reports_peer_dependencies_without_removing_them() {
     let project = TempProject::empty(

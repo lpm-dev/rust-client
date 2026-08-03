@@ -176,16 +176,20 @@ fn check_fast_lane_admission(
 }
 
 fn lockfile_contains_lpm_package(project_dir: &std::path::Path) -> bool {
-    let binary_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let project_lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir);
+    let binary_path = project_lockfile.as_ref().map_or_else(
+        |_| project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME),
+        |project| project.path.with_extension("lockb"),
+    );
     if let Ok(Some(reader)) = lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
         return reader
             .iter()
             .any(|package| package.name().starts_with("@lpm.dev/"));
     }
 
-    let toml_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    lpm_lockfile::Lockfile::read_from_file(&toml_path).map_or(true, |lockfile| {
-        lockfile
+    project_lockfile.map_or(true, |project| {
+        project
+            .lockfile
             .packages
             .iter()
             .any(|package| package.name.starts_with("@lpm.dev/"))
@@ -724,7 +728,7 @@ async fn async_main() -> Result<()> {
             if !packages.is_empty()
                 && frozen_lockfile_mode != commands::install::FrozenLockfileMode::Never
                 && (frozen_lockfile
-                    || (cwd.join(lpm_lockfile::LOCKFILE_NAME).exists()
+                    || (lpm_lockfile::Lockfile::read_for_project(&cwd).is_ok()
                         && commands::install::install_running_in_ci()))
             {
                 return Err(lpm_common::LpmError::Script(

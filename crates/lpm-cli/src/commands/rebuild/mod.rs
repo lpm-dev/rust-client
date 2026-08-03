@@ -242,15 +242,13 @@ async fn run_under_store_lock(
     let policy = SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
     // Load lockfile to get installed packages with their scripts
-    let lockfile_path = project_dir.join("lpm.lock");
-    if !lockfile_path.exists() {
-        return Err(LpmError::NotFound(
-            "No lpm.lock found. Run `lpm install` first.".into(),
-        ));
-    }
-
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read lockfile: {e}")))?;
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .map_err(|e| {
+            LpmError::NotFound(format!(
+                "No usable lpm.lock found. Run `lpm install` first: {e}"
+            ))
+        })?
+        .lockfile;
 
     // Read the force-security-floor
     // kill-switch once per invocation and thread it through every

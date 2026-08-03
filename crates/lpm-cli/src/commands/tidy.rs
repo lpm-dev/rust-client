@@ -127,32 +127,6 @@ impl CompiledPattern {
     }
 }
 
-enum FileSnapshot {
-    Present(Vec<u8>),
-    Absent,
-}
-
-impl FileSnapshot {
-    fn read(path: &Path) -> Result<Self, LpmError> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Self::Present(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::Absent),
-            Err(error) => Err(LpmError::Io(error)),
-        }
-    }
-
-    fn restore(&self, path: &Path) -> Result<(), LpmError> {
-        match self {
-            Self::Present(bytes) => write_file_atomic(path, bytes).map_err(LpmError::Io),
-            Self::Absent => match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(LpmError::Io(error)),
-            },
-        }
-    }
-}
-
 pub async fn run(
     client: &RegistryClient,
     cwd: &Path,
@@ -818,46 +792,47 @@ async fn apply_fix(
         return Ok(Vec::new());
     }
 
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let lockfile_binary_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-    let manifest_snapshot = FileSnapshot::Present(original_manifest.to_vec());
-    let lockfile_snapshot = FileSnapshot::read(&lockfile_path)?;
-    let lockfile_binary_snapshot = FileSnapshot::read(&lockfile_binary_path)?;
+    let project_dirs = [project_dir.to_path_buf()];
+    crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
+        project_dir,
+        &project_dirs,
+        async {
+            let lockfile_path =
+                crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+            let lockfile_binary_path = lockfile_path.with_extension("lockb");
+            let install_hash_path = project_dir.join(".lpm").join("install-hash");
+            let transaction =
+                crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
+                    &[(manifest_path, original_manifest)],
+                    &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
+                    &[install_hash_path.as_path()],
+                )
+                .map_err(|error| {
+                    LpmError::Registry(format!(
+                        "package.json changed while tidy was analyzing the project; no changes were applied: {error}"
+                    ))
+                })?;
 
-    let removed = remove_unused_from_manifest(manifest, &fixable);
-    let updated = serde_json::to_string_pretty(manifest)
-        .map_err(|error| LpmError::Registry(error.to_string()))?;
-    write_file_atomic(manifest_path, format!("{updated}\n")).map_err(LpmError::Io)?;
+            let removed = remove_unused_from_manifest(manifest, &fixable);
+            let updated = serde_json::to_string_pretty(manifest)
+                .map_err(|error| LpmError::Registry(error.to_string()))?;
+            write_file_atomic(manifest_path, format!("{updated}\n")).map_err(LpmError::Io)?;
 
-    let cleanup_removed = || {
-        let removed_names: Vec<String> = removed.iter().map(|entry| entry.name.clone()).collect();
-        crate::commands::uninstall::cleanup_removed_packages(
-            project_dir,
-            &removed_names,
-            &HashMap::new(),
-        )
-        .map(|_| ())
-    };
-
-    if let Err(error) = reconcile_install(client, project_dir)
-        .await
-        .and_then(|()| cleanup_removed())
-    {
-        let restore_result = manifest_snapshot
-            .restore(manifest_path)
-            .and_then(|()| lockfile_snapshot.restore(&lockfile_path))
-            .and_then(|()| lockfile_binary_snapshot.restore(&lockfile_binary_path));
-        if let Err(restore_error) = restore_result {
-            return Err(LpmError::Registry(format!(
-                "tidy --fix failed during install ({error}); also failed to restore manifest/lockfile snapshots: {restore_error}"
-            )));
-        }
-        return Err(LpmError::Registry(format!(
-            "tidy --fix failed during install and restored package.json/lpm.lock snapshots: {error}"
-        )));
-    }
-
-    Ok(removed)
+            reconcile_install(client, project_dir).await?;
+            let removed_names = removed
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>();
+            crate::commands::uninstall::cleanup_removed_packages(
+                project_dir,
+                &removed_names,
+                &HashMap::new(),
+            )?;
+            crate::commands::install::workspace_lockfile::commit_manifest_transaction(transaction);
+            Ok(removed)
+        },
+    )
+    .await
 }
 
 fn remove_unused_from_manifest(

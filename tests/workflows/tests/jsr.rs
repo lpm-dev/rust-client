@@ -134,9 +134,9 @@ async fn install_workspace_member_semver_jsr_dependency_installs_alias_dependenc
         .assert()
         .success();
 
-    let lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
-            .expect("lockfile should parse after install");
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project.path())
+        .expect("root lockfile projection should parse after install")
+        .lockfile;
     let app = lockfile
         .packages
         .iter()

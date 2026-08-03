@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{TempProject, lpm, write_npm_firewall_global_config};
+use support::{TempProject, lpm, lpm_spawnable, write_npm_firewall_global_config};
 
 const INSTALL_FLAGS: &[&str] = &[
     "--no-security-summary",
@@ -105,9 +105,9 @@ fn assert_install_succeeded(output: &std::process::Output, context: &str) {
 fn assert_target_installed(project: &TempProject, relative_dir: &str) {
     let root = project.path().join(relative_dir);
     assert!(
-        root.join("lpm.lock").is_file(),
-        "{} should contain lpm.lock",
-        root.display(),
+        target_has_lockfile_projection(project, relative_dir),
+        "{} should have a lockfile projection",
+        root.display()
     );
     assert!(
         root.join("node_modules").is_dir(),
@@ -124,8 +124,8 @@ fn assert_target_installed(project: &TempProject, relative_dir: &str) {
 fn assert_target_not_installed(project: &TempProject, relative_dir: &str) {
     let root = project.path().join(relative_dir);
     assert!(
-        !root.join("lpm.lock").exists(),
-        "{} should not contain lpm.lock",
+        !target_has_lockfile_projection(project, relative_dir),
+        "{} should not have a lockfile projection",
         root.display(),
     );
     assert!(
@@ -133,6 +133,27 @@ fn assert_target_not_installed(project: &TempProject, relative_dir: &str) {
         "{} should not contain node_modules",
         root.display(),
     );
+}
+
+fn target_has_lockfile_projection(project: &TempProject, relative_dir: &str) -> bool {
+    let local_path = project.path().join(relative_dir).join("lpm.lock");
+    if !relative_dir.is_empty() && local_path.is_file() {
+        return true;
+    }
+    let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")) else {
+        return false;
+    };
+    if lockfile.metadata.lockfile_version
+        < lpm_lockfile::LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
+    {
+        return relative_dir.is_empty();
+    }
+    let importer = if relative_dir.is_empty() {
+        "."
+    } else {
+        relative_dir
+    };
+    lockfile.importers.contains_key(importer)
 }
 
 #[test]
@@ -645,6 +666,362 @@ fn install_recursive_filter_includes_workspace_dependency_closure() {
 }
 
 #[test]
+fn filtered_recursive_install_migrates_unselected_member_lockfiles_into_the_root_union() {
+    let project = workspace_project();
+    let mut legacy = lpm_lockfile::Lockfile::new();
+    legacy
+        .importers
+        .insert(".".to_string(), lpm_lockfile::ImporterSnapshot::default());
+    legacy
+        .write_to_file(&project.path().join("packages/unrelated/lpm.lock"))
+        .expect("seed an old member-local lockfile");
+    assert!(project.path().join("packages/unrelated/lpm.lock").is_file());
+
+    let output = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(["--filter", "@fixture/web"])
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run filtered recursive migration");
+    assert_install_succeeded(&output, "filtered recursive migration should succeed");
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("read migrated root lockfile");
+    assert_eq!(
+        lockfile
+            .importers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["packages/core", "packages/unrelated", "packages/web"],
+    );
+    for member in ["core", "unrelated", "web"] {
+        assert!(
+            !project
+                .path()
+                .join(format!("packages/{member}/lpm.lock"))
+                .exists(),
+            "{member} member lockfile should be removed after migration",
+        );
+    }
+}
+
+#[tokio::test]
+async fn recursive_install_reads_and_commits_workspace_lockfile_under_one_transaction_lock() {
+    let project = workspace_project();
+    let legacy_path = project.path().join("packages/unrelated/lpm.lock");
+    let mut legacy = lpm_lockfile::Lockfile::new();
+    legacy
+        .root_aliases
+        .insert("transaction-marker".to_string(), "before-lock".to_string());
+    legacy
+        .write_to_file(&legacy_path)
+        .expect("seed the member lockfile before lock contention");
+
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the workspace install transaction lock");
+    let mut command = lpm_spawnable(&project);
+    command
+        .arg("install")
+        .arg("--recursive")
+        .args(["--filter", "@fixture/web"])
+        .args(INSTALL_FLAGS);
+    let mut child = command.spawn().expect("spawn contending recursive install");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect contending install")
+            .is_none(),
+        "recursive install must wait while another transaction owns the workspace lock",
+    );
+
+    legacy
+        .root_aliases
+        .insert("transaction-marker".to_string(), "after-lock".to_string());
+    legacy
+        .write_to_file(&legacy_path)
+        .expect("update the member lockfile while the install waits");
+    drop(transaction_lock);
+
+    let output = child
+        .wait_with_output()
+        .expect("finish contending recursive install");
+    assert_install_succeeded(
+        &output,
+        "recursive install should continue after the transaction lock is released",
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("read committed root lockfile");
+    let unrelated = lockfile
+        .project_importer("packages/unrelated")
+        .expect("project the migrated unrelated importer");
+    assert_eq!(
+        unrelated
+            .root_aliases
+            .get("transaction-marker")
+            .map(String::as_str),
+        Some("after-lock"),
+        "the transaction must preload the latest member projection after acquiring the lock",
+    );
+}
+
+#[tokio::test]
+async fn recursive_install_selects_members_after_acquiring_workspace_transaction_lock() {
+    let project = workspace_project();
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the workspace install transaction lock");
+    let mut command = lpm_spawnable(&project);
+    command
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS);
+    let mut child = command.spawn().expect("spawn contending recursive install");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect contending install")
+            .is_none(),
+        "recursive install must wait while another transaction owns the workspace lock",
+    );
+
+    project.write_file(
+        "packages/added-while-waiting/package.json",
+        r#"{
+  "name": "@fixture/added-while-waiting",
+  "version": "1.0.0",
+  "private": true
+}"#,
+    );
+    drop(transaction_lock);
+
+    let output = child
+        .wait_with_output()
+        .expect("finish contending recursive install");
+    assert_install_succeeded(
+        &output,
+        "recursive install should continue after the transaction lock is released",
+    );
+    assert_target_installed(&project, "packages/added-while-waiting");
+}
+
+#[tokio::test]
+async fn member_install_migrates_members_discovered_after_acquiring_workspace_transaction_lock() {
+    let project = workspace_project();
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the workspace install transaction lock");
+    let mut command = lpm_spawnable(&project);
+    command
+        .current_dir(project.path().join("packages/web"))
+        .arg("install")
+        .args(INSTALL_FLAGS);
+    let mut child = command.spawn().expect("spawn contending member install");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect contending member install")
+            .is_none(),
+        "member install must wait while another transaction owns the workspace lock",
+    );
+
+    project.write_file(
+        "packages/added-while-waiting/package.json",
+        r#"{
+  "name": "@fixture/added-while-waiting",
+  "version": "1.0.0",
+  "private": true
+}"#,
+    );
+    let legacy_path = project.path().join("packages/added-while-waiting/lpm.lock");
+    let mut legacy = lpm_lockfile::Lockfile::new();
+    legacy.root_aliases.insert(
+        "transaction-marker".to_string(),
+        "discovered-after-lock".to_string(),
+    );
+    legacy
+        .write_to_file(&legacy_path)
+        .expect("seed the newly discovered member lockfile");
+    drop(transaction_lock);
+
+    let output = child
+        .wait_with_output()
+        .expect("finish contending member install");
+    assert_install_succeeded(
+        &output,
+        "member install should continue after the transaction lock is released",
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("read committed root lockfile");
+    let added = lockfile
+        .project_importer("packages/added-while-waiting")
+        .expect("project the newly discovered member");
+    assert_eq!(
+        added
+            .root_aliases
+            .get("transaction-marker")
+            .map(String::as_str),
+        Some("discovered-after-lock"),
+        "the transaction must inventory legacy member lockfiles after acquiring the lock",
+    );
+    assert!(
+        !legacy_path.exists(),
+        "the migrated member lockfile should be removed after the root union commits",
+    );
+}
+
+#[tokio::test]
+async fn workspace_mutation_migrates_members_discovered_after_acquiring_transaction_lock() {
+    let project = workspace_project();
+    let seed = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed the workspace root lockfile");
+    assert_install_succeeded(&seed, "workspace seed install should succeed");
+
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the workspace install transaction lock");
+    let mut command = lpm_spawnable(&project);
+    command
+        .current_dir(project.path().join("packages/web"))
+        .args(["uninstall", "@fixture/core"]);
+    let mut child = command
+        .spawn()
+        .expect("spawn contending workspace mutation");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect contending workspace mutation")
+            .is_none(),
+        "workspace mutation must wait while another transaction owns the workspace lock",
+    );
+
+    project.write_file(
+        "packages/added-during-mutation/package.json",
+        r#"{
+  "name": "@fixture/added-during-mutation",
+  "version": "1.0.0",
+  "private": true
+}"#,
+    );
+    let legacy_path = project
+        .path()
+        .join("packages/added-during-mutation/lpm.lock");
+    let mut legacy = lpm_lockfile::Lockfile::new();
+    legacy.root_aliases.insert(
+        "transaction-marker".to_string(),
+        "mutation-discovered-after-lock".to_string(),
+    );
+    legacy
+        .write_to_file(&legacy_path)
+        .expect("seed the member lockfile added during mutation");
+    drop(transaction_lock);
+
+    let output = child
+        .wait_with_output()
+        .expect("finish contending workspace mutation");
+    assert_install_succeeded(
+        &output,
+        "workspace mutation should continue after the transaction lock is released",
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("read committed root lockfile");
+    let added = lockfile
+        .project_importer("packages/added-during-mutation")
+        .expect("project the member added during mutation");
+    assert_eq!(
+        added
+            .root_aliases
+            .get("transaction-marker")
+            .map(String::as_str),
+        Some("mutation-discovered-after-lock"),
+        "the mutation transaction must inventory legacy lockfiles after acquiring the lock",
+    );
+    assert!(
+        !legacy_path.exists(),
+        "the migrated member lockfile should be removed after the mutation commits",
+    );
+}
+
+#[tokio::test]
+async fn workspace_mutation_aborts_when_its_target_is_removed_while_waiting_for_the_lock() {
+    let project = workspace_project();
+    let seed = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed the workspace root lockfile");
+    assert_install_succeeded(&seed, "workspace seed install should succeed");
+    let lockfile_before = project.read_file("lpm.lock");
+    let web_manifest_before = project.read_file("packages/web/package.json");
+
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the workspace install transaction lock");
+    let mut command = lpm_spawnable(&project);
+    command
+        .current_dir(project.path().join("packages/web"))
+        .args(["uninstall", "@fixture/core"]);
+    let mut child = command
+        .spawn()
+        .expect("spawn contending workspace mutation");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect contending workspace mutation")
+            .is_none(),
+        "workspace mutation must wait while another transaction owns the workspace lock",
+    );
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "workspace-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/core", "packages/unrelated"]
+}"#,
+    );
+    drop(transaction_lock);
+
+    let output = child
+        .wait_with_output()
+        .expect("finish contending workspace mutation");
+    assert!(
+        !output.status.success(),
+        "a removed workspace target must not commit\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("packages/web/package.json"),
+        web_manifest_before,
+        "the removed target manifest must remain unchanged",
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lockfile_before,
+        "the rejected mutation must leave the root lockfile unchanged",
+    );
+}
+
+#[test]
 fn recursive_filter_prod_excludes_dev_only_workspace_dependencies() {
     let project = TempProject::empty(
         r#"{
@@ -777,7 +1154,7 @@ fn pnpm_workspace_root_bare_install_recurses_by_default() {
 }
 
 #[test]
-fn bare_install_inside_member_remains_member_local() {
+fn bare_install_inside_member_updates_only_its_root_lockfile_projection() {
     let project = workspace_project();
     let output = lpm(&project)
         .current_dir(project.path().join("packages/web"))
@@ -787,6 +1164,8 @@ fn bare_install_inside_member_remains_member_local() {
         .expect("run member-local bare install");
 
     assert_install_succeeded(&output, "bare install inside a member should succeed");
+    assert!(project.path().join("lpm.lock").is_file());
+    assert!(!project.path().join("packages/web/lpm.lock").exists());
     assert_target_installed(&project, "packages/web");
     assert_target_not_installed(&project, "");
     assert_target_not_installed(&project, "packages/core");
@@ -1384,8 +1763,21 @@ async fn mount_peer_sensitive_workspace_packages(mock: &MockRegistry) {
 }
 
 fn member_package_graph(project: &TempProject, member: &str) -> Vec<(String, String, Vec<String>)> {
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join(member).join("lpm.lock"))
-        .unwrap_or_else(|error| panic!("read {member}/lpm.lock: {error}"));
+    let root_path = project.path().join("lpm.lock");
+    let root_lockfile = lpm_lockfile::Lockfile::read_fast(&root_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root_path.display()));
+    let lockfile = if root_lockfile.metadata.lockfile_version
+        >= lpm_lockfile::LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
+    {
+        root_lockfile
+            .project_importer(if member.is_empty() { "." } else { member })
+            .unwrap_or_else(|error| panic!("project importer {member:?}: {error}"))
+    } else if member.is_empty() {
+        root_lockfile
+    } else {
+        lpm_lockfile::Lockfile::read_fast(&project.path().join(member).join("lpm.lock"))
+            .unwrap_or_else(|error| panic!("read {member}/lpm.lock: {error}"))
+    };
     lockfile
         .packages
         .into_iter()
@@ -1460,7 +1852,7 @@ async fn recursive_install_preserves_importer_local_peer_contexts_in_parallel() 
 }
 
 #[tokio::test]
-async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
+async fn recursive_install_writes_one_root_lockfile_with_importer_projections() {
     let mock = MockRegistry::start().await;
     mount_registry_packages(&mock, &[("shared-dep", "1.0.0"), ("web-only-dep", "2.0.0")]).await;
 
@@ -1529,7 +1921,33 @@ async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
         "core must not receive web's dependency from the shared resolution",
     );
 
-    let core_lock = project.read_file("packages/core/lpm.lock");
+    assert!(
+        !project.path().join("packages/core/lpm.lock").exists(),
+        "core must not write a member-local lockfile",
+    );
+    assert!(
+        !project.path().join("packages/web/lpm.lock").exists(),
+        "web must not write a member-local lockfile",
+    );
+
+    let root_lock_path = project.path().join("lpm.lock");
+    let root_lock = lpm_lockfile::Lockfile::read_fast(&root_lock_path)
+        .unwrap_or_else(|error| panic!("read root lpm.lock: {error}"));
+    assert_eq!(
+        root_lock
+            .importers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [".", "packages/core", "packages/web"],
+        "the root lockfile must contain every workspace importer in path order",
+    );
+
+    let core_lock = root_lock
+        .project_importer("packages/core")
+        .expect("project the core importer")
+        .to_toml()
+        .expect("serialize the core projection");
     assert!(
         core_lock.contains("shared-dep"),
         "core lockfile must record its direct dependency: {core_lock}",
@@ -1538,11 +1956,287 @@ async fn recursive_install_keeps_each_member_lockfile_scoped_to_its_importer() {
         !core_lock.contains("web-only-dep"),
         "core lockfile must not leak web's dependency from the shared resolution: {core_lock}",
     );
-    let web_lock = project.read_file("packages/web/lpm.lock");
+    let web_lock = root_lock
+        .project_importer("packages/web")
+        .expect("project the web importer")
+        .to_toml()
+        .expect("serialize the web projection");
     assert!(
         web_lock.contains("shared-dep") && web_lock.contains("web-only-dep"),
         "web lockfile must record both of its direct dependencies: {web_lock}",
     );
+}
+
+#[test]
+fn recursive_install_prunes_the_projection_for_a_removed_workspace_member() {
+    let project = workspace_project();
+    let initial = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run the initial recursive install");
+    assert_install_succeeded(&initial, "initial recursive install should succeed");
+
+    std::fs::remove_dir_all(project.path().join("packages/unrelated"))
+        .expect("remove the unrelated workspace member");
+    let refresh = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("refresh the workspace after removing a member");
+    assert_install_succeeded(
+        &refresh,
+        "recursive install should refresh the workspace after removing a member",
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("read refreshed root lockfile");
+    assert!(
+        !lockfile.importers.contains_key("packages/unrelated"),
+        "the root lockfile must prune importers that are no longer workspace members",
+    );
+}
+
+#[tokio::test]
+async fn member_refresh_replaces_only_its_root_lockfile_projection() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[
+            ("core-dep", "1.0.0"),
+            ("core-next", "2.0.0"),
+            ("web-dep", "1.0.0"),
+        ],
+    )
+    .await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"core","version":"1.0.0","dependencies":{"core-dep":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/web/package.json",
+        r#"{"name":"web","version":"1.0.0","dependencies":{"web-dep":"1.0.0"}}"#,
+    );
+    let seed = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed workspace union lockfile");
+    assert_install_succeeded(&seed, "workspace seed install should succeed");
+    let before = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    let web_before = before.project_importer("packages/web").unwrap();
+
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"core","version":"1.0.0","dependencies":{"core-dep":"1.0.0","core-next":"2.0.0"}}"#,
+    );
+    let refresh = lpm_with_registry(&project, &mock.url())
+        .current_dir(project.path().join("packages/core"))
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("refresh one member projection");
+    assert_install_succeeded(&refresh, "member refresh should succeed");
+
+    let after = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert_eq!(after.project_importer("packages/web").unwrap(), web_before);
+    assert!(
+        after
+            .project_importer("packages/core")
+            .unwrap()
+            .packages
+            .iter()
+            .any(|package| package.name == "core-next"),
+    );
+    assert!(!project.path().join("packages/core/lpm.lock").exists());
+}
+
+#[tokio::test]
+async fn cold_recursive_install_runs_one_union_resolution_for_compatible_importers() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("core-dep", "1.0.0"), ("web-dep", "1.0.0")]).await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"core","version":"1.0.0","dependencies":{"core-dep":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/web/package.json",
+        r#"{"name":"web","version":"1.0.0","dependencies":{"web-dep":"1.0.0"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("RUST_LOG", "lpm=debug")
+        .arg("--verbose")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run verbose cold workspace install");
+    assert_install_succeeded(&output, "cold union workspace install should succeed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("workspace union resolution completed")
+            .count(),
+        1,
+        "compatible workspace importers should share exactly one resolver traversal: {stderr}",
+    );
+    assert!(
+        stderr.contains("importers=2"),
+        "the union traversal should project both non-empty importers: {stderr}",
+    );
+}
+
+#[tokio::test]
+async fn failed_member_refresh_keeps_the_root_lockfile_byte_identical() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("seed-dep", "1.0.0")]).await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/member/package.json",
+        r#"{"name":"member","version":"1.0.0","dependencies":{"seed-dep":"1.0.0"}}"#,
+    );
+    let seed = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed workspace union lockfile");
+    assert_install_succeeded(&seed, "workspace seed install should succeed");
+    let before = project.read_file("lpm.lock");
+
+    project.write_file(
+        "packages/member/package.json",
+        r#"{"name":"member","version":"1.0.0","dependencies":{"missing-dep":"1.0.0"}}"#,
+    );
+    let failed = lpm_with_registry(&project, &mock.url())
+        .current_dir(project.path().join("packages/member"))
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run failing member refresh");
+    assert!(!failed.status.success());
+    assert_eq!(project.read_file("lpm.lock"), before);
+    assert!(!project.path().join("packages/member/lpm.lock").exists());
+}
+
+#[tokio::test]
+async fn member_add_and_uninstall_update_the_same_root_lockfile_projection() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("added-dep", "1.0.0")]).await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/member/package.json",
+        r#"{"name":"member","version":"1.0.0"}"#,
+    );
+    let seed = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed workspace lockfile");
+    assert_install_succeeded(&seed, "workspace seed install should succeed");
+
+    let add = lpm_with_registry(&project, &mock.url())
+        .current_dir(project.path().join("packages/member"))
+        .arg("install")
+        .arg("added-dep@1.0.0")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("add dependency to workspace member");
+    assert_install_succeeded(&add, "member add should succeed");
+    let added = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert!(
+        added
+            .project_importer("packages/member")
+            .unwrap()
+            .packages
+            .iter()
+            .any(|package| package.name == "added-dep"),
+    );
+
+    let uninstall = lpm_with_registry(&project, &mock.url())
+        .current_dir(project.path().join("packages/member"))
+        .arg("uninstall")
+        .arg("added-dep")
+        .output()
+        .expect("uninstall dependency from workspace member");
+    assert_install_succeeded(&uninstall, "member uninstall should succeed");
+    let removed = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert!(
+        removed
+            .project_importer("packages/member")
+            .unwrap()
+            .packages
+            .is_empty(),
+    );
+    assert!(!project.path().join("packages/member/lpm.lock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_filtered_uninstall_restores_all_manifests_and_the_root_lockfile() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(&mock, &[("shared-dep", "1.0.0")]).await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/member-a/package.json",
+        r#"{"name":"member-a","version":"1.0.0","dependencies":{"shared-dep":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/member-b/package.json",
+        r#"{"name":"member-b","version":"1.0.0","dependencies":{"shared-dep":"1.0.0"}}"#,
+    );
+    let seed = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed filtered uninstall rollback fixture");
+    assert_install_succeeded(&seed, "rollback fixture install should succeed");
+
+    let manifest_a_before = project.read_file("packages/member-a/package.json");
+    let manifest_b_before = project.read_file("packages/member-b/package.json");
+    let lockfile_before = project.read_file("lpm.lock");
+    let member_b_modules = project.path().join("packages/member-b/node_modules");
+    std::fs::set_permissions(&member_b_modules, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("uninstall")
+        .arg("shared-dep")
+        .args(["--filter", "member-*", "--yes"])
+        .output()
+        .expect("run failing filtered uninstall");
+    std::fs::set_permissions(&member_b_modules, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "the protected second target should fail cleanup\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("packages/member-a/package.json"),
+        manifest_a_before,
+    );
+    assert_eq!(
+        project.read_file("packages/member-b/package.json"),
+        manifest_b_before,
+    );
+    assert_eq!(project.read_file("lpm.lock"), lockfile_before);
 }
 
 #[tokio::test]
@@ -1966,6 +2660,11 @@ async fn warm_recursive_replay_preserves_each_importers_root_links_and_bin_shims
         .output()
         .expect("seed importer-local lockfiles and store entries");
     assert_install_succeeded(&seed, "initial recursive install should succeed");
+    let root_lockfile_path = project.path().join("lpm.lock");
+    let lockfile_modified_before_replay = std::fs::metadata(&root_lockfile_path)
+        .expect("root lockfile metadata")
+        .modified()
+        .expect("root lockfile modification time");
 
     for target in ["", "packages/first", "packages/second"] {
         let node_modules = project.path().join(target).join("node_modules");
@@ -1984,6 +2683,14 @@ async fn warm_recursive_replay_preserves_each_importers_root_links_and_bin_shims
         .output()
         .expect("run warm recursive lockfile replay");
     assert_install_succeeded(&replay, "warm recursive replay should succeed");
+    assert_eq!(
+        std::fs::metadata(&root_lockfile_path)
+            .expect("root lockfile metadata after replay")
+            .modified()
+            .expect("root lockfile modification time after replay"),
+        lockfile_modified_before_replay,
+        "an unchanged warm replay must not rewrite the root workspace lockfile"
+    );
 
     for target in ["", "packages/first", "packages/second"] {
         let node_modules = project.path().join(target).join("node_modules");

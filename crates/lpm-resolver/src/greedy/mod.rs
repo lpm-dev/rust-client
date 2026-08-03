@@ -64,6 +64,7 @@ mod tests;
 mod tree_policy;
 mod types;
 mod version;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -86,6 +87,9 @@ pub use fused::{
     resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots,
 };
 pub use types::PeerConflictReport;
+pub use workspace::{
+    WorkspaceResolveOutcome, resolve_greedy_fused_workspace_with_cache_options_and_policy,
+};
 
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]

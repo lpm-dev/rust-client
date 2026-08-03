@@ -26,6 +26,7 @@ pub(crate) fn metadata_fetch_detail_test_lock() -> &'static tokio::sync::Mutex<(
 }
 
 pub use greedy::PeerConflictReport;
+pub use greedy::WorkspaceResolveOutcome;
 pub use greedy::{
     ExperimentalMetadataFetchTimings, ExperimentalVersionSelection, SharedMetadataConcurrency,
     experimental_fetch_cached_package_info_with_policy,
@@ -37,6 +38,7 @@ pub use greedy::{
     resolve_greedy_fused_with_cache_options_and_policy_roots,
     resolve_greedy_fused_with_cache_options_policy_and_selected_events,
     resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots,
+    resolve_greedy_fused_workspace_with_cache_options_and_policy,
 };
 pub use npm_version::NpmVersion;
 pub use overrides::{
