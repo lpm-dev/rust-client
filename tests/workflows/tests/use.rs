@@ -1149,7 +1149,7 @@ fn run_keeps_lpm_runner_when_runtime_bun_is_pinned() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Using bun 1.3.14 (from lpm.json)"),
+        stderr.contains("Using bun 1.3.14 (from lpm.json > runtime.bun)"),
         "runtime.bun should still be recognized as a managed PATH entry, got:\n{stderr}"
     );
 
