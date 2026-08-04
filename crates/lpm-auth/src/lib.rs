@@ -67,6 +67,9 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 #[cfg(target_os = "macos")]
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_INVALID_OWNER_EDIT: i32 = -25244;
+
 #[derive(Debug)]
 enum KeychainCredentialProbe {
     Found(String),
@@ -1595,11 +1598,46 @@ fn set_password_in_macos_keychain(service: &str, account: &str, token: &str) -> 
 }
 
 #[cfg(target_os = "macos")]
+fn clear_security_cli_password_from_macos_keychain_locked(
+    service: &str,
+    account: &str,
+) -> Result<(), String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args(["delete-generic-password", "-s", service, "-a", account])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| format!("keychain legacy delete spawn error: {error}"))?;
+
+    if output.status.success() || output.status.code() == Some(44) {
+        return Ok(());
+    }
+
+    let error = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "keychain legacy delete error (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        error.trim()
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_keychain_delete_requires_security_cli(error_code: i32) -> bool {
+    error_code == ERR_SEC_INVALID_OWNER_EDIT
+}
+
+#[cfg(target_os = "macos")]
 fn clear_password_from_macos_keychain(service: &str, account: &str) -> Result<(), String> {
     let _lock = lpm_common::platform::macos_keychain_operation_lock();
     match macos_delete_generic_password(service, account) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+        // Items written by the older `security` CLI path reject query-based
+        // SecItemDelete, but the CLI can delete them without reading the secret.
+        Err(error) if macos_keychain_delete_requires_security_cli(error.code()) => {
+            clear_security_cli_password_from_macos_keychain_locked(service, account)
+        }
         Err(error) => Err(format!("keychain delete error: {error}")),
     }
 }
@@ -2363,6 +2401,16 @@ mod tests {
         assert_eq!(token_from_keychain_password(vec![0xff, 0xfe]), None);
     }
 
+    #[test]
+    fn invalid_owner_keychain_delete_uses_the_security_cli_fallback() {
+        assert!(macos_keychain_delete_requires_security_cli(-25244));
+    }
+
+    #[test]
+    fn unrelated_keychain_delete_error_does_not_use_the_security_cli_fallback() {
+        assert!(!macos_keychain_delete_requires_security_cli(-25308));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn modern_keychain_read_waits_for_process_interaction_lock() {
@@ -2423,6 +2471,44 @@ mod tests {
 
             cleanup_keychain_item(service, &access_account);
             cleanup_keychain_item(service, &refresh_account);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "macOS keychain integration; opt-in only and serial execution required"]
+    fn logout_clears_credentials_written_by_the_legacy_security_cli() {
+        require_keychain_opt_in();
+
+        with_test_keychain_service(|service| {
+            let account = "legacy-security-cli-credential";
+            cleanup_keychain_item(service, account);
+
+            let status = std::process::Command::new("security")
+                .args([
+                    "add-generic-password",
+                    "-s",
+                    service,
+                    "-a",
+                    account,
+                    "-w",
+                    "integration-test-credential",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .status()
+                .expect("create legacy security CLI credential");
+            assert!(status.success(), "legacy credential setup must succeed");
+
+            let result = clear_password_from_macos_keychain(service, account);
+            if result.is_err() {
+                cleanup_keychain_item(service, account);
+            }
+
+            assert!(
+                result.is_ok(),
+                "logout must clear legacy security CLI credentials: {result:?}"
+            );
         });
     }
 
