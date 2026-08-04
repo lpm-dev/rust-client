@@ -2038,6 +2038,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         ambient_peer_installs,
         peer_conflicts,
         stage_timing: StageTiming {
+            workspace_union: Default::default(),
             followup_rpc_ms: snap.metadata_rpc.as_millis() as u64,
             followup_rpc_count: snap.metadata_rpc_count,
             parse_ndjson_ms: snap.parse_ndjson.as_millis() as u64,

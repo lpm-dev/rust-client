@@ -180,8 +180,13 @@ pub(super) struct WorkspaceUnionRequest {
 
 enum WorkspaceUnionResult {
     Projected(Box<lpm_resolver::ResolveResult>),
-    Isolated,
+    Isolated(Option<lpm_resolver::WorkspaceUnionStageTiming>),
     Failed(lpm_resolver::ResolveError),
+}
+
+pub(super) enum WorkspaceUnionResolution {
+    Projected(Box<lpm_resolver::ResolveResult>),
+    Isolated(Option<lpm_resolver::WorkspaceUnionStageTiming>),
 }
 
 struct RootProviderState {
@@ -496,12 +501,12 @@ pub(super) fn resolver_metadata_concurrency_for_importer(
 
 pub(super) async fn resolve_workspace_union(
     request: WorkspaceUnionRequest,
-) -> Result<Option<lpm_resolver::ResolveResult>, LpmError> {
+) -> Result<WorkspaceUnionResolution, LpmError> {
     let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) else {
-        return Ok(None);
+        return Ok(WorkspaceUnionResolution::Isolated(None));
     };
     let Some(union) = task.coordinator.union.as_ref() else {
-        return Ok(None);
+        return Ok(WorkspaceUnionResolution::Isolated(None));
     };
 
     {
@@ -547,8 +552,8 @@ pub(super) async fn resolve_workspace_union(
             LpmError::Registry("workspace union resolver completed without a result".to_string())
         })?;
     match result {
-        WorkspaceUnionResult::Projected(result) => Ok(Some(*result)),
-        WorkspaceUnionResult::Isolated => Ok(None),
+        WorkspaceUnionResult::Projected(result) => Ok(WorkspaceUnionResolution::Projected(result)),
+        WorkspaceUnionResult::Isolated(timing) => Ok(WorkspaceUnionResolution::Isolated(timing)),
         WorkspaceUnionResult::Failed(error) => {
             Err(crate::resolver_error::resolver_error_to_lpm(error))
         }
@@ -584,6 +589,11 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
         HashMap::<WorkspaceUnionGroupKey, usize>::with_capacity(requests.len());
     for (index, request) in requests.iter().enumerate() {
         let Some(route_key) = request.route_table.workspace_resolution_key() else {
+            tracing::debug!(
+                importer_index = index,
+                reason = "route-key-unavailable",
+                "workspace union resolution retained isolated importer"
+            );
             groups.push(vec![index]);
             continue;
         };
@@ -604,7 +614,7 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
     }
 
     let mut results = (0..requests.len())
-        .map(|_| Some(WorkspaceUnionResult::Isolated))
+        .map(|_| Some(WorkspaceUnionResult::Isolated(None)))
         .collect::<Vec<_>>();
     for indices in groups {
         if indices.len() < 2 {
@@ -645,7 +655,10 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
         )
         .await;
         match resolved {
-            Ok(lpm_resolver::WorkspaceResolveOutcome::Projected(projected)) => {
+            Ok(lpm_resolver::WorkspaceResolveOutcome::Projected {
+                results: projected,
+                timing,
+            }) => {
                 let projected_count = projected.iter().filter(|result| result.is_some()).count();
                 if let Some(materialization) = super::workspace_materialization::current() {
                     materialization.publish_union_object_candidates(
@@ -661,6 +674,9 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
                     projected = projected_count,
                     "workspace union resolution completed"
                 );
+                if projected_count == 0 {
+                    results[indices[0]] = Some(WorkspaceUnionResult::Isolated(Some(timing)));
+                }
                 for (index, projection) in indices.into_iter().zip(projected) {
                     if let Some(projection) = projection {
                         results[index] =
@@ -668,7 +684,13 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
                     }
                 }
             }
-            Ok(lpm_resolver::WorkspaceResolveOutcome::RequiresIsolatedResolution) => {}
+            Ok(lpm_resolver::WorkspaceResolveOutcome::RequiresIsolatedResolution) => {
+                tracing::debug!(
+                    importers = indices.len(),
+                    reason = "resolver-group-ineligible",
+                    "workspace union resolution retained isolated importer fallbacks"
+                );
+            }
             Err(error) => {
                 for index in indices {
                     results[index] = Some(WorkspaceUnionResult::Failed(error.clone()));
@@ -1303,6 +1325,12 @@ mod tests {
             .expect("valid route table")
     }
 
+    fn tls_customized_route_table() -> lpm_registry::RouteTable {
+        let npmrc = lpm_registry::NpmrcConfig::parse("strict-ssl=true\n", "test", &|_| None);
+        lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc)
+            .expect("valid route table")
+    }
+
     async fn workspace_union_results_for_routes(
         first_route: lpm_registry::RouteTable,
         second_route: lpm_registry::RouteTable,
@@ -1346,7 +1374,14 @@ mod tests {
                 )
             })
             .await;
-        (first.unwrap().unwrap(), second.unwrap().unwrap())
+        let projected = |resolution| match resolution {
+            WorkspaceUnionResolution::Projected(result) => Some(*result),
+            WorkspaceUnionResolution::Isolated(_) => None,
+        };
+        (
+            projected(first.unwrap().unwrap()),
+            projected(second.unwrap().unwrap()),
+        )
     }
 
     async fn fact_caches_for_resolution_importers(
@@ -1539,6 +1574,32 @@ mod tests {
             rendered
                 .matches("reason=\"singleton-equivalence-group\"")
                 .count(),
+            2,
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_union_logs_when_route_key_is_unavailable() {
+        let output = TraceBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(output.clone())
+            .finish();
+        let route_table = tls_customized_route_table();
+        let (first, second) = workspace_union_results_for_routes(route_table.clone(), route_table)
+            .with_subscriber(subscriber)
+            .await;
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            rendered.matches("reason=\"route-key-unavailable\"").count(),
             2,
             "{rendered}"
         );

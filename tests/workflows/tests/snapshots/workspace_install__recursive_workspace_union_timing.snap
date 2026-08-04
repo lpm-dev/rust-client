@@ -1,0 +1,22 @@
+---
+source: tests/workflows/tests/workspace_install.rs
+assertion_line: 1875
+expression: "report[\"timing\"][\"workspace_union\"]"
+---
+{
+  "scope": "recursive_command",
+  "aggregation": "sum_of_union_groups",
+  "importer_count": 2,
+  "eligible_importer_count": 2,
+  "projected_importer_count": 2,
+  "isolated_importer_count": 0,
+  "expansion_pass_count": 1,
+  "expansion_capped": false,
+  "isolated_importer_reasons": {
+    "root_specifier_count": 0,
+    "release_age_policy_count": 0,
+    "projection_count": 0,
+    "ambient_peer_cap_count": 0,
+    "ambient_peer_stalled_count": 0
+  }
+}

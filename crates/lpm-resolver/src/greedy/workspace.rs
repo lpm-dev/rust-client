@@ -17,8 +17,13 @@ use crate::ranges::NpmRange;
 use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, RootDependencies};
 use crate::specifier::Specifier;
 
+const MAX_AMBIENT_PEER_EXPANSION_PASSES: usize = 4;
+
 pub enum WorkspaceResolveOutcome {
-    Projected(Vec<Option<ResolveResult>>),
+    Projected {
+        results: Vec<Option<ResolveResult>>,
+        timing: crate::resolve::WorkspaceUnionStageTiming,
+    },
     RequiresIsolatedResolution,
 }
 
@@ -32,7 +37,9 @@ struct RootSlot {
 
 struct UnionRoots {
     dependencies: RootDependencies,
-    slots: Vec<Vec<RootSlot>>,
+    slots: Vec<Option<Vec<RootSlot>>>,
+    eligible_importer_count: usize,
+    root_specifier_isolated_count: usize,
 }
 
 type PeerRequirement = (usize, String, NpmRange, bool);
@@ -59,6 +66,10 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
         )));
     }
     let Some(first_policy) = policies.first() else {
+        tracing::debug!(
+            reason = "empty-union-group",
+            "workspace union resolution retained isolated importer fallbacks"
+        );
         return Ok(WorkspaceResolveOutcome::RequiresIsolatedResolution);
     };
     let group_key = first_policy.workspace_resolution_key();
@@ -66,14 +77,38 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
         .iter()
         .any(|policy| policy.workspace_resolution_key() != group_key)
     {
+        tracing::debug!(
+            importers = policies.len(),
+            reason = "policy-key-mismatch",
+            "workspace union resolution retained isolated importer fallbacks"
+        );
         return Ok(WorkspaceResolveOutcome::RequiresIsolatedResolution);
     }
-    let Some(UnionRoots {
+    let UnionRoots {
         mut dependencies,
         slots,
-    }) = union_root_dependencies(&roots)?
-    else {
-        return Ok(WorkspaceResolveOutcome::RequiresIsolatedResolution);
+        eligible_importer_count,
+        root_specifier_isolated_count,
+    } = union_root_dependencies(&roots)?;
+    if eligible_importer_count < 2 {
+        tracing::debug!(
+            importers = roots.len(),
+            eligible_importers = eligible_importer_count,
+            reason = "fewer-than-two-eligible-importers",
+            "workspace union resolution retained isolated importer fallbacks"
+        );
+        return Ok(WorkspaceResolveOutcome::Projected {
+            results: (0..roots.len()).map(|_| None).collect(),
+            timing: crate::resolve::WorkspaceUnionStageTiming {
+                importer_count: usize_to_u64_saturating(roots.len()),
+                eligible_importer_count: usize_to_u64_saturating(eligible_importer_count),
+                isolated_importer_count: usize_to_u64_saturating(roots.len()),
+                root_specifier_isolated_count: usize_to_u64_saturating(
+                    root_specifier_isolated_count,
+                ),
+                ..Default::default()
+            },
+        });
     };
     let union_policy = first_policy.for_workspace_union();
     let mut supplemental_peers = HashSet::new();
@@ -97,7 +132,30 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
         .await?;
         let pass = project_union_result(union, &slots, &overrides, auto_install_peers, &policies)?;
         if pass.missing_ambient_peers.is_empty() {
-            return Ok(WorkspaceResolveOutcome::Projected(pass.projected));
+            return Ok(pass.into_outcome(
+                expansion_pass,
+                root_specifier_isolated_count,
+                false,
+                0,
+                0,
+            ));
+        }
+        if expansion_pass >= MAX_AMBIENT_PEER_EXPANSION_PASSES {
+            let isolated_importers = pass.ambient_peer_pending_importer_count;
+            tracing::warn!(
+                expansion_pass,
+                max_expansion_passes = MAX_AMBIENT_PEER_EXPANSION_PASSES,
+                isolated_importers,
+                reason = "ambient-peer-expansion-cap",
+                "workspace union ambient-peer expansion reached its cap; falling back to isolated resolution for unconverged importers"
+            );
+            return Ok(pass.into_outcome(
+                expansion_pass,
+                root_specifier_isolated_count,
+                true,
+                isolated_importers,
+                0,
+            ));
         }
 
         let mut added = 0usize;
@@ -117,7 +175,14 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
                 reason = "ambient-peer-expansion-stalled",
                 "workspace union resolution retained isolated importer fallbacks"
             );
-            return Ok(WorkspaceResolveOutcome::Projected(pass.projected));
+            let isolated_importers = pass.ambient_peer_pending_importer_count;
+            return Ok(pass.into_outcome(
+                expansion_pass,
+                root_specifier_isolated_count,
+                false,
+                0,
+                isolated_importers,
+            ));
         }
         tracing::debug!(
             expansion_pass,
@@ -128,7 +193,7 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
     }
 }
 
-fn union_root_dependencies(roots: &[RootDependencies]) -> Result<Option<UnionRoots>, ResolveError> {
+fn union_root_dependencies(roots: &[RootDependencies]) -> Result<UnionRoots, ResolveError> {
     let dependency_count = roots
         .iter()
         .map(|root| root.dependencies.len())
@@ -136,11 +201,13 @@ fn union_root_dependencies(roots: &[RootDependencies]) -> Result<Option<UnionRoo
     let mut dependencies = HashMap::with_capacity(dependency_count);
     let mut optional_names = HashSet::with_capacity(dependency_count);
     let mut all_slots = Vec::with_capacity(roots.len());
+    let mut root_specifier_isolated_count = 0usize;
 
     for (root_index, root) in roots.iter().enumerate() {
         let mut entries = root.dependencies.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(right.0));
-        let mut slots = Vec::with_capacity(entries.len());
+        let mut parsed_slots = Vec::with_capacity(entries.len());
+        let mut ineligible = None;
         for (slot_index, (local, raw)) in entries.into_iter().enumerate() {
             let (target, range, alias) = match Specifier::parse(raw).map_err(|error| {
                 ResolveError::Internal(format!(
@@ -149,38 +216,122 @@ fn union_root_dependencies(roots: &[RootDependencies]) -> Result<Option<UnionRoo
             })? {
                 Specifier::SemverRange(range) => (local.clone(), range, false),
                 Specifier::NpmAlias { target, range } => (target, range, true),
-                Specifier::Workspace(_)
-                | Specifier::Tarball { .. }
-                | Specifier::File { .. }
-                | Specifier::Link { .. }
-                | Specifier::Git { .. } => return Ok(None),
+                specifier => {
+                    ineligible = Some((local.as_str(), non_registry_specifier_kind(&specifier)));
+                    break;
+                }
             };
             let synthetic = format!("lpm-workspace-root-{root_index}-{slot_index}");
             let optional = root.optional_names.contains(local);
-            if optional {
-                optional_names.insert(synthetic.clone());
-            }
-            dependencies.insert(synthetic.clone(), format!("npm:{target}@{range}"));
-            slots.push(RootSlot {
-                synthetic,
-                local: local.clone(),
-                target,
-                optional,
-                alias,
-            });
+            parsed_slots.push((
+                RootSlot {
+                    synthetic,
+                    local: local.clone(),
+                    target,
+                    optional,
+                    alias,
+                },
+                range,
+            ));
         }
-        all_slots.push(slots);
+        if let Some((dependency, specifier_kind)) = ineligible {
+            root_specifier_isolated_count += 1;
+            tracing::debug!(
+                importer_index = root_index,
+                dependency,
+                specifier_kind,
+                reason = "ineligible-root-specifier",
+                "workspace union importer requires isolated resolution"
+            );
+            all_slots.push(None);
+            continue;
+        }
+        let mut slots = Vec::with_capacity(parsed_slots.len());
+        for (slot, range) in parsed_slots {
+            if slot.optional {
+                optional_names.insert(slot.synthetic.clone());
+            }
+            dependencies.insert(
+                slot.synthetic.clone(),
+                format!("npm:{}@{range}", slot.target),
+            );
+            slots.push(slot);
+        }
+        all_slots.push(Some(slots));
     }
 
-    Ok(Some(UnionRoots {
+    let eligible_importer_count = all_slots.iter().filter(|slots| slots.is_some()).count();
+    Ok(UnionRoots {
         dependencies: RootDependencies::with_optional_names(dependencies, optional_names),
         slots: all_slots,
-    }))
+        eligible_importer_count,
+        root_specifier_isolated_count,
+    })
+}
+
+fn non_registry_specifier_kind(specifier: &Specifier) -> &'static str {
+    match specifier {
+        Specifier::Workspace(_) => "workspace",
+        Specifier::Tarball { .. } => "tarball",
+        Specifier::File { .. } => "file",
+        Specifier::Link { .. } => "link",
+        Specifier::Git { .. } => "git",
+        Specifier::SemverRange(_) | Specifier::NpmAlias { .. } => "registry",
+    }
 }
 
 struct WorkspaceProjectionPass {
     projected: Vec<Option<ResolveResult>>,
     missing_ambient_peers: Vec<(String, String)>,
+    union_stage_timing: crate::resolve::StageTiming,
+    eligible_importer_count: usize,
+    release_age_policy_isolated_count: usize,
+    projection_isolated_count: usize,
+    ambient_peer_pending_importer_count: usize,
+}
+
+impl WorkspaceProjectionPass {
+    fn into_outcome(
+        mut self,
+        expansion_pass_count: usize,
+        root_specifier_isolated_count: usize,
+        expansion_capped: bool,
+        ambient_peer_cap_isolated_count: usize,
+        ambient_peer_stalled_isolated_count: usize,
+    ) -> WorkspaceResolveOutcome {
+        let projected_importer_count = self.projected.iter().flatten().count();
+        let timing = crate::resolve::WorkspaceUnionStageTiming {
+            importer_count: usize_to_u64_saturating(self.projected.len()),
+            eligible_importer_count: usize_to_u64_saturating(self.eligible_importer_count),
+            projected_importer_count: usize_to_u64_saturating(projected_importer_count),
+            isolated_importer_count: usize_to_u64_saturating(
+                self.projected
+                    .len()
+                    .saturating_sub(projected_importer_count),
+            ),
+            ambient_peer_expansion_pass_count: usize_to_u64_saturating(expansion_pass_count),
+            ambient_peer_expansion_capped: expansion_capped,
+            root_specifier_isolated_count: usize_to_u64_saturating(root_specifier_isolated_count),
+            release_age_policy_isolated_count: usize_to_u64_saturating(
+                self.release_age_policy_isolated_count,
+            ),
+            projection_isolated_count: usize_to_u64_saturating(self.projection_isolated_count),
+            ambient_peer_cap_isolated_count: usize_to_u64_saturating(
+                ambient_peer_cap_isolated_count,
+            ),
+            ambient_peer_stalled_isolated_count: usize_to_u64_saturating(
+                ambient_peer_stalled_isolated_count,
+            ),
+        };
+        if let Some(result) = self.projected.iter_mut().flatten().next() {
+            result.stage_timing = self.union_stage_timing;
+            result.stage_timing.workspace_union = timing;
+        }
+        WorkspaceResolveOutcome::Projected {
+            results: self.projected,
+            timing,
+        }
+    }
 }
 
 enum ImporterProjection {
@@ -197,20 +348,27 @@ struct ImporterProjectionContext<'a> {
     auto_install_peers: bool,
     policy: &'a ResolverPolicy,
     importer_index: usize,
-    account_union_timing: bool,
 }
 
 fn project_union_result(
     union: ResolveResult,
-    slots: &[Vec<RootSlot>],
+    slots: &[Option<Vec<RootSlot>>],
     overrides: &OverrideSet,
     auto_install_peers: bool,
     policies: &[ResolverPolicy],
 ) -> Result<WorkspaceProjectionPass, ResolveError> {
+    let union_stage_timing = union.stage_timing;
     let package_index = package_indices(&union.packages);
     let mut projected = Vec::with_capacity(slots.len());
     let mut missing_ambient_peers = Vec::new();
+    let mut release_age_policy_isolated_count = 0usize;
+    let mut projection_isolated_count = 0usize;
+    let mut ambient_peer_pending_importer_count = 0usize;
     for (root_index, root_slots) in slots.iter().enumerate() {
+        let Some(root_slots) = root_slots else {
+            projected.push(None);
+            continue;
+        };
         let context = ImporterProjectionContext {
             union: &union,
             package_index: &package_index,
@@ -218,7 +376,6 @@ fn project_union_result(
             auto_install_peers,
             policy: &policies[root_index],
             importer_index: root_index,
-            account_union_timing: root_index == 0,
         };
         let result = project_importer(root_slots, &context)?;
         let result = match result {
@@ -228,6 +385,7 @@ fn project_union_result(
                 Some(*result)
             }
             ImporterProjection::Projected(_) => {
+                release_age_policy_isolated_count += 1;
                 tracing::debug!(
                     importer_index = root_index,
                     reason = "release-age-policy",
@@ -236,10 +394,14 @@ fn project_union_result(
                 None
             }
             ImporterProjection::NeedsAmbientPeers(missing) => {
+                ambient_peer_pending_importer_count += 1;
                 missing_ambient_peers.extend(missing);
                 None
             }
-            ImporterProjection::RequiresIsolatedResolution => None,
+            ImporterProjection::RequiresIsolatedResolution => {
+                projection_isolated_count += 1;
+                None
+            }
         };
         projected.push(result);
     }
@@ -248,6 +410,11 @@ fn project_union_result(
     Ok(WorkspaceProjectionPass {
         projected,
         missing_ambient_peers,
+        union_stage_timing,
+        eligible_importer_count: slots.iter().flatten().count(),
+        release_age_policy_isolated_count,
+        projection_isolated_count,
+        ambient_peer_pending_importer_count,
     })
 }
 
@@ -391,12 +558,12 @@ fn project_importer(
         root_resolutions,
         ambient_peer_installs,
         peer_conflicts,
-        stage_timing: if context.account_union_timing {
-            union.stage_timing
-        } else {
-            Default::default()
-        },
+        stage_timing: Default::default(),
     })))
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn add_dependency_closure(
@@ -854,7 +1021,7 @@ mod tests {
         let policies = vec![ResolverPolicy::default(); roots.len()];
         let outcome = resolve_roots_with_policies(roots, cache_entries, policies).await;
         match outcome {
-            WorkspaceResolveOutcome::Projected(results) => results
+            WorkspaceResolveOutcome::Projected { results, .. } => results
                 .into_iter()
                 .map(|result| result.expect("fixture projection should remain union-compatible"))
                 .collect(),
@@ -1003,7 +1170,7 @@ mod tests {
         )
         .await;
 
-        let WorkspaceResolveOutcome::Projected(results) = outcome else {
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
             panic!("unrelated overrides should not disable the union traversal")
         };
         assert!(results.iter().all(Option::is_some));
@@ -1045,7 +1212,7 @@ mod tests {
         )
         .await;
 
-        let WorkspaceResolveOutcome::Projected(results) = outcome else {
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
             panic!("peer overrides should stay inside the union traversal")
         };
         for result in results {
@@ -1094,7 +1261,7 @@ mod tests {
         )
         .await;
 
-        let WorkspaceResolveOutcome::Projected(results) = outcome else {
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
             panic!("the ambient peer should expand the union traversal")
         };
         assert!(results[0].is_some());
@@ -1152,6 +1319,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn union_resolution_isolates_only_importer_with_non_registry_root() {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([(
+                "local".to_string(),
+                "file:../local".to_string(),
+            )])),
+            RootDependencies::required(HashMap::from([(
+                "shared".to_string(),
+                "1.0.0".to_string(),
+            )])),
+            RootDependencies::required(HashMap::from([(
+                "shared".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        ];
+        let outcome = resolve_roots_with_policies(
+            roots,
+            vec![("shared", cached_package(&[("1.0.0", &[], &[])]))],
+            vec![ResolverPolicy::default(); 3],
+        )
+        .await;
+
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
+            panic!("one non-registry root must not disable compatible sibling importers")
+        };
+        assert!(results[0].is_none());
+        let timing = results[1]
+            .as_ref()
+            .expect("eligible importer should be projected")
+            .stage_timing
+            .workspace_union;
+        assert!(results[2].is_some());
+        assert_eq!(timing.importer_count, 3);
+        assert_eq!(timing.eligible_importer_count, 2);
+        assert_eq!(timing.projected_importer_count, 2);
+        assert_eq!(timing.isolated_importer_count, 1);
+        assert_eq!(timing.root_specifier_isolated_count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_resolution_falls_back_importer_when_ambient_peer_expansion_exceeds_cap() {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("consumer".to_string(), "1.0.0".to_string()),
+                ("peer-a".to_string(), "1.0.0".to_string()),
+                ("peer-b".to_string(), "1.0.0".to_string()),
+                ("peer-c".to_string(), "1.0.0".to_string()),
+                ("peer-d".to_string(), "1.0.0".to_string()),
+                ("peer-e".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([(
+                "consumer".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        ];
+        let outcome = resolve_roots_with_policies(
+            roots,
+            vec![
+                (
+                    "consumer",
+                    cached_package(&[("1.0.0", &[], &[("peer-a", "*")])]),
+                ),
+                (
+                    "peer-a",
+                    cached_package(&[("2.0.0", &[], &[("peer-b", "*")]), ("1.0.0", &[], &[])]),
+                ),
+                (
+                    "peer-b",
+                    cached_package(&[("2.0.0", &[], &[("peer-c", "*")]), ("1.0.0", &[], &[])]),
+                ),
+                (
+                    "peer-c",
+                    cached_package(&[("2.0.0", &[], &[("peer-d", "*")]), ("1.0.0", &[], &[])]),
+                ),
+                (
+                    "peer-d",
+                    cached_package(&[("2.0.0", &[], &[("peer-e", "*")]), ("1.0.0", &[], &[])]),
+                ),
+                (
+                    "peer-e",
+                    cached_package(&[("2.0.0", &[], &[]), ("1.0.0", &[], &[])]),
+                ),
+            ],
+            vec![ResolverPolicy::default(); 2],
+        )
+        .await;
+
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
+            panic!("the union should preserve projections that converged before the cap")
+        };
+        let timing = results[0]
+            .as_ref()
+            .expect("converged importer should remain projected")
+            .stage_timing
+            .workspace_union;
+        assert!(results[1].is_none());
+        assert_eq!(timing.ambient_peer_expansion_pass_count, 4);
+        assert!(timing.ambient_peer_expansion_capped);
+        assert_eq!(timing.ambient_peer_cap_isolated_count, 1);
+        assert_eq!(timing.isolated_importer_count, 1);
+    }
+
+    #[test]
+    fn workspace_projection_retains_timing_when_every_importer_is_isolated() {
+        let outcome = WorkspaceProjectionPass {
+            projected: vec![None, None],
+            missing_ambient_peers: Vec::new(),
+            union_stage_timing: Default::default(),
+            eligible_importer_count: 2,
+            release_age_policy_isolated_count: 0,
+            projection_isolated_count: 0,
+            ambient_peer_pending_importer_count: 2,
+        }
+        .into_outcome(4, 0, true, 2, 0);
+
+        let WorkspaceResolveOutcome::Projected { results, timing } = outcome else {
+            panic!("isolated projections should preserve the union outcome")
+        };
+        assert!(results.iter().all(Option::is_none));
+        assert_eq!(timing.ambient_peer_expansion_pass_count, 4);
+        assert!(timing.ambient_peer_expansion_capped);
+        assert_eq!(timing.ambient_peer_cap_isolated_count, 2);
+        assert_eq!(timing.isolated_importer_count, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn union_resolution_falls_back_only_the_importer_with_a_too_new_direct_root() {
         const CUTOFF_UNIX: i64 = 1_735_776_000;
         let roots = vec![
@@ -1194,7 +1487,7 @@ mod tests {
         )
         .await;
 
-        let WorkspaceResolveOutcome::Projected(results) = outcome else {
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
             panic!("direct-scoped release-age policies should share the union traversal")
         };
         assert!(results[0].is_none());

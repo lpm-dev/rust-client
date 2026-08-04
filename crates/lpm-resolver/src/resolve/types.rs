@@ -237,6 +237,33 @@ pub struct PeerStageTiming {
     pub synthesized_edge_count: u64,
 }
 
+/// Workspace-union convergence and importer fallback telemetry.
+#[derive(Debug, Clone, Default, Copy)]
+pub struct WorkspaceUnionStageTiming {
+    /// Importers submitted to the union group.
+    pub importer_count: u64,
+    /// Importers whose resolver roots were eligible for union resolution.
+    pub eligible_importer_count: u64,
+    /// Importers resolved from the final union graph projection.
+    pub projected_importer_count: u64,
+    /// Importers sent through importer-local resolution.
+    pub isolated_importer_count: u64,
+    /// Ambient-peer roots added after complete union resolution passes.
+    pub ambient_peer_expansion_pass_count: u64,
+    /// Whether ambient-peer expansion reached its configured cap.
+    pub ambient_peer_expansion_capped: bool,
+    /// Importers isolated because a resolver root was not registry-backed.
+    pub root_specifier_isolated_count: u64,
+    /// Importers isolated because their release-age policy rejected a projection.
+    pub release_age_policy_isolated_count: u64,
+    /// Importers isolated because their graph could not be projected safely.
+    pub projection_isolated_count: u64,
+    /// Importers isolated after ambient-peer expansion reached its cap.
+    pub ambient_peer_cap_isolated_count: u64,
+    /// Importers isolated after ambient-peer expansion stopped making progress.
+    pub ambient_peer_stalled_isolated_count: u64,
+}
+
 /// Per-substage wall-clock breakdown emitted by
 /// [`resolve_with_shared_cache`].
 ///
@@ -262,6 +289,9 @@ pub struct PeerStageTiming {
 ///   approximates pubgrub-core work (backtracking, selection).
 #[derive(Debug, Clone, Default, Copy)]
 pub struct StageTiming {
+    /// Workspace-union convergence and per-importer fallback counts.
+    /// All fields are zero for importer-local resolver calls.
+    pub workspace_union: WorkspaceUnionStageTiming,
     /// Wall-clock spent in follow-up metadata RPCs triggered from
     /// inside the resolver's PubGrub callbacks. Does NOT include
     /// install.rs's pre-resolve initial batch. Reset + snapshot

@@ -1642,18 +1642,75 @@ fn populate_nests_scoped_same_name_sibling_symlink() {
 fn populate_reuses_entry_with_same_name_dependency() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
+    let request = same_name_dependency_request(&store, "same-name-reuse");
+    let first = populate_link_entry_source(&store, request.clone()).unwrap();
+    let second = populate_link_entry_source(&store, request).unwrap();
 
-    let pkg_sri = synthetic_sri(b"same-name-reuse/pkg");
-    let dep_sri = synthetic_sri(b"same-name-reuse/dep");
-    let pkg_obj = write_object(&store, &pkg_sri, &[("package.json", b"{}")]);
-    write_object(&store, &dep_sri, &[("package.json", b"{}")]);
+    assert!(first.freshly_populated);
+    assert!(
+        !second.freshly_populated,
+        "an unchanged same-name dependency layout must reuse its link entry"
+    );
+}
+
+#[test]
+fn populate_reuses_same_name_dependency_after_package_metadata_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let request = same_name_dependency_request(&store, "same-name-metadata-reuse");
+    let first = populate_link_entry_source(&store, request.clone()).unwrap();
+    let package_json = first
+        .link_dir
+        .join(LINK_NODE_MODULES)
+        .join("self-dependent")
+        .join("package.json");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(package_json)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+
+    let second = populate_link_entry_source(&store, request).unwrap();
+
+    assert!(
+        !second.freshly_populated,
+        "an unchanged same-name dependency layout must survive benign metadata drift"
+    );
+}
+
+#[test]
+fn populate_rebuilds_same_name_dependency_after_package_content_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let request = same_name_dependency_request(&store, "same-name-content-change");
+    let first = populate_link_entry_source(&store, request.clone()).unwrap();
+    let package_json = first
+        .link_dir
+        .join(LINK_NODE_MODULES)
+        .join("self-dependent")
+        .join("package.json");
+    std::fs::write(package_json, b"{\"tampered\":true}").unwrap();
+
+    let second = populate_link_entry_source(&store, request).unwrap();
+
+    assert!(
+        second.freshly_populated,
+        "a modified same-name dependency layout must be rebuilt from the verified object"
+    );
+}
+
+fn same_name_dependency_request(store: &Store, fixture: &str) -> LinkEntryRequest {
+    let pkg_sri = synthetic_sri(format!("{fixture}/pkg").as_bytes());
+    let dep_sri = synthetic_sri(format!("{fixture}/dep").as_bytes());
+    let pkg_obj = write_object(store, &pkg_sri, &[("package.json", b"{}")]);
+    write_object(store, &dep_sri, &[("package.json", b"{}")]);
     let dep_obj = store.paths().object_dir(&dep_sri).unwrap();
-
     let pkg_key = arc_key("self-dependent", "2.0.0");
     let dep_key = arc_key("self-dependent", "1.0.0");
 
     populate_link_entry_source(
-        &store,
+        store,
         LinkEntryRequest {
             graph_key: dep_key.clone(),
             source_sri: dep_sri,
@@ -1664,7 +1721,7 @@ fn populate_reuses_entry_with_same_name_dependency() {
     )
     .unwrap();
 
-    let request = LinkEntryRequest {
+    LinkEntryRequest {
         graph_key: pkg_key,
         source_sri: pkg_sri,
         object_dir: pkg_obj,
@@ -1673,15 +1730,7 @@ fn populate_reuses_entry_with_same_name_dependency() {
             target: dep_key,
         }],
         platform: Arc::new(sample_meta_platform()),
-    };
-    let first = populate_link_entry_source(&store, request.clone()).unwrap();
-    let second = populate_link_entry_source(&store, request).unwrap();
-
-    assert!(first.freshly_populated);
-    assert!(
-        !second.freshly_populated,
-        "an unchanged same-name dependency layout must reuse its link entry"
-    );
+    }
 }
 
 #[test]

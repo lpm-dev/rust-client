@@ -1474,6 +1474,42 @@ fn attach_aggregate_telemetry(
             })
             .fold(0u64, u64::saturating_add)
     };
+    let workspace_union_sum = |field: &str| -> u64 {
+        targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .get("timing")
+                    .and_then(|timing| timing.get("resolve"))
+                    .and_then(|resolve| resolve.get("workspace_union"))
+                    .and_then(|union| union.get(field))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .fold(0u64, u64::saturating_add)
+    };
+    let workspace_union_reason_sum = |field: &str| -> u64 {
+        targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .get("timing")
+                    .and_then(|timing| timing.get("resolve"))
+                    .and_then(|resolve| resolve.get("workspace_union"))
+                    .and_then(|union| union.get("isolated_importer_reasons"))
+                    .and_then(|reasons| reasons.get(field))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .fold(0u64, u64::saturating_add)
+    };
+    let workspace_union_expansion_capped = targets.iter().any(|target| {
+        target
+            .get("timing")
+            .and_then(|timing| timing.get("resolve"))
+            .and_then(|resolve| resolve.get("workspace_union"))
+            .and_then(|union| union.get("expansion_capped"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
     let waterfall_sum = |field: &str| -> u64 {
         targets
             .iter()
@@ -1518,6 +1554,23 @@ fn attach_aggregate_telemetry(
             "graph_finalization_ms": resolver_substage_sum("graph_finalization_ms"),
         })
     });
+    let workspace_union_timing = serde_json::json!({
+        "scope": "recursive_command",
+        "aggregation": "sum_of_union_groups",
+        "importer_count": workspace_union_sum("importer_count"),
+        "eligible_importer_count": workspace_union_sum("eligible_importer_count"),
+        "projected_importer_count": workspace_union_sum("projected_importer_count"),
+        "isolated_importer_count": workspace_union_sum("isolated_importer_count"),
+        "expansion_pass_count": workspace_union_sum("expansion_pass_count"),
+        "expansion_capped": workspace_union_expansion_capped,
+        "isolated_importer_reasons": {
+            "root_specifier_count": workspace_union_reason_sum("root_specifier_count"),
+            "release_age_policy_count": workspace_union_reason_sum("release_age_policy_count"),
+            "projection_count": workspace_union_reason_sum("projection_count"),
+            "ambient_peer_cap_count": workspace_union_reason_sum("ambient_peer_cap_count"),
+            "ambient_peer_stalled_count": workspace_union_reason_sum("ambient_peer_stalled_count"),
+        },
+    });
     let aggregate_counts = serde_json::json!({
         "scope": "recursive_command",
         "aggregation": "sum_of_target_observations",
@@ -1552,6 +1605,7 @@ fn attach_aggregate_telemetry(
             "fetch_ms": fetch_ms,
             "link_ms": link_ms,
             "total_ms": wall_ms,
+            "workspace_union": workspace_union_timing,
             "waterfall": {
                 "total_ms": wall_ms,
             },

@@ -341,6 +341,65 @@ async fn pre_resolve_no_op_when_no_tarball_url_deps() {
     assert_eq!(deps, original_deps);
 }
 
+#[test]
+fn resolver_roots_exclude_every_non_registry_specifier_after_manifest_partition() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("packages/app")).unwrap();
+    std::fs::create_dir_all(root.join("packages/core")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/core/package.json"),
+        r#"{"name":"@fixture/core","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/app/package.json"),
+        r#"{
+            "name":"@fixture/app",
+            "version":"1.0.0",
+            "dependencies":{
+                "@fixture/core":"workspace:*",
+                "local-tarball":"file:./fixtures/local.tgz",
+                "local-directory":"file:./fixtures/local",
+                "local-link":"link:./fixtures/linked",
+                "git-source":"github:owner/repository#main",
+                "remote-tarball":"https://example.test/archive.tgz",
+                "registry-range":"^1.0.0",
+                "registry-alias":"npm:target-package@2.0.0"
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let app_dir = root.join("packages/app");
+    let package = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
+    let mut deps = package.dependencies;
+    let workspace = lpm_workspace::discover_workspace(&app_dir)
+        .unwrap()
+        .unwrap();
+    extract_workspace_protocol_deps(&mut deps, &workspace).unwrap();
+    let file_kinds = HashMap::from([
+        ("local-tarball".to_string(), FileKindClassification::Tarball),
+        (
+            "local-directory".to_string(),
+            FileKindClassification::Directory,
+        ),
+    ]);
+
+    partition_non_registry_dependency_specs(&mut deps, &file_kinds);
+
+    assert!(registry_resolver_roots_are_eligible(&deps));
+    assert_eq!(
+        deps.keys().cloned().collect::<HashSet<_>>(),
+        HashSet::from(["registry-alias".to_string(), "registry-range".to_string()])
+    );
+}
+
 // ── (): --strict-integrity ──────────────────────────
 
 #[tokio::test]

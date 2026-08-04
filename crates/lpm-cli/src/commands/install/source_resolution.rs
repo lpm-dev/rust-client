@@ -741,48 +741,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // Partition the manifest deps into the five non-registry arms.
     // Each arm has its own fetch/materialize site below; the resolver
     // only sees what's left in `deps`.
-    let mut tarball_url_specs: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut file_tarball_specs: Vec<(String, String)> = Vec::new();
-    let mut directory_specs: Vec<(String, String)> = Vec::new();
-    let mut link_specs: Vec<(String, String)> = Vec::new();
-    let mut git_specs: Vec<(String, String, String, Option<String>)> = Vec::new();
-    deps.retain(
-        |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
-            Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
-                tarball_url_specs.push((local_name.clone(), url, integrity));
-                false
-            }
-            Ok(lpm_resolver::Specifier::File { path }) => {
-                // Pre-flight loop above populated `file_kinds` with
-                // the stat result for every File specifier that
-                // didn't error. `expect` documents the invariant.
-                match file_kinds
-                    .get(local_name)
-                    .expect("pre-flight loop classifies every File specifier or returns Err")
-                {
-                    FileKindClassification::Tarball => {
-                        file_tarball_specs.push((local_name.clone(), path));
-                    }
-                    FileKindClassification::Directory => {
-                        directory_specs.push((local_name.clone(), path));
-                    }
-                }
-                false
-            }
-            Ok(lpm_resolver::Specifier::Link { path }) => {
-                // Pre-flight loop above already verified the link:
-                // target is a directory or returned an error; the
-                // partition unconditionally adds to link_specs.
-                link_specs.push((local_name.clone(), path));
-                false
-            }
-            Ok(lpm_resolver::Specifier::Git { url, refspec }) => {
-                git_specs.push((local_name.clone(), raw.clone(), url, refspec));
-                false
-            }
-            _ => true,
-        },
-    );
+    let NonRegistryDependencySpecs {
+        tarball_url_specs,
+        file_tarball_specs,
+        directory_specs,
+        link_specs,
+        git_specs,
+    } = partition_non_registry_dependency_specs(deps, &file_kinds);
 
     if tarball_url_specs.is_empty()
         && file_tarball_specs.is_empty()
@@ -1374,6 +1339,73 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         additional_workspace_links,
         optional_registry_roots,
         resolved_git_sources,
+    })
+}
+
+pub(super) struct NonRegistryDependencySpecs {
+    tarball_url_specs: Vec<(String, String, Option<String>)>,
+    file_tarball_specs: Vec<(String, String)>,
+    directory_specs: Vec<(String, String)>,
+    link_specs: Vec<(String, String)>,
+    git_specs: Vec<(String, String, String, Option<String>)>,
+}
+
+pub(super) fn partition_non_registry_dependency_specs(
+    deps: &mut HashMap<String, String>,
+    file_kinds: &HashMap<String, FileKindClassification>,
+) -> NonRegistryDependencySpecs {
+    let mut specs = NonRegistryDependencySpecs {
+        tarball_url_specs: Vec::new(),
+        file_tarball_specs: Vec::new(),
+        directory_specs: Vec::new(),
+        link_specs: Vec::new(),
+        git_specs: Vec::new(),
+    };
+    deps.retain(
+        |local_name, raw| match lpm_resolver::Specifier::parse(raw) {
+            Ok(lpm_resolver::Specifier::Tarball { url, integrity }) => {
+                specs
+                    .tarball_url_specs
+                    .push((local_name.clone(), url, integrity));
+                false
+            }
+            Ok(lpm_resolver::Specifier::File { path }) => {
+                match file_kinds
+                    .get(local_name)
+                    .expect("pre-flight loop classifies every File specifier or returns Err")
+                {
+                    FileKindClassification::Tarball => {
+                        specs.file_tarball_specs.push((local_name.clone(), path));
+                    }
+                    FileKindClassification::Directory => {
+                        specs.directory_specs.push((local_name.clone(), path));
+                    }
+                }
+                false
+            }
+            Ok(lpm_resolver::Specifier::Link { path }) => {
+                specs.link_specs.push((local_name.clone(), path));
+                false
+            }
+            Ok(lpm_resolver::Specifier::Git { url, refspec }) => {
+                specs
+                    .git_specs
+                    .push((local_name.clone(), raw.clone(), url, refspec));
+                false
+            }
+            _ => true,
+        },
+    );
+    specs
+}
+
+pub(super) fn registry_resolver_roots_are_eligible(deps: &HashMap<String, String>) -> bool {
+    deps.values().all(|raw| {
+        matches!(
+            lpm_resolver::Specifier::parse(raw),
+            Ok(lpm_resolver::Specifier::SemverRange(_))
+                | Ok(lpm_resolver::Specifier::NpmAlias { .. })
+        )
     })
 }
 
