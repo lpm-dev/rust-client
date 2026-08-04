@@ -3,12 +3,11 @@
 //! The metadata file at `links/<graph-key>/.lpm-link-meta.json` makes
 //! `lpm cache prune` traversable: given just the link directory, prune
 //! can identify the source object + sibling targets without
-//! filesystem-walking back through the clonefile/hardlink relationship
-//! (which on APFS / Linux ext4 / hardlink-fallback paths gives no
-//! traversable reference back to the source).
+//! filesystem-walking back through the clone/reflink/copy relationship,
+//! which carries no traversable reference back to the source.
 //!
 //! Required for:
-//! - **Object orphan detection** — clonefile/hardlink doesn't preserve
+//! - **Object orphan detection** — materialization doesn't preserve
 //!   a reverse pointer; `source_sri` carries it explicitly.
 //! - **Link orphan detection** — BFS over `deps[].target_graph_key`.
 //! - **Migration recovery** — a partially-populated link entry that
@@ -103,6 +102,8 @@ pub struct LinkMeta {
     /// store is portable across `$LPM_HOME` overrides; absolute paths
     /// would lock the user to one cache location.
     pub object_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_digest: Option<String>,
     /// Sibling-dep symlink targets — the BFS edges prune walks.
     pub deps: Vec<LinkMetaDep>,
     /// Platform tuple frozen at materialization time. Lets prune detect
@@ -138,11 +139,17 @@ impl LinkMeta {
             version: graph_key.version().to_string(),
             source_sri: source_sri.into(),
             object_path: object_path.into(),
+            tree_digest: None,
             deps,
             platform,
             created_at: now,
             last_referenced_at: now,
         }
+    }
+
+    pub(crate) fn with_tree_digest(mut self, tree_digest: Option<String>) -> Self {
+        self.tree_digest = tree_digest;
+        self
     }
 
     /// Update [`Self::last_referenced_at`] to the current UTC time.
@@ -171,14 +178,14 @@ impl LinkMeta {
             .open(sidecar_path)
             .map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to open v2 link sidecar for touch at {}: {e}",
+                    "failed to open virtual-store link sidecar for touch at {}: {e}",
                     sidecar_path.display()
                 ))
             })?;
         file.set_modified(std::time::SystemTime::now())
             .map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to update v2 link sidecar mtime at {}: {e}",
+                    "failed to update virtual-store link sidecar mtime at {}: {e}",
                     sidecar_path.display()
                 ))
             })?;
@@ -226,13 +233,13 @@ impl LinkMeta {
         let path = link_dir.join(LINK_META_FILENAME);
         let metadata = std::fs::metadata(&path).map_err(|e| {
             LpmError::Store(format!(
-                "failed to read v2 link sidecar at {}: {e}",
+                "failed to read virtual-store link sidecar at {}: {e}",
                 path.display()
             ))
         })?;
         if metadata.len() > LINK_META_MAX_BYTES {
             return Err(LpmError::Store(format!(
-                "v2 link sidecar at {} is {} bytes; refusing to read above the {} byte cap",
+                "virtual-store link sidecar at {} is {} bytes; refusing to read above the {} byte cap",
                 path.display(),
                 metadata.len(),
                 LINK_META_MAX_BYTES
@@ -240,19 +247,19 @@ impl LinkMeta {
         }
         let bytes = std::fs::read(&path).map_err(|e| {
             LpmError::Store(format!(
-                "failed to read v2 link sidecar at {}: {e}",
+                "failed to read virtual-store link sidecar at {}: {e}",
                 path.display()
             ))
         })?;
         let parsed: LinkMeta = serde_json::from_slice(&bytes).map_err(|e| {
             LpmError::Store(format!(
-                "malformed v2 link sidecar at {}: {e}",
+                "malformed virtual-store link sidecar at {}: {e}",
                 path.display()
             ))
         })?;
         if parsed.schema != LINK_META_SCHEMA_VERSION {
             return Err(LpmError::Store(format!(
-                "v2 link sidecar at {} has unsupported schema {} (expected {})",
+                "virtual-store link sidecar at {} has unsupported schema {} (expected {})",
                 path.display(),
                 parsed.schema,
                 LINK_META_SCHEMA_VERSION
@@ -260,14 +267,24 @@ impl LinkMeta {
         }
         if let Err(why) = validate_name_for_path_join(&parsed.name) {
             return Err(LpmError::Store(format!(
-                "v2 link sidecar at {} has unsafe name {:?}: {why}",
+                "virtual-store link sidecar at {} has unsafe name {:?}: {why}",
                 path.display(),
                 parsed.name
             )));
         }
         if !is_lower_hex_digest(&parsed.graph_key_digest_hex) {
             return Err(LpmError::Store(format!(
-                "v2 link sidecar at {} has invalid graph-key digest",
+                "virtual-store link sidecar at {} has invalid graph-key digest",
+                path.display()
+            )));
+        }
+        if parsed
+            .tree_digest
+            .as_deref()
+            .is_some_and(|digest| !is_lower_hex_digest(digest))
+        {
+            return Err(LpmError::Store(format!(
+                "virtual-store link sidecar at {} has invalid CAS tree digest",
                 path.display()
             )));
         }
@@ -288,12 +305,15 @@ impl LinkMeta {
     pub fn write_to(&self, link_dir: &Path) -> Result<PathBuf, LpmError> {
         let final_path = link_dir.join(LINK_META_FILENAME);
 
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|e| LpmError::Store(format!("failed to serialize v2 link sidecar: {e}")))?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to serialize virtual-store link sidecar: {e}"
+            ))
+        })?;
 
         lpm_common::write_file_atomic(&final_path, &bytes).map_err(|e| {
             LpmError::Store(format!(
-                "failed to atomically install v2 link sidecar at {}: {e}",
+                "failed to atomically install virtual-store link sidecar at {}: {e}",
                 final_path.display()
             ))
         })?;
@@ -316,11 +336,14 @@ impl LinkMeta {
     /// entry × hundreds of packages).
     pub fn write_to_unpublished(&self, staging_dir: &Path) -> Result<PathBuf, LpmError> {
         let final_path = staging_dir.join(LINK_META_FILENAME);
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|e| LpmError::Store(format!("failed to serialize v2 link sidecar: {e}")))?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to serialize virtual-store link sidecar: {e}"
+            ))
+        })?;
         std::fs::write(&final_path, &bytes).map_err(|e| {
             LpmError::Store(format!(
-                "failed to write v2 link sidecar at {}: {e}",
+                "failed to write virtual-store link sidecar at {}: {e}",
                 final_path.display()
             ))
         })?;
@@ -472,14 +495,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(LINK_META_FILENAME), b"{not json").unwrap();
         let err = LinkMeta::read_from(dir.path()).unwrap_err();
-        assert!(format!("{err}").contains("malformed v2 link sidecar"));
+        assert!(format!("{err}").contains("malformed virtual-store link sidecar"));
     }
 
     #[test]
     fn missing_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let err = LinkMeta::read_from(dir.path()).unwrap_err();
-        assert!(format!("{err}").contains("failed to read v2 link sidecar"));
+        assert!(format!("{err}").contains("failed to read virtual-store link sidecar"));
     }
 
     #[test]

@@ -387,7 +387,7 @@ pub(super) async fn run_online_fetch_phase(
     if v2_mode {
         let store_v2 = store_v2_handle
             .as_deref()
-            .expect("v2_mode implies v2 store handle is available");
+            .expect("v2_mode implies virtual-store store handle is available");
         for target in &link_targets {
             if !matches!(
                 target.materialization,
@@ -404,7 +404,7 @@ pub(super) async fn run_online_fetch_phase(
                         Arc::clone(
                             store_v2_handle
                                 .as_ref()
-                                .expect("v2_mode implies v2 store handle is available"),
+                                .expect("v2_mode implies virtual-store store handle is available"),
                         ),
                     )
                     .await?;
@@ -515,7 +515,7 @@ pub(super) async fn run_online_fetch_phase(
     let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
         let store_v2 = store_v2_handle
             .as_deref()
-            .expect("v2_event_driven implies v2 store");
+            .expect("v2_event_driven implies virtual-store store");
         let plan = match (
             used_lockfile && lockfile_peer_context_authoritative,
             workspace_coordinator.as_deref(),
@@ -650,7 +650,7 @@ pub(super) async fn run_online_fetch_phase(
                 let store_arc = std::sync::Arc::clone(
                     store_v2_handle
                         .as_ref()
-                        .expect("v2_event_driven implies v2 store"),
+                        .expect("v2_event_driven implies virtual-store store"),
                 );
                 let handle = spawn_v2_link_task(
                     plan_arc,
@@ -711,7 +711,7 @@ pub(super) async fn run_online_fetch_phase(
                 let store_arc = std::sync::Arc::clone(
                     store_v2_handle
                         .as_ref()
-                        .expect("v2_event_driven implies v2 store"),
+                        .expect("v2_event_driven implies virtual-store store"),
                 );
                 let handle = spawn_v2_link_task(
                     plan_arc,
@@ -778,7 +778,7 @@ pub(super) async fn run_online_fetch_phase(
                         let store_arc = std::sync::Arc::clone(
                             store_v2_handle
                                 .as_ref()
-                                .expect("v2_event_driven implies v2 store"),
+                                .expect("v2_event_driven implies virtual-store store"),
                         );
                         let handle = spawn_v2_link_task(
                             plan_arc,
@@ -807,7 +807,7 @@ pub(super) async fn run_online_fetch_phase(
                         classification_start,
                     );
                     tracing::debug!(
-                        "v1→v2 translation for {}@{} failed: {e} (falling back to fetch)",
+                        "v1→virtual-store translation for {}@{} failed: {e} (falling back to fetch)",
                         p.name,
                         p.version
                     );
@@ -1763,7 +1763,7 @@ pub(super) async fn run_online_fetch_phase(
                     })
                     .await
                     .map_err(|e| {
-                        LpmError::Registry(format!("v2 cache check task panicked: {e}"))
+                        LpmError::Registry(format!("virtual-store cache check task panicked: {e}"))
                     })??;
                     if let Some(reusable_object) = reusable_object {
                         let v2_link_h: Option<V2LinkHandle> =
@@ -2839,7 +2839,7 @@ pub(super) async fn speculative_download_and_store(
                 .map(|_| ())
         })
         .await
-        .map_err(|e| LpmError::Registry(format!("spec v2 blocking task: {e}")))??;
+        .map_err(|e| LpmError::Registry(format!("spec virtual-store blocking task: {e}")))??;
         return Ok(SpeculativeFetchOutcome::Stored);
     }
 
@@ -3311,7 +3311,7 @@ pub(super) async fn fetch_and_store_legacy(
         // tarball size which already passed the size limit upstream.
         let bytes = std::fs::read(downloaded.file.path()).map_err(|e| {
             LpmError::Registry(format!(
-                "v2 store: failed to re-read downloaded tarball at {}: {e}",
+                "virtual store: failed to re-read downloaded tarball at {}: {e}",
                 downloaded.file.path().display()
             ))
         })?;

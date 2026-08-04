@@ -889,10 +889,11 @@ pub(super) async fn run_offline_install_phase(
 
     let store =
         PackageStore::from_root_with_security_analysis_policy(lpm_root, security_analysis_policy);
-    let requested_v2_mode = store_version.is_v2();
+    let requested_v2_mode = store_version.uses_virtual_store();
     let store_v2 = requested_v2_mode.then(|| {
-        lpm_store::v2::Store::from_lpm_root_with_policies(
+        lpm_store::v2::Store::from_lpm_root_for_version_with_policies(
             lpm_root,
+            store_version,
             object_integrity_policy,
             security_analysis_policy,
         )

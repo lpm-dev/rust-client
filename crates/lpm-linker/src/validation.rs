@@ -164,8 +164,8 @@ pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
 /// Validate that a bin script path does not escape its package directory via path traversal.
 /// Returns `Ok(canonical_target)` with the validated canonical path, or `Err(reason)`.
 ///
-/// `pub(crate)` so the v2 bin-shim emitter enforces the same containment
-/// as the v1 hoisted/isolated emitter — v2 is the default store version
+/// `pub(crate)` so the virtual-store bin-shim emitter enforces the same containment
+/// as the v1 hoisted/isolated emitter
 /// and a malicious package's bin entry like
 /// `"bin": {"x": "../../bin/sh"}` must be skipped, not materialised.
 pub(crate) fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<PathBuf, String> {

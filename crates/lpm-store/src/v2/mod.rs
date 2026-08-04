@@ -1,7 +1,7 @@
-//! v2 store layout primitives — on-disk shape and identity helpers
-//! for LPM's default virtual store. The CLI selects this layout when
-//! `LPM_STORE_VERSION` is unset, empty, `v2`, or `2`; only explicit
-//! `LPM_STORE_VERSION=v1` (or `1`) selects the rollback writer.
+//! Shared v2 primitives retained under the `v2` module path for API
+//! compatibility. The experimental v3 store reuses the graph-key, link,
+//! build-cache, and integrity machinery here while adding file-level CAS.
+//! Unset `LPM_STORE_VERSION`, `v2`, or `2` selects this layout.
 //!
 //! # Layout
 //!
@@ -10,7 +10,7 @@
 //! ├── objects/<sri>/                 # Content-addressable extracted bytes
 //! └── links/<graph-key>/
 //!     ├── node_modules/
-//!     │   ├── <pkg>/                 # Clonefile from objects/<sri>
+//!     │   ├── <pkg>/                 # Independent clone/reflink/copy from objects/<sri>
 //!     │   └── <dep_local>/           # Symlink → ../../<other-graph-key>/node_modules/<dep>
 //!     └── .lpm-link-meta.json        # Sidecar (see [`link_meta`])
 //! ```
@@ -62,6 +62,6 @@ pub use platform::PlatformTuple;
 pub use store::{
     COMPAT_ISLAND_COMPLETE_FILENAME, CompatIslandKeyEntry, DepLink, ENV_V2_OBJECT_INTEGRITY,
     ExtractedObject, FreshObjectIntegrity, LinkEntry, LinkEntryRequest, LinkEntryTimings,
-    ObjectIntegrityPolicy, ReusableObject, ReusableObjectCheckTimings, Store, StoreV2Paths,
-    VerifiedObjectIntegrity, compat_island_key,
+    ObjectIntegrityPolicy, ReusableObject, ReusableObjectCheckTimings,
+    ReusableObjectValidationBatch, Store, StoreV2Paths, VerifiedObjectIntegrity, compat_island_key,
 };

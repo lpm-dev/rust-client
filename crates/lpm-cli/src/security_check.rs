@@ -799,14 +799,14 @@ mod tests {
 
     fn write_cached_analysis_link(
         lpm_root: &lpm_common::LpmRoot,
+        store_version: lpm_store::StoreVersion,
         suffix: &str,
         source_sri: &str,
         analysis: &PackageAnalysis,
     ) {
-        let link_dir = lpm_root
-            .store_root()
-            .join("v2")
-            .join("links")
+        let link_dir = lpm_store::v2::Store::from_lpm_root_for_version(lpm_root, store_version)
+            .paths()
+            .links_root()
             .join(format!("duplicate@1.0.0+{suffix}"));
         let package_dir = link_dir.join("node_modules").join("duplicate");
         std::fs::create_dir_all(&package_dir).unwrap();
@@ -824,6 +824,7 @@ mod tests {
             version: "1.0.0".to_string(),
             source_sri: source_sri.to_string(),
             object_path: format!("objects/{source_sri}"),
+            tree_digest: None,
             deps: Vec::new(),
             platform: Arc::new(LinkMetaPlatform {
                 os: "darwin".to_string(),
@@ -838,11 +839,12 @@ mod tests {
     }
 
     #[test]
-    fn cached_security_lookup_distinguishes_same_coordinates_from_different_sources() {
+    fn cached_security_lookup_distinguishes_sources_across_v2_and_v3() {
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
         write_cached_analysis_link(
             &lpm_root,
+            lpm_store::StoreVersion::V3,
             "aaaaaaaaaaaaaaaa",
             "sha512-source-a",
             &make_analysis(
@@ -856,6 +858,7 @@ mod tests {
         );
         write_cached_analysis_link(
             &lpm_root,
+            lpm_store::StoreVersion::V2,
             "bbbbbbbbbbbbbbbb",
             "sha512-source-b",
             &make_analysis(

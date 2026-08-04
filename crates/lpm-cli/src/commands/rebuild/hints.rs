@@ -68,17 +68,13 @@ pub(crate) fn scriptable_package_rows(
     let trusted_scopes = parse_trusted_scopes(project_dir);
 
     // Build the
-    // v2 link-entry index ONCE before the rayon walk, scoped to this
+    // virtual-store link-entry index ONCE before the rayon walk, scoped to this
     // project's tree. Per-package lookups become O(1) map reads;
     // the project scoping prevents the same-coordinate ambiguity where a
     // global scan might return a sibling project's link entry for
     // the same `(name, version)`.
     //
-    // Index-build errors are upgraded to "no v2 store available"
-    // because the legacy code silently fell back to v1 for any
-    // non-Some result. Surfacing the error here would change the
-    // contract observable to callers (silent skip → hard error).
-    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root).unwrap_or_default();
+    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root);
 
     let walk_start = std::time::Instant::now();
 
@@ -307,14 +303,12 @@ pub fn all_scripted_packages_trusted(
     >,
 ) -> bool {
     // Build the
-    // v2 link-entry index ONCE before the per-package loop, scoped to
+    // virtual-store link-entry index ONCE before the per-package loop, scoped to
     // this project's tree. Same rationale as `scriptable_package_rows`
     // — install-time auto-build predicate checks every lockfile entry,
     // and the global walk could otherwise return a sibling project's
-    // link entry under same-coordinate same-coord coexistence. Falling back
-    // to an empty index on construction failure preserves the legacy
-    // silent-skip-of-v1-only semantic.
-    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root).unwrap_or_default();
+    // link entry under same-coordinate same-coord coexistence.
+    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root);
 
     let mut has_any_unbuilt = false;
 

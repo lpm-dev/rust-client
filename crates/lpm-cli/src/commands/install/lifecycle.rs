@@ -278,11 +278,11 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
+    let baseline_index = if store_version.uses_virtual_store() {
         Some(lpm_store::V2BaselineIndex::for_project(
             project_dir,
             lpm_root,
-        )?)
+        ))
     } else {
         None
     };

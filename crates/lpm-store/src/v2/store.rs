@@ -2,8 +2,8 @@
 //!
 //! Splits responsibility cleanly:
 //! - [`StoreV2Paths`] — pure path computations (no I/O).
-//! - [`Store`] — I/O entry points: object extraction (clonefile-able),
-//!   link-entry population (clonefile from objects + sibling symlinks
+//! - [`Store`] — I/O entry points: object extraction and link-entry
+//!   population (independent clone/reflink/copy from objects + sibling symlinks
 //!   + atomic rename + sidecar write).
 //!
 //! The install command uses this writer by default. The retained v1 writer
@@ -20,18 +20,20 @@ use sha2::{Digest, Sha256};
 use super::finalize_permits::v2_finalize_limiter;
 use super::fs_util::{
     copy_dir_recursively, create_dir_symlink, create_tmp_dir_locked, ensure_store_tier_dir_locked,
-    materialize_into, tmp_sibling,
+    materialize_into_with_integrity, tmp_sibling,
 };
 pub use super::integrity::{
     ENV_V2_OBJECT_INTEGRITY, FreshObjectIntegrity, ObjectIntegrityPolicy,
     ReusableObjectCheckTimings, VerifiedObjectIntegrity,
 };
 use super::integrity::{
-    finish_object_rename_after_collision, is_complete_object_dir, object_dir_is_reusable_or_remove,
+    current_tree_content_matches_snapshot, finish_object_rename_after_collision,
+    has_local_source_sentinel, is_complete_object_dir, object_dir_is_reusable_or_remove,
     object_integrity_for_link, object_integrity_or_remove, object_integrity_or_remove_with_timings,
-    object_integrity_policy_from_env, read_tree_snapshot, source_object_integrity,
-    source_policy_uses_source_integrity, tree_snapshot_matches, write_object_integrity_for_policy,
-    write_tree_snapshot, write_tree_snapshot_best_effort,
+    object_integrity_policy_from_env, read_object_integrity, read_tree_snapshot,
+    remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
+    tree_snapshot_matches, write_object_integrity_for_policy, write_tree_snapshot,
+    write_tree_snapshot_best_effort,
 };
 use super::local_source::{
     LocalSourceFingerprint, compute_local_source_fingerprint, local_source_snapshot_matches,
@@ -46,12 +48,16 @@ use crate::v2::graph_key::GraphKey;
 use crate::v2::link_meta::{
     LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform, validate_name_for_path_join,
 };
-use crate::{SecurityAnalysisPolicy, StageTimings};
+use crate::v3::{
+    FileCas, FileCasReuseTimings, FileCasValidationBatch, PreparedSourceRecord, SourceReuseStatus,
+};
+use crate::{SecurityAnalysisPolicy, StageTimings, StoreVersion};
 
 /// v2 layout version segment under `~/.lpm/store/`. Bumped whenever
 /// the on-disk shape changes; lpm reading a higher-numbered store
 /// MUST refuse rather than silently misinterpret.
 const STORE_V2_VERSION: &str = "v2";
+const STORE_V3_VERSION: &str = "v3";
 
 /// Subdirectory holding the content-addressable object dirs.
 const OBJECTS_DIR: &str = "objects";
@@ -70,6 +76,17 @@ const COMPAT_DIR: &str = "compat";
 /// Subdirectory holding lifecycle-build artifacts keyed by their complete
 /// execution inputs.
 const BUILDS_DIR: &str = "builds";
+
+enum FileCasSourceFinish {
+    Ready(Option<VerifiedObjectIntegrity>),
+    Unusable,
+}
+
+struct FileCasFinishContext<'a> {
+    prepared: Option<&'a PreparedSourceRecord>,
+    reuse_timings: Option<&'a mut ReusableObjectCheckTimings>,
+    validation_batch: Option<&'a ReusableObjectValidationBatch>,
+}
 
 /// Subdirectory holding per-build-key advisory lock files.
 const BUILD_LOCKS_DIR: &str = "build-locks";
@@ -164,21 +181,12 @@ impl StoreV2Paths {
     /// Build the path helper rooted at `<lpm_home>/store/v2/`.
     pub fn from_lpm_root(lpm_root: &LpmRoot) -> Self {
         let root = lpm_root.store_root().join(STORE_V2_VERSION);
-        let objects_root = root.join(OBJECTS_DIR);
-        let links_root = root.join(LINKS_DIR);
-        let compat_root = root.join(COMPAT_DIR);
-        let builds_root = root.join(BUILDS_DIR);
-        let build_locks_root = root.join(BUILD_LOCKS_DIR);
-        let build_entry_locks_root = root.join(BUILD_ENTRY_LOCKS_DIR);
-        Self {
-            root,
-            objects_root,
-            links_root,
-            compat_root,
-            builds_root,
-            build_locks_root,
-            build_entry_locks_root,
-        }
+        Self::at(root)
+    }
+
+    pub fn from_lpm_root_v3(lpm_root: &LpmRoot) -> Self {
+        let root = lpm_root.store_root().join(STORE_V3_VERSION);
+        Self::at(root)
     }
 
     /// Build the path helper at an arbitrary base (test seam).
@@ -405,6 +413,11 @@ pub struct ReusableObject {
     pub object_integrity: VerifiedObjectIntegrity,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ReusableObjectValidationBatch {
+    file_cas: Option<FileCasValidationBatch>,
+}
+
 /// Object directory just produced or validated by an extraction call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedObject {
@@ -480,6 +493,8 @@ pub struct LinkEntryTimings {
 #[derive(Debug, Clone)]
 pub struct Store {
     paths: StoreV2Paths,
+    file_cas: Option<FileCas>,
+    migration_paths: Option<StoreV2Paths>,
     object_integrity_policy: ObjectIntegrityPolicy,
     security_analysis_policy: SecurityAnalysisPolicy,
     #[cfg(test)]
@@ -487,6 +502,49 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn from_lpm_root_for_version(lpm_root: &LpmRoot, version: StoreVersion) -> Self {
+        Self::from_lpm_root_for_version_with_policies(
+            lpm_root,
+            version,
+            object_integrity_policy_from_env(),
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    pub fn from_lpm_root_for_version_with_object_integrity_policy(
+        lpm_root: &LpmRoot,
+        version: StoreVersion,
+        object_integrity_policy: ObjectIntegrityPolicy,
+    ) -> Self {
+        Self::from_lpm_root_for_version_with_policies(
+            lpm_root,
+            version,
+            object_integrity_policy,
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    pub fn from_lpm_root_for_version_with_policies(
+        lpm_root: &LpmRoot,
+        version: StoreVersion,
+        object_integrity_policy: ObjectIntegrityPolicy,
+        security_analysis_policy: SecurityAnalysisPolicy,
+    ) -> Self {
+        if version == StoreVersion::V3 {
+            Self::from_lpm_root_v3_with_policies(
+                lpm_root,
+                object_integrity_policy,
+                security_analysis_policy,
+            )
+        } else {
+            Self::from_lpm_root_with_policies(
+                lpm_root,
+                object_integrity_policy,
+                security_analysis_policy,
+            )
+        }
+    }
+
     /// Resolve the v2 store from the given LPM home.
     pub fn from_lpm_root(lpm_root: &LpmRoot) -> Self {
         Self::from_lpm_root_with_object_integrity_policy(
@@ -514,6 +572,45 @@ impl Store {
     ) -> Self {
         Self {
             paths: StoreV2Paths::from_lpm_root(lpm_root),
+            file_cas: None,
+            migration_paths: Some(StoreV2Paths::from_lpm_root_v3(lpm_root)),
+            object_integrity_policy,
+            security_analysis_policy,
+            #[cfg(test)]
+            object_publish_barriers: None,
+        }
+    }
+
+    pub fn from_lpm_root_v3(lpm_root: &LpmRoot) -> Self {
+        Self::from_lpm_root_v3_with_policies(
+            lpm_root,
+            object_integrity_policy_from_env(),
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    pub fn from_lpm_root_v3_with_object_integrity_policy(
+        lpm_root: &LpmRoot,
+        object_integrity_policy: ObjectIntegrityPolicy,
+    ) -> Self {
+        Self::from_lpm_root_v3_with_policies(
+            lpm_root,
+            object_integrity_policy,
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    pub fn from_lpm_root_v3_with_policies(
+        lpm_root: &LpmRoot,
+        object_integrity_policy: ObjectIntegrityPolicy,
+        security_analysis_policy: SecurityAnalysisPolicy,
+    ) -> Self {
+        let paths = StoreV2Paths::from_lpm_root_v3(lpm_root);
+        let file_cas = Some(FileCas::at(paths.root()));
+        Self {
+            paths,
+            file_cas,
+            migration_paths: Some(StoreV2Paths::from_lpm_root(lpm_root)),
             object_integrity_policy,
             security_analysis_policy,
             #[cfg(test)]
@@ -545,6 +642,34 @@ impl Store {
     ) -> Self {
         Self {
             paths: StoreV2Paths::at(root),
+            file_cas: None,
+            migration_paths: None,
+            object_integrity_policy,
+            security_analysis_policy,
+            #[cfg(test)]
+            object_publish_barriers: None,
+        }
+    }
+
+    pub fn at_v3(root: impl Into<PathBuf>) -> Self {
+        Self::at_v3_with_policies(
+            root,
+            object_integrity_policy_from_env(),
+            SecurityAnalysisPolicy::Enabled,
+        )
+    }
+
+    pub fn at_v3_with_policies(
+        root: impl Into<PathBuf>,
+        object_integrity_policy: ObjectIntegrityPolicy,
+        security_analysis_policy: SecurityAnalysisPolicy,
+    ) -> Self {
+        let paths = StoreV2Paths::at(root);
+        let file_cas = Some(FileCas::at(paths.root()));
+        Self {
+            paths,
+            file_cas,
+            migration_paths: None,
             object_integrity_policy,
             security_analysis_policy,
             #[cfg(test)]
@@ -576,12 +701,168 @@ impl Store {
         self.security_analysis_policy
     }
 
+    fn prepare_file_cas_source(
+        &self,
+        object_dir: &Path,
+        published_object_dir: &Path,
+        source_sri: &str,
+        local_source: bool,
+    ) -> Result<Option<PreparedSourceRecord>, LpmError> {
+        self.file_cas
+            .as_ref()
+            .map(|cas| {
+                cas.ingest_object_tree_as(
+                    object_dir,
+                    published_object_dir,
+                    source_sri,
+                    local_source,
+                )
+            })
+            .transpose()
+    }
+
+    fn finish_file_cas_source(
+        &self,
+        object_dir: &Path,
+        source_sri: &str,
+        local_source: bool,
+        prepared: Option<&PreparedSourceRecord>,
+        policy: ObjectIntegrityPolicy,
+    ) -> Result<FileCasSourceFinish, LpmError> {
+        self.finish_file_cas_source_with_timings(
+            object_dir,
+            source_sri,
+            local_source,
+            policy,
+            FileCasFinishContext {
+                prepared,
+                reuse_timings: None,
+                validation_batch: None,
+            },
+        )
+    }
+
+    fn finish_file_cas_source_with_timings(
+        &self,
+        object_dir: &Path,
+        source_sri: &str,
+        local_source: bool,
+        policy: ObjectIntegrityPolicy,
+        context: FileCasFinishContext<'_>,
+    ) -> Result<FileCasSourceFinish, LpmError> {
+        let FileCasFinishContext {
+            prepared,
+            reuse_timings,
+            validation_batch,
+        } = context;
+        let Some(cas) = &self.file_cas else {
+            return Ok(FileCasSourceFinish::Ready(None));
+        };
+        if let Some(prepared) = prepared {
+            cas.publish_source_record(object_dir, prepared)?;
+            return Ok(FileCasSourceFinish::Ready(None));
+        }
+        let mut cas_timings = FileCasReuseTimings::default();
+        let reuse_status = cas.source_reuse_status_with_timings_in_batch(
+            object_dir,
+            source_sri,
+            &mut cas_timings,
+            validation_batch.and_then(|batch| batch.file_cas.as_ref()),
+        )?;
+        if let Some(reuse_timings) = reuse_timings {
+            reuse_timings.record_file_cas(cas_timings);
+        }
+        match reuse_status {
+            SourceReuseStatus::Reusable => return Ok(FileCasSourceFinish::Ready(None)),
+            SourceReuseStatus::CorruptBlob => {
+                remove_unusable_object_dir(object_dir, "after v3 CAS blob corruption")?;
+                return Ok(FileCasSourceFinish::Unusable);
+            }
+            SourceReuseStatus::MissingOrInvalid => {}
+        }
+        let snapshot_is_valid = read_tree_snapshot(object_dir)
+            .map(|snapshot| current_tree_content_matches_snapshot(object_dir, &snapshot))
+            .transpose()?
+            .flatten()
+            .is_some();
+        if !snapshot_is_valid {
+            remove_unusable_object_dir(object_dir, "before v3 CAS metadata reconstruction")?;
+            return Ok(FileCasSourceFinish::Unusable);
+        }
+        let prepared = cas.ingest_object_tree(object_dir, source_sri, local_source)?;
+        let integrities = write_object_integrity_for_policy(object_dir, source_sri, policy)?;
+        cas.publish_source_record(object_dir, &prepared)?;
+        Ok(FileCasSourceFinish::Ready(Some(
+            VerifiedObjectIntegrity::new(integrities.content),
+        )))
+    }
+
+    fn try_migrate_prior_virtual_object(
+        &self,
+        source_sri: &str,
+        policy: ObjectIntegrityPolicy,
+    ) -> Result<bool, LpmError> {
+        let Some(prior_paths) = &self.migration_paths else {
+            return Ok(false);
+        };
+        let source_dir = prior_paths.object_dir(source_sri)?;
+        if !is_complete_object_dir(&source_dir) || has_local_source_sentinel(&source_dir) {
+            return Ok(false);
+        }
+        let stored_sri = match std::fs::read_to_string(source_dir.join(".integrity")) {
+            Ok(stored_sri) => stored_sri,
+            Err(error) => {
+                tracing::debug!(
+                    target = %source_dir.display(),
+                    "prior virtual-store object is not migration-safe: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        if stored_sri.trim() != source_sri {
+            return Ok(false);
+        }
+        let expected = match read_object_integrity(&source_dir) {
+            Ok(expected) => expected,
+            Err(error) => {
+                tracing::debug!(
+                    target = %source_dir.display(),
+                    "prior virtual-store object is not migration-safe: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        let valid = if matches!(policy, ObjectIntegrityPolicy::Source) {
+            expected == source_object_integrity(source_sri)
+        } else {
+            match compute_object_tree_integrities(&source_dir) {
+                Ok(actual) => actual.content == expected,
+                Err(error) => {
+                    tracing::debug!(
+                        target = %source_dir.display(),
+                        "prior virtual-store object is not migration-safe: {error}"
+                    );
+                    false
+                }
+            }
+        };
+        if !valid {
+            return Ok(false);
+        }
+        self.populate_object_from_existing_tree(
+            &source_dir,
+            source_sri,
+            "virtual-store generation migration",
+        )?;
+        Ok(true)
+    }
+
     /// Ensure the cached compatibility-island root exists with store-tier
     /// permissions.
     pub fn ensure_compat_root_locked(&self) -> Result<(), LpmError> {
         ensure_store_tier_dir_locked(self.paths.compat_root()).map_err(|e| {
             LpmError::Store(format!(
-                "failed to create v2 compat islands dir at {}: {e}",
+                "failed to create virtual-store compat islands dir at {}: {e}",
                 self.paths.compat_root().display()
             ))
         })
@@ -606,14 +887,25 @@ impl Store {
         policy: ObjectIntegrityPolicy,
     ) -> Result<Option<ReusableObject>, LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
-        if !object_dir.exists() {
+        if !object_dir.exists() && !self.try_migrate_prior_virtual_object(sri, policy)? {
             return Ok(None);
         }
-        let Some(object_integrity) =
+        let Some(mut object_integrity) =
             object_integrity_or_remove(&object_dir, "before cache reuse", sri, policy)?
         else {
             return Ok(None);
         };
+        match self.finish_file_cas_source(
+            &object_dir,
+            sri,
+            has_local_source_sentinel(&object_dir),
+            None,
+            policy,
+        )? {
+            FileCasSourceFinish::Ready(Some(refreshed)) => object_integrity = refreshed,
+            FileCasSourceFinish::Ready(None) => {}
+            FileCasSourceFinish::Unusable => return Ok(None),
+        }
         self.backfill_security_cache_if_enabled(&object_dir, sri);
         Ok(Some(ReusableObject {
             path: object_dir,
@@ -626,23 +918,41 @@ impl Store {
         &self,
         sri: &str,
     ) -> Result<(Option<ReusableObject>, ReusableObjectCheckTimings), LpmError> {
-        self.reusable_object_with_timings_and_policy(sri, self.object_integrity_policy)
+        self.reusable_object_with_timings_and_policy(sri, self.object_integrity_policy, None)
+    }
+
+    pub fn reusable_object_validation_batch(&self) -> ReusableObjectValidationBatch {
+        ReusableObjectValidationBatch {
+            file_cas: self
+                .file_cas
+                .as_ref()
+                .map(|_| FileCasValidationBatch::default()),
+        }
+    }
+
+    pub fn reusable_object_with_timings_in_batch(
+        &self,
+        sri: &str,
+        batch: &ReusableObjectValidationBatch,
+    ) -> Result<(Option<ReusableObject>, ReusableObjectCheckTimings), LpmError> {
+        self.reusable_object_with_timings_and_policy(sri, self.object_integrity_policy, Some(batch))
     }
 
     fn reusable_object_with_timings_and_policy(
         &self,
         sri: &str,
         policy: ObjectIntegrityPolicy,
+        validation_batch: Option<&ReusableObjectValidationBatch>,
     ) -> Result<(Option<ReusableObject>, ReusableObjectCheckTimings), LpmError> {
         let total_start = std::time::Instant::now();
         let mut timings = ReusableObjectCheckTimings::default();
         let object_dir = self.paths.object_dir(sri)?;
-        if !object_dir.exists() {
+        if !object_dir.exists() && !self.try_migrate_prior_virtual_object(sri, policy)? {
             timings.missing_count = 1;
             timings.total_ms = total_start.elapsed().as_millis();
             return Ok((None, timings));
         }
-        let Some(object_integrity) = object_integrity_or_remove_with_timings(
+        let Some(mut object_integrity) = object_integrity_or_remove_with_timings(
             &object_dir,
             "before cache reuse",
             sri,
@@ -653,6 +963,25 @@ impl Store {
             timings.total_ms = total_start.elapsed().as_millis();
             return Ok((None, timings));
         };
+        match self.finish_file_cas_source_with_timings(
+            &object_dir,
+            sri,
+            has_local_source_sentinel(&object_dir),
+            policy,
+            FileCasFinishContext {
+                prepared: None,
+                reuse_timings: Some(&mut timings),
+                validation_batch,
+            },
+        )? {
+            FileCasSourceFinish::Ready(Some(refreshed)) => object_integrity = refreshed,
+            FileCasSourceFinish::Ready(None) => {}
+            FileCasSourceFinish::Unusable => {
+                timings.removed_count = timings.removed_count.saturating_add(1);
+                timings.total_ms = total_start.elapsed().as_millis();
+                return Ok((None, timings));
+            }
+        }
         self.backfill_security_cache_if_enabled(&object_dir, sri);
         timings.total_ms = total_start.elapsed().as_millis();
         Ok((
@@ -724,6 +1053,10 @@ impl Store {
         let object_dir = self.paths.object_dir(sri)?;
         let mut timings = StageTimings::default();
 
+        if !object_dir.exists() {
+            self.try_migrate_prior_virtual_object(sri, policy)?;
+        }
+
         // Mirrors v1's `store_at_dir` recovery: a leftover `objects/<sri>/`
         // from a crashed extract (no `.integrity`, no `package.json`) is
         // NOT a hit — remove it and re-extract. Without this, a partial
@@ -731,35 +1064,55 @@ impl Store {
         // half-populated object dir and downstream link entries inherit
         // the corruption.
         if object_dir.exists()
-            && let Some(object_integrity) =
+            && let Some(mut object_integrity) =
                 object_integrity_or_remove(&object_dir, "before re-extract", sri, policy)?
         {
-            self.backfill_security_cache_if_enabled(&object_dir, sri);
-            tracing::debug!(
-                target = %object_dir.display(),
-                "v2 store: object hit"
-            );
-            return Ok((
-                ExtractedObject {
-                    path: object_dir,
-                    source_sri: sri.to_string(),
-                    object_integrity: FreshObjectIntegrity::new(object_integrity),
-                },
-                timings,
-            ));
+            let reusable = match self.finish_file_cas_source(
+                &object_dir,
+                sri,
+                has_local_source_sentinel(&object_dir),
+                None,
+                policy,
+            )? {
+                FileCasSourceFinish::Ready(Some(refreshed)) => {
+                    object_integrity = refreshed;
+                    true
+                }
+                FileCasSourceFinish::Ready(None) => true,
+                FileCasSourceFinish::Unusable => false,
+            };
+            if reusable {
+                self.backfill_security_cache_if_enabled(&object_dir, sri);
+                tracing::debug!(
+                    target = %object_dir.display(),
+                    "virtual store: object hit"
+                );
+                return Ok((
+                    ExtractedObject {
+                        path: object_dir,
+                        source_sri: sri.to_string(),
+                        object_integrity: FreshObjectIntegrity::new(object_integrity),
+                    },
+                    timings,
+                ));
+            }
         }
 
         if let Some(parent) = object_dir.parent() {
-            ensure_store_tier_dir_locked(parent)
-                .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
+            ensure_store_tier_dir_locked(parent).map_err(|e| {
+                LpmError::Store(format!("failed to create virtual-store objects dir: {e}"))
+            })?;
         }
 
         let tmp_dir = tmp_sibling(&object_dir);
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
-        create_tmp_dir_locked(&tmp_dir)
-            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
+        create_tmp_dir_locked(&tmp_dir).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create virtual-store tmp staging dir: {e}"
+            ))
+        })?;
 
         // Fused extract + behavioral scan in a single pass: small source
         // entries are buffered and fed directly into the analyzer, while
@@ -773,32 +1126,79 @@ impl Store {
         let source_analysis_enabled = self.security_analysis_policy.is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
         let extracted_stats = std::cell::RefCell::new(ExtractedObjectStats::default());
-        let extract_result = lpm_extractor::extract_tarball_with_inspector(
-            tarball_data,
-            &tmp_dir,
-            |path, size| {
-                source_analysis_enabled
-                    && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
-            },
-            |entry| {
-                extracted_stats
-                    .borrow_mut()
-                    .record_file(entry.relative_path, entry.size);
-                if !source_analysis_enabled {
-                    return;
+        let registry_cas_ingest = self
+            .file_cas
+            .as_ref()
+            .map(|cas| cas.begin_registry_ingest(&object_dir, sri))
+            .transpose()?
+            .map(std::cell::RefCell::new);
+        let registry_cas_error = std::cell::RefCell::new(None);
+        let inspect_entry = |entry: lpm_extractor::EntryInfo<'_>| {
+            if registry_cas_error.borrow().is_none()
+                && let (Some(ingest), Some(cas)) =
+                    (registry_cas_ingest.as_ref(), self.file_cas.as_ref())
+            {
+                let result = entry
+                    .blake3_digest
+                    .ok_or_else(|| {
+                        LpmError::Store(format!(
+                            "v3 CAS extraction omitted a digest for {}",
+                            entry.relative_path.display()
+                        ))
+                    })
+                    .and_then(|digest| {
+                        cas.ingest_registry_file(
+                            &mut ingest.borrow_mut(),
+                            &tmp_dir,
+                            entry.relative_path,
+                            entry.size,
+                            digest,
+                        )
+                    });
+                if let Err(error) = result {
+                    *registry_cas_error.borrow_mut() = Some(error);
                 }
-                if let Some(bytes) = entry.bytes {
-                    analyzer.borrow_mut().feed(entry.relative_path, bytes);
-                } else {
-                    analyzer.borrow_mut().feed_oversized_source_file(
-                        entry.relative_path,
-                        &tmp_dir.join(entry.relative_path),
-                        entry.size,
-                    );
-                }
-            },
-        );
+            }
+            extracted_stats
+                .borrow_mut()
+                .record_file(entry.relative_path, entry.size);
+            if !source_analysis_enabled {
+                return;
+            }
+            if let Some(bytes) = entry.bytes {
+                analyzer.borrow_mut().feed(entry.relative_path, bytes);
+            } else {
+                analyzer.borrow_mut().feed_oversized_source_file(
+                    entry.relative_path,
+                    &tmp_dir.join(entry.relative_path),
+                    entry.size,
+                );
+            }
+        };
+        let buffer_predicate = |path: &Path, size: u64| {
+            source_analysis_enabled
+                && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
+        };
+        let extract_result = if registry_cas_ingest.is_some() {
+            lpm_extractor::extract_tarball_with_entry_digests(
+                tarball_data,
+                &tmp_dir,
+                buffer_predicate,
+                inspect_entry,
+            )
+        } else {
+            lpm_extractor::extract_tarball_with_inspector(
+                tarball_data,
+                &tmp_dir,
+                buffer_predicate,
+                inspect_entry,
+            )
+        };
         if let Err(error) = extract_result {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(error);
+        }
+        if let Some(error) = registry_cas_error.into_inner() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(error);
         }
@@ -816,7 +1216,7 @@ impl Store {
             if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
                 tracing::warn!(
                     target = %tmp_dir.display(),
-                    "v2 store: failed to write .lpm-security.json: {e}"
+                    "virtual store: failed to write .lpm-security.json: {e}"
                 );
             }
             timings.security_ms = security_start.elapsed().as_millis();
@@ -825,6 +1225,22 @@ impl Store {
         let finalize_permit_wait_start = std::time::Instant::now();
         let _finalize_permit = v2_finalize_limiter().map(|limiter| limiter.acquire());
         timings.finalize_permit_wait_ms = finalize_permit_wait_start.elapsed().as_millis();
+
+        let prepared_cas = match registry_cas_ingest {
+            Some(ingest) => self
+                .file_cas
+                .as_ref()
+                .map(|cas| cas.finish_registry_ingest(ingest.into_inner()))
+                .transpose(),
+            None => Ok(None),
+        };
+        let prepared_cas = match prepared_cas {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(error);
+            }
+        };
 
         // Persist the SRI alongside the object bytes for
         // post-extraction integrity verification — same `.integrity`
@@ -859,7 +1275,7 @@ impl Store {
         if let Err(e) = integrity_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!(
-                "failed to write v2 .integrity: {e}"
+                "failed to write virtual-store .integrity: {e}"
             )));
         }
 
@@ -872,35 +1288,64 @@ impl Store {
         let rename_result = std::fs::rename(&tmp_dir, &object_dir);
         timings.finalize_rename_ms = rename_start.elapsed().as_millis();
         let result = match rename_result {
-            Ok(()) => Ok(ExtractedObject {
-                path: object_dir,
-                source_sri: sri.to_string(),
-                object_integrity,
-            }),
+            Ok(()) => {
+                if matches!(
+                    self.finish_file_cas_source(
+                        &object_dir,
+                        sri,
+                        false,
+                        prepared_cas.as_ref(),
+                        policy,
+                    )?,
+                    FileCasSourceFinish::Unusable
+                ) {
+                    return Err(LpmError::Store(format!(
+                        "freshly extracted v3 CAS source became unusable at {}",
+                        object_dir.display()
+                    )));
+                }
+                Ok(ExtractedObject {
+                    path: object_dir,
+                    source_sri: sri.to_string(),
+                    object_integrity,
+                })
+            }
             Err(e) => {
                 let collision_start = std::time::Instant::now();
                 let result = finish_object_rename_after_collision(
                     &tmp_dir,
                     &object_dir,
                     sri,
-                    "v2 extract",
+                    "virtual-store extract",
                     e,
                     policy,
                 );
                 timings.finalize_collision_recovery_ms = collision_start.elapsed().as_millis();
                 let object_dir = result?;
-                let object_integrity = object_integrity_or_remove(
+                let mut object_integrity = object_integrity_or_remove(
                     &object_dir,
-                    "after v2 extract collision",
+                    "after virtual-store extract collision",
                     sri,
                     policy,
                 )?
                 .ok_or_else(|| {
                     LpmError::Store(format!(
-                        "v2 extract collision left no reusable object at {}",
+                        "virtual-store extract collision left no reusable object at {}",
                         object_dir.display()
                     ))
                 })?;
+                match self.finish_file_cas_source(&object_dir, sri, false, None, policy)? {
+                    FileCasSourceFinish::Ready(Some(refreshed)) => {
+                        object_integrity = refreshed;
+                    }
+                    FileCasSourceFinish::Ready(None) => {}
+                    FileCasSourceFinish::Unusable => {
+                        return Err(LpmError::Store(format!(
+                            "v3 CAS extract collision left no reusable object at {}",
+                            object_dir.display()
+                        )));
+                    }
+                }
                 self.backfill_security_cache_if_enabled(&object_dir, sri);
                 Ok(ExtractedObject {
                     path: object_dir,
@@ -979,7 +1424,7 @@ impl Store {
                 &candidate_owned
             } else {
                 return Err(LpmError::Registry(format!(
-                    "unsupported integrity algorithm in v2 extract: {expected} — \
+                    "unsupported integrity algorithm in virtual-store extract: {expected} — \
                      expected sha512-… (preferred), sha256-…, or sha1-…"
                 )));
             };
@@ -1040,14 +1485,14 @@ impl Store {
     ) -> Result<LinkEntry, LpmError> {
         if fresh_object.source_sri != request.source_sri {
             return Err(LpmError::Store(format!(
-                "fresh v2 link extracted object SRI mismatch: fresh {}, request {}",
+                "fresh virtual-store link extracted object SRI mismatch: fresh {}, request {}",
                 fresh_object.source_sri, request.source_sri
             )));
         }
         let expected_object_dir = self.paths.object_dir(&request.source_sri)?;
         if request.object_dir != expected_object_dir {
             return Err(LpmError::Store(format!(
-                "fresh v2 link request object path mismatch for {}: request {}, expected {}",
+                "fresh virtual-store link request object path mismatch for {}: request {}, expected {}",
                 request.source_sri,
                 request.object_dir.display(),
                 expected_object_dir.display()
@@ -1055,7 +1500,7 @@ impl Store {
         }
         if fresh_object.path != expected_object_dir {
             return Err(LpmError::Store(format!(
-                "fresh v2 link extracted object path mismatch for {}: fresh {}, expected {}",
+                "fresh virtual-store link extracted object path mismatch for {}: fresh {}, expected {}",
                 request.source_sri,
                 fresh_object.path.display(),
                 expected_object_dir.display()
@@ -1088,6 +1533,11 @@ impl Store {
 
         let final_dir = self.paths.link_dir(&graph_key);
         let sidecar_dir_relpath = self.paths.relative_object_path(&source_sri)?;
+        let cas_tree_digest = self
+            .file_cas
+            .as_ref()
+            .map(|cas| cas.source_tree_digest(&object_dir, &source_sri))
+            .transpose()?;
 
         // Mirrors the v1 store's "incomplete-on-disk → remove and
         // re-populate" recovery (lib.rs:303-315). Without it, a crash
@@ -1103,6 +1553,7 @@ impl Store {
                 &object_dir,
                 &source_sri,
                 verified_object_digest,
+                cas_tree_digest.as_deref(),
                 policy,
             )? {
                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
@@ -1117,7 +1568,7 @@ impl Store {
                 if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
                     // Non-fatal: a missed touch only widens prune's
                     // view of cold entries by one install cycle.
-                    tracing::debug!("v2 store: cache-hit touch failed: {e}");
+                    tracing::debug!("virtual store: cache-hit touch failed: {e}");
                 }
                 return Ok(LinkEntry {
                     link_dir: final_dir,
@@ -1133,27 +1584,44 @@ impl Store {
 
             tracing::warn!(
                 target = %final_dir.display(),
-                "v2 store: incomplete or stale link entry; removing before re-populate"
+                "virtual store: incomplete or stale link entry; removing before re-populate"
             );
             std::fs::remove_dir_all(&final_dir).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove incomplete or stale v2 link entry at {}: {e}",
+                    "failed to remove incomplete or stale virtual-store link entry at {}: {e}",
                     final_dir.display()
                 ))
             })?;
         }
 
+        let materialize_dir = self
+            .file_cas
+            .as_ref()
+            .map(|cas| {
+                cas.link_materialization_source(
+                    &object_dir,
+                    &source_sri,
+                    fresh_object_digest.is_some() || verified_object_digest.is_some(),
+                )
+            })
+            .transpose()?;
+        let materialize_dir = materialize_dir.as_deref().unwrap_or(&object_dir);
+
         if let Some(parent) = final_dir.parent() {
-            ensure_store_tier_dir_locked(parent)
-                .map_err(|e| LpmError::Store(format!("failed to create v2 links dir: {e}")))?;
+            ensure_store_tier_dir_locked(parent).map_err(|e| {
+                LpmError::Store(format!("failed to create virtual-store links dir: {e}"))
+            })?;
         }
 
         let tmp_dir = tmp_sibling(&final_dir);
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
-        create_tmp_dir_locked(&tmp_dir)
-            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
+        create_tmp_dir_locked(&tmp_dir).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create virtual-store tmp staging dir: {e}"
+            ))
+        })?;
 
         // Run the atomic-staging body in a closure so a single error
         // path can clean up the tmp dir uniformly. Anything that
@@ -1164,10 +1632,12 @@ impl Store {
             &graph_key,
             PopulateObject {
                 dir: &object_dir,
+                materialize_dir,
                 source_sri: &source_sri,
                 sidecar_relpath: &sidecar_dir_relpath,
                 policy,
                 fresh_object_integrity: fresh_object_digest,
+                tree_digest: cas_tree_digest.as_deref(),
             },
             &deps,
             &platform,
@@ -1209,6 +1679,7 @@ impl Store {
                     &object_dir,
                     &source_sri,
                     verified_object_digest,
+                    cas_tree_digest.as_deref(),
                     policy,
                 )? {
                     // Concurrent install beat us — discard our stage and
@@ -1216,7 +1687,7 @@ impl Store {
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                     let sidecar_path = final_dir.join(LINK_META_FILENAME);
                     if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
-                        tracing::debug!("v2 store: race-loss touch failed: {e}");
+                        tracing::debug!("virtual store: race-loss touch failed: {e}");
                     }
                     timings.collision_recovery_ms = timings
                         .collision_recovery_ms
@@ -1237,12 +1708,12 @@ impl Store {
                     // change filesystem-level failures such as permission errors.
                     tracing::warn!(
                         target = %final_dir.display(),
-                        "v2 store: rename hit incomplete or stale leftover; removing and retrying once"
+                        "virtual store: rename hit incomplete or stale leftover; removing and retrying once"
                     );
                     if let Err(e) = std::fs::remove_dir_all(&final_dir) {
                         let _ = std::fs::remove_dir_all(&tmp_dir);
                         return Err(LpmError::Store(format!(
-                            "failed to remove incomplete or stale v2 link entry during retry at {}: {e}",
+                            "failed to remove incomplete or stale virtual-store link entry during retry at {}: {e}",
                             final_dir.display()
                         )));
                     }
@@ -1267,14 +1738,14 @@ impl Store {
                         Err(e) => {
                             let _ = std::fs::remove_dir_all(&tmp_dir);
                             Err(LpmError::Store(format!(
-                                "failed to atomically install v2 link entry on retry: {e}"
+                                "failed to atomically install virtual-store link entry on retry: {e}"
                             )))
                         }
                     };
                 }
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 Err(LpmError::Store(format!(
-                    "failed to atomically install v2 link entry: {e}"
+                    "failed to atomically install virtual-store link entry: {e}"
                 )))
             }
         }
@@ -1321,7 +1792,7 @@ impl Store {
         }
         let read_dir = std::fs::read_dir(&links_root).map_err(|e| {
             LpmError::Store(format!(
-                "failed to enumerate v2 links root at {}: {e}",
+                "failed to enumerate virtual-store links root at {}: {e}",
                 links_root.display()
             ))
         })?;
@@ -1331,7 +1802,7 @@ impl Store {
             let file_type = entry.file_type().ok()?;
             if file_type.is_symlink() {
                 tracing::warn!(
-                    "v2 store: refusing symlinked link entry at {} (store writer never creates symlinks here; tamper signal)",
+                    "virtual store: refusing symlinked link entry at {} (store writer never creates symlinks here; tamper signal)",
                     link_dir.display()
                 );
                 return None;
@@ -1343,7 +1814,7 @@ impl Store {
                 Ok(meta) => Some((link_dir, meta)),
                 Err(e) => {
                     tracing::debug!(
-                        "v2 store: skipping {}: sidecar unreadable ({e})",
+                        "virtual store: skipping {}: sidecar unreadable ({e})",
                         link_dir.display()
                     );
                     None
@@ -1370,7 +1841,7 @@ impl Store {
         }
         let read_dir = std::fs::read_dir(&links_root).map_err(|e| {
             LpmError::Store(format!(
-                "failed to enumerate v2 links root at {}: {e}",
+                "failed to enumerate virtual-store links root at {}: {e}",
                 links_root.display()
             ))
         })?;
@@ -1385,7 +1856,7 @@ impl Store {
                 out.push((
                     link_dir,
                     Err(LpmError::Store(
-                        "v2 link entry is a symlink (store writer never creates symlinks at links/<entry>; refusing to follow into an outside-store path)".to_string(),
+                        "virtual-store link entry is a symlink (store writer never creates symlinks at links/<entry>; refusing to follow into an outside-store path)".to_string(),
                     )),
                 ));
                 continue;
@@ -1442,7 +1913,7 @@ impl Store {
         }
         if !is_complete_link_entry(&link_dir, key) {
             return Err(LpmError::Store(format!(
-                "v2 link entry {} is incomplete; cannot key compatibility island",
+                "virtual-store link entry {} is incomplete; cannot key compatibility island",
                 link_dir.display()
             )));
         }
@@ -1505,40 +1976,52 @@ impl Store {
         v1_pkg_dir: &Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
+        self.populate_object_from_existing_tree(v1_pkg_dir, sri, "v1 to virtual-store translation")
+    }
+
+    fn populate_object_from_existing_tree(
+        &self,
+        source_dir: &Path,
+        sri: &str,
+        context: &str,
+    ) -> Result<PathBuf, LpmError> {
         let policy = self.object_integrity_policy;
         let object_dir = self.paths.object_dir(sri)?;
         if object_dir.exists()
-            && object_dir_is_reusable_or_remove(
-                &object_dir,
-                "before v1 to v2 translation",
-                sri,
-                policy,
-            )?
+            && object_dir_is_reusable_or_remove(&object_dir, context, sri, policy)?
+            && !matches!(
+                self.finish_file_cas_source(&object_dir, sri, false, None, policy)?,
+                FileCasSourceFinish::Unusable
+            )
         {
             return Ok(object_dir);
         }
-        if !v1_pkg_dir.is_dir() {
+        if !source_dir.is_dir() {
             return Err(LpmError::Store(format!(
-                "v1 → v2 translation: source dir {} is not readable",
-                v1_pkg_dir.display()
+                "{context}: source dir {} is not readable",
+                source_dir.display()
             )));
         }
         if let Some(parent) = object_dir.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                LpmError::Store(format!("failed to create virtual-store objects dir: {e}"))
+            })?;
         }
         let tmp_dir = tmp_sibling(&object_dir);
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
-        create_tmp_dir_locked(&tmp_dir)
-            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
+        create_tmp_dir_locked(&tmp_dir).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create virtual-store tmp staging dir: {e}"
+            ))
+        })?;
 
-        copy_dir_recursively(v1_pkg_dir, &tmp_dir).map_err(|e| {
+        copy_dir_recursively(source_dir, &tmp_dir).map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             LpmError::Store(format!(
-                "v1 → v2 translation: failed to copy {} → {}: {e}",
-                v1_pkg_dir.display(),
+                "{context}: failed to copy {} → {}: {e}",
+                source_dir.display(),
                 tmp_dir.display()
             ))
         })?;
@@ -1551,9 +2034,17 @@ impl Store {
         {
             let analysis = lpm_security::behavioral::analyze_package(&tmp_dir);
             if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-                tracing::warn!("v2 translation: failed to write .lpm-security.json: {e}");
+                tracing::warn!("{context}: failed to write .lpm-security.json: {e}");
             }
         }
+
+        let prepared_cas = match self.prepare_file_cas_source(&tmp_dir, &object_dir, sri, false) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(error);
+            }
+        };
 
         if let Err(e) = write_object_integrity_for_policy(&tmp_dir, sri, policy) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1562,22 +2053,44 @@ impl Store {
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!(
-                "failed to write v2 .integrity during v1 translation: {e}"
+                "failed to write .integrity during {context}: {e}"
             )));
         }
 
-        std::fs::rename(&tmp_dir, &object_dir)
-            .map(|()| object_dir.clone())
-            .or_else(|e| {
+        let (published, used_prepared) = match std::fs::rename(&tmp_dir, &object_dir) {
+            Ok(()) => (object_dir, true),
+            Err(error) => (
                 finish_object_rename_after_collision(
                     &tmp_dir,
                     &object_dir,
                     sri,
-                    "v1 to v2 translation",
-                    e,
+                    context,
+                    error,
                     policy,
-                )
-            })
+                )?,
+                false,
+            ),
+        };
+        if matches!(
+            self.finish_file_cas_source(
+                &published,
+                sri,
+                false,
+                if used_prepared {
+                    prepared_cas.as_ref()
+                } else {
+                    None
+                },
+                policy,
+            )?,
+            FileCasSourceFinish::Unusable
+        ) {
+            return Err(LpmError::Store(format!(
+                "published v3 CAS source became unusable at {}",
+                published.display()
+            )));
+        }
+        Ok(published)
     }
 
     fn backfill_security_cache_if_enabled(&self, object_dir: &Path, sri: &str) {
@@ -1587,12 +2100,12 @@ impl Store {
         match lpm_security::behavioral::backfill_cached_analysis(object_dir) {
             Ok(true) => tracing::debug!(
                 target = %object_dir.display(),
-                "v2 store: backfilled security analysis cache for {sri}"
+                "virtual store: backfilled security analysis cache for {sri}"
             ),
             Ok(false) => {}
             Err(error) => tracing::warn!(
                 target = %object_dir.display(),
-                "v2 store: failed to backfill .lpm-security.json for {sri}: {error}"
+                "virtual store: failed to backfill .lpm-security.json for {sri}: {error}"
             ),
         }
     }
@@ -1610,7 +2123,7 @@ impl Store {
     ) -> Result<PathBuf, LpmError> {
         let canonical_source = source_dir.canonicalize().map_err(|e| {
             LpmError::Store(format!(
-                "v2 local-source object: failed to canonicalize {}: {e}",
+                "virtual-store local-source object: failed to canonicalize {}: {e}",
                 source_dir.display()
             ))
         })?;
@@ -1646,14 +2159,27 @@ impl Store {
                 if !fingerprint_matches {
                     record_local_source_fingerprint(&object_dir, source_fingerprint.as_ref());
                 }
-                self.backfill_security_cache_if_enabled(&object_dir, sri);
-                return Ok(object_dir);
+                let cas_ready = !matches!(
+                    self.finish_file_cas_source(
+                        &object_dir,
+                        sri,
+                        true,
+                        None,
+                        ObjectIntegrityPolicy::Tree,
+                    )?,
+                    FileCasSourceFinish::Unusable
+                );
+                if cas_ready {
+                    self.backfill_security_cache_if_enabled(&object_dir, sri);
+                    return Ok(object_dir);
+                }
             }
         }
 
         if let Some(parent) = object_dir.parent() {
-            ensure_store_tier_dir_locked(parent)
-                .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
+            ensure_store_tier_dir_locked(parent).map_err(|e| {
+                LpmError::Store(format!("failed to create virtual-store objects dir: {e}"))
+            })?;
         }
 
         let tmp_dir = tmp_sibling(&object_dir);
@@ -1662,7 +2188,9 @@ impl Store {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
             }
             create_tmp_dir_locked(&tmp_dir).map_err(|e| {
-                LpmError::Store(format!("failed to create v2 tmp staging dir: {e}"))
+                LpmError::Store(format!(
+                    "failed to create virtual-store tmp staging dir: {e}"
+                ))
             })?;
 
             let before_population = compute_local_source_fingerprint(&canonical_source)?;
@@ -1682,17 +2210,47 @@ impl Store {
                     continue;
                 }
                 return Err(LpmError::Store(format!(
-                    "v2 local-source object changed while snapshotting {}",
+                    "virtual-store local-source object changed while snapshotting {}",
                     canonical_source.display()
                 )));
             }
 
+            let prepared_cas = match self.prepare_file_cas_source(&tmp_dir, &object_dir, sri, true)
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err(error);
+                }
+            };
+            if let Err(error) =
+                write_object_integrity_for_policy(&tmp_dir, sri, ObjectIntegrityPolicy::Tree)
+            {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(error);
+            }
+
             replace_local_source_object(&tmp_dir, &object_dir, &canonical_source)?;
             record_local_source_fingerprint(&object_dir, after_population.as_ref());
+            if matches!(
+                self.finish_file_cas_source(
+                    &object_dir,
+                    sri,
+                    true,
+                    prepared_cas.as_ref(),
+                    ObjectIntegrityPolicy::Tree,
+                )?,
+                FileCasSourceFinish::Unusable
+            ) {
+                return Err(LpmError::Store(format!(
+                    "fresh local-source v3 CAS snapshot became unusable at {}",
+                    object_dir.display()
+                )));
+            }
             return Ok(object_dir);
         }
         Err(LpmError::Store(format!(
-            "v2 local-source object changed repeatedly while snapshotting {}",
+            "virtual-store local-source object changed repeatedly while snapshotting {}",
             canonical_source.display()
         )))
     }
@@ -1720,7 +2278,7 @@ impl Store {
         }
         let read_dir = std::fs::read_dir(&objects_root).map_err(|e| {
             LpmError::Store(format!(
-                "failed to enumerate v2 objects root at {}: {e}",
+                "failed to enumerate virtual-store objects root at {}: {e}",
                 objects_root.display()
             ))
         })?;
@@ -1730,7 +2288,7 @@ impl Store {
             let file_type = entry.file_type().ok()?;
             if file_type.is_symlink() {
                 tracing::warn!(
-                    "v2 store: refusing symlinked object entry at {} (store writer never creates symlinks here; tamper signal)",
+                    "virtual store: refusing symlinked object entry at {} (store writer never creates symlinks here; tamper signal)",
                     object_dir.display()
                 );
                 return None;
@@ -1745,6 +2303,262 @@ impl Store {
             Some((object_dir, segment))
         });
         Ok(Box::new(iter) as Box<dyn Iterator<Item = (PathBuf, String)>>)
+    }
+
+    pub fn verify_file_cas(
+        &self,
+        deep: bool,
+    ) -> Result<Option<crate::v3::FileCasVerification>, LpmError> {
+        let Some(cas) = &self.file_cas else {
+            return Ok(None);
+        };
+        let mut verification = crate::v3::FileCasVerification::default();
+        let mut expected_sources = std::collections::HashMap::new();
+        for (object_dir, _) in self.iter_object_dirs()? {
+            let source_sri = match std::fs::read_to_string(object_dir.join(".integrity")) {
+                Ok(source_sri) => source_sri,
+                Err(error) => {
+                    verification.issues.push(format!(
+                        "{}: failed to read source integrity: {error}",
+                        object_dir.display()
+                    ));
+                    continue;
+                }
+            };
+            let source_sri = source_sri.trim().to_string();
+            match cas.source_record_path(&source_sri) {
+                Ok(path) => {
+                    expected_sources.insert(path, (object_dir, source_sri));
+                }
+                Err(error) => verification.issues.push(error.to_string()),
+            }
+        }
+
+        let source_files = cas.source_record_files()?;
+        let _source_validation_files = cas.source_validation_files()?;
+        verification.sources = source_files.len();
+        let mut reachable_tree_paths = std::collections::HashSet::new();
+        let mut reachable_tree_digests = std::collections::HashSet::new();
+        for source_path in &source_files {
+            let record = match cas.source_record_from_file(source_path) {
+                Ok(record) => record,
+                Err(error) => {
+                    verification.issues.push(error.to_string());
+                    continue;
+                }
+            };
+            match expected_sources.remove(source_path) {
+                Some((object_dir, source_sri)) => {
+                    if let Err(error) = cas.source_manifest_for_verify(&object_dir, &source_sri) {
+                        verification.issues.push(error.to_string());
+                        continue;
+                    }
+                }
+                None => {
+                    verification.orphaned_sources = verification.orphaned_sources.saturating_add(1);
+                    if let Err(error) = cas.manifest_for_source_record(&record) {
+                        verification.issues.push(error.to_string());
+                    }
+                    continue;
+                }
+            }
+            match cas.tree_manifest_path(&record.tree_digest) {
+                Ok(path) => {
+                    reachable_tree_paths.insert(path);
+                    reachable_tree_digests.insert(record.tree_digest);
+                }
+                Err(error) => verification.issues.push(error.to_string()),
+            }
+        }
+        for (_, (object_dir, _)) in expected_sources {
+            verification.issues.push(format!(
+                "missing v3 CAS source record for {}",
+                object_dir.display()
+            ));
+        }
+
+        let tree_files = cas.tree_manifest_files()?;
+        verification.trees = tree_files.len();
+        let mut all_tree_blobs = std::collections::HashSet::new();
+        let mut reachable_blob_paths = std::collections::HashSet::new();
+        let mut tree_manifests = std::collections::HashMap::new();
+        for tree_path in &tree_files {
+            let (digest, manifest) = match cas.manifest_from_file(tree_path) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    verification.issues.push(error.to_string());
+                    continue;
+                }
+            };
+            if !reachable_tree_paths.contains(tree_path) {
+                verification.orphaned_trees = verification.orphaned_trees.saturating_add(1);
+            }
+            let tree_is_reachable = reachable_tree_digests.contains(&digest);
+            tree_manifests.insert(digest, manifest.clone());
+            for key in manifest
+                .entries
+                .iter()
+                .filter_map(|entry| entry.blob.as_ref())
+            {
+                match cas.blob_path(key) {
+                    Ok(path) => {
+                        if tree_is_reachable {
+                            reachable_blob_paths.insert(path);
+                        }
+                        all_tree_blobs.insert(key.clone());
+                    }
+                    Err(error) => verification.issues.push(error.to_string()),
+                }
+            }
+        }
+
+        let materialized_entries = cas.materialized_entry_dirs()?;
+        verification.materialized = materialized_entries.len();
+        for entry_dir in &materialized_entries {
+            let digest = match cas.materialized_digest_from_entry(entry_dir) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    verification.orphaned_materialized =
+                        verification.orphaned_materialized.saturating_add(1);
+                    verification.issues.push(error.to_string());
+                    continue;
+                }
+            };
+            if !reachable_tree_digests.contains(&digest) {
+                verification.orphaned_materialized =
+                    verification.orphaned_materialized.saturating_add(1);
+            }
+            let Some(manifest) = tree_manifests.get(&digest) else {
+                verification.issues.push(format!(
+                    "v3 CAS materialized entry has no tree manifest at {}",
+                    entry_dir.display()
+                ));
+                continue;
+            };
+            if !cas.materialized_entry_is_complete(entry_dir, &digest) {
+                verification.issues.push(format!(
+                    "v3 CAS materialized entry is incomplete at {}",
+                    entry_dir.display()
+                ));
+            }
+            if let Err(error) = cas.validate_materialized_entry(entry_dir, &digest, manifest) {
+                verification.issues.push(error.to_string());
+            }
+        }
+
+        let blob_files = cas.blob_files()?;
+        verification.blobs = blob_files.len();
+        let mut hash_buffer = vec![0_u8; 64 * 1024];
+        let mut verified_blob_paths = std::collections::HashSet::with_capacity(blob_files.len());
+        for blob_path in &blob_files {
+            let key = match cas.blob_key_from_file(blob_path) {
+                Ok(key) => key,
+                Err(error) => {
+                    verification.issues.push(error.to_string());
+                    continue;
+                }
+            };
+            verified_blob_paths.insert(blob_path.clone());
+            if !reachable_blob_paths.contains(blob_path) {
+                verification.orphaned_blobs = verification.orphaned_blobs.saturating_add(1);
+            }
+            if deep {
+                verification.blobs_rehashed = verification.blobs_rehashed.saturating_add(1);
+                if let Err(error) = cas.verify_blob(&key, true, &mut hash_buffer) {
+                    verification.issues.push(error.to_string());
+                }
+            }
+        }
+        for key in &all_tree_blobs {
+            let path = cas.blob_path(key)?;
+            if verified_blob_paths.contains(&path) {
+                continue;
+            }
+            if let Err(error) = cas.verify_blob(key, deep, &mut hash_buffer) {
+                verification.issues.push(error.to_string());
+            }
+        }
+        verification.issues.sort_unstable();
+        verification.issues.dedup();
+        Ok(Some(verification))
+    }
+
+    pub fn file_cas_tree_digest(&self, source_sri: &str) -> Result<Option<String>, LpmError> {
+        let Some(cas) = &self.file_cas else {
+            return Ok(None);
+        };
+        let object_dir = self.paths.object_dir(source_sri)?;
+        cas.source_tree_digest(&object_dir, source_sri).map(Some)
+    }
+
+    pub fn file_cas_prune_plan(
+        &self,
+        objects_to_remove: &std::collections::HashSet<PathBuf>,
+    ) -> Result<Option<crate::v3::FileCasPrunePlan>, LpmError> {
+        let Some(cas) = &self.file_cas else {
+            return Ok(None);
+        };
+        let mut reachable_trees = std::collections::HashSet::new();
+        let mut reachable_blobs = std::collections::HashSet::new();
+        let mut reachable_materialized = std::collections::HashSet::new();
+        let mut live_source_records = std::collections::HashSet::new();
+        let mut live_source_validations = std::collections::HashSet::new();
+        for (object_dir, _) in self.iter_object_dirs()? {
+            if objects_to_remove.contains(&object_dir) {
+                continue;
+            }
+            let source_sri =
+                std::fs::read_to_string(object_dir.join(".integrity")).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to read v3 source integrity at {}: {error}",
+                        object_dir.display()
+                    ))
+                })?;
+            let (record, manifest) =
+                cas.source_manifest_for_verify(&object_dir, source_sri.trim())?;
+            reachable_trees.insert(cas.tree_manifest_path(&record.tree_digest)?);
+            reachable_materialized.insert(cas.materialized_entry_dir(&record.tree_digest)?);
+            live_source_records.insert(cas.source_record_path(source_sri.trim())?);
+            live_source_validations.insert(cas.source_validation_path(source_sri.trim())?);
+            for blob in manifest
+                .entries
+                .iter()
+                .filter_map(|entry| entry.blob.as_ref())
+            {
+                reachable_blobs.insert(cas.blob_path(blob)?);
+            }
+        }
+
+        let tree_files = cas.tree_manifest_files()?;
+        let blob_files = cas.blob_files()?;
+        let source_record_files = cas.source_record_files()?;
+        let source_validation_files = cas.source_validation_files()?;
+        let materialized_entries = cas.materialized_entry_dirs()?;
+        Ok(Some(crate::v3::FileCasPrunePlan {
+            trees_total: tree_files.len(),
+            tree_files_orphaned: tree_files
+                .into_iter()
+                .filter(|path| !reachable_trees.contains(path))
+                .collect(),
+            blobs_total: blob_files.len(),
+            blob_files_orphaned: blob_files
+                .into_iter()
+                .filter(|path| !reachable_blobs.contains(path))
+                .collect(),
+            source_record_files_orphaned: source_record_files
+                .into_iter()
+                .filter(|path| !live_source_records.contains(path))
+                .collect(),
+            source_validation_files_orphaned: source_validation_files
+                .into_iter()
+                .filter(|path| !live_source_validations.contains(path))
+                .collect(),
+            materialized_total: materialized_entries.len(),
+            materialized_entries_orphaned: materialized_entries
+                .into_iter()
+                .filter(|path| !reachable_materialized.contains(path))
+                .collect(),
+        }))
     }
 
     /// Returns `true` iff `path` (after symlink resolution) lives under
@@ -1772,10 +2586,12 @@ impl Store {
 
 struct PopulateObject<'a> {
     dir: &'a Path,
+    materialize_dir: &'a Path,
     source_sri: &'a str,
     sidecar_relpath: &'a str,
     policy: ObjectIntegrityPolicy,
     fresh_object_integrity: Option<&'a FreshObjectIntegrity>,
+    tree_digest: Option<&'a str>,
 }
 
 struct PopulateIntoResult {
@@ -1794,7 +2610,7 @@ fn populate_into(
     let node_modules = tmp_dir.join(LINK_NODE_MODULES);
     std::fs::create_dir_all(&node_modules).map_err(|e| {
         LpmError::Store(format!(
-            "failed to create v2 link node_modules at {}: {e}",
+            "failed to create virtual-store link node_modules at {}: {e}",
             node_modules.display()
         ))
     })?;
@@ -1816,13 +2632,17 @@ fn populate_into(
     if let Some(parent) = pkg_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             LpmError::Store(format!(
-                "failed to create v2 link package parent at {}: {e}",
+                "failed to create virtual-store link package parent at {}: {e}",
                 parent.display()
             ))
         })?;
     }
     let materialize_start = std::time::Instant::now();
-    materialize_into(object.dir, &pkg_dir)?;
+    let materialized_metadata_integrity = materialize_into_with_integrity(
+        object.materialize_dir,
+        &pkg_dir,
+        has_local_source_sentinel(object.dir),
+    )?;
     timings.materialize_ms = materialize_start.elapsed().as_millis();
 
     // Sibling-dep symlinks. Each lives next to the package (siblings
@@ -1835,7 +2655,10 @@ fn populate_into(
     timings.symlink_ms = symlink_start.elapsed().as_millis();
 
     let snapshot_start = std::time::Instant::now();
-    let package_metadata_integrity = compute_tree_metadata_integrity(&pkg_dir)?;
+    let package_metadata_integrity = match materialized_metadata_integrity {
+        Some(integrity) => integrity,
+        None => compute_tree_metadata_integrity(&pkg_dir)?,
+    };
     write_tree_snapshot(
         tmp_dir,
         &TreeIntegrities {
@@ -1858,7 +2681,8 @@ fn populate_into(
         object.sidecar_relpath,
         deps_meta,
         Arc::clone(platform),
-    );
+    )
+    .with_tree_digest(object.tree_digest.map(str::to_owned));
     // `tmp_dir` is the unpublished staging dir; the outer rename in
     // `populate_link_entry` is the visibility boundary, so we can skip the
     // tmp+rename dance and write the sidecar straight in. See
@@ -1877,7 +2701,7 @@ fn create_sibling_symlink(
 ) -> Result<(), LpmError> {
     if let Err(why) = validate_name_for_path_join(&dep.local) {
         return Err(LpmError::Store(format!(
-            "unsafe dependency local name {:?} in v2 link entry for {}: {why}",
+            "unsafe dependency local name {:?} in virtual-store link entry for {}: {why}",
             dep.local,
             self_key.dir_name()
         )));
@@ -1909,7 +2733,7 @@ fn create_sibling_symlink(
 
     create_dir_symlink(&target, &link_path).map_err(|e| {
         LpmError::Store(format!(
-            "failed to create v2 sibling symlink {} → {} (self={}): {e}",
+            "failed to create virtual-store sibling symlink {} → {} (self={}): {e}",
             link_path.display(),
             target.display(),
             self_key.dir_name()
@@ -1920,7 +2744,7 @@ fn create_sibling_symlink(
 fn ensure_sibling_parent_dir(base: &Path, link_path: &Path, label: &str) -> Result<(), LpmError> {
     let Some(parent) = link_path.parent() else {
         return Err(LpmError::Store(format!(
-            "v2 {label} link path has no parent: {}",
+            "virtual-store {label} link path has no parent: {}",
             link_path.display()
         )));
     };
@@ -1929,7 +2753,7 @@ fn ensure_sibling_parent_dir(base: &Path, link_path: &Path, label: &str) -> Resu
     }
     let relative = parent.strip_prefix(base).map_err(|e| {
         LpmError::Store(format!(
-            "v2 {label} parent {} is outside base {}: {e}",
+            "virtual-store {label} parent {} is outside base {}: {e}",
             parent.display(),
             base.display()
         ))
@@ -1938,7 +2762,7 @@ fn ensure_sibling_parent_dir(base: &Path, link_path: &Path, label: &str) -> Resu
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             return Err(LpmError::Store(format!(
-                "v2 {label} parent contains unsafe component at {}",
+                "virtual-store {label} parent contains unsafe component at {}",
                 parent.display()
             )));
         };
@@ -1954,7 +2778,7 @@ fn ensure_real_dir_or_create(path: &Path, label: &str) -> Result<(), LpmError> {
             Ok(())
         }
         Ok(_) => Err(LpmError::Store(format!(
-            "refusing to create v2 {label} through non-directory path at {}",
+            "refusing to create virtual-store {label} through non-directory path at {}",
             path.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1964,13 +2788,13 @@ fn ensure_real_dir_or_create(path: &Path, label: &str) -> Result<(), LpmError> {
                     ensure_real_dir_or_create(path, label)
                 }
                 Err(error) => Err(LpmError::Store(format!(
-                    "failed to create v2 {label} directory at {}: {error}",
+                    "failed to create virtual-store {label} directory at {}: {error}",
                     path.display()
                 ))),
             }
         }
         Err(error) => Err(LpmError::Store(format!(
-            "failed to inspect v2 {label} directory at {}: {error}",
+            "failed to inspect virtual-store {label} directory at {}: {error}",
             path.display()
         ))),
     }
@@ -2022,9 +2846,17 @@ fn link_entry_is_reusable(
     object_dir: &Path,
     source_sri: &str,
     verified_object_digest: Option<&VerifiedObjectIntegrity>,
+    tree_digest: Option<&str>,
     policy: ObjectIntegrityPolicy,
 ) -> Result<bool, LpmError> {
     if !is_complete_link_entry(dir, key) {
+        return Ok(false);
+    }
+    let sidecar = LinkMeta::read_from(dir)?;
+    if sidecar.graph_key_digest_hex != key.digest_hex()
+        || sidecar.source_sri != source_sri
+        || sidecar.tree_digest.as_deref() != tree_digest
+    {
         return Ok(false);
     }
     let expected = match verified_object_digest {
@@ -2097,7 +2929,7 @@ fn record_local_source_fingerprint(
     if let Err(error) = write_local_source_fingerprint(object_dir, fingerprint) {
         tracing::warn!(
             target = %object_dir.display(),
-            "v2 local-source object: failed to record source fingerprint: {error}"
+            "virtual-store local-source object: failed to record source fingerprint: {error}"
         );
     }
 }

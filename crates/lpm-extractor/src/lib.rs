@@ -316,6 +316,9 @@ pub struct EntryInfo<'a> {
     /// which case `entry.unpack()` streamed the file to disk without
     /// materializing bytes in memory.
     pub bytes: Option<&'a [u8]>,
+    /// BLAKE3 digest computed while the entry was written when the caller
+    /// selected the digest-enabled extraction path.
+    pub blake3_digest: Option<[u8; 32]>,
 }
 
 /// Extract tarball AND invoke a caller-supplied
@@ -351,6 +354,7 @@ where
         reader,
         target_dir,
         DEFAULT_EXTRACTION_LIMITS,
+        false,
         buffer_predicate,
         inspector,
     )
@@ -375,6 +379,29 @@ where
         data,
         target_dir,
         DEFAULT_EXTRACTION_LIMITS,
+        false,
+        buffer_predicate,
+        inspector,
+    )
+}
+
+/// Extract an in-memory tarball while computing a BLAKE3 digest for every
+/// regular file in the same write pass.
+pub fn extract_tarball_with_entry_digests<P, I>(
+    data: &[u8],
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    extract_tarball_from_slice_with_inspector_with_limits(
+        data,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        true,
         buffer_predicate,
         inspector,
     )
@@ -384,6 +411,7 @@ fn extract_tarball_from_reader_with_inspector_with_limits<R, P, I>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
+    compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
 ) -> Result<Vec<PathBuf>, LpmError>
@@ -412,12 +440,18 @@ where
             &compressed,
             target_dir,
             limits,
+            compute_blake3,
             buffer_predicate,
             inspector,
         ),
-        CompressedInput::Stream(reader) => {
-            extract_streaming_gzip_tarball(reader, target_dir, limits, buffer_predicate, inspector)
-        }
+        CompressedInput::Stream(reader) => extract_streaming_gzip_tarball(
+            reader,
+            target_dir,
+            limits,
+            compute_blake3,
+            buffer_predicate,
+            inspector,
+        ),
     }
 }
 
@@ -425,6 +459,7 @@ fn extract_tarball_from_slice_with_inspector_with_limits<P, I>(
     data: &[u8],
     target_dir: &Path,
     limits: ExtractionLimits,
+    compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
 ) -> Result<Vec<PathBuf>, LpmError>
@@ -438,18 +473,27 @@ where
             std::io::Cursor::new(data),
             target_dir,
             limits,
+            compute_blake3,
             buffer_predicate,
             inspector,
         );
     }
 
-    extract_buffered_gzip_tarball(data, target_dir, limits, buffer_predicate, inspector)
+    extract_buffered_gzip_tarball(
+        data,
+        target_dir,
+        limits,
+        compute_blake3,
+        buffer_predicate,
+        inspector,
+    )
 }
 
 fn extract_buffered_gzip_tarball<P, I>(
     compressed: &[u8],
     target_dir: &Path,
     limits: ExtractionLimits,
+    compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
 ) -> Result<Vec<PathBuf>, LpmError>
@@ -462,6 +506,7 @@ where
             std::io::Cursor::new(decompressed),
             target_dir,
             limits,
+            compute_blake3,
             buffer_predicate,
             inspector,
             |_| Ok(()),
@@ -470,6 +515,7 @@ where
             std::io::Cursor::new(compressed),
             target_dir,
             limits,
+            compute_blake3,
             buffer_predicate,
             inspector,
         ),
@@ -517,6 +563,7 @@ fn extract_streaming_gzip_tarball<R, P, I>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
+    compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
 ) -> Result<Vec<PathBuf>, LpmError>
@@ -531,6 +578,7 @@ where
         limited,
         target_dir,
         limits,
+        compute_blake3,
         buffer_predicate,
         inspector,
         |mut reader| {
@@ -586,6 +634,7 @@ fn extract_tar_archive_with_inspector<R, P, I, D>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
+    compute_blake3: bool,
     buffer_predicate: P,
     mut inspector: I,
     drain_after_entries: D,
@@ -759,16 +808,18 @@ where
 
             // Only extract regular files (skip symlinks for security)
             if entry.header().entry_type().is_file() {
-                if let Err(error) =
-                    record_case_fold_archive_path(&mut seen_archive_paths, &relative_path)
-                {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        error,
-                    );
-                }
+                let duplicate_path =
+                    match record_case_fold_archive_path(&mut seen_archive_paths, &relative_path) {
+                        Ok(duplicate_path) => duplicate_path,
+                        Err(error) => {
+                            return rollback_extraction(
+                                &extraction_root,
+                                &extracted_files,
+                                &created_dirs,
+                                error,
+                            );
+                        }
+                    };
 
                 // Capture the tar entry's exec bits BEFORE any read; the
                 // header is parsed up-front by the tar crate. We honor
@@ -791,7 +842,7 @@ where
                 // Otherwise stream directly via `entry.unpack()` as the pre-P2
                 // code did — same memory profile for non-buffered entries.
                 let buffer_this = buffer_predicate(&relative_path, size);
-                let buffered_bytes = if buffer_this {
+                let (buffered_bytes, blake3_digest) = if buffer_this {
                     let mut buf = Vec::with_capacity(size as usize);
                     if let Err(error) = entry.read_to_end(&mut buf) {
                         return rollback_extraction(
@@ -801,7 +852,7 @@ where
                             LpmError::Io(error),
                         );
                     }
-                    if let Err(error) = write_buffered_entry(&target_path, &buf) {
+                    if let Err(error) = write_buffered_entry(&target_path, &buf, duplicate_path) {
                         return rollback_extraction(
                             &extraction_root,
                             &extracted_files,
@@ -809,7 +860,8 @@ where
                             error,
                         );
                     }
-                    Some(buf)
+                    let digest = compute_blake3.then(|| *blake3::hash(&buf).as_bytes());
+                    (Some(buf), digest)
                 } else {
                     // Stream directly to disk via `io::copy` instead of
                     // `entry.unpack()`. Even with the three `preserve_*`
@@ -821,15 +873,23 @@ where
                     // Same minimal write semantics as [`write_buffered_entry`]:
                     // create-or-truncate, default mode (umask-respecting), no
                     // post-write metadata calls.
-                    if let Err(error) = stream_entry_to_disk(&mut entry, &target_path) {
-                        return rollback_extraction(
-                            &extraction_root,
-                            &extracted_files,
-                            &created_dirs,
-                            error,
-                        );
-                    }
-                    None
+                    let digest = match stream_entry_to_disk(
+                        &mut entry,
+                        &target_path,
+                        compute_blake3,
+                        duplicate_path,
+                    ) {
+                        Ok(digest) => digest,
+                        Err(error) => {
+                            return rollback_extraction(
+                                &extraction_root,
+                                &extracted_files,
+                                &created_dirs,
+                                error,
+                            );
+                        }
+                    };
+                    (None, digest)
                 };
 
                 // Restore the exec bits captured before the write. Skipped
@@ -855,6 +915,7 @@ where
                     relative_path: &relative_path,
                     size,
                     bytes: buffered_bytes.as_deref(),
+                    blake3_digest,
                 });
 
                 extracted_files.push(relative_path);
@@ -875,9 +936,13 @@ where
 /// restoring mode/mtime metadata — we don't need either for npm packages
 /// and keeping it minimal reduces `fs` syscall count vs `tar`'s full
 /// unpack path.
-fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError> {
+fn write_buffered_entry(
+    target_path: &Path,
+    bytes: &[u8],
+    replace_existing: bool,
+) -> Result<(), LpmError> {
     use std::io::Write;
-    let mut file = create_leaf_file(target_path)?;
+    let mut file = create_leaf_file(target_path, replace_existing)?;
     file.write_all(bytes).map_err(LpmError::Io)?;
     Ok(())
 }
@@ -889,10 +954,28 @@ fn write_buffered_entry(target_path: &Path, bytes: &[u8]) -> Result<(), LpmError
 fn stream_entry_to_disk<R: std::io::Read>(
     entry: &mut tar::Entry<'_, R>,
     target_path: &Path,
-) -> Result<(), LpmError> {
-    let mut file = create_leaf_file(target_path)?;
-    std::io::copy(entry, &mut file).map_err(LpmError::Io)?;
-    Ok(())
+    compute_blake3: bool,
+    replace_existing: bool,
+) -> Result<Option<[u8; 32]>, LpmError> {
+    use std::io::Write;
+
+    let mut file = create_leaf_file(target_path, replace_existing)?;
+    if !compute_blake3 {
+        std::io::copy(entry, &mut file).map_err(LpmError::Io)?;
+        return Ok(None);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = entry.read(&mut buffer).map_err(LpmError::Io)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).map_err(LpmError::Io)?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Some(*hasher.finalize().as_bytes()))
 }
 
 fn cleanup_extracted_files(
@@ -1005,14 +1088,43 @@ fn prepare_output_path(
 /// as the previous explicit `symlink_metadata` pre-check, fewer
 /// syscalls. On windows the optimization is skipped (no `O_NOFOLLOW`
 /// equivalent in `OpenOptions`); we fall back to an explicit stat.
-fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
+/// Exact duplicate archive members detach the prior file before opening it
+/// because an inspector may already have hardlinked that inode into a CAS.
+fn create_leaf_file(target_path: &Path, replace_existing: bool) -> Result<std::fs::File, LpmError> {
+    if replace_existing {
+        let metadata = std::fs::symlink_metadata(target_path).map_err(LpmError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(LpmError::Registry(format!(
+                "path traversal detected via symlink in tarball target: {}",
+                target_path.display()
+            )));
+        }
+        if is_windows_reparse_point(&metadata) {
+            return Err(LpmError::Registry(format!(
+                "path traversal detected via reparse point in tarball target: {}",
+                target_path.display()
+            )));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(LpmError::Registry(format!(
+                "non-file path blocks duplicate tarball entry: {}",
+                target_path.display()
+            )));
+        }
+        std::fs::remove_file(target_path).map_err(LpmError::Io)?;
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true);
+        if replace_existing {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        options
             // `O_NOFOLLOW` only checks the FINAL path component — the
             // parent walk in `prepare_output_path` already verified
             // every intermediate dir is a real directory, not a
@@ -1057,7 +1169,14 @@ fn create_leaf_file(target_path: &Path) -> Result<std::fs::File, LpmError> {
             }
             Ok(_) | Err(_) => {}
         }
-        std::fs::File::create(target_path).map_err(LpmError::Io)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true);
+        if replace_existing {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        options.open(target_path).map_err(LpmError::Io)
     }
 }
 
@@ -1251,11 +1370,11 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
 fn record_case_fold_archive_path(
     seen_paths: &mut HashMap<String, PathBuf>,
     relative_path: &Path,
-) -> Result<(), LpmError> {
+) -> Result<bool, LpmError> {
     let key = case_fold_path_key(relative_path);
     if let Some(existing_path) = seen_paths.get(&key) {
         if existing_path == relative_path {
-            return Ok(());
+            return Ok(true);
         }
 
         return Err(LpmError::Registry(format!(
@@ -1266,7 +1385,7 @@ fn record_case_fold_archive_path(
     }
 
     seen_paths.insert(key, relative_path.to_path_buf());
-    Ok(())
+    Ok(false)
 }
 
 fn case_fold_path_key(path: &Path) -> String {
@@ -1380,6 +1499,7 @@ mod tests {
             std::io::Cursor::new(&tgz),
             dir.path(),
             streaming_test_limits(),
+            false,
             |path, size| path == Path::new("payload.bin") && size == payload.len() as u64,
             |entry| {
                 if let Some(bytes) = entry.bytes {
@@ -1398,6 +1518,40 @@ mod tests {
     }
 
     #[test]
+    fn digest_enabled_extraction_hashes_buffered_and_streamed_entries_during_write() {
+        let buffered = b"console.log('buffered')";
+        let streamed = b"not source code";
+        let tgz = create_test_tarball_with_entries(&[
+            ("index.js", buffered.as_slice()),
+            ("asset.bin", streamed.as_slice()),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut digests = HashMap::new();
+
+        extract_tarball_with_entry_digests(
+            &tgz,
+            dir.path(),
+            |path, _| path == Path::new("index.js"),
+            |entry| {
+                digests.insert(
+                    entry.relative_path.to_path_buf(),
+                    entry.blake3_digest.expect("digest-enabled extraction"),
+                );
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            digests[Path::new("index.js")],
+            *blake3::hash(buffered).as_bytes()
+        );
+        assert_eq!(
+            digests[Path::new("asset.bin")],
+            *blake3::hash(streamed).as_bytes()
+        );
+    }
+
+    #[test]
     fn extract_tarball_streams_when_compressed_input_exceeds_buffered_cap() {
         let payload = b"small package content";
         let tgz = create_test_tarball("index.js", payload);
@@ -1412,6 +1566,7 @@ mod tests {
             std::io::Cursor::new(&tgz),
             dir.path(),
             limits,
+            false,
             |_, _| false,
             |_| {},
         )
@@ -1436,6 +1591,7 @@ mod tests {
             &tgz,
             dir.path(),
             limits,
+            false,
             |_, _| false,
             |_| {},
         )
@@ -1489,6 +1645,7 @@ mod tests {
             std::io::Cursor::new(&tgz),
             dir.path(),
             limits,
+            false,
             |_, _| false,
             |_| {},
         )

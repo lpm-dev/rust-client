@@ -93,25 +93,25 @@ fn validate_local_tarball_raw_path_accepts_absolute_paths() {
 // ── migration tests ───────────────────────────
 
 #[test]
-fn needs_v2_migration_detects_legacy_isolated_wrappers() {
+fn virtual_store_migration_detects_legacy_isolated_wrappers() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".lpm/wrappers/express@4.21.0")).unwrap();
-    assert!(needs_v2_migration(dir.path()));
+    assert!(needs_virtual_store_migration(dir.path()));
 }
 
 #[test]
-fn needs_v2_migration_detects_legacy_hoisted_metadata() {
+fn virtual_store_migration_detects_legacy_hoisted_metadata() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".lpm/hoisted")).unwrap();
     std::fs::write(dir.path().join(".lpm/hoisted/metadata.json"), b"{}").unwrap();
-    assert!(needs_v2_migration(dir.path()));
+    assert!(needs_virtual_store_migration(dir.path()));
 }
 
 #[test]
-fn needs_v2_migration_returns_false_on_clean_v2_or_fresh_project() {
+fn virtual_store_migration_returns_false_on_clean_virtual_store_or_fresh_project() {
     let dir = tempfile::tempdir().unwrap();
     // Fresh project (no .lpm at all) — must NOT trigger migration.
-    assert!(!needs_v2_migration(dir.path()));
+    assert!(!needs_virtual_store_migration(dir.path()));
 
     // Clean v2 install: project node_modules has symlinks but no
     // legacy `.lpm/wrappers/` or `.lpm/hoisted/`.
@@ -119,13 +119,13 @@ fn needs_v2_migration_returns_false_on_clean_v2_or_fresh_project() {
     std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
     std::fs::write(dir.path().join(".lpm/install-hash"), b"hash").unwrap();
     assert!(
-        !needs_v2_migration(dir.path()),
-        "v2 install with no legacy markers must not request migration"
+        !needs_virtual_store_migration(dir.path()),
+        "virtual-store install with no legacy markers must not request migration"
     );
 }
 
 #[test]
-fn migrate_v1_to_v2_wipes_all_required_paths() {
+fn migrating_v1_to_virtual_store_wipes_all_required_paths() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path();
 
@@ -142,7 +142,7 @@ fn migrate_v1_to_v2_wipes_all_required_paths() {
     std::fs::create_dir_all(project.join(".lpm/hoisted")).unwrap();
     std::fs::write(project.join(".lpm/hoisted/metadata.json"), b"{}").unwrap();
 
-    migrate_v1_to_v2(project).unwrap();
+    migrate_v1_to_virtual_store(project).unwrap();
 
     assert!(!project.join(".lpm/wrappers").exists());
     assert!(!project.join(".lpm/hoisted").exists());
@@ -156,16 +156,16 @@ fn migrate_v1_to_v2_wipes_all_required_paths() {
 }
 
 #[test]
-fn migrate_v1_to_v2_is_idempotent_on_clean_state() {
+fn migrating_v1_to_virtual_store_is_idempotent_on_clean_state() {
     let dir = tempfile::tempdir().unwrap();
     // No legacy state at all — migration must succeed as a no-op.
-    migrate_v1_to_v2(dir.path()).unwrap();
+    migrate_v1_to_virtual_store(dir.path()).unwrap();
     // Second call also a no-op.
-    migrate_v1_to_v2(dir.path()).unwrap();
+    migrate_v1_to_virtual_store(dir.path()).unwrap();
 }
 
 #[test]
-fn migrate_v1_to_v2_preserves_project_lpm_sidecars() {
+fn migrating_v1_to_virtual_store_preserves_project_lpm_sidecars() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path();
 
@@ -177,7 +177,7 @@ fn migrate_v1_to_v2_preserves_project_lpm_sidecars() {
     std::fs::write(project.join(".lpm/trust-snapshot.json"), b"{}").unwrap();
     std::fs::create_dir_all(project.join(".lpm/wrappers")).unwrap();
 
-    migrate_v1_to_v2(project).unwrap();
+    migrate_v1_to_virtual_store(project).unwrap();
 
     assert!(project.join(".lpm/build-state.json").exists());
     assert!(project.join(".lpm/trust-snapshot.json").exists());
@@ -1286,7 +1286,7 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         &[foo.clone(), bar.clone()],
         true,
     )
-    .expect("v2 direct workspace pre-resolve should promote workspace child");
+    .expect("virtual-store direct workspace pre-resolve should promote workspace child");
 
     let names: Vec<&str> = result
         .install_pkgs

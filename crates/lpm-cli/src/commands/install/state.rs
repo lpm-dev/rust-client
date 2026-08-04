@@ -240,7 +240,7 @@ pub(super) async fn run_install_freshness_phase(
             input.security_analysis_policy,
         );
     let setup_install_state_ms = setup_state_t.elapsed().as_millis();
-    let compatibility_bins_ready = !input.store_version.is_v2()
+    let compatibility_bins_ready = !input.store_version.uses_virtual_store()
         || input.compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(
             input.project_dir,
@@ -460,8 +460,8 @@ pub(super) fn source_analysis_caches_are_current(
 
     let store_v1 = PackageStore::from_root(lpm_root);
     let store_v2 = store_version
-        .is_v2()
-        .then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
+        .uses_virtual_store()
+        .then(|| lpm_store::v2::Store::from_lpm_root_for_version(lpm_root, store_version));
     let mut checked = HashSet::with_capacity(packages.len());
     for package in packages {
         let package_dir = if let Some(store_v2) = store_v2.as_ref() {

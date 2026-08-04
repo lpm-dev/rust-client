@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use lpm_common::LpmError;
 
 use super::integrity::has_local_source_sentinel;
-use super::tree_hash::is_object_metadata_sidecar;
+use super::tree_hash::{TreeMetadataBuilder, TreeMetadataKind, is_object_metadata_sidecar};
 
 pub(crate) fn tmp_sibling(dir: &Path) -> PathBuf {
     // Random 64-bit suffix replaces the pid+tid pair so a same-UID
@@ -100,7 +100,7 @@ pub(crate) fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()
             // surrounding files but the unsafe link is dropped.
             tracing::warn!(
                 src = %entry_src.display(),
-                "v1→v2 copy: skipping symlink (refused — v1 store entries should not contain symlinks)",
+                "v1→virtual-store copy: skipping symlink (refused — v1 store entries should not contain symlinks)",
             );
         } else if ft.is_file() {
             std::fs::copy(&entry_src, &entry_dst)?;
@@ -129,50 +129,143 @@ pub(crate) fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     materialize_into_inner(src, src, dst, allow_source_symlinks)
 }
 
+pub(crate) fn materialize_into_with_integrity(
+    src: &Path,
+    dst: &Path,
+    allow_source_symlinks: bool,
+) -> Result<Option<String>, LpmError> {
+    #[cfg(target_os = "macos")]
+    {
+        if try_clonefile(src, dst) {
+            remove_materialized_object_sidecars(dst)?;
+            return Ok(None);
+        }
+    }
+    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks).map(Some)
+}
+
+fn materialize_into_portable_with_integrity_inner(
+    src: &Path,
+    dst: &Path,
+    allow_source_symlinks: bool,
+) -> Result<String, LpmError> {
+    let mut metadata = TreeMetadataBuilder::new();
+    materialize_into_inner_impl(
+        src,
+        src,
+        dst,
+        dst,
+        allow_source_symlinks,
+        false,
+        Some(&mut metadata),
+    )?;
+    Ok(metadata.finish())
+}
+
+#[cfg(test)]
+pub(crate) fn materialize_into_portable_with_integrity(
+    src: &Path,
+    dst: &Path,
+) -> Result<String, LpmError> {
+    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src))
+}
+
+#[cfg(test)]
+pub(crate) fn materialize_into_portable_with_integrity_and_symlink_policy(
+    src: &Path,
+    dst: &Path,
+    allow_source_symlinks: bool,
+) -> Result<String, LpmError> {
+    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks)
+}
+
 pub(crate) fn materialize_into_inner(
     root: &Path,
     src: &Path,
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<(), LpmError> {
+    materialize_into_inner_impl(root, src, dst, dst, allow_source_symlinks, true, None)
+}
+
+fn materialize_into_inner_impl(
+    root: &Path,
+    src: &Path,
+    dst: &Path,
+    destination_root: &Path,
+    allow_source_symlinks: bool,
+    allow_clonefile: bool,
+    mut tree_metadata: Option<&mut TreeMetadataBuilder>,
+) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
     {
-        if try_clonefile(src, dst) {
+        if allow_clonefile && try_clonefile(src, dst) {
             remove_materialized_object_sidecars(dst)?;
             return Ok(());
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = allow_clonefile;
 
     std::fs::create_dir_all(dst).map_err(|e| {
         LpmError::Store(format!(
-            "failed to create v2 link package dir at {}: {e}",
+            "failed to create virtual-store link package dir at {}: {e}",
             dst.display()
         ))
     })?;
 
+    let mut names = Vec::new();
     for entry in std::fs::read_dir(src).map_err(|e| {
         LpmError::Store(format!(
-            "failed to read v2 source object dir {}: {e}",
+            "failed to read virtual-store source object dir {}: {e}",
             src.display()
         ))
     })? {
-        let entry = entry
-            .map_err(|e| LpmError::Store(format!("failed to enumerate v2 source dir: {e}")))?;
-        let src_path = entry.path();
+        names.push(
+            entry
+                .map_err(|e| {
+                    LpmError::Store(format!("failed to enumerate virtual-store source dir: {e}"))
+                })?
+                .file_name(),
+        );
+    }
+    names.sort_unstable();
+
+    for name in names {
+        let src_path = src.join(&name);
         if is_object_metadata_sidecar(root, &src_path) {
             continue;
         }
-        let dst_path = dst.join(entry.file_name());
+        let dst_path = dst.join(&name);
 
-        let file_type = entry.file_type().map_err(|e| {
-            LpmError::Store(format!(
-                "failed to stat v2 source entry {}: {e}",
-                src_path.display()
-            ))
-        })?;
+        let file_type = std::fs::symlink_metadata(&src_path)
+            .map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to stat virtual-store source entry {}: {e}",
+                    src_path.display()
+                ))
+            })?
+            .file_type();
 
         if file_type.is_dir() {
-            materialize_into_inner(root, &src_path, &dst_path, allow_source_symlinks)?;
+            let record = tree_metadata
+                .as_deref_mut()
+                .map(|metadata| {
+                    metadata.reserve(destination_root, &dst_path, TreeMetadataKind::Directory)
+                })
+                .transpose()?;
+            materialize_into_inner_impl(
+                root,
+                &src_path,
+                &dst_path,
+                destination_root,
+                allow_source_symlinks,
+                allow_clonefile,
+                tree_metadata.as_deref_mut(),
+            )?;
+            if let (Some(metadata), Some(record)) = (tree_metadata.as_deref_mut(), record) {
+                metadata.refresh(record, &dst_path, Vec::new())?;
+            }
         } else if file_type.is_symlink() {
             if !allow_source_symlinks {
                 // Refuse symlink entries — the extractor's `is_file()`
@@ -181,52 +274,177 @@ pub(crate) fn materialize_into_inner(
                 // with the v1→v2 `copy_dir_recursively` refusal.
                 let target = std::fs::read_link(&src_path).unwrap_or_default();
                 return Err(LpmError::Store(format!(
-                    "refusing v2 symlink entry {} → {}; symlinks must not appear under objects/",
+                    "refusing virtual-store symlink entry {} → {}; symlinks must not appear under objects/",
                     src_path.display(),
                     target.display(),
                 )));
             }
             let target = std::fs::read_link(&src_path).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to read v2 local-source symlink {}: {e}",
+                    "failed to read virtual-store local-source symlink {}: {e}",
                     src_path.display()
                 ))
             })?;
             create_fs_symlink(&target, &dst_path).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to recreate v2 local-source symlink {} → {}: {e}",
+                    "failed to recreate virtual-store local-source symlink {} → {}: {e}",
                     dst_path.display(),
                     target.display()
                 ))
             })?;
+            if let Some(metadata) = tree_metadata.as_deref_mut() {
+                metadata.record(
+                    destination_root,
+                    &dst_path,
+                    TreeMetadataKind::Symlink,
+                    os_str_bytes(target.as_os_str()),
+                )?;
+            }
         } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|copy_err| {
-                LpmError::Store(format!(
-                    "failed to copy v2 source file {} → {}: {copy_err}",
-                    src_path.display(),
-                    dst_path.display()
-                ))
-            })?;
+            materialize_regular_file(&src_path, &dst_path)?;
+            if let Some(metadata) = tree_metadata.as_deref_mut() {
+                metadata.record(
+                    destination_root,
+                    &dst_path,
+                    TreeMetadataKind::File,
+                    Vec::new(),
+                )?;
+            }
         }
     }
 
     Ok(())
 }
 
+fn materialize_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    #[cfg(target_os = "linux")]
+    if try_linux_reflink(src, dst)? {
+        return Ok(());
+    }
+
+    std::fs::copy(src, dst).map_err(|copy_err| {
+        LpmError::Store(format!(
+            "failed to copy virtual-store source file {} → {}: {copy_err}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_str_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(target_os = "linux")]
+fn try_linux_reflink(src: &Path, dst: &Path) -> Result<bool, LpmError> {
+    use std::collections::HashSet;
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::sync::{Mutex, OnceLock};
+
+    static UNSUPPORTED_FILESYSTEMS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let src_metadata = std::fs::metadata(src).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to inspect reflink source {}: {error}",
+            src.display()
+        ))
+    })?;
+    let device = src_metadata.dev();
+    if UNSUPPORTED_FILESYSTEMS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&device)
+    {
+        return Ok(false);
+    }
+
+    let source = std::fs::File::open(src).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to open reflink source {}: {error}",
+            src.display()
+        ))
+    })?;
+    let destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)
+        .map_err(|error| {
+            LpmError::Store(format!(
+                "failed to create reflink destination {}: {error}",
+                dst.display()
+            ))
+        })?;
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    // SAFETY: both descriptors are live regular files opened above, and
+    // FICLONE only reads the source fd and initializes the empty destination.
+    let result = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+    if result == 0 {
+        std::fs::set_permissions(dst, src_metadata.permissions()).map_err(|error| {
+            let _ = std::fs::remove_file(dst);
+            LpmError::Store(format!(
+                "failed to apply reflink destination mode at {}: {error}",
+                dst.display()
+            ))
+        })?;
+        return Ok(true);
+    }
+
+    let error = std::io::Error::last_os_error();
+    drop(destination);
+    let _ = std::fs::remove_file(dst);
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => {
+            UNSUPPORTED_FILESYSTEMS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(device);
+            Ok(false)
+        }
+        Some(libc::EXDEV) => Ok(false),
+        _ => Err(LpmError::Store(format!(
+            "failed to reflink {} → {}: {error}",
+            src.display(),
+            dst.display()
+        ))),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn remove_materialized_object_sidecars(dst: &Path) -> Result<(), LpmError> {
-    use super::integrity::OBJECT_INTEGRITY_FILENAME;
+    use super::integrity::{OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME};
 
     for name in [
         ".integrity",
         ".lpm-security.json",
         OBJECT_INTEGRITY_FILENAME,
+        TREE_SNAPSHOT_FILENAME,
     ] {
         let path = dst.join(name);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove v2 metadata sidecar from materialized package at {}: {e}",
+                    "failed to remove virtual-store metadata sidecar from materialized package at {}: {e}",
                     path.display()
                 ))
             })?;
@@ -256,7 +474,7 @@ fn try_clonefile(src: &Path, dst: &Path) -> bool {
         tracing::debug!(
             src = %src.display(),
             dst = %dst.display(),
-            "v2 materialize: clonefile"
+            "virtual-store materialize: clonefile"
         );
         true
     } else {

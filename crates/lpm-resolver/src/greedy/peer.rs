@@ -30,11 +30,11 @@ use super::version::{VersionPick, find_best_version_with_policy};
 // **Architectural correction (vs. earlier draft).** Peers are
 // deliberately NOT routed as `n.children` edges of the consumer.
 // `ResolvedPackage.dependencies` and `ResolvedPackage.peers` are
-// distinct fields; the v2 store's graph-key derivation depends on
+// distinct fields; virtual-store graph-key derivation depends on
 // the separation
 // (`ResolvedPackage.dependencies` / `ResolvedPackage.peers`).
 // Smuggling peers in as children would break peer-divergent link-
-// entry isolation under v2 (default). Hence: ambient install at
+// entry isolation under the virtual store. Hence: ambient install at
 // ROOT scope, satisfying the peer's canonical from the side without
 // modifying the consumer's child list.
 

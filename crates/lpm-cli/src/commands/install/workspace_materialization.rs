@@ -256,6 +256,7 @@ pub(super) struct WorkspaceMaterializationCoordinator {
     object_validation_results: Arc<dashmap::DashMap<String, ObjectValidation>>,
     object_validations_in_flight: Mutex<HashSet<String>>,
     object_validations_ready: Notify,
+    object_validation_batch: OnceLock<lpm_store::v2::ReusableObjectValidationBatch>,
     union_object_candidates: OnceLock<Arc<HashSet<String>>>,
     union_object_validation: OnceLock<Arc<UnionObjectValidationOperation>>,
     local_source_populations:
@@ -291,6 +292,7 @@ impl WorkspaceMaterializationCoordinator {
             object_validation_results: Arc::new(dashmap::DashMap::new()),
             object_validations_in_flight: Mutex::new(HashSet::new()),
             object_validations_ready: Notify::new(),
+            object_validation_batch: OnceLock::new(),
             union_object_candidates: OnceLock::new(),
             union_object_validation: OnceLock::new(),
             local_source_populations: SingleFlight::default(),
@@ -373,7 +375,7 @@ impl WorkspaceMaterializationCoordinator {
             })
             .await
             .map_err(|error| {
-                LpmError::Registry(format!("v2 local-source task panicked: {error}"))
+                LpmError::Registry(format!("virtual-store local-source task panicked: {error}"))
             })??;
             self.object_validation_results.remove(&validation_sri);
             return Ok(Coordinated {
@@ -400,7 +402,7 @@ impl WorkspaceMaterializationCoordinator {
                 .await
                 .map_err(|error| {
                     SharedMaterializationError::Registry(Arc::from(format!(
-                        "v2 local-source task panicked: {error}"
+                        "virtual-store local-source task panicked: {error}"
                     )))
                 })?
                 .map_err(SharedMaterializationError::from)
@@ -448,6 +450,10 @@ impl WorkspaceMaterializationCoordinator {
         let mut performed_hit_count = 0usize;
         let mut max_concurrency = 0usize;
         let mut timings = super::V2ReusableValidationTimings::default();
+        let validation_batch = self
+            .object_validation_batch
+            .get_or_init(|| store.reusable_object_validation_batch())
+            .clone();
 
         loop {
             let notified = self.object_validations_ready.notified();
@@ -479,20 +485,28 @@ impl WorkspaceMaterializationCoordinator {
                     futures::stream::iter(check_source_sris.into_iter().map(|source_sri| {
                         let permits = Arc::clone(&permits);
                         let store = Arc::clone(&store);
+                        let validation_batch = validation_batch.clone();
                         async move {
                             let _permit = permits.acquire_owned().await.map_err(|_| {
-                                LpmError::Registry("v2 object validation semaphore closed".into())
+                                LpmError::Registry(
+                                    "virtual-store object validation semaphore closed".into(),
+                                )
                             })?;
                             tokio::task::spawn_blocking(move || {
-                                store.reusable_object_with_timings(&source_sri).map(
-                                    |(reusable, timings)| {
+                                store
+                                    .reusable_object_with_timings_in_batch(
+                                        &source_sri,
+                                        &validation_batch,
+                                    )
+                                    .map(|(reusable, timings)| {
                                         (source_sri, ObjectValidation { reusable, timings })
-                                    },
-                                )
+                                    })
                             })
                             .await
                             .map_err(|error| {
-                                LpmError::Registry(format!("v2 cache check task panicked: {error}"))
+                                LpmError::Registry(format!(
+                                    "virtual-store cache check task panicked: {error}"
+                                ))
                             })?
                         }
                     }))
@@ -558,7 +572,7 @@ impl WorkspaceMaterializationCoordinator {
             .map(|validation| validation.clone())
             .ok_or_else(|| {
                 LpmError::Store(format!(
-                    "v2 object validation completed without a result for {source_sri}"
+                    "virtual-store object validation completed without a result for {source_sri}"
                 ))
             })?;
         Ok(Coordinated {
@@ -612,7 +626,9 @@ impl WorkspaceMaterializationCoordinator {
                 let started = std::time::Instant::now();
                 let result = async {
                     let _permit = semaphore.acquire_owned().await.map_err(|_| {
-                        SharedMaterializationError::Registry(Arc::from("v2 link semaphore closed"))
+                        SharedMaterializationError::Registry(Arc::from(
+                            "virtual-store link semaphore closed",
+                        ))
                     })?;
                     tokio::task::spawn_blocking(move || {
                         lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store).map(
@@ -627,7 +643,7 @@ impl WorkspaceMaterializationCoordinator {
                     .await
                     .map_err(|error| {
                         SharedMaterializationError::Registry(Arc::from(format!(
-                            "v2 link task panicked: {error}"
+                            "virtual-store link task panicked: {error}"
                         )))
                     })?
                     .map_err(SharedMaterializationError::from)
@@ -680,7 +696,7 @@ mod tests {
         assert_eq!(
             coordinator
                 .fetch_extract_limiter(true)
-                .expect("v2 extraction limiter")
+                .expect("virtual-store extraction limiter")
                 .available_permits(),
             3,
         );

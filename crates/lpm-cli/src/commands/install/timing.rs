@@ -539,6 +539,18 @@ pub(super) struct V2ReusableValidationTimings {
     pub(super) full_hash_ms: u128,
     pub(super) removed_count: u64,
     pub(super) remove_ms: u128,
+    pub(super) cas_source_record_read_count: u64,
+    pub(super) cas_source_record_read_ms: u128,
+    pub(super) cas_manifest_read_count: u64,
+    pub(super) cas_manifest_read_ms: u128,
+    pub(super) cas_manifest_validate_ms: u128,
+    pub(super) cas_blob_stat_count: u64,
+    pub(super) cas_blob_stat_cache_hit_count: u64,
+    pub(super) cas_blob_stat_ms: u128,
+    pub(super) cas_source_validation_read_count: u64,
+    pub(super) cas_source_validation_read_ms: u128,
+    pub(super) cas_blob_rehash_count: u64,
+    pub(super) cas_blob_rehash_ms: u128,
 }
 
 impl V2ReusableValidationTimings {
@@ -583,6 +595,42 @@ impl V2ReusableValidationTimings {
         self.full_hash_ms = self.full_hash_ms.saturating_add(timings.full_hash_ms);
         self.removed_count = self.removed_count.saturating_add(timings.removed_count);
         self.remove_ms = self.remove_ms.saturating_add(timings.remove_ms);
+        self.cas_source_record_read_count = self
+            .cas_source_record_read_count
+            .saturating_add(timings.cas_source_record_read_count);
+        self.cas_source_record_read_ms = self
+            .cas_source_record_read_ms
+            .saturating_add(timings.cas_source_record_read_ms);
+        self.cas_manifest_read_count = self
+            .cas_manifest_read_count
+            .saturating_add(timings.cas_manifest_read_count);
+        self.cas_manifest_read_ms = self
+            .cas_manifest_read_ms
+            .saturating_add(timings.cas_manifest_read_ms);
+        self.cas_manifest_validate_ms = self
+            .cas_manifest_validate_ms
+            .saturating_add(timings.cas_manifest_validate_ms);
+        self.cas_blob_stat_count = self
+            .cas_blob_stat_count
+            .saturating_add(timings.cas_blob_stat_count);
+        self.cas_blob_stat_cache_hit_count = self
+            .cas_blob_stat_cache_hit_count
+            .saturating_add(timings.cas_blob_stat_cache_hit_count);
+        self.cas_blob_stat_ms = self
+            .cas_blob_stat_ms
+            .saturating_add(timings.cas_blob_stat_ms);
+        self.cas_source_validation_read_count = self
+            .cas_source_validation_read_count
+            .saturating_add(timings.cas_source_validation_read_count);
+        self.cas_source_validation_read_ms = self
+            .cas_source_validation_read_ms
+            .saturating_add(timings.cas_source_validation_read_ms);
+        self.cas_blob_rehash_count = self
+            .cas_blob_rehash_count
+            .saturating_add(timings.cas_blob_rehash_count);
+        self.cas_blob_rehash_ms = self
+            .cas_blob_rehash_ms
+            .saturating_add(timings.cas_blob_rehash_ms);
     }
 
     pub(super) fn to_json(self) -> serde_json::Value {
@@ -606,6 +654,18 @@ impl V2ReusableValidationTimings {
             "full_hash_ms": self.full_hash_ms,
             "removed_count": self.removed_count,
             "remove_ms": self.remove_ms,
+            "cas_source_record_read_count": self.cas_source_record_read_count,
+            "cas_source_record_read_ms": self.cas_source_record_read_ms,
+            "cas_manifest_read_count": self.cas_manifest_read_count,
+            "cas_manifest_read_ms": self.cas_manifest_read_ms,
+            "cas_manifest_validate_ms": self.cas_manifest_validate_ms,
+            "cas_blob_stat_count": self.cas_blob_stat_count,
+            "cas_blob_stat_cache_hit_count": self.cas_blob_stat_cache_hit_count,
+            "cas_blob_stat_ms": self.cas_blob_stat_ms,
+            "cas_source_validation_read_count": self.cas_source_validation_read_count,
+            "cas_source_validation_read_ms": self.cas_source_validation_read_ms,
+            "cas_blob_rehash_count": self.cas_blob_rehash_count,
+            "cas_blob_rehash_ms": self.cas_blob_rehash_ms,
         })
     }
 }
@@ -1533,6 +1593,41 @@ mod tests {
         assert_eq!(json["v2_reusable_validation"]["snapshot_hit_count"], 1);
         assert_eq!(json["v2_reusable_validation"]["metadata_hash_count"], 1);
         assert_eq!(json["v2_reusable_validation"]["total_ms"], 7);
+    }
+
+    #[test]
+    fn fetch_stage_timings_reports_file_cas_validation_counters() {
+        let mut validation = V2ReusableValidationTimings::default();
+        validation.record(
+            lpm_store::v2::ReusableObjectCheckTimings {
+                cas_source_record_read_count: 1,
+                cas_blob_stat_count: 3,
+                cas_blob_stat_cache_hit_count: 2,
+                cas_source_validation_read_count: 1,
+                ..lpm_store::v2::ReusableObjectCheckTimings::default()
+            },
+            true,
+        );
+        let timings = FetchStageTimings {
+            v2_reusable_validation: validation,
+            ..FetchStageTimings::default()
+        };
+
+        let json = timings.to_json(1, 1, 1, 0, FetchBreakdown::default());
+
+        assert_eq!(
+            json["v2_reusable_validation"]["cas_source_record_read_count"],
+            1
+        );
+        assert_eq!(json["v2_reusable_validation"]["cas_blob_stat_count"], 3);
+        assert_eq!(
+            json["v2_reusable_validation"]["cas_blob_stat_cache_hit_count"],
+            2
+        );
+        assert_eq!(
+            json["v2_reusable_validation"]["cas_source_validation_read_count"],
+            1
+        );
     }
 
     #[test]

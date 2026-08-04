@@ -49,7 +49,7 @@ fn fast_exit_allows_v2_compatibility_root() {
 
     assert!(
         crate::install_state::check_install_state(dir.path()).up_to_date,
-        "v2 compatibility islands must not look like legacy v1 wrapper state"
+        "virtual-store compatibility islands must not look like legacy v1 wrapper state"
     );
 }
 

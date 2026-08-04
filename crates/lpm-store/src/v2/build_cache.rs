@@ -299,7 +299,9 @@ impl Store {
             )));
         }
         ensure_store_tier_dir_locked(self.paths().builds_root()).map_err(|error| {
-            LpmError::Store(format!("failed to create v2 builds directory: {error}"))
+            LpmError::Store(format!(
+                "failed to create virtual-store builds directory: {error}"
+            ))
         })?;
 
         let final_dir = self.paths().build_artifact_dir(key);

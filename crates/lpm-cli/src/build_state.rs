@@ -837,11 +837,11 @@ pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
     execution_exclusions: Option<&HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
     store_version: lpm_store::StoreVersion,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
+    let baseline_index = if store_version.uses_virtual_store() {
         Some(lpm_store::V2BaselineIndex::for_project(
             project_dir,
             &store.lpm_root()?,
-        )?)
+        ))
     } else {
         None
     };

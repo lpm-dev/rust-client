@@ -78,7 +78,7 @@ pub(super) fn run_behavioral_analysis(
     let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
     let lpm_root = lpm_common::LpmRoot::from_env().ok();
-    let baseline_index = lpm_root.as_ref().and_then(|root| {
+    let baseline_index = lpm_root.as_ref().map(|root| {
         inventory::build_project_v2_baseline_index(&discovery.project_root, root, store_version)
     });
 

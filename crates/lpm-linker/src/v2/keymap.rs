@@ -350,7 +350,7 @@ pub(super) fn derive_graph_keys(
         );
         if by_triple.insert(tkey, key.clone()).is_some() {
             return Err(LpmError::Store(format!(
-                "v2 linker: duplicate LinkTarget for {}@{} wrapper_id={:?}",
+                "virtual-store linker: duplicate LinkTarget for {}@{} wrapper_id={:?}",
                 v2t.target.name, v2t.target.version, v2t.target.wrapper_id
             )));
         }
@@ -358,7 +358,7 @@ pub(super) fn derive_graph_keys(
             let wkey = name_wrapper_key(&v2t.target.name, wrapper_id);
             if !source_identities.insert(wkey) {
                 return Err(LpmError::Store(format!(
-                    "v2 linker: duplicate source identity for {} wrapper_id={wrapper_id:?}",
+                    "virtual-store linker: duplicate source identity for {} wrapper_id={wrapper_id:?}",
                     v2t.target.name
                 )));
             }

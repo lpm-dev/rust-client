@@ -53,7 +53,7 @@ fn ensure_bin_dir(bin_dir: &Path) -> Result<(), LpmError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(LpmError::Store(format!(
-                "v2 linker: failed to inspect .bin directory at {}: {error}",
+                "virtual-store linker: failed to inspect .bin directory at {}: {error}",
                 bin_dir.display()
             )));
         }
@@ -61,7 +61,7 @@ fn ensure_bin_dir(bin_dir: &Path) -> Result<(), LpmError> {
 
     std::fs::create_dir_all(bin_dir).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to create .bin/ at {}: {e}",
+            "virtual-store linker: failed to create .bin/ at {}: {e}",
             bin_dir.display()
         ))
     })?;
@@ -74,7 +74,7 @@ fn reconcile_bin_dir(bin_dir: &Path, desired: &HashSet<String>) -> Result<(), Lp
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(LpmError::Store(format!(
-                "v2 linker: failed to read .bin directory at {}: {error}",
+                "virtual-store linker: failed to read .bin directory at {}: {error}",
                 bin_dir.display()
             )));
         }
@@ -158,7 +158,7 @@ pub(super) fn create_bin_links_v2(
             Ok(None) => continue,
             Err(e) => {
                 tracing::debug!(
-                    "v2 linker: skipping bin links for {}: failed to parse package.json: {e}",
+                    "virtual-store linker: skipping bin links for {}: failed to parse package.json: {e}",
                     v2t.target.name
                 );
                 continue;
@@ -178,7 +178,7 @@ pub(super) fn create_bin_links_v2(
             // so one malformed entry doesn't abort the whole link.
             if let Err(reason) = validate_bin_name(&cmd_name, &v2t.target.name) {
                 tracing::warn!(
-                    "v2 linker: rejecting bin \"{cmd_name}\" from {}: {reason}",
+                    "virtual-store linker: rejecting bin \"{cmd_name}\" from {}: {reason}",
                     v2t.target.name
                 );
                 continue;
@@ -201,7 +201,7 @@ pub(super) fn create_bin_links_v2(
             // - rejection of missing files (canonicalize fails)
             if let Err(reason) = validate_bin_target(&pkg_dir, &bin_rel_path) {
                 tracing::warn!(
-                    "v2 linker: rejecting bin {cmd_name} from {}: {reason}",
+                    "virtual-store linker: rejecting bin {cmd_name} from {}: {reason}",
                     v2t.target.name
                 );
                 continue;
@@ -214,7 +214,7 @@ pub(super) fn create_bin_links_v2(
                 Ok(invocation) => invocation,
                 Err(error) => {
                     tracing::warn!(
-                        "v2 linker: skipping bin {cmd_name} from {}: {error}",
+                        "virtual-store linker: skipping bin {cmd_name} from {}: {error}",
                         v2t.target.name
                     );
                     continue;
@@ -284,7 +284,7 @@ pub(super) fn create_bin_links_v2(
                 }
                 std::os::unix::fs::symlink(&relative, &link_path).map_err(|e| {
                     LpmError::Store(format!(
-                        "v2 linker: failed to create bin shim {} → {}: {e}",
+                        "virtual-store linker: failed to create bin shim {} → {}: {e}",
                         link_path.display(),
                         relative.display()
                     ))
@@ -303,7 +303,7 @@ pub(super) fn create_bin_links_v2(
             let target_str = spec.target.to_string_lossy();
             if let Err(reason) = lpm_common::symlink::validate_cmd_path(&target_str) {
                 tracing::warn!(
-                    "v2 linker: skipping .cmd shim for {}: {reason}",
+                    "virtual-store linker: skipping .cmd shim for {}: {reason}",
                     spec.cmd_name
                 );
                 continue;
@@ -312,7 +312,7 @@ pub(super) fn create_bin_links_v2(
                 let node_path_str = project_node_modules.to_string_lossy();
                 if let Err(reason) = lpm_common::symlink::validate_cmd_path(&node_path_str) {
                     tracing::warn!(
-                        "v2 linker: skipping .cmd shim for {}: {reason}",
+                        "virtual-store linker: skipping .cmd shim for {}: {reason}",
                         spec.cmd_name
                     );
                     continue;
@@ -336,7 +336,7 @@ pub(super) fn create_bin_links_v2(
             }
             std::fs::write(&cmd_path, cmd_content).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to write .cmd shim at {}: {e}",
+                    "virtual-store linker: failed to write .cmd shim at {}: {e}",
                     cmd_path.display()
                 ))
             })?;
@@ -425,7 +425,7 @@ fn write_unix_bin_wrapper(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(LpmError::Store(format!(
-                "v2 linker: failed to inspect bin shim at {}: {error}",
+                "virtual-store linker: failed to inspect bin shim at {}: {error}",
                 link_path.display()
             )));
         }
@@ -442,7 +442,7 @@ fn write_unix_bin_wrapper(
     }
     std::fs::write(link_path, content).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to write bin shim at {}: {e}",
+            "virtual-store linker: failed to write bin shim at {}: {e}",
             link_path.display()
         ))
     })?;
@@ -455,7 +455,7 @@ fn set_unix_bin_shim_executable(link_path: &Path) -> Result<(), LpmError> {
     let mut permissions = std::fs::metadata(link_path)
         .map_err(|e| {
             LpmError::Store(format!(
-                "v2 linker: failed to inspect bin shim at {}: {e}",
+                "virtual-store linker: failed to inspect bin shim at {}: {e}",
                 link_path.display()
             ))
         })?
@@ -463,7 +463,7 @@ fn set_unix_bin_shim_executable(link_path: &Path) -> Result<(), LpmError> {
     permissions.set_mode(0o755);
     std::fs::set_permissions(link_path, permissions).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to mark bin shim executable at {}: {e}",
+            "virtual-store linker: failed to mark bin shim executable at {}: {e}",
             link_path.display()
         ))
     })

@@ -920,10 +920,10 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         };
     }
 
-    // — v1 → v2 store-layout migration gate. After
-    // the default flip, an upgrade-in-place user (still with
+    // v1 → virtual-store layout migration gate. After the default flip, an
+    // upgrade-in-place user (still with
     // v1's `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/`
-    // populated) needs the install pipeline to run the v1→v2 wipe-
+    // populated) needs the install pipeline to run the v1→virtual-store wipe-
     // and-rebuild sequence. Without this gate the sync fast lane in
     // `main.rs` short-circuits with "up to date" and the user's
     // project stays on the legacy layout indefinitely. The dual-gate
@@ -931,12 +931,12 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
     // store version active = freshness reset.
     //
     // Detection mirrors the install-pipeline's
-    // [`commands::install::needs_v2_migration`] but is duplicated
+    // [`commands::install::needs_virtual_store_migration`] but is duplicated
     // here intentionally: importing the install module from
     // install_state would create a cyclic-ish coupling for one
     // two-line predicate, and the predicate is small enough that
     // drift won't realistically diverge.
-    if store_version.is_v2() {
+    if store_version.uses_virtual_store() {
         let legacy_isolated = project_dir.join(".lpm").join("wrappers");
         let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
         if legacy_isolated.exists() || legacy_hoisted.exists() {
@@ -945,6 +945,12 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
                 hash: Some(current_hash),
             };
         }
+    }
+    if project_uses_other_virtual_store(project_dir, store_version) {
+        return InstallState {
+            up_to_date: false,
+            hash: Some(current_hash),
+        };
     }
 
     // Hash comparison — read only the first line of the file so v1 (bare
@@ -988,6 +994,22 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         up_to_date,
         hash: Some(current_hash),
     }
+}
+
+fn project_uses_other_virtual_store(project_dir: &Path, selected: lpm_store::StoreVersion) -> bool {
+    let Ok(lpm_root) = lpm_common::LpmRoot::from_env() else {
+        return false;
+    };
+    let other_links = match selected {
+        lpm_store::StoreVersion::V1 => return false,
+        lpm_store::StoreVersion::V2 => {
+            lpm_store::v2::StoreV2Paths::from_lpm_root_v3(&lpm_root).links_root()
+        }
+        lpm_store::StoreVersion::V3 => {
+            lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_root).links_root()
+        }
+    };
+    lpm_linker::LayoutPaths::for_project(project_dir).is_v2_install(&other_links)
 }
 
 /// mtime short-circuit for the up-to-date check.
@@ -1049,19 +1071,22 @@ fn try_mtime_fast_path(
         return None;
     }
 
-    // — v1 → v2 store migration gate. Must mirror
+    // v1 → virtual-store migration gate. Must mirror
     // the slow-path guard in `check_install_state_with_content`
     // because the mtime fast lane skips that function entirely on
     // mtime hits. Without this, an upgrade-in-place user whose
     // package.json + lpm.lock mtimes haven't changed would
     // permanently short-circuit at "up to date" and never run the
-    // v1 → v2 wipe-and-rebuild sequence.
-    if store_version.is_v2() {
+    // v1 → virtual-store wipe-and-rebuild sequence.
+    if store_version.uses_virtual_store() {
         let legacy_isolated = project_dir.join(".lpm").join("wrappers");
         let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
         if legacy_isolated.exists() || legacy_hoisted.exists() {
             return None;
         }
+    }
+    if project_uses_other_virtual_store(project_dir, store_version) {
+        return None;
     }
 
     let hash_file = project_dir.join(".lpm").join("install-hash");
@@ -1598,6 +1623,7 @@ mod tests {
     fn scoped_home_for(_path: &Path) -> crate::test_env::ScopedEnv {
         crate::test_env::ScopedEnv::update([
             ("LPM_LINKER", None),
+            (lpm_store::StoreVersion::ENV_VAR, None),
             (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
         ])
     }
@@ -2093,6 +2119,7 @@ mod tests {
     fn install_hash_records_when_binary_sidecar_is_not_required() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::default();
         lockfile
@@ -3051,20 +3078,10 @@ mod tests {
         assert!(state.up_to_date, "empty legacy dir must not gate install");
     }
 
-    /// D8c contract — historically asserted that "both
-    /// legacy + new isolated wrapper layouts populated → migration
-    /// complete → up-to-date".  the default flip to
-    /// v2 changes this: `<project>/.lpm/wrappers/` is now the
-    /// LEGACY-V1 marker and triggers a v2 migration regardless of
-    /// the legacy isolated-vs-new-isolated distinction. The 4d gate
-    /// fires unconditionally on v1 wrappers when the active store
-    /// version is v2, and `StoreVersion::default()` is v2 since the
-    /// flip — so this test now asserts the post-contract:
-    /// v1 wrappers populated → v2 migration owed → up-to-date is
-    /// false. The pre-"both isolated layouts populated →
-    /// fresh" contract is intentionally retired.
+    /// Populated v1 wrapper state is stale whenever a virtual-store version is
+    /// selected, even if the manifest and lockfile hash still match.
     #[test]
-    fn populated_v1_wrappers_force_v2_migration_on_default() {
+    fn populated_v1_wrappers_force_virtual_store_migration_on_default() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let _home = scoped_home_for(p);
@@ -3079,7 +3096,7 @@ mod tests {
         let state = check_install_state(p);
         assert!(
             !state.up_to_date,
-            "v1 wrappers under post-4d v2 default must trigger migration"
+            "v1 wrappers under the virtual-store default must trigger migration"
         );
     }
 
@@ -3111,9 +3128,70 @@ mod tests {
             "none",
             lpm_store::StoreVersion::V2,
         );
+        let v3 = check_install_state_with_linker_integrity_and_dependency_engine(
+            p,
+            pkg_json,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            "none",
+            lpm_store::StoreVersion::V3,
+        );
 
         assert_eq!(v1.hash.as_deref(), Some(hash.as_str()));
         assert!(v1.up_to_date, "explicit v1 keeps its rollback layout valid");
-        assert!(!v2.up_to_date, "v2 must migrate the same rollback layout");
+        assert!(!v2.up_to_date, "v2 must migrate the same legacy v1 layout");
+        assert!(!v3.up_to_date, "v3 must migrate the same legacy v1 layout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_virtual_store_version_invalidates_links_to_the_other_store() {
+        let dir = TempDir::new().unwrap();
+        let lpm_home = dir.path().join("lpm-home");
+        let _home =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.as_os_str().to_owned())]);
+        let lpm_root = lpm_common::LpmRoot::from_dir(&lpm_home);
+
+        for (actual, selected, project_name) in [
+            (
+                lpm_store::StoreVersion::V3,
+                lpm_store::StoreVersion::V2,
+                "v3-to-v2",
+            ),
+            (
+                lpm_store::StoreVersion::V2,
+                lpm_store::StoreVersion::V3,
+                "v2-to-v3",
+            ),
+        ] {
+            let project = dir.path().join(project_name);
+            let package_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+            fs::create_dir_all(project.join("node_modules")).unwrap();
+            fs::create_dir_all(project.join(".lpm")).unwrap();
+            fs::write(project.join("package.json"), package_json).unwrap();
+            let lock = write_test_lockfile(&project);
+
+            let store = lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, actual);
+            let target = store.paths().links_root().join("entry/node_modules/a");
+            fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, project.join("node_modules/a")).unwrap();
+
+            let hash = compute_install_hash(package_json, &lock);
+            write_install_hash(&project, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
+
+            let state = check_install_state_with_linker_integrity_and_dependency_engine(
+                &project,
+                package_json,
+                lpm_linker::LinkerMode::Isolated,
+                ObjectIntegrityPolicy::Source,
+                "none",
+                selected,
+            );
+
+            assert!(
+                !state.up_to_date,
+                "selecting {selected} must relink a project that still points into {actual}"
+            );
+        }
     }
 }

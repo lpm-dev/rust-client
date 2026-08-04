@@ -78,7 +78,7 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     assert_eq!(prevalidation.validation_timings.snapshot_hit_count, 0);
     let hit = prevalidation
         .reusable(&sri)
-        .expect("prevalidation must return the v2 object hit");
+        .expect("prevalidation must return the virtual-store object hit");
     assert_eq!(hit.path, object_dir);
     assert!(hit.object_integrity.as_str().starts_with("sha256-"));
 }
@@ -141,7 +141,7 @@ async fn prevalidate_v2_reusable_objects_tree_policy_removes_tampered_registry_o
     assert_eq!(prevalidation.validation_timings.removed_count, 1);
     assert!(
         !object_dir.exists(),
-        "tree policy must remove tampered v2 objects before cache reuse"
+        "tree policy must remove tampered virtual-store objects before cache reuse"
     );
 }
 

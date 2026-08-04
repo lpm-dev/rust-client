@@ -98,7 +98,7 @@ pub enum Tier {
     /// lint / fmt subprocesses, TypeScript / plugin reachability,
     /// global-install hygiene, sandbox probe, manifest-compat sweep,
     /// project-maintenance rows (`.gitattributes` lockb hygiene,
-    /// v2 store orphan counts).
+    /// virtual-store orphan counts).
     Extended,
 }
 
@@ -526,8 +526,8 @@ pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
     name: "node_modules",
     category: Category::ProjectState,
     tier: Tier::Fast,
-    description: "`node_modules/` symlinks point into the virtual store at `~/.lpm/store/v2/links/`.",
-    when_fires: "The active store version is v2 (the default) and the virtual-store layout is intact.",
+    description: "`node_modules/` symlinks point into the active global virtual store.",
+    when_fires: "The active store version uses the virtual-store layout and its project links are intact.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -535,11 +535,11 @@ pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
 
 pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
     code: "v2_store_orphans",
-    name: "v2 virtual store",
+    name: "virtual store",
     category: Category::ProjectState,
     tier: Tier::Extended,
-    description: "v2 store at `~/.lpm/store/v2/` has link entries or objects no longer reachable from any registered project.",
-    when_fires: "After projects are deleted or move on disk; the v2 store grows monotonically across all projects on the machine until pruned.",
+    description: "The v2 or v3 store has entries no longer reachable from any registered project.",
+    when_fires: "After projects are deleted or move on disk; virtual stores grow across all projects on the machine until pruned.",
     remediation: "Run `lpm cache prune` for a dry-run preview, then `lpm cache prune --apply` to remove orphans.",
     possible_severities: &[Severity::Pass, Severity::Warn],
     auto_fix: Some("lpm cache prune --apply"),

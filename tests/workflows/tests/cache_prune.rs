@@ -263,7 +263,9 @@ fn prune_apply_human_output_uses_done_line_with_elapsed() {
         String::from_utf8_lossy(&output.stderr)
     ));
     assert!(
-        combined.contains("✓ Done · pruned 0 link entries + 0 objects (0 B) in "),
+        combined.contains(
+            "✓ Done · pruned 0 link entries + 0 objects + 0 CAS materializations + 0 CAS trees + 0 CAS blobs (0 B logical; unavailable physical free-space increase) in "
+        ),
         "cache prune apply should finish with elapsed done line, got:\n{combined}"
     );
 }

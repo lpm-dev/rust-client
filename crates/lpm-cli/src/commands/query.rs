@@ -85,7 +85,7 @@ pub async fn run(
             );
             for pkg in &inv.discovery.packages {
                 let pkg_dir = crate::commands::audit::inventory::find_project_baseline(
-                    baseline_index.as_ref(),
+                    Some(&baseline_index),
                     &lpm_root_inner,
                     &pkg.name,
                     &pkg.version,

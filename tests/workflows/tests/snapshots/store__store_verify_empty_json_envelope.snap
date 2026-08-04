@@ -1,0 +1,29 @@
+---
+source: tests/workflows/tests/store.rs
+expression: envelope
+---
+{
+  "success": true,
+  "check_kind": "presence",
+  "legacy_check_kind": "presence",
+  "bytes_integrity_recomputed": false,
+  "entries_verified": 0,
+  "verified": 0,
+  "unique_coords": 0,
+  "duplicated_entries": 0,
+  "corrupted": 0,
+  "issues": [],
+  "cas": {
+    "check_kind": "metadata",
+    "sources": 0,
+    "trees": 0,
+    "blobs": 0,
+    "blobs_rehashed": 0,
+    "materialized": 0,
+    "orphaned_sources": 0,
+    "orphaned_trees": 0,
+    "orphaned_blobs": 0,
+    "orphaned_materialized": 0,
+    "blob_integrity_recomputed": false
+  }
+}

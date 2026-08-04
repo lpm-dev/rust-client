@@ -228,25 +228,29 @@ pub async fn run(
 }
 
 fn v2_store_for_fetch(lpm_root: &LpmRoot) -> Result<Option<Arc<lpm_store::v2::Store>>, LpmError> {
-    if !lpm_store::StoreVersion::from_env().is_v2() {
+    let store_version = lpm_store::StoreVersion::from_env();
+    if !store_version.uses_virtual_store() {
         return Ok(None);
     }
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     Ok(Some(configured_v2_store_for_fetch(
         lpm_root,
         &global_config,
+        store_version,
     )?))
 }
 
 fn configured_v2_store_for_fetch(
     lpm_root: &LpmRoot,
     global_config: &crate::commands::config::GlobalConfig,
+    store_version: lpm_store::StoreVersion,
 ) -> Result<Arc<lpm_store::v2::Store>, LpmError> {
     let object_integrity_policy =
         crate::commands::config::resolve_object_integrity_policy(global_config)?;
     Ok(Arc::new(
-        lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+        lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
             lpm_root,
+            store_version,
             object_integrity_policy,
         ),
     ))
@@ -791,7 +795,9 @@ mod tests {
         );
         let global_config = crate::commands::config::GlobalConfig::from_table(table);
 
-        let store = configured_v2_store_for_fetch(&lpm_root, &global_config).unwrap();
+        let store =
+            configured_v2_store_for_fetch(&lpm_root, &global_config, lpm_store::StoreVersion::V2)
+                .unwrap();
 
         assert_eq!(
             store.object_integrity_policy(),

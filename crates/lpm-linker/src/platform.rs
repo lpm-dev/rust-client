@@ -69,24 +69,21 @@ pub(crate) use lpm_common::symlink::{
     create_dir_symlink_or_junction as create_symlink_or_junction,
     create_symlink as create_fs_symlink,
 };
-/// Break shared inodes inside a live per-package directory so
-/// subsequent writes don't propagate into the global content-addressable
-/// store at `~/.lpm/store/v1/`.
+/// Break shared inodes inside a live per-package directory so subsequent
+/// writes cannot propagate to any other path referencing those inodes.
 ///
-/// **Why this exists.** [`link_dir_recursive`] uses `std::fs::hard_link`
-/// on Linux. A hard link makes the live file and the store file
-/// share an inode, so a lifecycle script that mutates a file in
-/// its own package directory mutates the store too. macOS uses
-/// `clonefile()` (CoW), which makes writes independent at link
-/// time, and Windows always copies, so the bug is Linux-specific.
+/// **Why this exists.** Current v2/v3 virtual-store materialization uses
+/// independent writable inodes. The legacy v1 linker and synthetic or
+/// externally-created layouts can still contain hardlinks, so lifecycle
+/// execution keeps this Linux defense-in-depth boundary. macOS uses CoW
+/// clones and Windows copies, so they do not need inode detachment.
 ///
 /// **What it does.** Walks `dir` recursively. For every regular file
 /// with `nlink > 1`, copies the content to a sibling temp file and
 /// atomically renames it back over the original. After the rename
 /// the live entry points at a fresh inode (nlink = 1) while the
-/// store entry still points at the original inode (nlink decremented
-/// by 1). Subsequent writes through the live path no longer reach
-/// the store.
+/// other entries still point at the original inode (nlink decremented
+/// by 1). Subsequent writes through the live path stay isolated.
 ///
 /// **Why this is fast where it matters.** `std::fs::copy` on Linux
 /// uses the `copy_file_range(2)` syscall, which the kernel implements
@@ -98,11 +95,10 @@ pub(crate) use lpm_common::symlink::{
 /// fact that only packages with lifecycle scripts hit this path
 /// (~10% of dependencies in a typical install).
 ///
-/// **Symlinks are preserved**, not detached. The isolated linker
-/// uses symlinks under `<project>/node_modules/.lpm/<safe>@<ver>/node_modules/`
-/// to expose a package's siblings — breaking those would corrupt the
-/// dep graph. We use [`std::fs::symlink_metadata`] to inspect file
-/// type without following links.
+/// **Symlinks are preserved**, not detached. Linker layouts use them
+/// for dependency edges, and replacing those paths would corrupt the
+/// graph. We use [`std::fs::symlink_metadata`] to inspect file type
+/// without following links.
 ///
 /// **No-op on macOS / Windows.** macOS already gets CoW from
 /// `clonefile()`; Windows already gets independent copies. The

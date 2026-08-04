@@ -84,9 +84,9 @@ fn read_lockfile_for_patch_selector(project_dir: &Path) -> Result<Lockfile, LpmE
 async fn run_patch_inner(name: String, version: String, json_output: bool) -> Result<(), LpmError> {
     // Lookup goes
     // through `find_installed_package_baseline`, which prefers the
-    // v2 virtual store (default) and falls back to v1.
+    // default v2, then experimental v3, and falls back to v1.
     // Pre-fix this called `store.has_package(...)` (v1-only), which
-    // always returned false under v2 → "not in the global store".
+    // always returned false under virtual stores → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     let baseline =
         find_installed_package_baseline(&lpm_root, &name, &version)?.ok_or_else(|| {
@@ -96,7 +96,7 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
             ))
         })?;
     // Seed the staging copy from
-    // the PRISTINE bytes — `objects/<sri>/` under v2, or the v1 store
+    // the PRISTINE bytes — the virtual-store object projection, or the v1 store
     // dir (which v1 patches never mutate). Reading `package_dir` on
     // an already-patched v2 link entry would seed the staging dir
     // with previously-applied edits, defeating the workflow.

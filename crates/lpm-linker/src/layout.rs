@@ -382,6 +382,16 @@ impl<'a> LayoutPaths<'a> {
     /// See [`Self::install_appears_healthy`] for the predicate's
     /// no-v2 contract.
     pub fn install_appears_healthy_with_v2(&self, v2_links_root: Option<&Path>) -> InstallHealth {
+        match v2_links_root {
+            Some(root) => self.install_appears_healthy_with_virtual_roots(&[root]),
+            None => self.install_appears_healthy_with_virtual_roots(&[]),
+        }
+    }
+
+    pub fn install_appears_healthy_with_virtual_roots(
+        &self,
+        links_roots: &[&Path],
+    ) -> InstallHealth {
         let nm = self.project_dir.join("node_modules");
         if !nm.exists() {
             return InstallHealth::NoNodeModules;
@@ -411,8 +421,9 @@ impl<'a> LayoutPaths<'a> {
 
         // Neither v1 marker is populated. Probe for v2 shape if the
         // caller supplied the virtual-store links root.
-        if let Some(links_root) = v2_links_root
-            && self.is_v2_install(links_root)
+        if links_roots
+            .iter()
+            .any(|links_root| self.is_v2_install(links_root))
         {
             return InstallHealth::Healthy {
                 layout: LinkerLayout::Virtual,

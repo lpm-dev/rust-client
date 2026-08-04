@@ -37,6 +37,62 @@ fn write_store_package(
     std::fs::write(pkg_dir.join(".integrity"), "sha512-test-fake").unwrap();
 }
 
+#[test]
+fn rebuild_store_version_recognizes_v3_package_paths() {
+    let root = Path::new("/lpm/store");
+    let version = rebuild_store_version(
+        Path::new("/lpm/store/v3/links/pkg/node_modules/pkg"),
+        &root.join("v3"),
+        &root.join("v2"),
+        Some("graph"),
+    )
+    .unwrap();
+
+    assert_eq!(version, lpm_store::StoreVersion::V3);
+}
+
+#[test]
+fn rebuild_store_version_recognizes_default_v2_package_paths() {
+    let root = Path::new("/lpm/store");
+    let version = rebuild_store_version(
+        Path::new("/lpm/store/v2/links/pkg/node_modules/pkg"),
+        &root.join("v3"),
+        &root.join("v2"),
+        Some("graph"),
+    )
+    .unwrap();
+
+    assert_eq!(version, lpm_store::StoreVersion::V2);
+}
+
+#[test]
+fn rebuild_store_version_rejects_graph_identity_outside_virtual_stores() {
+    let root = Path::new("/lpm/store");
+    let error = rebuild_store_version(
+        Path::new("/unexpected/links/pkg/node_modules/pkg"),
+        &root.join("v3"),
+        &root.join("v2"),
+        Some("graph"),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("outside the v2 and v3 stores"));
+}
+
+#[test]
+fn rebuild_store_version_keeps_legacy_packages_on_default_cache_namespace() {
+    let root = Path::new("/lpm/store");
+    let version = rebuild_store_version(
+        Path::new("/lpm/store/v1/pkg"),
+        &root.join("v3"),
+        &root.join("v2"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(version, lpm_store::StoreVersion::V2);
+}
+
 // ── live_package_dir tests ─────────────────────────
 //
 // The fix for the esbuild postinstall failure: lifecycle scripts
@@ -296,8 +352,9 @@ fn live_package_dir_prefers_isolated_when_both_exist() {
 //
 // These tests pin the integration: composing `live_package_dir`
 // with `lpm_linker::detach_package_hardlinks`, plus the
-// semantic guard that prevents detaching anything inside the
-// store root. The unit tests on `detach_package_hardlinks` in
+// semantic guard that rejects canonical bytes while allowing writable
+// v2/v3 link entries inside the store root. The unit tests on
+// `detach_package_hardlinks` in
 // lpm-linker cover the detach primitive; these cover the
 // composition that the rebuild loop actually calls.
 
@@ -329,13 +386,38 @@ fn prepare_live_package_dir_returns_isolated_path_when_present() {
 }
 
 #[test]
+fn prepare_live_package_dir_accepts_experimental_v3_link_entry() {
+    let project = tempfile::tempdir().unwrap();
+    let lpm_home = tempfile::tempdir().unwrap();
+    let store_root = lpm_home.path().join("store");
+    let _env = crate::test_env::ScopedEnv::set([
+        ("LPM_HOME", lpm_home.path().as_os_str().to_os_string()),
+        ("LPM_STORE_VERSION", "v3".into()),
+    ]);
+    let live = store_root.join("v3/links/esbuild@0.21.5+0123456789abcdef/node_modules/esbuild");
+    std::fs::create_dir_all(&live).unwrap();
+
+    let resolved = prepare_live_package_dir(
+        project.path(),
+        "esbuild",
+        "0.21.5",
+        None,
+        &live,
+        &store_root,
+        None,
+    )
+    .expect("v3 link entries are valid lifecycle working directories");
+
+    assert_eq!(resolved, live);
+}
+
+#[test]
 fn prepare_live_package_dir_errors_when_unlinked() {
     // Pathological "package not
     // actually linked" case. Pre-`prepare_live_package_dir`
     // returned `Ok(store_path)` here, letting the caller chdir into
-    // the canonical store bytes for the lifecycle script — silent
-    // store corruption on macOS/clonefile, shared-inode write on
-    // Linux. Now the function hard-errors so the failure mode
+    // canonical store bytes for the lifecycle script, making direct
+    // writes corrupt the source for future installs. Now the function hard-errors so the failure mode
     // is loud and actionable, and the canonical bytes are
     // guaranteed untouched.
     let store_root = tempfile::tempdir().unwrap();

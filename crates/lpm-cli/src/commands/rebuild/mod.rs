@@ -77,6 +77,27 @@ fn elapsed_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn rebuild_store_version(
+    package_path: &Path,
+    v3_root: &Path,
+    v2_root: &Path,
+    graph_key_digest: Option<&str>,
+) -> Result<lpm_store::StoreVersion, LpmError> {
+    if package_path.starts_with(v3_root) {
+        return Ok(lpm_store::StoreVersion::V3);
+    }
+    if package_path.starts_with(v2_root) {
+        return Ok(lpm_store::StoreVersion::V2);
+    }
+    if graph_key_digest.is_some() {
+        return Err(LpmError::Store(
+            "package has a virtual-store graph identity but its install path is outside the v2 and v3 stores"
+                .to_string(),
+        ));
+    }
+    Ok(lpm_store::StoreVersion::V2)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     project_dir: &Path,
@@ -232,12 +253,12 @@ async fn run_under_store_lock(
     }
 
     // `find_installed_package_baseline`
-    // (via [`package_baseline_dir`]) prefers the v2 store (default since
-    // 4b) and falls back to v1, so the post-install pipeline
+    // (via [`package_baseline_dir`]) prefers the v2/v3 virtual stores and falls
+    // back to v1, so the post-install pipeline
     // doesn't blindly call the v1-only `PackageStore::package_dir`.
-    // Without this, every v2-installed scripted package silently skipped
+    // Without this, every virtual-store scripted package silently skipped
     // at the `pkg_json_path.exists()` check below — i.e., lifecycle
-    // scripts never executed for v2 installs.
+    // scripts never executed for virtual-store installs.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     let policy = SecurityPolicy::from_package_json(&project_dir.join("package.json"));
 
@@ -279,22 +300,22 @@ async fn run_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::security_approval::authorized_capability_user_bound();
 
-    // Build the v2 link-entry index once before the per-package loop,
+    // Build the virtual-store link-entry index once before the per-package loop,
     // scoped to this project's tree. A global scan is ambiguous when
     // same-coordinate packages coexist; the project-scoped walk avoids
     // returning a sibling project's patched copy of the same package.
-    let baseline_index = V2BaselineIndex::for_project(project_dir, &lpm_root)?;
+    let baseline_index = V2BaselineIndex::for_project(project_dir, &lpm_root);
 
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
 
     for lp in &lockfile.packages {
-        // v2-aware lookup, routed through the invocation-local index.
+        // Virtual-store-aware lookup, routed through the invocation-local index.
         // `live_package_dir` returns `None` when the package isn't in
         // either store (workspace/file/link sources, corrupt
         // installs); silent skip preserves the previously
         // `pkg_json_path.exists()` semantic for non-store sources
-        // while fixing the v2-installed-and-skipped data-loss bug.
+        // while fixing the virtual-store-installed-and-skipped data-loss bug.
         let baseline = match lpm_store::find_installed_package_baseline_indexed(
             &baseline_index,
             &lpm_root,
@@ -1090,6 +1111,10 @@ async fn run_under_store_lock(
         }
     }
 
+    let virtual_store_root = lpm_root.store_root();
+    let v3_store_root = virtual_store_root.join("v3");
+    let v2_store_root = virtual_store_root.join("v2");
+
     for pkg in &to_build {
         let mut pkg_success = true;
 
@@ -1103,9 +1128,35 @@ async fn run_under_store_lock(
         } else if is_cacheable_native_build(pkg) {
             build_cache_metrics.bypassed += 1;
         }
-        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+        let package_store_version = match rebuild_store_version(
+            &pkg.store_path,
+            &v3_store_root,
+            &v2_store_root,
+            pkg.graph_key_digest.as_deref(),
+        ) {
+            Ok(version) => version,
+            Err(error) => {
+                if !json_output {
+                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                    let error = error.to_string();
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} {}  {}",
+                        install_ui::red("✗"),
+                        label,
+                        lpm_common::sanitize_terminal_inline(&error),
+                    ));
+                }
+                if json_output {
+                    install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error));
+                }
+                failures += 1;
+                continue;
+            }
+        };
+        let virtual_store =
+            lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, package_store_version);
         let _build_entry_lock = if let Some(graph_key_digest) = pkg.graph_key_digest.as_deref() {
-            match v2_store
+            match virtual_store
                 .paths()
                 .build_entry_lock_path(graph_key_digest)
                 .and_then(lpm_common::acquire_exclusive_lock)
@@ -1133,7 +1184,7 @@ async fn run_under_store_lock(
             None
         };
         let _build_key_lock = if let Some(key) = build_key.as_ref() {
-            match lpm_common::acquire_exclusive_lock(v2_store.paths().build_lock_path(key)) {
+            match lpm_common::acquire_exclusive_lock(virtual_store.paths().build_lock_path(key)) {
                 Ok(lock) => Some(lock),
                 Err(error) => {
                     tracing::warn!(
@@ -1159,12 +1210,10 @@ async fn run_under_store_lock(
         // most visibly with `esbuild`'s install.js trying to find
         // its platform-specific binary subpackage.
         //
-        // on Linux the linker hardlinks store
-        // files into the live directory, so the live and store files
-        // share an inode. Detach hardlinks before any script runs so
-        // a script that mutates its own package files doesn't bleed
-        // into the global store. macOS (clonefile, already CoW) and
-        // Windows (always copies) get a no-op return.
+        // Current v2/v3 link entries use independent writable inodes.
+        // Detach any hardlinks left by a legacy or externally-created
+        // layout before running untrusted script writes; this is a
+        // Linux defense-in-depth pass and a no-op on other platforms.
         let live_pkg_dir = match prepare_live_package_dir(
             project_dir,
             &pkg.name,
@@ -1228,13 +1277,12 @@ async fn run_under_store_lock(
             }
         }
         if !force && let Some(key) = build_key.as_ref() {
-            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
             let lookup_start = std::time::Instant::now();
-            match store.reusable_build_artifact(key) {
+            match virtual_store.reusable_build_artifact(key) {
                 Ok(Some(artifact)) => {
                     build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
                     let restore_start = std::time::Instant::now();
-                    match store.restore_build_artifact(&artifact, &pkg.store_path) {
+                    match virtual_store.restore_build_artifact(&artifact, &pkg.store_path) {
                         Ok(()) => {
                             build_cache_metrics.restore_ms +=
                                 elapsed_millis(restore_start.elapsed());
@@ -1299,9 +1347,9 @@ async fn run_under_store_lock(
         }
 
         if build_key.is_some() {
-            let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
             let rematerialize_start = std::time::Instant::now();
-            if let Err(error) = store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
+            if let Err(error) =
+                virtual_store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
             {
                 build_cache_metrics.rematerialize_ms +=
                     elapsed_millis(rematerialize_start.elapsed());
@@ -1403,9 +1451,8 @@ async fn run_under_store_lock(
 
         if pkg_success {
             if let Some(key) = build_key.as_ref() {
-                let store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
                 let publish_start = std::time::Instant::now();
-                if let Err(error) = store.publish_build_artifact(
+                if let Err(error) = virtual_store.publish_build_artifact(
                     key,
                     &pkg.source_integrity,
                     &pkg.store_path,

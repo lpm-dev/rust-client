@@ -1,20 +1,20 @@
 //! `node_modules` layout manager for LPM.
 //!
-//! The default store-v2 linker creates project root symlinks into reusable
-//! graph entries under `~/.lpm/store/v2/links/<graph-key>/`. Both
+//! The virtual-store linker creates project root symlinks into reusable graph
+//! entries under the active store's `links/<graph-key>/` directory. Both
 //! [`LinkerMode::Hoisted`] (the default) and [`LinkerMode::Isolated`] use
 //! those shared entries while applying their own root-link semantics.
 //!
 //! ```text
 //! <project>/node_modules/<dep>
-//!   -> ~/.lpm/store/v2/links/<graph-key>/node_modules/<dep>
+//!   -> ~/.lpm/store/v{2,3}/links/<graph-key>/node_modules/<dep>
 //! ```
 //!
 //! The [`link_packages`] and [`link_packages_hoisted`] exports are the v1
 //! implementations retained for `LPM_STORE_VERSION=v1` rollback. They
 //! materialize project-local state under `.lpm/wrappers/` or `.lpm/hoisted/`
 //! and must remain paired with the v1 store writer for the rollback lifetime.
-//! The v2 linker also recognizes and removes that project-local state during
+//! The virtual-store linker also recognizes and removes that project-local state during
 //! migration; those compatibility readers outlive the rollback writer.
 
 pub mod layout;

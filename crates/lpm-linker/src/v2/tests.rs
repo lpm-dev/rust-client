@@ -613,7 +613,7 @@ fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() 
     );
     assert!(
         !next_real.starts_with(&store_root),
-        "Next's root realpath must not point straight into the global v2 store",
+        "Next's root realpath must not point straight into the global virtual-store store",
     );
 
     let compat_node_modules = next_real
@@ -635,7 +635,7 @@ fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() 
         );
         assert!(
             !package_real.starts_with(&store_root),
-            "{package} must not resolve straight into the global v2 store",
+            "{package} must not resolve straight into the global virtual-store store",
         );
     }
 
@@ -1189,7 +1189,7 @@ fn finalize_existing_link_entries_refreshes_compatibility_copy_after_generated_b
     let link_pkg = store
         .find_link_package_dir("tool", "1.0.0")
         .unwrap()
-        .expect("initial link must populate the v2 link entry");
+        .expect("initial link must populate the virtual-store link entry");
     let generated_bin = link_pkg.join("bin").join("tool.js");
     std::fs::create_dir_all(generated_bin.parent().unwrap()).unwrap();
     std::fs::write(&generated_bin, b"#!/usr/bin/env node\n").unwrap();
@@ -1347,7 +1347,7 @@ fn link_packages_v2_supports_local_source_dep_edges() {
             .unwrap()
             .file_type()
             .is_symlink(),
-        "local-source entrypoints must be real files so Node resolves deps from the v2 link entry"
+        "local-source entrypoints must be real files so Node resolves deps from the virtual-store link entry"
     );
 }
 
@@ -1378,7 +1378,7 @@ fn link_packages_v2_wipes_legacy_v1_wrappers() {
 
     assert!(
         !project.join(".lpm").join("wrappers").exists(),
-        "v2 linker must wipe legacy v1 wrapper tree"
+        "virtual-store linker must wipe legacy v1 wrapper tree"
     );
 }
 
@@ -1890,7 +1890,7 @@ fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
         .expect("consumer materialized with react 19");
     assert_ne!(
         consumer_dest_18, consumer_dest_19,
-        "hoisted v2 link entries must include peer pinning when peer siblings are materialized"
+        "hoisted virtual-store link entries must include peer pinning when peer siblings are materialized"
     );
 }
 
@@ -2309,8 +2309,8 @@ impl Drop for NofileLimitGuard {
 
 /// A package whose `bin` map keys a shim with a path-traversal
 /// name must be skipped. v1's hoisted emitter has enforced this
-/// since the validators were introduced; v2 (the default store
-/// version) was the gap a malicious package could exploit to
+/// since the validators were introduced; the v2 emitter was the gap
+/// a malicious package could exploit to
 /// shadow `/usr/bin` entries via `node_modules/.bin/`.
 #[test]
 fn v2_skips_bin_shim_when_bin_name_contains_path_traversal() {
@@ -2488,7 +2488,7 @@ fn link_packages_v2_reuses_up_to_date_bin_shim_on_warm_rerun() {
             .mode()
             & 0o777,
         0o644,
-        "v2 bin shim creation must not chmod the shared link entry target"
+        "virtual-store bin shim creation must not chmod the shared link entry target"
     );
     let first_content = std::fs::read_to_string(&shim).expect("shim should be a wrapper file");
     let first_inode = shim.symlink_metadata().expect("shim metadata").ino();
@@ -2764,6 +2764,6 @@ fn link_v2_finalize_replaces_symlinked_scope_parent_before_root_symlink_write() 
         .unwrap();
     assert!(
         symlink_points_to(&root_link, &store.paths().link_package_dir(key)),
-        "scoped root link should point at the v2 link package dir",
+        "scoped root link should point at the virtual-store link package dir",
     );
 }

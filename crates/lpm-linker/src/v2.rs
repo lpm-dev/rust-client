@@ -12,8 +12,8 @@
 //! 2. Derives a [`GraphKey`] for every [`LinkTarget`] in the install
 //!    set so cross-references between targets resolve to stable
 //!    graph-key directory names.
-//! 3. Calls [`Store::populate_link_entry`] per target, which clonefiles
-//!    the package bytes from `objects/<sri>/` into
+//! 3. Calls [`Store::populate_link_entry`] per target, which materializes
+//!    independent package bytes from `objects/<sri>/` into
 //!    `links/<graph-key>/node_modules/<name>/` and writes sibling
 //!    dep + peer symlinks alongside.
 //! 4. Writes project-side `node_modules/<root_link_name>` symlinks
@@ -149,7 +149,7 @@ impl LinkPlanV2 {
             .cloned()
             .ok_or_else(|| {
                 LpmError::Store(format!(
-                    "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
+                    "virtual-store linker: missing graph key for {}@{} (key map pre-pass failed)",
                     target.target.name, target.target.version
                 ))
             })
@@ -197,7 +197,7 @@ fn target_declares_no_peers(_target: &LinkTarget) -> bool {
     false
 }
 
-/// Materialize the install set under the v2 store layout.
+/// Materialize the install set under the v2 or v3 virtual-store layout.
 ///
 /// Returns a [`LinkResult`] in the same shape v1 produces so the
 /// install pipeline's reporting / lockfile-write paths don't branch.
@@ -535,9 +535,9 @@ fn link_v2_prepare_inner(
 
 /// Step 2 of the event-driven v2 link API.
 ///
-/// Materializes a single link entry in `~/.lpm/store/v2/links/<key>/`
+/// Materializes a single link entry in the active store's `links/<key>/`
 /// from a precomputed [`LinkPlanV2`]. Idempotent — concurrent calls
-/// for the same graph key serialize through the v2 store's
+/// for the same graph key serialize through the virtual store's
 /// atomic-rename machinery.
 ///
 /// Returns `(MaterializedPackage, freshly_populated)` so the caller can
@@ -548,7 +548,7 @@ fn link_v2_prepare_inner(
 /// **Object precondition.** `<store>/objects/<source_sri>/` must already
 /// be populated by `Store::extract_object_from_bytes` before this
 /// function is called for `target`. Calling earlier returns an error
-/// from `populate_link_entry`'s clonefile step.
+/// from `populate_link_entry`'s materialization step.
 pub fn link_v2_one(
     plan: &LinkPlanV2,
     target: &V2Target,
@@ -753,7 +753,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(
-                    "v2 linker: skipping peer derivation for {}@{}: {e}",
+                    "virtual-store linker: skipping peer derivation for {}@{}: {e}",
                     v2t.target.name,
                     v2t.target.version
                 );
@@ -775,7 +775,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(
-                    "v2 linker: failed to parse {}/package.json for peer derivation: {e}",
+                    "virtual-store linker: failed to parse {}/package.json for peer derivation: {e}",
                     object_dir.display()
                 );
                 continue;
@@ -793,7 +793,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
                 Some(ver) => derived.push((peer_name.clone(), ver.clone())),
                 None if !is_optional => {
                     tracing::debug!(
-                        "v2 linker: REQUIRED peer dep {peer_name} of {}@{} not in install set — \
+                        "virtual-store linker: REQUIRED peer dep {peer_name} of {}@{} not in install set — \
                          resolver should have caught this in check_unmet_peers",
                         v2t.target.name,
                         v2t.target.version
@@ -829,7 +829,7 @@ fn populate_one(
 ) -> Result<PopulatedEntry, LpmError> {
     let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
         LpmError::Store(format!(
-            "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
+            "virtual-store linker: missing graph key for {}@{} (key map pre-pass failed)",
             v2t.target.name, v2t.target.version
         ))
     })?;
@@ -847,7 +847,7 @@ fn populate_one(
     for dep in &v2t.target.dependencies {
         if !is_safe_root_link_name(&dep.local) {
             tracing::warn!(
-                "v2 linker: skipping unsafe dependency local name {:?} for {}@{}",
+                "virtual-store linker: skipping unsafe dependency local name {:?} for {}@{}",
                 dep.local,
                 v2t.target.name,
                 v2t.target.version
@@ -856,7 +856,7 @@ fn populate_one(
         }
         let dep_key = key_map.get_for_dependency(dep).ok_or_else(|| {
             LpmError::Store(format!(
-                "v2 linker: dep {}=>{}@{} of {}@{} has no resolved graph key",
+                "virtual-store linker: dep {}=>{}@{} of {}@{} has no resolved graph key",
                 dep.local,
                 dep.target_name,
                 dep.graph_key_value(),
@@ -869,7 +869,7 @@ fn populate_one(
                 continue;
             }
             return Err(LpmError::Store(format!(
-                "v2 linker: dependency slot {} of {}@{} resolves to conflicting graph keys {} and {}",
+                "virtual-store linker: dependency slot {} of {}@{} resolves to conflicting graph keys {} and {}",
                 dep.local,
                 v2t.target.name,
                 v2t.target.version,
@@ -898,7 +898,7 @@ fn populate_one(
                         true
                     } else {
                         tracing::warn!(
-                            "v2 linker: skipping unsafe peer local name {:?} for {}@{}",
+                            "virtual-store linker: skipping unsafe peer local name {:?} for {}@{}",
                             peer_name,
                             v2t.target.name,
                             v2t.target.version
@@ -950,7 +950,7 @@ fn existing_link_entry_packages(
     let links_root = store.paths().links_root();
     let canonical_links_root = std::fs::canonicalize(&links_root).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to inspect links root at {}: {e}",
+            "virtual-store linker: failed to inspect links root at {}: {e}",
             links_root.display()
         ))
     })?;
@@ -959,7 +959,7 @@ fn existing_link_entry_packages(
     for v2t in &plan.augmented_targets {
         let key = plan.key_map.get_for(&v2t.target).ok_or_else(|| {
             LpmError::Store(format!(
-                "v2 linker: missing graph key for {}@{} during existing-link validation",
+                "virtual-store linker: missing graph key for {}@{} during existing-link validation",
                 v2t.target.name, v2t.target.version
             ))
         })?;
@@ -987,13 +987,13 @@ fn ensure_existing_link_package_dir(
 ) -> Result<(), LpmError> {
     let canonical_package_dir = std::fs::canonicalize(package_dir).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: required link entry for {name}@{version} is missing at {}: {e}",
+            "virtual-store linker: required link entry for {name}@{version} is missing at {}: {e}",
             package_dir.display()
         ))
     })?;
     if !canonical_package_dir.starts_with(canonical_links_root) {
         return Err(LpmError::Store(format!(
-            "v2 linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
+            "virtual-store linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
             package_dir.display(),
             canonical_links_root.display()
         )));
@@ -1005,13 +1005,13 @@ fn ensure_existing_link_package_dir(
     package_json.push("package.json");
     let metadata = std::fs::symlink_metadata(&package_json).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: required package.json for {name}@{version} is missing at {}: {e}",
+            "virtual-store linker: required package.json for {name}@{version} is missing at {}: {e}",
             package_json.display()
         ))
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(LpmError::Store(format!(
-            "v2 linker: refusing existing link entry for {name}@{version} with non-file package.json at {}",
+            "virtual-store linker: refusing existing link entry for {name}@{version} with non-file package.json at {}",
             package_json.display()
         )));
     }

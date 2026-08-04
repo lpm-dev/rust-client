@@ -23,6 +23,31 @@ fn read_project_lockfile(project: &TempProject, relative: &str) -> lpm_lockfile:
         .lockfile
 }
 
+fn find_v3_blob_with_contents(project: &TempProject, expected: &[u8]) -> std::path::PathBuf {
+    let blobs_root = project.home().join(".lpm/store/v3/blobs/blake3");
+    for shard in std::fs::read_dir(&blobs_root)
+        .unwrap_or_else(|error| panic!("read CAS blob root {}: {error}", blobs_root.display()))
+    {
+        let shard = shard.expect("read CAS blob shard entry").path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&shard)
+            .unwrap_or_else(|error| panic!("read CAS blob shard {}: {error}", shard.display()))
+        {
+            let path = entry.expect("read CAS blob entry").path();
+            if path.is_file() && std::fs::read(&path).is_ok_and(|bytes| bytes == expected) {
+                return path;
+            }
+        }
+    }
+    panic!(
+        "v3 CAS blob with {} expected bytes was not found under {}",
+        expected.len(),
+        blobs_root.display()
+    );
+}
+
 // ─── No package.json ─────────────────────────────────────────────
 
 #[test]
@@ -4414,7 +4439,7 @@ async fn install_offline_firewall_enforce_uses_public_lockfile_source_when_npmrc
 }
 
 #[tokio::test]
-async fn install_offline_with_v2_store_relinks_from_object_store() {
+async fn install_offline_with_default_v2_store_relinks_from_object_store() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("is-number", "7.0.0");
     mock.with_package("is-number", "7.0.0", &tarball).await;
@@ -4465,14 +4490,407 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
 
     assert!(
         offline.status.success(),
-        "offline v2 install must use the v2 object store, not the v1 package path\nstdout: {}\nstderr: {}",
+        "offline v2 install must reuse the default object store\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&offline.stdout),
         String::from_utf8_lossy(&offline.stderr)
     );
     assertions::assert_in_node_modules(project.path(), "is-number");
     assert!(
+        project.home().join(".lpm/store/v2").is_dir(),
+        "default online and offline installs must populate the v2 store"
+    );
+    assert!(
         !project.home().join(".lpm/store/v1").exists(),
         "default online and offline installs must not write the v1 store"
+    );
+    assert!(
+        !project.home().join(".lpm/store/v3").exists(),
+        "default online and offline installs must not activate the experimental v3 store"
+    );
+}
+
+#[tokio::test]
+async fn install_explicit_v3_lazily_migrates_v2_object_offline_without_rewriting_lockfiles() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-v2-to-v3-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let seeded = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed the v2 store");
+    assert!(
+        seeded.status.success(),
+        "v2 seed install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let v2_object = v2_store.paths().object_dir(&sri).unwrap();
+    let v2_bytes = std::fs::read(v2_object.join("index.js")).expect("read seeded v2 object");
+    let lock_before = std::fs::read(project.path().join("lpm.lock")).expect("read lpm.lock");
+    let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
+    let requests_before = mock.tarball_request_count("is-number", "7.0.0").await;
+    assert_eq!(requests_before, 1, "v2 seed must download one tarball");
+
+    let migrated = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline v2-to-v3 migration");
+    assert!(
+        migrated.status.success(),
+        "explicit v3 install must migrate the v2 object without network access\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&migrated.stdout),
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+
+    let v3_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v3"));
+    let v3_object = v3_store.paths().object_dir(&sri).unwrap();
+    assert_eq!(
+        std::fs::read(v3_object.join("index.js")).expect("read migrated v3 object"),
+        v2_bytes,
+        "lazy migration must preserve extracted package bytes"
+    );
+    assert_eq!(
+        std::fs::read(v2_object.join("index.js")).expect("read retained v2 object"),
+        v2_bytes,
+        "lazy migration must not mutate the v2 store"
+    );
+    assert_eq!(
+        mock.tarball_request_count("is-number", "7.0.0").await,
+        requests_before,
+        "lazy migration must not redownload the tarball"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).expect("read migrated lpm.lock"),
+        lock_before,
+        "v2-to-v3 migration must keep lpm.lock byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        lockb_before,
+        "v2-to-v3 migration must keep a supported lpm.lockb byte-identical and preserve absence when importer metadata requires TOML"
+    );
+    assertions::assert_in_node_modules(project.path(), "is-number");
+}
+
+#[tokio::test]
+async fn install_default_v2_lazily_migrates_v3_object_offline_without_rewriting_lockfiles() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-v3-to-v2-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let seeded = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed the v3 store");
+    assert!(
+        seeded.status.success(),
+        "v3 seed install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let sri = compute_integrity(&tarball);
+    let v3_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v3"));
+    let v3_object = v3_store.paths().object_dir(&sri).unwrap();
+    let v3_bytes = std::fs::read(v3_object.join("index.js")).expect("read seeded v3 object");
+    let lock_before = std::fs::read(project.path().join("lpm.lock")).expect("read lpm.lock");
+    let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
+    let requests_before = mock.tarball_request_count("is-number", "7.0.0").await;
+    assert_eq!(requests_before, 1, "v3 seed must download one tarball");
+
+    let migrated = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env_remove("LPM_STORE_VERSION")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline v3-to-v2 migration");
+    assert!(
+        migrated.status.success(),
+        "default v2 install must migrate the v3 object without network access\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&migrated.stdout),
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+
+    let v2_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let v2_object = v2_store.paths().object_dir(&sri).unwrap();
+    assert_eq!(
+        std::fs::read(v2_object.join("index.js")).expect("read migrated v2 object"),
+        v3_bytes,
+        "rollback migration must preserve extracted package bytes"
+    );
+    assert_eq!(
+        std::fs::read(v3_object.join("index.js")).expect("read retained v3 object"),
+        v3_bytes,
+        "rollback migration must not mutate the v3 store"
+    );
+    assert_eq!(
+        mock.tarball_request_count("is-number", "7.0.0").await,
+        requests_before,
+        "rollback migration must not redownload the tarball"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).expect("read migrated lpm.lock"),
+        lock_before,
+        "v3-to-v2 migration must keep lpm.lock byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        lockb_before,
+        "v3-to-v2 migration must keep a supported lpm.lockb byte-identical and preserve absence when importer metadata requires TOML"
+    );
+    assertions::assert_in_node_modules(project.path(), "is-number");
+}
+
+#[tokio::test]
+async fn store_verify_deep_detects_same_size_v3_blob_tampering() {
+    let mock = MockRegistry::start().await;
+    let clean_bytes = b"same-size-clean";
+    let tarball =
+        make_tarball_with_files("cas-deep-verify", "1.0.0", &[("payload.bin", clean_bytes)]);
+    mock.with_package("cas-deep-verify", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "cas-deep-verify-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "cas-deep-verify": "1.0.0"
+        }
+    }"#,
+    );
+
+    let installed = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install v3 deep-verification fixture");
+    assert!(
+        installed.status.success(),
+        "v3 fixture install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+
+    let blob = find_v3_blob_with_contents(&project, clean_bytes);
+    std::fs::write(&blob, b"same-size-dirty").expect("tamper v3 CAS blob");
+    let verified = lpm(&project)
+        .args(["--json", "store", "verify", "--deep"])
+        .output()
+        .expect("run deep store verification");
+    assert!(
+        !verified.status.success(),
+        "deep verification must reject same-size CAS tampering\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&verified.stdout).expect("deep verification failure must emit JSON");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["cas"]["blob_integrity_recomputed"],
+        serde_json::json!(true)
+    );
+    assert!(
+        envelope["issues"]
+            .as_array()
+            .expect("issues must be an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|issue| issue.contains("v3 CAS") && issue.contains("failed integrity validation")),
+        "deep verification must identify the corrupt CAS blob: {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn cache_prune_keeps_shared_v3_blob_until_its_last_package_reference_is_removed() {
+    let mock = MockRegistry::start().await;
+    let shared_bytes = b"shared-cas-payload";
+    let first_tarball =
+        make_tarball_with_files("cas-first", "1.0.0", &[("shared.bin", shared_bytes)]);
+    let second_tarball =
+        make_tarball_with_files("cas-second", "1.0.0", &[("shared.bin", shared_bytes)]);
+    mock.with_package("cas-first", "1.0.0", &first_tarball)
+        .await;
+    mock.with_package("cas-second", "1.0.0", &second_tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "cas-last-reference-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "cas-first": "1.0.0",
+            "cas-second": "1.0.0"
+        }
+    }"#,
+    );
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install shared CAS fixture");
+    assert!(
+        initial.status.success(),
+        "shared CAS fixture install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let shared_blob = find_v3_blob_with_contents(&project, shared_bytes);
+
+    project.write_file(
+        "package.json",
+        r#"{
+        "name": "cas-last-reference-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "cas-second": "1.0.0"
+        }
+    }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove prior links before relinking one package");
+    let one_reference = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("remove the first package reference");
+    assert!(
+        one_reference.status.success(),
+        "install after removing first reference failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&one_reference.stdout),
+        String::from_utf8_lossy(&one_reference.stderr)
+    );
+    let first_prune = lpm(&project)
+        .args([
+            "cache",
+            "prune",
+            "--apply",
+            "--project",
+            project.path().to_str().expect("project path must be UTF-8"),
+            "--json",
+        ])
+        .output()
+        .expect("prune after removing first reference");
+    assert!(
+        first_prune.status.success(),
+        "first-reference prune failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first_prune.stdout),
+        String::from_utf8_lossy(&first_prune.stderr)
+    );
+    assert!(
+        shared_blob.is_file(),
+        "a blob shared by a reachable package must survive prune"
+    );
+
+    project.write_file(
+        "package.json",
+        r#"{
+        "name": "cas-last-reference-project",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove prior links before relinking an empty project");
+    let no_references = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("remove the last package reference");
+    assert!(
+        no_references.status.success(),
+        "install after removing last reference failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&no_references.stdout),
+        String::from_utf8_lossy(&no_references.stderr)
+    );
+    let last_prune = lpm(&project)
+        .args([
+            "cache",
+            "prune",
+            "--apply",
+            "--project",
+            project.path().to_str().expect("project path must be UTF-8"),
+            "--json",
+        ])
+        .output()
+        .expect("prune after removing last reference");
+    assert!(
+        last_prune.status.success(),
+        "last-reference prune failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&last_prune.stdout),
+        String::from_utf8_lossy(&last_prune.stderr)
+    );
+    assert!(
+        !shared_blob.exists(),
+        "the shared blob must be deleted after its last package reference is removed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&last_prune.stdout),
+        String::from_utf8_lossy(&last_prune.stderr)
     );
 }
 
@@ -4992,7 +5410,7 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
 
     assert!(
         output.status.success(),
-        "default install should succeed with shipped v2/direct defaults\nstdout: {}\nstderr: {}",
+        "default install should succeed with the shipped v2 layout\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -5003,7 +5421,7 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
         .expect("installed package should have filesystem metadata");
     assert!(
         metadata.file_type().is_symlink(),
-        "shipped default layout should expose root packages as v2 symlinks, not v1 real dirs"
+        "shipped default layout should expose root packages as virtual-store symlinks, not v1 real dirs"
     );
     assert!(
         !project.path().join(".lpm/wrappers").exists(),
@@ -5016,6 +5434,14 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
     assert!(
         !project.home().join(".lpm/store/v1").exists(),
         "shipped v2 layout should not populate the v1 store"
+    );
+    assert!(
+        project.home().join(".lpm/store/v2").is_dir(),
+        "shipped v2 layout should populate the v2 store"
+    );
+    assert!(
+        !project.home().join(".lpm/store/v3").exists(),
+        "shipped v2 layout should not populate the experimental v3 store"
     );
 }
 

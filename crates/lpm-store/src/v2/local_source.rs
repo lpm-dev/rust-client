@@ -24,7 +24,7 @@ pub(crate) fn local_source_fingerprint_path(object_dir: &Path) -> Result<PathBuf
     let sentinel = local_source_sentinel_path(object_dir)?;
     let parent = sentinel.parent().ok_or_else(|| {
         LpmError::Store(format!(
-            "v2 local-source sentinel has no parent: {}",
+            "virtual-store local-source sentinel has no parent: {}",
             sentinel.display()
         ))
     })?;
@@ -50,7 +50,7 @@ pub(crate) fn write_local_source_fingerprint(
     let path = local_source_fingerprint_path(object_dir)?;
     lpm_common::write_file_atomic(&path, format!("{}\n", fingerprint.0)).map_err(|error| {
         LpmError::Store(format!(
-            "failed to write v2 local-source fingerprint at {}: {error}",
+            "failed to write virtual-store local-source fingerprint at {}: {error}",
             path.display()
         ))
     })
@@ -85,7 +85,7 @@ fn hash_local_source_metadata(
 
     if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
         return Err(LpmError::Store(format!(
-            "v2 local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            "virtual-store local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
             source_dir.display()
         )));
     }
@@ -159,14 +159,14 @@ fn write_local_source_sentinel(object_dir: &Path, source_root: &Path) -> Result<
     if let Some(parent) = path.parent() {
         ensure_store_tier_dir_locked(parent).map_err(|e| {
             LpmError::Store(format!(
-                "failed to create v2 local-source metadata dir at {}: {e}",
+                "failed to create virtual-store local-source metadata dir at {}: {e}",
                 parent.display()
             ))
         })?;
     }
     std::fs::write(&path, source_root.display().to_string()).map_err(|e| {
         LpmError::Store(format!(
-            "failed to write v2 local-source sentinel at {}: {e}",
+            "failed to write virtual-store local-source sentinel at {}: {e}",
             path.display()
         ))
     })
@@ -206,7 +206,7 @@ pub(crate) fn replace_local_source_object(
         Err(e) => {
             let _ = std::fs::remove_dir_all(tmp_dir);
             return Err(LpmError::Store(format!(
-                "failed to move previous v2 local-source object at {} aside: {e}",
+                "failed to move previous virtual-store local-source object at {} aside: {e}",
                 object_dir.display()
             )));
         }
@@ -217,7 +217,7 @@ pub(crate) fn replace_local_source_object(
             if let Err(e) = std::fs::remove_dir_all(&backup_dir) {
                 tracing::warn!(
                     target = %backup_dir.display(),
-                    "v2 local-source object: failed to remove replaced object backup: {e}"
+                    "virtual-store local-source object: failed to remove replaced object backup: {e}"
                 );
             }
             Ok(())
@@ -227,7 +227,7 @@ pub(crate) fn replace_local_source_object(
             let _ = std::fs::remove_dir_all(&backup_dir);
             tracing::debug!(
                 target = %object_dir.display(),
-                "v2 local-source object: concurrent refresh completed first: {e}"
+                "virtual-store local-source object: concurrent refresh completed first: {e}"
             );
             Ok(())
         }
@@ -239,7 +239,7 @@ pub(crate) fn replace_local_source_object(
                 let _ = std::fs::remove_dir_all(&backup_dir);
             }
             Err(LpmError::Store(format!(
-                "failed to atomically refresh v2 local-source object at {}: {e}",
+                "failed to atomically refresh virtual-store local-source object at {}: {e}",
                 object_dir.display()
             )))
         }
@@ -277,7 +277,7 @@ fn finish_local_source_object_rename(
             let _ = std::fs::remove_dir_all(tmp_dir);
             remove_object_metadata_dir_best_effort(object_dir);
             Err(LpmError::Store(format!(
-                "failed to atomically install v2 local-source object: {e}"
+                "failed to atomically install virtual-store local-source object: {e}"
             )))
         }
     }
@@ -319,7 +319,7 @@ fn local_source_snapshot_dirs_match(
 ) -> Result<bool, LpmError> {
     if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
         return Err(LpmError::Store(format!(
-            "v2 local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            "virtual-store local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
             source_dir.display()
         )));
     }
@@ -566,14 +566,16 @@ pub(crate) fn populate_local_source_object_into(
     if security_analysis_policy.is_enabled() {
         let analysis = lpm_security::behavioral::analyze_package(tmp_dir);
         if let Err(e) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis) {
-            tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
+            tracing::warn!(
+                "virtual-store local-source object: failed to write .lpm-security.json: {e}"
+            );
         }
     }
 
     write_tree_object_integrity(tmp_dir)?;
     std::fs::write(tmp_dir.join(".integrity"), sri).map_err(|e| {
         LpmError::Store(format!(
-            "failed to write v2 local-source .integrity at {}: {e}",
+            "failed to write virtual-store local-source .integrity at {}: {e}",
             tmp_dir.display()
         ))
     })?;
@@ -588,13 +590,13 @@ fn walk_local_source_object(
 ) -> Result<(), LpmError> {
     if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
         return Err(LpmError::Store(format!(
-            "v2 local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            "virtual-store local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
             src.display()
         )));
     }
     std::fs::create_dir_all(dst).map_err(|e| {
         LpmError::Store(format!(
-            "failed to create v2 local-source object dir at {}: {e}",
+            "failed to create virtual-store local-source object dir at {}: {e}",
             dst.display()
         ))
     })?;
@@ -634,7 +636,7 @@ fn walk_local_source_object(
                     source = %source_root.display(),
                     symlink = %entry_src.display(),
                     target = %abs_target.display(),
-                    "v2 local-source object: symlink escapes source root; exposing target as-is"
+                    "virtual-store local-source object: symlink escapes source root; exposing target as-is"
                 );
             }
             match std::fs::metadata(&abs_target) {
@@ -644,7 +646,7 @@ fn walk_local_source_object(
                 _ => {
                     create_fs_symlink(&abs_target, &entry_dst).map_err(|e| {
                         LpmError::Store(format!(
-                            "failed to stage v2 local-source symlink {} → {}: {e}",
+                            "failed to stage virtual-store local-source symlink {} → {}: {e}",
                             entry_dst.display(),
                             abs_target.display()
                         ))
@@ -661,14 +663,14 @@ fn materialize_local_source_file(src: &Path, dst: &Path) -> Result<(), LpmError>
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             LpmError::Store(format!(
-                "failed to create v2 local-source object parent at {}: {e}",
+                "failed to create virtual-store local-source object parent at {}: {e}",
                 parent.display()
             ))
         })?;
     }
     std::fs::copy(src, dst).map_err(|copy_err| {
         LpmError::Store(format!(
-            "failed to copy v2 local-source file {} → {}: {copy_err}",
+            "failed to copy virtual-store local-source file {} → {}: {copy_err}",
             src.display(),
             dst.display()
         ))

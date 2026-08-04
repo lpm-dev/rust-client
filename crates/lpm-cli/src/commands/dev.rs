@@ -2010,7 +2010,7 @@ fn dev_entrypoint_compatibility_bins(project_dir: &Path) -> Vec<String> {
 
 fn dev_entrypoint_compatibility_missing(project_dir: &Path, bin_names: &[String]) -> bool {
     !bin_names.is_empty()
-        && lpm_store::StoreVersion::from_env().is_v2()
+        && lpm_store::StoreVersion::from_env().uses_virtual_store()
         && !lpm_linker::v2::project_compatibility_bins_ready(project_dir, bin_names)
 }
 

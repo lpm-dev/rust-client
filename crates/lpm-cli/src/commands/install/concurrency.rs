@@ -89,9 +89,9 @@ impl V2LinkHandle {
 
     pub(super) async fn wait(self) -> Result<V2LinkTaskResult, LpmError> {
         match self {
-            Self::Task(handle) => handle
-                .await
-                .map_err(|error| LpmError::Registry(format!("v2 link task panicked: {error}")))?,
+            Self::Task(handle) => handle.await.map_err(|error| {
+                LpmError::Registry(format!("virtual-store link task panicked: {error}"))
+            })?,
             Self::Workspace(handle) => {
                 let coordinated = handle.wait().await?;
                 let materialization = coordinated.value;
@@ -132,7 +132,7 @@ pub(super) fn spawn_v2_link_task(
         let _permit = semaphore
             .acquire_owned()
             .await
-            .map_err(|_| LpmError::Registry("v2 link semaphore closed".into()))?;
+            .map_err(|_| LpmError::Registry("virtual-store link semaphore closed".into()))?;
         let start = Instant::now();
         tokio::task::spawn_blocking(move || {
             let (materialized, freshly_populated, timings) =
@@ -145,7 +145,7 @@ pub(super) fn spawn_v2_link_task(
             })
         })
         .await
-        .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))?
+        .map_err(|e| LpmError::Registry(format!("virtual-store link task panicked: {e}")))?
     })))
 }
 
@@ -183,16 +183,20 @@ pub(super) async fn prevalidate_v2_reusable_objects(
     let unique_candidates: HashSet<String> = candidates.into_iter().map(str::to_owned).collect();
     let candidate_count = unique_candidates.len();
     let concurrency = v2_cache_check_concurrency(candidate_count);
+    let validation_batch = store_v2.reusable_object_validation_batch();
     let mut checks = futures::stream::iter(unique_candidates.into_iter().map(|sri| {
         let store_v2 = Arc::clone(&store_v2);
+        let validation_batch = validation_batch.clone();
         async move {
             tokio::task::spawn_blocking(move || {
                 store_v2
-                    .reusable_object_with_timings(&sri)
+                    .reusable_object_with_timings_in_batch(&sri, &validation_batch)
                     .map(|(hit, timings)| (sri, hit, timings))
             })
             .await
-            .map_err(|error| LpmError::Registry(format!("v2 cache check task panicked: {error}")))?
+            .map_err(|error| {
+                LpmError::Registry(format!("virtual-store cache check task panicked: {error}"))
+            })?
         }
     }))
     .buffer_unordered(concurrency);

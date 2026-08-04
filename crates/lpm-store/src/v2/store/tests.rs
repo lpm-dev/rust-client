@@ -1,9 +1,12 @@
 use super::*;
 use crate::v2::finalize_permits::{FinalizePermitLimiter, parse_v2_finalize_permits};
-use crate::v2::fs_util::tmp_sibling;
 #[cfg(unix)]
 use crate::v2::fs_util::{
     copy_dir_recursively, create_tmp_dir_locked, ensure_store_tier_dir_locked,
+};
+use crate::v2::fs_util::{
+    materialize_into_portable_with_integrity,
+    materialize_into_portable_with_integrity_and_symlink_policy, tmp_sibling,
 };
 use crate::v2::graph_key::{GraphKeyInputs, LinkerModeTag, PeerEntry};
 use crate::v2::integrity::{
@@ -270,7 +273,7 @@ fn reusable_object_with_timings_tree_policy_reports_snapshot_fast_path() {
     );
 
     let (reusable, timings) = store
-        .reusable_object_with_timings_and_policy(&sri, ObjectIntegrityPolicy::Tree)
+        .reusable_object_with_timings_and_policy(&sri, ObjectIntegrityPolicy::Tree, None)
         .unwrap();
 
     assert_eq!(reusable.unwrap().path, object_dir);
@@ -299,7 +302,7 @@ fn reusable_object_with_timings_tree_policy_reports_full_hash_fallback() {
     std::fs::remove_file(&snapshot_path).unwrap();
 
     let (reusable, timings) = store
-        .reusable_object_with_timings_and_policy(&sri, ObjectIntegrityPolicy::Tree)
+        .reusable_object_with_timings_and_policy(&sri, ObjectIntegrityPolicy::Tree, None)
         .unwrap();
 
     assert_eq!(reusable.unwrap().path, object_dir);
@@ -399,6 +402,24 @@ fn compute_tree_metadata_integrity_ignores_vanished_atomic_tree_snapshot_tmp_fil
     assert!(
         result.is_ok(),
         "vanished tree snapshot temp files should be ignored before stat: {result:?}"
+    );
+}
+
+#[test]
+fn portable_materialization_metadata_matches_the_tree_walker() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let destination = dir.path().join("destination");
+    std::fs::create_dir_all(source.join("a")).unwrap();
+    std::fs::write(source.join("a/z.js"), b"nested").unwrap();
+    std::fs::write(source.join("a-foo.js"), b"sibling").unwrap();
+    std::fs::write(source.join("package.json"), b"{}").unwrap();
+
+    let fused = materialize_into_portable_with_integrity(&source, &destination).unwrap();
+
+    assert_eq!(
+        fused,
+        compute_tree_metadata_integrity(&destination).unwrap()
     );
 }
 
@@ -583,7 +604,7 @@ fn reusable_object_tree_policy_removes_tampered_object_tree() {
     assert!(reusable.is_none());
     assert!(
         !object_dir.exists(),
-        "tampered v2 objects must be removed before cache reuse"
+        "tampered virtual-store objects must be removed before cache reuse"
     );
 }
 
@@ -673,7 +694,8 @@ fn populate_link_entry_tree_policy_rejects_object_tree_integrity_mismatch() {
         .unwrap_err();
 
     assert!(
-        err.to_string().contains("v2 object integrity mismatch"),
+        err.to_string()
+            .contains("virtual-store object integrity mismatch"),
         "link population must fail before reading tampered object bytes, got: {err}"
     );
     assert!(
@@ -745,7 +767,7 @@ fn populate_link_entry_source_policy_rejects_wrong_source_sidecar() {
 
     assert!(
         err.to_string()
-            .contains("v2 object source integrity mismatch"),
+            .contains("virtual-store object source integrity mismatch"),
         "source policy must reject source sidecars derived from another SRI, got: {err}"
     );
 }
@@ -783,7 +805,7 @@ fn populate_object_from_local_source_materializes_real_files_for_node_resolution
             .unwrap()
             .file_type()
             .is_symlink(),
-        "local-source package files must be real files so Node keeps module realpaths inside the v2 link entry"
+        "local-source package files must be real files so Node keeps module realpaths inside the virtual-store link entry"
     );
     assert!(
         !object_dir
@@ -1202,7 +1224,8 @@ fn populate_link_entry_with_tree_policy_revalidates_tampered_object() {
         .unwrap_err();
 
     assert!(
-        err.to_string().contains("v2 object integrity mismatch"),
+        err.to_string()
+            .contains("virtual-store object integrity mismatch"),
         "verified-object warm path must revalidate the object before materializing it, got: {err}"
     );
     assert!(
@@ -1253,7 +1276,7 @@ fn populate_link_entry_with_fresh_object_rejects_mismatched_object() {
 
     assert!(
         err.to_string()
-            .contains("fresh v2 link extracted object SRI mismatch"),
+            .contains("fresh virtual-store link extracted object SRI mismatch"),
         "fresh-object populate must reject a digest/path from another object, got: {err}"
     );
     assert!(
@@ -1310,7 +1333,7 @@ fn populate_link_entry_with_fresh_object_rejects_digest_transplant() {
 
     assert!(
         err.to_string()
-            .contains("fresh v2 link extracted object SRI mismatch"),
+            .contains("fresh virtual-store link extracted object SRI mismatch"),
         "fresh-object populate must reject a cloned digest paired with another object path, got: {err}"
     );
     assert!(
@@ -1678,7 +1701,7 @@ fn populate_failure_cleans_up_tmp_dir() {
         },
     )
     .unwrap_err();
-    assert!(format!("{err}").contains("v2"));
+    assert!(format!("{err}").contains("virtual-store"));
 
     // No `links/<dir>` should exist (final or tmp).
     let final_dir = store.paths().link_dir(&key);
@@ -1887,6 +1910,764 @@ fn build_test_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+fn v3_blob_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let blobs = root.join("blobs").join("blake3");
+    for shard in std::fs::read_dir(blobs).unwrap() {
+        for entry in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+    }
+    files
+}
+
+#[test]
+fn v3_registry_ingest_uses_last_duplicate_tar_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"duplicate-member\",\"version\":\"1.0.0\"}",
+        ),
+        ("dist/index.cjs", b"module.exports = 'first';\n"),
+        ("dist/index.cjs", b"module.exports = 'last';\n"),
+    ]);
+
+    let (object, source_sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    let link = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: arc_key("duplicate-member", "1.0.0"),
+            source_sri,
+            object_dir: object.clone(),
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap()
+        .link_dir
+        .join("node_modules/duplicate-member/dist/index.cjs");
+
+    assert_eq!(
+        std::fs::read(object.join("dist/index.cjs")).unwrap(),
+        b"module.exports = 'last';\n"
+    );
+    assert_eq!(std::fs::read(link).unwrap(), b"module.exports = 'last';\n");
+    let blob_contents = v3_blob_files(dir.path())
+        .into_iter()
+        .map(std::fs::read)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        blob_contents
+            .iter()
+            .any(|content| content == b"module.exports = 'first';\n")
+    );
+    assert!(
+        blob_contents
+            .iter()
+            .any(|content| content == b"module.exports = 'last';\n")
+    );
+    assert!(
+        store
+            .verify_file_cas(true)
+            .unwrap()
+            .unwrap()
+            .issues
+            .is_empty()
+    );
+}
+
+#[test]
+fn v3_deduplicates_object_files_without_sharing_writable_link_inodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let first_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"cas-a\",\"version\":\"1.0.0\"}",
+        ),
+        ("shared.js", b"shared"),
+    ]);
+    let second_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"cas-b\",\"version\":\"1.0.0\"}",
+        ),
+        ("shared.js", b"shared"),
+    ]);
+    let (first_object, first_sri, _) = store
+        .extract_object_from_bytes(&first_tarball, None)
+        .unwrap();
+    let (second_object, second_sri, _) = store
+        .extract_object_from_bytes(&second_tarball, None)
+        .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let first = std::fs::metadata(first_object.join("shared.js")).unwrap();
+        let second = std::fs::metadata(second_object.join("shared.js")).unwrap();
+        assert_eq!((first.dev(), first.ino()), (second.dev(), second.ino()));
+    }
+
+    let first_link = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: arc_key("cas-a", "1.0.0"),
+            source_sri: first_sri.clone(),
+            object_dir: first_object.clone(),
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap()
+        .link_dir
+        .join("node_modules/cas-a/shared.js");
+    let second_link = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: arc_key("cas-b", "1.0.0"),
+            source_sri: second_sri,
+            object_dir: second_object.clone(),
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap()
+        .link_dir
+        .join("node_modules/cas-b/shared.js");
+    let first_cache = store
+        .file_cas
+        .as_ref()
+        .unwrap()
+        .materialized_source(&first_object, &first_sri)
+        .unwrap();
+    let shared_blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 6))
+        .unwrap();
+    std::fs::write(&first_link, b"mutate").unwrap();
+    let rematerialized = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: arc_key("cas-a", "1.0.1"),
+            source_sri: first_sri,
+            object_dir: first_object.clone(),
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap()
+        .link_dir
+        .join("node_modules/cas-a/shared.js");
+
+    assert_eq!(
+        std::fs::read(first_object.join("shared.js")).unwrap(),
+        b"shared"
+    );
+    assert_eq!(
+        std::fs::read(second_object.join("shared.js")).unwrap(),
+        b"shared"
+    );
+    assert_eq!(std::fs::read(second_link).unwrap(), b"shared");
+    assert_eq!(
+        std::fs::read(first_cache.join("shared.js")).unwrap(),
+        b"shared"
+    );
+    assert_eq!(std::fs::read(shared_blob).unwrap(), b"shared");
+    assert_eq!(std::fs::read(rematerialized).unwrap(), b"shared");
+    assert!(
+        store
+            .verify_file_cas(true)
+            .unwrap()
+            .unwrap()
+            .issues
+            .is_empty()
+    );
+}
+
+#[test]
+fn v3_validation_batch_stats_a_shared_blob_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let first_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"batch-a\",\"version\":\"1.0.0\"}",
+        ),
+        ("shared.js", b"shared"),
+    ]);
+    let second_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"batch-b\",\"version\":\"1.0.0\"}",
+        ),
+        ("shared.js", b"shared"),
+    ]);
+    let (_, first_sri, _) = store
+        .extract_object_from_bytes(&first_tarball, None)
+        .unwrap();
+    let (_, second_sri, _) = store
+        .extract_object_from_bytes(&second_tarball, None)
+        .unwrap();
+    let batch = store.reusable_object_validation_batch();
+
+    let (first, first_timings) = store
+        .reusable_object_with_timings_in_batch(&first_sri, &batch)
+        .unwrap();
+    let (second, second_timings) = store
+        .reusable_object_with_timings_in_batch(&second_sri, &batch)
+        .unwrap();
+
+    assert!(first.is_some() && second.is_some());
+    assert_eq!(
+        first_timings.cas_blob_stat_count + second_timings.cas_blob_stat_count,
+        3
+    );
+    assert_eq!(second_timings.cas_blob_stat_cache_hit_count, 1);
+
+    let next_batch = store.reusable_object_validation_batch();
+    let (_, next_timings) = store
+        .reusable_object_with_timings_in_batch(&second_sri, &next_batch)
+        .unwrap();
+    assert_eq!(next_timings.cas_blob_stat_count, 2);
+    assert_eq!(next_timings.cas_blob_stat_cache_hit_count, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn v3_verified_object_clones_the_validated_projection_without_building_a_farm() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"validated-projection\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"validated"),
+    ]);
+    let (object_dir, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    let reusable = store.reusable_object(&sri).unwrap().unwrap();
+
+    store
+        .populate_link_entry_with_verified_object(
+            LinkEntryRequest {
+                graph_key: arc_key("validated-projection", "1.0.0"),
+                source_sri: sri,
+                object_dir,
+                deps: Vec::new(),
+                platform: Arc::new(sample_meta_platform()),
+            },
+            &reusable.object_integrity,
+        )
+        .unwrap();
+
+    assert!(!dir.path().join("materialized").exists());
+}
+
+#[test]
+fn v3_lazily_migrates_a_valid_v2_object_without_mutating_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+    let v2 = Store::from_lpm_root(&lpm_root);
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"migrated\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"original"),
+    ]);
+    let (v2_object, sri, _) = v2.extract_object_from_bytes(&tarball, None).unwrap();
+    let v2_bytes = std::fs::read(v2_object.join("index.js")).unwrap();
+
+    let v3 = Store::from_lpm_root_v3(&lpm_root);
+    let migrated = v3.reusable_object(&sri).unwrap().unwrap();
+
+    assert!(v2_object.is_dir());
+    assert_eq!(std::fs::read(v2_object.join("index.js")).unwrap(), v2_bytes);
+    assert_eq!(
+        std::fs::read(migrated.path.join("index.js")).unwrap(),
+        v2_bytes
+    );
+    assert!(v3.verify_file_cas(true).unwrap().unwrap().issues.is_empty());
+}
+
+#[test]
+fn v2_lazily_migrates_a_valid_v3_object_without_mutating_v3() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+    let v3 = Store::from_lpm_root_v3(&lpm_root);
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"rolled-back\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"experimental"),
+    ]);
+    let (v3_object, sri, _) = v3.extract_object_from_bytes(&tarball, None).unwrap();
+    let v3_bytes = std::fs::read(v3_object.join("index.js")).unwrap();
+
+    let v2 = Store::from_lpm_root(&lpm_root);
+    let migrated = v2.reusable_object(&sri).unwrap().unwrap();
+
+    assert!(v3_object.is_dir());
+    assert_eq!(std::fs::read(v3_object.join("index.js")).unwrap(), v3_bytes);
+    assert_eq!(
+        std::fs::read(migrated.path.join("index.js")).unwrap(),
+        v3_bytes
+    );
+}
+
+#[test]
+fn v3_migration_treats_unreadable_v2_integrity_metadata_as_a_cache_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+    let v2 = Store::from_lpm_root(&lpm_root);
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"corrupt-migration\",\"version\":\"1.0.0\"}",
+    )]);
+    let (v2_object, sri, _) = v2.extract_object_from_bytes(&tarball, None).unwrap();
+    let invalid_metadata = [0xff, 0xfe, 0xfd];
+    std::fs::write(
+        v2_object.join(crate::v2::integrity::OBJECT_INTEGRITY_FILENAME),
+        invalid_metadata,
+    )
+    .unwrap();
+
+    let v3 = Store::from_lpm_root_v3(&lpm_root);
+    let reusable = v3.reusable_object(&sri).unwrap();
+
+    assert!(reusable.is_none());
+    assert_eq!(
+        std::fs::read(v2_object.join(crate::v2::integrity::OBJECT_INTEGRITY_FILENAME)).unwrap(),
+        invalid_metadata
+    );
+}
+
+#[test]
+fn v3_deep_verification_detects_same_size_blob_tampering() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"tamper\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"before"),
+    ]);
+    store.extract_object_from_bytes(&tarball, None).unwrap();
+    let blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 6))
+        .unwrap();
+    std::fs::write(blob, b"after!").unwrap();
+
+    let verification = store.verify_file_cas(true).unwrap().unwrap();
+    assert_eq!(verification.blobs_rehashed, verification.blobs);
+    assert!(
+        verification
+            .issues
+            .iter()
+            .any(|issue| issue.contains("failed integrity validation"))
+    );
+}
+
+#[test]
+fn v3_normal_reuse_rejects_same_size_blob_tampering() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"tamper-reuse\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"before"),
+    ]);
+    let (_, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    let blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 6))
+        .unwrap();
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&blob).unwrap());
+    std::fs::write(&blob, b"after!").unwrap();
+    filetime::set_file_mtime(&blob, original_mtime).unwrap();
+
+    let reusable = store.reusable_object(&sri).unwrap();
+
+    assert!(reusable.is_none());
+    assert!(!blob.exists());
+    assert!(
+        dir.path()
+            .join("quarantine/blobs")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+}
+
+#[test]
+fn v3_verify_counts_unreferenced_source_tree_and_blob_as_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let orphan = dir.path().join("unreferenced-object");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("orphan.js"), b"unreferenced").unwrap();
+    let cas = store.file_cas.as_ref().unwrap();
+    let prepared = cas
+        .ingest_object_tree(&orphan, "sha512-unreferenced", false)
+        .unwrap();
+    cas.publish_source_record(&orphan, &prepared).unwrap();
+
+    let verification = store.verify_file_cas(true).unwrap().unwrap();
+
+    assert_eq!(verification.orphaned_sources, 1);
+    assert_eq!(verification.orphaned_trees, 1);
+    assert_eq!(verification.orphaned_blobs, 1);
+}
+
+#[test]
+fn v3_prune_keeps_a_blob_until_its_last_source_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let first_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"keep-a\",\"version\":\"1.0.0\"}",
+        ),
+        ("shared.js", b"shared"),
+    ]);
+    let second_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"keep-b\",\"version\":\"1.0.0\"}",
+        ),
+        ("shared.js", b"shared"),
+    ]);
+    let (first, _, _) = store
+        .extract_object_from_bytes(&first_tarball, None)
+        .unwrap();
+    let (second, _, _) = store
+        .extract_object_from_bytes(&second_tarball, None)
+        .unwrap();
+    let shared_blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 6))
+        .unwrap();
+
+    let first_only = std::collections::HashSet::from([first.clone()]);
+    let plan = store.file_cas_prune_plan(&first_only).unwrap().unwrap();
+    assert!(!plan.blob_files_orphaned.contains(&shared_blob));
+    assert_eq!(plan.source_validation_files_orphaned.len(), 1);
+
+    let both = std::collections::HashSet::from([first, second]);
+    let plan = store.file_cas_prune_plan(&both).unwrap().unwrap();
+    assert!(plan.blob_files_orphaned.contains(&shared_blob));
+    assert_eq!(plan.source_validation_files_orphaned.len(), 2);
+}
+
+#[test]
+fn v3_prune_refuses_to_plan_when_a_live_manifest_is_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"malformed-live-tree\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"retained"),
+    ]);
+    let (object_dir, _, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    let blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 8))
+        .unwrap();
+    let manifest = store
+        .file_cas
+        .as_ref()
+        .unwrap()
+        .tree_manifest_files()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    std::fs::write(manifest, b"malformed").unwrap();
+
+    let error = store
+        .file_cas_prune_plan(&std::collections::HashSet::new())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("tree digest mismatch"));
+    assert!(object_dir.is_dir());
+    assert!(blob.is_file());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn v3_prune_marks_materialized_cache_orphan_after_source_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"cached\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"cached"),
+    ]);
+    let (object_dir, source_sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: arc_key("cached", "1.0.0"),
+            source_sri,
+            object_dir: object_dir.clone(),
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+
+    let live = store
+        .file_cas_prune_plan(&std::collections::HashSet::new())
+        .unwrap()
+        .unwrap();
+    assert!(live.materialized_entries_orphaned.is_empty());
+
+    let removed = std::collections::HashSet::from([object_dir]);
+    let orphaned = store.file_cas_prune_plan(&removed).unwrap().unwrap();
+    assert_eq!(orphaned.materialized_entries_orphaned.len(), 1);
+}
+
+#[test]
+fn v3_link_population_uses_the_materialized_hardlink_farm_only_on_macos() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"platform-cache\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"content"),
+    ]);
+    let (object_dir, source_sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: arc_key("platform-cache", "1.0.0"),
+            source_sri,
+            object_dir,
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+
+    let materialized_count = store
+        .file_cas
+        .as_ref()
+        .unwrap()
+        .materialized_entry_dirs()
+        .unwrap()
+        .len();
+
+    assert_eq!(materialized_count, usize::from(cfg!(target_os = "macos")));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn v3_fresh_link_population_skips_the_materialized_hardlink_farm() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"fresh-clone\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"fresh-clone"),
+    ]);
+    let (fresh_object, source_sri, _) = store
+        .extract_object_from_bytes_with_fresh_integrity(&tarball, None)
+        .unwrap();
+
+    store
+        .populate_link_entry_with_fresh_object(
+            LinkEntryRequest {
+                graph_key: arc_key("fresh-clone", "1.0.0"),
+                source_sri,
+                object_dir: fresh_object.path.clone(),
+                deps: Vec::new(),
+                platform: Arc::new(sample_meta_platform()),
+            },
+            &fresh_object,
+        )
+        .unwrap();
+
+    let materialized_count = store
+        .file_cas
+        .as_ref()
+        .unwrap()
+        .materialized_entry_dirs()
+        .unwrap()
+        .len();
+    assert_eq!(materialized_count, 0);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn v3_fresh_link_population_does_not_change_cas_blob_ctime() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let payload = b"blob-ctime-payload";
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"fresh-ctime\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", payload),
+    ]);
+    let (fresh_object, source_sri, _) = store
+        .extract_object_from_bytes_with_fresh_integrity(&tarball, None)
+        .unwrap();
+    let blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| {
+            path.metadata()
+                .is_ok_and(|metadata| metadata.len() == payload.len() as u64)
+        })
+        .unwrap();
+    let before = std::fs::metadata(&blob).unwrap();
+
+    store
+        .populate_link_entry_with_fresh_object(
+            LinkEntryRequest {
+                graph_key: arc_key("fresh-ctime", "1.0.0"),
+                source_sri,
+                object_dir: fresh_object.path.clone(),
+                deps: Vec::new(),
+                platform: Arc::new(sample_meta_platform()),
+            },
+            &fresh_object,
+        )
+        .unwrap();
+
+    let after = std::fs::metadata(blob).unwrap();
+    assert_eq!(
+        (after.ctime(), after.ctime_nsec()),
+        (before.ctime(), before.ctime_nsec())
+    );
+}
+
+#[test]
+fn v3_fresh_link_population_omits_object_sidecars_from_the_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"fresh-sidecars\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"fresh-sidecars"),
+    ]);
+    let (fresh_object, source_sri, _) = store
+        .extract_object_from_bytes_with_fresh_integrity(&tarball, None)
+        .unwrap();
+    let entry = store
+        .populate_link_entry_with_fresh_object(
+            LinkEntryRequest {
+                graph_key: arc_key("fresh-sidecars", "1.0.0"),
+                source_sri,
+                object_dir: fresh_object.path.clone(),
+                deps: Vec::new(),
+                platform: Arc::new(sample_meta_platform()),
+            },
+            &fresh_object,
+        )
+        .unwrap();
+    let package_dir = entry.link_dir.join("node_modules/fresh-sidecars");
+
+    for sidecar in [
+        ".integrity",
+        ".lpm-security.json",
+        OBJECT_INTEGRITY_FILENAME,
+        TREE_SNAPSHOT_FILENAME,
+    ] {
+        assert!(!package_dir.join(sidecar).exists(), "found {sidecar}");
+    }
+}
+
+#[test]
+fn v3_fresh_link_population_keeps_cas_bytes_isolated_from_package_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let original = b"immutable-cas-bytes";
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"fresh-isolation\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", original),
+    ]);
+    let (fresh_object, source_sri, _) = store
+        .extract_object_from_bytes_with_fresh_integrity(&tarball, None)
+        .unwrap();
+    let object_index = fresh_object.path.join("index.js");
+    let blob = v3_blob_files(dir.path())
+        .into_iter()
+        .find(|path| {
+            path.metadata()
+                .is_ok_and(|metadata| metadata.len() == original.len() as u64)
+        })
+        .unwrap();
+    let entry = store
+        .populate_link_entry_with_fresh_object(
+            LinkEntryRequest {
+                graph_key: arc_key("fresh-isolation", "1.0.0"),
+                source_sri,
+                object_dir: fresh_object.path.clone(),
+                deps: Vec::new(),
+                platform: Arc::new(sample_meta_platform()),
+            },
+            &fresh_object,
+        )
+        .unwrap();
+    let linked_index = entry.link_dir.join("node_modules/fresh-isolation/index.js");
+
+    std::fs::write(linked_index, b"mutated-package-bytes").unwrap();
+
+    assert_eq!(std::fs::read(object_index).unwrap(), original);
+    assert_eq!(std::fs::read(blob).unwrap(), original);
+}
+
+#[test]
+#[cfg(unix)]
+fn v3_portable_materialization_preserves_local_source_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path().join("store"));
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("package.json"),
+        br#"{"name":"linked","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(source.join("target-dir")).unwrap();
+    std::fs::write(source.join("target-dir/index.js"), b"target").unwrap();
+    std::os::unix::fs::symlink("target-dir", source.join("alias-dir")).unwrap();
+    let sri = synthetic_sri(b"v3-local-symlink");
+    let object = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+    let cache = store
+        .file_cas
+        .as_ref()
+        .unwrap()
+        .materialized_source(&object, &sri)
+        .unwrap();
+    let destination = dir.path().join("destination");
+
+    materialize_into_portable_with_integrity_and_symlink_policy(&cache, &destination, true)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_link(destination.join("alias-dir")).unwrap(),
+        source.join("target-dir").canonicalize().unwrap()
+    );
+}
+
 #[test]
 fn extract_object_from_bytes_populates_object_dir() {
     // End-to-end round trip from raw bytes through SRI
@@ -1909,7 +2690,7 @@ fn extract_object_from_bytes_populates_object_dir() {
     // Security cache lives next to the object.
     assert!(
         obj_dir.join(".lpm-security.json").is_file(),
-        "v2 security analysis must run inside extract_object"
+        "virtual-store security analysis must run inside extract_object"
     );
 }
 
@@ -3336,7 +4117,7 @@ fn copy_dir_recursively_skips_symlinks_from_v1_source() {
     );
     assert!(
         dst.join("escape").symlink_metadata().is_err(),
-        "symlink must be skipped — refusing to migrate v1→v2 symlinks",
+        "symlink must be skipped — refusing to migrate v1→virtual-store symlinks",
     );
 }
 

@@ -527,6 +527,15 @@ console.log('global-firewall-tool');
         combined.contains("LPM Firewall active"),
         "firewall-active global install must show the badge; got:\n{combined}"
     );
+    let store_root = project.home().join(".lpm/store");
+    assert!(
+        store_root.join("v2/links").is_dir(),
+        "successful global installs must use the default v2 virtual store"
+    );
+    assert!(
+        !store_root.join("v3").exists(),
+        "default global installs must not activate the experimental v3 store"
+    );
 }
 
 #[tokio::test]

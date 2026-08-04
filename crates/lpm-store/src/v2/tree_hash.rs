@@ -27,6 +27,116 @@ pub(crate) struct ExtractedObjectStats {
     dirs: std::collections::HashSet<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TreeMetadataKind {
+    Directory,
+    File,
+    Symlink,
+}
+
+pub(crate) struct TreeMetadataBuilder {
+    records: Vec<TreeMetadataRecord>,
+}
+
+struct TreeMetadataRecord {
+    kind: TreeMetadataKind,
+    relative: Vec<u8>,
+    mode: u32,
+    len: u64,
+    modified_time_nanos: i128,
+    change_time_nanos: i128,
+    payload: Vec<u8>,
+}
+
+impl TreeMetadataBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        kind: TreeMetadataKind,
+    ) -> Result<usize, LpmError> {
+        let relative = relative_path_bytes(root, path)?;
+        let index = self.records.len();
+        self.records.push(TreeMetadataRecord {
+            kind,
+            relative,
+            mode: 0,
+            len: 0,
+            modified_time_nanos: 0,
+            change_time_nanos: 0,
+            payload: Vec::new(),
+        });
+        Ok(index)
+    }
+
+    pub(crate) fn refresh(
+        &mut self,
+        index: usize,
+        path: &Path,
+        payload: Vec<u8>,
+    ) -> Result<(), LpmError> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to stat materialized tree entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        let record = self.records.get_mut(index).ok_or_else(|| {
+            LpmError::Store("invalid materialized tree metadata record index".into())
+        })?;
+        record.mode = object_entry_mode(&metadata);
+        record.len = metadata.len();
+        record.modified_time_nanos = modified_time_nanos(&metadata);
+        record.change_time_nanos = change_time_nanos(&metadata);
+        record.payload = payload;
+        Ok(())
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        kind: TreeMetadataKind,
+        payload: Vec<u8>,
+    ) -> Result<(), LpmError> {
+        let index = self.reserve(root, path, kind)?;
+        self.refresh(index, path, payload)
+    }
+
+    pub(crate) fn finish(self) -> String {
+        let mut hasher = Sha256::new();
+        for record in self.records {
+            hash_tree_metadata_fields(
+                &mut hasher,
+                record.kind.tag(),
+                &record.relative,
+                record.mode,
+                record.len,
+                record.modified_time_nanos,
+                record.change_time_nanos,
+                &record.payload,
+            );
+        }
+        format!("sha256-{}", hex::encode(hasher.finalize()))
+    }
+}
+
+impl TreeMetadataKind {
+    fn tag(self) -> &'static [u8] {
+        match self {
+            Self::Directory => b"dir",
+            Self::File => b"file",
+            Self::Symlink => b"symlink",
+        }
+    }
+}
+
 impl ExtractedObjectStats {
     pub(crate) fn record_file(&mut self, relative_path: &Path, size: u64) {
         self.stats.file_count = self.stats.file_count.saturating_add(1);
@@ -72,7 +182,7 @@ pub(crate) fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmE
         Ok(integrity) => return Ok(integrity),
         Err(error) => tracing::trace!(
             target = %dir.display(),
-            "v2 store: bulk metadata walk unavailable, using portable walker: {error}"
+            "virtual store: bulk metadata walk unavailable, using portable walker: {error}"
         ),
     }
     compute_tree_metadata_integrity_portable(dir)
@@ -123,12 +233,14 @@ fn hash_object_tree_dir_inner(
     // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
     for entry in std::fs::read_dir(dir).map_err(|e| {
         LpmError::Store(format!(
-            "failed to read v2 object tree at {}: {e}",
+            "failed to read virtual-store object tree at {}: {e}",
             dir.display()
         ))
     })? {
         let entry = entry.map_err(|e| {
-            LpmError::Store(format!("failed to enumerate v2 object tree entry: {e}"))
+            LpmError::Store(format!(
+                "failed to enumerate virtual-store object tree entry: {e}"
+            ))
         })?;
         let file_name = entry.file_name();
         if is_object_metadata_sidecar_name(root, dir, &file_name) {
@@ -136,7 +248,7 @@ fn hash_object_tree_dir_inner(
         }
         let metadata = entry.metadata().map_err(|e| {
             LpmError::Store(format!(
-                "failed to stat v2 object tree entry {}: {e}",
+                "failed to stat virtual-store object tree entry {}: {e}",
                 dir.join(&file_name).display()
             ))
         })?;
@@ -203,7 +315,7 @@ fn hash_object_tree_dir_inner(
             path_pushed = true;
             let target = std::fs::read_link(&path).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to read v2 object symlink {}: {e}",
+                    "failed to read virtual-store object symlink {}: {e}",
                     path.display()
                 ))
             })?;
@@ -224,7 +336,7 @@ fn hash_object_tree_dir_inner(
             path.push(&entry_name);
             path_pushed = true;
             Err(LpmError::Store(format!(
-                "unsupported v2 object entry type at {}",
+                "unsupported virtual-store object entry type at {}",
                 path.display()
             )))
         };
@@ -297,7 +409,7 @@ fn hash_tree_metadata_dir_bulk(
             MacosEntryKind::Symlink => {
                 let target = std::fs::read_link(&path).map_err(|error| {
                     LpmError::Store(format!(
-                        "failed to read v2 object symlink {}: {error}",
+                        "failed to read virtual-store object symlink {}: {error}",
                         path.display()
                     ))
                 })?;
@@ -316,7 +428,7 @@ fn hash_tree_metadata_dir_bulk(
                 Ok(())
             }
             MacosEntryKind::Unsupported => Err(LpmError::Store(format!(
-                "unsupported v2 object entry type at {}",
+                "unsupported virtual-store object entry type at {}",
                 path.display()
             ))),
         };
@@ -355,7 +467,7 @@ fn read_bulk_metadata_entries(
 
     let directory = std::fs::File::open(dir).map_err(|error| {
         LpmError::Store(format!(
-            "failed to read v2 object tree at {}: {error}",
+            "failed to read virtual-store object tree at {}: {error}",
             dir.display()
         ))
     })?;
@@ -390,7 +502,7 @@ fn read_bulk_metadata_entries(
         };
         if count < 0 {
             return Err(LpmError::Store(format!(
-                "failed to enumerate v2 object metadata at {}: {}",
+                "failed to enumerate virtual-store object metadata at {}: {}",
                 dir.display(),
                 std::io::Error::last_os_error()
             )));
@@ -657,7 +769,7 @@ fn hash_object_file(
     hasher.update(metadata.len().to_le_bytes());
     let file = std::fs::File::open(path).map_err(|e| {
         LpmError::Store(format!(
-            "failed to open v2 object file {} for integrity hashing: {e}",
+            "failed to open virtual-store object file {} for integrity hashing: {e}",
             path.display()
         ))
     })?;
@@ -666,7 +778,7 @@ fn hash_object_file(
     loop {
         let read = reader.read(&mut buf).map_err(|e| {
             LpmError::Store(format!(
-                "failed to read v2 object file {} for integrity hashing: {e}",
+                "failed to read virtual-store object file {} for integrity hashing: {e}",
                 path.display()
             ))
         })?;
@@ -686,10 +798,36 @@ fn hash_object_tree_record(hasher: &mut Sha256, kind: &[u8], relative: &[u8], pa
     hasher.update(payload);
 }
 
+fn relative_path_bytes(root: &Path, path: &Path) -> Result<Vec<u8>, LpmError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        LpmError::Store(format!(
+            "materialized tree entry escapes destination root: {}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(relative.as_os_str().len());
+    for component in relative.components() {
+        if !bytes.is_empty() {
+            push_path_separator(&mut bytes);
+        }
+        push_os_str_bytes(&mut bytes, component.as_os_str());
+    }
+    if bytes.is_empty() {
+        return Err(LpmError::Store(
+            "materialized tree metadata cannot record its root".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 fn push_os_str_bytes(out: &mut Vec<u8>, value: &std::ffi::OsStr) {
     use std::os::unix::ffi::OsStrExt;
     out.extend_from_slice(value.as_bytes());
+}
+
+fn push_path_separator(out: &mut Vec<u8>) {
+    out.push(b'/');
 }
 
 #[cfg(windows)]
@@ -744,4 +882,21 @@ pub(crate) fn is_object_metadata_sidecar_name(root: &Path, dir: &Path, name: &Os
         // stage `.lpm-<random>` temporaries in the object root; a
         // concurrent tree hash must not observe them.
         || lpm_common::atomic_write::is_atomic_temp_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_bytes_use_the_tree_hash_canonical_separator() {
+        let root = Path::new("root");
+        let path = root.join("parent").join("child");
+        let mut expected = Vec::new();
+        push_os_str_bytes(&mut expected, OsStr::new("parent"));
+        expected.push(b'/');
+        push_os_str_bytes(&mut expected, OsStr::new("child"));
+
+        assert_eq!(relative_path_bytes(root, &path).unwrap(), expected);
+    }
 }

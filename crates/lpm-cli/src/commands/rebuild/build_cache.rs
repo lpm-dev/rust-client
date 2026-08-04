@@ -77,17 +77,17 @@ impl BuildCacheScratch {
             .ok_or_else(|| std::io::Error::other("package is not inside a node_modules tree"))?;
         let link_dir = node_modules_dir
             .parent()
-            .ok_or_else(|| std::io::Error::other("package has no v2 link-entry parent"))?;
+            .ok_or_else(|| std::io::Error::other("package has no virtual-store link parent"))?;
         let metadata = lpm_store::v2::LinkMeta::read_from(link_dir)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         if metadata.graph_key_digest_hex != graph_key_digest {
             return Err(std::io::Error::other(
-                "package graph identity does not match its v2 link sidecar",
+                "package graph identity does not match its virtual-store link sidecar",
             ));
         }
         if node_modules_dir.join(&metadata.name) != package_dir {
             return Err(std::io::Error::other(
-                "package path does not match its v2 link sidecar",
+                "package path does not match its virtual-store link sidecar",
             ));
         }
         Ok(link_dir.join(".lpm-build-tmp"))
