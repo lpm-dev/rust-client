@@ -394,7 +394,7 @@ fn try_linux_reflink(src: &Path, dst: &Path) -> Result<bool, LpmError> {
                 dst.display()
             ))
         })?;
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    const FICLONE: libc::Ioctl = 0x4004_9409;
     // SAFETY: both descriptors are live regular files opened above, and
     // FICLONE only reads the source fd and initializes the empty destination.
     let result = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
