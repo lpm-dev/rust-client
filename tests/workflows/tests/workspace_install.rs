@@ -1852,6 +1852,33 @@ async fn recursive_install_preserves_importer_local_peer_contexts_in_parallel() 
 }
 
 #[tokio::test]
+async fn recursive_json_timing_reports_workspace_union_expansion_and_fallback_counts() {
+    let mock = MockRegistry::start().await;
+    mount_peer_sensitive_workspace_packages(&mock).await;
+    let project = peer_sensitive_workspace_project();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("install")
+        .arg("--recursive")
+        .arg("--json")
+        .arg("--timing")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run recursive install with workspace union telemetry");
+    assert_install_succeeded(
+        &output,
+        "recursive install with workspace union telemetry should succeed",
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recursive install must emit JSON");
+    insta::assert_json_snapshot!(
+        "recursive_workspace_union_timing",
+        report["timing"]["workspace_union"]
+    );
+}
+
+#[tokio::test]
 async fn recursive_install_writes_one_root_lockfile_with_importer_projections() {
     let mock = MockRegistry::start().await;
     mount_registry_packages(&mock, &[("shared-dep", "1.0.0"), ("web-only-dep", "2.0.0")]).await;

@@ -166,8 +166,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let v2_source_deps = bound_v2_source_deps
         .as_ref()
         .unwrap_or(&v2_workspace_root_pre_resolve.source_deps);
-    let resolver_root_dependencies =
-        lpm_resolver::RootDependencies::with_optional_names(deps.clone(), optional_registry_roots);
 
     merge_workspace_member_links(
         workspace_member_deps,
@@ -224,6 +222,15 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 (fast_path.packages, 0u128, true, 0usize, HashMap::new())
             }
             None => {
+                debug_assert!(
+                    registry_resolver_roots_are_eligible(deps),
+                    "non-registry dependency reached the resolver-root boundary"
+                );
+                let resolver_root_dependencies =
+                    lpm_resolver::RootDependencies::with_optional_names(
+                        deps.clone(),
+                        optional_registry_roots,
+                    );
                 let resolve_start = Instant::now();
                 let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
                 let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
@@ -401,8 +408,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     )
                     .await?;
                     let res = match union_result {
-                        Some(result) => Ok(result),
-                        None => lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+                        workspace_resolution::WorkspaceUnionResolution::Projected(result) => {
+                            Ok(*result)
+                        }
+                        workspace_resolution::WorkspaceUnionResolution::Isolated(union_timing) => {
+                            lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
                             arc_client.clone(),
                             resolver_root_dependencies.clone(),
                             override_set.clone(),
@@ -421,7 +431,14 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             ),
                         )
                         .await
-                        .map_err(crate::resolver_error::resolver_error_to_lpm),
+                        .map(|mut result| {
+                            if let Some(union_timing) = union_timing {
+                                result.stage_timing.workspace_union = union_timing;
+                            }
+                            result
+                        })
+                        .map_err(crate::resolver_error::resolver_error_to_lpm)
+                        }
                     };
 
                     speculation_join = Some(SpeculationJoin {

@@ -175,6 +175,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         }
         .to_json();
         let metadata_dispatcher = metadata_dispatcher_json(resolver_stage_timing);
+        let workspace_union = workspace_union_timing_json(resolver_stage_timing);
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
             .map(|p| {
@@ -257,6 +258,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // `resolve` are additive observability.
                        "resolve": {
                            "platform_skipped": platform_skipped,
+                           "workspace_union": workspace_union,
                            "initial_batch_ms": initial_batch_ms,
                            "followup_rpc_ms": resolver_stage_timing.followup_rpc_ms,
                            "followup_rpc_count": resolver_stage_timing.followup_rpc_count,

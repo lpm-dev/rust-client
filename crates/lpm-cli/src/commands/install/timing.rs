@@ -1336,6 +1336,25 @@ pub(super) fn metadata_dispatcher_json(stage: &lpm_resolver::StageTiming) -> ser
     })
 }
 
+pub(super) fn workspace_union_timing_json(stage: &lpm_resolver::StageTiming) -> serde_json::Value {
+    let union = stage.workspace_union;
+    serde_json::json!({
+        "importer_count": union.importer_count,
+        "eligible_importer_count": union.eligible_importer_count,
+        "projected_importer_count": union.projected_importer_count,
+        "isolated_importer_count": union.isolated_importer_count,
+        "expansion_pass_count": union.ambient_peer_expansion_pass_count,
+        "expansion_capped": union.ambient_peer_expansion_capped,
+        "isolated_importer_reasons": {
+            "root_specifier_count": union.root_specifier_isolated_count,
+            "release_age_policy_count": union.release_age_policy_isolated_count,
+            "projection_count": union.projection_isolated_count,
+            "ambient_peer_cap_count": union.ambient_peer_cap_isolated_count,
+            "ambient_peer_stalled_count": union.ambient_peer_stalled_isolated_count,
+        },
+    })
+}
+
 pub(super) fn resolve_detail_json(
     resolve_wall_ms: u128,
     initial_batch_ms: u128,
@@ -1485,6 +1504,43 @@ pub(super) fn resolve_detail_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_union_timing_reports_expansion_and_isolated_importer_reasons() {
+        let stage = lpm_resolver::StageTiming {
+            workspace_union: lpm_resolver::WorkspaceUnionStageTiming {
+                importer_count: 3,
+                eligible_importer_count: 2,
+                projected_importer_count: 1,
+                isolated_importer_count: 2,
+                ambient_peer_expansion_pass_count: 4,
+                ambient_peer_expansion_capped: true,
+                root_specifier_isolated_count: 1,
+                ambient_peer_cap_isolated_count: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            workspace_union_timing_json(&stage),
+            serde_json::json!({
+                "importer_count": 3,
+                "eligible_importer_count": 2,
+                "projected_importer_count": 1,
+                "isolated_importer_count": 2,
+                "expansion_pass_count": 4,
+                "expansion_capped": true,
+                "isolated_importer_reasons": {
+                    "root_specifier_count": 1,
+                    "release_age_policy_count": 0,
+                    "projection_count": 0,
+                    "ambient_peer_cap_count": 1,
+                    "ambient_peer_stalled_count": 0,
+                },
+            })
+        );
+    }
 
     #[test]
     fn install_count_semantics_distinguishes_store_reuse_from_linker_entry_creation() {
