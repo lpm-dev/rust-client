@@ -769,21 +769,92 @@ async fn query_osv_batch_returns_err_on_non_success_http() {
         .mount(&server)
         .await;
 
-    // SAFETY: a `Mutex`-guarded env var would be ideal but this
-    // module doesn't have an env-isolation harness like
-    // `release_lookup`. The OSV URL env var is read inside the
-    // function under test, so the set→call→remove sequence is
-    // race-free within a single test. Other tests in this module
-    // do not set LPM_OSV_URL.
-    unsafe { std::env::set_var("LPM_OSV_URL", server.uri()) };
-    let result = query_osv_batch(&[("react".to_string(), "1.0.0".to_string())]).await;
-    unsafe { std::env::remove_var("LPM_OSV_URL") };
+    let result =
+        query_osv_batch(&[("react".to_string(), "1.0.0".to_string())], &server.uri()).await;
 
     let err = result.expect_err("non-2xx OSV response must surface as Err");
     let msg = err.to_string();
     assert!(
         msg.contains("HTTP 500") && msg.contains("degraded"),
         "error must label the failure mode: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn query_osv_batch_splits_requests_at_osv_query_limit() {
+    use wiremock::matchers::{body_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const OSV_QUERY_LIMIT: usize = 1000;
+
+    let server = MockServer::start().await;
+    let packages: Vec<(String, String)> = (0..=OSV_QUERY_LIMIT)
+        .map(|index| (format!("package-{index}"), "1.0.0".to_string()))
+        .collect();
+
+    for batch in packages.chunks(OSV_QUERY_LIMIT) {
+        let queries: Vec<serde_json::Value> = batch
+            .iter()
+            .map(|(name, version)| {
+                serde_json::json!({
+                    "package": { "name": name, "ecosystem": "npm" },
+                    "version": version,
+                })
+            })
+            .collect();
+        let results: Vec<serde_json::Value> = batch
+            .iter()
+            .map(|(name, _)| {
+                let vulns = if name == "package-999" || name == "package-1000" {
+                    vec![serde_json::json!({
+                        "id": format!("GHSA-{name}"),
+                        "summary": "boundary vulnerability",
+                        "severity": [{ "type": "CVSS_V3", "score": "9.8" }],
+                        "affected": [{
+                            "package": { "ecosystem": "npm", "name": name },
+                            "ranges": [{
+                                "type": "SEMVER",
+                                "events": [{ "introduced": "0" }],
+                            }],
+                        }],
+                    })]
+                } else {
+                    Vec::new()
+                };
+                serde_json::json!({ "vulns": vulns })
+            })
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(body_json(serde_json::json!({ "queries": queries })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": results,
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let vulnerabilities = query_osv_batch(&packages, &server.uri())
+        .await
+        .expect("requests above the OSV limit must be split");
+    let request_count = server
+        .received_requests()
+        .await
+        .expect("request recording must succeed")
+        .len();
+    let findings: Vec<(&str, &str)> = vulnerabilities
+        .iter()
+        .map(|vulnerability| (vulnerability.package.as_str(), vulnerability.id.as_str()))
+        .collect();
+    assert_eq!(
+        (findings, request_count),
+        (
+            vec![
+                ("package-999", "GHSA-package-999"),
+                ("package-1000", "GHSA-package-1000"),
+            ],
+            2,
+        )
     );
 }
 

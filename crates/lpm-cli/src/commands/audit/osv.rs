@@ -91,6 +91,23 @@ struct OsvBatchResponse {
     results: Vec<OsvQueryResult>,
 }
 
+#[derive(serde::Serialize)]
+struct OsvBatchRequest<'a> {
+    queries: Vec<OsvQuery<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct OsvQuery<'a> {
+    package: OsvQueryPackage<'a>,
+    version: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct OsvQueryPackage<'a> {
+    name: &'a str,
+    ecosystem: &'static str,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct OsvQueryResult {
     #[serde(default)]
@@ -175,6 +192,8 @@ impl OsvVulnerability {
 }
 
 const OSV_URL_DEFAULT: &str = "https://api.osv.dev/v1/querybatch";
+const OSV_MAX_QUERIES_PER_REQUEST: usize = 1000;
+const OSV_BATCH_REQUEST_CONCURRENCY: usize = 4;
 
 /// Resolve the OSV endpoint, honouring `LPM_OSV_URL` overrides only
 /// when the scheme/host combination matches the same gating contract as
@@ -254,8 +273,9 @@ fn host_is_loopback(host: &str) -> bool {
 #[cfg(test)]
 pub(super) async fn query_osv_batch(
     packages: &[(String, String)],
+    osv_url: &str,
 ) -> Result<Vec<OsvVulnerability>, LpmError> {
-    query_osv_batch_with_warnings(packages, true).await
+    query_osv_batch_from_url(packages, osv_url).await
 }
 
 async fn query_osv_batch_with_warnings(
@@ -266,59 +286,45 @@ async fn query_osv_batch_with_warnings(
         return Ok(Vec::new());
     }
 
+    let osv_url = resolve_osv_url(emit_warnings);
+    query_osv_batch_from_url(packages, &osv_url).await
+}
+
+async fn query_osv_batch_from_url(
+    packages: &[(String, String)],
+    osv_url: &str,
+) -> Result<Vec<OsvVulnerability>, LpmError> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let client = lpm_http::client_builder()
         .build()
         .map_err(|error| LpmError::Network(format!("OSV client build failed: {error}")))?;
 
-    let queries: Vec<serde_json::Value> = packages
-        .iter()
-        .map(|(name, version)| {
-            serde_json::json!({
-                "package": { "name": name, "ecosystem": "npm" },
-                "version": version,
-            })
-        })
-        .collect();
-
-    let body = serde_json::json!({ "queries": queries });
-
-    let osv_url = resolve_osv_url(emit_warnings);
-
-    let response = client
-        .post(&osv_url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|error| {
-            LpmError::Network(format!(
-                "OSV API error: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-
-    if !response.status().is_success() {
-        return Err(LpmError::Network(format!(
-            "OSV API returned HTTP {}; treat as degraded — vulnerability data not retrieved",
-            response.status().as_u16()
-        )));
+    let request_count = packages.len().div_ceil(OSV_MAX_QUERIES_PER_REQUEST);
+    let mut requests = Vec::with_capacity(request_count);
+    for batch in packages.chunks(OSV_MAX_QUERIES_PER_REQUEST) {
+        requests.push(build_osv_batch_request(&client, osv_url, batch));
     }
 
-    let result: OsvBatchResponse = response
-        .json()
-        .await
-        .map_err(|e| LpmError::Network(format!("OSV parse error: {e}")))?;
+    let batch_requests = stream::iter(
+        requests
+            .into_iter()
+            .map(|(request, query_count)| send_osv_batch_request(request, query_count)),
+    )
+    .buffered(OSV_BATCH_REQUEST_CONCURRENCY);
+    futures::pin_mut!(batch_requests);
 
-    if result.results.len() != packages.len() {
-        return Err(LpmError::Network(format!(
-            "OSV batch response cardinality mismatch: sent {} queries, received {} result slots",
-            packages.len(),
-            result.results.len()
-        )));
+    let mut query_results = Vec::with_capacity(packages.len());
+    while let Some(batch_result) = batch_requests.next().await {
+        query_results.extend(batch_result?);
     }
 
     let mut hydration_ids = HashSet::new();
-    for query_result in &result.results {
+    let mut vulnerability_count = 0usize;
+    for query_result in &query_results {
+        vulnerability_count += query_result.vulns.len();
         for vuln in &query_result.vulns {
             if osv_advisory_needs_hydration(vuln) {
                 hydration_ids.insert(vuln.id.clone());
@@ -328,7 +334,7 @@ async fn query_osv_batch_with_warnings(
 
     let hydrated: Vec<(String, OsvVuln)> = stream::iter(hydration_ids.into_iter().map(|id| {
         let client = client.clone();
-        let osv_url = osv_url.clone();
+        let osv_url = osv_url.to_string();
         async move {
             let vuln = fetch_osv_advisory(&client, &osv_url, &id).await?;
             Ok::<_, LpmError>((id, vuln))
@@ -341,9 +347,9 @@ async fn query_osv_batch_with_warnings(
     .collect::<Result<Vec<_>, _>>()?;
     let hydrated: HashMap<String, OsvVuln> = hydrated.into_iter().collect();
 
-    let mut vulns: Vec<OsvVulnerability> = Vec::new();
+    let mut vulns = Vec::with_capacity(vulnerability_count);
 
-    for (query_result, (package, version)) in result.results.into_iter().zip(packages) {
+    for (query_result, (package, version)) in query_results.into_iter().zip(packages) {
         for batch_vuln in query_result.vulns {
             let vuln = hydrated.get(&batch_vuln.id).unwrap_or(&batch_vuln);
             if matches!(
@@ -364,6 +370,63 @@ async fn query_osv_batch_with_warnings(
     }
 
     Ok(vulns)
+}
+
+fn build_osv_batch_request(
+    client: &reqwest::Client,
+    osv_url: &str,
+    packages: &[(String, String)],
+) -> (reqwest::RequestBuilder, usize) {
+    let mut queries = Vec::with_capacity(packages.len());
+    for (name, version) in packages {
+        queries.push(OsvQuery {
+            package: OsvQueryPackage {
+                name: name.as_str(),
+                ecosystem: "npm",
+            },
+            version: version.as_str(),
+        });
+    }
+    let body = OsvBatchRequest { queries };
+    let request = client
+        .post(osv_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10));
+    (request, packages.len())
+}
+
+async fn send_osv_batch_request(
+    request: reqwest::RequestBuilder,
+    query_count: usize,
+) -> Result<Vec<OsvQueryResult>, LpmError> {
+    let response = request.send().await.map_err(|error| {
+        LpmError::Network(format!(
+            "OSV API error: {}",
+            lpm_http::display_error(&error)
+        ))
+    })?;
+
+    if !response.status().is_success() {
+        return Err(LpmError::Network(format!(
+            "OSV API returned HTTP {}; treat as degraded — vulnerability data not retrieved",
+            response.status().as_u16()
+        )));
+    }
+
+    let result: OsvBatchResponse = response
+        .json()
+        .await
+        .map_err(|error| LpmError::Network(format!("OSV parse error: {error}")))?;
+
+    if result.results.len() != query_count {
+        return Err(LpmError::Network(format!(
+            "OSV batch response cardinality mismatch: sent {} queries, received {} result slots",
+            query_count,
+            result.results.len()
+        )));
+    }
+
+    Ok(result.results)
 }
 
 fn osv_advisory_needs_hydration(vuln: &OsvVuln) -> bool {
