@@ -1528,6 +1528,14 @@ use support::mock_registry::{
 };
 
 async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)]) {
+    let batch = mount_registry_package_routes(mock, packages).await;
+    mock.with_batch_metadata(batch).await;
+}
+
+async fn mount_registry_package_routes(
+    mock: &MockRegistry,
+    packages: &[(&str, &str)],
+) -> Vec<serde_json::Value> {
     let mut batch = Vec::with_capacity(packages.len());
     for (name, version) in packages {
         let tarball = make_tarball(name, version);
@@ -1550,7 +1558,7 @@ async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)])
             "time": { *version: "2025-01-01T00:00:00.000Z" }
         }));
     }
-    mock.with_batch_metadata(batch).await;
+    batch
 }
 
 async fn mount_importer_context_packages(mock: &MockRegistry) {
@@ -2632,13 +2640,16 @@ async fn recursive_firewall_preflight_does_not_launch_importer_local_tarball_wat
 #[tokio::test]
 async fn recursive_firewall_fetch_failure_commits_no_importer() {
     let mock = MockRegistry::start().await;
-    mount_registry_packages(&mock, &[("member-allowed", "1.0.0")]).await;
-    mock.with_full_package_metadata(
-        "root-missing-tarball",
-        "1.0.0",
-        &[("1.0.0", serde_json::json!({}), None)],
-    )
-    .await;
+    let mut batch = mount_registry_package_routes(&mock, &[("member-allowed", "1.0.0")]).await;
+    batch.push(
+        mock.mount_full_package_metadata_routes(
+            "root-missing-tarball",
+            "1.0.0",
+            &[("1.0.0", serde_json::json!({}), None)],
+        )
+        .await,
+    );
+    mock.with_batch_metadata(batch).await;
     mock.with_npm_firewall_allow("member-allowed", "1.0.0")
         .await;
     mock.with_npm_firewall_allow("root-missing-tarball", "1.0.0")
@@ -2680,6 +2691,22 @@ async fn recursive_firewall_fetch_failure_commits_no_importer() {
         "recursive install must fail when an importer cannot materialize its graph\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("Selected artifact unavailable")
+            && combined.contains("root-missing-tarball@1.0.0"),
+        "recursive install must fail at the missing root tarball: {combined}",
+    );
+    assert_eq!(
+        mock.tarball_request_count("root-missing-tarball", "1.0.0")
+            .await,
+        1,
+        "recursive install must fetch the missing root tarball exactly once",
     );
 
     assert_target_not_installed(&project, "packages/member");
